@@ -109,6 +109,7 @@ export function TerminalPane(props: PaneCommonProps & {
   /** Request control as soon as the pane is ready, for the row shortcut that
    *  opens a writable terminal in one click. */
   autoTakeControl?: boolean;
+  onAutoTakeControlConsumed?: () => void;
   /** 触屏容器（手机端）改用虚拟宽度等比缩放内嵌终端，见 ScaledTerminalFrame；
    *  标题栏的「新标签页打开」仍然是全屏入口。 */
   handOffToFullScreen?: boolean;
@@ -231,6 +232,7 @@ export function TerminalPane(props: PaneCommonProps & {
     if (!control || control.mode !== 'readonly' || control.fixed) return;
     if (autoTakeoverDone.current === props.session.sessionId) return;
     autoTakeoverDone.current = props.session.sessionId;
+    props.onAutoTakeControlConsumed?.();
     void mutate('takeover');
   });
 
@@ -500,6 +502,9 @@ export function WebPane(props: PaneCommonProps): JSX.Element {
 interface PaneTreeProps extends PaneCommonProps {
   tree: WorkbenchPaneTree;
   location: WorkbenchTerminalLocation | null;
+  autoTakeControl?: boolean;
+  scaleTerminal?: boolean;
+  onAutoTakeControlConsumed?: () => void;
   onRatioChange(ratio: number): void;
 }
 
@@ -542,6 +547,9 @@ function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { t
     authenticated: props.authenticated,
     now: props.now,
     location: props.location,
+    autoTakeControl: props.autoTakeControl,
+    scaleTerminal: props.scaleTerminal,
+    onAutoTakeControlConsumed: props.onAutoTakeControlConsumed,
     onRatioChange: props.onRatioChange,
   };
   return (
@@ -567,7 +575,16 @@ function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { t
 function PaneTreeNode(props: PaneTreeProps): JSX.Element {
   if (props.tree.type === 'split') return <SplitPane {...props} tree={props.tree} />;
   return props.tree.pane === 'terminal'
-    ? <TerminalPane session={props.session} api={props.api} authenticated={props.authenticated} now={props.now} location={props.location} />
+    ? <TerminalPane
+        session={props.session}
+        api={props.api}
+        authenticated={props.authenticated}
+        now={props.now}
+        location={props.location}
+        autoTakeControl={props.autoTakeControl}
+        handOffToFullScreen={props.scaleTerminal}
+        onAutoTakeControlConsumed={props.onAutoTakeControlConsumed}
+      />
     : <WebPane session={props.session} api={props.api} authenticated={props.authenticated} now={props.now} />;
 }
 
@@ -575,6 +592,9 @@ export function WorkbenchPaneRegion(props: PaneCommonProps & {
   layout: WorkbenchLayoutState;
   effectivePaneMode: 'focus' | 'split';
   location: WorkbenchTerminalLocation | null;
+  autoTakeControl?: boolean;
+  scaleTerminal?: boolean;
+  onAutoTakeControlConsumed?: () => void;
   onRatioChange(ratio: number): void;
 }): JSX.Element {
   const effective = useMemo(
@@ -590,6 +610,9 @@ export function WorkbenchPaneRegion(props: PaneCommonProps & {
         authenticated={props.authenticated}
         now={props.now}
         location={props.location}
+        autoTakeControl={props.autoTakeControl}
+        scaleTerminal={props.scaleTerminal}
+        onAutoTakeControlConsumed={props.onAutoTakeControlConsumed}
         onRatioChange={props.onRatioChange}
       />
     </div>

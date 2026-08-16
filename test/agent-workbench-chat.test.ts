@@ -18,20 +18,36 @@ describe('Agent Workbench Feishu chat bridge', () => {
     expect(enterChat).not.toHaveBeenCalled();
   });
 
-  it('goes straight from a rejected toggleChat to AppLink on desktop', async () => {
-    // enterChat navigates the entire page. When toggleChat is rejected the JSAPI
-    // is unauthorised, so enterChat would fail the same way while additionally
-    // displacing the Workbench — the double navigation users reported.
+  it('falls back from a rejected toggleChat to enterChat before AppLink', async () => {
     const order: string[] = [];
     const sdk: FeishuJsApi = {
       toggleChat(options) { order.push('toggleChat'); options.fail?.({ errno: 1 }); },
-      enterChat(options) { order.push('enterChat'); options.fail?.({ errno: 2 }); },
+      enterChat(options) { order.push('enterChat'); options.success?.(); },
     };
     const opened: string[] = [];
     const result = await openWorkbenchChat({ chatId: 'oc_2', preferSplit: true, sdk, openExternal: url => opened.push(url) });
-    expect(order).toEqual(['toggleChat']);
-    expect(result.kind).toBe('applink');
-    expect(opened[0]).toContain('openChatId=oc_2');
+    expect(order).toEqual(['toggleChat', 'enterChat']);
+    expect(result).toEqual({ kind: 'native-jump', method: 'enterChat' });
+    expect(opened).toEqual([]);
+  });
+
+  it('treats a silent toggleChat timeout as failure and ignores its late callback', async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      let lateSuccess: (() => void) | undefined;
+      const sdk: FeishuJsApi = {
+        toggleChat(options) { order.push('toggleChat'); lateSuccess = options.success; },
+        enterChat(options) { order.push('enterChat'); options.success?.(); },
+      };
+      const pending = openWorkbenchChat({ chatId: 'oc_timeout', preferSplit: true, sdk, timeoutMs: 250 });
+      await vi.advanceTimersByTimeAsync(250);
+      await expect(pending).resolves.toEqual({ kind: 'native-jump', method: 'enterChat' });
+      lateSuccess?.();
+      expect(order).toEqual(['toggleChat', 'enterChat']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reports the client rejection reason instead of inferring one', async () => {

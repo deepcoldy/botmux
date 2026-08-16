@@ -94,6 +94,8 @@ const api: WorkbenchApi = {
   async getH5Context() {
     return { enabled: true, appId: 'cli_demo_app', brand: 'feishu', entryPath: '/auth/feishu' };
   },
+  async getTerminalViewLink() { return null; },
+  async locateSession() {},
 };
 
 document.documentElement.dataset.theme = 'dark';

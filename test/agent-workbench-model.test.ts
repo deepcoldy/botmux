@@ -73,15 +73,11 @@ describe('Agent Workbench pure model', () => {
   it('applies the ordered 1280px degradation and fixed mobile stack', () => {
     const requested = { ...defaultWorkbenchLayout(), paneMode: 'split' as const, chatRequested: true };
     expect(deriveResponsiveWorkbenchLayout(1440, requested)).toMatchObject({ step: 'full', railCollapsed: false, paneMode: 'split', chatMode: 'native-split' });
-    // Width degrades chat mode and pane splitting, but never collapses the rail
-    // on the user's behalf — the session list is the primary surface, and
-    // auto-collapsing left narrow windows showing only an expand handle.
-    expect(deriveResponsiveWorkbenchLayout(1279, requested)).toMatchObject({ step: 'rail-collapsed', railCollapsed: false, paneMode: 'split', chatMode: 'native-split' });
-    expect(deriveResponsiveWorkbenchLayout(1119, requested)).toMatchObject({ step: 'focus', railCollapsed: false, paneMode: 'focus', chatMode: 'native-split' });
-    expect(deriveResponsiveWorkbenchLayout(959, requested)).toMatchObject({ step: 'chat-jump', railCollapsed: false, paneMode: 'focus', chatMode: 'jump' });
-    expect(deriveResponsiveWorkbenchLayout(700, { ...requested, railCollapsed: true }))
-      .toMatchObject({ railCollapsed: true });
-    expect(deriveResponsiveWorkbenchLayout(610, requested)).toEqual({ mode: 'mobile', step: 'mobile-stack', railCollapsed: true, paneMode: 'focus', chatMode: 'jump' });
+    expect(deriveResponsiveWorkbenchLayout(1279, requested)).toMatchObject({ step: 'rail-collapsed', railCollapsed: true, paneMode: 'split', chatMode: 'native-split' });
+    expect(deriveResponsiveWorkbenchLayout(1119, requested)).toMatchObject({ step: 'focus', railCollapsed: true, paneMode: 'focus', chatMode: 'native-split' });
+    expect(deriveResponsiveWorkbenchLayout(959, requested)).toMatchObject({ step: 'chat-jump', railCollapsed: true, paneMode: 'focus', chatMode: 'jump' });
+    expect(deriveResponsiveWorkbenchLayout(768, requested)).toMatchObject({ mode: 'desktop', step: 'chat-jump' });
+    expect(deriveResponsiveWorkbenchLayout(767, requested)).toEqual({ mode: 'mobile', step: 'mobile-stack', railCollapsed: true, paneMode: 'focus', chatMode: 'jump' });
   });
 
   it('groups NEEDS YOU / ACTIVE / RECENT with reason summaries and full-text search', () => {
@@ -456,7 +452,7 @@ describe('Agent Workbench 行高契约', () => {
     // 虚拟滚动按这个数摆放每一行，对不上列表就会滚过自己的末尾。
     expect(workbenchListItemHeight(row)).toBe(54);
     expect(workbenchListItemHeight(row, false)).toBe(54);
-    // 触屏那条（620px 断点里的 min-height: 84px）不受桌面收窄影响，
+    // 触屏那条（767px 断点里的 min-height: 84px）不受桌面收窄影响，
     // 44px 的点击目标是无障碍底线，不能跟着桌面一起变矮。
     expect(workbenchListItemHeight(row, true)).toBe(84);
     // 组头不分触屏桌面。

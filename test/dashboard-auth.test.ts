@@ -1026,7 +1026,9 @@ describe('Workbench H5 capability boundary', () => {
     expect(workbenchH5Capability('GET', '/api/sessions')).toBe('workbench.view');
     expect(workbenchH5Capability('GET', '/events')).toBe('workbench.view');
     expect(workbenchH5Capability('GET', '/api/workbench/h5-context')).toBe('workbench.view');
+    expect(workbenchH5Capability('GET', '/api/sessions/s1/view-link')).toBe('terminal.view');
     expect(workbenchH5Capability('GET', '/api/sessions/s1/control')).toBe('terminal.view');
+    expect(workbenchH5Capability('GET', '/api/sessions/s1/preview')).toBe('preview.view');
     expect(workbenchH5Capability('POST', '/api/sessions/s1/control/takeover')).toBe('terminal.operate');
     expect(workbenchH5Capability('POST', '/api/sessions/s1/preview-interaction/unlock')).toBe('preview.operate');
   });

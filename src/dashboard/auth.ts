@@ -367,8 +367,12 @@ export function workbenchH5Capability(method: string, pathname: string): Workben
   // observing identities may fetch it; the writable twin (write-link) stays
   // behind the local management cookie.
   if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
-    && /^\/api\/sessions\/[^/]+\/(view-link|preview)$/.test(pathname)) {
+    && /^\/api\/sessions\/[^/]+\/view-link$/.test(pathname)) {
     return 'terminal.view';
+  }
+  if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && /^\/api\/sessions\/[^/]+\/preview$/.test(pathname)) {
+    return 'preview.view';
   }
 
   const terminal = pathname.match(/^\/api\/sessions\/[^/]+\/control(?:\/(takeover|release))?$/);

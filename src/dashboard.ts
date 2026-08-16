@@ -3184,6 +3184,11 @@ const server = createServer(async (req, res) => {
       res.writeHead(401, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
+        // A valid H5/platform Workbench identity is expected to be denied by
+        // management-only endpoints such as /api/settings. Let the SPA tell
+        // that narrow denial from an expired identity, otherwise its global
+        // fetch wrapper covers a healthy Workbench with the login overlay.
+        ...(workbenchOnlyIdentity ? { 'x-botmux-auth-scope': 'workbench' } : {}),
         ...(loginUrl ? { 'x-botmux-login-url': loginUrl } : {}),
       });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');

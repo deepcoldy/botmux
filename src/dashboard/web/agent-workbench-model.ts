@@ -1,8 +1,8 @@
 export const WORKBENCH_MAIN_ROUTE = '#/agent-workbench';
 export const WORKBENCH_DOCK_ROUTE = '#/agent-workbench-dock';
-export const WORKBENCH_RAIL_DEFAULT = 300;
+export const WORKBENCH_RAIL_DEFAULT = 200;
 export const WORKBENCH_RAIL_MIN = 176;
-export const WORKBENCH_RAIL_MAX = 460;
+export const WORKBENCH_RAIL_MAX = 280;
 export const WORKBENCH_RAIL_COLLAPSED = 40;
 
 export type WorkbenchSurface = 'main' | 'dock';
@@ -246,21 +246,14 @@ export function deriveResponsiveWorkbenchLayout(
   viewportWidth: number,
   requested: WorkbenchLayoutState,
 ): ResponsiveWorkbenchLayout {
-  // Below this the page stacks into a single paged surface. Keep it tight: a
-  // ~600px Feishu column still reads fine as a plain list, and the page tabs
-  // cost more room than they earn there.
-  if (viewportWidth < 620) {
+  if (viewportWidth < 768) {
     return { mode: 'mobile', step: 'mobile-stack', railCollapsed: true, paneMode: 'focus', chatMode: 'jump' };
   }
-  // The rail is the product, not a side panel: collapsing it automatically left
-  // narrow windows showing an expand handle and nothing else. Width now decides
-  // how much *else* fits (chat mode, split panes); whether the session list is
-  // collapsed stays the user's own choice at every size.
   if (viewportWidth < 960) {
     return {
       mode: 'desktop',
       step: 'chat-jump',
-      railCollapsed: requested.railCollapsed,
+      railCollapsed: true,
       paneMode: 'focus',
       chatMode: 'jump',
     };
@@ -269,7 +262,7 @@ export function deriveResponsiveWorkbenchLayout(
     return {
       mode: 'desktop',
       step: 'focus',
-      railCollapsed: requested.railCollapsed,
+      railCollapsed: true,
       paneMode: 'focus',
       chatMode: 'native-split',
     };
@@ -278,7 +271,7 @@ export function deriveResponsiveWorkbenchLayout(
     return {
       mode: 'desktop',
       step: 'rail-collapsed',
-      railCollapsed: requested.railCollapsed,
+      railCollapsed: true,
       paneMode: requested.paneMode,
       chatMode: 'native-split',
     };
@@ -603,7 +596,7 @@ export function flattenWorkbenchGroups(
  *  Touch layouts use taller rows for 44px targets, so the measurement is passed
  *  in rather than assumed.
  *  桌面 54px 与 style.css 的 `.wb-session-row { height: 54px }` 一一对应；触屏
- *  84px 对应 620px 断点里的那条。改一处必须同时改另一处。 */
+ *  84px 对应 767px 断点里的那条。改一处必须同时改另一处。 */
 export function workbenchListItemHeight(item: WorkbenchListItem, touch = false): number {
   if (item.kind === 'header') return 30;
   return touch ? 84 : 54;

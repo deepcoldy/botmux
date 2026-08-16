@@ -1331,6 +1331,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    // Management reads are intentionally outside an H5/platform Workbench
+    // identity's capability map. The server marks that expected narrow denial;
+    // an unmarked 401 still means the identity expired and opens the login UI.
+    if (res.headers.get('x-botmux-auth-scope') === 'workbench') return res;
     const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
@@ -1342,15 +1346,33 @@ window.fetch = async function patchedFetch(
 
 async function loadAuthState(): Promise<void> {
   try {
-    const r = await fetch('/api/settings');
+    // Use the unwrapped request: a valid narrow Workbench identity is supposed
+    // to get a scoped 401 here, and that is auth-state data rather than an
+    // expiry event for the global fetch wrapper.
+    const r = await origFetch('/api/settings');
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
+      ui.workbenchAuthed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
+    } else if (r.status === 401 && r.headers.get('x-botmux-auth-scope') === 'workbench') {
+      // H5/platform identities can use Workbench control leases but must never
+      // become Dashboard owners merely because the shell probed /api/settings.
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = true;
+      publicReadOnly = false;
+      ui.publicReadOnly = false;
+    } else if (r.status === 401) {
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = false;
+      const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
+      showAuthExpiredOverlay(loginUrl);
     }
   } catch { /* keep defaults */ }
 }

@@ -18,10 +18,8 @@ import {
   groupWorkbenchSessions,
   sessionActivityAt,
   validWorkbenchSessionId,
-  workbenchPreviewHref,
   type WorkbenchGroupDimension,
   type WorkbenchLayoutState,
-  type WorkbenchPaneKind,
   type WorkbenchSessionRow,
   type WorkbenchTerminalLocation,
 } from './agent-workbench-model.js';
@@ -38,19 +36,29 @@ import {
   type WorkbenchSeenLedger,
   type WorkbenchStorage,
 } from './agent-workbench-storage.js';
-import type { FeishuJsApi, WorkbenchH5Context } from './agent-workbench-chat.js';
+import {
+  buildChatAppLink,
+  ensureFeishuJsApi,
+  openWorkbenchChat,
+  type FeishuJsApi,
+  type WorkbenchH5Context,
+} from './agent-workbench-chat.js';
 import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
 import { WorkbenchSessionList } from './agent-workbench-session-list.js';
 import {
-  TerminalPane,
-  WebPane,
   WorkbenchInfo,
+  WorkbenchInfoDrawer,
+  WorkbenchPaneRegion,
+  paneLabel,
 } from './agent-workbench-panes.js';
 
 export interface AgentWorkbenchViewProps {
   sessions: readonly WorkbenchSessionRow[];
   online: boolean;
   authenticated: boolean;
+  /** Sending a locate marker mutates Feishu and therefore remains a legacy
+   *  Dashboard-owner action, outside the narrow H5/platform capability set. */
+  canLocate?: boolean;
   initialSessionId?: string | null;
   locale?: string;
   now?: number;
@@ -64,7 +72,7 @@ export interface AgentWorkbenchViewProps {
   onRouteChange?(hash: string): void;
 }
 
-type MobilePage = 'sessions' | 'workspace' | 'preview' | 'info';
+type MobilePage = 'sessions' | 'workspace' | 'info';
 
 /** A drag emits a pointermove per pixel; only the resting value is worth a write. */
 const LAYOUT_SAVE_DEBOUNCE_MS = 250;
@@ -105,6 +113,17 @@ function preferredSessionId(sessions: readonly WorkbenchSessionRow[]): string | 
   return groups['needs-you'][0]?.sessionId ?? groups.active[0]?.sessionId ?? groups.recent[0]?.sessionId ?? null;
 }
 
+function layoutLevel(
+  layout: WorkbenchLayoutState,
+  paneMode: 'focus' | 'split',
+  chatMode: 'native-split' | 'jump',
+): string {
+  const chatSplitActive = chatMode === 'native-split' && layout.chatRequested;
+  if (paneMode === 'split') return chatSplitActive ? 'L3 · 面板 + 聊天' : 'L3 · 终端 / 网页';
+  if (chatSplitActive) return 'L2 · 面板 + 原生聊天';
+  return 'L1 · 专注';
+}
+
 function nextLayout(
   current: WorkbenchLayoutState,
   patch: Partial<WorkbenchLayoutState>,
@@ -138,11 +157,17 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         : loaded,
     };
   });
-  // Session management is the home surface — narrow layouts open on the list,
-  // and only an explicit surface button moves to the workspace.
   const [mobilePage, setMobilePage] = useState<MobilePage>('sessions');
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [chatFeedback, setChatFeedback] = useState('原生聊天尚未打开。');
+  const [chatBusy, setChatBusy] = useState(false);
+  const [sdk, setSdk] = useState<FeishuJsApi | null>(props.sdk ?? null);
+  const [h5Context, setH5Context] = useState<WorkbenchH5Context | null>(props.h5Context ?? null);
+  const [autoTakeControlSessionId, setAutoTakeControlSessionId] = useState<string | null>(null);
   const rootRef = useRef<HTMLElement | null>(null);
   const previousInitialSessionId = useRef(props.initialSessionId);
+  const selectedSessionIdRef = useRef(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
   // effect 里要用「这一帧的 now」，但把 now 放进依赖会让 effect 每次渲染都跑
   // （props.now 缺省时它每次都是新的 Date.now()）。用 ref 顺手带过去。
   const nowRef = useRef(now);
@@ -167,46 +192,10 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   });
   const previousStatusRef = useRef<Map<string, string>>(new Map());
 
-  // Keeps the native chat pointed at whatever row is selected — always on, no
-  // toggle. The follow itself is the row's own real anchor, not a scripted
-  // open: the client gives a trusted click the standard chat panel, while an
-  // open the page initiates (even a synthesised anchor click) is demoted to the
-  // narrow attached container — that demotion was the "chat opens narrow" bug.
-
-  // One terminal fills the workspace at a time; the row button toggles it.
-  // Stacking panes in-page was the wrong model — Feishu owns multi-column
-  // layout, and chat opens through it rather than inside this document.
-  const [terminalSessionId, setTerminalSessionId] = useState<string | null>(null);
-  const [terminalWantsControl, setTerminalWantsControl] = useState(false);
-
-  const toggleTerminal = (sessionId: string, wantsControl: boolean) => {
-    setTerminalSessionId(current => {
-      // Re-clicking the same button closes; switching mode or session keeps it
-      // open and applies the new intent.
-      if (current === sessionId && terminalWantsControl === wantsControl) return null;
-      setTerminalWantsControl(wantsControl);
-      return sessionId;
-    });
-  };
-
-  // Drop the pane if its session vanished during snapshot reconciliation.
-  const terminalSession = useMemo(
-    () => props.sessions.find(row => row.sessionId === terminalSessionId) ?? null,
-    [props.sessions, terminalSessionId],
-  );
-
   const selected = useMemo(
     () => props.sessions.find(session => session.sessionId === selectedSessionId) ?? null,
     [props.sessions, selectedSessionId],
   );
-  const selectedHasPreview = !!selected && workbenchPreviewHref(selected) !== null;
-  // Web only appears once the session has registered a dev-server port; an
-  // always-present tab that opens an empty pane is worse than no tab.
-  const mobileSurfaces = useMemo(() => (
-    selectedHasPreview
-      ? (['workspace', 'preview', 'info'] as const)
-      : (['workspace', 'info'] as const)
-  ), [selectedHasPreview]);
 
   const layout = layoutEnvelope.layout;
   const responsive = deriveResponsiveWorkbenchLayout(viewportWidth, layout);
@@ -223,6 +212,8 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
 
   useEffect(() => {
     if (layoutEnvelope.sessionId === selectedSessionId) return;
+    setInfoOpen(false);
+    setAutoTakeControlSessionId(null);
     setLayoutEnvelope(current => {
       const loaded = selectedSessionId
         ? loadWorkbenchLayout(selectedSessionId, storage)
@@ -241,11 +232,29 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     });
   }, [layoutEnvelope.sessionId, selectedSessionId, storage]);
 
-  // Switching to a session without a preview must not strand the user on an
-  // empty Web page — fall back to the terminal surface.
   useEffect(() => {
-    if (mobilePage === 'preview' && !selectedHasPreview) setMobilePage('workspace');
-  }, [mobilePage, selectedHasPreview]);
+    if (props.h5Context !== undefined) {
+      setH5Context(props.h5Context);
+      return undefined;
+    }
+    const controller = new AbortController();
+    void api.getH5Context(controller.signal).then(setH5Context);
+    return () => controller.abort();
+  }, [api, props.h5Context]);
+
+  useEffect(() => {
+    if (props.sdk !== undefined) {
+      setSdk(props.sdk);
+      return undefined;
+    }
+    if (!h5Context?.enabled) {
+      setSdk(null);
+      return undefined;
+    }
+    let live = true;
+    void ensureFeishuJsApi().then(value => { if (live) setSdk(value); });
+    return () => { live = false; };
+  }, [h5Context?.enabled, props.sdk]);
 
   useEffect(() => {
     const sessionId = layoutEnvelope.sessionId;
@@ -347,20 +356,68 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     setLayoutEnvelope(current => ({ ...current, layout: nextLayout(current.layout, patch) }));
   };
 
-  const selectSession = (sessionId: string) => {
-    // 选中行 = 点开会话，未读在这里清掉。行内的「终端 / 接管」也走 onOpenSurface
-    // → selectSession，所以这一处就覆盖了所有会改变选中态的入口。
+  const activateSession = (
+    sessionId: string,
+    patch?: Partial<WorkbenchLayoutState>,
+  ) => {
     markSessionSeen(sessionId);
     setSelectedSessionId(sessionId);
-    // The session list is the primary surface — picking a row must not navigate
-    // away from it on narrow layouts. Only an explicit surface button moves to
-    // the workspace.
-    // An already-open terminal follows the selection instead of staying pinned
-    // to the previous session.
-    setTerminalSessionId(current => (current === null ? null : sessionId));
+    setInfoOpen(false);
+    setAutoTakeControlSessionId(null);
+    setMobilePage('workspace');
+    setLayoutEnvelope(current => {
+      const loaded = current.sessionId === sessionId
+        ? current.layout
+        : {
+            ...loadWorkbenchLayout(sessionId, storage),
+            railWidth: current.layout.railWidth,
+            railCollapsed: current.layout.railCollapsed,
+          };
+      return {
+        sessionId,
+        layout: patch ? nextLayout(loaded, patch) : loaded,
+      };
+    });
     const hash = buildWorkbenchHash('main', sessionId);
     if (props.onRouteChange) props.onRouteChange(hash);
     else if (typeof window !== 'undefined') window.history.replaceState(window.history.state, '', hash);
+  };
+
+  const openChat = async (session: WorkbenchSessionRow | null = selected) => {
+    if (!session?.chatId || chatBusy) return;
+    const sessionId = session.sessionId;
+    const wasRequested = layoutEnvelope.sessionId === sessionId && chatSplitActive;
+    setChatBusy(true);
+    setChatFeedback('正在打开原生聊天…');
+    try {
+      const result = await openWorkbenchChat({
+        chatId: session.chatId,
+        appLink: session.feishuChatLink || buildChatAppLink(session.chatId, h5Context?.brand),
+        preferSplit: responsive.chatMode === 'native-split',
+        nativeEnabled: props.sdk !== undefined || h5Context?.enabled === true,
+        sdk,
+        openExternal: url => {
+          if (typeof window !== 'undefined') window.location.assign(url);
+        },
+      });
+      if (selectedSessionIdRef.current !== sessionId) return;
+      if (result.kind === 'native-split') {
+        updateLayout({ chatRequested: !wasRequested });
+        setChatFeedback(!wasRequested ? '原生聊天已在飞书右侧槽位打开。' : '原生聊天已关闭。');
+      } else if (result.kind === 'native-jump') {
+        updateLayout({ chatRequested: false });
+        setChatFeedback('分栏不可用，已跳转到飞书原生聊天。');
+      } else {
+        updateLayout({ chatRequested: false });
+        setChatFeedback('JSAPI 不可用，已使用 AppLink 打开聊天。');
+      }
+    } catch (error) {
+      if (selectedSessionIdRef.current === sessionId) {
+        setChatFeedback(`聊天打开失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      setChatBusy(false);
+    }
   };
 
   const resizeRail = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -420,6 +477,10 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       event.preventDefault();
       rootRef.current?.querySelector<HTMLInputElement>('.wb-session-search input')?.focus();
     }
+    if (event.key === 'Escape' && infoOpen) {
+      event.preventDefault();
+      setInfoOpen(false);
+    }
   };
 
   const rootStyle = {
@@ -434,33 +495,24 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       locale={props.locale}
       now={now}
       online={props.online}
-      chatFollowNavigates={responsive.mode !== 'mobile'}
       // 桌面和移动两条渲染路径共用这一个 sessionList 常量，未读和维度天然同步。
       unreadIds={unreadIds}
       dimension={dimension}
       onDimensionChange={changeDimension}
       onSeen={markSessionSeen}
-      onLocate={sessionId => api.locateSession(sessionId)}
-      onSelect={sessionId => {
-        selectSession(sessionId);
-        // Touch layouts drill in on tap; pointer layouts keep selection and
-        // workspace independent so the list stays usable while reading a pane.
-        if (responsive.mode === 'mobile') {
-          setTerminalSessionId(sessionId);
-          setMobilePage('workspace');
-          // Chat is a full-screen page on a phone. Following the selection here
-          // would hand the user to Feishu at the same moment they asked to open
-          // the workspace — two destinations for one tap. Chat stays an explicit
-          // action from the row's own button.
+      onLocate={props.canLocate
+        ? sessionId => api.locateSession(sessionId)
+        : undefined}
+      onSelect={activateSession}
+      onOpenSurface={(sessionId, surface) => {
+        const session = props.sessions.find(row => row.sessionId === sessionId) ?? null;
+        if (surface === 'chat') {
+          activateSession(sessionId);
+          void openChat(session);
           return;
         }
-        // Chat-follow rides the row's own anchor (a trusted click the client
-        // honours with the standard panel); nothing to script from here.
-      }}
-      onOpenSurface={(sessionId, surface) => {
-        selectSession(sessionId);
-        toggleTerminal(sessionId, surface === 'terminal-control');
-        setMobilePage('workspace');
+        activateSession(sessionId, { focus: 'terminal', paneMode: 'focus' });
+        setAutoTakeControlSessionId(surface === 'terminal-control' ? sessionId : null);
       }}
       onToggleCollapsed={responsive.mode === 'desktop' && responsive.step === 'full'
         ? () => updateLayout({ railCollapsed: !layout.railCollapsed })
@@ -472,42 +524,88 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     <section className="wb-workspace" aria-label={`工作台 — ${selected.title || selected.sessionId}`}>
       <header className="wb-workspace-header">
         <div className="wb-workspace-title">
+          <span className="wb-bot-mark" aria-hidden="true">B</span>
           <span>
             <strong title={String(selected.title || selected.sessionId)}>{String(selected.title || selected.sessionId)}</strong>
             <small>{selected.botName || selected.larkAppId || 'Bot'} · {selected.cliId || '未知'} · {selected.repoName || '无仓库'}</small>
           </span>
         </div>
-        <div className="wb-workspace-controls">
-          {terminalSession ? (
-            <button
-              type="button"
-              className="wb-layout-level wb-terminal-toggle"
-              aria-pressed="true"
-              title="关闭终端面板"
-              onClick={() => setTerminalSessionId(null)}
-            >关闭终端 ✕</button>
-          ) : null}
+        <div
+          className="wb-layout-level"
+          aria-label={`布局 ${layoutLevel(layout, responsive.paneMode, responsive.chatMode)}`}
+        >
+          {layoutLevel(layout, responsive.paneMode, responsive.chatMode)}
         </div>
       </header>
-      <div className="wb-pane-stack">
-        {terminalSession ? (
-          <TerminalPane
-            key={`${terminalSession.sessionId}:${terminalWantsControl ? 'rw' : 'ro'}`}
-            session={terminalSession}
-            api={api}
-            authenticated={props.authenticated}
-            now={now}
-            location={location}
-            autoTakeControl={terminalWantsControl}
-            handOffToFullScreen={responsive.mode === 'mobile'}
-          />
-        ) : (
-          <div className="wb-pane-placeholder" role="status">
-            <span aria-hidden="true">›_</span>
-            <p>在左侧会话行点击终端图标打开终端</p>
-          </div>
-        )}
+      <nav className="wb-pane-toolbar" aria-label="工作台布局">
+        <div className="wb-toolbar-group" aria-label="专注面板">
+          {(['terminal', 'web'] as const).map(kind => (
+            <button
+              key={kind}
+              type="button"
+              className={responsive.paneMode === 'focus' && layout.focus === kind ? 'is-active' : undefined}
+              aria-pressed={responsive.paneMode === 'focus' && layout.focus === kind}
+              onClick={() => updateLayout({ focus: kind, paneMode: 'focus' })}
+            >{paneLabel(kind)}</button>
+          ))}
+        </div>
+        <div className="wb-toolbar-group" aria-label="终端与网页分屏">
+          <button
+            type="button"
+            className={responsive.paneMode === 'split' && layout.splitAxis === 'horizontal' ? 'is-active' : undefined}
+            aria-pressed={responsive.paneMode === 'split' && layout.splitAxis === 'horizontal'}
+            disabled={responsive.step === 'focus' || responsive.step === 'chat-jump' || responsive.step === 'mobile-stack'}
+            onClick={() => updateLayout({ paneMode: 'split', splitAxis: 'horizontal' })}
+          ><span aria-hidden="true">◫</span> 左右</button>
+          <button
+            type="button"
+            className={responsive.paneMode === 'split' && layout.splitAxis === 'vertical' ? 'is-active' : undefined}
+            aria-pressed={responsive.paneMode === 'split' && layout.splitAxis === 'vertical'}
+            disabled={responsive.step === 'focus' || responsive.step === 'chat-jump' || responsive.step === 'mobile-stack'}
+            onClick={() => updateLayout({ paneMode: 'split', splitAxis: 'vertical' })}
+          ><span aria-hidden="true">⬒</span> 上下</button>
+        </div>
+        <div className="wb-toolbar-spacer" />
+        <button
+          type="button"
+          aria-pressed={responsive.mode === 'mobile' ? mobilePage === 'info' : infoOpen}
+          onClick={() => {
+            if (responsive.mode === 'mobile') setMobilePage('info');
+            else setInfoOpen(value => !value);
+          }}
+        >{responsive.mode === 'mobile' ? '信息' : '信息抽屉'}</button>
+        <button
+          type="button"
+          className={chatSplitActive ? 'is-active' : undefined}
+          aria-pressed={chatSplitActive}
+          disabled={!selected.chatId || chatBusy}
+          onClick={() => void openChat()}
+        >
+          <span aria-hidden="true">▣</span> {responsive.chatMode === 'native-split' ? '原生聊天' : '打开聊天'}
+        </button>
+      </nav>
+      <div className="wb-chat-contract" role="status" aria-live="polite">
+        <span className={chatSplitActive ? 'is-open' : undefined} aria-hidden="true">{chatSplitActive ? '◆' : '◇'}</span>
+        <strong>{responsive.chatMode === 'native-split' ? '聊天 · 飞书外部右侧槽位' : '聊天 · 原生跳转'}</strong>
+        <span>{chatFeedback}</span>
       </div>
+      <WorkbenchPaneRegion
+        key={selected.sessionId}
+        session={selected}
+        api={api}
+        authenticated={props.authenticated}
+        now={now}
+        layout={layout}
+        effectivePaneMode={responsive.paneMode}
+        location={location}
+        autoTakeControl={autoTakeControlSessionId === selected.sessionId}
+        scaleTerminal={responsive.mode === 'mobile'}
+        onAutoTakeControlConsumed={() => setAutoTakeControlSessionId(null)}
+        onRatioChange={splitRatio => updateLayout({ splitRatio })}
+      />
+      {responsive.mode === 'desktop'
+        ? <WorkbenchInfoDrawer session={selected} open={infoOpen} onClose={() => setInfoOpen(false)} />
+        : null}
     </section>
   ) : (
     <section className="wb-workspace wb-no-selection" aria-live="polite">
@@ -534,45 +632,21 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       onKeyDown={rootKeyDown}
     >
       {responsive.mode === 'mobile' ? (
-        // Drill-down, not tabs. When this page is pinned into Feishu's own
-        // mobile tab bar, a second in-page bar would stack two navigations and
-        // eat terminal height. The list is the home level; a session pushes a
-        // workspace with an explicit back control.
         <div className="wb-mobile-stack">
-          {mobilePage === 'sessions' ? sessionList : (
-            <div className="wb-mobile-detail">
-              <div className="wb-mobile-detail-bar">
-                <button type="button" className="wb-mobile-back" onClick={() => setMobilePage('sessions')}>‹ 会话列表</button>
-                {selected ? (
-                  <span className="wb-mobile-detail-title" title={String(selected.title || selected.sessionId)}>
-                    {String(selected.title || selected.sessionId)}
-                  </span>
-                ) : null}
-                <span className="wb-mobile-detail-seg">
-                  {mobileSurfaces.map(page => (
-                    <button
-                      key={page}
-                      type="button"
-                      aria-current={mobilePage === page ? 'page' : undefined}
-                      onClick={() => setMobilePage(page)}
-                    >{page === 'workspace' ? '终端' : page === 'preview' ? '网页' : '信息'}</button>
-                  ))}
-                </span>
-              </div>
-              {mobilePage === 'info' && selected
-                ? <main className="wb-mobile-info"><WorkbenchInfo session={selected} /></main>
-                : mobilePage === 'preview' && selected
-                  ? (
-                    <main className="wb-mobile-preview">
-                      <WebPane session={selected} api={api} authenticated={props.authenticated} now={now} />
-                    </main>
-                  )
-                  : workspace}
-            </div>
-          )}
+          {mobileContent}
+          <nav className="wb-mobile-nav" aria-label="工作台页面">
+            {(['sessions', 'workspace', 'info'] as const).map(page => (
+              <button
+                key={page}
+                type="button"
+                aria-current={mobilePage === page ? 'page' : undefined}
+                onClick={() => setMobilePage(page)}
+              >{page === 'sessions' ? '会话' : page === 'workspace' ? '工作区' : '信息'}</button>
+            ))}
+          </nav>
         </div>
       ) : (
-        <div className={`wb-desktop-layout${forcedRailCollapsed ? ' is-rail-collapsed' : ''}${terminalSession ? '' : ' is-terminal-closed'}`}>
+        <div className={`wb-desktop-layout${forcedRailCollapsed ? ' is-rail-collapsed' : ''}`}>
           {sessionList}
           {!forcedRailCollapsed ? (
             <button

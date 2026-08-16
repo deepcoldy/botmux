@@ -17,7 +17,8 @@ function AgentWorkbenchRoutePage(): JSX.Element {
     <AgentWorkbenchView
       sessions={[...snapshot.sessions.values()] as WorkbenchSessionRow[]}
       online={snapshot.online}
-      authenticated={ui.authed}
+      authenticated={ui.workbenchAuthed}
+      canLocate={ui.authed}
       initialSessionId={route?.surface === 'main' ? route.sessionId : null}
       locale="zh-CN"
       now={now}

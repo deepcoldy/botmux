@@ -17,7 +17,7 @@ function AgentWorkbenchDockRoutePage(): JSX.Element {
     <AgentWorkbenchDockView
       sessions={[...snapshot.sessions.values()] as WorkbenchSessionRow[]}
       online={snapshot.online}
-      authenticated={ui.authed}
+      authenticated={ui.workbenchAuthed}
       initialSessionId={route?.surface === 'dock' ? route.sessionId : null}
       locale="zh-CN"
       now={now}

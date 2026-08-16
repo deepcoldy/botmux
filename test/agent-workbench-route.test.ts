@@ -55,7 +55,7 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 }
 
-describe('chat opens as a real link, never as scripted navigation', () => {
+describe('chat surfaces keep a safe AppLink fallback while main prefers JSAPI', () => {
   // Regression guard. Feishu places a chat beside the page when the client
   // receives a genuine link activation; opening it from script instead made the
   // Workbench navigate itself away. `window.open(..., 'noopener')` also returns
@@ -80,9 +80,10 @@ describe('chat opens as a real link, never as scripted navigation', () => {
     });
   }
 
-  it('keeps the anchor contract out of the JSAPI fallback path', () => {
+  it('routes the main Workbench through capability detection without window.open', () => {
     const view = stripComments(readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8'));
     expect(view).not.toContain('window.open');
-    expect(view).not.toContain('location.assign');
+    expect(view).toContain('openWorkbenchChat');
+    expect(view).toContain('location.assign');
   });
 });

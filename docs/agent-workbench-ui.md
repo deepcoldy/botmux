@@ -1,6 +1,6 @@
 # Agent Workbench UI
 
-Status: implemented, browser-verified and production-built on `feat/agent-workbench`. The full integration, API, security and manual Feishu validation guide is in agent-workbench-implementation.md.
+Status: implemented and browser-verified on `feat/agent-workbench`. Code-level verification is green, but final operational isolation is not accepted because this host's global wrapper and existing live daemons use the feature checkout; one audit-closeout build also regenerated that checkout's `dist`. The full integration, API, security, incident note and manual Feishu validation guide is in agent-workbench-implementation.md.
 
 ## Entry surfaces
 
@@ -13,11 +13,13 @@ Both entries are lazy routes. The Dock route is matched before the Full route, s
 
 Authenticated GET /api/workbench/h5-context exposes enabled, appId, brand and entryPath only. App Secret and the allowlist never cross this projection.
 
+The client tracks local management authority separately from narrow Workbench authority. H5/platform identities can use the server-scoped Terminal and Preview leases without gaining Dashboard management controls; expected management 401s do not masquerade as an expired Workbench login.
+
 ## Components and state
 
 - agent-workbench-view.tsx owns the full appCenter surface, responsive degradation, rail resize, per-session layout and native Chat bridge.
 - agent-workbench-dock-view.tsx owns the narrow sidebar helper and appCenter/fallback actions.
-- agent-workbench-session-list.tsx implements grouped, searchable, variable-height virtualization with keyboard navigation.
+- agent-workbench-session-list.tsx implements unread completion state, six grouping dimensions, collapsible groups, search, fixed desktop/touch row metrics and keyboard navigation over 300+ rows.
 - agent-workbench-panes.tsx renders only Terminal and Web. Info is outside the pane tree, and Chat remains a Feishu-controlled external slot.
 - agent-workbench-model.ts contains browser-safe routes, DTOs, grouping, layout clamps, pane validation and responsive derivation.
 - agent-workbench-storage.ts persists versioned layout primitives only.
@@ -37,7 +39,7 @@ Pane state is keyed by sessionId. Control and Preview mutations use monotonic re
 - Below 960px: Chat jump.
 - Below 768px: fixed Sessions/Workspace/Info mobile stack with a full Sessions list.
 
-The CSS uses semantic dark/light tokens, no gradients, explicit radii no larger than 2px, focus-visible outlines, non-color state labels and reduced-motion handling.
+The CSS uses semantic dark/light tokens, no gradients, explicit pixel radii no larger than 4px, focus-visible outlines, non-color state labels, 44px mobile targets and reduced-motion handling.
 
 ## Native Chat
 
@@ -61,14 +63,14 @@ Final results:
 
 | Check | Result |
 |---|---|
-| Workbench direct boundary | 22 files, 203 tests passed. |
-| Model runner | Passed: 320 sessions, 19 virtual items and four responsive degradation steps. |
-| Component runner | Passed: 9 checks and 12 rendered session options. |
+| Workbench direct boundary | 23 files, 324 tests passed. |
+| Model runner | Passed: 320 sessions, 22 virtual items and four responsive degradation steps. |
+| Component runner | Passed: 9 checks and 14 rendered session options. |
 | Browser harness | 12 scenarios passed across 1440×900, 1280×800, 390×844 and 375×800. |
-| pnpm build | Passed; build id 20eef27b5357. |
-| Full unit project | 742 files / 11,216 tests passed, 1 file / 5 tests skipped, 0 failed. |
+| pnpm build | Passed; build id 17a04ba168ae. |
+| Full unit project | Composite unique result: 962 files / 15,588 tests passed, 1 file / 16 tests skipped, 0 product failures. The sole nested-namespace timeout passed in a complete 33/33 normal-process-view file rerun. |
 
-The full suite was run serially in a clean PID namespace because this checkout is itself inside an active Botmux workflow and process-discovery tests must not observe unrelated same-UID workers. A normal checkout can use the ordinary commands:
+The authoritative full suite is run serially from an exact-source isolated checkout with a private PID view and short bind-mounted paths. An accidental feature-checkout build during this audit is recorded separately as an operational-isolation failure in the implementation guide. A normal, non-live checkout can use the ordinary commands:
 
 ~~~bash
 pnpm exec vitest run --project unit test/agent-workbench-api.test.ts \
@@ -78,17 +80,32 @@ pnpm exec vitest run --project unit test/agent-workbench-api.test.ts \
   test/agent-workbench-preview-race.test.ts \
   test/agent-workbench-route.test.ts \
   test/agent-workbench-storage.test.ts \
-  test/agent-workbench-style.test.ts
+  test/agent-workbench-style.test.ts \
+  test/dashboard-auth.test.ts \
+  test/dashboard-h5-auth.test.ts \
+  test/dashboard-login-ui.test.ts \
+  test/dashboard-preview-wiring.test.ts \
+  test/dashboard-public-redact.test.ts \
+  test/ipc-preview-route.test.ts \
+  test/preview-cli.test.ts \
+  test/preview-guard-page.test.ts \
+  test/preview-interaction.test.ts \
+  test/session-preview-proxy.test.ts \
+  test/session-preview.test.ts \
+  test/session-store.test.ts \
+  test/terminal-control.test.ts \
+  test/terminal-front-proxy.test.ts \
+  test/worker-terminal-read-auth.integration.test.ts
 pnpm exec tsc --noEmit
 pnpm build
 pnpm test -- --maxWorkers=1 --no-file-parallelism
 pnpm exec tsx scripts/verify-agent-workbench-browser.ts
 ~~~
 
-The final lazy chunks are agent-workbench-page-YQTRZKGF.js (21,866 bytes) and agent-workbench-dock-page-35RTDMEP.js (4,068 bytes).
+The final lazy chunks are agent-workbench-page-PFUFPODV.js (28,571 bytes) and agent-workbench-dock-page-4Y3L7XRK.js (3,947 bytes).
 
 ## Screenshot
 
 The checked-in screenshot is docs/assets/agent-workbench-dark.png (1440×900). It uses synthetic data and local same-origin fixtures; it contains no credential or live session data.
 
-The sidecar reports 320 sessions, 15 rendered virtual rows, split pane mode and full responsive state. Browser scenario evidence is in docs/assets/agent-workbench-browser-results.json.
+The sidecar reports 320 sessions, 18 rendered virtual rows, split pane mode and full responsive state. Browser scenario evidence is in docs/assets/agent-workbench-browser-results.json.

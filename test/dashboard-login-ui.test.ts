@@ -36,4 +36,18 @@ describe('Dashboard one-click login wiring', () => {
     expect(app).toContain('id="dashboard-one-click-login"');
     expect(app).toContain('一键登录');
   });
+
+  it('keeps a valid narrow Workbench identity out of the expiry overlay', () => {
+    const server = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+    const app = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf8');
+    const main = readFileSync(new URL('../src/dashboard/web/agent-workbench-page.tsx', import.meta.url), 'utf8');
+    const dock = readFileSync(new URL('../src/dashboard/web/agent-workbench-dock-page.tsx', import.meta.url), 'utf8');
+    expect(server).toContain("'x-botmux-auth-scope': 'workbench'");
+    expect(app).toContain("res.headers.get('x-botmux-auth-scope') === 'workbench'");
+    expect(app).toContain('ui.workbenchAuthed = true');
+    expect(app).toContain('ui.authed = false');
+    expect(main).toContain('authenticated={ui.workbenchAuthed}');
+    expect(main).toContain('canLocate={ui.authed}');
+    expect(dock).toContain('authenticated={ui.workbenchAuthed}');
+  });
 });
