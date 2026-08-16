@@ -504,6 +504,63 @@ describe('mojo explicit close', () => {
     expect(sessionStore.getSession(fixture.session.sessionId)?.status).not.toBe('closed');
   });
 
+  it('DRAINS an uncertain journal: the row closes with the lineage parked as a residual (P1-1)', async () => {
+    // The reconciliation exit the journal always promised. Before it, an
+    // `uncertain` row (restore's downgrade of every crashed close) was refused
+    // on every /close as reconciliation_required while never being registered —
+    // a permanent brick whose remote session kept its credential, fixable only
+    // by hand-editing JSON state.
+    const fixture = createFixture();
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-crashed', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-crashed', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+    setActiveSessionsRegistry(new Map());
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-sid-123' },
+      alreadyClosed: false,
+      known: true,
+    });
+    // Never a second cancel through an unknown outcome — the drain closes the
+    // local row only and preserves the id for manual remote cleanup.
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    const after = sessionStore.getSession(fixture.session.sessionId);
+    expect(after).toMatchObject({ status: 'closed' });
+    expect(after?.mojoQuarantinedLineage).toBe('mojo-sid-123');
+    expect(after?.riffParentTaskId).toBeUndefined();
+    expect(after?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('RETRIES the cancel for a journal durably recorded as retryable (P1-2)', async () => {
+    // `recovery: 'retryable'` is a durable statement that re-running the cancel
+    // is legitimate. With a registered owner, /close must actually re-enter the
+    // cancel under a fresh requestId instead of being refused forever.
+    const fixture = createFixture();
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-failed', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-failed', {
+      recovery: 'retryable',
+      taskId: 'mojo-sid-123',
+      admission: 'restorable',
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed',
+      alreadyClosed: false,
+      known: true,
+    });
+    expect(cancelMojoMock).toHaveBeenCalledWith(expect.anything(), 'mojo-sid-123');
+    const after = sessionStore.getSession(fixture.session.sessionId);
+    expect(after).toMatchObject({ status: 'closed' });
+    expect(after?.riffParentTaskId).toBeUndefined();
+    expect(after?.mojoCloseJournal).toBeUndefined();
+  });
+
   it('commits a live-worker cancellation only after its prepare result', async () => {
     const fixture = createFixture({ liveWorker: true });
 

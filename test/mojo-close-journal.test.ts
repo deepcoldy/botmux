@@ -467,6 +467,58 @@ describe('the journal is actually DURABLE, not just in-memory', () => {
   });
 });
 
+describe('a RETRYABLE journal accepts a fresh close attempt (P1-1/P1-2)', () => {
+  function seedRetryable(hint: string, admission: 'restorable' | 'fenced' = 'restorable') {
+    sessionStore.init('app');
+    const session = sessionStore.createSession('oc_r', `om_${hint}`, hint, 'group');
+    session.larkAppId = 'app';
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-retry';
+    sessionStore.updateSession(session);
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-old', 'mojo-sid-retry');
+    sessionStore.markMojoCloseUnresolved(session.sessionId, 'req-old', {
+      recovery: 'retryable',
+      taskId: 'mojo-sid-retry',
+      admission,
+    });
+    return session;
+  }
+
+  it('lets a NEW requestId restart a journal recorded as retryable', () => {
+    // Refusing every fresh requestId made the persisted `retryable` dead-code:
+    // the promised retry could never re-enter the cancel, so the row was a
+    // permanent brick that only hand-editing JSON state could clear.
+    const session = seedRetryable('retry-restart');
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-new', 'mojo-sid-retry');
+    // Rebuilt from scratch: the stale recovery/admission verdict must not
+    // survive into the fresh attempt.
+    expect(sessionStore.getSession(session.sessionId)?.mojoCloseJournal).toEqual({
+      phase: 'preparing',
+      requestId: 'req-new',
+      taskId: 'mojo-sid-retry',
+      updatedAt: expect.any(String),
+    });
+  });
+
+  it('still refuses a NEW requestId when the journal did not say retryable', () => {
+    sessionStore.init('app');
+    const session = sessionStore.createSession('oc_r', 'om_owned', 'owned', 'group');
+    session.larkAppId = 'app';
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-owned';
+    sessionStore.updateSession(session);
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-a', 'mojo-sid-owned');
+    expect(() => sessionStore.beginMojoCloseJournal(session.sessionId, 'req-b', 'mojo-sid-owned'))
+      .toThrow(/already owns/);
+  });
+
+  it('still refuses a retryable restart whose lineage changed', () => {
+    const session = seedRetryable('retry-lineage');
+    expect(() => sessionStore.beginMojoCloseJournal(session.sessionId, 'req-new', 'mojo-sid-OTHER'))
+      .toThrow(/lineage changed/);
+  });
+});
+
 describe('a commit-only journal forbids further teardown', () => {
   function seedCommitOnly() {
     sessionStore.init('app');

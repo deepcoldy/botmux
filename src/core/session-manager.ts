@@ -1913,11 +1913,31 @@ export async function restoreActiveSessions(
       quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_commit_failed');
       continue;
     }
-    if (session.mojoCloseJournal) {
+    if (session.mojoCloseJournal
+        && session.mojoCloseJournal.phase === 'preparing'
+        && session.mojoCloseJournal.recovery === 'retryable'
+        && session.mojoCloseJournal.admission === 'restorable') {
+      // P1-2: a prepare that FAILED CLEANLY — nothing irreversible happened, the
+      // worker restored write admission, and the verdict was durably recorded as
+      // retryable/restorable. Downgrading this to `uncertain` made the persisted
+      // `retryable` dead-code and the user-facing "retryable" promise a lie: the
+      // row was quarantined unregistered and every later /close refused. Keep
+      // the journal exactly as persisted and register the row normally — writes
+      // were already legal (admission restorable), and an explicit /close can
+      // re-run the cancel (beginMojoCloseJournal accepts the fresh requestId).
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] restoring row with retryable Mojo close `
+        + `journal (${session.mojoCloseJournal.requestId}); close may be retried`,
+      );
+      // fall through to normal registration below
+    } else if (session.mojoCloseJournal) {
       // A crash while the worker cancel was in flight cannot be classified as
       // cancelled or safely resumable without a real remote status oracle. Turn
       // the durable intent into an explicit uncertainty fence and reserve the
       // routing anchor; never auto-cancel or launch a replacement generation.
+      // The fence is not a dead end: an explicit /close DRAINS it — the row
+      // closes with its lineage parked as a residual for manual cleanup (see
+      // prepareMojoExplicitClose).
       session.mojoCloseJournal = {
         phase: 'uncertain',
         requestId: session.mojoCloseJournal.requestId,

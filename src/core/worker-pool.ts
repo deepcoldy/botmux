@@ -3930,18 +3930,59 @@ async function prepareMojoExplicitClose(
     && !!ds.worker
     && !ds.worker.killed;
   if (durableClose && !livePreparedProof && !liveAbortRestoreProof) {
-    logger.warn(
-      `[${session.sessionId.slice(0, 8)}] explicit close requires Mojo reconciliation: `
-      + `durable journal is ${durableClose.phase} (${durableClose.requestId})`,
-    );
-    return {
-      ok: false,
-      error: 'mojo_close_reconciliation_required',
-      retryable: true,
-      ...((durableClose.taskId ?? remoteId)
-        ? { taskId: (durableClose.taskId ?? remoteId)! }
-        : {}),
-    };
+    const journalLineage = durableClose.taskId ?? remoteId;
+    // The RECONCILIATION EXIT this journal has always promised (types.ts:
+    // "pending explicit reconciliation"). Before it existed, every journal
+    // without a matching runtime proof was refused here forever: restore
+    // downgraded crashed closes to `uncertain` and quarantined the row
+    // unregistered, this branch then refused each /close as
+    // reconciliation_required, and CLI-mismatch cleanup re-quarantined it —
+    // a permanent brick whose remote session kept credentials, fixable only
+    // by hand-editing JSON state (P1-1). Two journal shapes are reconcilable
+    // by an EXPLICIT close:
+    //   * `uncertain` — no retry can classify the crashed cancel without a
+    //     remote status oracle, so the row DRAINS: it closes with the lineage
+    //     parked as an explicit residual (same isolation-over-deletion shape
+    //     as a quarantined lineage — cleanup is remote, the id is preserved,
+    //     and replays keep reporting it).
+    //   * `preparing` + recovery 'retryable' — the failed prepare durably
+    //     recorded that retrying the cancel is legitimate (P1-2). With a
+    //     registered owner the close falls through and re-runs the cancel
+    //     under a fresh requestId (beginMojoCloseJournal accepts the restart);
+    //     without one there is nothing to cancel through, so it drains like
+    //     `uncertain`.
+    const retryableJournal = durableClose.phase === 'preparing'
+      && durableClose.recovery === 'retryable';
+    const drainable = durableClose.phase === 'uncertain'
+      || (retryableJournal && !ds);
+    if (drainable) {
+      logger.warn(
+        `[${session.sessionId.slice(0, 8)}] explicit close drains ${durableClose.phase} Mojo `
+        + `journal (${durableClose.requestId}): the row closes`
+        + (journalLineage
+          ? ` and lineage ${journalLineage} is parked as a residual for manual cleanup`
+          : ' with no lineage to park'),
+      );
+      if (!journalLineage) return parked ? { ok: true, residual: parked } : { ok: true };
+      return {
+        ok: true,
+        residual: parked ?? { reason: 'mojo_lineage_quarantined', taskId: journalLineage },
+        parkMojoLineage: journalLineage,
+      };
+    }
+    if (!retryableJournal) {
+      logger.warn(
+        `[${session.sessionId.slice(0, 8)}] explicit close requires Mojo reconciliation: `
+        + `durable journal is ${durableClose.phase} (${durableClose.requestId})`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...(journalLineage ? { taskId: journalLineage } : {}),
+      };
+    }
+    // retryable with a registered owner: fall through to the cancel below.
   }
   // A live worker is the only authority that can cover the pre-init window:
   // destroySession waits for system/init, then returns the exact lineage in its

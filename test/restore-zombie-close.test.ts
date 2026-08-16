@@ -526,6 +526,48 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     });
   });
 
+  it('registers a row whose close failed cleanly-retryable instead of quarantining it (P1-2)', async () => {
+    // recovery 'retryable' + admission 'restorable' is the durable record of a
+    // prepare that failed BEFORE anything irreversible happened, with writes
+    // already legal again. Downgrading it to `uncertain` + quarantine made the
+    // persisted `retryable` dead-code: the row was never registered again and
+    // every later /close was refused, so "retryable" was a promise the daemon
+    // could not keep.
+    const s = makeActivePersistentSession('om_mojo_retryable_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-retryable-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'preparing',
+      requestId: 'close-failed-retryable',
+      taskId: 'mojo-retryable-id',
+      recovery: 'retryable',
+      admission: 'restorable',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    // Registered as an ordinary row — the anchor stays usable and the close
+    // stays retryable — with the journal preserved exactly as persisted.
+    expect(map.size).toBe(1);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      mojoCloseJournal: {
+        phase: 'preparing',
+        requestId: 'close-failed-retryable',
+        recovery: 'retryable',
+        admission: 'restorable',
+      },
+    });
+    expect(sessionStore.getSession(s.sessionId)?.restoreQuarantinedAt).toBeUndefined();
+  });
+
   it('quarantines a Mojo journal stamped onto another backend instead of closing it', async () => {
     const s = makeActivePersistentSession('om_invalid_mojo_journal', 'riff');
     s.riffParentTaskId = 'riff-task-must-survive';
