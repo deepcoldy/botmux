@@ -21,6 +21,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
+import type { TerminationOutcome } from '../src/adapters/backend/mojo-process-tree.js';
+import { isLinux } from './helpers/synthetic-proc.js';
 import {
   buildCloseResultMessage,
   interpretAbortOutcome,
@@ -81,7 +83,10 @@ async function withUnprovableChild<T>(
 }
 
 describe('close retryability and write admission are separate verdicts', () => {
-  it('keeps writes fenced after an unproven local termination, even across abortDestroySession()', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('keeps writes fenced after an unproven local termination, even across abortDestroySession()', async () => {
     const bin = fakeMojo('mojo-adm-unproven', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
 echo '{"type":"system","subtype":"init","session_id":"sid-adm"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-adm","warnings":[]}'`);
@@ -116,7 +121,10 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-adm","warni
     expect(backend.write('a turn after the abort')).toBe(false);
   }, 20_000);
 
-  it('REPORTS the refused rollback instead of letting the daemon infer success', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('REPORTS the refused rollback instead of letting the daemon infer success', async () => {
     // The cross-layer half of the same bug. abortDestroySession() returning void
     // on a refusal is indistinguishable from a successful restore, and the daemon
     // treats "the worker answered without throwing" as admissionRestored:true —
@@ -166,8 +174,14 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-lifetime","
 
     // The survivor is now gone, so the retried close must reach the remote cancel
     // and SUCCEED. The fence must not have wedged it.
-    (backend as unknown as { terminateChildProven: () => Promise<boolean> })
-      .terminateChildProven = async () => true;
+    (backend as unknown as { terminateChildProven: () => Promise<TerminationOutcome> })
+      .terminateChildProven = async () => ({
+        ok: true,
+        boundaryProven: true,
+        evidence: 'members-empty',
+        residual: null,
+        signalsStopped: true,
+      });
     await expect(backend.destroySession()).resolves.toMatchObject({
       ok: true,
       taskId: 'sid-lifetime',
@@ -219,8 +233,14 @@ exit 0`);
     // legitimately come back quiescent and the case would silently degrade into
     // the plain mojo_lineage_not_materialized path it is meant to contrast with).
     // What matters here is only the ORDER of the two verdicts.
-    (backend as unknown as { terminateChildProven: () => Promise<boolean> })
-      .terminateChildProven = async () => false;
+    (backend as unknown as { terminateChildProven: () => Promise<TerminationOutcome> })
+      .terminateChildProven = async () => ({
+        ok: false,
+        boundaryProven: false,
+        evidence: 'timeout',
+        residual: { deviceIsolation: true, pids: [424242] },
+        signalsStopped: false,
+      });
 
     const result = await backend.destroySession();
 

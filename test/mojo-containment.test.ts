@@ -11,12 +11,20 @@
  *  4. the root pid exiting is NOT proof (a setsid descendant outlives it)
  *  5. generation replacement INHERITS outstanding handles, verbatim identity
  *  6. pid reuse must not be mistaken for the original tree
+ *
+ * PLATFORM SCOPE: every case builds its own synthetic /proc and cgroup under a
+ * temp dir and passes it through the procRoot seam, so the file runs on ANY
+ * platform. The two cases that deliberately consult the REAL kernel (a real
+ * zombie, and the field-22 cross-check that guards the fixture itself) are
+ * Linux-only and are gated with it.runIf(isLinux) so they SKIP off Linux instead
+ * of silently reporting a pass they never performed.
  */
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isLinux } from './helpers/synthetic-proc.js';
 
 import {
     MojoContainmentUnavailableError,
@@ -155,13 +163,30 @@ describe('release requires proof', () => {
         expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
     });
 
-    it('releases on a proven verdict and drops the session from the blocker set', () => {
+    it('releases only on BOUNDARY-proven evidence, and drops the session from the blocker set', () => {
+        // A reboot is the one thing a weak handle can prove without /proc: the
+        // recorded tree cannot have survived the boot id changing under it.
         const dataDir = freshDataDir();
         const handle = weak();
         recordContainmentHandle(handle, dataDir);
-        releaseContainmentHandle({ proven: true, handle }, dataDir);
+        releaseContainmentHandle({ proven: true, handle, evidence: 'boot-id-changed' }, dataDir);
         expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
         expect(containmentSessionIds(dataDir)).toEqual([]);
+    });
+
+    it('a merely SCAN-CLEAN weak verdict does not drop the session from the blocker set', () => {
+        // Previously this shape released the handle, which is exactly how a clean
+        // /proc scan came to authorise a plain closed row. It must not any more:
+        // the close may proceed, the isolation stays.
+        const dataDir = freshDataDir();
+        const handle = weak();
+        recordContainmentHandle(handle, dataDir);
+        const decision = releaseContainmentHandle({ proven: true, handle, evidence: 'scan-clean' }, dataDir);
+        expect(decision.boundaryProof).toBe(false);
+        expect(decision.releaseAuthorised).toBe(false);
+        expect(decision.signalsStopped).toBe(true);
+        expect(decision.residual?.deviceIsolation).toBe(true);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
     });
 
     it('releasing one generation handle leaves a sibling generation blocked', () => {
@@ -170,7 +195,7 @@ describe('release requires proof', () => {
         const g2 = weak({ generation: 2, rootPid: 200, startTime: 22 });
         recordContainmentHandle(g1, dataDir);
         recordContainmentHandle(g2, dataDir);
-        releaseContainmentHandle({ proven: true, handle: g1 }, dataDir);
+        releaseContainmentHandle({ proven: true, handle: g1, evidence: 'boot-id-changed' }, dataDir);
         const left = containmentHandles('sess-1', dataDir);
         expect(left).toHaveLength(1);
         expect((left[0] as WeakContainmentHandle).rootPid).toBe(200);
@@ -335,8 +360,10 @@ describe('readProcStartTime agrees with the real kernel', () => {
     // deliberately different route — a naive whitespace split of the whole line,
     // which is valid precisely because this process's comm ("node") has no
     // spaces — so it cannot share a bug with the production parser.
-    it('reads field 22 of a real /proc/<pid>/stat', () => {
-        if (!existsSync('/proc/self/stat')) return;   // non-Linux
+    // Linux-only: there is no real /proc to cross-check against elsewhere. Kept as
+    // an explicit skip rather than an early return, so it can never look green on
+    // a platform where it did nothing.
+    it.runIf(isLinux && existsSync('/proc/self/stat'))('reads field 22 of a real /proc/<pid>/stat', () => {
         const raw = readFileSync('/proc/self/stat', 'utf8').trim();
         const comm = raw.slice(raw.indexOf('(') + 1, raw.lastIndexOf(')'));
         if (/\s/.test(comm)) return;                  // naive split would be wrong
@@ -436,8 +463,8 @@ describe('zombie members do not wedge a cgroup forever', () => {
         expect(proveContainmentQuiescent(strongAt(dir), { procRoot }).proven).toBe(true);
     });
 
-    it('classifies a REAL zombie as zombie, and a live process as running', async () => {
-        if (process.platform !== 'linux') return;
+    // Linux-only: needs a real fork/exit and the kernel's own zombie state.
+    it.runIf(isLinux)('classifies a REAL zombie as zombie, and a live process as running', async () => {
         // A genuine zombie: the grandchild exits while its parent sleeps without
         // reaping, so the kernel keeps it in state Z. Nothing synthetic here.
         // bash is NOT usable as the non-reaping parent: it maintains its job table

@@ -94,9 +94,17 @@ export type MojoTreeScan =
  * Whether a turn subtree is gone, and — crucially — whether that answer is
  * strong enough to drop a credential blocker.
  *
- * `boundaryProof` is the ONLY field a blocker decision may consult. It is true
+ * `boundaryProof` is the field a blocker decision consults, and it is true
  * exclusively for `contained-proven`, which this module never produces: it is
  * reserved for the kernel-level containment handle.
+ *
+ * It is NOT consumed directly by callers. It is projected into
+ * `TerminationOutcome.boundaryProven` by `terminationOutcomeFromQuiescence()`
+ * below, and that projected field is what the production close path reads --
+ * see the `boundaryProven` check in MojoBackend.destroySession(). The previous
+ * wording here claimed this was "the ONLY field a blocker decision may
+ * consult" while no conditional anywhere consumed it; the claim is now
+ * restricted to a statement about the projection, which has a real consumer.
  */
 export type TurnQuiescence =
   | { kind: 'contained-proven'; boundaryProof: true }
@@ -104,6 +112,153 @@ export type TurnQuiescence =
   | { kind: 'alive'; boundaryProof: false; pids: number[] }
   | { kind: 'unscannable'; boundaryProof: false; reason: string }
   | { kind: 'unsupported-platform'; boundaryProof: false; platform: string };
+
+/**
+ * Why a termination attempt believes what it believes.
+ *
+ * `esrch` is reserved for a future "the pid is provably gone because signalling
+ * it returned ESRCH" observation. Nothing synthesises it today, and it is
+ * deliberately NOT treated as boundary proof if it ever appears: a vanished
+ * root pid says nothing about a descendant that setsid'd away from it.
+ */
+export type TerminationEvidence =
+  | 'members-empty'
+  | 'esrch'
+  | 'diagnostic-clean'
+  | 'timeout'
+  | 'unknown';
+
+/**
+ * What is still owed after a termination attempt that did not establish a
+ * boundary.
+ *
+ * `deviceIsolation: true` means the session's device-isolation blocker must be
+ * retained even if the session row itself is allowed to close.
+ */
+export interface TerminationResidual {
+  deviceIsolation: boolean;
+  pids?: number[];
+  reason?: string;
+}
+
+/**
+ * Structured result of a termination attempt. Replaces the bare boolean that
+ * `terminateChildProven()` used to return, which collapsed "the signalling
+ * ladder finished" and "a credential boundary was established" into one bit --
+ * so `diagnostic-clean` (an empty scan on Linux, which proves nothing) was
+ * indistinguishable from a real cgroup-backed proof and authorised a plain
+ * closed row.
+ *
+ * Field semantics, all load-bearing:
+ *
+ *  * `ok`             the ladder ran to completion without evidence of a live
+ *                     member. It does NOT mean the boundary is proven.
+ *                     `ok: true` with `boundaryProven: false` is legal and, on
+ *                     Linux weak handles, the COMMON case.
+ *  * `boundaryProven` the gate. Only this may authorise dropping a credential
+ *                     blocker or deleting a containment handle. True only for
+ *                     kernel-level containment.
+ *  * `residual`       non-null whenever the boundary was not proven, so the
+ *                     caller has something concrete to retain rather than an
+ *                     absence to overlook.
+ *  * `signalsStopped` whether it is pointless to keep signalling. A clean scan
+ *                     earns this and nothing else.
+ */
+export interface TerminationOutcome {
+  ok: boolean;
+  boundaryProven: boolean;
+  evidence: TerminationEvidence;
+  residual: TerminationResidual | null;
+  signalsStopped: boolean;
+}
+
+/**
+ * The invariants that make `boundaryProven` trustworthy, asserted at the single
+ * construction point rather than documented and hoped for.
+ *
+ * Throwing is deliberate: a violated invariant here means some future edit has
+ * re-created the exact fail-open this type exists to prevent (a clean scan
+ * laundered into a boundary proof, or an unproven boundary with nothing left
+ * behind to hold the blocker). Failing loudly at the source beats publishing a
+ * closed row for a session whose credential may still be reachable.
+ */
+function assertTerminationInvariants(outcome: TerminationOutcome): TerminationOutcome {
+  if (outcome.evidence === 'diagnostic-clean' && outcome.boundaryProven) {
+    throw new Error('termination invariant: diagnostic-clean can never be a boundary proof');
+  }
+  if (outcome.evidence === 'diagnostic-clean' && outcome.residual === null) {
+    throw new Error('termination invariant: diagnostic-clean must leave a residual');
+  }
+  if (!outcome.boundaryProven && outcome.residual === null) {
+    throw new Error('termination invariant: an unproven boundary must leave a residual');
+  }
+  if (outcome.boundaryProven && outcome.residual !== null) {
+    throw new Error('termination invariant: a proven boundary must not leave a residual');
+  }
+  return outcome;
+}
+
+/**
+ * Project a scan/containment verdict onto the termination contract.
+ *
+ * This is the ONLY place a `TerminationOutcome` is constructed, so the
+ * invariants above cannot be bypassed by a caller assembling the object by
+ * hand.
+ */
+export function terminationOutcomeFromQuiescence(q: TurnQuiescence): TerminationOutcome {
+  switch (q.kind) {
+    case 'contained-proven':
+      // A kernel-level container reported no members. This is the only branch
+      // that may authorise dropping the blocker.
+      return assertTerminationInvariants({
+        ok: true,
+        boundaryProven: true,
+        evidence: 'members-empty',
+        residual: null,
+        signalsStopped: true,
+      });
+    case 'diagnostic-clean':
+      // Enumeration found nothing, which is worth stopping the signalling for
+      // and worth NOTHING else: a descendant that setsid'd and scrubbed its own
+      // environ is invisible to exactly this scan. The residual is what keeps
+      // the device-isolation blocker alive while the session row closes.
+      return assertTerminationInvariants({
+        ok: true,
+        boundaryProven: false,
+        evidence: 'diagnostic-clean',
+        residual: {
+          deviceIsolation: true,
+          reason: 'clean scan is a diagnostic signal only; no unforgeable boundary proof was obtained',
+        },
+        signalsStopped: true,
+      });
+    case 'alive':
+      return assertTerminationInvariants({
+        ok: false,
+        boundaryProven: false,
+        evidence: 'timeout',
+        residual: { deviceIsolation: true, pids: [...q.pids], reason: 'members still executing after escalation' },
+        signalsStopped: false,
+      });
+    case 'unscannable':
+      // "Cannot enumerate" must never read as "nothing is running".
+      return assertTerminationInvariants({
+        ok: false,
+        boundaryProven: false,
+        evidence: 'unknown',
+        residual: { deviceIsolation: true, reason: q.reason },
+        signalsStopped: false,
+      });
+    case 'unsupported-platform':
+      return assertTerminationInvariants({
+        ok: false,
+        boundaryProven: false,
+        evidence: 'unknown',
+        residual: { deviceIsolation: true, reason: `cannot enumerate on ${q.platform}: /proc is Linux-only` },
+        signalsStopped: false,
+      });
+  }
+}
 
 /**
  * Identity of a pid that is stable across pid recycling.
@@ -174,13 +329,42 @@ function readBootId(procRoot: string): { ok: true; bootId: string } | { ok: fals
   }
 }
 
+/** The real kernel interface. Anything else is, by definition, an override. */
+export const DEFAULT_PROC_ROOT = '/proc';
+
+/**
+ * Is this `procRoot` a SUBSTITUTE for the kernel's own /proc?
+ *
+ * The distinction is the whole gate. The previous test was
+ * `procRoot !== undefined`, and every production caller passes a procRoot -- the
+ * backend's getter returns the string '/proc' -- so the override branch was
+ * unconditionally taken and the non-Linux refusal below could never fire in
+ * production. Passing the real path is not an override; only pointing the scanner
+ * somewhere else is.
+ */
+export function isProcRootOverridden(procRoot: string | undefined): boolean {
+  return procRoot !== undefined && procRoot !== DEFAULT_PROC_ROOT;
+}
+
 /**
  * `/proc` is a Linux interface. On any other platform the layout either does not
  * exist or does not mean the same thing, so enumeration is refused OUTRIGHT
  * rather than allowed to fail its way into a misleading "nothing is running".
  *
- * An explicit `procRoot` override opts back in: that is how a test points the
- * scanner at a synthetic tree, and it is never set in production.
+ * Refusing OUTRIGHT is not pedantry, it is the difference between two very
+ * different closes. `unsupported-platform` routes to a residual close, which
+ * publishes the row, keeps the device-isolation blocker on the durable handle and
+ * lets the remote cancel proceed. Any other failure -- including `unscannable` --
+ * routes to a fence, which latches write admission and returns a failed close.
+ * A fence is right when a retry might yet produce proof; on a host that can NEVER
+ * enumerate, it is a permanent wedge, which is exactly the behaviour this module
+ * was fixed not to have.
+ *
+ * A synthetic `procRoot` opts back in: that is how a test points the scanner at a
+ * fake tree. The previous version of this comment claimed such an override "is
+ * never set in production", which was the reverse of the truth -- production
+ * always sets it, to the real /proc, which is why the gate was dead. See
+ * `isProcRootOverridden`.
  */
 export function mojoTreeScanSupported(
   opts: { platform?: string; procRootOverridden?: boolean } = {},
@@ -316,7 +500,7 @@ export function scanMojoTree(
   opts: { procRoot?: string; excludePids?: readonly number[]; platform?: string } = {},
 ): MojoTreeScan {
   const platform = opts.platform ?? process.platform;
-  if (!mojoTreeScanSupported({ platform, procRootOverridden: opts.procRoot !== undefined })) {
+  if (!mojoTreeScanSupported({ platform, procRootOverridden: isProcRootOverridden(opts.procRoot) })) {
     return unsupportedScan(platform);
   }
   const procRoot = opts.procRoot ?? '/proc';
@@ -387,7 +571,7 @@ export function readProcessIdentity(
   opts: { procRoot?: string; platform?: string } = {},
 ): MojoIdentityRead {
   const platform = opts.platform ?? process.platform;
-  if (!mojoTreeScanSupported({ platform, procRootOverridden: opts.procRoot !== undefined })) {
+  if (!mojoTreeScanSupported({ platform, procRootOverridden: isProcRootOverridden(opts.procRoot) })) {
     const failed = unsupportedScan(platform);
     return { ok: false, failure: failed.failure, reason: failed.reason };
   }

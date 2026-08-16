@@ -225,19 +225,26 @@ export interface SessionDestroyResult {
    */
   admission?: 'restorable' | 'fenced';
   /**
-   * Set when the close SUCCEEDED but a local subtree could not be proven gone for
-   * a reason no retry can change — today only "this host cannot enumerate
-   * processes at all" (a non-Linux platform, where /proc does not exist).
+   * Set when the close SUCCEEDED but a local subtree could not be proven gone.
+   * Two distinct facts, deliberately kept distinguishable:
    *
-   * Deliberately NOT a failure. "The platform has no instrument" is a different
-   * fact from "the instrument says something may still be running": the latter is
-   * evidence of a possible credentialed survivor and must fence write admission,
-   * while the former would fence every session on that platform forever with no
-   * possible recovery. The credential boundary is carried instead by the durable
-   * containment handle, which on such a host is `unprovable` and can never be
-   * released, so the device-isolation blocker is retained.
+   *  * `local_subtree_unprovable_on_platform` — this host cannot enumerate
+   *    processes at all (a non-Linux platform, where /proc does not exist), so no
+   *    retry can change the answer.
+   *  * `local_subtree_boundary_unproven` — enumeration DID run and found nothing
+   *    executing, but a clean scan is a diagnostic signal, not an unforgeable
+   *    boundary: a descendant that setsid'd and scrubbed its own environ is
+   *    invisible to it. This is the ordinary Linux weak-handle outcome.
+   *
+   * Neither is a failure. "The boundary is unproven" is a different fact from
+   * "the instrument says something may still be running": the latter is evidence
+   * of a possible credentialed survivor and must fence write admission, while
+   * these two would fence ordinary sessions forever with no possible recovery.
+   * The credential boundary is carried instead by the durable containment
+   * handle, which is retained (not released) in both cases, so the
+   * device-isolation blocker survives the close.
    */
-  residual?: 'local_subtree_unprovable_on_platform';
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
 }
 
 /**

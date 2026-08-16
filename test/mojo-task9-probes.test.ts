@@ -25,6 +25,11 @@
  * On the fully merged tree the expected state is: P1 P3 P4 green, P2 red until 7-A.
  *
  * Run:  npx vitest run test/mojo-task9-probes.test.ts
+ *
+ * PLATFORM SCOPE: probe 1 reproduces the escape with a REAL setsid descendant and
+ * reads the host's real /proc to decide when it is gone, so it is Linux-only and
+ * gated with describe.runIf(isLinux) — off Linux it SKIPS rather than failing for
+ * the absence of /proc, which would be noise rather than evidence.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -43,6 +48,10 @@ import {
     recordContainmentHandle,
 } from '../src/core/mojo-containment.js';
 import { MOJO_TREE_NONCE_ENV, scanMojoTree } from '../src/adapters/backend/mojo-process-tree.js';
+import { isLinux } from './helpers/synthetic-proc.js';
+
+/** Linux-only: real setsid escape + real /proc liveness. */
+const describeLinux = describe.runIf(isLinux);
 
 let binDir: string;
 const strays: number[] = [];
@@ -83,7 +92,7 @@ class FastProofBackend extends MojoBackend {
     protected override get terminationProofBudgetMs(): number { return 400; }
 }
 
-describe('PROBE 1 — an escaped descendant must never be judged proven', () => {
+describeLinux('PROBE 1 — an escaped descendant must never be judged proven', () => {
     it('reproduces the escape and reports what the code concludes', async () => {
         // A real setsid grandchild that ignores SIGTERM: it leaves the original
         // process group and session, so kill(-pgid) can never reach it, and it
@@ -294,7 +303,9 @@ exit 0`);
         }
     }, 40_000);
 
-    it('the durable handle is what makes the old tree reachable across generations', async () => {
+    // Linux-only: it plants a REAL setsid escapee and reads its identity through
+    // /proc, which is the mechanism being probed.
+    it.runIf(isLinux)('the durable handle is what makes the old tree reachable across generations', async () => {
         // Independent of the backend wiring: this is the mechanism the fix relies
         // on, so the report can separate "mechanism works" from "mechanism wired".
         const dataDir = mkdtempSync(join(binDir, 'p2-store-'));

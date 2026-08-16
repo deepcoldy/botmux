@@ -28,6 +28,7 @@ import {
   MOJO_CHILD_TERMINATION_PROOF_MS,
 } from '../src/adapters/backend/mojo-budgets.js';
 import type { EffectiveMojoConfig } from '../src/adapters/backend/mojo-types.js';
+import { isLinux } from './helpers/synthetic-proc.js';
 
 let binDir: string;
 
@@ -117,7 +118,10 @@ describe('MojoBackend spawn contract', () => {
 });
 
 describe('MojoBackend teardown', () => {
-  it('cancels the remote session even when /close lands before the init event', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('cancels the remote session even when /close lands before the init event', async () => {
     // Race: destroySession() read cliSessionId immediately, but that id only
     // exists after the first `system/init` line is parsed. A /close inside the
     // "turn dispatched, init not yet arrived" window therefore skipped the cancel
@@ -141,9 +145,17 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-late","warn
     // Close INSIDE the window: the turn is dispatched, init has not arrived.
     await new Promise<void>(r => setTimeout(r, 100));
     expect(backend.cliSessionIdForTest).toBeUndefined();
+    // A turn WAS dispatched here, so a containment handle exists and the only
+    // evidence available is a /proc scan. The close therefore carries the residual
+    // marker: this assertion used to demand its absence, which is the fail-open the
+    // reviewer reproduced -- a plain closed row for a subtree nothing had proved
+    // was gone.
     await expect(backend.destroySession()).resolves.toEqual({
       ok: true,
       taskId: 'sid-late',
+      // The residual is the honest grade of the LOCAL verdict, not a failure:
+      // what this case is about is the remote cancel still happening.
+      residual: 'local_subtree_boundary_unproven',
     });
 
     const argv = readFileSync(argvLog, 'utf-8');

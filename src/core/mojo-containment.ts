@@ -133,8 +133,64 @@ export type ContainmentHandle =
  * caller, because all of them must keep the blocker.
  */
 export type QuiescenceVerdict =
-    | { proven: true; handle: ContainmentHandle; reason?: string }
+    | { proven: true; handle: ContainmentHandle; reason?: string; evidence?: QuiescenceEvidence }
     | { proven: false; handle: ContainmentHandle; reason: string; residualPids?: number[] };
+
+/**
+ * WHICH fact settled a `proven: true` verdict. The distinction is the entire
+ * safety argument of this module, so it is carried in the data instead of being
+ * re-derived by every caller:
+ *
+ *   - `cgroup-empty` / `cgroup-zombie-only`: kernel-owned membership state that a
+ *     same-user child can neither forge, unlink nor escape -> boundary proof.
+ *   - `boot-id-changed`: the recorded tree cannot have survived the reboot that
+ *     changed the kernel boot id, and a same-user child cannot fake a boot id ->
+ *     boundary proof.
+ *   - `scan-clean`: a /proc subtree scan came back empty. DIAGNOSTIC ONLY: a
+ *     descendant that calls setsid(), scrubs its own environ and reparents to
+ *     init evades enumeration entirely, so this can never authorise dropping
+ *     device isolation.
+ *
+ * An absent field is read as "the strongest thing this handle KIND could prove",
+ * for compatibility with hand-built verdicts; it can never be read as stronger
+ * than the handle kind allows.
+ */
+export type QuiescenceEvidence =
+    | 'cgroup-empty'
+    | 'cgroup-zombie-only'
+    | 'boot-id-changed'
+    | 'scan-clean';
+
+/** What stays isolated after a close that could not prove its boundary. */
+export interface ContainmentResidual {
+    /** True keeps the device-isolation blocker even though the session may close. */
+    deviceIsolation: boolean;
+    /** Pids the evidence named, when it named any. */
+    pids?: number[];
+    /** Operator-facing explanation of what is still unproven. */
+    reason?: string;
+}
+
+/**
+ * The single authority on "may this handle be forgotten, and may the blocker go?".
+ *
+ * `boundaryProof` is the only field that answer may consult, and unlike the
+ * previous revision that statement now has a real production consumer:
+ * `releaseContainmentHandle` branches on `releaseAuthorised` below, so a clean
+ * weak scan cannot reach the removal path at all.
+ */
+export interface ContainmentReleaseDecision {
+    /** Unforgeable boundary evidence. The gate. */
+    boundaryProof: boolean;
+    /** `verdict.proven && boundaryProof` - the only state that removes a handle. */
+    releaseAuthorised: boolean;
+    /** Which fact was available, or `not-proven` when quiescence itself failed. */
+    evidence: QuiescenceEvidence | 'not-proven';
+    /** Non-null whenever the handle stays behind; null only on a real release. */
+    residual: ContainmentResidual | null;
+    /** May the caller stop re-signalling? True once quiescence itself is proven. */
+    signalsStopped: boolean;
+}
 
 /** Thrown instead of degrading to an empty (fail-open) handle store. */
 export class MojoContainmentUnavailableError extends Error {
@@ -409,7 +465,7 @@ export function proveContainmentQuiescent(
             raw = readFileSync(`${handle.cgroupPath}/cgroup.procs`, 'utf8');
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                return { proven: true, handle };
+                return { proven: true, handle, evidence: 'cgroup-empty' };
             }
             return {
                 proven: false,
@@ -419,7 +475,7 @@ export function proveContainmentQuiescent(
             };
         }
         const pids = raw.split('\n').map(l => Number(l.trim())).filter(n => Number.isInteger(n) && n > 0);
-        if (pids.length === 0) return { proven: true, handle };
+        if (pids.length === 0) return { proven: true, handle, evidence: 'cgroup-empty' };
         // A non-empty cgroup is NOT automatically a live tree. `cgroup.procs`
         // keeps listing a zombie until its parent reaps it, and a zombie executes
         // nothing and cannot use the injected credential. Treating it as alive
@@ -446,8 +502,13 @@ export function proveContainmentQuiescent(
         // genuine quiescence. Reported in the reason so an operator can see why a
         // still-populated cgroup was accepted.
         return zombies.length > 0
-            ? { proven: true, handle, reason: `zombie-only cgroup members (${zombies.join(',')})` }
-            : { proven: true, handle };
+            ? {
+                proven: true,
+                handle,
+                reason: `zombie-only cgroup members (${zombies.join(',')})`,
+                evidence: 'cgroup-zombie-only',
+            }
+            : { proven: true, handle, evidence: 'cgroup-empty' };
     }
 
     if (handle.kind === 'unprovable') {
@@ -469,7 +530,7 @@ export function proveContainmentQuiescent(
         return { proven: false, handle, reason: 'boot id unreadable; cannot age out the recorded tree' };
     }
     if (currentBootId !== handle.bootId) {
-        return { proven: true, handle };
+        return { proven: true, handle, evidence: 'boot-id-changed' };
     }
     if (!opts.scan) {
         return {
@@ -494,7 +555,10 @@ export function proveContainmentQuiescent(
             residualPids: [...evidence.pids],
         };
     }
-    return { proven: true, handle };
+    // Clean scan. Labelled `scan-clean` on purpose, NOT a boundary proof: this is
+    // exactly the shape the reviewer reproduced with a setsid + scrubbed-environ
+    // + reparented descendant, which stays alive while the scan reports nothing.
+    return { proven: true, handle, evidence: 'scan-clean' };
 }
 
 /**
@@ -703,6 +767,78 @@ export function hasUnprovenContainment(sessionId: string, dataDir?: string): boo
 }
 
 /**
+ * Is this verdict strong enough to FORGET the tree, and how much stays behind?
+ *
+ * This is the production gate on `boundaryProof`. It exists because a
+ * `proven: true` verdict is NOT one thing: on a cgroup host it is kernel state,
+ * on a plain Linux host it can be nothing more than "the scan saw nobody", and
+ * those two must not share a code path.
+ *
+ * Truth table, all of it pinned by unit tests:
+ *
+ *   verdict           evidence              boundaryProof  release  residual
+ *   ----------------  --------------------  -------------  -------  --------
+ *   proven, cgroup    cgroup-empty          true           yes      null
+ *   proven, cgroup    cgroup-zombie-only    true           yes      null
+ *   proven, weak      boot-id-changed       true           yes      null
+ *   proven, weak      scan-clean            FALSE          NO       deviceIsolation
+ *   not proven        n/a                   false          NO       deviceIsolation
+ *
+ * The fourth row is the whole fix: a clean weak scan lets the caller stop
+ * re-signalling (`signalsStopped: true`) and lets the SESSION close, but it
+ * authorises nothing else. The handle stays in the durable store, so
+ * `hasUnprovenContainment` keeps answering true and the device-isolation blocker
+ * survives the close.
+ */
+export function containmentReleaseDecision(verdict: QuiescenceVerdict): ContainmentReleaseDecision {
+    const handle = verdict.handle;
+    if (!verdict.proven) {
+        return {
+            boundaryProof: false,
+            releaseAuthorised: false,
+            evidence: 'not-proven',
+            residual: {
+                deviceIsolation: true,
+                pids: verdict.residualPids ? [...verdict.residualPids] : undefined,
+                reason: verdict.reason,
+            },
+            signalsStopped: false,
+        };
+    }
+    // An absent evidence field is filled in from the handle kind, never upgraded
+    // past it: a weak handle defaults to `scan-clean`, the weakest option.
+    const evidence: QuiescenceEvidence = verdict.evidence
+        ?? (handle.kind === 'cgroup' ? 'cgroup-empty' : 'scan-clean');
+    // Two, and only two, unforgeable facts. Both are kernel-owned: cgroup
+    // membership the child cannot escape, and a boot id the child cannot rewrite.
+    // `scan-clean` is absent from this set on purpose and a mutation that adds it
+    // is exactly what the reviewer's third /proc probe shape kills.
+    const boundaryProof = handle.kind === 'cgroup'
+        ? (evidence === 'cgroup-empty' || evidence === 'cgroup-zombie-only')
+        : evidence === 'boot-id-changed';
+    if (boundaryProof) {
+        return {
+            boundaryProof: true,
+            releaseAuthorised: true,
+            evidence,
+            residual: null,
+            signalsStopped: true,
+        };
+    }
+    return {
+        boundaryProof: false,
+        releaseAuthorised: false,
+        evidence,
+        residual: {
+            deviceIsolation: true,
+            reason: `${evidence} is a diagnostic signal, not a boundary proof: a descendant that `
+                + 'calls setsid, scrubs its environ and reparents to init is invisible to the scan',
+        },
+        signalsStopped: true,
+    };
+}
+
+/**
  * Release a handle — the ONLY removal path, and it demands the proof.
  *
  * Taking the verdict (rather than a boolean, or nothing at all) is deliberate: it
@@ -717,7 +853,7 @@ export function hasUnprovenContainment(sessionId: string, dataDir?: string): boo
 export function releaseContainmentHandle(
     verdict: QuiescenceVerdict,
     dataDir?: string,
-): void {
+): ContainmentReleaseDecision {
     if (!verdict.proven) {
         throw new MojoContainmentUnavailableError(
             `refusing to release containment for session ${verdict.handle.sessionId}: `
@@ -725,6 +861,18 @@ export function releaseContainmentHandle(
         );
     }
     const handle = verdict.handle;
+    const decision = containmentReleaseDecision(verdict);
+    if (!decision.releaseAuthorised) {
+        // Proven, but only diagnostically. Do NOT throw: the caller is allowed to
+        // stop signalling and to close the session. Just refuse to forget the tree,
+        // which is what keeps the device-isolation blocker after the close.
+        logger.warn(
+            `[mojo] session ${handle.sessionId}: containment looks quiescent by `
+            + `${decision.evidence} but that is not a boundary proof; keeping the handle and the `
+            + 'device-isolation residual. Signals stopped, blocker retained.',
+        );
+        return decision;
+    }
     const path = filePath(dataDir);
     mkdirSync(dirname(path), { recursive: true });
     withFileLockSync(path, () => {
@@ -759,6 +907,7 @@ export function releaseContainmentHandle(
             }
         }
     }
+    return decision;
 }
 
 /**
@@ -811,12 +960,28 @@ export function inheritContainmentHandles(
  *     boundary proof.
  *
  * A WEAK handle therefore maps to `diagnostic-clean` even when its verdict is
- * `proven: true`. That is deliberate and is NOT a downgrade of this module's own
- * release rule: releasing a weak handle from the durable store is legitimate
- * (the tree really does look gone by every means this host offers), but it must
- * not license clearing a device-isolation blocker, whose bar is an unforgeable
- * boundary. Callers gate the blocker on `boundaryProof === true` only.
+ * `proven: true`, and this module's own release rule now agrees with that
+ * mapping instead of contradicting it: `containmentReleaseDecision` refuses to
+ * authorise removal for `scan-clean`, so a weak handle is NOT released from the
+ * durable store on a clean scan. The previous revision claimed callers gated the
+ * blocker on `boundaryProof === true` while no caller did; the gate now lives
+ * here, in `containmentReleaseDecision`, which is a real production consumer.
+ * Only `boot-id-changed` lifts a weak handle to a boundary proof.
  */
+/**
+ * The ONE place a `boundaryProof: true` TurnQuiescence is constructed.
+ *
+ * Round 4 claimed this property in a comment while three separate sites minted
+ * the value, which is why the claim was rejected as unverifiable. It is now
+ * structural: every caller goes through here, so
+ * `git grep -n "boundaryProof: true" -- src/` returns this function and the type
+ * definitions only. It is exported for the backend, which decides WHETHER a
+ * proven boundary applies but must not decide what one looks like.
+ */
+export function containedProvenQuiescence(): TurnQuiescence {
+    return { kind: 'contained-proven', boundaryProof: true };
+}
+
 export function containmentQuiescence(verdict: QuiescenceVerdict): TurnQuiescence {
     if (!verdict.proven) {
         if (verdict.handle.kind === 'unprovable') {
@@ -826,8 +991,8 @@ export function containmentQuiescence(verdict: QuiescenceVerdict): TurnQuiescenc
             ? { kind: 'alive', boundaryProof: false, pids: [...verdict.residualPids] }
             : { kind: 'unscannable', boundaryProof: false, reason: verdict.reason };
     }
-    if (verdict.handle.kind === 'cgroup') {
-        return { kind: 'contained-proven', boundaryProof: true };
+    if (containmentReleaseDecision(verdict).boundaryProof) {
+        return containedProvenQuiescence();
     }
     // No `unprovable` case here on purpose. proveContainmentQuiescent NEVER returns
     // proven:true for that kind, so a branch for it would be unreachable — an
@@ -848,8 +1013,8 @@ export function containmentQuiescence(verdict: QuiescenceVerdict): TurnQuiescenc
  *   - any handle that is not proven  → that handle's non-proof is the answer
  *   - no handles at all              → `diagnostic-clean`; nothing is recorded,
  *     but "nothing recorded" is not a kernel-level boundary proof either
- *   - every handle proven, at least one weak → `diagnostic-clean`
- *   - every handle proven AND all strong     → `contained-proven`
+ *   - every handle proven, at least one only diagnostically → `diagnostic-clean`
+ *   - every handle proven WITH a boundary proof              → `contained-proven`
  *
  * A store that cannot be read THROWS (via `containmentHandles`), so an
  * unreadable store can never present itself as a clean session.
@@ -861,13 +1026,17 @@ export function sessionContainmentQuiescence(
 ): TurnQuiescence {
     const handles = containmentHandles(sessionId, dataDir);
     if (handles.length === 0) return { kind: 'diagnostic-clean', boundaryProof: false };
-    let allStrong = true;
+    // Same authority as the single-handle path on purpose: a session is only as
+    // contained as its weakest tree, and "weakest" is decided by boundary proof,
+    // not by handle kind, so a weak handle aged out by a reboot counts while a
+    // weak handle that merely scanned clean does not.
+    let allProvenBoundary = true;
     for (const handle of handles) {
         const verdict = prove(handle);
         if (!verdict.proven) return containmentQuiescence(verdict);
-        if (handle.kind !== 'cgroup') allStrong = false;   // weak or unprovable
+        if (!containmentReleaseDecision(verdict).boundaryProof) allProvenBoundary = false;
     }
-    return allStrong
-        ? { kind: 'contained-proven', boundaryProof: true }
+    return allProvenBoundary
+        ? containedProvenQuiescence()
         : { kind: 'diagnostic-clean', boundaryProof: false };
 }

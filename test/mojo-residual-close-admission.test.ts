@@ -48,6 +48,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
+import type { TerminationOutcome } from '../src/adapters/backend/mojo-process-tree.js';
+import { isLinux } from './helpers/synthetic-proc.js';
 
 let binDir: string;
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-residual-')); });
@@ -77,8 +79,14 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-residual","
     // Force the one terminal verdict that routes to a residual close. Stubbing the
     // quiescence result (rather than faking a Darwin host) keeps this runnable on
     // Linux CI, which is the only place we can run it at all.
-    (backend as unknown as { terminateChildProven: () => Promise<boolean> })
-      .terminateChildProven = async () => false;
+    (backend as unknown as { terminateChildProven: () => Promise<TerminationOutcome> })
+      .terminateChildProven = async () => ({
+        ok: false,
+        boundaryProven: false,
+        evidence: 'unknown',
+        residual: { deviceIsolation: true, reason: 'cannot enumerate on darwin' },
+        signalsStopped: false,
+      });
     (backend as unknown as { lastQuiescence: unknown }).lastQuiescence = {
       kind: 'unsupported-platform',
       boundaryProof: false,
@@ -111,10 +119,21 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-residual","
     expect(backend.write('a turn after aborting a residual close')).toBe(false);
   }, 20_000);
 
-  it('does not mark a normally-proven close as residual', async () => {
-    // Guards the blast radius from the other side: if `residual` leaked onto every
-    // close, the daemon could not tell a genuinely clean teardown from one that
-    // left an unenumerable subtree behind.
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('marks an ordinary clean-scan close as boundary-unproven, not as fully clean', async () => {
+    // Guards the blast radius from the other side. `residual` must not be one
+    // undifferentiated flag: the daemon has to tell "this host has no instrument"
+    // apart from "the instrument answered and its answer is not proof".
+    //
+    // This assertion was INVERTED before indictment A: it demanded
+    // `residual === undefined` for exactly this path, which is the ordinary Linux
+    // weak-handle close. That is the fail-open the reviewer reproduced -- a clean
+    // scan publishing a plain closed row, which drops the session out of the
+    // device-isolation inventory while a setsid'd, environ-scrubbed descendant may
+    // still hold the credential. A clean scan now closes the session WITH a
+    // residual marker so the blocker is retained.
     const bin = fakeMojo('mojo-clean', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
 echo '{"type":"system","subtype":"init","session_id":"sid-clean"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clean","warnings":[]}'
@@ -129,7 +148,10 @@ exit 0`);
 
     const result = await backend.destroySession();
     expect(result).toMatchObject({ ok: true, taskId: 'sid-clean' });
-    expect(result.residual).toBeUndefined();
+    // Closed, but explicitly NOT laundered into a proof-backed clean close...
+    expect(result.residual).toBe('local_subtree_boundary_unproven');
+    // ...and still distinguishable from the no-instrument platform verdict.
+    expect(result.residual).not.toBe('local_subtree_unprovable_on_platform');
     expect(backend.write('a turn after a clean close')).toBe(false);
   }, 20_000);
 });

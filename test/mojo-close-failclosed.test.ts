@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
+import { isLinux } from './helpers/synthetic-proc.js';
 
 let binDir: string;
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-failclosed-')); });
@@ -76,7 +77,10 @@ exit 0`);
     expect(backend.write('a turn that must be refused')).toBe(false);
   });
 
-  it('refuses the close when the local child cannot be proven dead', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('refuses the close when the local child cannot be proven dead', async () => {
     const bin = fakeMojo('mojo-stuck', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
 echo '{"type":"system","subtype":"init","session_id":"sid-stuck"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-stuck","warnings":[]}'`);
@@ -129,7 +133,10 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-stuck","war
     expect((backend as unknown as { child: unknown }).child).toBe(unkillable);
   });
 
-  it('kills a descendant that ESCAPED the process group via setsid', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('kills a descendant that ESCAPED the process group via setsid', async () => {
     // The earlier version of this case only started a background shell, which
     // stays in the SAME process group -- so it passed against a plain kill(-pgid)
     // and proved nothing about escapes. `setsid` makes the descendant the leader of
@@ -162,7 +169,10 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-escaped","w
     await vi.waitFor(() => expect(alive(escaped)).toBe(false), { timeout: 5_000 });
   }, 20_000);
 
-  it('refuses the close while the escaped descendant cannot be killed', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('refuses the close while the escaped descendant cannot be killed', async () => {
     // Same escape, but the survivor cannot be signalled away. The close must fail
     // closed so the row stays active and its device-isolation blocker is retained,
     // instead of reporting ok:true with a credentialed process still running.
@@ -203,7 +213,10 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-immortal","
     });
   }, 20_000);
 
-  it('still scans the subtree after the direct child has been reaped', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('still scans the subtree after the direct child has been reaped', async () => {
     // The child's own `close` handler clears this.child, so a /close arriving after
     // the turn finished had nothing left to check and skipped the scan entirely --
     // which is precisely when an escaped descendant is the only thing left.
@@ -232,7 +245,10 @@ exit 0`);
     await vi.waitFor(() => expect(alive(escaped)).toBe(false), { timeout: 5_000 });
   }, 20_000);
 
-  it('escalates to SIGKILL for a child that ignores SIGTERM', async () => {
+  // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
+  // termination verdict. Off Linux the scanner returns unsupported-platform by
+  // design, so this case is skipped explicitly instead of failing.
+  it.runIf(isLinux)('escalates to SIGKILL for a child that ignores SIGTERM', async () => {
     // Proves the ESCALATION, not just the final timeout: this child survives
     // SIGTERM forever, so the close can only succeed if SIGKILL is actually sent.
     // Deleting the SIGKILL step turns this red instead of leaving it green.

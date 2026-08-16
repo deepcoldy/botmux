@@ -176,9 +176,17 @@ describe.skipIf(!LINUX)('a real escaped descendant survives generation replaceme
 
         const after = proveContainmentQuiescent(handle!, { scan: realScan });
         expect(after.proven).toBe(true);
-        releaseContainmentHandle(after, dataDir);
-        expect(hasUnprovenContainment('sess-xgen-b', dataDir)).toBe(false);
-        expect(containmentHandles('sess-xgen-b', dataDir)).toEqual([]);
+        if (after.proven) expect(after.evidence).toBe('scan-clean');
+        // The kill stops the signalling loop, but this host offers no unforgeable
+        // boundary: a sibling that setsid'd and scrubbed its environ would have
+        // been invisible to the very scan that just came back clean. So the close
+        // may proceed while the handle - and the blocker - stay behind.
+        const decision = releaseContainmentHandle(after, dataDir);
+        expect(decision.signalsStopped).toBe(true);
+        expect(decision.releaseAuthorised).toBe(false);
+        expect(decision.residual?.deviceIsolation).toBe(true);
+        expect(hasUnprovenContainment('sess-xgen-b', dataDir)).toBe(true);
+        expect(containmentHandles('sess-xgen-b', dataDir)).toHaveLength(1);
     }, 30_000);
 
     it('records a starttime, so a recycled pid cannot inherit the block', async () => {

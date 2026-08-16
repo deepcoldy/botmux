@@ -55,17 +55,20 @@ import {
     proveContainmentQuiescent,
     recordContainmentHandle,
     releaseContainmentHandle,
+    containedProvenQuiescence,
+    type ContainmentReleaseDecision,
     weakHandleRootStillOriginal,
 } from '../../core/mojo-containment.js';
 import type { ContainmentHandle, QuiescenceVerdict } from '../../core/mojo-containment.js';
 import {
     MOJO_TREE_NONCE_ENV,
+    terminationOutcomeFromQuiescence,
     quiescenceFromScan,
     readProcessIdentity,
     scanMojoTree,
     signalTurnTreeGroup,
 } from './mojo-process-tree.js';
-import type { MojoProcessIdentity, TurnQuiescence } from './mojo-process-tree.js';
+import type { MojoProcessIdentity, TerminationOutcome, TurnQuiescence } from './mojo-process-tree.js';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -221,12 +224,19 @@ export class MojoBackend implements SessionBackend {
      */
     private turnIdentity: MojoProcessIdentity | null = null;
     /**
-     * Evidence class of the last quiescence attempt.
+     * Evidence class of the last quiescence attempt. DIAGNOSTIC ONLY.
      *
-     * Exposed so the containment/blocker decision can require
-     * `boundaryProof === true` instead of treating a merely clean scan as proof.
+     * The previous wording claimed the blocker decision requires
+     * `boundaryProof === true` on this value. It did not, and still does not:
+     * nothing in production reads `TurnQuiescence.boundaryProof`, so that was a
+     * claim about code that was never written. The real gate is
+     * `TerminationOutcome.boundaryProven` (see the close path below), which is
+     * derived from `containmentReleaseDecision` in mojo-containment.ts. This field
+     * is kept for logs and for tests that assert the grading, and it is read
+     * through the `lastTurnQuiescence` getter only.
      */
     private lastQuiescence: TurnQuiescence | null = null;
+    private lastTermination: TerminationOutcome | null = null;
     /** True once the current turn has emitted its `result` event, so a late
      *  process exit cannot fire a second turn boundary. */
     private turnSettled = true;
@@ -597,13 +607,15 @@ export class MojoBackend implements SessionBackend {
      * SIGTERM the whole turn SUBTREE, then gather the best evidence this host can
      * give that nothing in it survives (escalating to SIGKILL).
      *
-     * Read the return value precisely: `true` means "no executing member was
+     * Read the result precisely. `ok: true` means "no executing member was
      * found", NOT "the credential is now unreachable". Enumeration cannot see a
      * descendant that both setsid'd and scrubbed its own environ, so a clean scan
-     * is a DIAGNOSTIC signal only — `lastTurnQuiescence.boundaryProof` is the field
-     * that says whether a real boundary was established, and only kernel-level
-     * containment (a per-session cgroup) can set it true. Callers that gate a
-     * credential blocker must consult that, not this boolean.
+     * is a DIAGNOSTIC signal only — `boundaryProven` is the field that says
+     * whether a real boundary was established, and only kernel-level containment
+     * (a per-session cgroup) can set it true. `ok: true` with
+     * `boundaryProven: false` is therefore legal and, for Linux weak handles, the
+     * common case; destroySession() below consumes the two fields separately and
+     * downgrades the second case to a residual close.
      *
      * Three fail-open paths are closed here.
      *
@@ -617,8 +629,8 @@ export class MojoBackend implements SessionBackend {
      *    setsid/detached. Enumeration therefore unions PGID, the inherited env
      *    nonce and the PPID chain — see mojo-process-tree.
      *
-     * Returns false whenever no such evidence could be obtained, INCLUDING when the
-     * scan itself fails: "cannot enumerate" must never read as "nothing is
+     * Reports `ok: false` whenever no such evidence could be obtained, INCLUDING when
+     * the scan itself fails: "cannot enumerate" must never read as "nothing is
      * running". The caller then refuses the close, which keeps the row active and
      * so keeps the device-isolation blocker in place. (destroySession makes ONE
      * exception, for a platform that can never enumerate at all — see the
@@ -627,14 +639,21 @@ export class MojoBackend implements SessionBackend {
      * Zombie members are discounted, because a reaped process executes nothing and
      * cannot use the credential; only a definite `Z` state qualifies.
      */
-    private async terminateChildProven(): Promise<boolean> {
+    private async terminateChildProven(): Promise<TerminationOutcome> {
         const q = await this.proveTurnQuiescence();
-        // NOTE: `diagnostic-clean` is enough to stop signalling, but it is NOT
-        // credential-boundary proof. Whoever decides whether the session's
-        // device-isolation blocker may be dropped must consult
-        // `lastTurnQuiescence.boundaryProof`, which only kernel-level containment
-        // can set to true.
-        return q.kind === 'contained-proven' || q.kind === 'diagnostic-clean';
+        // The projection is where evidence grading survives. Returning a bare
+        // boolean here is what discarded it: `diagnostic-clean` and
+        // `contained-proven` both collapsed to `true`, so a clean Linux scan --
+        // which cannot see a setsid'd, environ-scrubbed descendant -- authorised
+        // the same plain closed row as a real kernel-level proof.
+        const outcome = terminationOutcomeFromQuiescence(q);
+        this.lastTermination = outcome;
+        return outcome;
+    }
+
+    /** Structured evidence from the last termination attempt; see TerminationOutcome. */
+    get lastTerminationOutcome(): TerminationOutcome | null {
+        return this.lastTermination;
     }
 
     /** Evidence class of the last termination attempt; see TurnQuiescence. */
@@ -833,6 +852,7 @@ export class MojoBackend implements SessionBackend {
         outstanding: readonly ContainmentHandle[],
         cleanVerdict: TurnQuiescence,
     ): TurnQuiescence {
+        const decisions: ContainmentReleaseDecision[] = [];
         for (const handle of outstanding) {
             // An inherited handle means this generation TOOK OVER responsibility for
             // cleaning that tree. Only proving it (never signalling it) left an
@@ -890,13 +910,30 @@ export class MojoBackend implements SessionBackend {
                 );
                 return { kind: 'unscannable', boundaryProof: false, reason: verdict.reason };
             }
-            releaseContainmentHandle(verdict);
+            // The decision is the containment module's to make, not ours: it says
+            // whether the handle was actually discharged and whether a residual
+            // must survive the close. Discarding it here and re-deriving the answer
+            // from `handle.kind` is what made this path contradict the store --
+            // a bootId-aged-out weak handle really was released, while the verdict
+            // still reported `diagnostic-clean`, so the outcome asked the daemon to
+            // keep a device-isolation blocker whose only evidence (the handle) had
+            // just been deleted. The blocker IS the handle, so that was a lie in the
+            // safe-looking direction, and a lie is what the review is about.
+            decisions.push(releaseContainmentHandle(verdict));
         }
-        // Every handle discharged. A cgroup-backed proof is a real kernel boundary,
-        // so it may upgrade the verdict; a weak (scan-only) proof may not, and stays
-        // `diagnostic-clean` with boundaryProof false.
-        if (outstanding.length > 0 && outstanding.every(h => h.kind === 'cgroup')) {
-            return { kind: 'contained-proven', boundaryProof: true };
+        // A boundary proof is the only thing that may upgrade the verdict, and
+        // `boundaryProof` is the single field allowed to say so. It is true for a
+        // kernel-owned cgroup and for a weak handle whose recorded boot is gone;
+        // it is false for a merely clean scan, which therefore stays
+        // `diagnostic-clean` and keeps its residual.
+        if (decisions.length > 0 && decisions.every(d => d.boundaryProof)) {
+            // Built by the containment module, which owns the only constructor of a
+            // proven boundary; this layer decides WHETHER it applies, never what it
+            // looks like. Fabricating a verdict to feed containmentQuiescence would
+            // be wrong here: a weak handle aged out by a changed boot id is a real
+            // boundary proof, yet a synthesised cgroup-empty verdict on that same
+            // handle would be graded back down to a diagnostic scan.
+            return containedProvenQuiescence();
         }
         return cleanVerdict;
     }
@@ -1002,6 +1039,11 @@ export class MojoBackend implements SessionBackend {
         // (a platform with no /proc). Carried onto the successful result as an
         // explicit residual marker rather than silently dropped.
         let residualOnPlatform = false;
+        // Set when the ladder completed cleanly but produced no unforgeable boundary
+        // proof (Linux weak handle / diagnostic-clean). Distinct from
+        // residualOnPlatform: that one is "this host has no instrument at all", this
+        // one is "the instrument answered, and its answer is not proof".
+        let residualBoundaryUnproven = false;
         if (this.shutdownDetaching) {
             return {
                 ok: false,
@@ -1045,7 +1087,8 @@ export class MojoBackend implements SessionBackend {
         //
         // SIGTERM is not proof, and neither is the direct pid — see
         // terminateChildProven.
-        if (!await this.terminateChildProven()) {
+        const termination = await this.terminateChildProven();
+        if (!termination.ok) {
             // Two very different facts reach this branch, and collapsing them is
             // what wedged non-Linux hosts.
             //
@@ -1101,6 +1144,37 @@ export class MojoBackend implements SessionBackend {
                     admission: 'fenced',
                 };
             }
+        } else if (!termination.boundaryProven) {
+            // THE GATE. The ladder completed and found no executing member, but no
+            // unforgeable boundary was established -- on Linux this is the weak
+            // handle / `diagnostic-clean` case, which the old bare boolean laundered
+            // into a plain `closed` row. A closed row is filtered out of the
+            // device-isolation inventory, so the blocker vanished for a subtree that
+            // a setsid'd, environ-scrubbed descendant could still be living in.
+            //
+            // Reviewer's second option, deliberately not the first: the clean scan is
+            // allowed to stop the signalling (`signalsStopped`) and the session row is
+            // allowed to close, but it does NOT authorise a plain closed row. The
+            // residual marker below is what carries the device-isolation blocker past
+            // the close.
+            //
+            // Admission is deliberately NOT fenced: unlike the `!ok` branch there is
+            // no positive evidence of a live member, and fencing every clean-scan
+            // close would wedge ordinary Linux sessions forever. Execution continues
+            // into the remote cancel for the same reason it does on the
+            // residual-close path: a residual LOCAL subtree is no reason to leak the
+            // REMOTE session.
+            //
+            // Releasing the handle is not done here by design -- that decision lives
+            // in mojo-containment.ts, and only `boundaryProven === true` may authorise
+            // it. This branch is the negative case, so it releases nothing.
+            logger.warn(
+                `[mojo] session ${this.sessionId}: local turn subtree scanned clean but the credential `
+                + `boundary is NOT proven (evidence ${termination.evidence}`
+                + `${termination.residual?.reason ? `: ${termination.residual.reason}` : ''}); closing with a `
+                + 'residual marker instead of a plain closed row — the device-isolation blocker is retained',
+            );
+            residualBoundaryUnproven = true;
         }
         // A turn was dispatched but its lineage never materialised: there may be a
         // remote session we have no id for, so it cannot be cancelled and cannot be
@@ -1163,7 +1237,11 @@ export class MojoBackend implements SessionBackend {
         return {
             ok: true,
             ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
-            ...(residualOnPlatform ? { residual: 'local_subtree_unprovable_on_platform' as const } : {}),
+            ...(residualOnPlatform
+                ? { residual: 'local_subtree_unprovable_on_platform' as const }
+                : residualBoundaryUnproven
+                    ? { residual: 'local_subtree_boundary_unproven' as const }
+                    : {}),
         };
     }
 

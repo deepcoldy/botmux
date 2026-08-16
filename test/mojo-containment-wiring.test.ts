@@ -14,6 +14,18 @@
  *
  * The store is redirected via SESSION_DATA_DIR, so nothing here touches a real
  * containment file.
+ *
+ * PLATFORM SCOPE
+ * --------------
+ * Cases that build a fake tree go through the `procRoot` seam and the synthetic
+ * /proc fixture (test/helpers/synthetic-proc.ts), so they never read the host's
+ * real /proc and run on ANY platform.
+ *
+ * Cases that need a REAL live process (spawnSleeper / liveWeakHandle / reading
+ * /proc/<pid>/stat of an actual child) are Linux-only and are gated explicitly
+ * with describe.runIf(isLinux) / it.runIf(isLinux) so they SKIP off Linux rather
+ * than fail. Any suite below whose name is introduced through `describeLinux` is
+ * Linux-only by construction, not by accident.
  */
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,6 +36,7 @@ import {
   MojoBackend,
   proveWorkerlessLocalSubtree,
 } from '../src/adapters/backend/mojo-backend.js';
+import { isLinux, syntheticProcRoot } from './helpers/synthetic-proc.js';
 import {
   containmentHandles,
   recordContainmentHandle,
@@ -31,6 +44,9 @@ import {
 } from '../src/core/mojo-containment.js';
 
 const STORE = 'mojo-containment-handles.json';
+
+/** Linux-only: needs a real /proc and real process signalling. */
+const describeLinux = describe.runIf(isLinux);
 
 let dataDir: string;
 let prevDataDir: string | undefined;
@@ -61,7 +77,14 @@ function staleWeakHandle(sessionId: string, rootPid: number): ContainmentHandle 
   };
 }
 
-/** A weak handle for THIS boot whose subtree is a live, scannable process. */
+/**
+ * A weak handle for THIS boot whose subtree is a live, scannable process.
+ *
+ * LINUX ONLY: it reads the host's real /proc to learn the boot id and the child's
+ * starttime, which is the whole point (the handle must agree with the REAL
+ * kernel). Every caller is therefore gated with runIf(isLinux); a fake tree case
+ * must use syntheticProcRoot instead.
+ */
 function liveWeakHandle(sessionId: string, rootPid: number, nonce: string): ContainmentHandle {
   const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
   const stat = readFileSync(`/proc/${rootPid}/stat`, 'utf8');
@@ -98,7 +121,7 @@ describe('A2: treeNonce is per-session and inherited', () => {
 });
 
 describe('A3: rootPid === null no longer means "no subtree"', () => {
-  it('kills an inherited live subtree instead of leaving the session unclosable', async () => {
+  it.runIf(isLinux)('kills an inherited live subtree instead of leaving the session unclosable', async () => {
     // THE bug this segment started from: on a replacement generation lastTurnPid is
     // always null, so the old code returned true — reporting a clean close for a
     // session that still had a live credentialed survivor.
@@ -115,14 +138,22 @@ describe('A3: rootPid === null no longer means "no subtree"', () => {
       // No turn was ever spawned by THIS backend, so rootPid is null.
       expect(backend['lastTurnPid']).toBeNull();
 
-      const proven = await backend['terminateChildProven']();
-      // Genuinely gone now, so the close may proceed and the handle is discharged.
-      expect(proven).toBe(true);
+      const outcome = await backend['terminateChildProven']();
+      // The close may proceed (ok), but a /proc scan is not a boundary proof, so
+      // the outcome must say so and must carry the residual that keeps isolation.
+      expect(outcome.ok).toBe(true);
+      expect(outcome.boundaryProven).toBe(false);
+      expect(outcome.evidence).toBe('diagnostic-clean');
+      expect(outcome.residual?.deviceIsolation).toBe(true);
+      expect(outcome.signalsStopped).toBe(true);
       // Not merely "signal delivered": it must no longer be EXECUTING. A killed
       // child whose parent has not reaped it yet lingers as a zombie, and
       // kill(pid, 0) still succeeds for one, so liveness is read from its state.
       expect(executing(child.pid)).toBe(false);
-      expect(containmentHandles(sessionId)).toEqual([]);
+      // The handle is NOT discharged: this host proved quiescence by /proc scan
+      // only, which is a diagnostic signal. The session closes, the residual and
+      // its device-isolation blocker stay.
+      expect(containmentHandles(sessionId)).toHaveLength(1);
     } finally {
       try { process.kill(child.pid, 'SIGKILL'); } catch { /* already gone */ }
     }
@@ -133,27 +164,26 @@ describe('A3: rootPid === null no longer means "no subtree"', () => {
     // synthetic /proc keeps reporting it, which is what an uninterruptible or
     // otherwise unkillable process looks like from here.
     const sessionId = 'sess-inherited-unkillable';
-    const fakeProc = join(dataDir, 'proc-unkillable');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
-    mkdirSync(join(fakeProc, '7000'), { recursive: true });
-    writeFileSync(join(fakeProc, '7000', 'stat'), `7000 (root) S 1 7000 ${filler} 555`);
-    writeFileSync(join(fakeProc, '7000', 'environ'), '');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-unkillable' });
+    proc.addProcess({ pid: 7000, state: 'S', pgid: 7000, startTime: 555 });
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 7000, bootId, startTime: 555, nonce: 'nonce-unkillable',
+      rootPid: 7000, bootId: proc.bootId, startTime: 555, nonce: 'nonce-unkillable',
     });
     class Unkillable extends MojoBackend {
-      protected get procRoot(): string { return fakeProc; }
+      protected get procRoot(): string { return proc.path; }
     }
     const backend = new Unkillable({ model: 'default' } as never, sessionId);
-    await expect(backend['terminateChildProven']()).resolves.toBe(false);
+    const outcome = await backend['terminateChildProven']();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.boundaryProven).toBe(false);
+    // A refused close must never claim the signals are done with.
+    expect(outcome.signalsStopped).toBe(false);
+    expect(outcome.residual?.deviceIsolation).toBe(true);
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
-  it('reports the quiescence verdict without boundary proof for a scan-only handle', async () => {
+  it.runIf(isLinux)('reports the quiescence verdict without boundary proof for a scan-only handle', async () => {
     const child = spawnSleeper();
     try {
       const sessionId = 'sess-inherited-alive-2';
@@ -170,16 +200,33 @@ describe('A3: rootPid === null no longer means "no subtree"', () => {
 
   it('still allows the close when nothing was ever spawned and nothing is outstanding', async () => {
     const backend = backendFor('sess-virgin');
-    await expect(backend['terminateChildProven']()).resolves.toBe(true);
+    const outcome = await backend['terminateChildProven']();
+    expect(outcome.ok).toBe(true);
+    // "Nothing recorded" is not a kernel-level boundary proof either, so this
+    // stays unproven rather than claiming a boundary it never observed. It costs
+    // nothing: with no handle in the store there is no blocker to retain.
+    expect(outcome.boundaryProven).toBe(false);
   });
 
-  it('discharges an inherited handle whose recorded boot no longer matches', async () => {
+  // Linux-only in substance: discharging on a boot-id MISMATCH requires reading
+  // a boot id at all. Off Linux there is none, so the correct production answer
+  // is to refuse (fail-closed) rather than age the handle out -- a different
+  // behaviour, not a broken test, so this pins the Linux rule only.
+  it.runIf(isLinux)('discharges an inherited handle whose recorded boot no longer matches', async () => {
     // A bootId mismatch is genuine proof: the recorded tree cannot have survived
     // the reboot that changed the id, so the handle may be retired.
     const sessionId = 'sess-rebooted';
     recordContainmentHandle(staleWeakHandle(sessionId, 999_002));
     const backend = backendFor(sessionId);
-    await expect(backend['terminateChildProven']()).resolves.toBe(true);
+    const outcome = await backend['terminateChildProven']();
+    expect(outcome.ok).toBe(true);
+    // The one case where a WEAK handle does reach a boundary proof: the recorded
+    // tree cannot have survived the reboot that changed the boot id, and a
+    // same-user child cannot rewrite that id. The outcome must agree with the
+    // store it just emptied -- claiming a residual here would ask the daemon to
+    // keep a blocker whose only evidence has been deleted.
+    expect(outcome.boundaryProven).toBe(true);
+    expect(outcome.residual).toBeNull();
     expect(containmentHandles(sessionId)).toEqual([]);
   });
 
@@ -213,7 +260,7 @@ describe('A4: shutdown must not release the tree', () => {
 });
 
 describe('A5: a workerless close must prove the local subtree', () => {
-  it('refuses when a local credentialed subtree is still alive', () => {
+  it.runIf(isLinux)('refuses when a local credentialed subtree is still alive', () => {
     // "No worker" must never imply "no local process": the worker dying is exactly
     // what orphans a credentialed descendant.
     const child = spawnSleeper();
@@ -230,7 +277,11 @@ describe('A5: a workerless close must prove the local subtree', () => {
     }
   });
 
-  it('passes and discharges the handle when the local subtree is provably gone', () => {
+  // Linux-only in substance: discharging on a boot-id MISMATCH requires reading
+  // a boot id at all. Off Linux there is none, so the correct production answer
+  // is to refuse (fail-closed) rather than age the handle out -- a different
+  // behaviour, not a broken test, so this pins the Linux rule only.
+  it.runIf(isLinux)('passes and discharges the handle when the local subtree is provably gone', () => {
     const sessionId = 'sess-workerless-gone';
     recordContainmentHandle(staleWeakHandle(sessionId, 999_004));
     expect(proveWorkerlessLocalSubtree(sessionId)).toBeNull();
@@ -253,47 +304,35 @@ describe('A5: a workerless close must prove the local subtree', () => {
     // The workerless path must use the SAME definition of "running" as teardown,
     // or a dead worker's reaped subtree would block the close forever.
     const sessionId = 'sess-workerless-zombie';
-    const fakeProc = join(dataDir, 'proc-workerless-zombie');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
-    mkdirSync(join(fakeProc, '5150'), { recursive: true });
-    writeFileSync(join(fakeProc, '5150', 'stat'), `5150 (root) Z 1 5150 ${filler} 999`);
-    writeFileSync(join(fakeProc, '5150', 'environ'), '');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-workerless-zombie' });
+    proc.addProcess({ pid: 5150, state: 'Z', pgid: 5150, startTime: 999 });
 
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 5150, bootId, startTime: 999, nonce: 'nonce-workerless-zombie',
+      rootPid: 5150, bootId: proc.bootId, startTime: 999, nonce: 'nonce-workerless-zombie',
     });
-    expect(proveWorkerlessLocalSubtree(sessionId, { procRoot: fakeProc })).toBeNull();
-    expect(containmentHandles(sessionId)).toEqual([]);
+    expect(proveWorkerlessLocalSubtree(sessionId, { procRoot: proc.path })).toBeNull();
+    // Close allowed (a zombie executes nothing), handle retained: a weak handle
+    // never mints a boundary proof, so the blocker outlives the close.
+    expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
   it('still refuses a workerless close when a live member remains beside a zombie', () => {
     const sessionId = 'sess-workerless-zombie-live';
-    const fakeProc = join(dataDir, 'proc-workerless-mixed');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
-    mkdirSync(join(fakeProc, '5150'), { recursive: true });
-    writeFileSync(join(fakeProc, '5150', 'stat'), `5150 (root) Z 1 5150 ${filler} 999`);
-    writeFileSync(join(fakeProc, '5150', 'environ'), '');
-    mkdirSync(join(fakeProc, '5151'), { recursive: true });
-    writeFileSync(join(fakeProc, '5151', 'stat'), `5151 (kid) S 5150 5150 ${filler} 1000`);
-    writeFileSync(join(fakeProc, '5151', 'environ'), '');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-workerless-mixed' });
+    proc.addProcess({ pid: 5150, state: 'Z', pgid: 5150, startTime: 999 });
+    proc.addProcess({ pid: 5151, name: 'kid', state: 'S', ppid: 5150, pgid: 5150, startTime: 1000 });
 
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 5150, bootId, startTime: 999, nonce: 'nonce-workerless-mixed',
+      rootPid: 5150, bootId: proc.bootId, startTime: 999, nonce: 'nonce-workerless-mixed',
     });
-    const outcome = proveWorkerlessLocalSubtree(sessionId, { procRoot: fakeProc });
+    const outcome = proveWorkerlessLocalSubtree(sessionId, { procRoot: proc.path });
     expect(outcome?.kind).toBe('failed');
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
-  it('does not read a failed scan as an empty subtree', () => {
+  it.runIf(isLinux)('does not read a failed scan as an empty subtree', () => {
     // scanned:false collapsing into pids:[] would read as "nothing alive" and mint
     // a proof we do not have. Point the scan at a /proc that does not exist.
     const sessionId = 'sess-workerless-unscannable';
@@ -304,7 +343,8 @@ describe('A5: a workerless close must prove the local subtree', () => {
   });
 });
 
-describe('A1: the handle is recorded at spawn, not at close', () => {
+// Linux-only: every case here spawns a REAL child and reads its real /proc identity.
+describeLinux('A1: the handle is recorded at spawn, not at close', () => {
   it('persists a handle for the freshly spawned turn root', () => {
     // Recording at close would be too late: a crash in between loses the tree, and
     // a lost tree can never be proven quiescent afterwards.
@@ -370,7 +410,7 @@ describe('A1: the handle is recorded at spawn, not at close', () => {
 });
 
 describe('A3: a failed scan is not an empty subtree (backend teardown path)', () => {
-  it('refuses the close when the inherited tree cannot be scanned at all', async () => {
+  it.runIf(isLinux)('refuses the close when the inherited tree cannot be scanned at all', async () => {
     // scanned:false collapsing into pids:[] would read as "nothing alive" and
     // release a handle on the strength of a scan that never ran.
     const sessionId = 'sess-teardown-unscannable';
@@ -380,7 +420,10 @@ describe('A3: a failed scan is not an empty subtree (backend teardown path)', ()
       protected get procRoot(): string { return missingProc; }
     }
     const backend = new Unscannable({ model: 'default' } as never, sessionId);
-    await expect(backend['terminateChildProven']()).resolves.toBe(false);
+    const outcome = await backend['terminateChildProven']();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.boundaryProven).toBe(false);
+    expect(outcome.residual?.deviceIsolation).toBe(true);
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
@@ -390,34 +433,31 @@ describe('A3: a failed scan is not an empty subtree (backend teardown path)', ()
     // into `pids: []` the handle would be released on evidence that never
     // existed — this is the one shape where fail-open is invisible.
     const sessionId = 'sess-teardown-scan-fails';
-    const fakeProc = join(dataDir, 'proc-scan-fails');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-scan-fails' });
     // The recorded root, with a starttime the handle will agree with.
-    mkdirSync(join(fakeProc, '4242'), { recursive: true });
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
-    writeFileSync(join(fakeProc, '4242', 'stat'), `4242 (root) S 1 4242 ${filler} 777`);
-    writeFileSync(join(fakeProc, '4242', 'environ'), '');
+    proc.addProcess({ pid: 4242, state: 'S', pgid: 4242, startTime: 777 });
     // A SECOND pid whose stat is unparsable, which fails the whole scan.
-    mkdirSync(join(fakeProc, '4243'), { recursive: true });
-    writeFileSync(join(fakeProc, '4243', 'stat'), 'garbage with no parens');
-    writeFileSync(join(fakeProc, '4243', 'environ'), '');
+    proc.addUnparsableProcess(4243);
 
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 4242, bootId, startTime: 777, nonce: 'nonce-scan-fails',
+      rootPid: 4242, bootId: proc.bootId, startTime: 777, nonce: 'nonce-scan-fails',
     });
     class ScanFails extends MojoBackend {
-      protected get procRoot(): string { return fakeProc; }
+      protected get procRoot(): string { return proc.path; }
     }
     const backend = new ScanFails({ model: 'default' } as never, sessionId);
-    await expect(backend['terminateChildProven']()).resolves.toBe(false);
+    const outcome = await backend['terminateChildProven']();
+    expect(outcome.ok).toBe(false);
+    // "Cannot enumerate" must not be reported as an observation of emptiness.
+    expect(outcome.evidence).toBe('unknown');
+    expect(outcome.residual?.deviceIsolation).toBe(true);
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 });
 
-describe('A5: the workerless close entry point enforces the local check', () => {
+// Linux-only: needs a real live survivor process to refuse the close.
+describeLinux('A5: the workerless close entry point enforces the local check', () => {
   it('returns failed from cancelMojoSessionById without cancelling anything remote', async () => {
     // The local gate must run BEFORE the remote cancel, so a live local subtree
     // refuses the close even though no CLI is reachable in this test.
@@ -535,52 +575,46 @@ describe('the handle proof and the in-memory ladder must agree about zombies', (
     // could never be discharged — a permanent, unrecoverable block on a process
     // that executes nothing.
     const sessionId = 'sess-zombie-agree';
-    const fakeProc = join(dataDir, 'proc-zombie');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-zombie' });
     // The recorded root, still present but REAPED (state Z).
-    mkdirSync(join(fakeProc, '4242'), { recursive: true });
-    writeFileSync(join(fakeProc, '4242', 'stat'), `4242 (root) Z 1 4242 ${filler} 777`);
-    writeFileSync(join(fakeProc, '4242', 'environ'), '');
+    proc.addProcess({ pid: 4242, state: 'Z', pgid: 4242, startTime: 777 });
 
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 4242, bootId, startTime: 777, nonce: 'nonce-zombie',
+      rootPid: 4242, bootId: proc.bootId, startTime: 777, nonce: 'nonce-zombie',
     });
     class ZombieProc extends MojoBackend {
-      protected get procRoot(): string { return fakeProc; }
+      protected get procRoot(): string { return proc.path; }
     }
     const backend = new ZombieProc({ model: 'default' } as never, sessionId);
-    await expect(backend['terminateChildProven']()).resolves.toBe(true);
-    expect(containmentHandles(sessionId)).toEqual([]);
+    const outcome = await backend['terminateChildProven']();
+    // Agreement is about the CLOSE, not about discharging the handle: the weak
+    // handle stays until something unforgeable proves the boundary.
+    expect(outcome.ok).toBe(true);
+    expect(outcome.boundaryProven).toBe(false);
+    expect(outcome.residual?.deviceIsolation).toBe(true);
+    expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
   it('still refuses when a non-zombie member remains alongside a zombie', async () => {
     const sessionId = 'sess-zombie-plus-live';
-    const fakeProc = join(dataDir, 'proc-zombie-live');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
-    mkdirSync(join(fakeProc, '4242'), { recursive: true });
-    writeFileSync(join(fakeProc, '4242', 'stat'), `4242 (root) Z 1 4242 ${filler} 777`);
-    writeFileSync(join(fakeProc, '4242', 'environ'), '');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-zombie-live' });
+    proc.addProcess({ pid: 4242, state: 'Z', pgid: 4242, startTime: 777 });
     // A descendant in the same group that is genuinely running.
-    mkdirSync(join(fakeProc, '4243'), { recursive: true });
-    writeFileSync(join(fakeProc, '4243', 'stat'), `4243 (kid) R 4242 4242 ${filler} 778`);
-    writeFileSync(join(fakeProc, '4243', 'environ'), '');
+    proc.addProcess({ pid: 4243, name: 'kid', state: 'R', ppid: 4242, pgid: 4242, startTime: 778 });
 
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 4242, bootId, startTime: 777, nonce: 'nonce-zombie-live',
+      rootPid: 4242, bootId: proc.bootId, startTime: 777, nonce: 'nonce-zombie-live',
     });
     class ZombiePlusLive extends MojoBackend {
-      protected get procRoot(): string { return fakeProc; }
+      protected get procRoot(): string { return proc.path; }
     }
     const backend = new ZombiePlusLive({ model: 'default' } as never, sessionId);
-    await expect(backend['terminateChildProven']()).resolves.toBe(false);
+    const outcome = await backend['terminateChildProven']();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.boundaryProven).toBe(false);
+    expect(outcome.residual?.deviceIsolation).toBe(true);
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 });
@@ -611,19 +645,16 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     // meant "signal nothing", that survivor would be re-proven alive on every retry
     // and the session could never be closed at all.
     const sessionId = 'sess-escaped-member';
-    const fakeProc = join(dataDir, 'proc-escaped');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-escaped' });
     // The recorded root is GONE from /proc entirely...
     // ...but an escaped descendant survives in its own session, found by the nonce.
-    mkdirSync(join(fakeProc, '9100'), { recursive: true });
-    writeFileSync(join(fakeProc, '9100', 'stat'), `9100 (escaped) S 1 9100 ${filler} 654`);
-    writeFileSync(join(fakeProc, '9100', 'environ'), `PATH=/bin\0BOTMUX_MOJO_TREE_NONCE=nonce-escaped\0`);
+    proc.addProcess({
+      pid: 9100, name: 'escaped', state: 'S', pgid: 9100, startTime: 654,
+      environ: 'PATH=/bin\0BOTMUX_MOJO_TREE_NONCE=nonce-escaped\0',
+    });
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
-      rootPid: 9000, bootId, startTime: 654, nonce: 'nonce-escaped',
+      rootPid: 9000, bootId: proc.bootId, startTime: 654, nonce: 'nonce-escaped',
     });
 
     const sent: number[] = [];
@@ -635,7 +666,7 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     }) as typeof process.kill);
     try {
       class FakeProc extends MojoBackend {
-        protected get procRoot(): string { return fakeProc; }
+        protected get procRoot(): string { return proc.path; }
       }
       const backend = new FakeProc({ model: 'default' } as never, sessionId);
       backend['signalInheritedTree'](9000, false);
@@ -651,14 +682,8 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     // recycled pid that is a stranger's group, which is unrecoverable — so it must
     // be sent ONLY when the recorded identity still verifies.
     const sessionId = 'sess-group-gate';
-    const fakeProc = join(dataDir, 'proc-group-gate');
-    mkdirSync(join(fakeProc, 'sys', 'kernel', 'random'), { recursive: true });
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    writeFileSync(join(fakeProc, 'sys', 'kernel', 'random', 'boot_id'), `${bootId}\n`);
-    const filler = Array.from({ length: 16 }, () => '0').join(' ');
-    mkdirSync(join(fakeProc, '8000'), { recursive: true });
-    writeFileSync(join(fakeProc, '8000', 'stat'), `8000 (root) S 1 8000 ${filler} 321`);
-    writeFileSync(join(fakeProc, '8000', 'environ'), '');
+    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-group-gate' });
+    proc.addProcess({ pid: 8000, state: 'S', pgid: 8000, startTime: 321 });
 
     const sent: number[] = [];
     const realKill = process.kill.bind(process);
@@ -669,7 +694,7 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     }) as typeof process.kill);
     try {
       class FakeProc extends MojoBackend {
-        protected get procRoot(): string { return fakeProc; }
+        protected get procRoot(): string { return proc.path; }
       }
       const backend = new FakeProc({ model: 'default' } as never, sessionId);
       backend['signalInheritedTree'](8000, false);

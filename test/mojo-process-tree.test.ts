@@ -17,7 +17,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  DEFAULT_PROC_ROOT,
   MOJO_TREE_NONCE_ENV,
+  isProcRootOverridden,
   mojoTreeScanSupported,
   quiescenceFromScan,
   readProcessIdentity,
@@ -25,6 +27,7 @@ import {
   scanMojoTree,
   signalTurnTreeGroup,
 } from '../src/adapters/backend/mojo-process-tree.js';
+import { classifyUnprovenTermination } from '../src/adapters/backend/destroy-result.js';
 
 let procRoot: string;
 const NONCE = 'botmux-mojo-deadbeef';
@@ -427,5 +430,58 @@ describe('group signalling is gated on identity', () => {
     );
     expect(out.kind).toBe('unsupported-platform');
     expect(sent).toEqual([]);
+  });
+});
+
+describe('the non-Linux refusal must be reachable from PRODUCTION, not just from tests', () => {
+  // C-7. The gate was `procRoot !== undefined`, and every production caller passes
+  // one: the backend's procRoot getter returns the string '/proc'. So the override
+  // branch was taken unconditionally and the refusal below never fired off Linux.
+  //
+  // Why that mattered more than a dead branch normally would: `unsupported-platform`
+  // routes to a RESIDUAL CLOSE (row published, blocker kept on the durable handle,
+  // remote cancel proceeds), while every other failure -- `unscannable` included --
+  // routes to a FENCE that latches write admission and fails the close. A fence is
+  // correct when a retry might still produce proof. On a host that can never
+  // enumerate at all, it is a permanent wedge, which is precisely the behaviour this
+  // module was previously fixed not to have.
+  it('does NOT treat the DEFAULT procRoot as an override, so the gate stays live in production', () => {
+    expect(isProcRootOverridden(undefined)).toBe(false);
+    expect(isProcRootOverridden(DEFAULT_PROC_ROOT)).toBe(false);
+    expect(isProcRootOverridden('/proc')).toBe(false);
+    expect(isProcRootOverridden('/tmp/synthetic-proc')).toBe(true);
+  });
+
+  it('refuses off-Linux on the EXACT call shape production uses (procRoot = /proc)', () => {
+    // Asserting only on the helper would be a test of the helper. These two are the
+    // real production call shapes, and both must refuse.
+    const scan = scanMojoTree(100, NONCE, { platform: 'darwin', procRoot: DEFAULT_PROC_ROOT });
+    expect(scan.ok).toBe(false);
+    if (!scan.ok) expect(scan.failure.kind).toBe('unsupported-platform');
+
+    const ident = readProcessIdentity(100, { platform: 'darwin', procRoot: DEFAULT_PROC_ROOT });
+    expect(ident.ok).toBe(false);
+    if (!ident.ok) expect(ident.failure.kind).toBe('unsupported-platform');
+  });
+
+  it('routes that refusal to a residual close, NOT to a fence', () => {
+    // The consequence, pinned end to end: the verdict a non-Linux host reaches must
+    // be the one classifyUnprovenTermination turns into 'residual-close'. If the gate
+    // is dead the host reports `unscannable` instead, which fences and wedges.
+    const scan = scanMojoTree(100, NONCE, { platform: 'darwin', procRoot: DEFAULT_PROC_ROOT });
+    const verdict = quiescenceFromScan(scan);
+    expect(verdict.kind).toBe('unsupported-platform');
+    expect(verdict.boundaryProof).toBe(false);
+    expect(classifyUnprovenTermination(verdict.kind).outcome).toBe('residual-close');
+    // And the fence path is what we must NOT be on. This is the exact verdict a
+    // dead gate produces instead, so the two lines together say why C-7 mattered.
+    expect(classifyUnprovenTermination('unscannable').outcome).toBe('fence');
+  });
+
+  it('still lets a synthetic procRoot opt back in off Linux', () => {
+    // The seam has to keep working: that is how every fake-tree case runs anywhere.
+    proc(100, { ppid: 1, pgid: 100, starttime: 4242, nonce: NONCE });
+    const scan = scanMojoTree(100, NONCE, { platform: 'darwin', procRoot });
+    expect(scan.ok).toBe(true);
   });
 });
