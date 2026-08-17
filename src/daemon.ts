@@ -153,6 +153,7 @@ import {
   hasQueuedActivationAdmissionGate,
   sendWorkerSessionInput,
   killWorker,
+  retireWorkerProcessOnly,
   reapOrphanWorkers,
   scheduleCardPatch,
   setCurrentCliVersion,
@@ -268,6 +269,7 @@ import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   getSessionPersistentBackendType,
+  isRemoteBackendSession,
   killPersistentBackendTarget,
   killPersistentSession,
   probePersistentBackendTarget,
@@ -789,6 +791,23 @@ function vcMeetingPersistentBackendAvailable(backendType: PersistentBackendType)
   return ZmxBackend.isAvailable();
 }
 
+/**
+ * VC receiver teardown: this fence's job is to guarantee the local PRODUCER
+ * process is dead before hub replay is admitted. killWorker refuses an
+ * unprepared live remote worker (P0-2) — the fail-safe direction for lineage,
+ * but for THIS caller a silent refusal is fail-OPEN: the pane probes then read
+ * `missing` (mojo has no persistent pane) and the fence cleared while the
+ * producer kept running. Remote-frozen receivers are therefore retired
+ * process-only — no close IPC, no remote cancel, lineage and containment
+ * handles intact — with retireWorkerProcessOnly's SIGTERM→SIGKILL backstop
+ * guaranteeing death; local receivers keep killWorker so their backing
+ * session is torn down as before.
+ */
+function teardownVcReceiverWorker(ds: DaemonSession): void {
+  if (isRemoteBackendSession(ds)) retireWorkerProcessOnly(ds, 'vc_runtime_lease');
+  else killWorker(ds);
+}
+
 let testOnlyVcMeetingBootBackingMissing:
   | ((sessionId: string, destroy: boolean) => boolean)
   | undefined;
@@ -798,8 +817,12 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     return testOnlyVcMeetingBootBackingMissing(sessionId, destroy);
   }
   const ds = findActiveBySessionId(sessionId);
+  // Captured BEFORE teardown: retirement nulls ds.worker while the process
+  // dies asynchronously, and the producer-liveness check below needs the real
+  // ChildProcess to prove the exit.
+  const workerBefore = ds?.worker && !ds.worker.killed ? ds.worker : null;
   if (destroy && ds) {
-    try { killWorker(ds); }
+    try { teardownVcReceiverWorker(ds); }
     catch (err) {
       logger.warn(`[vc-delivery] boot recovery worker teardown failed session=${sessionId}: ${err}`);
     }
@@ -840,6 +863,18 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
         + `backend=${backendType} session=${sessionId}`,
       );
     }
+  }
+  // The worker PROCESS is itself the producer this recovery gates on; pane
+  // probes say nothing about it (mojo has no pane at all, so they always read
+  // `missing`). Clear only once the previously-live worker has actually
+  // exited — the retirement's SIGTERM→SIGKILL backstop makes a later reprobe
+  // see it gone.
+  if (workerBefore && workerBefore.exitCode === null && workerBefore.signalCode === null) {
+    allMissing = false;
+    logger.error(
+      `[vc-delivery] boot recovery worker process still live; receiver remains gated `
+      + `session=${sessionId}`,
+    );
   }
   return allMissing;
 }
@@ -882,9 +917,11 @@ function escalateVcMeetingBootRecovery(key: string, sessionId: string): void {
   vcMeetingReceiverRecoveryTimers.delete(key);
   vcMeetingReceiverRecoveryEscalating.add(key);
   const ds = findActiveBySessionId(sessionId);
-  if (ds) killWorker(ds);
-  // Wait past killWorker's 7s SIGKILL backstop, then direct-kill and probe the
-  // persisted exact backend. exists/unknown stays scoped-gated and reprobes.
+  if (ds) teardownVcReceiverWorker(ds);
+  // Wait past the retirement's SIGTERM→SIGKILL backstop window (killWorker for
+  // local receivers, retireWorkerProcessOnly for remote-frozen ones — a plain
+  // killWorker would REFUSE a live remote worker and arm nothing), then
+  // direct-kill and probe. exists/unknown stays scoped-gated and reprobes.
   scheduleVcMeetingBootRecoveryProbe(
     key,
     sessionId,
@@ -1078,6 +1115,10 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
 
+    // Captured BEFORE teardown: retirement nulls ds.worker while the process
+    // dies asynchronously; the producer-liveness gate below needs the real
+    // ChildProcess to prove the exit.
+    const workerBefore = ds?.worker && !ds.worker.killed ? ds.worker : null;
     if (ds) {
       try { deps.killWorker(ds); }
       catch (err) {
@@ -1126,6 +1167,19 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
           + `attempt=${fence.dispatchAttempt}`,
         );
       }
+    }
+    // The worker PROCESS is itself the producer this fence gates on; pane
+    // probes say nothing about it — mojo owns no pane, so they always read
+    // `missing`, which is exactly how a refused/incomplete teardown became
+    // fail-OPEN (third-round review, gate 3). Clear only once the previously
+    // live worker has actually EXITED; the retirement's SIGTERM→SIGKILL
+    // backstop guarantees a later reprobe sees it gone.
+    if (workerBefore && workerBefore.exitCode === null && workerBefore.signalCode === null) {
+      allMissing = false;
+      deps.error(
+        `[vc-delivery] runtime lease worker process still live; delivery remains gated `
+        + `session=${fence.receiverSessionId} attempt=${fence.dispatchAttempt}`,
+      );
     }
 
     // PTY has no surviving backing process once its worker has crossed the
@@ -1192,8 +1246,11 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         + `session=${fence.receiverSessionId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    // killWorker's live path has a 7s SIGKILL backstop. Only after that window
-    // do we directly kill + probe the deterministic owned pane.
+    // The teardown above arms a SIGTERM→SIGKILL backstop (killWorker's close
+    // path for local receivers; retireWorkerProcessOnly for remote-frozen
+    // ones — a plain killWorker would REFUSE a live remote worker and arm
+    // nothing, which is why the fence used to fail open for mojo). Only after
+    // that window do we directly kill + probe the deterministic owned pane.
     fence.timer = setTimeout(() => {
       if (!isCurrent(fence) || fence.phase !== 'escalating') return;
       teardownAndProbe(fence, 'timeout teardown');
@@ -1382,7 +1439,7 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
     if (!ds.worker || ds.worker.killed) throw new Error('receiver worker is not live');
     ds.worker.send(message);
   },
-  killWorker,
+  killWorker: teardownVcReceiverWorker,
   resolvePersistentScope(ds) {
     const backendType = getSessionPersistentBackendType(ds);
     if (backendType) return backendType;

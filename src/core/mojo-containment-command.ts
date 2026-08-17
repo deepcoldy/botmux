@@ -32,6 +32,7 @@ import {
   containmentHandleKey,
   containmentHandles,
   containmentSessionIds,
+  readBootId,
   revokeContainmentHandles,
   weakHandleRootStillOriginal,
   type ContainmentHandle,
@@ -50,16 +51,40 @@ const USAGE = `用法:
         · 弱 handle 记录的 root 进程仍是原进程且存活；
         · 会话行仍处于 active。`;
 
-/** Best-effort "is this session row still active" — a read of the session
- *  store from the CLI process. Unreadable/unknown does NOT block a revoke
- *  (the gate only rejects on PROVEN liveness); it blocks only a definite
- *  `status === 'active'`. */
+/**
+ * "Is this session row still active" — a STRICT cross-process read of every
+ * session file, from the CLI process.
+ *
+ * Tri-state on purpose (gate-5 review): the store's lenient readers swallow a
+ * parse failure into "no row", which this gate would read as proven-inactive —
+ * silently passing on exactly the corrupted-state day an operator reaches for
+ * this command. Here an unreadable file yields `undefined` ("evidence
+ * unavailable"), which does NOT block the revoke but IS surfaced to the
+ * operator; only a definite `status === 'active'` blocks.
+ */
 async function defaultIsSessionActive(sessionId: string): Promise<boolean | undefined> {
   try {
-    const store = await import('../services/session-store.js');
-    const session = store.getSession(sessionId);
-    if (!session) return false;
-    return session.status === 'active';
+    const [{ config }, { readdirSync, readFileSync }, { join }] = await Promise.all([
+      import('../config.js'),
+      import('node:fs'),
+      import('node:path'),
+    ]);
+    const dir = config.session.dataDir;
+    let sawUnreadable = false;
+    for (const file of readdirSync(dir)) {
+      if (!/^sessions(-[^.]+)?\.json$/.test(file)) continue;
+      try {
+        const data = JSON.parse(readFileSync(join(dir, file), 'utf-8')) as
+          Record<string, { status?: string } | undefined>;
+        const row = data[sessionId];
+        if (row) return row.status === 'active';
+      } catch {
+        // A corrupt file may be the very one hiding this row: unknown, never
+        // "proven inactive".
+        sawUnreadable = true;
+      }
+    }
+    return sawUnreadable ? undefined : false;
   } catch {
     return undefined;
   }
@@ -130,6 +155,16 @@ export async function runMojoContainmentCommand(
         err(USAGE);
         return 1;
       }
+      // Reject stray positionals instead of silently dropping them: a typo'd
+      // second sessionId must not quietly revoke only the first.
+      const strays = rest.filter((a, i) => i > 0
+        && !a.startsWith('--')
+        && !(handleFlag >= 0 && i === handleFlag + 1));
+      if (strays.length > 0) {
+        err(`多余的参数: ${strays.join(' ')}（revoke 一次只处理一个 sessionId）`);
+        err(USAGE);
+        return 1;
+      }
       if (!rest.includes('--yes')) {
         err('撤销会在没有静止证明的情况下丢弃 handle：若子树仍有进程存活，将不再被追踪。');
         err('确认后请追加 --yes 重新执行。');
@@ -147,6 +182,15 @@ export async function runMojoContainmentCommand(
         return 1;
       }
       const liveBlockers: string[] = [];
+      // Evidence-availability surfacing (gate-5 review): "only PROVEN liveness
+      // blocks" must not silently degrade into "no check ran". When the probe
+      // substrate itself is unreadable, say so — the operator decides with
+      // open eyes instead of a gate that quietly became a no-op.
+      if (candidates.some(h => h.kind === 'tree-identity')
+          && readBootId(deps.procRoot ? { procRoot: deps.procRoot } : {}) === null) {
+        err('⚠️ 无法读取 /proc 启动身份（hidepid / 非 Linux？）：弱 handle 的存活检测'
+          + '不可用，不作为拦截依据——撤销前请自行确认子树已消亡。');
+      }
       for (const h of candidates) {
         if (rootStillLive(h)) {
           liveBlockers.push(`${containmentHandleKey(h)}：记录的 root pid `
@@ -156,6 +200,9 @@ export async function runMojoContainmentCommand(
       const active = await (deps.isSessionActive ?? defaultIsSessionActive)(sessionId);
       if (active === true) {
         liveBlockers.push(`session ${sessionId} 的会话行仍处于 active（先 /close 它）`);
+      } else if (active === undefined) {
+        err('⚠️ 会话库不可读：无法判定会话行是否 active，不作为拦截依据——'
+          + '撤销前请自行确认会话已关闭。');
       }
       if (liveBlockers.length > 0 && !force) {
         err('拒绝撤销 —— 以下证据表明目标可能仍在运行（撤销即凭证泄漏面）：');

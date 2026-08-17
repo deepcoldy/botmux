@@ -551,6 +551,16 @@ describe('mojo explicit close', () => {
       taskId: 'mojo-sid-123',
       admission: 'fenced',
     });
+    // PRODUCTION-FAITHFUL fixture (third-round review): every in-process path
+    // that produces a durable uncertain journal also leaves the runtime
+    // uncertain fence on the ds — the combination "durable uncertain + live
+    // worker + clean runtime state" does not exist in production. The takeover
+    // must therefore clear THIS fence too, or the exit is dead code.
+    fixture.ds.remoteCloseState = {
+      phase: 'uncertain',
+      requestId: 'req-crashed',
+      taskId: 'mojo-sid-123',
+    };
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
@@ -574,6 +584,31 @@ describe('mojo explicit close', () => {
     expect(after?.mojoCloseJournal).toBeUndefined();
     // No lineage was parked: the cancel really ran, nothing was left behind.
     expect(after?.mojoQuarantinedLineage).toBeUndefined();
+  });
+
+  it('keeps refusing when the runtime uncertain fence does not match the durable journal', async () => {
+    // The takeover requires runtime and disk to describe the SAME failed
+    // attempt (phase + requestId + lineage). A mismatched pair means they
+    // disagree about which attempt happened; clearing the fence on that would
+    // launder an unknown state into a fresh cancel.
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-disk', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-disk', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+    fixture.ds.remoteCloseState = {
+      phase: 'uncertain',
+      requestId: 'req-OTHER',
+      taskId: 'mojo-sid-123',
+    };
+
+    const result = await closeSession(fixture.session.sessionId);
+    expect(result).toMatchObject({ ok: false, error: 'mojo_close_reconciliation_required' });
+    // Nothing was sent to the worker and nothing closed.
+    expect(fixture.worker.send).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
   });
 
   it('RETRIES the cancel for a journal durably recorded as retryable (P1-2)', async () => {

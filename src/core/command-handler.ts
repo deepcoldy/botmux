@@ -1510,9 +1510,13 @@ export async function handleCommand(
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
             break;
           }
-          if (isRiffBackendSession(ds)) {
-            logger.info(`[${logTag}] Rejected /restart for Riff backend session`);
-            await sessionReply(rootId, t('cmd.restart.riff_unsupported', undefined, loc));
+          // ALL remote backends: destroy-and-respawn severs or replaces the
+          // remote lineage. The riff-only guard let mojo /restart through to
+          // restartCliProcess, which cancels the remote session and cold-boots
+          // a context-less replacement (third-round review, gate 4).
+          if (isRemoteBackendSession(ds)) {
+            logger.info(`[${logTag}] Rejected /restart for remote backend session`);
+            await sessionReply(rootId, t('cmd.restart.remote_unsupported', undefined, loc));
             break;
           }
           // Codex App: an accepted-but-unsettled dispatch still owns the turn
@@ -1655,13 +1659,15 @@ export async function handleCommand(
         break;
       }
       case '/repo': {
-        // A live Riff generation must finish the explicit /close protocol before
-        // its anchor can be reused.  The generic repo-switch path closes and
-        // immediately reforks; if remote cancellation fails, that would fall
-        // through to the double-fork kill and orphan the remote task.
-        if (ds && !ds.pendingRepo && isRiffBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
-          logger.warn(`[${logTag}] Repo switch refused: Riff session requires explicit close before replacement`);
+        // A live REMOTE generation (Riff or Mojo) must finish the explicit
+        // /close protocol before its anchor can be reused. The generic
+        // repo-switch path closes and immediately reforks; if remote
+        // cancellation fails, that would fall through to the double-fork kill
+        // and orphan the remote task — the guard's own rationale, which the
+        // riff-only predicate left open for mojo (third-round review, gate 4).
+        if (ds && !ds.pendingRepo && isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
+          logger.warn(`[${logTag}] Repo switch refused: remote session requires explicit close before replacement`);
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
@@ -4246,10 +4252,12 @@ async function blockRiffTakeover(
   ds: DaemonSession,
   sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
 ): Promise<boolean> {
-  if (!isRiffBackendSession(ds)) return false;
+  // Historical name, remote-wide guard: takeover/import replaces the live
+  // generation, which every remote backend forbids outside prepare/commit.
+  if (!isRemoteBackendSession(ds)) return false;
   const loc = localeForBot(ds.larkAppId);
-  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.riff_unsupported', undefined, loc));
-  logger.warn(`[${tag(ds)}] Takeover refused: Riff session requires explicit close before replacement`);
+  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.remote_unsupported', undefined, loc));
+  logger.warn(`[${tag(ds)}] Takeover refused: remote session requires explicit close before replacement`);
   return true;
 }
 

@@ -1169,14 +1169,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
   }
-  // Riff owns a remote task lineage. Its worker deliberately refuses restart
-  // because destroy + respawn would sever or replace that lineage. Reject at
-  // the daemon boundary so the dashboard never reports HTTP 200 for a no-op.
-  if (isRiffBackendSession(ds)) {
+  // Every REMOTE backend owns a remote lineage that destroy + respawn would
+  // sever or replace (for mojo the worker restart actively cancels the remote
+  // session and cold-boots a context-less replacement). Reject at the daemon
+  // boundary so the dashboard never reports HTTP 200 for a lineage-destroying
+  // restart.
+  if (isRemoteBackendSession(ds)) {
     return jsonRes(res, 409, {
       ok: false,
-      error: 'riff_restart_unsupported',
-      message: t('cmd.restart.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+      error: 'remote_restart_unsupported',
+      message: t('cmd.restart.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
   if (rejectProtectedSessionMutation(res, [ds])) return;

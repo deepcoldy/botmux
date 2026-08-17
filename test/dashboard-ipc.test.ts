@@ -1745,9 +1745,34 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({
       ok: false,
-      error: 'riff_restart_unsupported',
+      error: 'remote_restart_unsupported',
       message: expect.stringMatching(/Riff.*不支持重启.*\/close/),
     });
+    expect(send).not.toHaveBeenCalled();
+    expect(forkSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    forkSpy.mockRestore();
+  });
+
+  it('rejects Mojo restarts with the same remote guard (gate 4: restart cancels the remote session)', async () => {
+    const send = vi.fn();
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-mojo-rst', cliId: 'mojo', backendType: 'mojo' },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-mojo-rst/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'remote_restart_unsupported',
+    });
+    // Neither the restart IPC (whose mojo teardown cancels the remote session)
+    // nor a refork may have fired.
     expect(send).not.toHaveBeenCalled();
     expect(forkSpy).not.toHaveBeenCalled();
     findSpy.mockRestore();

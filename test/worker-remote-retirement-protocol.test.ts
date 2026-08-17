@@ -188,6 +188,12 @@ describe('worker remote retirement protocol', () => {
     // success while the live generation stays on the old cwd. The guard must
     // therefore cover every remote backend (mojo included), and it must sit
     // BEFORE validation/repin in both entrypoints.
+    //
+    // WHY a structural (source-order) assertion rather than a behavioral one:
+    // the property under test is ORDERING — guard precedes mutation. The
+    // behavioral tests (command-handler / ipc-cd-route) prove the rejection
+    // fires and nothing mutates on the tested inputs, but only the source
+    // order proves no input can reach the mutation first. Keep both.
     const commandStart = commandHandlerSource.indexOf("case '/cd':");
     const commandEnd = commandHandlerSource.indexOf("case '/repo':", commandStart);
     const command = commandHandlerSource.slice(commandStart, commandEnd);

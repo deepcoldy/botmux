@@ -97,8 +97,10 @@ import { managedHerdrAgentName } from '../src/adapters/backend/session-backend-s
 import {
   killStalePids,
   killWorker,
+  setActiveSessionSafe,
   teardownAuthoritativePersistentBackingBeforeClose,
 } from '../src/core/worker-pool.js';
+import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 const SID = 'abcd1234-0000-0000-0000-000000000000';
@@ -551,6 +553,41 @@ describe('killWorker — with a live worker (unchanged path)', () => {
       // Worker and remote-task lineage are preserved for a prepared close.
       expect(d.worker, remote).not.toBeNull();
     }
+  });
+
+  it('collision loser: a REMOTE loser is retired process-only, never orphaned (gate 2)', async () => {
+    // The loser's registry entry is deleted right after retirement, so a
+    // killWorker refusal (correct for lineage) left a live credential-carrying
+    // mojo worker unreachable — the P0-new orphan shape through another door.
+    // A remote loser must die as a PROCESS: SIGTERM + backstop, no close IPC
+    // (which the worker refuses request-less), no remote cancel.
+    const send = vi.fn();
+    const kill = vi.fn();
+    const loser = ds({
+      worker: { killed: false, send, kill, once: vi.fn() } as any,
+      session: {
+        sessionId: 'aaaa1111-0000-0000-0000-000000000000',
+        status: 'active',
+        backendType: 'mojo',
+        riffParentTaskId: 'mojo-task-loser',
+      } as any,
+    }, { backendType: 'mojo' });
+    const winner = ds({
+      session: { sessionId: 'bbbb2222-0000-0000-0000-000000000000', status: 'active' } as any,
+    }, { backendType: 'mojo' });
+    const key = activeSessionKey(winner);
+    const map = new Map([[activeSessionKey(loser), loser]]);
+
+    const result = await setActiveSessionSafe(map, key, winner);
+
+    expect(result.accepted).toBe(true);
+    // Process-only retirement: SIGTERM sent, no close IPC, worker slot cleared.
+    expect(kill).toHaveBeenCalledWith('SIGTERM');
+    expect(send).not.toHaveBeenCalled();
+    expect(loser.worker).toBeNull();
+    expect(map.get(key)).toBe(winner);
+    // The remote lineage was NOT cancelled — it stays for manual cleanup.
+    expect(loser.session.riffParentTaskId).toBe('mojo-task-loser');
   });
 
   it('still retires a live remote worker when the prepare/commit requestId is carried (P0-2)', () => {

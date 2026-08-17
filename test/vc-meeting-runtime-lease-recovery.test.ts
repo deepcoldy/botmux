@@ -87,6 +87,9 @@ function harness(input: {
   missingPersistentScope?: FakeSession['testPersistentScope'];
   backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => boolean;
   retireDispatch?: (sessionId: string, turnId: string, dispatchAttempt: number) => boolean;
+  /** Override the teardown; the default kills. A no-op models killWorker's
+   *  refusal of an unprepared live remote worker (P0-2). */
+  killWorker?: (ds: FakeSession) => void;
 } = {}) {
   const sessions = new Map((input.sessions ?? []).map(ds => [ds.session.sessionId, ds]));
   const sent: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
@@ -108,7 +111,8 @@ function harness(input: {
     },
     killWorker: (ds: FakeSession) => {
       killed.push(ds.session.sessionId);
-      ds.worker = null;
+      if (input.killWorker) input.killWorker(ds);
+      else ds.worker = null;
     },
     resolvePersistentScope: (ds: FakeSession) => ds.testPersistentScope ?? 'unknown',
     resolveMissingPersistentScope: () => input.missingPersistentScope ?? 'unknown',
@@ -192,6 +196,41 @@ describe('VC meeting runtime lease recovery', () => {
 
     probeState = 'missing';
     await vi.advanceTimersByTimeAsync(8_000);
+    expect(h.recovery.snapshot()).toEqual([]);
+  });
+
+  it('never clears while the producer worker process is still live (gate 3: mojo fail-open)', async () => {
+    // A mojo-shaped receiver: persistent scope 'unknown', no backend installed,
+    // so every pane probe reads `missing` — and a teardown that leaves the
+    // worker running (killWorker refuses an unprepared live remote worker,
+    // P0-2). Before the producer-liveness gate, allMissing was true and the
+    // fence cleared while the producer process kept running: hub replay could
+    // then double-deliver.
+    const live = fakeSession({ persistentScope: 'unknown' });
+    (live.worker as unknown as { exitCode: number | null; signalCode: string | null }).exitCode = null;
+    (live.worker as unknown as { exitCode: number | null; signalCode: string | null }).signalCode = null;
+    const h = harness({
+      sessions: [live],
+      backendAvailable: () => false,
+      killWorker: () => { /* refused: live remote worker without prepare/commit */ },
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    expect(h.recovery.acknowledge({
+      sessionId: 'session_a', turnId: 'delivery_a', dispatchAttempt: 1,
+      workerGeneration: 7, disposition: 'cli_fenced',
+    })).toBe(false);
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    // Zero surviving panes — but the producer process is alive, so the fence
+    // MUST stay gated.
+    expect(h.recovery.snapshot()).not.toEqual([]);
+    expect(h.errors.some(m => m.includes('worker process still live'))).toBe(true);
+
+    // The retirement backstop finally lands: the process exits, and the next
+    // reprobe clears the fence.
+    (live.worker as unknown as { exitCode: number | null }).exitCode = 0;
+    await vi.advanceTimersByTimeAsync(180_000);
     expect(h.recovery.snapshot()).toEqual([]);
   });
 

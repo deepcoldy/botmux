@@ -82,7 +82,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendType, isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -2542,6 +2542,43 @@ export function killWorker(
   ds.workerViewToken = null;
 }
 
+/**
+ * Retire the worker PROCESS only — no close semantics of any kind.
+ *
+ * No `close` IPC (a request-less remote close is refused by the worker, and a
+ * local one would destroy the backing session), no remote cancel, lineage and
+ * containment handles intact. SIGTERM is sent immediately (the worker's
+ * handler runs killCli() — for mojo that is backend.kill(), which by contract
+ * never cancels the remote session) and armWorkerKillBackstop guarantees
+ * SIGKILL if it wedges.
+ *
+ * For callers that must make a worker generation DIE while its logical/remote
+ * state lives on: the collision loser (its registry entry is deleted right
+ * after, so a refused killWorker left a live credential-carrying worker
+ * unreachable — the P0-new orphan shape) and the VC runtime-lease fence
+ * (which must prove the local producer process dead before admitting replay).
+ */
+export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
+  restartCoordinator.cancelSession(ds.session.sessionId);
+  clearUsageLimitState(ds);
+  ds.workerReady = false;
+  clearUsageRefreshTimer(ds);
+  ds.localProcessAttestation = undefined;
+  ds.managedTurnOrigin = undefined;
+  invalidateStuckWarning(ds, reason);
+  invalidateTuiPrompt(ds, reason);
+  const w = ds.worker;
+  if (w && !w.killed) {
+    trackLifecycleRetirement(ds, w);
+    try { w.kill('SIGTERM'); } catch { /* already gone */ }
+    armWorkerKillBackstop(w, tag(ds));
+  }
+  ds.worker = null;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  ds.workerViewToken = null;
+}
+
 function clearTransferWorkerState(
   ds: DaemonSession,
   worker: ChildProcess | null,
@@ -3298,10 +3335,33 @@ async function prepareLiveRemoteWorkerClose(
     };
   }
   if (ds.remoteCloseState) {
-    // An `uncertain` fence is NOT a retry candidate: nothing here can prove the
-    // remote session gone, so reporting it as retryable invited an infinite
-    // close loop that re-fenced the same unresolved state forever.
-    if (backendType === 'mojo' && ds.remoteCloseState.phase === 'uncertain') {
+    const runtimeUncertain = backendType === 'mojo'
+      && ds.remoteCloseState.phase === 'uncertain';
+    // A runtime `uncertain` fence used to be a dead end: "a blind retry proves
+    // nothing" was true when the journal refused every restart, so /close
+    // failed with retryable:false for the daemon's whole lifetime and the only
+    // exit was a daemon restart — a process-level soft deadlock (third-round
+    // review, gate 1). The retry is no longer blind: an explicit close with a
+    // LIVE worker re-runs the full destroySession, which can produce fresh
+    // evidence. When the runtime fence and the DURABLE journal describe the
+    // same failed attempt — same phase, same requestId, same lineage — the
+    // fence is cleared and the close re-enters prepare under a new requestId
+    // (beginMojoCloseJournal accepts the uncertain takeover). Anything less
+    // than an exact match keeps the refusal: a mismatched pair means runtime
+    // and disk disagree about which attempt happened, and clearing on that
+    // would launder an unknown state.
+    const durableForTakeover = ds.session.mojoCloseJournal;
+    const takeoverEligible = runtimeUncertain
+      && durableForTakeover?.phase === 'uncertain'
+      && durableForTakeover.requestId === ds.remoteCloseState.requestId
+      && (durableForTakeover.taskId ?? undefined) === (ds.remoteCloseState.taskId ?? undefined);
+    if (takeoverEligible) {
+      logger.warn(
+        `[${tag(ds)}] explicit close takes over uncertain Mojo journal `
+        + `(${ds.remoteCloseState.requestId}); re-running the cancel through the live worker`,
+      );
+      ds.remoteCloseState = undefined;
+    } else if (runtimeUncertain) {
       return {
         ok: false,
         error: 'mojo_close_reconciliation_required',
@@ -3309,13 +3369,14 @@ async function prepareLiveRemoteWorkerClose(
         recovery: 'uncertain',
         ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
       };
+    } else {
+      return {
+        ok: false,
+        error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+        retryable: true,
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
     }
-    return {
-      ok: false,
-      error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
-      retryable: true,
-      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
-    };
   }
   const requestId = randomUUID();
   if (backendType === 'mojo') {
@@ -5152,7 +5213,19 @@ async function closeUnregisteredCollisionLoser(
     return { ok: false, error: 'durable_close_failed' };
   }
 
-  killWorker(loser);
+  // The registry entry is deleted right below, so the loser's worker MUST
+  // actually die here. killWorker refuses an unprepared live remote worker
+  // (P0-2) — correct for lineage, but on this path the refusal recreated the
+  // P0-new orphan: row closed, registry cleared, credential-carrying worker
+  // alive and unreachable. A remote loser is therefore retired process-only
+  // (no close IPC, no remote cancel — its lineage stays on the closed row for
+  // manual cleanup, mirroring the drain's isolation-over-deletion shape),
+  // while local losers keep killWorker so their backing session is destroyed.
+  if (isRemoteBackendSession(loser)) {
+    retireWorkerProcessOnly(loser, 'collision_loser');
+  } else {
+    killWorker(loser);
+  }
   for (const [registeredKey, candidate] of map) {
     if (candidate === loser) map.delete(registeredKey);
   }

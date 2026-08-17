@@ -293,6 +293,70 @@ describe('operator revocation is the ONLY unproven exit (P1-3)', () => {
         expect(err.join('\n')).toMatch(/账本不可用/);
     });
 
+    it('records the --force override in the OPERATOR REVOCATION audit line', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const { logger } = await import('../src/utils/logger.js');
+        const warnSpy = vi.spyOn(logger, 'warn');
+        const dataDir = freshDataDir();
+        const procRoot = fakeProc({ bootId: BOOT, pids: { 4242: 999 } });
+        recordContainmentHandle(weak(), dataDir);
+        try {
+            expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes', '--force'], {
+                dataDir,
+                procRoot,
+                isSessionActive: () => false,
+                stdout: () => { /* ignore */ },
+                stderr: () => { /* ignore */ },
+            })).toBe(0);
+            const auditLines = warnSpy.mock.calls.map(c => String(c[0]))
+                .filter(l => l.includes('OPERATOR REVOCATION'));
+            expect(auditLines).toHaveLength(1);
+            expect(auditLines[0]).toContain('--force past LIVE evidence');
+            expect(auditLines[0]).toContain('4242');
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
+    it('rejects unknown flags and stray positionals instead of silently ignoring them', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        const err: string[] = [];
+        const deps = {
+            dataDir,
+            isSessionActive: () => false,
+            stdout: () => { /* ignore */ },
+            stderr: (l: string) => err.push(l),
+        };
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes', '--wipe-all'], deps)).toBe(1);
+        expect(err.join('\n')).toMatch(/未知参数/);
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', 'sess-2', '--yes'], deps)).toBe(1);
+        expect(err.join('\n')).toMatch(/多余的参数/);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+    });
+
+    it('surfaces "evidence unavailable" instead of a silently passing gate', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        // A procRoot with no boot_id models hidepid/non-Linux: the weak-handle
+        // liveness probe cannot run at all — the gate must SAY so, not no-op.
+        const bareProcRoot = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        const err: string[] = [];
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], {
+            dataDir,
+            procRoot: bareProcRoot,
+            isSessionActive: () => undefined,   // session store unreadable
+            stdout: () => { /* ignore */ },
+            stderr: (l: string) => err.push(l),
+        })).toBe(0);
+        expect(err.join('\n')).toMatch(/存活检测/);
+        expect(err.join('\n')).toMatch(/会话库不可读/);
+        // Unavailable evidence never blocks — it informs.
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
+    });
+
     it('rejects a --handle whose value is another switch instead of eating --yes', async () => {
         const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
         const dataDir = freshDataDir();

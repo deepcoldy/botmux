@@ -16638,6 +16638,14 @@ process.on('message', async (raw: unknown) => {
         log('Refused Riff generation restart; the existing lineage-owning worker is retained');
         break;
       }
+      // Mojo is deliberately NOT refused here (unlike riff): the mojo restart
+      // teardown cancels the remote session and cold-boots a replacement, and
+      // internal machinery (per-bot env hot updates, backend-replacement tests)
+      // relies on that. USER-facing restart for every remote backend is instead
+      // rejected at the daemon boundary — /restart in command-handler and the
+      // dashboard restart route both gate on isRemoteBackendSession — so a
+      // restart IPC that reaches a mojo worker is a daemon-internal decision,
+      // not a user command that would silently destroy remote context.
       // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
