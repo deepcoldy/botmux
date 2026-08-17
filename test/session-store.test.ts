@@ -420,6 +420,56 @@ describe('closeSession()', () => {
     });
   });
 
+  // `previewTarget` is the literal loopback (host, port) an agent registered
+  // with `botmux preview <port>`; the dashboard proxy dials it by host/port
+  // alone. A closed session owns no port any more, and the OS may hand that
+  // number to an unrelated local server — so it must not survive in the row.
+  it('clears the registered preview target from the closed row data', () => {
+    const session = createSession('chat1', 'root1', 'Close Preview');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
+
+    // Atomic with status='closed': neither the parsed row nor the raw file
+    // (read by offline/cross-store row readers) may still carry the target.
+    init();
+    expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
+    const raw = readFileSync(join(tempDir, 'sessions.json'), 'utf-8');
+    expect(raw).not.toContain('previewTarget');
+    expect(raw).not.toContain('4173');
+  });
+
+  it('keeps the preview target in memory when the atomic close save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Preview Save Failure');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(session.sessionId))
+      .toThrow(/simulated session repair write failure/);
+
+    // The close did not happen, so the still-active session keeps proxying its
+    // own live port — rollback must restore the field with the rest of the row.
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.previewTarget).toEqual({
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    });
+  });
+
   it('should call deleteFrozenCards with the sessionId', () => {
     const session = createSession('chat1', 'root1', 'Frozen');
     closeSession(session.sessionId);
@@ -477,6 +527,29 @@ describe('reactivateClosedSession()', () => {
     expect(reloaded.queuedActivationToken).toBeUndefined();
     expect(reloaded.queuedActivationInput).toBeUndefined();
     expect(reloaded.queuedActivationTail).toBeUndefined();
+  });
+
+  it('does not revive a preview target left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Preview');
+    closeSession(session.sessionId);
+    // Rows closed by a build older than the close-path cleanup still carry the
+    // target on disk. Resume starts a new worker generation that has registered
+    // no port, so reactivation must not hand the proxy the old host/port.
+    const legacy = getSession(session.sessionId)!;
+    legacy.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+
+    init();
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.previewTarget).toBeUndefined();
   });
 });
 

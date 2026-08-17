@@ -346,6 +346,15 @@ async function waitForText(page: Page, text: string): Promise<void> {
   await page.getByText(text, { exact: false }).first().waitFor();
 }
 
+/** 行操作浮层平时是 opacity:0 / pointer-events:none，悬停或聚焦才出现。不先 hover
+ *  就点，点击会被铺满整行的聊天锚点（.wb-session-copy-link::after）吃掉。 */
+async function rowAction(page: Page, title: string | RegExp, action: 'terminal' | 'terminal-control'): Promise<void> {
+  const row = page.getByRole('option', { name: title });
+  await row.waitFor();
+  await row.hover();
+  await row.locator(`.wb-session-row-action.is-${action}`).click();
+}
+
 try {
   await scenario('h5_success', async () => {
     const context = await localContext({ width: 1280, height: 800 });
@@ -403,30 +412,41 @@ try {
     await context.close();
   });
 
-  await scenario('workbench_success_and_chat', async () => {
+  // 原名 workbench_success_and_chat。页内聊天挂件（Native chat 按钮 + h5sdk
+  // toggleChat）已被有意移除——聊天现在是行内那个真锚点，交给飞书客户端自己开，
+  // 所以那几条断言删掉，换成「锚点形态正确 + 完全没走 JS SDK」的守卫。
+  await scenario('workbench_route_switch_and_terminal_control', async () => {
     const context = await authenticatedContext();
     const page = await context.newPage();
+    // 仍然给页面挂一个「能用」的 h5sdk（sdk=toggle-success）——正因为它可用，
+    // 下面那条 sdkCalls 为空的断言才有意义：不是没得调，是这条路已经不走了。
     await page.goto(`${base}/?scenario=success&sdk=toggle-success`);
     await page.locator('.agent-workbench-page').waitFor();
-    await page.getByRole('option', { name: /Secondary session for route switching/ }).click();
+    // 工作区默认收起（.wb-desktop-layout.is-terminal-closed 把它整块隐藏，列表铺满），
+    // 只有行内「终端 / 接管」才会把它开出来——所以路由切换也从行操作走。
+    assert.equal(await page.locator('.wb-desktop-layout.is-terminal-closed').count(), 1);
+    await rowAction(page, /Secondary session for route switching/, 'terminal');
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
-    await page.getByRole('option', { name: /Integrated Workbench browser scenario/ }).click();
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
+    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal-control');
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
-    await page.getByRole('button', { name: 'Take control' }).click();
+    // 「接管」= 开面板并自动请求写权限，不需要再点一次面板里的按钮。
     await page.locator('.wb-mode-chip.is-controlled').waitFor();
-    await page.getByRole('button', { name: 'Enable interaction' }).click();
-    await page.locator('.wb-mode-chip.is-interactive').waitFor();
-    const previewGuard = page.frameLocator('.wb-web-pane iframe.wb-pane-frame');
-    await previewGuard.locator('#overlay').waitFor({ state: 'hidden' });
-    await waitForText(page, '不是应用级强只读安全边界');
-    await page.getByRole('button', { name: 'Native chat' }).click();
-    await waitForText(page, 'Native chat is open in the external right slot');
-    assert.deepEqual(await page.evaluate(() => window.__workbenchHarness?.sdkCalls), ['toggleChat']);
-    await page.getByRole('button', { name: 'Release' }).click();
+    await waitForText(page, '已接管，可键盘输入。');
+    // 聊天必须是 target=_blank rel=noopener 的真锚点：脚本化打开（window.open /
+    // 合成 click / enterChat）会被飞书客户端降级到窄容器，这正是当初那个 bug。
+    const chatAnchor = page.getByRole('option', { name: /Integrated Workbench browser scenario/ })
+      .locator('a.wb-session-row-action.is-chat');
+    assert.equal(await chatAnchor.getAttribute('target'), '_blank');
+    assert.equal(await chatAnchor.getAttribute('rel'), 'noopener');
+    assert.match(await chatAnchor.getAttribute('href') ?? '', /^https:\/\/applink\.feishu\.cn\/client\/chat\/open\?/);
+    assert.deepEqual(await page.evaluate(() => window.__workbenchHarness?.sdkCalls), []);
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '释放输入' }).click();
     await page.locator('.wb-mode-chip.is-readonly').waitFor();
-    await page.getByRole('button', { name: 'Lock now' }).click();
-    await page.locator('.wb-mode-chip.is-preview').waitFor();
-    await previewGuard.locator('#overlay:not(.hidden)').waitFor();
+    // 关掉面板，工作区收回，列表重新铺满。
+    await page.locator('.wb-workspace-controls').getByRole('button', { name: '关闭终端' }).click();
+    await page.locator('.wb-desktop-layout.is-terminal-closed').waitFor();
+    assert.equal(await page.locator('.wb-terminal-pane').count(), 0);
     await context.close();
   });
 
@@ -434,8 +454,10 @@ try {
     const context = await authenticatedContext();
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=failure`);
-    await waitForText(page, 'Owning daemon is offline');
-    await waitForText(page, 'Relocked safely: preview unreachable');
+    await rowAction(page, /Workbench failure boundary/, 'terminal-control');
+    // 控制权接口 503 daemon_offline → 面板报错并停在只读，不会假装接管成功。
+    await waitForText(page, '所属 daemon 已离线');
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
     await context.close();
   });
 
@@ -443,8 +465,10 @@ try {
     const context = await localContext({ width: 1280, height: 800 });
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=success&authenticated=false`);
-    await waitForText(page, 'Authentication required');
-    await waitForText(page, 'Relocked safely: Authentication required');
+    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+    // 未登录只给只读，接管按钮根本不渲染——不是渲染出来再报错。
+    await waitForText(page, '只读查看。登录 Dashboard 后可接管。');
+    assert.equal(await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).count(), 0);
     const statuses = await page.evaluate(async () => ({
       preview: (await fetch('/preview/browser-success/ping')).status,
       h5Context: (await fetch('/api/workbench/h5-context')).status,
@@ -458,9 +482,16 @@ try {
     const page = await mobile.newPage();
     await page.goto(`${base}/?scenario=success`);
     await page.locator('.agent-workbench-page[data-responsive-step="mobile-stack"]').waitFor();
-    assert.equal(await page.locator('.wb-mobile-nav').count(), 1);
+    // 窄屏是「列表 → 详情」的下钻，不是页内 tab 栏：飞书自己的底部 tab 已经占了
+    // 一层导航，页内再来一条会吃掉终端高度。分屏也已移除。
+    assert.equal(await page.locator('.wb-mobile-stack').count(), 1);
+    assert.equal(await page.locator('.wb-mobile-nav').count(), 0);
     assert.equal(await page.locator('.wb-pane-split').count(), 0);
-    await page.getByRole('button', { name: 'Sessions' }).click();
+    await page.locator('.wb-session-list').waitFor();
+    // 点一行钻进工作区，再用「‹ 会话列表」退回来。
+    await page.getByRole('option', { name: /Integrated Workbench browser scenario/ }).click();
+    await page.locator('.wb-mobile-detail').waitFor();
+    await page.locator('.wb-mobile-back').click();
     await page.locator('.wb-session-list').waitFor();
     await mobile.close();
 
@@ -471,6 +502,29 @@ try {
     assert.equal(await dock.locator('.agent-workbench-dock').evaluate(element => getComputedStyle(element).minWidth), '350px');
     assert.equal(await dock.locator('.wb-pane').count(), 0);
     await sidebar.close();
+  });
+
+  // 网页预览面板如今只在窄屏的「网页」页签下存在——桌面工作区只承载终端。
+  // 交互解锁/回锁这条契约因此整体搬到移动视口来验。
+  await scenario('mobile_preview_interaction', async () => {
+    const context = await authenticatedContext({ width: 390, height: 844 });
+    const page = await context.newPage();
+    await page.goto(`${base}/?scenario=success`);
+    await page.locator('.agent-workbench-page[data-responsive-step="mobile-stack"]').waitFor();
+    await page.getByRole('option', { name: /Integrated Workbench browser scenario/ }).click();
+    await page.locator('.wb-mobile-detail').waitFor();
+    await page.locator('.wb-mobile-detail-seg').getByRole('button', { name: '网页' }).click();
+    await page.locator('.wb-web-pane').waitFor();
+    const previewGuard = page.frameLocator('.wb-web-pane iframe.wb-pane-frame');
+    await previewGuard.locator('#overlay:not(.hidden)').waitFor();
+    await page.locator('.wb-web-pane').getByRole('button', { name: '开启交互' }).click();
+    await page.locator('.wb-mode-chip.is-interactive').waitFor();
+    await previewGuard.locator('#overlay').waitFor({ state: 'hidden' });
+    await waitForText(page, '不是应用级强只读安全边界');
+    await page.locator('.wb-web-pane').getByRole('button', { name: '立即锁定' }).click();
+    await page.locator('.wb-mode-chip.is-preview').waitFor();
+    await previewGuard.locator('#overlay:not(.hidden)').waitFor();
+    await context.close();
   });
 
   await scenario('preview_registration_and_proxy_boundaries', async () => {

@@ -472,7 +472,7 @@ import {
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
-import { maybeBirthSessionGroup } from './core/session-group-birth.js';
+import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle } from './services/session-group-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
@@ -17080,6 +17080,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 「话题内发送 + 同时发送到会话」的消息 root_id 为空但带 thread_id——
     // 语境属于既有话题，绝不当全新会话建群（回退 thread 旧行为）。
     && !data?.message?.thread_id
+    // 斜杠命令判定必须**早于扣费**：/help、/login、/close 本来就不进 CLI，既不该
+    // 被预扣一次额度，也不该在额度耗尽时被这道闸静默丢掉（下面的 return 会让命令
+    // 根本执行不到）。maybeBirthSessionGroup 对同一条消息本就返回 null（命令不建
+    // 群），所以这里只是把它的结论提前一步，建群行为一字未改；命令随后照常走
+    // parseSlashCommandInvocation 分支，真正会注入 CLI 的消息（含未注册的 /foo，
+    // 它落不进命令分支）仍由下面 pre-worker 那道闸按原样扣一次费——净扣费不变。
+    // 谓词刻意复用 birth 内部的同一个：两侧同源才能保证「跳过扣费」与「不建群」
+    // 是同一个判断——窄于它会退回本 bug，宽于它则会让本该建群的消息不再建群。
+    && !declinesSessionGroupBirthAsSlashCommand(data)
   ) {
     // A quota denial must have zero external side effects. Charge the original
     // DM before creating the real Feishu chat, then mark the rewritten turn so

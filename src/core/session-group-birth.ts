@@ -41,6 +41,26 @@ export function buildPlaceholderName(text: string | null, prefix: string, locale
   return `${prefix}${base}`;
 }
 
+/**
+ * Does this inbound message decline session-group birth because it is a slash
+ * command? Exported so the CALLER can ask BEFORE it charges message quota.
+ *
+ * A command (`/help`, `/login`, `/close`, …) never reaches a CLI, so it must
+ * neither spend a quota unit nor be blocked by an exhausted one — but the
+ * pre-birth charge has to run before the real Feishu chat is created (a quota
+ * denial must have zero external side effects), i.e. long before the router's
+ * own slash parsing. Hoisting THIS predicate is what keeps both invariants.
+ *
+ * Single source of truth on purpose: the caller's "skip the charge" decision and
+ * this function's "don't birth" decision have to be the SAME decision. A caller
+ * predicate NARROWER than this one re-opens the charge-a-command bug; a WIDER
+ * one silently stops births for messages this function would still birth. Both
+ * sides must call this.
+ */
+export function declinesSessionGroupBirthAsSlashCommand(data: any): boolean {
+  return (extractMessageTextForRouting(data?.message) ?? '').trim().startsWith('/');
+}
+
 export async function maybeBirthSessionGroup(
   data: any,
   ctx: RoutingContext,
@@ -56,7 +76,9 @@ export async function maybeBirthSessionGroup(
   const trimmed = (text ?? '').trim();
   // Slash commands (daemon or passthrough) must never birth a group — /close,
   // /login, /relay … are conversation-management, not conversations.
-  if (trimmed.startsWith('/')) return null;
+  // Shared predicate: handleNewTopic asks the same question before charging
+  // quota, so a command is neither charged nor blocked by an exhausted quota.
+  if (declinesSessionGroupBirthAsSlashCommand(data)) return null;
 
   const prefix = sg.namePrefix ?? '';
   const placeholder = buildPlaceholderName(text, prefix, locale);

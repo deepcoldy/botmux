@@ -45,15 +45,12 @@ const sessions: WorkbenchSessionRow[] = Array.from({ length: 320 }, (_, index) =
   return base;
 });
 
+// 工作台如今只读这两项布局偏好（分屏/信息抽屉/页内聊天已移除），种子里就不再
+// 塞 paneMode/splitAxis/chatRequested 那些不再驱动任何东西的键。
 window.localStorage.setItem(workbenchLayoutStorageKey(SESSION_ID), JSON.stringify({
   version: 1,
   railWidth: 246,
   railCollapsed: false,
-  focus: 'terminal',
-  paneMode: 'split',
-  splitAxis: 'horizontal',
-  splitRatio: 0.48,
-  chatRequested: true,
 }));
 
 const api: WorkbenchApi = {

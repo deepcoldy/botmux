@@ -61,8 +61,14 @@ const sdk: FeishuJsApi = {
   toggleChat(options) { callOrder.push('toggleChat'); options.fail?.(); },
   enterChat(options) { callOrder.push('enterChat'); options.success?.(); },
 };
-assert.deepEqual(await openWorkbenchChat({ chatId: 'oc_x', preferSplit: true, sdk }), { kind: 'native-jump', method: 'enterChat' });
-assert.deepEqual(callOrder, ['toggleChat', 'enterChat']);
+// 被明确拒绝的 toggleChat 不再叠加 enterChat：两者需要同一份 JSAPI 授权，enterChat
+// 只会以同样的理由失败，还要整页跳转把工作台顶掉。直接回落 AppLink，由客户端安排会话窗口。
+assert.deepEqual(await openWorkbenchChat({ chatId: 'oc_x', preferSplit: true, sdk }), {
+  kind: 'applink',
+  method: 'AppLink',
+  url: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_x',
+});
+assert.deepEqual(callOrder, ['toggleChat']);
 const dockLink = buildWorkbenchWebAppLink({ appId: 'cli_x', surface: 'dock', targetOrigin: 'https://dash.example' });
 assert.match(dockLink ?? '', /mode=sidebar/);
 assert.match(dockLink ?? '', /min_width=350/);

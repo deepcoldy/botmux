@@ -14,6 +14,11 @@ import {
   loadPersistedToken, loadOrCreatePersistedToken, persistToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from '../src/dashboard/auth.js';
+import {
+  projectSessionEventForAudience,
+  projectSessionsForAudience,
+  sessionBoardAudienceFor,
+} from '../src/dashboard/public-redact.js';
 import { UnsafeHostAuthorityFileError } from '../src/platform/secure-host-file.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
@@ -1054,5 +1059,62 @@ describe('Workbench H5 capability boundary', () => {
     expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/' }).kind).toBe('allow');
     expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/assets/dashboard.js' }).kind).toBe('allow');
     expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/api/settings' }).kind).toBe('deny401');
+  });
+
+  // The capability grant and the payload projection are decided in two different
+  // modules; they drifted apart once already. `/api/sessions` + `/events` were
+  // granted as `workbench.view` while dashboard.ts kept projecting them with the
+  // ANONYMOUS redactor, so the identity that holds `preview.view` /
+  // `preview.operate` was served rows with the `preview` descriptor deleted.
+  describe('granted capability vs delivered payload', () => {
+    const previewRow = {
+      sessionId: 's1',
+      status: 'working',
+      preview: { path: '/preview/s1/', registeredAt: '2026-08-11T12:00:00.000Z' },
+      riffAccessUrl: 'https://abc123.sandbox.example/term',
+    };
+
+    it('serves the preview descriptor on every path the H5 identity may read', () => {
+      const audience = sessionBoardAudienceFor({ legacyAuthed: false, workbenchIdentity: true });
+      expect(audience).toBe('workbench');
+
+      // Exactly the two session-board paths granted `workbench.view`…
+      for (const pathname of ['/api/sessions', '/events']) {
+        expect(workbenchH5Capability('GET', pathname), pathname).toBe('workbench.view');
+        expect(decideWorkbenchH5Auth({ method: 'GET', pathname }).kind, pathname).toBe('allow');
+      }
+      // …and the preview capabilities that operate on what those paths carry.
+      expect(workbenchH5Capability('GET', '/api/sessions/s1/preview')).toBe('preview.view');
+      expect(workbenchH5Capability('POST', '/api/sessions/s1/preview-interaction/unlock')).toBe('preview.operate');
+
+      const [rest] = projectSessionsForAudience([previewRow], audience) as any[];
+      expect(rest.preview).toEqual(previewRow.preview);
+      const sse = projectSessionEventForAudience('session.spawned', { session: previewRow }, audience) as any;
+      expect(sse.session.preview).toEqual(previewRow.preview);
+    });
+
+    it('keeps the sandbox write URL aligned with the write-link denial', () => {
+      // /write-link is refused to Workbench identities through the front door,
+      // so the session board must not hand the same bearer URL out the side.
+      expect(workbenchH5Capability('GET', '/api/sessions/s1/write-link')).toBeNull();
+      const audience = sessionBoardAudienceFor({ legacyAuthed: false, workbenchIdentity: true });
+      const [rest] = projectSessionsForAudience([previewRow], audience) as any[];
+      expect(rest).not.toHaveProperty('riffAccessUrl');
+    });
+
+    it('a tokenless visitor is still anonymous even though the same paths are public-read', () => {
+      // publicReadOnly opens the same two paths, but to an identity-less viewer —
+      // the widened projection must not follow the path, only the identity.
+      expect(decideDashboardAuth({
+        method: 'GET', pathname: '/api/sessions', hasTokenParam: false,
+        presentedToken: undefined, activeToken: 'a'.repeat(43), publicReadOnly: true,
+      }).kind).toBe('allow');
+
+      const audience = sessionBoardAudienceFor({ legacyAuthed: false, workbenchIdentity: false });
+      expect(audience).toBe('anonymous');
+      const [rest] = projectSessionsForAudience([previewRow], audience) as any[];
+      expect(rest).not.toHaveProperty('preview');
+      expect(rest).not.toHaveProperty('riffAccessUrl');
+    });
   });
 });

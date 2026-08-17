@@ -545,10 +545,22 @@ export function closeSession(
     const priorRiffParentTaskId = session.riffParentTaskId;
     const priorDashboardAttachments = session.dashboardAttachments;
     const priorQueuedAttachments = session.queuedAttachments;
+    const priorPreviewTarget = session.previewTarget;
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     session.dashboardAttachments = undefined;
     session.queuedAttachments = undefined;
+    // `previewTarget` is a live loopback (host, port) the session's agent
+    // registered with `botmux preview <port>` for its CURRENT worker
+    // generation — routing state, not a durable property of the conversation.
+    // A closed session owns no port any more, and the OS is free to hand that
+    // number to an unrelated local server; the preview proxy dials a target by
+    // host/port alone, so a retained value would let a later reader (resume,
+    // an offline row copy, a dashboard snapshot) proxy the user into someone
+    // else's service. Drop it in the same atomic save as status='closed'.
+    // Cleanup only: registration and proxying are untouched, and a resumed
+    // session simply re-runs `botmux preview <port>`.
+    session.previewTarget = undefined;
     // Riff cancellation has already completed before this durable transition.
     // Clear its retry handle in the same atomic save as status='closed'.
     if (opts.clearRiffParentTaskId) session.riffParentTaskId = undefined;
@@ -560,6 +572,7 @@ export function closeSession(
       session.riffParentTaskId = priorRiffParentTaskId;
       session.dashboardAttachments = priorDashboardAttachments;
       session.queuedAttachments = priorQueuedAttachments;
+      session.previewTarget = priorPreviewTarget;
       throw err;
     }
     if (session.larkAppId && priorDashboardAttachments?.length) {
@@ -588,6 +601,10 @@ export function closeSession(
  * since 2026-07, but older closed rows can still contain prepared input.  A
  * generic resume is an explicit new lifecycle and must never revive that
  * abandoned FIFO.
+ *
+ * `previewTarget` is cleared here for the same reason: closeSession() now drops
+ * it, but rows closed by an older build still carry one on disk, and resume
+ * starts a new worker generation that has not registered any port.
  */
 export function reactivateClosedSession(
   sessionId: string,
@@ -617,6 +634,7 @@ export function reactivateClosedSession(
     queuedActivationTail: session.queuedActivationTail,
     queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
     pendingRepoSetup: session.pendingRepoSetup,
+    previewTarget: session.previewTarget,
   };
 
   session.status = 'active';
@@ -637,6 +655,7 @@ export function reactivateClosedSession(
   session.queuedActivationTail = undefined;
   session.queuedActivationTailNextOrder = undefined;
   session.pendingRepoSetup = undefined;
+  session.previewTarget = undefined;
 
   try {
     save();

@@ -66,6 +66,14 @@ export interface AgentWorkbenchViewProps {
 
 type MobilePage = 'sessions' | 'workspace' | 'preview' | 'info';
 
+/**
+ * 终端面板的完整意图：开在**哪个会话**上，以及这次开是否**带接管**。
+ * 两者必须原子地一起变。拆成两个 state 时，「面板跟随选中切会话」只改了会话 id，
+ * 接管意图原封不动留着 —— 于是在 A 行点过「接管」之后，普通点击选中 B 会把这份意图
+ * 带过去，对 B 自动发起接管（用户从没为 B 要过写权限）。
+ */
+type WorkbenchTerminalIntent = { sessionId: string; wantsControl: boolean };
+
 /** A drag emits a pointermove per pixel; only the resting value is worth a write. */
 const LAYOUT_SAVE_DEBOUNCE_MS = 250;
 
@@ -176,16 +184,20 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   // One terminal fills the workspace at a time; the row button toggles it.
   // Stacking panes in-page was the wrong model — Feishu owns multi-column
   // layout, and chat opens through it rather than inside this document.
-  const [terminalSessionId, setTerminalSessionId] = useState<string | null>(null);
-  const [terminalWantsControl, setTerminalWantsControl] = useState(false);
+  const [terminal, setTerminal] = useState<WorkbenchTerminalIntent | null>(null);
+  const terminalSessionId = terminal?.sessionId ?? null;
+  const terminalWantsControl = terminal?.wantsControl ?? false;
 
+  /** 只有行内的「终端 / 接管」按钮走这里 —— 接管意图只能由这条路产生。 */
   const toggleTerminal = (sessionId: string, wantsControl: boolean) => {
-    setTerminalSessionId(current => {
+    setTerminal(current => {
       // Re-clicking the same button closes; switching mode or session keeps it
-      // open and applies the new intent.
-      if (current === sessionId && terminalWantsControl === wantsControl) return null;
-      setTerminalWantsControl(wantsControl);
-      return sessionId;
+      // open and applies the new intent. 比较用的是 updater 里的**最新**意图，不是
+      // 这一帧的闭包快照：onOpenSurface 先调 selectSession 把面板跟过来（并压回只
+      // 读），紧接着这次比较必须看到那一步的结果，否则「A 接管中 → 点 B 的接管」会
+      // 被误判成同一个按钮的二次点击而把面板关掉。
+      if (current && current.sessionId === sessionId && current.wantsControl === wantsControl) return null;
+      return { sessionId, wantsControl };
     });
   };
 
@@ -356,8 +368,15 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     // away from it on narrow layouts. Only an explicit surface button moves to
     // the workspace.
     // An already-open terminal follows the selection instead of staying pinned
-    // to the previous session.
-    setTerminalSessionId(current => (current === null ? null : sessionId));
+    // to the previous session —— 但只跟到**只读**。接管意图属于「你在那一行按下
+    // 接管」的那个会话，普通选中（行点击 / j-k 键盘选择 / 路由选中）不是要写权限的
+    // 表示；让它跟着漂到新会话，就等于替用户对一个他只是点开看看的会话发起接管。
+    // 同一个会话内重复选中不动意图：正在接管 A 时点 A 的行不该把自己的写权限收掉。
+    setTerminal(current => {
+      if (current === null) return null;
+      if (current.sessionId === sessionId) return current;
+      return { sessionId, wantsControl: false };
+    });
     const hash = buildWorkbenchHash('main', sessionId);
     if (props.onRouteChange) props.onRouteChange(hash);
     else if (typeof window !== 'undefined') window.history.replaceState(window.history.state, '', hash);
@@ -446,7 +465,8 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         // Touch layouts drill in on tap; pointer layouts keep selection and
         // workspace independent so the list stays usable while reading a pane.
         if (responsive.mode === 'mobile') {
-          setTerminalSessionId(sessionId);
+          // 钻进工作区是「打开看看」，不是要写权限：手机端一律只读打开。
+          setTerminal({ sessionId, wantsControl: false });
           setMobilePage('workspace');
           // Chat is a full-screen page on a phone. Following the selection here
           // would hand the user to Feishu at the same moment they asked to open
@@ -484,7 +504,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
               className="wb-layout-level wb-terminal-toggle"
               aria-pressed="true"
               title="关闭终端面板"
-              onClick={() => setTerminalSessionId(null)}
+              onClick={() => setTerminal(null)}
             >关闭终端 ✕</button>
           ) : null}
         </div>

@@ -63,31 +63,34 @@ Final results:
 
 | Check | Result |
 |---|---|
-| Workbench direct boundary | 22 files, 203 tests passed. |
-| Model runner | Passed: 320 sessions, 19 virtual items and four responsive degradation steps. |
-| Component runner | Passed: 9 checks and 12 rendered session options. |
-| Browser harness | 12 scenarios passed across 1440×900, 1280×800, 390×844 and 375×800. |
-| pnpm build | Passed; build id 20eef27b5357. |
-| Full unit project | 742 files / 11,216 tests passed, 1 file / 5 tests skipped, 0 failed. |
+| Workbench direct boundary | 16 files, 262 tests passed. |
+| Model runner | Passed: 320 sessions, 22 virtual items and four responsive degradation steps. |
+| Component runner | Passed: 21 checks and 14 rendered session options. |
+| Browser harness | 13 scenarios passed across 1440×900, 1280×800, 390×844 and 375×800. |
+| pnpm build | Passed; build id 5f17015159ac. |
+| Full unit project | 963 files / 15,668 tests passed, 1 file / 16 tests skipped, 0 failed. |
 
 The full suite was run serially in a clean PID namespace because this checkout is itself inside an active Botmux workflow and process-discovery tests must not observe unrelated same-UID workers. A normal checkout can use the ordinary commands:
 
 ~~~bash
-pnpm exec vitest run --project unit test/agent-workbench-api.test.ts \
-  test/agent-workbench-chat.test.ts \
-  test/agent-workbench-components.test.ts \
-  test/agent-workbench-model.test.ts \
-  test/agent-workbench-preview-race.test.ts \
-  test/agent-workbench-route.test.ts \
-  test/agent-workbench-storage.test.ts \
-  test/agent-workbench-style.test.ts
+pnpm exec vitest run --project unit test/agent-workbench-*.test.ts \
+  test/dashboard-auth.test.ts \
+  test/dashboard-h5-auth.test.ts \
+  test/dashboard-login-ui.test.ts \
+  test/dashboard-preview-wiring.test.ts \
+  test/dashboard-public-redact.test.ts \
+  test/session-preview.test.ts \
+  test/session-preview-proxy.test.ts \
+  test/terminal-control.test.ts
 pnpm exec tsc --noEmit
 pnpm build
 pnpm test -- --maxWorkers=1 --no-file-parallelism
+pnpm exec tsx scripts/verify-agent-workbench.ts
+pnpm exec tsx scripts/verify-agent-workbench-components.ts
 pnpm exec tsx scripts/verify-agent-workbench-browser.ts
 ~~~
 
-The final lazy chunks are agent-workbench-page-YQTRZKGF.js (21,866 bytes) and agent-workbench-dock-page-35RTDMEP.js (4,068 bytes).
+The final lazy chunks are agent-workbench-page-4FMJKB3O.js (23,752 bytes) and agent-workbench-dock-page-WGMQQKSK.js (3,947 bytes).
 
 ## Screenshot
 

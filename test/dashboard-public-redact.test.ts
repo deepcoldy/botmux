@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
+  projectSessionEventForAudience,
+  projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
   redactSessionEventForPublic,
   redactSessionsForPublic,
   redactSettingsForPublic,
+  sessionBoardAudienceFor,
 } from '../src/dashboard/public-redact.js';
 
 // A representative slice of the /api/groups `chats` payload that dashboard.ts
@@ -298,6 +301,172 @@ describe('session presentation redaction', () => {
       },
     }) as any;
     expect(update.patch).toEqual({ status: 'working' });
+  });
+});
+
+// Regression: `/api/sessions` and `/events` used to gate their projection on
+// "holds the local management cookie", so an authenticated Feishu H5 / platform
+// Workbench identity was served the ANONYMOUS projection. That deleted the very
+// `preview` descriptor its own `preview.view` / `preview.operate` capabilities
+// operate on, and the mobile Workbench + Dock rendered 「无网页预览」 forever.
+describe('session board audience (H5/Workbench identity is not anonymous)', () => {
+  // Everything a session row can carry that the anonymous projection strips.
+  function boardSession() {
+    return {
+      sessionId: 's1',
+      status: 'working',
+      cliId: 'claude',
+      webPort: 3007,
+      gitBranch: 'issue/CUSTOMER-123',
+      runtimeId: 'internal-vendor-codex',
+      runtimeDisplayName: 'Internal Vendor Codex',
+      preview: { path: '/preview/s1/', registeredAt: '2026-08-11T12:00:00.000Z' },
+      previewUserText: 'private question',
+      previewBotText: 'private answer',
+      previewUserFullText: 'private question in full',
+      previewBotFullText: 'private answer in full',
+      previewUserAt: 100,
+      previewBotAt: 200,
+      previewBotState: 'replied',
+      openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: true, items: [{ status: 'in_progress', text: 'task text' }] },
+      riffAccessUrl: 'https://abc123.sandbox.example/term',
+    };
+  }
+
+  describe('sessionBoardAudienceFor', () => {
+    it('maps the local management cookie to `management` (H5 flag is irrelevant)', () => {
+      expect(sessionBoardAudienceFor({ legacyAuthed: true, workbenchIdentity: false })).toBe('management');
+      expect(sessionBoardAudienceFor({ legacyAuthed: true, workbenchIdentity: true })).toBe('management');
+    });
+
+    it('maps an authenticated H5 / platform-dashboard identity to `workbench`, NOT anonymous', () => {
+      expect(sessionBoardAudienceFor({ legacyAuthed: false, workbenchIdentity: true })).toBe('workbench');
+    });
+
+    it('maps a tokenless publicReadOnly visitor to `anonymous`', () => {
+      expect(sessionBoardAudienceFor({ legacyAuthed: false, workbenchIdentity: false })).toBe('anonymous');
+    });
+  });
+
+  it('hands the H5 identity the preview descriptor the anonymous board never gets', () => {
+    const session = boardSession();
+    const [workbench] = projectSessionsForAudience([session], 'workbench') as any[];
+    // The point of the fix: preview.view / preview.operate have something to act on.
+    expect(workbench.preview).toEqual({ path: '/preview/s1/', registeredAt: '2026-08-11T12:00:00.000Z' });
+
+    const [anon] = projectSessionsForAudience([session], 'anonymous') as any[];
+    expect(anon).not.toHaveProperty('preview');
+  });
+
+  it('restores every display field for the H5 identity while anonymous keeps losing them', () => {
+    const session = boardSession();
+    const [workbench] = projectSessionsForAudience([session], 'workbench') as any[];
+    for (const [field, value] of [
+      ['gitBranch', 'issue/CUSTOMER-123'],
+      ['runtimeId', 'internal-vendor-codex'],
+      ['runtimeDisplayName', 'Internal Vendor Codex'],
+      ['previewUserText', 'private question'],
+      ['previewBotText', 'private answer'],
+      ['previewUserFullText', 'private question in full'],
+      ['previewBotFullText', 'private answer in full'],
+      ['previewUserAt', 100],
+      ['previewBotAt', 200],
+      ['previewBotState', 'replied'],
+    ] as const) {
+      expect(workbench[field], field).toEqual(value);
+    }
+    expect(workbench.openTodos).toEqual(session.openTodos);
+
+    const [anon] = projectSessionsForAudience([session], 'anonymous') as any[];
+    for (const field of [
+      'gitBranch', 'runtimeId', 'runtimeDisplayName', 'previewUserText', 'previewBotText',
+      'previewUserFullText', 'previewBotFullText', 'previewUserAt', 'previewBotAt',
+      'previewBotState', 'openTodos',
+    ]) {
+      expect(anon, field).not.toHaveProperty(field);
+    }
+    // Anonymous keeps exactly the watch-board fields it always had.
+    expect(anon).toEqual({ sessionId: 's1', status: 'working', cliId: 'claude', webPort: 3007 });
+  });
+
+  it('still withholds the Riff sandbox bearer WRITE url from the Workbench identity', () => {
+    // riffAccessUrl is a credential, not a display field: the unique subdomain IS
+    // the write capability. `GET /api/sessions/:id/write-link` is deliberately
+    // absent from workbenchH5Capability, and terminal writes are arbitrated by a
+    // server-side single-writer lease — the sandbox URL would bypass both.
+    const session = boardSession();
+    const [workbench] = projectSessionsForAudience([session], 'workbench') as any[];
+    expect(workbench).not.toHaveProperty('riffAccessUrl');
+    expect(JSON.stringify(workbench)).not.toContain('abc123.sandbox.example');
+    // The read path the Workbench actually uses survives.
+    expect(workbench.webPort).toBe(3007);
+
+    // Only the local management cookie sees it.
+    const [management] = projectSessionsForAudience([session], 'management') as any[];
+    expect(management.riffAccessUrl).toBe('https://abc123.sandbox.example/term');
+  });
+
+  it('applies the identical audience rule to SSE spawned rows and update patches', () => {
+    const session = boardSession();
+    const spawned = projectSessionEventForAudience('session.spawned', { session }, 'workbench') as any;
+    expect(spawned.session.preview).toEqual(session.preview);
+    expect(spawned.session.gitBranch).toBe('issue/CUSTOMER-123');
+    expect(spawned.session).not.toHaveProperty('riffAccessUrl');
+
+    // A live patch must not take back what the initial REST fetch delivered,
+    // otherwise the preview pane goes blank on the first status edge.
+    const updateBody = {
+      sessionId: 's1',
+      patch: {
+        status: 'idle',
+        preview: { path: '/preview/s1/', registeredAt: '2026-08-11T12:05:00.000Z' },
+        previewBotText: 'private answer',
+        gitBranch: 'issue/CUSTOMER-456',
+        riffAccessUrl: 'https://def456.sandbox.example/term',
+      },
+    };
+    const updated = projectSessionEventForAudience('session.update', updateBody, 'workbench') as any;
+    expect(updated.patch).toEqual({
+      status: 'idle',
+      preview: { path: '/preview/s1/', registeredAt: '2026-08-11T12:05:00.000Z' },
+      previewBotText: 'private answer',
+      gitBranch: 'issue/CUSTOMER-456',
+    });
+
+    const anonUpdate = projectSessionEventForAudience('session.update', updateBody, 'anonymous') as any;
+    expect(anonUpdate.patch).toEqual({ status: 'idle' });
+  });
+
+  it('leaves management rows and non-session events completely untouched', () => {
+    const session = boardSession();
+    const sessions = [session];
+    // Identity, not a copy: the management path must stay a pure pass-through.
+    expect(projectSessionsForAudience(sessions, 'management')).toBe(sessions);
+
+    const scheduleBody = { schedule: { id: 'sch1', prompt: 'business instructions' } };
+    for (const audience of ['management', 'workbench', 'anonymous'] as const) {
+      // Schedule prompts are gated separately (management-only) in dashboard.ts;
+      // the session projector must not silently claim to handle them.
+      expect(projectSessionEventForAudience('schedule.created', scheduleBody, audience)).toBe(scheduleBody);
+    }
+  });
+
+  it('never mutates the caller rows when projecting for the Workbench', () => {
+    const session = boardSession();
+    projectSessionsForAudience([session], 'workbench');
+    projectSessionEventForAudience('session.spawned', { session }, 'workbench');
+    expect(session.riffAccessUrl).toBe('https://abc123.sandbox.example/term');
+    expect(session.preview).toEqual({ path: '/preview/s1/', registeredAt: '2026-08-11T12:00:00.000Z' });
+  });
+
+  it('tolerates malformed shapes without throwing on any audience', () => {
+    for (const audience of ['management', 'workbench', 'anonymous'] as const) {
+      expect(() => projectSessionsForAudience([null, 'x', 42] as unknown[], audience)).not.toThrow();
+      expect(projectSessionsForAudience('nope' as unknown as unknown[], audience)).toBe('nope');
+      expect(projectSessionEventForAudience('session.spawned', null, audience)).toBeNull();
+      expect(projectSessionEventForAudience('session.update', { sessionId: 's1' }, audience))
+        .toEqual({ sessionId: 's1' });
+    }
   });
 });
 

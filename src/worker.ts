@@ -14710,7 +14710,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             name: 'xterm-256color',
             cols,
             rows,
-            env: zellijEnv() as { [key: string]: string },
+            // redactChildEnv first, matching the tmux viewer above (tmuxEnv()
+            // folds REDACTED_CHILD_ENV_KEYS into its own strip set, zellijEnv()
+            // only drops ZELLIJ*). A viewer client needs none of the daemon's
+            // secrets — bare IM-app creds, GitHub tokens, or the Dashboard H5
+            // credentials — so it must not carry them into a pty it owns.
+            env: zellijEnv(redactChildEnv(process.env)) as { [key: string]: string },
           });
           attachStarted = true;
           observeBe?.setLiveAttach(true);

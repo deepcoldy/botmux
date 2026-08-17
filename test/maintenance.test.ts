@@ -17,6 +17,7 @@ import {
 import type { MaintenanceConfig } from '../src/global-config.js';
 import type { RestartIntent } from '../src/services/restart-intent-store.js';
 import { WORKFLOW_WORKER_ENV_KEYS } from '../src/utils/child-env.js';
+import { DAEMON_ENV_KEYS } from '../src/cli/daemon-lifecycle-env.js';
 
 // 2026-06-07T04:00:00Z === 2026-06-07 12:00 local (Asia/Shanghai)
 const NOON = Date.parse('2026-06-07T04:00:00.000Z');
@@ -213,6 +214,22 @@ describe('detachedRestartEnv', () => {
     expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
     expect(inherited.WEB_EXTERNAL_HOST).toBe('10.255.64.131');
     expect(inherited.BOTMUX_WORKFLOW).toBe('leaked');
+  });
+
+  it('strips every key DAEMON_ENV_KEYS bakes into the PM2 env (mirror guard)', () => {
+    // The two lists are deliberately separate literals (maintenance.ts must not
+    // import the CLI layer), and the comment on each says they MUST stay
+    // mirrored. This is what enforces it: a key added to DAEMON_ENV_KEYS but not
+    // to detachedRestartEnv survives a detached restart (dashboard
+    // update/restart, maintenance auto-update) as a stale baked value, so the
+    // operator's ~/.botmux/.env edit never takes effect — the exact failure that
+    // kept a re-keyed H5 APP_SECRET / a revoked open_id allowlist alive.
+    const inherited = {
+      ...Object.fromEntries(DAEMON_ENV_KEYS.map((key) => [key, 'stale'])),
+      PATH: '/usr/bin',
+    };
+
+    expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
   });
 });
 

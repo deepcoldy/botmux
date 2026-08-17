@@ -178,8 +178,10 @@ Preview guard 的覆盖层不是安全沙箱。同源应用脚本仍可能主动
 openWorkbenchChat 的顺序为：
 
 1. 适合 PC 分栏且 capability 存在时调用 toggleChat({ openChatId })。
-2. 不支持或失败时调用 enterChat({ openChatId })。
-3. 再失败时打开 /client/chat/open?openChatId=… AppLink。
+2. 不走分栏的场景调用 enterChat({ openChatId })。
+3. 上述 JSAPI 不可用或被明确拒绝时，打开 /client/chat/open?openChatId=… AppLink。
+
+toggleChat 被明确拒绝后不再叠加 enterChat：两者需要同一份 JSAPI 授权，enterChat 只会以同样的理由失败，还要整页跳转把工作台顶掉，直接回落 AppLink 更稳。
 
 每个 JSAPI 有 throw、fail callback 和 timeout 处理。普通浏览器不主动加载飞书 SDK，并安全降级到 AppLink。sidebar AppLink 使用 mode=sidebar、min_width=350、max_width=520；主界面使用 mode=appCenter。Chat 不作为 iframe 或自定义 H5 pane 渲染。
 

@@ -209,6 +209,45 @@ async function resumeRestoredPendingRepoSetup(
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }
 
+/**
+ * Drop a persisted `previewTarget` that belonged to the previous worker
+ * generation, before this restore pass rebuilds a DaemonSession from the row.
+ *
+ * `previewTarget` is the literal loopback (host, port) an agent registered with
+ * `botmux preview <port>`; it is routing state for the worker that was live at
+ * registration time, not a durable property of the conversation. Restore always
+ * opens a NEW generation — every row here is rebuilt with `worker: null`, and
+ * killStalePids has just reaped the previous run's CLI processes — so whatever
+ * served that port is gone and the OS may hand the number to any unrelated
+ * local service. The preview proxy dials a registered target by host/port
+ * alone, so carrying one across the restart can proxy a user's preview into
+ * someone else's local server. Applies to adopt rows too: a surviving adopted
+ * CLI is no proof that its dev server survived, and re-registering costs one
+ * command inside the session.
+ *
+ * Cleanup only — registration (`POST /api/sessions/:id/preview`, which probes
+ * reachability first) and the proxy are untouched; the session simply
+ * re-registers. A failed save is logged and swallowed: the in-memory row this
+ * pass registers is already clear (so nothing dials the stale target), and the
+ * next successful save converges the file.
+ */
+function clearRestoredPreviewTarget(session: Session): void {
+  if (session.previewTarget === undefined) return;
+  session.previewTarget = undefined;
+  try {
+    sessionStore.updateSession(session);
+  } catch (err) {
+    logger.error(
+      `[${session.sessionId.substring(0, 8)}] Could not persist preview-target cleanup on restore: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  logger.debug(
+    `[${session.sessionId.substring(0, 8)}] Dropped preview target registered by the previous worker `
+    + `generation; the session must re-register with \`botmux preview <port>\``,
+  );
+}
+
 function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
   session.restoreQuarantinedAt ??= new Date().toISOString();
   try {
@@ -1768,6 +1807,10 @@ export async function restoreActiveSessions(
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
     }
+    // New worker generation ⇒ no registered preview port. Runs before every
+    // branch below (adopt / queued / ordinary / close / quarantine) so no
+    // rebuilt DaemonSession or announced row can carry the old target.
+    clearRestoredPreviewTarget(session);
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';

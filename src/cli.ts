@@ -25,7 +25,7 @@
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
@@ -876,7 +876,15 @@ function ecosystemConfig(
 
   const cfg = { apps };
   const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
-  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2));
+  // Owner-only, same as bots.json: the baked env block now carries the Dashboard
+  // Feishu H5 app secret (BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET, see
+  // DAEMON_ENV_KEYS), so this file is credential-bearing. writeFileSync's `mode`
+  // applies only when the file is CREATED — chmod as well, or an install that
+  // already wrote it 0644 keeps the world-readable mode forever.
+  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try { chmodSync(tmpFile, 0o600); } catch { /* best-effort: exotic FS / mounted noperm */ }
+  }
   return tmpFile;
 }
 

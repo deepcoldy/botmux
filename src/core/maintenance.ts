@@ -256,7 +256,10 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
   // This list MUST mirror DAEMON_ENV_KEYS in src/cli/daemon-lifecycle-env.ts:
   // every key baked into the PM2 env block there has to be stripped here, or a
   // detached restart (dashboard update/restart, maintenance auto-update) keeps
-  // the stale baked value instead of reloading from the file. Keep them in sync.
+  // the stale baked value instead of reloading from the file. Kept as a local
+  // literal so this stays importable from the daemon/dashboard without pulling
+  // in the CLI layer; test/maintenance.test.ts iterates the exported
+  // DAEMON_ENV_KEYS and fails the moment the two drift apart.
   for (const key of [
     'WEB_EXTERNAL_HOST',
     'BOTMUX_DASHBOARD_EXTERNAL_HOST',
@@ -265,6 +268,20 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
     'BOTMUX_PUBLIC_URL',
+    // Dashboard Feishu H5 passwordless login (h5-auth.ts) — a stale baked
+    // APP_SECRET / allowlist / TTL would outlive the operator's .env edit and,
+    // for the allowlist, keep granting a revoked open_id.
+    'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED',
+    'BOTMUX_DASHBOARD_FEISHU_H5_BRAND',
+    'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID',
+    'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET',
+    'BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS',
+    'BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH',
+    'BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS',
+    'BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE',
+    // Dashboard control-audit destination + terminal takeover lease TTL.
+    'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
+    'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
   ]) delete env[key];
   return env;
 }

@@ -15,6 +15,8 @@ import {
   resolveSessionPreviewFromRow,
 } from '../src/dashboard/preview-contract.js';
 import {
+  projectSessionEventForAudience,
+  projectSessionsForAudience,
   redactSessionEventForPublic,
   redactSessionsForPublic,
 } from '../src/dashboard/public-redact.js';
@@ -162,6 +164,27 @@ describe('session preview REST/SSE contract', () => {
     const sse = redactSessionEventForPublic('session.update', browserEvent) as any;
     expect(sse.patch).not.toHaveProperty('preview');
     expect(JSON.stringify(sse)).not.toContain('4173');
+  });
+
+  it('delivers the descriptor (and never the loopback target) to an authenticated Workbench identity', () => {
+    // Full `/api/sessions` pipeline: loopback target → same-origin descriptor →
+    // audience projection. An H5/platform identity holds preview.view, so the
+    // descriptor must survive the second hop — it used to be deleted by the
+    // anonymous projection, which is what made the Dock show 「无网页预览」.
+    const browserRow = projectSessionPreviewForBrowser({ sessionId: 's1', previewTarget }) as any;
+    const [rest] = projectSessionsForAudience([browserRow], 'workbench') as any[];
+    expect(rest.preview).toEqual({ path: '/preview/s1/', registeredAt: previewTarget.registeredAt });
+    // The proxy-only loopback host/port still never leaves the daemon.
+    expect(rest).not.toHaveProperty('previewTarget');
+    expect(JSON.stringify(rest)).not.toContain('127.0.0.1');
+    expect(JSON.stringify(rest)).not.toContain('4173');
+
+    const browserEvent = projectSessionPreviewEventForBrowser('session.update', {
+      sessionId: 's1', patch: { previewTarget },
+    });
+    const sse = projectSessionEventForAudience('session.update', browserEvent, 'workbench') as any;
+    expect(sse.patch.preview).toEqual({ path: '/preview/s1/', registeredAt: previewTarget.registeredAt });
+    expect(JSON.stringify(sse)).not.toContain('127.0.0.1');
   });
 });
 

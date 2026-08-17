@@ -57,11 +57,12 @@ import {
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
+  projectSessionEventForAudience,
+  projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
-  redactSessionEventForPublic,
-  redactSessionsForPublic,
   redactSettingsForPublic,
+  sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
@@ -3176,9 +3177,23 @@ const server = createServer(async (req, res) => {
           publicReadOnly,
         });
     // `authed` is deliberately the local management capability, not merely a
-    // valid Workbench/platform identity. Route-local redaction and privileged
-    // mutations therefore cannot be widened by H5 authentication.
+    // valid Workbench/platform identity. Privileged mutations and management
+    // reads (settings, schedules, groups) therefore cannot be widened by H5
+    // authentication.
     const authed = legacyAuthed;
+    // The session board is the one surface where `!authed` must NOT mean
+    // "anonymous". `/api/sessions` and `/events` are exactly the two paths
+    // workbenchH5Capability grants as `workbench.view`, and the same identity
+    // holds `preview.view`/`preview.operate`; reusing the anonymous projection
+    // here deleted the `preview` descriptor those capabilities operate on, so
+    // the mobile Workbench and the Dock showed 「无网页预览」 unconditionally.
+    // The three-way audience keeps management/anonymous behavior byte-identical
+    // and only restores display fields for an authenticated Workbench viewer —
+    // the Riff sandbox bearer write URL stays stripped (see public-redact.ts).
+    const sessionBoardAudience = sessionBoardAudienceFor({
+      legacyAuthed,
+      workbenchIdentity: workbenchOnlyIdentity,
+    });
 
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
@@ -3483,7 +3498,7 @@ const server = createServer(async (req, res) => {
       }), groupsMatrixSnapshot.peekPresentation());
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
       return jsonRes(res, 200, {
-        sessions: authed ? browserSessions : redactSessionsForPublic(browserSessions),
+        sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
     }
 
@@ -6196,14 +6211,21 @@ const server = createServer(async (req, res) => {
       });
       res.write('retry: 5000\n\n');
       const off = aggregator.on(ev => {
-        // Mirror the GET /api/schedules carve-out: schedule events carry the
-        // full task object — strip the prompt AND workingDir for anonymous SSE
-        // listeners, or the REST-side scrub would be trivially bypassed by
-        // `/events`.
+        // Session rows follow the same three-way audience as GET /api/sessions,
+        // or a Workbench viewer would receive the preview descriptor on the
+        // initial REST fetch and then lose it on the first live patch.
         const projectedBody = projectSessionPreviewEventForBrowser(ev.type, ev.body) as typeof ev.body;
-        let body = authed
-          ? projectedBody
-          : redactSessionEventForPublic(ev.type, projectedBody) as typeof ev.body;
+        let body = projectSessionEventForAudience(
+          ev.type,
+          projectedBody,
+          sessionBoardAudience,
+        ) as typeof ev.body;
+        // Schedules stay on the MANAGEMENT gate, mirroring the GET
+        // /api/schedules carve-out: schedule events carry the full task object
+        // (prompt = business instructions, workingDir = repo/customer path) and
+        // `/api/schedules` is not a Workbench capability, so widening this to
+        // `sessionBoardAudience` would let an H5 identity read over `/events`
+        // what the REST route refuses it.
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {

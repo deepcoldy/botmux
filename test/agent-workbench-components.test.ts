@@ -1053,3 +1053,190 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
     act(() => renderer.unmount());
   });
 });
+
+/**
+ * 接管是「针对某一行的一次显式动作」，不是工作台的全局模式。
+ * 这组用例把两件事拆开钉死：面板可以跟着选中走，**写权限不许跟着走**。
+ * 回归的形状是——在 A 行点过「接管」之后，普通选中 B 会把接管意图带过去，
+ * 于是用户只是想点开看看的 B 被自动接管了输入。
+ */
+describe('Agent Workbench 接管意图只属于按下「接管」的那一行', () => {
+  const NOW = 1_900_000_001_000;
+  /** 终端地址要 webPort + proxyPort + location 三者齐了才成立；缺一个面板只剩空态，
+   *  控制权接口压根不会被调用，这组用例也就证明不了任何事。 */
+  const terminalLocation = { protocol: 'http:', origin: 'http://dashboard.test', hostname: 'dashboard.test' };
+  const READONLY_FEEDBACK = '只读查看中，点「接管输入」可操作。';
+
+  /** A 的活跃时间**更新**，让它稳定排在 B 前面：组内按活跃降序排，j/k 的移动方向
+   *  必须可预期，否则键盘那条用例断的是运气。 */
+  function pair(): WorkbenchSessionRow[] {
+    const base = { status: 'working', botName: 'Builder', cliId: 'codex', webPort: 7681, proxyPort: 7682 };
+    return [
+      { ...base, sessionId: 'session-a', title: 'Session A', chatId: 'oc_a', lastMessageAt: 1_800_000_002_000 },
+      { ...base, sessionId: 'session-b', title: 'Session B', chatId: 'oc_b', lastMessageAt: 1_800_000_001_000 },
+    ];
+  }
+
+  async function renderPair(): Promise<{
+    renderer: TestRenderer.ReactTestRenderer;
+    takeovers: string[];
+  }> {
+    const takeovers: string[] = [];
+    const paneApi: WorkbenchApi = {
+      ...api,
+      takeoverTerminal: async (sessionId: string) => {
+        takeovers.push(sessionId);
+        return { mode: 'controlled', owned: true, expiresAt: Date.now() + 60_000 };
+      },
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
+        sessions: pair(),
+        online: true,
+        authenticated: true,
+        initialSessionId: 'session-a',
+        viewportWidth: 1440,
+        now: NOW,
+        api: paneApi,
+        storage: null,
+        location: terminalLocation,
+        sdk: null,
+        h5Context: null,
+        onRouteChange: () => {},
+      }));
+    });
+    return { renderer, takeovers };
+  }
+
+  /** 一次点击要走完「重挂面板 → 拉控制权 → 决定要不要接管」好几个 await，
+   *  多空跑一轮 act 让这条链彻底落定，断言才不是在半路上取样。 */
+  async function settle(): Promise<void> { await act(async () => {}); }
+
+  function rowAction(
+    renderer: TestRenderer.ReactTestRenderer,
+    title: string,
+    surface: 'terminal' | 'terminal-control',
+  ): ReactTestInstance {
+    return renderer.root.find(node => node.type === 'button'
+      && node.props.className === `wb-session-row-action is-${surface}`
+      && String(node.props['aria-label'] ?? '').endsWith(`— ${title}`));
+  }
+
+  /** 普通选中：点行本身，不碰行内的任何按钮。 */
+  async function clickRow(renderer: TestRenderer.ReactTestRenderer, title: string): Promise<void> {
+    const row = renderer.root.find(node => node.props.role === 'option'
+      && String(node.props['aria-label'] ?? '').startsWith(`${title}.`));
+    await act(async () => { row.props.onClick(); });
+    await settle();
+  }
+
+  async function clickRowAction(
+    renderer: TestRenderer.ReactTestRenderer,
+    title: string,
+    surface: 'terminal' | 'terminal-control',
+  ): Promise<void> {
+    await act(async () => { rowAction(renderer, title, surface).props.onClick({ stopPropagation() {} }); });
+    await settle();
+  }
+
+  /** 面板当前挂在哪个会话上、这次打开带不带接管意图。 */
+  function paneIntent(
+    renderer: TestRenderer.ReactTestRenderer,
+  ): { sessionId: string; autoTakeControl: boolean } | null {
+    const panes = renderer.root.findAllByType(TerminalPane);
+    if (panes.length === 0) return null;
+    return {
+      sessionId: String(panes[0].props.session.sessionId),
+      autoTakeControl: panes[0].props.autoTakeControl === true,
+    };
+  }
+
+  /** 徽标读的就是面板自己算出来的控制权，比 prop 更贴近用户看到的东西。 */
+  function paneMode(renderer: TestRenderer.ReactTestRenderer): 'controlled' | 'readonly' | 'closed' {
+    const chips = renderer.root.findAll(node =>
+      typeof node.props.className === 'string' && node.props.className.startsWith('wb-mode-chip'));
+    if (chips.length === 0) return 'closed';
+    return String(chips[0].props.className).includes('is-controlled') ? 'controlled' : 'readonly';
+  }
+
+  it('A 行点过接管后普通选中 B：面板跟过去，但只读，且不对 B 发起接管', async () => {
+    const { renderer, takeovers } = await renderPair();
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: true });
+    expect(takeovers).toEqual(['session-a']);
+    expect(paneMode(renderer)).toBe('controlled');
+
+    await clickRow(renderer, 'Session B');
+    // 跟随是对的（面板不该还钉在 A 上），跟过去的写权限不是。
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: false });
+    expect(takeovers).toEqual(['session-a']);
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(textOf(renderer.root.findByProps({ 'aria-label': '终端面板' }))).toContain(READONLY_FEEDBACK);
+    act(() => renderer.unmount());
+  });
+
+  it('键盘 j 选到下一行同样只跟随、不接管', async () => {
+    const { renderer, takeovers } = await renderPair();
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(takeovers).toEqual(['session-a']);
+
+    // j/k 走的是同一个 onSelect，和行点击必须给出同一个结论。
+    const listbox = renderer.root.find(node => node.props.role === 'listbox');
+    await act(async () => {
+      listbox.props.onKeyDown({ key: 'j', altKey: false, ctrlKey: false, metaKey: false, target: null, preventDefault() {} });
+    });
+    await settle();
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: false });
+    expect(takeovers).toEqual(['session-a']);
+    expect(paneMode(renderer)).toBe('readonly');
+    act(() => renderer.unmount());
+  });
+
+  it('B 行显式点接管才对 B 发起接管，面板也不会被误判成二次点击而关掉', async () => {
+    const { renderer, takeovers } = await renderPair();
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(takeovers).toEqual(['session-a']);
+
+    await clickRowAction(renderer, 'Session B', 'terminal-control');
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: true });
+    expect(takeovers).toEqual(['session-a', 'session-b']);
+    expect(paneMode(renderer)).toBe('controlled');
+    act(() => renderer.unmount());
+  });
+
+  it('绕回 A 之后再点接管仍然生效：一次性接管 ref 随面板重挂被重置', async () => {
+    const { renderer, takeovers } = await renderPair();
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await clickRow(renderer, 'Session B');
+    // 选回 A：普通选中，所以依旧只读——不能因为「A 之前接管过」就自动恢复写权限。
+    await clickRow(renderer, 'Session A');
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
+    expect(takeovers).toEqual(['session-a']);
+    expect(paneMode(renderer)).toBe('readonly');
+
+    // 显式再点一次 A 行的「接管」：请求必须真的发出去，不能被上一轮的一次性 ref 吞掉。
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: true });
+    expect(takeovers).toEqual(['session-a', 'session-a']);
+    expect(paneMode(renderer)).toBe('controlled');
+    act(() => renderer.unmount());
+  });
+
+  it('同一行重复点接管照旧关闭面板，只读「终端」按钮把它降回只读', async () => {
+    const { renderer, takeovers } = await renderPair();
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(paneMode(renderer)).toBe('controlled');
+
+    // 同按钮二次点击 = 关闭，这是原有的开关语义，改「意图」不该动它。
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(paneIntent(renderer)).toBeNull();
+
+    // 只读入口从来不该带写权限：重开为只读，接管次数停在原地。
+    await clickRowAction(renderer, 'Session A', 'terminal');
+    expect(paneIntent(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
+    expect(takeovers).toEqual(['session-a']);
+    expect(paneMode(renderer)).toBe('readonly');
+    act(() => renderer.unmount());
+  });
+});
