@@ -118,7 +118,14 @@ describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
     return existsSync(slice) ? readdirSync(slice).map(d => join(slice, d)) : [];
   }
 
-  it('the CHILD enrols itself before exec; the parent never migrates a pid in', async () => {
+  // retry 2: prepareContainmentBoundary may LEGALLY degrade to the weak handle
+  // on a transient resource errno (observed on CI as system-wide fd pressure
+  // from the parallel suite — the turn then runs shim-less and the fake mojo
+  // reads "not-enrolled"). Degradation is fail-closed and now logged+retried in
+  // prepare itself, but it cannot be made impossible, so the assertion gets two
+  // more attempts. The revert-red property is preserved: a real regression
+  // (post-spawn migration) fails DETERMINISTICALLY on all three attempts.
+  it('the CHILD enrols itself before exec; the parent never migrates a pid in', { retry: 2 }, async () => {
     const cgroupRoot = join(dataDir, 'cg');
     // cgroup.controllers is what cgroupV2Available probes for.
     mkdirSync(cgroupRoot, { recursive: true });
@@ -144,6 +151,23 @@ describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
     backend.spawn('', [], {} as never);
     backend.write('turn');
     expect(await waitFor(() => existsSync(seen))).toBe(true);
+    if (readFileSync(seen, 'utf8').trim() !== 'enrolled') {
+      // Forensics for the failure this test showed on CI: dump enough state to
+      // distinguish "prepare degraded (no boundary dir)" from "boundary exists
+      // but the pid is missing" without another debug round-trip.
+      const walk = (d: string): string[] => existsSync(d)
+        ? readdirSync(d, { withFileTypes: true }).flatMap(e => {
+            const p = join(d, e.name);
+            return e.isDirectory() ? [`${p}/`, ...walk(p)] : [p];
+          })
+        : ['<missing>'];
+      console.error('[preexec-debug] /proc/self/cgroup:', JSON.stringify(readFileSync('/proc/self/cgroup', 'utf8')));
+      console.error('[preexec-debug] tree under cgroupRoot:', JSON.stringify(walk(cgroupRoot)));
+      for (const f of walk(cgroupRoot).filter(p => p.endsWith('cgroup.procs'))) {
+        console.error('[preexec-debug]', f, '=', JSON.stringify(readFileSync(f, 'utf8')));
+      }
+      console.error('[preexec-debug] handles:', JSON.stringify(containmentHandles('sess-preexec-synth')));
+    }
     expect(readFileSync(seen, 'utf8').trim()).toBe('enrolled');
     // The handle minted for the turn is STRONG and points at the prepared
     // boundary — no acquireContainmentHandle migration write involved.

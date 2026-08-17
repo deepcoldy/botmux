@@ -457,21 +457,39 @@ export function prepareContainmentBoundary(
         sliceParent,
         `mojo-${sanitizeForPath(input.sessionId)}-g${input.generation}-${randomBytes(4).toString('hex')}`,
     );
-    try {
-        mkdirSync(dir, { recursive: true });
-        // Enrolment is the CHILD's job (pre-exec), but it must be possible at
-        // all: an unwritable cgroup.procs would make every spawn die on the shim
-        // handshake. Probe writability now — an empty write is a no-op for the
-        // kernel — so an undelegated slice degrades to the weak handle here
-        // instead of failing every turn later.
-        writeFileSync(`${dir}/cgroup.procs`, '');
-        return { sessionId: input.sessionId, generation: input.generation, cgroupPath: dir, nonce: input.nonce };
-    } catch {
-        // Delegation not granted / read-only /sys — the caller falls back to the
-        // weak handle rather than pretending containment was established.
-        try { rmdirSync(dir); } catch { /* best-effort */ }
-        return null;
+    // Two attempts: transient resource errno (system-wide file-table pressure —
+    // ENFILE/EMFILE — or an interrupted syscall) must not silently cost this turn
+    // its STRONG boundary when the very next open would succeed. Anything
+    // persistent (undelegated slice, read-only /sys) fails both attempts
+    // identically and degrades below.
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            mkdirSync(dir, { recursive: true });
+            // Enrolment is the CHILD's job (pre-exec), but it must be possible at
+            // all: an unwritable cgroup.procs would make every spawn die on the shim
+            // handshake. Probe writability now — an empty write is a no-op for the
+            // kernel — so an undelegated slice degrades to the weak handle here
+            // instead of failing every turn later.
+            writeFileSync(`${dir}/cgroup.procs`, '');
+            return { sessionId: input.sessionId, generation: input.generation, cgroupPath: dir, nonce: input.nonce };
+        } catch (err) {
+            lastErr = err;
+            try { rmdirSync(dir); } catch { /* best-effort */ }
+        }
     }
+    // Delegation not granted / read-only /sys / persistent resource exhaustion —
+    // the caller falls back to the weak handle rather than pretending containment
+    // was established. Loudly: this downgrades the session's containment evidence
+    // for the whole turn (its close can only ever be `closed_with_residual`), and
+    // a silent downgrade here is indistinguishable from "host has no cgroup v2"
+    // when someone later asks why a strong-capable host produced weak handles.
+    logger.warn(
+        `[mojo] session ${input.sessionId}: could not prepare a strong cgroup boundary under `
+        + `${sliceParent} (${(lastErr as NodeJS.ErrnoException)?.code ?? String(lastErr)}); `
+        + 'this turn degrades to the weak tree-identity handle',
+    );
+    return null;
 }
 
 /** Mint the strong handle for a boundary the child has enrolled itself into. */
