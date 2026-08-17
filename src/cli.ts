@@ -849,7 +849,11 @@ function ecosystemConfig(
 
   apps.push({
     name: 'botmux-dashboard',
-    script: join(PKG_ROOT, 'dist', 'dashboard.js'),
+    // index-dashboard.ts, NOT dashboard.js: the entry dotenv-loads
+    // ~/.botmux/.env before dynamically importing the dashboard, which is how
+    // the Feishu H5 credential family reaches the dashboard WITHOUT being baked
+    // into this file's shared env block (see DAEMON_ENV_KEYS).
+    script: join(PKG_ROOT, 'dist', 'index-dashboard.js'),
     interpreter,
     cwd: PKG_ROOT,
     autorestart: true,
@@ -876,11 +880,15 @@ function ecosystemConfig(
 
   const cfg = { apps };
   const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
-  // Owner-only, same as bots.json: the baked env block now carries the Dashboard
-  // Feishu H5 app secret (BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET, see
-  // DAEMON_ENV_KEYS), so this file is credential-bearing. writeFileSync's `mode`
-  // applies only when the file is CREATED — chmod as well, or an install that
-  // already wrote it 0644 keeps the world-readable mode forever.
+  // Owner-only, same as bots.json — kept as defense in depth. The Dashboard
+  // Feishu H5 app secret is no longer baked into the env block (the dashboard
+  // dotenv-loads it via index-dashboard.ts; DAEMON_ENV_KEYS excludes the
+  // family), but this file still bakes operator-configured hosts/ports/paths,
+  // an older install's copy may still carry the secret until overwritten, and
+  // 0600 keeps any future env-block regression from becoming world-readable.
+  // writeFileSync's `mode` applies only when the file is CREATED — chmod as
+  // well, or an install that already wrote it 0644 keeps the world-readable
+  // mode forever.
   writeFileSync(tmpFile, JSON.stringify(cfg, null, 2), { mode: 0o600 });
   if (process.platform !== 'win32') {
     try { chmodSync(tmpFile, 0o600); } catch { /* best-effort: exotic FS / mounted noperm */ }
@@ -4421,6 +4429,12 @@ interface SessionData {
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
   persistentBackendTarget?: PersistentBackendTarget;
+  /** Live loopback (host, port) registered via `botmux preview <port>` for the
+   * CURRENT worker generation — routing state, not conversation data. Offline
+   * close must drop it like services/session-store.ts closeSession() does:
+   * a closed session owns no port, and a retained value could proxy a later
+   * reader into an unrelated local server that re-acquired the port. */
+  previewTarget?: import('./core/session-preview.js').SessionPreviewTarget;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -4581,6 +4595,7 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
     delete latest.queuedActivationPending;
     delete latest.queuedActivationTail;
     delete latest.pendingRepoSetup;
+    delete latest.previewTarget;
     applied = true;
     return true;
   });
@@ -4599,6 +4614,7 @@ function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
     current.closedAt = new Date().toISOString();
     delete current.codexAppDispatchLedger;
     delete current.codexAppGenerationCommits;
+    delete current.previewTarget;
     pruned = true;
     return true;
   });

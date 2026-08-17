@@ -51,6 +51,7 @@ const mocks = vi.hoisted(() => {
     forkWorker: vi.fn(),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
     expandMergeForward: vi.fn(async () => ({ extraResources: [] })),
+    scheduleSessionGroupTitle: vi.fn(),
     createdSessions: [] as any[],
     createSession: vi.fn(function (chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') {
       const session = {
@@ -120,11 +121,22 @@ vi.mock('../src/im/lark/merge-forward.js', async () => {
   return { ...actual, expandMergeForward: (...args: any[]) => mocks.expandMergeForward(...args) };
 });
 
+// Mocked so the self-heal test below can COUNT daemon-side scheduling calls:
+// the real service dedups in-flight jobs internally, which would mask a
+// duplicated call site in handleThreadReplyAdmitted (review P3-1).
+vi.mock('../src/services/session-group-title.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/session-group-title.js');
+  return { ...actual, scheduleSessionGroupTitle: (...args: any[]) => mocks.scheduleSessionGroupTitle(...args) };
+});
+
 import { registerBot } from '../src/bot-registry.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
+  __testOnly_handleThreadReply as handleThreadReply,
 } from '../src/daemon.js';
+import { sessionKey } from '../src/core/types.js';
+import { initSessionGroups, registerSessionGroup } from '../src/services/session-groups-store.js';
 // Deliberately UNMOCKED: the provenance tests below run the real resolver
 // against a real (self-pid) authenticated ancestor marker.
 import {
@@ -218,6 +230,7 @@ beforeEach(() => {
   mocks.expandMergeForward.mockClear();
   mocks.createSession.mockClear();
   mocks.forkWorker.mockClear();
+  mocks.scheduleSessionGroupTitle.mockClear();
 });
 
 /** forkWorker(ds, input, resumeOrTurnId) — the 3rd arg is `false | string |
@@ -369,5 +382,85 @@ describe('session-group birth first-turn anchoring (image/file/merge_forward)', 
     expect(mocks.createdSessions).toHaveLength(1);
     expect(mocks.createdSessions[0].quoteTargetId).toBe(SOURCE_MSG);
     expect(mocks.createdSessions[0].quoteTargetId).toBe(forkTurnId);
+  });
+});
+
+/**
+ * Regression guard for the untitled-session-group self-heal call SITE in
+ * handleThreadReplyAdmitted (review P3-1): the block was once duplicated
+ * back-to-back, so a single inbound group message scheduled TWO heal jobs —
+ * masked in production only by the title service's internal in-flight dedup.
+ * With scheduleSessionGroupTitle mocked (no internal dedup), the daemon-side
+ * call count is observable: one message must schedule exactly one heal.
+ */
+describe('session-group title self-heal (thread reply)', () => {
+  const FOLLOWUP_MSG = 'om_followup_group_message';
+
+  function liveGroupSession(): any {
+    return {
+      session: {
+        sessionId: 'sess-live-heal',
+        chatId: GROUP_CHAT,
+        rootMessageId: GROUP_CHAT,
+        title: 'live',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: APP,
+        scope: 'chat',
+      },
+      worker: { killed: false, send: vi.fn() },
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: GROUP_CHAT,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.now(),
+      cliVersion: 'test',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+    };
+  }
+
+  function makeGroupTextEventData(text: string): any {
+    return {
+      sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+      message: {
+        message_id: FOLLOWUP_MSG,
+        chat_id: GROUP_CHAT,
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text }),
+        create_time: String(Date.now()),
+      },
+    };
+  }
+
+  function threadReplyCtx(): RoutingContext {
+    return {
+      chatId: GROUP_CHAT,
+      messageId: FOLLOWUP_MSG,
+      chatType: 'group',
+      scope: 'chat',
+      anchor: GROUP_CHAT,
+      replyRootId: FOLLOWUP_MSG,
+      larkAppId: APP,
+    };
+  }
+
+  it('a single group message schedules the title heal exactly once', async () => {
+    initSessionGroups(APP);
+    // titled left unset → the group is still on its placeholder name.
+    registerSessionGroup(GROUP_CHAT, { ownerOpenId: OWNER, lastSessionId: 'sess-live-heal' });
+    activeSessions.set(sessionKey(GROUP_CHAT, APP), liveGroupSession());
+
+    await handleThreadReply(makeGroupTextEventData('帮我看看这个问题'), threadReplyCtx());
+
+    expect(mocks.scheduleSessionGroupTitle).toHaveBeenCalledTimes(1);
+    expect(mocks.scheduleSessionGroupTitle).toHaveBeenCalledWith({
+      larkAppId: APP,
+      chatId: GROUP_CHAT,
+      userText: '帮我看看这个问题',
+    });
   });
 });

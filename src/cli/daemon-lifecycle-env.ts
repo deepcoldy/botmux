@@ -7,11 +7,18 @@ import { parse } from 'dotenv';
 // of reloading it from ~/.botmux/.env. test/maintenance.test.ts pins that
 // mirror by iterating this exported list.
 //
-// Being on this list is what makes a ~/.botmux/.env setting reach the DASHBOARD
-// at all: `botmux-dashboard` is a separate PM2 app and, unlike the bot daemons
-// (index-daemon.ts dotenv-loads the file), it only ever sees the env block baked
-// here. A dashboard-only setting left off this list silently falls back to its
-// built-in default no matter what the operator wrote in .env.
+// This baked block is SHARED: the same resolved values land in the env of the
+// dashboard AND of every bot daemon, and they persist on disk in
+// ~/.botmux/ecosystem.config.json. Only non-secret settings belong here.
+//
+// The Dashboard Feishu H5 login family (BOTMUX_DASHBOARD_FEISHU_H5_*, incl. the
+// APP_SECRET credential) is DELIBERATELY absent: the dashboard receives it via
+// its own entry point — index-dashboard.ts dotenv-loads ~/.botmux/.env, exactly
+// like the bot daemons' index-daemon.ts — so the secret never enters the shared
+// env block and never lands in ecosystem.config.json. Do not re-add those keys;
+// test/daemon-lifecycle-env.test.ts pins the exclusion, and utils/child-env.ts
+// (stripDashboardH5Env / redactChildEnv) keeps the family out of the daemon
+// process and every CLI child.
 export const DAEMON_ENV_KEYS = [
   'WEB_EXTERNAL_HOST',
   'BOTMUX_DASHBOARD_EXTERNAL_HOST',
@@ -25,26 +32,14 @@ export const DAEMON_ENV_KEYS = [
   // from a bot session (whose pane wrapper unsets BOTMUX_*) silently demoted
   // all web-terminal links back to raw ip:port.
   'BOTMUX_PUBLIC_URL',
-  // Dashboard Feishu H5 passwordless login — the complete set read by
-  // resolveDashboardH5AuthConfig() in src/dashboard/h5-auth.ts. Missing here,
-  // a fully configured .env still produced `enabled:false` in the dashboard
-  // process (H5 entry 404), and the TTL / Secure-cookie / allowlist knobs all
-  // silently fell back to their defaults. The APP_SECRET is a real credential:
-  // it reaches only the managed PM2 apps, and utils/child-env.ts redacts the
-  // whole BOTMUX_DASHBOARD_FEISHU_H5_ prefix at every CLI-child boundary.
-  'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED',
-  'BOTMUX_DASHBOARD_FEISHU_H5_BRAND',
-  'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID',
-  'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET',
-  'BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS',
-  'BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH',
-  'BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS',
-  'BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE',
-  // Same dashboard-only class as the H5 family: the control-audit destination
+  // Dashboard-only, non-secret settings: the control-audit destination
   // (dashboard/control-audit.ts defaultControlAuditPath) and the terminal
   // takeover lease TTL (dashboard/terminal-control.ts terminalControlTtlFromEnv).
   // Documented in .env.example, but without a baked value an operator pointing
-  // the audit log at /var/lib/botmux kept writing to ~/.botmux/audit instead.
+  // the audit log at /var/lib/botmux kept writing to ~/.botmux/audit instead
+  // ("configured but never took effect"). Baked values also outrank the
+  // dashboard's own dotenv load (dotenv never overrides existing vars), which
+  // keeps them on the deterministic resolveDaemonEnv snapshot semantics.
   'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
   'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
 ] as const;

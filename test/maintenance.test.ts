@@ -16,7 +16,7 @@ import {
 } from '../src/core/maintenance.js';
 import type { MaintenanceConfig } from '../src/global-config.js';
 import type { RestartIntent } from '../src/services/restart-intent-store.js';
-import { WORKFLOW_WORKER_ENV_KEYS } from '../src/utils/child-env.js';
+import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX, WORKFLOW_WORKER_ENV_KEYS } from '../src/utils/child-env.js';
 import { DAEMON_ENV_KEYS } from '../src/cli/daemon-lifecycle-env.js';
 
 // 2026-06-07T04:00:00Z === 2026-06-07 12:00 local (Asia/Shanghai)
@@ -230,6 +230,25 @@ describe('detachedRestartEnv', () => {
     };
 
     expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
+  });
+
+  it('strips the Dashboard H5 credential family the dashboard dotenv-loaded for itself', () => {
+    // The H5 keys are deliberately OFF the DAEMON_ENV_KEYS mirror above (never
+    // baked into the PM2 env block), but the DASHBOARD process legitimately
+    // holds them: index-dashboard.ts dotenv-loads ~/.botmux/.env. The detached
+    // `botmux restart` it spawns (update/restart button) inherits the
+    // dashboard's env — the restart driver has no consumer for the family and
+    // must not carry the APP_SECRET toward pm2. Prefix sweep included, so a
+    // future H5 knob is covered the day it ships.
+    const inherited = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'secret'])),
+      [`${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`]: 'secret',
+      PATH: '/usr/bin',
+    };
+
+    expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
+    // In place on the copy only — the dashboard keeps its own working env.
+    expect(inherited.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('secret');
   });
 });
 

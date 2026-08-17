@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
-import { DASHBOARD_H5_ENV_KEYS } from '../src/utils/child-env.js';
+import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
 
 /**
  * Every key resolves to '' unless a source sets it, except the dashboard bind
@@ -109,24 +109,54 @@ describe('resolveDaemonEnv()', () => {
   });
 });
 
-describe('DAEMON_ENV_KEYS carries the dashboard-only settings', () => {
-  // `botmux-dashboard` is its own PM2 app and, unlike the bot daemons
-  // (index-daemon.ts dotenv-loads ~/.botmux/.env), it sees ONLY the env block
-  // baked from this list. A dashboard-only key left off silently falls back to
-  // its built-in default: a fully configured H5 login stayed `enabled:false`
-  // (entry path 404) and the TTL / Secure-cookie / allowlist knobs were ignored.
-  it('includes every H5 var the dashboard auth config reads', () => {
+describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () => {
+  // `botmux-dashboard` is its own PM2 app. Non-secret dashboard settings reach
+  // it via the env block baked from this list; the Feishu H5 login family
+  // (APP_SECRET included) deliberately does NOT — the dashboard entry point
+  // (index-dashboard.ts) dotenv-loads ~/.botmux/.env itself, so the credential
+  // never enters the SHARED env block that every bot daemon receives and that
+  // persists on disk in ~/.botmux/ecosystem.config.json.
+  it('excludes every H5 var — the family flows through index-dashboard.ts dotenv, not this block', () => {
     for (const key of DASHBOARD_H5_ENV_KEYS) {
-      expect(DAEMON_ENV_KEYS as readonly string[], key).toContain(key);
+      expect(DAEMON_ENV_KEYS as readonly string[], key).not.toContain(key);
     }
   });
 
-  it('stays in step with resolveDashboardH5AuthConfig (drift guard)', () => {
+  it('keeps every var resolveDashboardH5AuthConfig reads OFF the whitelist (drift guard)', () => {
+    // Scrape the single consumer's source: an H5 knob added to h5-auth.ts and
+    // then "helpfully" whitelisted here would put a credential-family key back
+    // into the shared baked block. Also sweep the whole prefix so no future
+    // DAEMON_ENV_KEYS entry can smuggle the family in under a new name.
     const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
     const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
     expect(read.size).toBeGreaterThan(0);
     for (const key of read) {
-      expect(DAEMON_ENV_KEYS as readonly string[], key).toContain(key);
+      expect(DAEMON_ENV_KEYS as readonly string[], key).not.toContain(key);
+    }
+    for (const key of DAEMON_ENV_KEYS) {
+      expect(key.startsWith(DASHBOARD_H5_ENV_PREFIX), key).toBe(false);
+    }
+  });
+
+  it('emits no H5 key even when the inherited env AND .env are fully populated', () => {
+    // The isolation red line: resolveDaemonEnv's output IS the ecosystem env
+    // block (cli.ts ecosystemConfig), shared by the dashboard and every bot
+    // daemon and written to ~/.botmux/ecosystem.config.json. Flood both
+    // sources with the complete 8-key family plus a future prefix knob; none
+    // may surface, for a shell-origin or a session-origin restart alike.
+    const floodedEnv = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map(key => [key, 'secret-from-env'])),
+      [`${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`]: 'secret-from-env',
+    };
+    const floodedFile = [
+      ...DASHBOARD_H5_ENV_KEYS.map(key => `${key}=secret-from-file`),
+      `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB=secret-from-file`,
+    ].join('\n');
+    for (const inherited of [floodedEnv, { ...floodedEnv, BOTMUX_SESSION_ID: 'session-1' }]) {
+      const resolved = resolveDaemonEnv(inherited, floodedFile);
+      const leaked = Object.keys(resolved).filter(key => key.startsWith(DASHBOARD_H5_ENV_PREFIX));
+      expect(leaked).toEqual([]);
+      expect(JSON.stringify(resolved)).not.toContain('secret-from');
     }
   });
 
@@ -135,28 +165,18 @@ describe('DAEMON_ENV_KEYS carries the dashboard-only settings', () => {
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS');
   });
 
-  it('resolves each dashboard setting from the .env snapshot end to end', () => {
+  it('resolves the non-secret dashboard settings from the .env snapshot end to end', () => {
     const resolved = resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1' }, [
+      // The H5 lines sit in the SAME file the audit/TTL settings come from —
+      // they must stay out of the resolved block while their neighbors land.
       'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED=true',
-      'BOTMUX_DASHBOARD_FEISHU_H5_BRAND=lark',
-      'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID=cli_h5',
       'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET=h5-secret',
-      'BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS=ou_a,ou_b',
-      'BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH=/auth/feishu',
-      'BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS=1800000',
-      'BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE=true',
       'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH=/var/lib/botmux/audit/dashboard-control.ndjson',
       'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS=300000',
     ].join('\n'));
+    // expected() is derived from DAEMON_ENV_KEYS, so the exact-shape equality
+    // doubles as "no H5 key in the output".
     expect(resolved).toEqual(expected({
-      BOTMUX_DASHBOARD_FEISHU_H5_ENABLED: 'true',
-      BOTMUX_DASHBOARD_FEISHU_H5_BRAND: 'lark',
-      BOTMUX_DASHBOARD_FEISHU_H5_APP_ID: 'cli_h5',
-      BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret',
-      BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS: 'ou_a,ou_b',
-      BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH: '/auth/feishu',
-      BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS: '1800000',
-      BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE: 'true',
       BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH: '/var/lib/botmux/audit/dashboard-control.ndjson',
       BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS: '300000',
     }));

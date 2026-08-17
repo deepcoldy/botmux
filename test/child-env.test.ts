@@ -12,6 +12,7 @@ import {
   scrubSessionCliHomeEnv,
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
+  stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
@@ -205,6 +206,57 @@ describe('redactChildEnv()', () => {
       if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
       else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
     }
+  });
+});
+
+describe('stripDashboardH5Env()', () => {
+  it('deletes the full 8-key family plus any future prefix knob in place, keys absent not undefined', () => {
+    // The daemon dotenv-loads ~/.botmux/.env wholesale, so at boot its env
+    // holds the Dashboard's H5 APP_SECRET (a full Feishu app credential).
+    // index-daemon.ts calls this right after dotenv: the daemon process itself
+    // must hold nothing of the family — redactChildEnv/tmux pane unset stay as
+    // the second layer at the CLI-child boundary. Same node-pty trap as
+    // redactChildEnv: keys must be ABSENT, not present-with-"undefined".
+    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'secret'])),
+      [future]: 'secret',
+      KEEP: 'v',
+      PATH: '/usr/bin',
+    };
+
+    stripDashboardH5Env(env);
+
+    for (const key of DASHBOARD_H5_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(future in env).toBe(false);
+    // Non-H5 vars — including non-secret BOTMUX_DASHBOARD_* settings — survive.
+    expect(env.KEEP).toBe('v');
+    expect(env.PATH).toBe('/usr/bin');
+  });
+
+  it('leaves non-H5 dashboard settings alone', () => {
+    const env: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_PORT: '7991' };
+    stripDashboardH5Env(env);
+    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7991');
+  });
+
+  it('is called by index-daemon.ts after dotenv (source pin)', () => {
+    // The unit test above proves the function; this pins the boundary that
+    // makes it matter: the daemon strips the family it just dotenv-loaded
+    // BEFORE any daemon code (or the session-var scrubs below it) can run.
+    const src = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
+    const dotenvAt = src.indexOf('dotenvConfig(');
+    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
+    expect(dotenvAt).toBeGreaterThan(-1);
+    expect(stripAt).toBeGreaterThan(dotenvAt);
+  });
+
+  it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
+    const src = readFileSync(new URL('../src/core/maintenance.ts', import.meta.url), 'utf-8');
+    const fn = src.slice(src.indexOf('export function detachedRestartEnv('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('stripDashboardH5Env(');
   });
 });
 

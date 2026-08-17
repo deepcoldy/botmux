@@ -44,7 +44,7 @@ import {
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
 import { withFileLockSync } from '../utils/file-lock.js';
-import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { scrubWorkflowWorkerEnv, stripDashboardH5Env } from '../utils/child-env.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -250,6 +250,14 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
   // PM2 snapshot. `botmux restart` checks workflow mode before pm2Env(), so it
   // must not inherit node-worker identity even if a host boot scrub regresses.
   scrubWorkflowWorkerEnv(env);
+  // The dashboard process legitimately holds the Feishu H5 credential family
+  // (index-dashboard.ts dotenv-loads it from ~/.botmux/.env — deliberately NOT
+  // baked into the PM2 env block, see DAEMON_ENV_KEYS), so a detached restart
+  // it spawns would inherit the APP_SECRET. The restart driver has no consumer
+  // for any of it and must not carry it toward pm2; the fresh dashboard reloads
+  // the family from .env itself. Not part of the DAEMON_ENV_KEYS mirror below —
+  // this is credential hygiene, not baked-snapshot invalidation.
+  stripDashboardH5Env(env);
   // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
   // fresh CLI reload these settings from the file.
   //
@@ -268,17 +276,6 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
     'BOTMUX_PUBLIC_URL',
-    // Dashboard Feishu H5 passwordless login (h5-auth.ts) — a stale baked
-    // APP_SECRET / allowlist / TTL would outlive the operator's .env edit and,
-    // for the allowlist, keep granting a revoked open_id.
-    'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED',
-    'BOTMUX_DASHBOARD_FEISHU_H5_BRAND',
-    'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID',
-    'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET',
-    'BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS',
-    'BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH',
-    'BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS',
-    'BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE',
     // Dashboard control-audit destination + terminal takeover lease TTL.
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
     'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',

@@ -18495,16 +18495,6 @@ async function handleThreadReplyAdmitted(
     }
   }
 
-  // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
-  // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
-  // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
-  if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
-    const sgEntry = getSessionGroup(ctxChatId);
-    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
-      scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
-    }
-  }
-
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
   // 不是用户直接发的——后续不需要按"对话用户"的方式处理。signal-file 路径

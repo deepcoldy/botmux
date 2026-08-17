@@ -115,6 +115,34 @@ export const DASHBOARD_H5_ENV_KEYS = [
 ] as const;
 
 /**
+ * Delete the entire Dashboard-only Feishu H5 login family from `env` IN PLACE:
+ * every named key in {@link DASHBOARD_H5_ENV_KEYS} plus a
+ * {@link DASHBOARD_H5_ENV_PREFIX} sweep, so a knob added tomorrow is stripped
+ * the day it ships rather than the day someone extends the list.
+ *
+ * The Dashboard is the family's ONLY consumer, and it receives the values by
+ * dotenv-loading ~/.botmux/.env itself (index-dashboard.ts) — NOT through the
+ * shared PM2 env block (the H5 keys are deliberately absent from
+ * DAEMON_ENV_KEYS). Every other botmux-owned process must therefore hold none
+ * of it. Call sites:
+ *  - index-daemon.ts boot: the daemon dotenv-loads the same .env wholesale, so
+ *    it must drop the family right after dotenv — a daemon holding the H5
+ *    APP_SECRET can mint app_access_token for the Dashboard's login app.
+ *  - core/maintenance.ts detachedRestartEnv(): the detached `botmux restart`
+ *    the DASHBOARD spawns (update/restart button) inherits the dashboard's env,
+ *    which legitimately holds the secrets; the restart driver does not need
+ *    them and must not carry them toward pm2.
+ * redactChildEnv() keeps its own equivalent strip as the second line of
+ * defense at every CLI-child boundary (PTY/tmux pane unset/one-shot).
+ */
+export function stripDashboardH5Env(env: NodeJS.ProcessEnv): void {
+  for (const key of DASHBOARD_H5_ENV_KEYS) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(DASHBOARD_H5_ENV_PREFIX)) delete env[key];
+  }
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403
@@ -422,9 +450,8 @@ export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
   // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
   // knob added later. No CLI child ever consumes one, so a prefix-wide strip
-  // cannot break a supported configuration channel.
-  for (const key of Object.keys(env)) {
-    if (key.startsWith(DASHBOARD_H5_ENV_PREFIX)) delete env[key];
-  }
+  // cannot break a supported configuration channel. Same implementation as the
+  // daemon-boot / detached-restart strip so the two layers cannot drift.
+  stripDashboardH5Env(env);
   return env;
 }

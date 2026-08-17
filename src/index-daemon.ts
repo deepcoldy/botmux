@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv, stripDashboardH5Env } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -15,6 +15,17 @@ installStdioEpipeGuard();
 // Bot config now lives in bots.json; this is kept for backward compatibility.
 const globalEnv = join(homedir(), '.botmux', '.env');
 dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
+
+// The dotenv load above pulls in ~/.botmux/.env WHOLESALE — including the
+// Dashboard-only Feishu H5 login family, whose APP_SECRET can mint
+// app_access_token for the Dashboard's login app. Its single consumer runs in
+// the dashboard process (index-dashboard.ts loads the same file for itself);
+// the daemon process must not hold Dashboard credentials at all, so drop the
+// whole family (named keys + prefix sweep, so a future H5 knob is covered the
+// day it is added) before any daemon code can observe it. The
+// redactChildEnv()/tmux-pane-unset strip at every CLI-child boundary stays in
+// place as the second layer of defense.
+stripDashboardH5Env(process.env);
 
 // A daemon is never a session. pm2 startOrRestart injects the caller's
 // environment into restarted apps, so a `botmux restart` issued from inside a
