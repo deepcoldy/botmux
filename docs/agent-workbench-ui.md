@@ -91,4 +91,9 @@ The pre-merge acceptance build emitted the lazy chunks agent-workbench-page-4FMJ
 
 The checked-in screenshot is docs/assets/agent-workbench-dark.png (1440×900). It uses synthetic data and local same-origin fixtures; it contains no credential or live session data.
 
-The sidecar metrics report 320 sessions, 18 rendered virtual rows at the 54px row height, 2 group headers, the terminal chip in its writable「◆可输入」state and the full responsive step. Browser scenario evidence is in docs/assets/agent-workbench-browser-results.json.
+The sidecar metrics report 320 sessions, 18 rendered virtual rows at the 54px row height, 2 group headers, the terminal chip in its writable「◆可输入」state and the full responsive step.
+
+Two classes of browser evidence exist and they are not interchangeable:
+
+- **component harness** — docs/assets/agent-workbench-browser-results.json (`harnessType: "component"`). The page under test is scripts/fixtures/agent-workbench-browser.tsx, which mounts the Workbench components directly with hardcoded sessions, auth state and capabilities. It proves component behavior and the server-module contracts it exercises; it does NOT exercise the production entry, the store bootstrap or the real auth flow.
+- **production e2e** — docs/assets/workbench-production-e2e-results.json (`harnessType: "production-e2e"`). The page is the real esbuild output of src/dashboard/web/app.tsx, the identity is a real Feishu H5 session cookie, and the mobile run uses a real `hasTouch` device profile.

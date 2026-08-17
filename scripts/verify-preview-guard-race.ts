@@ -38,7 +38,8 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type BrowserContext, type Page } from 'playwright';
-import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
+import { resolvePreviewPortOwner } from '../src/core/preview-port-owner.js';
+import { PREVIEW_CONTENT_SEGMENT, type SessionPreviewTarget } from '../src/core/session-preview.js';
 import {
   previewInteractionWriteAllowed,
   projectWorkbenchOperationCapabilities,
@@ -94,8 +95,28 @@ const observed = {
 };
 
 /** 场景 B：把下一个 activity 响应挂住，直到显式放行或客户端断开。 */
-let heldActivity: { release(): void; aborted: boolean } | null = null;
+interface HeldActivity {
+  release(): void;
+  aborted: boolean;
+}
+let heldActivity: HeldActivity | null = null;
 let holdActivity = false;
+
+/** 读回当前被挂住的 activity。写成函数而不是直接读变量：它是在请求处理回调里被赋值
+ *  的，直接读的话控制流分析会停在 `heldActivity = null` 那一步、把类型收敛成 `never`，
+ *  于是 `.release()` / `.aborted` 编译不过。 */
+function pendingActivity(): HeldActivity | null {
+  return heldActivity;
+}
+
+/** P1-12 之后 `SessionPreviewTarget` 必须带端口持有证明与 worker 代次。被预览的上游
+ *  就监听在本进程里（`/preview/<id>/<content>/` 那条路由自己吐 APP_HTML），所以走生产
+ *  同一条 `resolvePreviewPortOwner` 求一份**真的**证明，而不是编一个形状糊过去。 */
+let previewTarget: SessionPreviewTarget | null = null;
+function requirePreviewTarget(): SessionPreviewTarget {
+  if (!previewTarget) throw new Error('preview target resolved before the harness server started listening');
+  return previewTarget;
+}
 
 function identityOf(req: IncomingMessage): (WorkbenchCapabilityActor & TerminalDashboardActor) | null {
   const cookie = req.headers.cookie ?? '';
@@ -111,7 +132,7 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 const guard = createPreviewGuardPage({
   authenticated: req => identityOf(req) !== null,
   resolve: sessionId => (sessionId === SESSION_ID
-    ? { ok: true, target: { host: '127.0.0.1', port: 4321, registeredAt: new Date().toISOString() } }
+    ? { ok: true, target: requirePreviewTarget() }
     : { ok: false, status: 404, error: 'unknown_session' }),
   mintContentCapability: (req, sessionId) => {
     const identity = identityOf(req);
@@ -243,6 +264,18 @@ async function touchPreviewApp(page: Page): Promise<void> {
 async function main(): Promise<void> {
   const port = await listen(server);
   const base = `http://127.0.0.1:${port}`;
+  const owner = resolvePreviewPortOwner({ host: '127.0.0.1', port, ownerPids: [process.pid] });
+  assert.ok(
+    owner.ok,
+    `拿不到本进程预览端口的持有证明（${(owner as { reason?: string }).reason}）——没有它 guard 壳的 resolve 就不是生产形状`,
+  );
+  previewTarget = {
+    host: '127.0.0.1',
+    port,
+    registeredAt: new Date().toISOString(),
+    owner: owner.proof,
+    workerGeneration: 1,
+  };
   const browserPath = await executablePath();
   const browser = await chromium.launch({ headless: true, ...(browserPath ? { executablePath: browserPath } : {}) });
 
@@ -306,13 +339,13 @@ async function main(): Promise<void> {
 
       await page.click('#lock');
       await page.waitForFunction(() => !document.getElementById('overlay')!.classList.contains('hidden'), null, { timeout: 5_000 });
-      heldActivity?.release();
+      pendingActivity()?.release();
       await page.waitForTimeout(600);
       const lockedAfterRelease = await overlayLocked(page);
       assert.equal(lockedAfterRelease, true, '服务端挂住的 activity 放行后掀开了蒙层');
       findings.nativePath = {
         lockedAfterRelease,
-        activityAbortedByClient: heldActivity?.aborted ?? false,
+        activityAbortedByClient: pendingActivity()?.aborted ?? false,
         lockRequests: observed.lockRequests,
       };
       await context.close();

@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -77,6 +79,17 @@ async function closeServer(server: Server): Promise<void> {
   await new Promise<void>(resolve => server.close(() => resolve()));
 }
 
+/** 证据要能被复现，就得说清「这份绿是哪个 commit、哪份夹具产物、哪个浏览器跑出来的」。 */
+function headCommit(): { commit: string; dirty: boolean } {
+  try {
+    const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+    const status = execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim();
+    return { commit, dirty: status.length > 0 };
+  } catch {
+    return { commit: 'unknown', dirty: false };
+  }
+}
+
 async function executablePath(): Promise<string | undefined> {
   const explicit = process.env.BOTMUX_WORKBENCH_BROWSER_EXECUTABLE?.trim();
   const candidates = [
@@ -115,11 +128,15 @@ const controlSecret = 'local-browser-control-secret-not-a-real-credential';
 /** Worker boot generation for the minted view capabilities. The real daemon
  *  derives it from the worker's per-boot card token; the harness feeds the same
  *  helper a synthetic upstream URL so the token shape is identical. */
-const viewGeneration = upstreamWorkerViewGeneration(
-  controlSecret,
-  'http://127.0.0.1:1/?viewToken=local-browser-boot-token',
-);
-if (!viewGeneration) throw new Error('unable to derive a worker view generation for the harness');
+function harnessViewGeneration(): string {
+  const derived = upstreamWorkerViewGeneration(
+    controlSecret,
+    'http://127.0.0.1:1/?viewToken=local-browser-boot-token',
+  );
+  if (!derived) throw new Error('unable to derive a worker view generation for the harness');
+  return derived;
+}
+const viewGeneration = harnessViewGeneration();
 const terminalControl = new TerminalControlManager({
   secret: controlSecret,
   audit,
@@ -821,9 +838,37 @@ try {
     await context.close();
   });
 
+  const head = headCommit();
   const output = {
     ok: true,
-    browser: browserPath ? 'local executable' : 'Playwright managed Chromium',
+    /**
+     * 这份结果的**性质**，必须写清楚：它是 component harness。
+     *
+     * 页面挂的是 `scripts/fixtures/agent-workbench-browser.tsx`——夹具自己
+     * `createRoot` 渲染工作台组件，会话数组、登录态、能力集都是硬编码常量，
+     * 生产入口 `app.tsx`、`store.ts` 的 bootstrap、真实认证流程一概没跑。
+     * 所以这里的全绿只证明「组件在给定 props 下的行为 + 服务端那几个真模块的
+     * 契约」，**不能当作生产 H5 / Store / 终端代理跑通的证据**。
+     * 生产链路的证据在 `docs/assets/workbench-production-e2e-results.json`
+     * （scripts/verify-workbench-production-e2e.ts，harnessType: production-e2e）。
+     */
+    harnessType: 'component',
+    harness: {
+      page: 'scripts/fixtures/agent-workbench-browser.tsx (hardcoded sessions / auth / capabilities)',
+      productionEntryExercised: false,
+      productionStoreExercised: false,
+      note: '生产 bundle 的端到端证据见 docs/assets/workbench-production-e2e-results.json',
+    },
+    head: head.commit,
+    worktreeDirty: head.dirty,
+    headNote: 'head 是跑这一轮时的 HEAD；worktreeDirty=true 表示工作区还有未提交改动（证据先于提交产生时的常态）',
+    fixtureBuild: {
+      bundler: 'esbuild (in-process, esm/chrome120)',
+      bytes: fixtureJs.byteLength,
+      sha256: createHash('sha256').update(fixtureJs).digest('hex'),
+    },
+    browser: browserPath ? `local executable (${browserPath})` : 'Playwright managed Chromium',
+    browserVersion: browser.version(),
     viewportCoverage: ['1440x900', '1280x800', '1194x834 (touch)', '900x800', '390x844 (iPhone 13 profile)', '375x800'],
     screenshots: shotDir,
     scenarios: scenarioResults,

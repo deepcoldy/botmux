@@ -4,11 +4,19 @@ import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js';
 import { AgentWorkbenchDockView } from '../src/dashboard/web/agent-workbench-dock-view.js';
 import type { WorkbenchApi } from '../src/dashboard/web/agent-workbench-api.js';
-import type { WorkbenchSessionRow } from '../src/dashboard/web/agent-workbench-model.js';
+import type { WorkbenchSessionRow, WorkbenchTerminalLocation } from '../src/dashboard/web/agent-workbench-model.js';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const TERMINAL_ORIGIN = 'https://dash.example';
+/** 注入的 location 必须是完整的 `WorkbenchTerminalLocation`（protocol / origin /
+ *  hostname 三件套），不能只给 origin：真实 `window.Location` 就是这个形状，缺字段的
+ *  夹具会让「HTTPS 集中域一律走同源 /s/ 反代」这类分支在脚本里根本走不到。字段从
+ *  origin 解出来，改一处即可。 */
+const TERMINAL_LOCATION: WorkbenchTerminalLocation = (() => {
+  const url = new URL(TERMINAL_ORIGIN);
+  return { protocol: url.protocol, origin: url.origin, hostname: url.hostname };
+})();
 let takeovers = 0;
 const api: WorkbenchApi = {
   getTerminalControl: async () => ({ mode: 'readonly', owned: false }),
@@ -49,9 +57,24 @@ function buttonWithText(root: ReactTestInstance, text: string): ReactTestInstanc
   return root.findAllByType('button').find(button => textOf(button) === text);
 }
 
+/**
+ * 挂载一个组件。
+ *
+ * props 与组件契约就在 `React.createElement` 这一行被真正检查——工作台组件改了必填
+ * 属性，这个脚本立刻编译不过，这正是把 scripts/ 纳入 tsc 要拦的那类夹具腐烂。
+ *
+ * 交给渲染器时的那次转换只为绕开一处依赖版本错配：`@types/react-test-renderer@19.1`
+ * 自己钉的是 `@types/react@18`，它眼里的 `ReactElement` 和仓库在用的 React 19 不是
+ * 同一个类型。转换只发生在「元素 → 渲染器入参」这一步，不放过任何 props 检查。
+ */
+function render<P extends object>(component: React.FunctionComponent<P>, props: P): TestRenderer.ReactTestRenderer {
+  const element = React.createElement(component, props);
+  return TestRenderer.create(element as unknown as Parameters<typeof TestRenderer.create>[0]);
+}
+
 let main!: TestRenderer.ReactTestRenderer;
 await act(async () => {
-  main = TestRenderer.create(React.createElement(AgentWorkbenchView, {
+  main = render(AgentWorkbenchView, {
     sessions,
     online: true,
     authenticated: true,
@@ -62,11 +85,11 @@ await act(async () => {
     now: 1_900_000_001_000,
     api,
     storage: null,
-    location: { origin: TERMINAL_ORIGIN },
+    location: TERMINAL_LOCATION,
     sdk: null,
     h5Context: null,
     onRouteChange: () => {},
-  }));
+  });
 });
 
 // 虚拟滚动：320 个会话只渲染一屏多一点，绝不是全量铺开。
@@ -136,7 +159,7 @@ act(() => main.unmount());
 
 let dock!: TestRenderer.ReactTestRenderer;
 await act(async () => {
-  dock = TestRenderer.create(React.createElement(AgentWorkbenchDockView, {
+  dock = render(AgentWorkbenchDockView, {
     sessions: sessions.slice(0, 3),
     online: true,
     authenticated: true,
@@ -145,9 +168,9 @@ await act(async () => {
     sdk: null,
     h5Context: { enabled: true, appId: 'cli_x', brand: 'feishu', entryPath: '/auth/feishu' },
     targetOrigin: TERMINAL_ORIGIN,
-    location: { origin: TERMINAL_ORIGIN },
+    location: TERMINAL_LOCATION,
     onRouteChange: () => {},
-  }));
+  });
 });
 assert.equal(dock.root.findByProps({ className: 'agent-workbench-dock' }).props.style.minWidth, 350);
 assert.match(dock.root.findByProps({ className: 'wb-primary-action' }).props.href, /mode=appCenter/);

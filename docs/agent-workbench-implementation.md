@@ -245,9 +245,17 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 
 安全批 1 验收轮的全量命令为 `npx vitest run --project unit`（默认并行），全绿。此前轮次曾用 `pnpm test -- --maxWorkers=1 --no-file-parallelism` 串行执行：由于验证本身运行在活跃 Botmux workflow 内，进程发现类测试使用清空 BOTMUX 上下文的环境、私有 PID `/proc` 和独立 `TMUX_TMPDIR`，避免把外层同 UID worker 误当成 fixture；串行执行也消除了 `/proc` 瞬态并发噪声。两种跑法都属测试进程隔离，不会修改或重启 live daemon。
 
-### 8.2 本地真实浏览器场景
+### 8.2 本地真实浏览器场景（component harness）
 
-浏览器脚本使用本机 Chromium headless shell、真实 React Workbench、真实 H5 controller、TerminalControlManager、PreviewInteractionManager、Preview guard/proxy，以及本地 loopback HTTP/WS fixture。没有连接真实飞书后端。
+浏览器脚本使用本机 Chromium headless shell、真实 React Workbench 组件、真实 H5 controller、TerminalControlManager、PreviewInteractionManager、Preview guard/proxy，以及本地 loopback HTTP/WS fixture。没有连接真实飞书后端。
+
+**这一套的性质必须说清楚：它是 component harness，不是生产端到端。** 页面挂的是
+`scripts/fixtures/agent-workbench-browser.tsx`——夹具自己 `createRoot` 渲染工作台组件，
+会话数组、登录态、能力集都是硬编码常量；生产入口 `src/dashboard/web/app.tsx`、
+`store.ts` 的 bootstrap、真实认证流程都没有参与。所以下表的全绿只证明「组件在给定
+props 下的行为 + 表内点名的那几个真服务端模块的契约」，**不能当作生产 H5 主链路、
+Store 快照或终端代理跑通的证据**——后者见 8.2.1。结果 JSON 里以
+`harnessType: "component"` 标注，并附 HEAD commit、夹具产物 sha256 与浏览器版本。
 
 | 场景 | 结果 |
 |---|---|
@@ -272,7 +280,35 @@ P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-previ
 
 guard 蒙层的时序与能力渲染另有 `scripts/verify-preview-guard-race.ts`（真 Chromium + 真 guard 壳 + 真交互状态机 + 真角色门禁）：① 一份在点击「返回预览模式」**之前**就已经落到浏览器手里的 activity 响应，在锁定之后才被交给壳，蒙层必须保持锁定（这类响应 AbortController 已经拦不住，只能靠请求代号丢弃）；② 不做任何注入的原生路径上，服务端挂住的 activity 被客户端 abort，放行后同样掀不开蒙层；③ 只读身份（platform teammate）的壳里没有解锁/锁定按钮、蒙层锁定、预览内容照常可见，同时直接 POST unlock 仍是 403。截图 assets/preview-guard-race-unlocked.png、assets/preview-guard-race-locked.png、assets/preview-guard-readonly.png，机器可读结果见 assets/preview-guard-race-results.json。
 
-机器可读结果见 assets/agent-workbench-browser-results.json。
+机器可读结果见 assets/agent-workbench-browser-results.json（`harnessType: "component"`）。
+
+### 8.2.1 生产 bundle 端到端（production-e2e）
+
+`scripts/verify-workbench-production-e2e.ts` 补的正是 8.2 证明不了的那一半：页面换成
+生产入口 `src/dashboard/web/app.tsx` 的 esbuild 产物（与 `pnpm dashboard:bundle` 同一套
+配置），会话来自真 `store.bootstrap()` 的 `/api/sessions` 快照，身份是真
+`DashboardSessionStore` 签发的飞书 H5 会话 Cookie，门禁由真 `decideWorkbenchH5Auth`
+判定、能力集由真 `projectWorkbenchOperationCapabilities` 投影，`/view-link` 走真
+`mintTerminalViewCapability` + `centralViewLinkPath`，控制类写请求过真
+`ControlCsrfTokens` + `guardControlRequest`，预览目标带真 `resolvePreviewPortOwner`
+证明。移动端用 Playwright 的 iPhone 13 profile，`hasTouch` 是真的（脚本自己断言
+`(hover: none)` 与 `maxTouchPoints > 0`），不是只把 viewport 改窄。
+
+| 断言 | 结果 |
+|---|---|
+| H5 身份进生产工作台，会话列表真的渲染出 2 行真实数据；`/api/schedules` 一跳未发；`/api/settings` 的窄门禁 401 没有触发登录蒙层（P1-14） | 通过 |
+| 真触屏 context 下会话坞终端链接带 `viewToken=`、同源、目标 ≥44px；生产 Dock 真的请求了 `/view-link`（P1-17） | 通过 |
+| 该链接在**完全无 Cookie**的上下文里页面 200、WebSocket 升级收到数据帧；同上下文的裸 `/s/<id>` 页面 401、WebSocket 被拒（iOS WebView 处境） | 通过 |
+| 移动「网页」页签里 guard 蒙层默认锁定 → 开启交互后收起 → 立即锁定后重新盖上，服务端审计留下 preview.unlock / preview.lock | 通过 |
+
+机器可读结果见 assets/workbench-production-e2e-results.json（`harnessType: "production-e2e"`，
+含 HEAD commit、bundle 配置、浏览器版本）；截图为
+assets/workbench-production-e2e-h5-sessions.png、-dock-touch.png、-cookieless-terminal.png、
+-guard-locked.png、-guard-unlocked.png。
+
+P1-14 另有一份专项对照 `scripts/verify-workbench-schedules-degradation.ts`（同样是生产
+bundle）：Workbench-only 与 legacy owner 两组身份跑同一条启动路径，证明排程 401 只让
+排程区块降级、不动会话快照。结果见 assets/workbench-schedules-degradation-results.json。
 
 ### 8.3 截图
 
