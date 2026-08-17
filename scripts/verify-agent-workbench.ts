@@ -76,8 +76,19 @@ assert.match(dockLink ?? '', /min_width=350/);
 const css = readFileSync(join(process.cwd(), 'src/dashboard/web/style.css'), 'utf8');
 const workbenchCss = css.slice(css.indexOf('/* Agent Workbench'));
 assert.doesNotMatch(workbenchCss, /(?:linear|radial|conic)-gradient\s*\(/i);
-const radii = [...workbenchCss.matchAll(/border-radius:\s*(\d+)px/g)].map(match => Number(match[1]));
-assert.ok(radii.length >= 8 && Math.max(...radii) <= 4);
+// 圆角走四级令牌，段里不留裸像素值：令牌值锁死 4/8/10/12，其余每条 border-radius
+// 的每个分量只能是令牌、0（方角重置）或 50%（未读圆点）。注释先剥掉再扫，说明文字
+// 里出现的 `border-radius: …` 不是声明，不该被当成漂移。
+const radiusTokens = new Map(
+  [...workbenchCss.matchAll(/--wb-radius-(s|m|l|xl):\s*(\d+)px/g)].map(match => [match[1], Number(match[2])]),
+);
+assert.deepEqual([...radiusTokens.keys()].sort(), ['l', 'm', 's', 'xl']);
+assert.deepEqual([radiusTokens.get('s'), radiusTokens.get('m'), radiusTokens.get('l'), radiusTokens.get('xl')], [4, 8, 10, 12]);
+const radiusValues = [...workbenchCss.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/border-radius:\s*([^;}]+)/g)]
+  .map(match => match[1].trim());
+assert.ok(radiusValues.length >= 20);
+const allowedRadius = /^(?:0|50%|var\(--wb-radius-(?:s|m|l|xl)\))$/;
+assert.deepEqual(radiusValues.filter(value => !value.split(/\s+/).every(part => allowedRadius.test(part))), []);
 const routes = readFileSync(join(process.cwd(), 'src/dashboard/web/dashboard-routes.ts'), 'utf8');
 assert.match(routes, /agent-workbench-dock-page/);
 assert.match(routes, /agent-workbench-page/);
