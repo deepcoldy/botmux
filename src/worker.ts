@@ -44,7 +44,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -4017,7 +4017,8 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
         ? 'worker.empty_final_failed_connection'
         : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
-  return partialText?.trim() ? `${partialText.trim()}\n\n${failure}` : failure;
+  const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
+  return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -8537,12 +8538,12 @@ async function handleTrustedCodexAppMarker(
       log(`${cliName()} native turn ${nativeTurnId.substring(0, 12)} mapped to botmux turn ${turnId.substring(0, 12)}`);
     }
     let suppressDelivery = false;
-    // What actually reaches Lark: strip a trailing sentinel line so the literal
-    // token never posts. `finalContent` stays RAW above (the steer_superseded
-    // validator asserts finalContent==='' and must see the unstripped payload).
-    // If nothing remains after stripping, this was a pure-silence final → treat
-    // as suppressed so the daemon persists the FIFO advance without delivering.
-    const deliverableContent = stripTrailingBridgeSentinelLine(finalContent);
+    // What actually reaches Lark: strip internal memory attribution and a
+    // trailing sentinel line. `finalContent` stays RAW above (the
+    // steer_superseded validator asserts finalContent==='' and the fallback gate
+    // must see the unstripped payload). If nothing remains, this was metadata or
+    // a pure-silence final → persist the FIFO advance without delivering.
+    const deliverableContent = bridgePostText(finalContent, false);
     if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
       suppressDelivery = true;
     }

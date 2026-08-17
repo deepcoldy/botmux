@@ -11,6 +11,7 @@ import {
   shouldSuppressBridgeEmit,
   structuredFallbackKind,
   stripTrailingBridgeSentinelLine,
+  stripTrailingOaiMemoryCitation,
   type BridgeSendMarker,
 } from '../src/services/bridge-fallback-gate.js';
 import {
@@ -28,6 +29,49 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
     ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
+
+const memoryCitation = (lineEnding = '\n', rolloutIds = '019c1234') => [
+  '<oai-mem-citation>',
+  '<citation_entries>',
+  'MEMORY.md:10-12|note=[routing context]',
+  '</citation_entries>',
+  '<rollout_ids>',
+  rolloutIds,
+  '</rollout_ids>',
+  '</oai-mem-citation>',
+].join(lineEnding);
+
+describe('stripTrailingOaiMemoryCitation', () => {
+  it('strips only a complete citation suffix and its separator', () => {
+    expect(stripTrailingOaiMemoryCitation(`Visible answer.\n\n${memoryCitation()}`))
+      .toBe('Visible answer.');
+    expect(stripTrailingOaiMemoryCitation(memoryCitation())).toBe('');
+  });
+
+  it('accepts CRLF, trailing whitespace, and an empty rollout_ids section', () => {
+    expect(stripTrailingOaiMemoryCitation(`Visible answer.\r\n\r\n${memoryCitation('\r\n', '')}\r\n  `))
+      .toBe('Visible answer.');
+  });
+
+  it('preserves middle-of-body occurrences and fenced examples', () => {
+    const middle = `${memoryCitation()}\n\nMore visible prose.`;
+    expect(stripTrailingOaiMemoryCitation(middle)).toBe(middle);
+
+    const fenced = `Example:\n\n\`\`\`xml\n${memoryCitation()}\n\`\`\``;
+    expect(stripTrailingOaiMemoryCitation(fenced)).toBe(fenced);
+  });
+
+  it('preserves inline, malformed, and incomplete blocks', () => {
+    const inline = `answer ${memoryCitation()}`;
+    expect(stripTrailingOaiMemoryCitation(inline)).toBe(inline);
+
+    const missingRollouts = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n</oai-mem-citation>';
+    expect(stripTrailingOaiMemoryCitation(missingRollouts)).toBe(missingRollouts);
+
+    const unclosed = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n<rollout_ids>';
+    expect(stripTrailingOaiMemoryCitation(unclosed)).toBe(unclosed);
+  });
+});
 
 describe('stripTrailingBridgeSentinelLine', () => {
   it('bare sentinel strips to empty (genuine silence)', () => {
@@ -77,7 +121,7 @@ describe('stripTrailingBridgeSentinelLine', () => {
   });
 });
 
-describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
+describe('bridgePostText (adopt sentinel contract — codex #791 blocker)', () => {
   it('non-adopt strips a trailing sentinel line (posts the prose)', () => {
     expect(bridgePostText(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`, false))
       .toBe('Here is the answer.');
@@ -85,7 +129,7 @@ describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
     expect(bridgePostText(BRIDGE_NOTHING_TO_SEND_SENTINEL, false)).toBe('');
   });
 
-  it('ADOPT returns text VERBATIM — never strips the sentinel', () => {
+  it('ADOPT preserves sentinel text verbatim', () => {
     // The adopted CLI is botmux-unaware; transcript drain is its only channel and
     // it may output the literal token as content. Stripping here would truncate a
     // real answer / drop a verbatim-token reply. shouldSuppressBridgeEmit(adopt)
@@ -101,6 +145,12 @@ describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
   it('leaves ordinary answers untouched in both modes', () => {
     expect(bridgePostText('a normal reply', false)).toBe('a normal reply');
     expect(bridgePostText('a normal reply', true)).toBe('a normal reply');
+  });
+
+  it('removes memory citation metadata from fallback output in both modes', () => {
+    const finalText = `Visible fallback.\n\n${memoryCitation()}`;
+    expect(bridgePostText(finalText, false)).toBe('Visible fallback.');
+    expect(bridgePostText(finalText, true)).toBe('Visible fallback.');
   });
 });
 
@@ -166,6 +216,20 @@ describe('buildBridgeSendMarkerContent', () => {
 });
 
 describe('shouldSuppressBridgeEmit', () => {
+  it('compares visible marker/final lengths without memory citation metadata', () => {
+    const visible = 'The answer already sent to the user.';
+    const withCitation = `${visible}\n\n${memoryCitation()}`;
+    const marker = markerForContent(150, withCitation);
+    expect(marker.contentLength).toBe(normalise(visible).length);
+    expect(marker.previewText).toBe(visible);
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: withCitation },
+      200,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
   it('non-adopt: exact nothing-to-send sentinel suppresses without a send marker', () => {
     expect(shouldSuppressBridgeEmit(
       { ...turn(100), finalText: `  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n` },
