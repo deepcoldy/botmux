@@ -1281,9 +1281,22 @@ function logWorkerStderr(t: string, line: string): void {
 // the first POST returns a real message_id.
 export const CARD_POSTING_SENTINEL = '__posting__';
 
-function streamingCardReplyTargetKey(ds: DaemonSession, turnId?: string): string {
-  const replyContext = frozenReplyContextForTurn(ds, fallbackTurnId(ds, turnId));
-  return replyTargetKey(replyContext.target);
+/**
+ * Freeze the destination used by one streaming-card POST before dispatch.
+ * A POST may await the Lark API while another turn replaces
+ * `currentReplyTarget`; callers must commit this captured key rather than
+ * re-reading mutable session state after the request resolves.
+ */
+function captureStreamingCardReplyTarget(
+  ds: DaemonSession,
+  turnId?: string,
+): { turnId: string | undefined; replyTargetKey: string } {
+  const effectiveTurnId = fallbackTurnId(ds, turnId);
+  const replyContext = frozenReplyContextForTurn(ds, effectiveTurnId);
+  return {
+    turnId: effectiveTurnId,
+    replyTargetKey: replyTargetKey(replyContext.target),
+  };
 }
 
 /**
@@ -1401,6 +1414,7 @@ export async function postTurnStartingCard(
   const previousCardId = ds.streamCardId;
   const previousNonce = ds.streamCardNonce;
   const previousReplyTargetKey = ds.streamCardReplyTargetKey;
+  const cardReplyTarget = captureStreamingCardReplyTarget(ds, turnId);
   // A newer turn may have arrived while the previous turn's POST was still in
   // flight, so beginNewTurn could not park that sentinel. Park the now-live
   // predecessor here before replacing its identity.
@@ -1452,7 +1466,7 @@ export async function postTurnStartingCard(
   };
   try {
     const messageId = await sessionReply(
-      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, turnId,
+      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
     );
     if (!stillOwnsPost()) {
       void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -1461,7 +1475,7 @@ export async function postTurnStartingCard(
       return false;
     }
     ds.streamCardId = messageId;
-    ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, turnId);
+    ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
     ds.parkedStreamCardNonce = undefined;
     const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
     if (!superseded) {
@@ -1535,6 +1549,7 @@ export async function postFreshStreamingCard(
   const prevNonce = ds.streamCardNonce;
   const prevReplyTargetKey = ds.streamCardReplyTargetKey;
   const prevPending = ds.streamCardPending;
+  const cardReplyTarget = captureStreamingCardReplyTarget(ds);
 
   ds.streamCardNonce = randomBytes(4).toString('hex');
   const cardJson = buildStreamingCard(
@@ -1560,9 +1575,10 @@ export async function postFreshStreamingCard(
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
-    const turnId = ds.currentReplyTarget?.turnId;
-    ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, turnId);
-    ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, turnId);
+    ds.streamCardId = await sessionReply(
+      sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, cardReplyTarget.turnId,
+    );
+    ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
     // This card is now the live one for the current turn. Clear the new-turn
     // pending flag so the next screen_update PATCHes it instead of POSTing a
     // duplicate (the gate above only suppresses cards when disabled+unforced;
@@ -7677,6 +7693,7 @@ function setupWorkerHandlers(
         // POST a second card; the in-flight POST becomes this turn's card.
         if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
         const postingGeneration = ds.streamCardTurnGeneration ?? 0;
+        const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -7710,13 +7727,15 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           );
-          const postedCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
+          const postedCardId = await scopedReply(
+            streamCardJson, 'interactive', cardReplyTarget.turnId,
+          );
           if (!ownsLifecycleMutation()) {
             void deleteMessage(ds.larkAppId, postedCardId).catch(() => { /* best-effort stale-card cleanup */ });
             break;
           }
           ds.streamCardId = postedCardId;
-          ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, msg.turnId);
+          ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
           // POSTing a second card. Without this, a re-fork that happens while
@@ -8122,14 +8141,15 @@ function setupWorkerHandlers(
           // not POSTed as duplicate cards.
           ds.streamCardPending = false;
           ds.streamCardId = CARD_POSTING_SENTINEL;
-          scopedReply(cardJson, 'interactive', msg.turnId)
+          const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
+          scopedReply(cardJson, 'interactive', cardReplyTarget.turnId)
             .then(msgId => {
               if (!ownsLifecycleMutation()) {
                 void deleteMessage(ds.larkAppId, msgId).catch(() => { /* best-effort stale-card cleanup */ });
                 return;
               }
               ds.streamCardId = msgId;
-              ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, msg.turnId);
+              ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
               const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
               if (!superseded) ds.streamCardPendingTurnId = undefined;
               ds.parkedStreamCardNonce = undefined;
