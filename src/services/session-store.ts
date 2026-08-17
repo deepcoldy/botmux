@@ -646,22 +646,34 @@ export function beginMojoCloseJournal(
         // double teardown this journal exists to prevent.
         throw new Error(`cannot re-cancel commit-only Mojo close journal for ${sessionId}`);
       }
-      if (existing.phase !== 'preparing') {
+      if (existing.phase !== 'preparing' && existing.phase !== 'uncertain') {
         throw new Error(`cannot restart ${existing.phase} Mojo close journal for ${sessionId}`);
       }
       if (existing.taskId !== expectedTaskId) {
         throw new Error(`Mojo close journal lineage changed before retry for ${sessionId}`);
       }
       if (existing.requestId !== requestId) {
-        if (existing.recovery !== 'retryable') {
+        if (existing.phase !== 'uncertain' && existing.recovery !== 'retryable') {
           throw new Error(`another Mojo close journal already owns ${sessionId}`);
         }
-        // A journal that durably recorded its own failure as `retryable` is an
-        // invitation to retry — refusing every fresh requestId here is what made
-        // `retryable` dead-code and the row a permanent brick (P1-1/P1-2). The
-        // row is rebuilt from scratch so the stale recovery/admission verdict
-        // cannot survive into the new attempt; lineage equality was asserted
-        // above, so the retry still addresses the same remote session.
+        // Two journal shapes accept a fresh attempt under a NEW requestId:
+        //   * `retryable` — the failed prepare durably recorded that retrying
+        //     the cancel is legitimate. Refusing every fresh requestId here is
+        //     what made `retryable` dead-code and the row a permanent brick
+        //     (P1-1/P1-2).
+        //   * `uncertain` — an explicit close IS the manual reconciliation the
+        //     fence demanded. Only a live worker's prepare/commit reaches this
+        //     takeover (ownerless uncertain rows DRAIN instead — see
+        //     prepareMojoExplicitClose), and re-running the cancel is the
+        //     fail-safe direction: the frozen identity pins the tenant, and an
+        //     already-terminal remote session is classified as gone, not as a
+        //     second teardown. Without the takeover the live-worker case had no
+        //     exit at all (P0-new).
+        // commitOnly / `prepared` journals were rejected above and stay
+        // non-restartable: those record an IRREVERSIBLE teardown. The row is
+        // rebuilt from scratch so the stale recovery/admission verdict cannot
+        // survive into the new attempt; lineage equality was asserted above, so
+        // the retry still addresses the same remote session.
         session.mojoCloseJournal = {
           phase: 'preparing',
           requestId,

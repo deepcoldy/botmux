@@ -14,7 +14,7 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRemoteBackendSession, isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -1558,12 +1558,14 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
-        // A live Riff worker owns a remote task rooted in its original cwd.
-        // killWorker/restart deliberately refuse to replace that generation,
-        // so persisting a new cwd here would report success while the remote
-        // task keeps running in the old directory.
-        if (isRiffBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+        // A live remote worker (Riff OR Mojo) owns a remote lineage rooted in
+        // its original cwd. killWorker refuses unprepared live retirement for
+        // EVERY remote backend, so persisting a new cwd here would report
+        // success while the live generation keeps running against the old
+        // directory — the exact split brain the riff-only guard used to allow
+        // for mojo (P1-a).
+        if (isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
           break;
         }
         // Cheap preflight avoids creating a requested directory when the

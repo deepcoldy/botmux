@@ -6799,6 +6799,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  mojo-containment list|revoke
+              查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
+              blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -13208,7 +13211,7 @@ switch (command) {
     // The auditable operator exit for fail-closed containment blockers that can
     // never self-release (weak handles on non-cgroup hosts, unprovable handles).
     const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
-    process.exitCode = runMojoContainmentCommand(process.argv.slice(3));
+    process.exitCode = await runMojoContainmentCommand(process.argv.slice(3));
     break;
   }
   case 'list':

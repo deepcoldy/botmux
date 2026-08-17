@@ -536,6 +536,46 @@ describe('mojo explicit close', () => {
     expect(after?.mojoCloseJournal).toBeUndefined();
   });
 
+  it('NEVER drains past a live worker: an uncertain journal goes through prepare/commit (P0-new)', async () => {
+    // The drain × remote-guard intersection: draining an uncertain journal
+    // while a live worker existed returned ok:true, closed the row and deleted
+    // the registry entry — but killWorker's remote guard (P0-2) refused the
+    // request-less retirement, so the still-running, credential-carrying worker
+    // became unreachable by every entry point. A live worker must instead be
+    // retired through prepare/commit: it re-runs the cancel under a fresh
+    // requestId (journal takeover) and is retired with the commit requestId.
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-crashed', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-crashed', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed',
+      alreadyClosed: false,
+      known: true,
+    });
+    // The worker was actually RETIRED, not orphaned: it received the prepare
+    // and then the commit that legally passes the remote-retirement guard.
+    expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close',
+      requestId: expect.any(String),
+    }));
+    expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close_commit',
+      requestId: expect.any(String),
+    }));
+    expect(fixture.ds.worker).toBeNull();
+    const after = sessionStore.getSession(fixture.session.sessionId);
+    expect(after).toMatchObject({ status: 'closed' });
+    expect(after?.mojoCloseJournal).toBeUndefined();
+    // No lineage was parked: the cancel really ran, nothing was left behind.
+    expect(after?.mojoQuarantinedLineage).toBeUndefined();
+  });
+
   it('RETRIES the cancel for a journal durably recorded as retryable (P1-2)', async () => {
     // `recovery: 'retryable'` is a durable statement that re-running the cancel
     // is legitimate. With a registered owner, /close must actually re-enter the

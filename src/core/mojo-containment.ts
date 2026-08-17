@@ -929,7 +929,7 @@ export function releaseContainmentHandle(
  */
 export function revokeContainmentHandles(
     sessionId: string,
-    opts: { handleKey?: string; dataDir?: string } = {},
+    opts: { handleKey?: string; dataDir?: string; auditNote?: string } = {},
 ): { removed: ContainmentHandle[]; remaining: ContainmentHandle[] } {
     const path = filePath(opts.dataDir);
     mkdirSync(dirname(path), { recursive: true });
@@ -953,7 +953,8 @@ export function revokeContainmentHandles(
         logger.warn(
             `[mojo] OPERATOR REVOCATION: containment handle ${containmentHandleKey(handle)} for `
             + `session ${sessionId} was dropped WITHOUT quiescence proof. Any surviving subtree `
-            + 'of that turn is no longer tracked; its device-isolation blocker is gone.',
+            + 'of that turn is no longer tracked; its device-isolation blocker is gone.'
+            + (opts.auditNote ? ` [${opts.auditNote}]` : ''),
         );
     }
     return { removed, remaining };

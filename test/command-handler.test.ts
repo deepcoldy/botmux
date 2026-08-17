@@ -2416,6 +2416,28 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/close');
     });
 
+    it('should reject Mojo cwd changes before creating or persisting the target (P1-a)', async () => {
+      // killWorker refuses unprepared live retirement for every remote backend
+      // (P0-2), so a /cd that repinned first left the live worker on the OLD
+      // cwd while reporting success — the riff-only guard let mojo through
+      // into exactly that split brain.
+      vi.mocked(existsSync).mockReturnValue(false);
+      const ds = makeDaemonSession();
+      ds.session.backendType = 'mojo';
+      const originalWorkingDir = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /brand-new/mojo-role'), deps, LARK_APP_ID);
+
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(originalWorkingDir);
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('Mojo');
+      expect(replyContent).toContain('/close');
+    });
+
     it('should reject /cd when auto-create fails', async () => {
       vi.mocked(existsSync).mockReturnValue(false);
       vi.mocked(mkdirSync).mockImplementationOnce(() => { throw new Error('EACCES: permission denied'); });

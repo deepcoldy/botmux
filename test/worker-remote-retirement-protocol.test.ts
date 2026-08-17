@@ -182,11 +182,16 @@ describe('worker remote retirement protocol', () => {
     expect(exitHandler).not.toContain('ds.remoteCloseState = undefined');
   });
 
-  it('rejects Riff cwd and role switches before mutating persisted workingDir', () => {
+  it('rejects REMOTE cwd and role switches before mutating persisted workingDir', () => {
+    // P1-a: killWorker refuses unprepared live retirement for every remote
+    // backend, so a /cd that repins first and retires after would report
+    // success while the live generation stays on the old cwd. The guard must
+    // therefore cover every remote backend (mojo included), and it must sit
+    // BEFORE validation/repin in both entrypoints.
     const commandStart = commandHandlerSource.indexOf("case '/cd':");
     const commandEnd = commandHandlerSource.indexOf("case '/repo':", commandStart);
     const command = commandHandlerSource.slice(commandStart, commandEnd);
-    const commandGuard = command.indexOf('if (isRiffBackendSession(ds))');
+    const commandGuard = command.indexOf('if (isRemoteBackendSession(ds))');
     expect(commandGuard).toBeGreaterThanOrEqual(0);
     expect(command.indexOf('validateWorkingDir(', commandGuard)).toBeGreaterThan(commandGuard);
     expect(command.indexOf('repinSessionWorkingDir(', commandGuard)).toBeGreaterThan(commandGuard);
@@ -194,10 +199,10 @@ describe('worker remote retirement protocol', () => {
     const routeStart = dashboardIpcSource.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/cd'");
     const routeEnd = dashboardIpcSource.indexOf('function findSessionRecord(', routeStart);
     const route = dashboardIpcSource.slice(routeStart, routeEnd);
-    const routeGuard = route.indexOf('if (isRiffBackendSession(ds))');
+    const routeGuard = route.indexOf('if (isRemoteBackendSession(ds))');
     expect(routeGuard).toBeGreaterThanOrEqual(0);
     expect(route.indexOf('validateRoleLibraryPath(', routeGuard)).toBeGreaterThan(routeGuard);
     expect(route.indexOf('repinSessionWorkingDir(', routeGuard)).toBeGreaterThan(routeGuard);
-    expect(route).toContain("error: 'riff_cd_unsupported'");
+    expect(route).toContain("error: 'remote_cd_unsupported'");
   });
 });

@@ -2432,6 +2432,23 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
+/**
+ * Retire a session's worker (and, worker-less, its orphaned backing session).
+ *
+ * CONTRACT FOR REMOTE BACKENDS (riff / mojo): a LIVE remote worker is refused
+ * unless the call carries the prepare/commit `remoteCloseCommitRequestId` —
+ * the function RETURNS WITHOUT RETIRING and the worker keeps running. Callers
+ * must not assume success. Today that refusal is absorbed differently per
+ * call site:
+ *   - /cd (IM + dashboard) rejects remote sessions BEFORE repinning, so this
+ *     refusal is never reached from there;
+ *   - the explicit-close path always carries the commit requestId;
+ *   - crash-loop, collision-loser, VC restore/upgrade and device-isolation
+ *     sweeps still call this best-effort and, for a live remote worker, keep
+ *     the generation alive with its lineage intact (fail-safe: never a silent
+ *     remote cancel). A caller that needs the worker GONE must go through
+ *     prepare/commit or the shutdown-detach flow — not this function.
+ */
 export function killWorker(
   ds: DaemonSession,
   opts: {
@@ -3953,8 +3970,19 @@ async function prepareMojoExplicitClose(
     //     `uncertain`.
     const retryableJournal = durableClose.phase === 'preparing'
       && durableClose.recovery === 'retryable';
-    const drainable = durableClose.phase === 'uncertain'
-      || (retryableJournal && !ds);
+    // NEVER drain past a live worker (P0-new). Draining set the row closed and
+    // deleted the registry entry while killWorker's remote guard (P0-2) refused
+    // the request-less retirement — the still-running, credential-carrying mojo
+    // worker became unreachable by every entry point. A live worker is also the
+    // one owner that can produce FRESH evidence, so it falls through to
+    // prepare/commit below instead: beginMojoCloseJournal accepts the takeover
+    // of an uncertain/retryable journal under the new requestId, the worker
+    // re-runs destroySession, and killWorker retires it legally with the commit
+    // requestId. (An in-process runtime `uncertain` fence still refuses inside
+    // prepareLiveRemoteWorkerClose — deliberately; refusal keeps the worker
+    // reachable, which is exactly what the drain violated.)
+    const drainable = !hasLiveWorker
+      && (durableClose.phase === 'uncertain' || (retryableJournal && !ds));
     if (drainable) {
       logger.warn(
         `[${session.sessionId.slice(0, 8)}] explicit close drains ${durableClose.phase} Mojo `
@@ -3970,7 +3998,9 @@ async function prepareMojoExplicitClose(
         parkMojoLineage: journalLineage,
       };
     }
-    if (!retryableJournal) {
+    const liveWorkerReconciles = hasLiveWorker
+      && (durableClose.phase === 'uncertain' || retryableJournal);
+    if (!retryableJournal && !liveWorkerReconciles) {
       logger.warn(
         `[${session.sessionId.slice(0, 8)}] explicit close requires Mojo reconciliation: `
         + `durable journal is ${durableClose.phase} (${durableClose.requestId})`,
@@ -3982,7 +4012,9 @@ async function prepareMojoExplicitClose(
         ...(journalLineage ? { taskId: journalLineage } : {}),
       };
     }
-    // retryable with a registered owner: fall through to the cancel below.
+    // Fall through: a retryable journal with a registered owner re-runs the
+    // cancel (live worker → prepare/commit; workerless → the cancel below),
+    // and an uncertain journal with a LIVE worker goes to prepare/commit.
   }
   // A live worker is the only authority that can cover the pre-init window:
   // destroySession waits for system/init, then returns the exact lineage in its

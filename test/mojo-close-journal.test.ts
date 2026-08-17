@@ -517,6 +517,45 @@ describe('a RETRYABLE journal accepts a fresh close attempt (P1-1/P1-2)', () => 
     expect(() => sessionStore.beginMojoCloseJournal(session.sessionId, 'req-new', 'mojo-sid-OTHER'))
       .toThrow(/lineage changed/);
   });
+
+  it('lets a NEW requestId take over an UNCERTAIN journal (the P0-new live-worker exit)', () => {
+    // An explicit close IS the manual reconciliation the uncertain fence
+    // demanded. Only the live-worker prepare/commit path reaches this takeover
+    // (ownerless uncertain rows drain instead); refusing it left the live
+    // worker with no legal retirement at all.
+    sessionStore.init('app');
+    const session = sessionStore.createSession('oc_u', 'om_uncertain_takeover', 'uncertain', 'group');
+    session.larkAppId = 'app';
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-unc';
+    sessionStore.updateSession(session);
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-old', 'mojo-sid-unc');
+    sessionStore.markMojoCloseUnresolved(session.sessionId, 'req-old', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-unc',
+      admission: 'fenced',
+    });
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-new', 'mojo-sid-unc');
+    expect(sessionStore.getSession(session.sessionId)?.mojoCloseJournal).toEqual({
+      phase: 'preparing',
+      requestId: 'req-new',
+      taskId: 'mojo-sid-unc',
+      updatedAt: expect.any(String),
+    });
+  });
+
+  it('still refuses to restart a PREPARED journal — irreversible proof is not restartable', () => {
+    sessionStore.init('app');
+    const session = sessionStore.createSession('oc_p', 'om_prepared_norestart', 'prepared', 'group');
+    session.larkAppId = 'app';
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-prep';
+    sessionStore.updateSession(session);
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-a', 'mojo-sid-prep');
+    sessionStore.markMojoClosePrepared(session.sessionId, 'req-a', 'mojo-sid-prep');
+    expect(() => sessionStore.beginMojoCloseJournal(session.sessionId, 'req-b', 'mojo-sid-prep'))
+      .toThrow(/cannot restart prepared/);
+  });
 });
 
 describe('a commit-only journal forbids further teardown', () => {

@@ -162,6 +162,18 @@ export function isRiffBackendSession(ds: DaemonSession): boolean {
   return (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff';
 }
 
+/** Whether the live/persisted session is frozen onto ANY remote backend.
+ *  Same frozen-stamp rule as isRiffBackendSession. Used by the guards that
+ *  must reject BEFORE mutating persisted state (e.g. /cd repin): killWorker
+ *  refuses unprepared live retirement for every remote backend, so a caller
+ *  that mutates first and retires after would report success while the live
+ *  generation keeps running against the old state — the split-brain the riff
+ *  guard has always prevented, now needed for mojo too. */
+export function isRemoteBackendSession(ds: DaemonSession): boolean {
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  return frozen !== undefined && isRemoteBackendType(frozen);
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:

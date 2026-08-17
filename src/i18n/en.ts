@@ -300,6 +300,7 @@ export const messages: Record<string, string> = {
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
   'cmd.restart.riff_unsupported': '⚠️ Riff sessions cannot be restarted. Use /close to close the current remote session, then send a new message to create one.',
   'cmd.cd.riff_unsupported': '⚠️ Riff sessions cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
+  'cmd.cd.remote_unsupported': '⚠️ Remote-backend sessions (Riff / Mojo) cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
   'cmd.takeover.riff_unsupported': '⚠️ Riff sessions cannot adopt or import another session in place. Use /close to safely close the current remote session, then create or import a session.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',

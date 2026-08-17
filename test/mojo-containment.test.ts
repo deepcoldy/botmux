@@ -204,13 +204,18 @@ describe('operator revocation is the ONLY unproven exit (P1-3)', () => {
         recordContainmentHandle(weak(), dataDir);
         const out: string[] = [];
         const err: string[] = [];
-        const deps = { dataDir, stdout: (l: string) => out.push(l), stderr: (l: string) => err.push(l) };
+        const deps = {
+            dataDir,
+            isSessionActive: () => false,
+            stdout: (l: string) => out.push(l),
+            stderr: (l: string) => err.push(l),
+        };
 
-        expect(runMojoContainmentCommand(['revoke', 'sess-1'], deps)).toBe(1);
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1'], deps)).toBe(1);
         expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
         expect(err.join('\n')).toMatch(/--yes/);
 
-        expect(runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], deps)).toBe(0);
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], deps)).toBe(0);
         expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
         expect(out.join('\n')).toMatch(/已撤销/);
     });
@@ -220,9 +225,87 @@ describe('operator revocation is the ONLY unproven exit (P1-3)', () => {
         const dataDir = freshDataDir();
         recordContainmentHandle(weak(), dataDir);
         const out: string[] = [];
-        expect(runMojoContainmentCommand(['list'], { dataDir, stdout: (l) => out.push(l) })).toBe(0);
+        expect(await runMojoContainmentCommand(['list'], { dataDir, stdout: (l) => out.push(l) })).toBe(0);
         expect(out.join('\n')).toContain('sess-1');
         expect(out.join('\n')).toContain(`tree:${BOOT}:4242:999`);
+    });
+
+    it('default-REJECTS revoking a weak handle whose root is still the original live process (P1-c)', async () => {
+        // Revoking wrong = credential leak: dropping the handle of a subtree
+        // that is still alive stops tracking a process still holding the
+        // injected JWT. The gate uses the same identity primitive as the
+        // runtime kill gate (boot id + starttime), and --force is the recorded
+        // override, not the default.
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        // A synthetic /proc where the recorded root VERIFIES as still-original.
+        const procRoot = fakeProc({ bootId: BOOT, pids: { 4242: 999 } });
+        recordContainmentHandle(weak(), dataDir);
+        const out: string[] = [];
+        const err: string[] = [];
+        const deps = {
+            dataDir,
+            procRoot,
+            isSessionActive: () => false,
+            stdout: (l: string) => out.push(l),
+            stderr: (l: string) => err.push(l),
+        };
+
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], deps)).toBe(1);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+        expect(err.join('\n')).toMatch(/仍是原进程且存活/);
+        expect(err.join('\n')).toMatch(/--force/);
+
+        // --force overrides, and says so on stdout (the audit line carries it too).
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes', '--force'], deps)).toBe(0);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
+        expect(out.join('\n')).toMatch(/--force 越过存活证据/);
+    });
+
+    it('default-REJECTS revoking while the session row is still active (P1-c)', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        const err: string[] = [];
+        const deps = {
+            dataDir,
+            isSessionActive: () => true,
+            stdout: () => { /* ignore */ },
+            stderr: (l: string) => err.push(l),
+        };
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], deps)).toBe(1);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+        expect(err.join('\n')).toMatch(/active/);
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes', '--force'], deps)).toBe(0);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
+    });
+
+    it('surfaces a corrupt ledger as a message instead of a stack trace', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        writeFileSync(join(dataDir, 'mojo-containment-handles.json'), '{ not json');
+        const err: string[] = [];
+        expect(await runMojoContainmentCommand(['list'], {
+            dataDir,
+            stdout: () => { /* ignore */ },
+            stderr: (l: string) => err.push(l),
+        })).toBe(1);
+        expect(err.join('\n')).toMatch(/账本不可用/);
+    });
+
+    it('rejects a --handle whose value is another switch instead of eating --yes', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        const err: string[] = [];
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--handle', '--yes'], {
+            dataDir,
+            isSessionActive: () => false,
+            stdout: () => { /* ignore */ },
+            stderr: (l: string) => err.push(l),
+        })).toBe(1);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+        expect(err.join('\n')).toMatch(/--handle 需要一个 handle key/);
     });
 });
 

@@ -208,7 +208,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
-import { isRiffBackendSession } from './persistent-backend.js';
+import { isRemoteBackendSession, isRiffBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
@@ -1515,14 +1515,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
   }
-  // Riff restart/kill is intentionally refused to preserve remote task
-  // lineage. Reject before validation/repin so the persisted cwd cannot drift
-  // from the still-running sandbox.
-  if (isRiffBackendSession(ds)) {
+  // Remote retirement (Riff AND Mojo) is intentionally refused without
+  // prepare/commit, so a cold restart cannot follow a repin here. Reject
+  // before validation/repin so the persisted cwd cannot drift from the
+  // still-running remote lineage — mojo used to slip past the riff-only
+  // guard, repin, and then killWorker's refusal left the live worker on the
+  // old cwd while the route reported cold-restart (P1-a split brain).
+  if (isRemoteBackendSession(ds)) {
     return jsonRes(res, 409, {
       ok: false,
-      error: 'riff_cd_unsupported',
-      message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+      error: 'remote_cd_unsupported',
+      message: t('cmd.cd.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
