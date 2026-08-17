@@ -76,12 +76,19 @@ export interface SessionPreviewProxyOptions {
    * 授权与撤销是两件事：`authenticated` / `verifyContentCapability` 只在握手那
    * 一刻说话，而预览的 SSE 与 WebSocket 一握手就能流上几个小时。没有这个钩子，
    * 登出只能等对端自己断开。
+   *
+   * P1-4：返回 `false` 表示「这条流所属的认证会话已经结束，不许登记」。授权发生
+   * 在**拨号前**，而 dev server 的握手最长可以拖 45 秒；登出若落在这段窗口里，撤
+   * 销扫描遍历索引时这条连接还不在里面，一条都关不到，等上游握完手再补登记就等于
+   * 把一条活流挂到已经死掉的认证会话名下——从此再没有任何撤销能碰到它。本钩子因此
+   * 是「登记点」也是「最后一次判定点」：调用方在这里重查存活，代理按 false 销毁
+   * 上游、不登记、不回 101/200。
    */
   bindStream?: (
     req: IncomingMessage,
     context: { sessionId: string; contentCapability: string | null },
     close: () => void,
-  ) => (() => void) | null;
+  ) => (() => void) | null | false;
 }
 
 type ParsedPreviewPath =
@@ -404,18 +411,25 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       // The timeout bounds the connect/header phase, not long-running preview
       // responses such as SSE. Once headers arrive, ordinary HTTP semantics win.
       upstream.setTimeout(0);
-      res.writeHead(
-        up.statusCode ?? 502,
-        previewResponseHeaders(up.headers, target, parsed.basePath, opaqueRequest),
-      );
-      // P1-8：headers 之后才登记——此刻才确定这是一条真的在流的响应（预览页常
-      // 见的 SSE / 长轮询都在这条路上）。短响应会立刻 close 并自行注销。
-      const unbind = options.bindStream?.(
+      // P1-8：上游 headers 到了才登记——此刻才确定这是一条真的在流的响应（预览页
+      // 常见的 SSE / 长轮询都在这条路上）。短响应会立刻 close 并自行注销。
+      // P1-4：登记在**我们自己写 headers 之前**，于是「重查存活 → 登记」是一个同步
+      // 动作；拨号期间被撤销的流在这里被拒，浏览器一个字节的预览内容都拿不到。
+      const bound = options.bindStream?.(
         req,
         { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
         () => { upstream.destroy(); res.destroy(); },
       );
-      if (unbind) res.on('close', unbind);
+      if (bound === false) {
+        upstream.destroy();
+        jsonError(res, 403, 'authentication_revoked');
+        return;
+      }
+      res.writeHead(
+        up.statusCode ?? 502,
+        previewResponseHeaders(up.headers, target, parsed.basePath, opaqueRequest),
+      );
+      if (bound) res.on('close', bound);
       up.pipe(res);
     });
     let failed = false;
@@ -471,6 +485,22 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       bridgedSocket = upstreamSocket;
       upstream.setTimeout(0);
       upstreamSocket.setTimeout(0);
+      // P1-8：预览 WebSocket 是最典型的「握手一次、流很久」——登出后不主动关，
+      // 它就一直把 agent 页面的内容送给已经登出的浏览器。
+      // P1-4：登记必须发生在转发 101 **之前**。授权是拨号前那一刻的快照，dev
+      // server 的握手可以慢到 45 秒；这段窗口里发生的登出扫描看不到这条还没入索引
+      // 的 socket，先回 101 再补登记就等于把它挂到一个已死的认证会话上。
+      const bound = options.bindStream?.(
+        req,
+        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
+        () => { upstreamSocket.destroy(); clientSocket.destroy(); },
+      );
+      if (bound === false) {
+        upstreamSocket.destroy();
+        socketError(clientSocket, 403, 'authentication_revoked');
+        return;
+      }
+      const unbind = bound ?? null;
       const lines = [`HTTP/1.1 ${upRes.statusCode ?? 101} ${upRes.statusMessage ?? 'Switching Protocols'}`];
       const raw = upRes.rawHeaders;
       for (let i = 0; i + 1 < raw.length; i += 2) {
@@ -482,13 +512,6 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       clientSocket.write(lines.join('\r\n'));
       if (upstreamHead.length) clientSocket.write(upstreamHead);
       if (head.length) upstreamSocket.write(head);
-      // P1-8：预览 WebSocket 是最典型的「握手一次、流很久」——登出后不主动关，
-      // 它就一直把 agent 页面的内容送给已经登出的浏览器。
-      const unbind = options.bindStream?.(
-        req,
-        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
-        () => { upstreamSocket.destroy(); clientSocket.destroy(); },
-      );
       upstreamSocket.pipe(clientSocket);
       clientSocket.pipe(upstreamSocket);
       const cleanup = () => {

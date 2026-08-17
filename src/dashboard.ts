@@ -595,13 +595,16 @@ const sessionPreviewProxy = createSessionPreviewProxy({
   // cookie, so its owner is the capability's own authSessionId.
   // P1-13：同一条流再按 sessionId 建第二个索引。预览目标失效（换代 / 关闭 / 端口易主）
   // 时身份仍然有效，只能靠这个索引定点断流。
+  // P1-4：这里同时是「登记点」和「最后一次判定点」。授权发生在拨号之前，而 dev
+  // server 的握手最长可以拖 45 秒；这段窗口里的登出/到期/rotate/解绑扫描不到一条
+  // 还没入索引的流。所以登记前把身份重新解一遍并复核存活：解不出身份（cookie 那条
+  // 路的会话已经没了）或已不存活，一律 fail closed，由代理销毁上游、不回 101/200。
   bindStream: (req, ctx, close) => {
     const authSessionId = ctx.contentCapability
       ? previewContentCapabilityAuthSession(ctx.contentCapability, ctx.sessionId)
       : dashboardRequestIdentity(req)?.authSessionId ?? null;
-    return authSessionId
-      ? authSessionConnections.register(authSessionId, close, ctx.sessionId)
-      : null;
+    if (!authSessionId || !terminalAuthSessionLive(authSessionId)) return false;
+    return authSessionConnections.register(authSessionId, close, ctx.sessionId);
   },
 });
 /**

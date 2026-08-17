@@ -1,5 +1,6 @@
-import { createServer, type IncomingMessage, type Server } from 'node:http';
-import { PassThrough } from 'node:stream';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { connect, type Socket } from 'node:net';
+import { PassThrough, type Duplex } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
@@ -835,5 +836,198 @@ describe('P1-11 management WebSocket upgrades check Origin (preview stays exempt
     expect(await firstMessage(ws)).toBe('preview-upstream');
     ws.terminate();
     liveSockets.delete(ws);
+  });
+});
+
+// ─── P1-4：拨号 → upstream 101/headers 之间的撤销竞态 ─────────────────────────
+//
+// 预览这条路上的授权（`authenticated` / `verifyContentCapability`）只在**拨号之前**
+// 说一次话，而 dev server 的握手最长可以拖 45 秒（PREVIEW_UPSTREAM_RESPONSE_TIMEOUT_MS）。
+// 登出若落在这段窗口里：撤销扫描遍历索引时这条流还没登记进去，一条都关不到；等上游
+// 握完手再补登记，等于把一条正在流的预览挂到一个已经死掉的认证会话名下——而预览侧
+// 连「能力到期自己断」这层兜底都没有，它会一直把 agent 页面的内容送给已登出的浏览器。
+//
+// 所以 `bindStream` 既是登记点、也是最后一次判定点：它返回 false 时代理必须销毁上游、
+// 不登记、不回 101/200。
+describe('P1-4 preview streams refuse to register under an auth session that died mid-handshake', () => {
+  const CAPABILITY_AUTH_SESSION = 'capability-auth-session';
+  const COOKIE_AUTH_SESSION = 'cookie-auth-session';
+  const LEAKED_PREVIEW = 'preview-bytes-after-logout';
+  const rawClients = new Set<Socket>();
+
+  afterEach(() => {
+    for (const socket of rawClients) socket.destroy();
+    rawClients.clear();
+  });
+
+  /** 上游 dev server：HTTP 响应与 WebSocket 握手都停在半路，由测试放行。 */
+  async function startRacingPreview(): Promise<{
+    port: number;
+    live: Set<string>;
+    registry: AuthSessionConnectionRegistry;
+    dialed: Promise<void>;
+    completeUpgrade: (payload?: string) => void;
+    completeResponse: (payload?: string) => void;
+  }> {
+    let markDialed!: () => void;
+    const dialed = new Promise<void>(resolve => { markDialed = resolve; });
+    let pausedSocket: Duplex | undefined;
+    let pausedResponse: ServerResponse | undefined;
+    upstream = createServer((_req, res) => { pausedResponse = res; markDialed(); });
+    upstream.on('upgrade', (_req, socket) => {
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+      pausedSocket = socket;
+      markDialed();
+    });
+    await new Promise<void>(resolve => upstream!.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const live = new Set([CAPABILITY_AUTH_SESSION, COOKIE_AUTH_SESSION]);
+    const registry = new AuthSessionConnectionRegistry();
+    const manager = createSessionPreviewProxy({
+      authenticated: req => req.headers.cookie?.split(';').some(part => part.trim() === managementCookie()) === true,
+      resolve: () => okTarget(upstreamPort),
+      verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
+      // dashboard.ts 的同款接线：登记之前把归属重新解一遍并复核存活，已经结束的
+      // 认证会话一律 fail closed。
+      bindStream: (_req, ctx, close) => {
+        const authSessionId = ctx.contentCapability ? CAPABILITY_AUTH_SESSION : COOKIE_AUTH_SESSION;
+        if (!live.has(authSessionId)) return false;
+        return registry.register(authSessionId, close, ctx.sessionId);
+      },
+    });
+    front = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      void manager.handleHttp(req, res, url).then(handled => {
+        if (!handled && !res.headersSent) { res.writeHead(404); res.end(); }
+      });
+    });
+    front.on('upgrade', (req, socket, head) => {
+      if (!manager.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>(resolve => front!.listen(0, '127.0.0.1', resolve));
+    return {
+      port: (front.address() as { port: number }).port,
+      live,
+      registry,
+      dialed,
+      completeUpgrade: (payload = '') => {
+        pausedSocket?.write(
+          'HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n'
+          + payload,
+        );
+      },
+      completeResponse: (payload = '') => {
+        pausedResponse?.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        pausedResponse?.write(payload);
+      },
+    };
+  }
+
+  /** 裸 socket：只关心到底收到了 101 还是错误，以及有没有收到预览字节。 */
+  function rawUpgrade(port: number, path: string): {
+    raw: () => string;
+    closed: Promise<void>;
+    waitFor: (needle: string, label: string) => Promise<void>;
+  } {
+    const socket = connect(port, '127.0.0.1');
+    rawClients.add(socket);
+    let raw = '';
+    const waiters = new Set<{ needle: string; resolve: () => void }>();
+    socket.on('data', chunk => {
+      raw += chunk.toString();
+      for (const waiter of [...waiters]) {
+        if (!raw.includes(waiter.needle)) continue;
+        waiters.delete(waiter);
+        waiter.resolve();
+      }
+    });
+    socket.on('error', () => { /* 断开本身就是断言对象 */ });
+    const closed = new Promise<void>(resolve => socket.on('close', () => resolve()));
+    socket.write(
+      `GET ${path} HTTP/1.1\r\nHost: dashboard.test\r\nOrigin: null\r\n`
+      + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+      + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+    );
+    return {
+      raw: () => raw,
+      closed,
+      waitFor: (needle, label) => new Promise<void>((resolve, reject) => {
+        if (raw.includes(needle)) { resolve(); return; }
+        waiters.add({ needle, resolve });
+        setTimeout(() => reject(new Error(`${label}\n---received---\n${raw}`)), 4_000).unref();
+      }),
+    };
+  }
+
+  it('refuses the sandboxed preview WebSocket when its auth session died during the dev-server handshake', async () => {
+    const ctx = await startRacingPreview();
+    const client = rawUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    // 拨号已发出，dev server 还没回 101：竞态窗口现在真的开着。
+    await ctx.dialed;
+
+    // 就在这一刻登出。此时索引里空无一物——扫描关不到任何东西。
+    ctx.live.delete(CAPABILITY_AUTH_SESSION);
+    expect(ctx.registry.closeAuthSession(CAPABILITY_AUTH_SESSION)).toBe(0);
+
+    // dev server 现在才握完手，并且已经开始吐页面内容。
+    ctx.completeUpgrade(LEAKED_PREVIEW);
+    await client.waitFor('403', '拨号中被撤销的预览升级请求没有被拒');
+    await client.closed;
+    expect(client.raw()).not.toContain('101');
+    expect(client.raw()).not.toContain(LEAKED_PREVIEW);
+    expect(client.raw()).toContain('authentication_revoked');
+    // 也没有被补登记到已经死掉的认证会话名下。
+    expect(ctx.registry.count(CAPABILITY_AUTH_SESSION)).toBe(0);
+  });
+
+  it('still bridges a live preview WebSocket, and that bridge still dies with its auth session', async () => {
+    const ctx = await startRacingPreview();
+    const client = rawUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    await ctx.dialed;
+    ctx.completeUpgrade('preview-frame-bytes');
+    await client.waitFor('101', '活着的预览连接没有拿到 101');
+    await client.waitFor('preview-frame-bytes', '桥接建立后预览字节没有透传');
+    expect(ctx.registry.count(CAPABILITY_AUTH_SESSION)).toBe(1);
+
+    // 登记确实发生了：P1-8 的关闭器照样能一把掐断。
+    const closed = client.closed;
+    expect(ctx.registry.closeAuthSession(CAPABILITY_AUTH_SESSION)).toBe(1);
+    await closed;
+  });
+
+  it('refuses an in-flight preview response whose auth session died before the upstream headers came back', async () => {
+    const ctx = await startRacingPreview();
+    const pending = fetch(`http://127.0.0.1:${ctx.port}/preview/s1/stream`, {
+      headers: { cookie: managementCookie() },
+    });
+    await ctx.dialed;
+    ctx.live.delete(COOKIE_AUTH_SESSION);
+    ctx.completeResponse(`event: hello\ndata: ${LEAKED_PREVIEW}\n\n`);
+
+    const response = await pending;
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'authentication_revoked' });
+    expect(ctx.registry.count(COOKIE_AUTH_SESSION)).toBe(0);
+  });
+
+  it('leaves a live cookie-authenticated preview response streaming as before', async () => {
+    const ctx = await startRacingPreview();
+    const pending = fetch(`http://127.0.0.1:${ctx.port}/preview/s1/stream`, {
+      headers: { cookie: managementCookie() },
+    });
+    await ctx.dialed;
+    ctx.completeResponse('event: hello\ndata: live-preview-payload\n\n');
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(ctx.registry.count(COOKIE_AUTH_SESSION)).toBe(1);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain('live-preview-payload');
+
+    // 登记确实发生了：这条流照旧随认证结束一起断。
+    expect(ctx.registry.closeAuthSession(COOKIE_AUTH_SESSION)).toBe(1);
+    await reader.read().catch(() => { /* 断流即预期 */ });
   });
 });

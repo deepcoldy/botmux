@@ -525,7 +525,10 @@ describe('P1-8 auth end closes every long-lived connection', () => {
             return verified.ok ? verified.claims.authSessionId : null;
           })()
           : identityOf(req)?.authSessionId ?? null;
-        return authSessionId ? registry.register(authSessionId, close) : null;
+        // P1-4：与 dashboard.ts 同款——登记点即最后一次判定点。拨号期间身份结束的
+        // 流在这里 fail closed，不补登记到一个已经死掉的认证会话名下。
+        if (!authSessionId || !isAuthSessionLive(authSessionId)) return false;
+        return registry.register(authSessionId, close);
       },
     });
 

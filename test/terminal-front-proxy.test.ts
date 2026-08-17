@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
-import { connect } from 'node:net';
-import { PassThrough } from 'node:stream';
+import { connect, type Socket } from 'node:net';
+import { PassThrough, type Duplex } from 'node:stream';
 import { describe, expect, it } from 'vitest';
+import { DashboardSessionStore } from '../src/dashboard/h5-auth.js';
 import {
   issueTerminalControlGrant,
   verifyTerminalControlGrant,
@@ -480,6 +481,273 @@ describe('central terminal front proxy boundary', () => {
     } finally {
       await close(front);
       await close(upstream);
+    }
+  });
+
+  // ── P1-4：拨号 → upstream 101 之间的撤销竞态 ───────────────────────────────
+  //
+  // 前门只在**拨号之前**查了一次 liveness。upstream 的 101 是异步回来的，中间隔着
+  // 一次真实的 worker 握手（光响应超时就允许 30 秒的 daemon 唤醒）。登出/到期若正
+  // 好落在这段窗口里：撤销扫描遍历 authSession→socket 索引时，这条 socket 还只存在
+  // 于闭包的局部变量里，一条都关不到；等 101 回来前门反而把它登记到一个**已经死掉**
+  // 的认证会话名下——从此没有任何撤销够得着它，只能等 worker 侧读能力自己到期。
+  //
+  // 下面三条用真的 `DashboardSessionStore`（真的 logout：先从表里删、再回调扫描）
+  // 加一个**卡在半路**的 upstream 握手，把这段窗口真实地撑开。
+
+  /** 上游 worker：WebSocket 握手停在半路，直到测试放行 101。 */
+  function pausableUpstream(): {
+    server: Server;
+    dialed: Promise<void>;
+    complete: (payload?: string) => void;
+    upstreamClosed: Promise<void>;
+  } {
+    let paused: Duplex | undefined;
+    let markDialed!: () => void;
+    let markClosed!: () => void;
+    const dialed = new Promise<void>(resolve => { markDialed = resolve; });
+    const upstreamClosed = new Promise<void>(resolve => { markClosed = resolve; });
+    const server = createServer(() => {});
+    server.on('upgrade', (_req, socket) => {
+      // HTTP server sockets allow half-open; without these the peer's FIN alone
+      // would leave this side open and server.close() waiting forever.
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+      socket.on('close', () => markClosed());
+      paused = socket;
+      markDialed();
+    });
+    return {
+      server,
+      dialed,
+      upstreamClosed,
+      complete: (payload = '') => {
+        paused?.write(
+          'HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n'
+          + payload,
+        );
+      },
+    };
+  }
+
+  /** 裸 socket 客户端：只看它到底收到了 101 还是错误，以及有没有收到终端字节。 */
+  function rawUpgrade(port: number, path: string): {
+    socket: Socket;
+    raw: () => string;
+    closed: Promise<void>;
+    waitFor: (needle: string, label: string) => Promise<void>;
+  } {
+    const socket = connect(port, '127.0.0.1');
+    let raw = '';
+    const waiters = new Set<{ needle: string; resolve: () => void }>();
+    socket.on('data', chunk => {
+      raw += chunk.toString();
+      for (const waiter of [...waiters]) {
+        if (!raw.includes(waiter.needle)) continue;
+        waiters.delete(waiter);
+        waiter.resolve();
+      }
+    });
+    socket.on('error', () => { /* 断开本身就是断言对象，不该炸测试 */ });
+    const closed = new Promise<void>(resolve => socket.on('close', () => resolve()));
+    socket.write(
+      `GET ${path} HTTP/1.1\r\nHost: front\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n`
+      + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+    );
+    return {
+      socket,
+      raw: () => raw,
+      closed,
+      waitFor: (needle, label) => new Promise<void>((resolve, reject) => {
+        if (raw.includes(needle)) { resolve(); return; }
+        waiters.add({ needle, resolve });
+        setTimeout(() => reject(new Error(`${label}\n---received---\n${raw}`)), 4_000).unref();
+      }),
+    };
+  }
+
+  /** dashboard.ts 的 endDashboardAuthSession 同款接线：真 session store 的结束
+   *  回调驱动 TerminalControlManager 扫索引，liveness 也读同一个 store。 */
+  function revocableWiring(): { sessions: DashboardSessionStore; control: TerminalControlManager } {
+    const sessions = new DashboardSessionStore();
+    const control = new TerminalControlManager({ secret: SECRET, audit: { append() {} } });
+    sessions.onEnd(ended => { control.releaseByAuthSession(ended.authSessionId); });
+    return { sessions, control };
+  }
+
+  const LEAKED_OUTPUT = 'terminal-bytes-after-logout';
+
+  it('P1-4: logout landing between the dial and the upstream 101 refuses the bridge instead of registering it', async () => {
+    const { sessions, control } = revocableWiring();
+    const { identity } = sessions.create('ou_race_viewer');
+    const worker = pausableUpstream();
+    const upstreamPort = await listen(worker.server);
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      resolveActor: () => null,
+      control,
+      viewCapabilityAuthSession: (sessionId, viewToken) =>
+        terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+      isAuthSessionLive: authSessionId => sessions.liveAuthSession(authSessionId),
+    });
+    const front = createServer((_req, res) => res.writeHead(404).end());
+    front.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const frontPort = await listen(front);
+    let client: ReturnType<typeof rawUpgrade> | undefined;
+    try {
+      const capability = boundViewCapability('s1', identity.authSessionId);
+      client = rawUpgrade(frontPort, `/s/s1/?viewToken=${encodeURIComponent(capability)}`);
+      // 拨号已经发出，upstream 还没回 101：竞态窗口现在是真的开着的。
+      await worker.dialed;
+
+      // 就在这一刻登出。撤销扫描此时看不到这条 socket——它还没入任何索引。
+      expect(sessions.revokeAuthSession(identity.authSessionId)).toBe(true);
+      expect(sessions.liveAuthSession(identity.authSessionId)).toBe(false);
+
+      // 现在 worker 才握完手，并且已经开始往回吐终端内容。
+      worker.complete(LEAKED_OUTPUT);
+
+      await client.waitFor('403', '拨号中被撤销的升级请求没有被拒');
+      await client.closed;
+      const received = client.raw();
+      // 不回 101、不转发任何终端字节。
+      expect(received).not.toContain('101');
+      expect(received).not.toContain(LEAKED_OUTPUT);
+      expect(received).toContain('authentication ended');
+      // 上游那条连接也必须销毁，不留半开的桥。
+      await worker.upstreamClosed;
+    } finally {
+      client?.socket.destroy();
+      await close(front);
+      await close(worker.server);
+    }
+  });
+
+  it('P1-4: a still-live session upgrades normally and the later logout closes that same bridge', async () => {
+    const { sessions, control } = revocableWiring();
+    const { identity } = sessions.create('ou_live_viewer');
+    const other = sessions.create('ou_bystander');
+    const worker = pausableUpstream();
+    const upstreamPort = await listen(worker.server);
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      resolveActor: () => null,
+      control,
+      viewCapabilityAuthSession: (sessionId, viewToken) =>
+        terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+      isAuthSessionLive: authSessionId => sessions.liveAuthSession(authSessionId),
+    });
+    const front = createServer((_req, res) => res.writeHead(404).end());
+    front.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const frontPort = await listen(front);
+    let client: ReturnType<typeof rawUpgrade> | undefined;
+    try {
+      const capability = boundViewCapability('s1', identity.authSessionId);
+      client = rawUpgrade(frontPort, `/s/s1/?viewToken=${encodeURIComponent(capability)}`);
+      await worker.dialed;
+      worker.complete('live-terminal-bytes');
+      await client.waitFor('101', '活着的会话没有拿到 101');
+      await client.waitFor('live-terminal-bytes', '桥接建立后终端字节没有透传');
+
+      // 别人的登出不许碰这条流。
+      expect(sessions.revokeAuthSession(other.identity.authSessionId)).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(client.socket.destroyed).toBe(false);
+
+      // 它自己的登出必须立刻关掉——说明这条 socket 确实进了索引，
+      // 「登记前重查」没有把 P1-5/P1-8 的关闭器一起挡掉。
+      const closed = client.closed;
+      expect(sessions.revokeAuthSession(identity.authSessionId)).toBe(true);
+      await closed;
+    } finally {
+      client?.socket.destroy();
+      await close(front);
+      await close(worker.server);
+    }
+  });
+
+  it('P1-4: revoking a DIFFERENT auth session during the handshake leaves this bridge alone', async () => {
+    const { sessions, control } = revocableWiring();
+    const { identity } = sessions.create('ou_untouched_viewer');
+    const other = sessions.create('ou_logging_out');
+    const worker = pausableUpstream();
+    const upstreamPort = await listen(worker.server);
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      resolveActor: () => null,
+      control,
+      viewCapabilityAuthSession: (sessionId, viewToken) =>
+        terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+      isAuthSessionLive: authSessionId => sessions.liveAuthSession(authSessionId),
+    });
+    const front = createServer((_req, res) => res.writeHead(404).end());
+    front.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const frontPort = await listen(front);
+    let client: ReturnType<typeof rawUpgrade> | undefined;
+    try {
+      const capability = boundViewCapability('s1', identity.authSessionId);
+      client = rawUpgrade(frontPort, `/s/s1/?viewToken=${encodeURIComponent(capability)}`);
+      await worker.dialed;
+      // 握手窗口里登出的是**另一个人**：重查不能变成一把误伤的锁。
+      expect(sessions.revokeAuthSession(other.identity.authSessionId)).toBe(true);
+      worker.complete('bytes-for-the-other-viewer');
+      await client.waitFor('101', '别人的登出误伤了这条连接');
+      await client.waitFor('bytes-for-the-other-viewer', '桥接建立后终端字节没有透传');
+      expect(client.raw()).not.toContain('403');
+    } finally {
+      client?.socket.destroy();
+      await close(front);
+      await close(worker.server);
+    }
+  });
+
+  it('P1-4: the platform owner write bridge is indexed too, so unbind closes it instead of leaving it un-revocable', async () => {
+    // 固定 owner 的写 grant 背后没有租约（grantForProxy 直接签一张写票），
+    // 所以它既不在 lease.sockets 里，原先也不在 authSession 索引里——重查放行之后
+    // 若不登记，撤销窗口只是往后挪了一个 tick，并没有被关上。
+    const control = new TerminalControlManager({ secret: SECRET, audit: { append() {} } });
+    const live = new Set(['machine-scope:owner']);
+    const owner: TerminalDashboardActor = {
+      userId: 'platform:machine-scope:owner',
+      authSessionId: 'machine-scope:owner',
+      expiresAt: Number.MAX_SAFE_INTEGER,
+      terminalCapability: 'owner',
+    };
+    const worker = pausableUpstream();
+    const upstreamPort = await listen(worker.server);
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      resolveActor: () => owner,
+      control,
+      isAuthSessionLive: authSessionId => live.has(authSessionId),
+    });
+    const front = createServer((_req, res) => res.writeHead(404).end());
+    front.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const frontPort = await listen(front);
+    let client: ReturnType<typeof rawUpgrade> | undefined;
+    try {
+      client = rawUpgrade(frontPort, '/s/s1/');
+      await worker.dialed;
+      worker.complete('owner-terminal-bytes');
+      await client.waitFor('101', 'owner 的写终端没有建立');
+
+      // 平台解绑：endDashboardAuthSession 的同款两步（liveness 先失效，再扫索引）。
+      const closed = client.closed;
+      live.delete(owner.authSessionId);
+      control.releaseByAuthSession(owner.authSessionId);
+      await closed;
+    } finally {
+      client?.socket.destroy();
+      await close(front);
+      await close(worker.server);
     }
   });
 });

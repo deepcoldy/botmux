@@ -133,6 +133,24 @@ type PreparedTerminalRequest =
       headers: OutgoingHttpHeaders;
     };
 
+/**
+ * P1-4: the auth session this bridge belongs to, or `undefined` when the
+ * request is authorized by something other than a dashboard authentication.
+ *
+ * An explicit `?token=` / `?viewToken=` query capability that did NOT resolve
+ * to a bound view capability is deliberately excluded: P1-6 made that token the
+ * SOLE authorization basis, so the opener's ambient authentication must not
+ * decide its fate in either direction. Everything else — a bound view
+ * capability, an injected read grant, an injected write grant (leased or the
+ * platform owner's fixed one) — lives and dies with its auth session.
+ */
+function bridgeAuthSession(
+  prepared: Extract<PreparedTerminalRequest, { revoked: false }>,
+): string | undefined {
+  return prepared.readAuthSessionId
+    ?? (prepared.proxyGrant ? prepared.actor?.authSessionId : undefined);
+}
+
 export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
   handleHttp(req: IncomingMessage, res: ServerResponse, url: URL): boolean;
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean;
@@ -257,6 +275,32 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       upstream.setTimeout(0);
       upstreamSocket.setTimeout(0);
 
+      // P1-4: the liveness check in `prepare` is a snapshot taken BEFORE the
+      // dial. Between it and this upstream 101 sits a real worker handshake
+      // (the response timeout alone allows 30s of daemon wake-up), and a
+      // logout / expiry / rotation / unbind landing inside that window revokes
+      // nothing here: the socket exists only as a local variable, so the
+      // revocation sweep walks the authSession→socket index and finds it
+      // absent. Registering it afterwards would file a live bridge under an
+      // already-dead auth session, where no future revocation reaches it
+      // either — it would survive until the worker's own read-capability
+      // expiry, up to ten more minutes.
+      //
+      // Re-check here, in the same synchronous tick that registers the socket.
+      // Revocation always deletes the session from the liveness authority
+      // BEFORE it sweeps the index (see DashboardSessionStore.endHash and
+      // dashboard.ts's endDashboardAuthSession), so the two possible orders are
+      // now: we register first and the sweep closes us, or the sweep already
+      // ran and this check refuses. There is no third order that leaks.
+      const authSessionId = bridgeAuthSession(prepared);
+      if (authSessionId !== undefined && options.isAuthSessionLive?.(authSessionId) === false) {
+        // Nothing is relayed: no 101, no registration, and the upstream socket
+        // dies so the worker does not keep a half-open bridge either.
+        upstreamSocket.destroy();
+        socketError(clientSocket, 403, 'authentication ended');
+        return;
+      }
+
       let leaseMarker: string | undefined;
       if (prepared.actor && prepared.proxyGrant?.scope === 'write' && prepared.proxyGrant.leaseMarker) {
         const registered = options.control.registerWritableSocket(
@@ -282,11 +326,15 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         }
       }
 
-      // P1-5: index the read stream under its auth session (bound view
-      // capability or injected read grant) so logout/expiry closes it now
-      // rather than at the worker's grant-expiry timer.
-      const deregisterReadSocket = prepared.readAuthSessionId
-        ? options.control.registerReadSocket(prepared.readAuthSessionId, clientSocket)
+      // P1-5: index the stream under its auth session so logout/expiry closes
+      // it now rather than at the worker's grant-expiry timer. A leased write
+      // bridge is already carried by its lease's own socket set; everything
+      // else (bound view capability, injected read grant, and the platform
+      // owner's fixed write grant, which has no lease behind it) is indexed
+      // here — otherwise the liveness re-check above would only have moved the
+      // leak one tick later instead of closing it.
+      const deregisterBridgeSocket = authSessionId !== undefined && !leaseMarker
+        ? options.control.registerReadSocket(authSessionId, clientSocket)
         : undefined;
 
       const lines = [`HTTP/1.1 ${upRes.statusCode ?? 101} ${upRes.statusMessage ?? 'Switching Protocols'}`];
@@ -301,7 +349,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       const releaseOnDisconnect = () => {
         if (disconnected) return;
         disconnected = true;
-        deregisterReadSocket?.();
+        deregisterBridgeSocket?.();
         if (prepared.actor && leaseMarker) {
           options.control.disconnect(prepared.actor, prepared.sessionId, leaseMarker);
         }
