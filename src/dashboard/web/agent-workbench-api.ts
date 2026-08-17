@@ -28,7 +28,8 @@ export interface WorkbenchApi {
   /** Capability URL for the read-only terminal (viewToken-bearing). The frame
    *  authenticates by this capability, so it also works where no Dashboard
    *  cookie exists — a Feishu WebView being the case that motivated it.
-   *  Returned rebased onto this page's origin — see `sameOriginViewLink`.
+   *  The server answers with a same-origin path and this client refuses
+   *  anything else (P1-5) — see `sameOriginViewLink`.
    *  The capability is short-lived and bound to this login (P1-5): `expiresAt`
    *  is when the server stops honoring it, so callers should fetch a fresh
    *  link shortly before then (null when the server did not say). */
@@ -154,27 +155,27 @@ function currentPageOrigin(): string | null {
   return typeof origin === 'string' && origin ? origin : null;
 }
 
-/** 把上游 view-link 改写成「工作台页面同源」的地址：只留 pathname + search，origin 换成
- *  当前页面的。
+/** 只接受「工作台页面同源」的 view-link，并在有 origin 时拼成绝对地址。
  *
- *  上游返回的是**终端反代自身端口**上的绝对 URL（形如 `http://<host>:8801/s/<id>?viewToken=…`），
- *  而客户端所在网段未必放行那个端口——实际踩到的案例：手机所在办公网只放行 dashboard 的
- *  端口，对反代端口没有任何可达连接，iframe 直接加载失败、终端一片空白。dashboard 同源
- *  也挂了同一套终端反代（`/s/*` 的 HTTP 反代 + WebSocket 升级桥接），路径与上游完全一致，
- *  所以换掉 origin 就能绕开这层网络不可达。凭证在 `?viewToken=` 查询参数里，跟着 search
- *  一起保留，鉴权链路不受 origin 改写影响。
+ *  P1-5 之后服务端只回同源相对路径（形如 `/s/<id>/?viewToken=…`），绝不再回
+ *  daemon/worker 自身端口上的绝对 URL。这不只是可达性问题（早先踩过的案例：手机所在办公
+ *  网只放行 dashboard 端口，对反代端口没有任何可达连接，iframe 一片空白），更是撤销问题：
+ *  daemon 反代和 worker 端口都在网络上开着，且都看不到 dashboard 的登出状态，凭证一旦被
+ *  指到那两个 origin 上，中央的吊销检查就形同虚设。所以这里对任何非同源地址一律拒绝，
+ *  不再「改写洗白」——服务端本就不会给，真给了也说明链路被人动过手脚。
  *
- *  origin 缺失或拼接失败（如沙箱 iframe 的不透明 origin，`window.location.origin` 为
- *  "null"）时回退原地址：改写是可达性优化，失败不该把链接整个废掉。 */
-function sameOriginViewLink(parsed: URL): string {
+ *  origin 缺失（SSR / 注入 fetchImpl 的测试环境）或拼接失败（沙箱 iframe 的不透明 origin，
+ *  `window.location.origin` 为 "null"）时保留相对路径：相对地址同样只会打到当前源，
+ *  iframe 直接用即可。 */
+function sameOriginViewLink(path: string): string {
   const origin = currentPageOrigin();
-  if (!origin) return parsed.toString();
+  if (!origin) return path;
   try {
-    const rebased = new URL(`${parsed.pathname}${parsed.search}`, origin);
-    if (rebased.protocol !== 'http:' && rebased.protocol !== 'https:') return parsed.toString();
+    const rebased = new URL(path, origin);
+    if (rebased.protocol !== 'http:' && rebased.protocol !== 'https:') return path;
     return rebased.toString();
   } catch {
-    return parsed.toString();
+    return path;
   }
 }
 
@@ -228,23 +229,20 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
           ),
           'invalid_view_link_response',
         );
-        // Same untrusted-URL discipline the pane applies to riffAccessUrl: the
-        // link is built by another daemon, so only http(s) without embedded
-        // credentials may reach the DOM. Validate the upstream URL first, then
-        // rebase it onto this page's origin.
+        // P1-5: the only shape allowed to reach the DOM is a same-origin
+        // terminal path. `//host/...` is a protocol-relative ABSOLUTE URL and
+        // `/\host` is treated the same way by browsers, so both are rejected
+        // along with every explicit scheme — an absolute link would hand this
+        // capability to an origin that cannot enforce revocation.
         if (typeof body.url !== 'string' || body.url.length > 2_048) return null;
-        const parsed = new URL(body.url);
-        if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
-          || parsed.username || parsed.password) {
-          return null;
-        }
+        if (!/^\/s\/[^/\\]/.test(body.url)) return null;
         // Malformed expiry degrades to "unknown" rather than rejecting the
         // link: expiry-driven refresh is an optimization, not the gate.
         const expiresAt = typeof body.expiresAt === 'number'
           && Number.isSafeInteger(body.expiresAt) && body.expiresAt > 0
           ? body.expiresAt
           : null;
-        return { url: sameOriginViewLink(parsed), expiresAt };
+        return { url: sameOriginViewLink(body.url), expiresAt };
       } catch {
         return null;
       }

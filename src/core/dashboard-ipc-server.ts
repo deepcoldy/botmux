@@ -2218,15 +2218,20 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
  * session. The central dashboard therefore REPLACES it with a short-lived
  * signed read grant bound to the requesting identity before answering its own
  * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
- * browser directly. Knowing any view capability never grants terminal input,
- * so the link stays read-only by construction rather than by UI convention.
+ * browser directly. That grant is also PINNED to the boot generation derived
+ * from this very token, so the value must be present and current — a live port
+ * left over from a previous boot (persisted `session.webPort` outliving the
+ * worker) is not enough. Same guard shape as write-link.
+ *
+ * Knowing any view capability never grants terminal input, so the link stays
+ * read-only by construction rather than by UI convention.
  */
 ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const port = ds.workerPort ?? ds.session.webPort;
-  if (!port) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
+  if (!port || !ds.workerViewToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
   jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
 });
 

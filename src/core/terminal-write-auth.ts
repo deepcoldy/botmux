@@ -59,8 +59,10 @@ export interface TerminalAccessDecision {
 //   • the worker's per-boot random `viewToken` (Feishu card links — dies with
 //     the worker generation), or
 //   • a short-lived signed read grant carried in `?viewToken=` (dashboard
-//     view-link API — bound to sessionId + authSessionId + expiresAt, verified
-//     statelessly by the worker via verifyTerminalControlGrant).
+//     view-link API — bound to sessionId + authSessionId + expiresAt, plus
+//     `audience: central` and the worker's boot generation; the worker accepts
+//     it only when the central front proxy countersigned the hop, so a raw
+//     copied URL dialled straight at the worker/daemon port cannot spend it).
 // Every previously issued stable view token therefore fails on new workers.
 // The WRITE capability below intentionally stays stable — an explicitly issued
 // 「操作链接」 is an independent capability that must survive restarts.

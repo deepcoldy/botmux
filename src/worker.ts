@@ -128,8 +128,11 @@ import {
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
 import {
+  deriveWorkerViewGeneration,
   looksLikeTerminalControlGrant,
+  TERMINAL_VIEW_FORWARD_HEADER,
   verifyTerminalControlGrant,
+  verifyTerminalViewForward,
 } from './core/terminal-control-grant.js';
 import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
@@ -1862,23 +1865,37 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   // `?viewToken=` read capability, two accepted forms (P1-5):
   //   • this worker's per-boot random token (Feishu card links) — plain
   //     equality; dies with the worker generation;
-  //   • a short-lived signed read grant minted by the dashboard view-link API —
-  //     verified statelessly (signature + expiry + session binding); the
-  //     WebSocket is additionally closed at the grant's expiresAt.
+  //   • a short-lived signed read grant minted by the dashboard view-link API.
   // The retired stable per-session HMAC matches neither form, so every
   // previously issued stable view token fails closed on this worker.
+  //
+  // The signed form is accepted ONLY when all four hold, because this worker
+  // has no view of dashboard logout state and a URL is trivially copied:
+  //   1. signature + expiry + session binding verify (stateless base check);
+  //   2. scope is `read` — a leaked write-scope loopback grant must never
+  //      double as a browser-shareable capability;
+  //   3. audience is `central` AND the central front proxy countersigned THIS
+  //      capability (X-Botmux-Terminal-View). That header is computed from the
+  //      host-only dashboard secret and is only emitted after the proxy checked
+  //      the capability's auth session is still live, so a raw view URL replayed
+  //      against this port — or against the daemon's own network-bound `/s/`
+  //      reverse proxy — cannot produce it and dies here;
+  //   4. the pinned worker generation matches this boot. A restart re-randomizes
+  //      `viewToken`, so grants minted for the previous boot fail closed even
+  //      though `.dashboard-secret` is unchanged.
+  // The WebSocket is additionally closed at the grant's expiresAt.
   const viewParam = url.searchParams.get('viewToken');
   let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken);
   let viewGrantUser: string | undefined;
   let viewGrantExpiresAt: number | undefined;
   if (!viewTokenMatches && looksLikeTerminalControlGrant(viewParam) && sessionId) {
     const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
-    if (secret) {
+    if (secret && verifyTerminalViewForward(secret, viewParam, req.headers[TERMINAL_VIEW_FORWARD_HEADER])) {
       const viewGrant = verifyTerminalControlGrant(secret, viewParam, sessionId);
-      // Only read scope may travel in a URL: the view-link API mints nothing
-      // else, and a leaked write-scope loopback grant must never double as a
-      // browser-shareable capability.
-      if (viewGrant.ok && viewGrant.claims.scope === 'read') {
+      if (viewGrant.ok
+        && viewGrant.claims.scope === 'read'
+        && viewGrant.claims.audience === 'central'
+        && viewGrant.claims.workerGeneration === deriveWorkerViewGeneration(secret, viewToken)) {
         viewTokenMatches = true;
         viewGrantUser = viewGrant.claims.userId;
         viewGrantExpiresAt = viewGrant.claims.expiresAt;

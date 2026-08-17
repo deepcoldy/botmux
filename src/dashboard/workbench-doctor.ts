@@ -520,16 +520,17 @@ function stepViewLink(ctx){
         return;
       }
       var u;
-      try { u = new URL(raw); } catch (e) {
+      try { u = new URL(raw, location.origin); } catch (e) {
         line('❌', 'view-link', 'HTTP 200 但 url 解析不了');
         return;
       }
-      // 同源改写在前端 api 层做，服务端这里返回的仍是反代自身端口的绝对地址。
-      // 两种情况都不算故障，但「服务端给的是哪个 origin」正是要看的东西。
-      var same = u.origin === location.origin;
-      line(same ? '✅' : '⚠️', 'view-link origin',
+      // P1-5 起服务端只回同源相对路径：跨端口/跨域地址会把只读凭证指到看不见登出状态的
+      // daemon/worker 端口上，中央吊销就白做了。这里如实报「服务端给的是哪个 origin」。
+      var same = raw.charAt(0) === '/' && u.origin === location.origin;
+      line(same ? '✅' : '❌', 'view-link origin',
         same ? '与页面同源' : u.origin,
-        same ? '服务端直接给的就是同源地址' : '服务端给的是跨端口地址，前端会改写成同源；下面按同源地址继续探');
+        same ? '服务端给的是同源相对路径（只有中央前门能消费）'
+          : '服务端给了跨源地址：绕开中央前门的吊销检查，按缺陷处理');
       line('✅', 'view-link 路径', u.pathname, u.search ? '带查询参数（viewToken 凭证已隐藏）' : '无查询参数');
       ctx.termPath = u.pathname;
       ctx.termSearch = u.search;

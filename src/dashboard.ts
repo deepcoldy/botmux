@@ -97,9 +97,11 @@ import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
 import { handleWorkbenchTicketRedemption } from './dashboard/workbench-ticket.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
+  centralViewLinkPath,
   mintTerminalViewCapability,
-  rewriteViewLinkCapability,
   terminalViewCapabilityAuthSession,
+  terminalViewForwardProof,
+  upstreamWorkerViewGeneration,
 } from './dashboard/terminal-view-capability.js';
 import {
   CLI_SELECT_OPTIONS,
@@ -565,6 +567,11 @@ const terminalFrontProxy = createTerminalFrontProxy({
   viewCapabilityAuthSession: (sessionId, viewToken) =>
     terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
   isAuthSessionLive: terminalAuthSessionLive,
+  // P1-5: this proxy is the ONLY consumer allowed to spend a view capability.
+  // The countersignature proves the loopback hop passed through here — and
+  // therefore through the liveness check above — so a raw view URL aimed at the
+  // worker port or the daemon's own `/s/` proxy is refused by the worker.
+  viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
 });
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
@@ -2947,6 +2954,11 @@ const server = createServer(async (req, res) => {
     // response straight back. Mounted before the dashboard auth gate because the
     // worker independently requires a view/write capability or authenticated
     // dashboard cookie before serving either HTTP or WebSocket terminal data.
+    // Since P1-5 this hop is also LOAD-BEARING for revocation, not just
+    // reachability: a signed view capability is checked here against live auth
+    // sessions and countersigned for the worker, which refuses one that arrived
+    // any other way. That is why the view-link API hands out a same-origin path
+    // instead of the daemon/worker origin — this is the only door.
     if (terminalFrontProxy.handleHttp(req, res, url)) return;
 
     if (await handleWebhookRoute(req, res, url, {
@@ -4752,15 +4764,22 @@ const server = createServer(async (req, res) => {
 
     // Read-only web-terminal link. The Workbench terminal pane uses it so the
     // frame authenticates by capability instead of by Dashboard cookie, which
-    // a Feishu WebView's WebSocket does not carry. The daemon's URL still
-    // embeds the worker's per-boot card token, which is NOT bound to the
-    // requesting authentication — so it is REPLACED here (never passed
-    // through) with a short-lived signed read grant bound to sessionId +
-    // authSessionId + expiresAt (P1-5). The worker verifies it statelessly and
-    // closes the socket at expiry; the front proxy refuses it once this auth
-    // session ends. A view capability can never send input, so this stays safe
-    // for any identity allowed to observe the session; unauthenticated callers
-    // were already rejected by the auth decision above (no public allow-list).
+    // a Feishu WebView's WebSocket does not carry.
+    //
+    // Two things about the daemon's answer never reach the browser (P1-5):
+    //   • its `?viewToken=` is the worker's per-boot card token, unbound to the
+    //     requesting authentication. It is consumed here — converted to a
+    //     one-way worker generation id — and REPLACED with a short-lived signed
+    //     read grant bound to sessionId + authSessionId + expiresAt + that
+    //     generation + `audience: central`;
+    //   • its ORIGIN is the daemon terminal proxy / worker port, both network
+    //     reachable and both blind to logout. We answer with a same-origin
+    //     relative path instead, so the only entry point the browser ever learns
+    //     is this dashboard's front proxy — the one place that checks auth
+    //     session liveness and countersigns the hop for the worker.
+    // A view capability can never send input, so this stays safe for any
+    // identity allowed to observe the session; unauthenticated callers were
+    // already rejected by the auth decision above (no public allow-list).
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/view-link$/))) {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
@@ -4777,13 +4796,14 @@ const server = createServer(async (req, res) => {
       } catch {
         upstreamUrl = undefined;
       }
-      const minted = requestIdentity
-        ? mintTerminalViewCapability(SECRET, sid, requestIdentity)
+      // No generation ⇒ no pinned capability. Fail closed rather than mint one
+      // that would outlive the worker boot it was meant for.
+      const generation = upstreamWorkerViewGeneration(SECRET, upstreamUrl);
+      const minted = requestIdentity && generation
+        ? mintTerminalViewCapability(SECRET, sid, requestIdentity, generation)
         : null;
-      const rewritten = minted && typeof upstreamUrl === 'string'
-        ? rewriteViewLinkCapability(upstreamUrl, minted.token)
-        : null;
-      // Fail closed rather than fall back to the unbound upstream token.
+      const rewritten = minted ? centralViewLinkPath(sid, minted.token) : null;
+      // Fail closed rather than fall back to the unbound upstream token/origin.
       if (!minted || !rewritten) return jsonRes(res, 502, { ok: false, error: 'view_link_unavailable' });
       return jsonRes(res, 200, { ok: true, url: rewritten, expiresAt: minted.expiresAt });
     }

@@ -8,7 +8,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
-import { issueTerminalControlGrant } from '../src/core/terminal-control-grant.js';
+import {
+  deriveWorkerViewGeneration,
+  issueTerminalControlGrant,
+  signTerminalViewForward,
+  TERMINAL_VIEW_FORWARD_HEADER,
+} from '../src/core/terminal-control-grant.js';
 
 /** The RETIRED stable view derivation (P1-5). Reproduced here so the tests can
  *  prove a live worker rejects every historically issued stable view token. */
@@ -17,6 +22,38 @@ function retiredStableViewToken(secret: string, sessionId: string): string {
     .update('botmux-terminal-view-v1\0')
     .update(sessionId)
     .digest('base64url');
+}
+
+/**
+ * What the central dashboard mints for a browser (P1-5): a READ grant that
+ * names its audience (`central`) and pins the worker BOOT it was issued
+ * against. `bootViewToken` is the per-boot token the worker reported in
+ * `ready`; the generation is derived one-way from it on both sides.
+ */
+function centralViewCapability(secret: string, sessionId: string, bootViewToken: string, opts: {
+  authSessionId?: string;
+  issuedAt?: number;
+  expiresAt?: number;
+  /** Override the pinned generation (to forge a different boot). */
+  generation?: string;
+} = {}): string {
+  return issueTerminalControlGrant(secret, {
+    scope: 'read',
+    sessionId,
+    userId: 'ou_h5_viewer',
+    authSessionId: opts.authSessionId ?? 'h5-auth-1',
+    issuedAt: opts.issuedAt ?? Date.now() - 1_000,
+    expiresAt: opts.expiresAt ?? Date.now() + 60_000,
+    audience: 'central',
+    workerGeneration: opts.generation ?? deriveWorkerViewGeneration(secret, bootViewToken)!,
+  });
+}
+
+/** The countersignature the central front proxy attaches on the loopback hop
+ *  after it verified the capability's auth session is still live. A browser
+ *  holding the raw URL cannot compute it. */
+function centralForwardHeaders(secret: string, capability: string): Record<string, string> {
+  return { [TERMINAL_VIEW_FORWARD_HEADER]: signTerminalViewForward(secret, capability)! };
 }
 
 const children = new Set<ChildProcess>();
@@ -195,20 +232,21 @@ setInterval(() => {}, 1_000);
     expect((await fetch(`${base}/?token=wrong-token`)).status).toBe(403);
 
     // P1-5: the dashboard-minted BOUND view capability (signed read grant in
-    // ?viewToken=) opens the terminal read-only…
-    const boundView = issueTerminalControlGrant(secret, {
-      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
-      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+    // ?viewToken=) opens the terminal read-only — but ONLY when it arrives
+    // through the central front proxy, which countersigns the hop.
+    const boundView = centralViewCapability(secret, sessionId, ready.viewToken!);
+    const boundResponse = await fetch(`${base}/?viewToken=${encodeURIComponent(boundView)}`, {
+      headers: centralForwardHeaders(secret, boundView),
     });
-    const boundResponse = await fetch(`${base}/?viewToken=${encodeURIComponent(boundView)}`);
     expect(boundResponse.status).toBe(200);
     expect(await boundResponse.text()).toContain('var hasToken=false');
     // …an EXPIRED one is refused (expired reconnects with a kept URL die)…
-    const expiredBoundView = issueTerminalControlGrant(secret, {
-      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+    const expiredBoundView = centralViewCapability(secret, sessionId, ready.viewToken!, {
       issuedAt: Date.now() - 20_000, expiresAt: Date.now() - 10_000,
     });
-    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(expiredBoundView)}`)).status).toBe(403);
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(expiredBoundView)}`, {
+      headers: centralForwardHeaders(secret, expiredBoundView),
+    })).status).toBe(403);
     // …and a WRITE-scope grant may never travel in a URL: it neither writes
     // nor even reads through the ?viewToken= channel (viewToken 永不升级).
     const writeScopeInUrl = issueTerminalControlGrant(secret, {
@@ -260,11 +298,13 @@ setInterval(() => {}, 1_000);
     // P1-5: a READ socket authorized by a bound capability is closed at the
     // capability's signed expiresAt — read streams no longer outlive their
     // authentication even when the front proxy never tears them down.
-    const shortBoundView = issueTerminalControlGrant(secret, {
-      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+    const shortBoundView = centralViewCapability(secret, sessionId, ready.viewToken!, {
       issuedAt: Date.now(), expiresAt: Date.now() + 2_000,
     });
-    const readWs = new WebSocket(`ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(shortBoundView)}`);
+    const readWs = new WebSocket(
+      `ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(shortBoundView)}`,
+      { headers: centralForwardHeaders(secret, shortBoundView) },
+    );
     const readWsClosed = new Promise<{ code: number; reason: string }>((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => rejectPromise(new Error('read WS was not closed at its expiry boundary')), 8_000);
       readWs.once('close', (code, reason) => { clearTimeout(timer); resolvePromise({ code, reason: reason.toString() }); });
@@ -330,6 +370,117 @@ setInterval(() => {}, 1_000);
     child.send({ type: 'close' } satisfies DaemonToWorker);
   }, 25_000);
 
+  // P1-5 第二轮：view grant 只有「经中央前门」才算数。之前的实现里，view-link 返回的
+  // URL 保留 daemon/worker origin，拿着裸 URL 直连 worker 端口（或直连 daemon 那个
+  // 监听 0.0.0.0 的 /s/ 反代）就能把中央的 authSession 存活性检查整条跳过——签名和
+  // 有效期都合法，worker 又是无状态验签，于是登出等于没登出。
+  it('P1-5: a raw view URL dialled straight at the worker is refused — only a central-proxy hop counts', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-view-central-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const secret = 'integration-central-only-secret';
+    const botmuxDir = join(root, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true });
+    writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
+    const fakeCli = join(root, 'fake-claude');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdin.setRawMode?.(true);
+process.stdin.resume();
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const logs: string[] = [];
+    const sessionId = 'view-central-session';
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_view_central',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_view_central',
+      rootMessageId: 'om_view_central',
+      workingDir: dataDir,
+      cliId: 'claude-code',
+      cliPathOverride: fakeCli,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_view_central',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    const ready = await waitForReady(child, logs);
+    const base = `http://127.0.0.1:${ready.port}`;
+    const boot = ready.viewToken!;
+
+    const capability = centralViewCapability(secret, sessionId, boot);
+    const url = `${base}/?viewToken=${encodeURIComponent(capability)}`;
+
+    // 1) 裸 URL 直连 worker（正是把 view-link 的返回值原样粘到浏览器地址栏那条路）：
+    //    签名、有效期、会话绑定全对，但没有中央前门的会签 ⇒ 403。
+    expect((await fetch(url)).status).toBe(403);
+    // 2) 自己编一个会签也没用：那把章是用宿主 .dashboard-secret 算的。
+    expect((await fetch(url, { headers: { [TERMINAL_VIEW_FORWARD_HEADER]: 'forged' } })).status).toBe(403);
+    // 3) 把别的能力的会签挪过来同样不行：章绑定的是「这一条」能力。
+    const otherCapability = centralViewCapability(secret, sessionId, boot, { authSessionId: 'h5-auth-2' });
+    expect((await fetch(url, {
+      headers: centralForwardHeaders(secret, otherCapability),
+    })).status).toBe(403);
+    // 4) 经中央前门（带正确会签）才放行，且只读。
+    const viaCentral = await fetch(url, { headers: centralForwardHeaders(secret, capability) });
+    expect(viaCentral.status).toBe(200);
+    expect(await viaCentral.text()).toContain('var hasToken=false');
+
+    // WS 同一把锁：裸 URL 升级握手直接 403，中央链路才 101。
+    expect(await rawWsHandshake(ready.port, `/?viewToken=${encodeURIComponent(capability)}`))
+      .toContain('403 Forbidden');
+    const centralWs = new WebSocket(`ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(capability)}`, {
+      headers: centralForwardHeaders(secret, capability),
+    });
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error('central read WS timeout')), 5_000);
+      centralWs.once('open', () => { clearTimeout(timer); resolvePromise(); });
+      centralWs.once('error', err => { clearTimeout(timer); rejectPromise(err); });
+    });
+    centralWs.close();
+
+    // 5) 没有 audience 的内部环回 read grant 塞进 ?viewToken=，哪怕会签是真的也过不去：
+    //    内部凭证不因为被塞进 URL 就多出一条浏览器通道。
+    const internal = issueTerminalControlGrant(secret, {
+      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+    });
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(internal)}`, {
+      headers: centralForwardHeaders(secret, internal),
+    })).status).toBe(403);
+
+    // 6) generation 钉的是「这一代 worker」：换一代就是另一条能力，会签再真也无效。
+    const wrongGeneration = centralViewCapability(secret, sessionId, boot, {
+      generation: deriveWorkerViewGeneration(secret, 'some-other-boot-token')!,
+    });
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(wrongGeneration)}`, {
+      headers: centralForwardHeaders(secret, wrongGeneration),
+    })).status).toBe(403);
+
+    // 7) 飞书卡片那条链路（worker 每 boot 明文 token）语义不变，仍然直连可读——
+    //    收紧的只是签名 grant，不是所有只读入口。
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(boot)}`)).status).toBe(200);
+
+    child.send({ type: 'close' } satisfies DaemonToWorker);
+  }, 25_000);
+
   // P1-5 回归矩阵的收尾一格：worker 重启后，重启前发出的一切读 token（旧稳定
   // HMAC、上一代 boot token）全部失效；而显式写能力（操作链接）跨重启存活不变。
   it('a worker restart invalidates every prior read capability while the operate link survives', async () => {
@@ -387,6 +538,16 @@ setInterval(() => {}, 1_000);
     const first = await spawnWorker();
     const firstViewToken = first.ready.viewToken!;
     expect(first.ready.token).toBe(deriveTerminalWriteToken(secret, sessionId));
+    // 重启前中央签发的一条 view capability（含会签）。它在这一代是好使的。
+    const firstGenerationCapability = centralViewCapability(secret, sessionId, firstViewToken, {
+      expiresAt: Date.now() + 10 * 60_000,
+    });
+    const firstGenerationHeaders = centralForwardHeaders(secret, firstGenerationCapability);
+    const beforeRestart = await fetch(
+      `http://127.0.0.1:${first.ready.port}/?viewToken=${encodeURIComponent(firstGenerationCapability)}`,
+      { headers: firstGenerationHeaders },
+    );
+    expect(beforeRestart.status).toBe(200);
     const firstExit = new Promise<void>(resolvePromise => first.child.once('exit', () => resolvePromise()));
     first.child.kill('SIGKILL');
     await firstExit;
@@ -401,6 +562,21 @@ setInterval(() => {}, 1_000);
     // 重启前的读能力（上一代 boot token、退役的稳定 HMAC）全部 403。
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(firstViewToken)}`)).status).toBe(403);
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);
+    // P1-5：重启前签发的中央 view capability 也一起死掉——同一把 .dashboard-secret
+    // 仍在，签名和有效期都还成立，但它钉的 generation 属于上一代 worker，且会签也不
+    // 会让它复活。旧 grant 跨 worker restart 继续读终端的路就此封死。
+    expect((await fetch(
+      `${base}/?viewToken=${encodeURIComponent(firstGenerationCapability)}`,
+      { headers: firstGenerationHeaders },
+    )).status).toBe(403);
+    // 本代重新签发的能力照常可读（重启只让旧能力失效，不是把功能关掉）。
+    const secondGenerationCapability = centralViewCapability(secret, sessionId, second.ready.viewToken!);
+    const reissued = await fetch(
+      `${base}/?viewToken=${encodeURIComponent(secondGenerationCapability)}`,
+      { headers: centralForwardHeaders(secret, secondGenerationCapability) },
+    );
+    expect(reissued.status).toBe(200);
+    expect(await reissued.text()).toContain('var hasToken=false');
     // 本代 boot token 只读可用。
     const freshView = await fetch(`${base}/?viewToken=${encodeURIComponent(second.ready.viewToken!)}`);
     expect(freshView.status).toBe(200);

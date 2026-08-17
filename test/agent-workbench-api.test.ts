@@ -106,24 +106,25 @@ describe('Agent Workbench API integration contract', () => {
     });
   });
 
-  it('把跨端口的 view-link 改写成同源地址，pathname 与 viewToken 原样保留', async () => {
-    // 上游给的是「终端反代自身端口」的绝对地址。手机所在办公网只放行 dashboard 端口、
-    // 对 8801 完全不可达，直接挂这条地址 iframe 加载不出来、终端一片空白。
+  it('把服务端给的同源相对路径拼成本页地址，pathname 与 viewToken 原样保留', async () => {
+    // P1-5 起服务端只回同源相对路径。它同时解决两件事：手机所在办公网只放行 dashboard
+    // 端口（对反代 8801 完全不可达，绝对地址 iframe 一片空白），以及只读凭证绝不能被
+    // 指到 daemon/worker 端口上——那两个 origin 看不见 dashboard 的登出状态。
     setPageOrigin('https://board.example');
     const api = createWorkbenchApi(async () => jsonResponse({
       ok: true,
-      url: 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc',
+      url: '/s/session-0/?viewToken=view-cap-abc',
       expiresAt: 1_755_000_000_000,
     }));
 
     const link = await api.getTerminalViewLink('session-0');
-    expect(link!.url).toBe('https://board.example/s/session-0?viewToken=view-cap-abc');
+    expect(link!.url).toBe('https://board.example/s/session-0/?viewToken=view-cap-abc');
     // 短时能力的到期时间原样透传，供面板在到期前主动换链。
     expect(link!.expiresAt).toBe(1_755_000_000_000);
-    // 端口/主机/协议全部换成当前页面的，路径与凭证一个字都不能动。
+    // origin 只可能是当前页面的，路径与凭证一个字都不能动。
     const parsed = new URL(link!.url);
     expect(parsed.origin).toBe('https://board.example');
-    expect(parsed.pathname).toBe('/s/session-0');
+    expect(parsed.pathname).toBe('/s/session-0/');
     expect(parsed.searchParams.get('viewToken')).toBe('view-cap-abc');
   });
 
@@ -132,23 +133,40 @@ describe('Agent Workbench API integration contract', () => {
     for (const expiresAt of [undefined, 'soon', -5, 1.5]) {
       const api = createWorkbenchApi(async () => jsonResponse({
         ok: true,
-        url: 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc',
+        url: '/s/session-0/?viewToken=view-cap-abc',
         ...(expiresAt === undefined ? {} : { expiresAt }),
       }));
       await expect(api.getTerminalViewLink('session-0')).resolves.toMatchObject({ expiresAt: null });
     }
   });
 
-  it('同源改写发生在协议与凭证校验之后，非法链接照旧拒绝', async () => {
+  it('P1-5：任何跨源写法都拒收，绝不「改写洗白」成同源地址', async () => {
     setPageOrigin('https://board.example');
 
-    // javascript: 之类的非 http(s) 协议不能进 DOM，更不能被改写「洗」成同源地址。
+    // 关键一格：daemon/worker 自身端口的绝对地址。以前这里会被剥掉 origin 洗成同源，
+    // 于是没人发现服务端本可以把凭证指向一个不做吊销检查的入口。现在直接拒。
+    const daemonOrigin = createWorkbenchApi(async () => jsonResponse({
+      ok: true, url: 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc',
+    }));
+    await expect(daemonOrigin.getTerminalViewLink('session-0')).resolves.toBeNull();
+
+    // 协议相对写法 `//host/...` 也是绝对地址，浏览器会当跨源加载。
+    const protocolRelative = createWorkbenchApi(async () => jsonResponse({
+      ok: true, url: '//evil.example/s/session-0?viewToken=t',
+    }));
+    await expect(protocolRelative.getTerminalViewLink('session-0')).resolves.toBeNull();
+    const backslash = createWorkbenchApi(async () => jsonResponse({
+      ok: true, url: '/\\evil.example/s/session-0?viewToken=t',
+    }));
+    await expect(backslash.getTerminalViewLink('session-0')).resolves.toBeNull();
+
+    // javascript: 之类的非 http(s) 协议不能进 DOM。
     const hostileProtocol = createWorkbenchApi(async () => jsonResponse({
       ok: true, url: 'javascript:alert(1)//board.example/s/session-0?viewToken=t',
     }));
     await expect(hostileProtocol.getTerminalViewLink('session-0')).resolves.toBeNull();
 
-    // 内嵌凭证同理：先判掉，不给它借同源改写落地的机会。
+    // 内嵌凭证同理。
     const embeddedCredentials = createWorkbenchApi(async () => jsonResponse({
       ok: true, url: 'https://user:pass@evil.example/s/session-0?viewToken=t',
     }));
@@ -156,15 +174,18 @@ describe('Agent Workbench API integration contract', () => {
 
     const notAUrl = createWorkbenchApi(async () => jsonResponse({ ok: true, url: 'not a url' }));
     await expect(notAUrl.getTerminalViewLink('session-0')).resolves.toBeNull();
+    // 非终端路径也不收：这个接口只该产出 /s/<id> 形态。
+    const wrongPath = createWorkbenchApi(async () => jsonResponse({ ok: true, url: '/api/whatever?viewToken=t' }));
+    await expect(wrongPath.getTerminalViewLink('session-0')).resolves.toBeNull();
   });
 
-  it('拿不到页面 origin 时回退原地址，不把链接改丢', async () => {
-    // SSR / 注入 fetchImpl 的测试环境没有 window；改写是可达性优化，缺条件就别动。
-    const upstream = 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc';
+  it('拿不到页面 origin 时保留相对路径，不把链接改丢', async () => {
+    // SSR / 注入 fetchImpl 的测试环境没有 window；相对地址本来就只会打到当前源。
+    const upstream = '/s/session-0/?viewToken=view-cap-abc';
     const noWindow = createWorkbenchApi(async () => jsonResponse({ ok: true, url: upstream }));
     await expect(noWindow.getTerminalViewLink('session-0')).resolves.toEqual({ url: upstream, expiresAt: null });
 
-    // 沙箱 iframe 的不透明 origin 是字符串 "null"，拼不出合法地址，同样回退。
+    // 沙箱 iframe 的不透明 origin 是字符串 "null"，拼不出合法地址，同样保留相对路径。
     setPageOrigin('null');
     const opaqueOrigin = createWorkbenchApi(async () => jsonResponse({ ok: true, url: upstream }));
     await expect(opaqueOrigin.getTerminalViewLink('session-0')).resolves.toEqual({ url: upstream, expiresAt: null });

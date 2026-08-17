@@ -15,20 +15,25 @@ import {
   parseTerminalFrontPath,
   terminalForwardHeaders,
   TERMINAL_CONTROL_HEADER,
+  TERMINAL_VIEW_FORWARD_HEADER,
 } from '../src/dashboard/terminal-front-proxy.js';
-import { terminalViewCapabilityAuthSession } from '../src/dashboard/terminal-view-capability.js';
+import {
+  mintTerminalViewCapability,
+  terminalViewCapabilityAuthSession,
+  terminalViewForwardProof,
+} from '../src/dashboard/terminal-view-capability.js';
+import { deriveWorkerViewGeneration, verifyTerminalViewForward } from '../src/core/terminal-control-grant.js';
 
 const SECRET = 'front-proxy-test-secret';
+const WORKER_GENERATION = deriveWorkerViewGeneration(SECRET, 'front-proxy-boot-token')!;
 
 function boundViewCapability(sessionId: string, authSessionId: string, expiresAt = Date.now() + 60_000): string {
-  return issueTerminalControlGrant(SECRET, {
-    scope: 'read',
+  return mintTerminalViewCapability(
+    SECRET,
     sessionId,
-    userId: 'ou_viewer',
-    authSessionId,
-    issuedAt: Date.now() - 1_000,
-    expiresAt,
-  });
+    { userId: 'ou_viewer', authSessionId, expiresAt },
+    WORKER_GENERATION,
+  )!.token;
 }
 
 function listen(server: Server): Promise<number> {
@@ -352,6 +357,73 @@ describe('central terminal front proxy boundary', () => {
       const crossSession = boundViewCapability('other-session', 'h5-auth-live');
       expect((await fetch(`http://127.0.0.1:${frontPort}/s/s1/?viewToken=${encodeURIComponent(crossSession)}`)).status).toBe(200);
       expect(upstreamHits).toBe(2);
+    } finally {
+      await close(front);
+      await close(upstream);
+    }
+  });
+
+  it('P1-5: countersigns ONLY a live bound capability, and the browser can never supply that proof', async () => {
+    // 这把签名是「读连接确实经过了持有吊销状态的中央前门」的唯一证据。worker 见不到
+    // dashboard 的登出状态，只能认这把章；所以它必须：只对活着的绑定能力盖、只盖当前
+    // 这一条、且浏览器自己伪造不出来。
+    const seen: Array<{ url: string; proof?: string }> = [];
+    const upstream = createServer((req, res) => {
+      const raw = req.headers[TERMINAL_VIEW_FORWARD_HEADER];
+      seen.push({ url: req.url ?? '', ...(typeof raw === 'string' ? { proof: raw } : {}) });
+      res.end('ok');
+    });
+    const upstreamPort = await listen(upstream);
+    const live = new Set(['h5-auth-live']);
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      resolveActor: () => null,
+      control: { registerReadSocket: () => () => {} } as any,
+      viewCapabilityAuthSession: (sessionId, viewToken) =>
+        terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+      isAuthSessionLive: authSessionId => live.has(authSessionId),
+      viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+    });
+    const front = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      if (!proxy.handleHttp(req, res, url)) res.writeHead(404).end();
+    });
+    const frontPort = await listen(front);
+    const get = (query: string, headers: Record<string, string> = {}) =>
+      fetch(`http://127.0.0.1:${frontPort}/s/s1/?${query}`, { headers });
+    try {
+      // 活着的绑定能力：盖章放行，章对得上这一条能力。
+      const capability = boundViewCapability('s1', 'h5-auth-live');
+      expect((await get(`viewToken=${encodeURIComponent(capability)}`)).status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(verifyTerminalViewForward(SECRET, capability, seen[0].proof)).toBe(true);
+
+      // 浏览器自带的伪造章在这一跳被整条丢掉，换成前门自己算的那把。
+      const forged = 'forged-forward-proof';
+      expect((await get(`viewToken=${encodeURIComponent(capability)}`, {
+        [TERMINAL_VIEW_FORWARD_HEADER]: forged,
+      })).status).toBe(200);
+      expect(seen[1].proof).not.toBe(forged);
+      expect(verifyTerminalViewForward(SECRET, capability, seen[1].proof)).toBe(true);
+
+      // 已登出的绑定能力：403 在前门就拦下，worker 一个字节都收不到，更不可能拿到章。
+      const revoked = boundViewCapability('s1', 'h5-auth-logged-out');
+      expect((await get(`viewToken=${encodeURIComponent(revoked)}`)).status).toBe(403);
+      expect(seen).toHaveLength(2);
+
+      // 内部环回 read grant（无 audience）不是给浏览器用的能力：前门不认、也不盖章，
+      // 于是它到了 worker 一样过不去——内部凭证不会因为塞进 URL 就多出一条浏览器通道。
+      const internal = issueTerminalControlGrant(SECRET, {
+        scope: 'read', sessionId: 's1', userId: 'ou_viewer', authSessionId: 'h5-auth-live',
+        issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+      });
+      expect((await get(`viewToken=${encodeURIComponent(internal)}`)).status).toBe(200);
+      expect(seen[2].proof).toBeUndefined();
+
+      // worker 每 boot 的卡片 token 走的是明文相等那条路，本来就不经过绑定能力，
+      // 不该被盖章（飞书卡片链接的语义一个字不动）。
+      expect((await get('viewToken=front-proxy-boot-token')).status).toBe(200);
+      expect(seen[3].proof).toBeUndefined();
     } finally {
       await close(front);
       await close(upstream);

@@ -6,6 +6,7 @@ import {
 } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
+import { TERMINAL_VIEW_FORWARD_HEADER } from '../core/terminal-control-grant.js';
 import type {
   TerminalControlManager,
   TerminalDashboardActor,
@@ -13,6 +14,7 @@ import type {
 } from './terminal-control.js';
 
 export const TERMINAL_CONTROL_HEADER = 'x-botmux-terminal-control';
+export { TERMINAL_VIEW_FORWARD_HEADER };
 /** Covers daemon wake-up (up to 10s) plus a bounded worker handshake. Cleared
  * as soon as response/upgrade headers arrive, so live streams stay unbounded. */
 export const TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS = 30_000;
@@ -30,6 +32,12 @@ export interface TerminalFrontProxyOptions {
    * means logout/expiry already revoked it — the request is refused even
    * though the worker's stateless check would still accept the signature. */
   isAuthSessionLive?(authSessionId: string): boolean;
+  /** P1-5: countersign an accepted view capability for the loopback hop. Only
+   * emitted after liveness passed, so the header IS the statement "the
+   * component holding the revocation state let this one through". Without it
+   * the worker refuses the capability, which is what makes a raw view URL
+   * aimed at the worker port or the daemon's own `/s/` proxy fail closed. */
+  viewCapabilityForwardProof?(viewToken: string): string | undefined;
 }
 
 function safeDecodeSessionId(raw: string): string | undefined {
@@ -148,36 +156,37 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     // Refuse it once that authentication ended (logout/expiry) — the worker's
     // stateless signature/expiry check alone would still accept it.
     let readAuthSessionId: string | undefined;
+    let viewForwardProof: string | undefined;
     if (hasExplicitQueryCapability) {
       const viewToken = url.searchParams.get('viewToken');
       const boundAuthSession = viewToken
         ? options.viewCapabilityAuthSession?.(parsed.sessionId, viewToken) ?? null
         : null;
-      if (boundAuthSession) {
+      if (boundAuthSession && viewToken) {
         if (options.isAuthSessionLive?.(boundAuthSession) === false) {
           return { ...parsed, port, revoked: true };
         }
         readAuthSessionId = boundAuthSession;
+        // Countersign only what this proxy just validated as live. The proof is
+        // bound to the exact capability string, so it can neither be moved onto
+        // a different grant nor be replayed by a browser that never sees it.
+        viewForwardProof = options.viewCapabilityForwardProof?.(viewToken);
       }
     }
     const proxyGrant = actor && !hasExplicitQueryCapability
       ? options.control.grantForProxy(actor, parsed.sessionId)
       : undefined;
     if (actor && proxyGrant?.scope === 'read') readAuthSessionId = actor.authSessionId;
-    return {
-      ...parsed,
-      port,
-      revoked: false,
-      actor,
-      proxyGrant,
-      readAuthSessionId,
-      headers: terminalForwardHeaders(req.headers, proxyGrant?.token, {
-        // Validate the explicit capability at the worker, but do not also send
-        // the legacy management cookie: a garbage `?token=` must not become a
-        // writable request merely because its opener is the owner Dashboard.
-        stripBrowserCredentials: hasExplicitQueryCapability,
-      }),
-    };
+    const headers = terminalForwardHeaders(req.headers, proxyGrant?.token, {
+      // Validate the explicit capability at the worker, but do not also send
+      // the legacy management cookie: a garbage `?token=` must not become a
+      // writable request merely because its opener is the owner Dashboard.
+      stripBrowserCredentials: hasExplicitQueryCapability,
+    });
+    // Set AFTER the header build, which drops every client-supplied `x-botmux-*`
+    // on this path: a browser can never smuggle its own forward proof through.
+    if (viewForwardProof) headers[TERMINAL_VIEW_FORWARD_HEADER] = viewForwardProof;
+    return { ...parsed, port, revoked: false, actor, proxyGrant, readAuthSessionId, headers };
   };
 
   const handleHttp = (req: IncomingMessage, res: ServerResponse, url: URL): boolean => {
