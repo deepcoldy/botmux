@@ -68,6 +68,7 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   brandLabel?: string | null;
   sandbox?: boolean;
+  codexAuthSync?: 'shared' | 'isolated';
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;

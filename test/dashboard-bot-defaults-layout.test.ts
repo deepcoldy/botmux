@@ -84,6 +84,15 @@ describe('bot defaults focused layout', () => {
     }
   });
 
+  it('offers the Codex auth policy in the sandbox section with explicit scope copy', () => {
+    expect(page).toContain('data-input="codexAuthSync"');
+    expect(page).toContain("bot.cliId === 'codex'");
+    expect(page).toContain('/codex-auth-sync');
+    expect(i18n.match(/'botDefaults\.codexAuthSyncHelp'/g)).toHaveLength(2);
+    expect(i18n).toContain('非沙箱仍使用全局 Codex 登录态');
+    expect(i18n).toContain('Unsandboxed Codex still uses the global login');
+  });
+
   it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');

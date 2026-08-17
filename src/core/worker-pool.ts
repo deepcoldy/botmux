@@ -6821,6 +6821,7 @@ export function forkWorker(
     turnTimeoutMs: botCfg.turnTimeoutMs,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    codexAuthSync: botCfg.codexAuthSync ?? 'shared',
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.

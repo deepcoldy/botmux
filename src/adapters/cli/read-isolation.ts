@@ -80,6 +80,19 @@ export function botHomePath(botmuxHome: string, appId: string): string {
   return `${botmuxHome.replace(/\/+$/, '')}/bots/${assertSafeAppId(appId)}`;
 }
 
+/** Whether a worker can redirect CLI data into BOT_HOME for this session. */
+export function shouldRedirectCliData(input: {
+  sandboxRequested: boolean;
+  supportsReadIsolation: boolean;
+  wrapperCli?: string;
+  sessionDataDir?: string;
+}): boolean {
+  return input.sandboxRequested
+    && input.supportsReadIsolation
+    && !input.wrapperCli
+    && !!input.sessionDataDir;
+}
+
 /**
  * Minimal read carve-outs needed to launch a CLI whose executable itself lives
  * under a globally denied data root. The standalone Codex installer exposes

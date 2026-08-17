@@ -2143,8 +2143,12 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const [enabled, setEnabled] = useState(bot.sandbox === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [authMode, setAuthMode] = useState<'shared' | 'isolated'>(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authStatus, setAuthStatus] = useState<StatusMessage>(null);
 
   useEffect(() => setEnabled(bot.sandbox === true), [bot.sandbox]);
+  useEffect(() => setAuthMode(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared'), [bot.codexAuthSync]);
 
   async function toggle(next: boolean): Promise<void> {
     setEnabled(next);
@@ -2164,6 +2168,28 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       setEnabled(!next);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function saveAuthMode(next: 'shared' | 'isolated'): Promise<void> {
+    const previous = authMode;
+    setAuthMode(next);
+    setAuthStatus(null);
+    setAuthBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/codex-auth-sync`, { codexAuthSync: next });
+      if (res.ok && res.body.ok) {
+        patchBot(bot.larkAppId, { codexAuthSync: next });
+        setAuthStatus({ text: `✓ ${tr('botDefaults.codexAuthSyncSaved')}`, ok: true });
+      } else {
+        setAuthMode(previous);
+        setAuthStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setAuthMode(previous);
+      setAuthStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setAuthBusy(false);
     }
   }
 
@@ -2187,6 +2213,24 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
         {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
       </p>
+      {bot.cliId === 'codex' ? (
+        <div className="bd-row">
+          <label>
+            <span>{tr('botDefaults.codexAuthSyncLabel')}</span>
+            <select
+              data-input="codexAuthSync"
+              value={authMode}
+              disabled={authBusy}
+              onChange={event => void saveAuthMode(event.currentTarget.value as 'shared' | 'isolated')}
+            >
+              <option value="shared">{tr('botDefaults.codexAuthSyncShared')}</option>
+              <option value="isolated">{tr('botDefaults.codexAuthSyncIsolated')}</option>
+            </select>
+          </label>
+          <small>{tr('botDefaults.codexAuthSyncHelp')}</small>
+          <StatusSpan status={authStatus} attr={{ 'data-codex-auth-sync-status': '' }} />
+        </div>
+      ) : null}
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
       </div>

@@ -3504,6 +3504,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
+  let codexAuthSync: 'shared' | 'isolated' = 'shared';
+  try { if (getBot(cachedLarkAppId).config.codexAuthSync === 'isolated') codexAuthSync = 'isolated'; } catch { /* default shared */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -3627,6 +3629,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    codexAuthSync,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
@@ -4508,6 +4511,22 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
+});
+
+// Codex credential sync policy for sandbox-redirected per-bot CODEX_HOME.
+ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { codexAuthSync?: unknown };
+  try { body = await readJsonBody<{ codexAuthSync?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  if (body.codexAuthSync !== 'shared' && body.codexAuthSync !== 'isolated') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_codex_auth_sync' });
+  }
+  const spec = findConfigField('codexAuthSync');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+  const r = await applyConfigField(cachedLarkAppId, spec, body.codexAuthSync);
+  if (!r.ok) return jsonRes(res, 400, r);
+  jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
 });
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
