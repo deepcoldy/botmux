@@ -159,7 +159,12 @@ const BUSY_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
  * Invoked as: sh -c SHIM <name> <cgroup.procs path> <bin> <args...>
  * ($0 = name, $1 = procs path; after `shift`, "$@" = bin + args.)
  */
-export const MOJO_CGROUP_ENROLL_SHIM = 'echo "$$" > "$1" || exit 97; shift; exec -- "$@"';
+// NOTE: `exec "$@"` NOT `exec -- "$@"`. dash (the Linux /bin/sh) treats `exec --`
+// as an attempt to exec a command literally named `--` and fails, so the shim
+// would never reach mojo. The `--` guard is unneeded anyway: the bin is always a
+// resolved ABSOLUTE path (never starts with `-`), so there is no option-injection
+// to guard against.
+export const MOJO_CGROUP_ENROLL_SHIM = 'echo "$$" > "$1" || exit 97; shift; exec "$@"';
 export const MOJO_ENROLL_FAILED_EXIT = 97;
 
 /**
