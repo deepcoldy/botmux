@@ -2455,9 +2455,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // recalled, fresh card posted at the thread bottom), AND send the
           // "✅ 会话已恢复…" text follow-up — both are wanted.
           // Ordering is load-bearing for two reasons:
-          //   1) ACK the callback FIRST (return {}), THEN post/delete in the
-          //      background — deleting the just-clicked card inside the callback
-          //      response races it and triggers client "code: 300000".
+          //   1) ACK the callback FIRST (bare `return` → empty ACK), THEN
+          //      post/delete in the background — deleting the just-clicked card
+          //      inside the callback response races it and triggers client
+          //      "code: 300000".
           //   2) POST the fresh card BEFORE deleting the old one, so the thread
           //      never briefly shows zero cards (same invariant as park→recall).
           // Skip in private-card mode (clicked card may be an ephemeral snapshot).
@@ -2480,7 +2481,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
                 logger.warn(`[${targetSessionId.substring(0, 8)}] resume card repost failed: ${err instanceof Error ? err.message : String(err)}`);
               }
             })();
-            return {}; // fast empty ACK; card work happens in background
+            // Bare `return` (→ undefined) so the dispatcher's shaper emits a
+            // genuine empty ACK `{}`. Returning `{}` here would instead be
+            // truthy and get wrapped as `{card:{type:raw,data:{}}}` — an
+            // in-place patch with an empty card body (invalid), racing the
+            // background deleteMessage above. Matches every other empty-ACK in
+            // this handler.
+            return; // fast empty ACK; card work happens in background
           }
           await deliverEphemeralOrReply(result.ds, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
