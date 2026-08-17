@@ -87,6 +87,7 @@ import {
 } from './dashboard/terminal-control.js';
 import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
+import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
   CLI_SELECT_OPTIONS,
@@ -3370,6 +3371,17 @@ const server = createServer(async (req, res) => {
       res.end();
       return;
     }
+
+    // Self-service diagnostics for the same phone that cannot render the
+    // Workbench terminal. Desktop browsers and Chromium's mobile emulation both
+    // succeed, so the failing device has to report its own conditions: which
+    // build it cached, whether its cookie rides along, whether the terminal's
+    // HTTP and WebSocket hops are reachable from its network. Zero external
+    // resources and no SPA bundle — it must open precisely when the SPA cannot,
+    // which is also why it is allow-listed beside the static shell in
+    // `decideDashboardAuth`. It probes only the visitor's own reachability and
+    // echoes no token or secret.
+    if (handleWorkbenchDoctor(req, res, url)) return;
 
     // Installable Workbench: Feishu has no way to pin a custom app into its
     // mobile tab bar, so the closest thing to a permanent entry is the phone's

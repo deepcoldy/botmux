@@ -469,6 +469,13 @@ export function decideDashboardAuth(opts: {
       // gated response silently disables "add to home screen". It names icons
       // and a start URL — no session data.
       pathname === '/workbench.webmanifest' ||
+      // Self-service diagnostics page. It is needed exactly when a device
+      // cannot authenticate or cannot load the SPA, so gating it behind the
+      // token would lock it out of its only job. The page is a static shell
+      // like the others: it reads no server state and renders no session data,
+      // and every probe it runs is the visitor's own browser calling the same
+      // gated APIs under the visitor's own (possibly absent) credentials.
+      pathname === '/workbench-doctor' ||
       pathname.startsWith('/assets/') ||
       pathname.startsWith('/game/')
     );
