@@ -16,7 +16,7 @@
     "src/dashboard/preview-guard-page.ts + preview-proxy.ts + preview-interaction.ts",
     "src/core/preview-port-owner.ts (real listening-port ownership proof)"
   ],
-  "head": "b424dd8c0c9863f598d3f248d3bc2a088adc75ae",
+  "head": "60074da93dee399711791eaf35678d60905225d2",
   "worktreeDirty": true,
   "headNote": "head 是跑这一轮时的 HEAD；worktreeDirty=true 表示工作区还有未提交改动（证据先于提交产生时的常态）",
   "browser": "local executable (/home/wanglingfeng.linvon/.cache/ui-check/chrome-headless-shell-linux64/chrome-headless-shell)",

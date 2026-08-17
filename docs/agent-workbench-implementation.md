@@ -90,6 +90,7 @@ BOTMUX_DASHBOARD_FEISHU_H5_ALLOWED_OPEN_IDS=ou_allowed_a,ou_allowed_b
 BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH=/auth/feishu
 BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS=1800000
 BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE=true
+BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS=1
 BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS=300000
 BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH=/var/lib/botmux/audit/dashboard-control.ndjson
 BOTMUX_PUBLIC_URL=https://<dashboard-host>
@@ -104,6 +105,7 @@ BOTMUX_PUBLIC_URL=https://<dashboard-host>
 | BOTMUX_DASHBOARD_FEISHU_H5_ENTRY_PATH | /auth/feishu | 仅允许安全的绝对 path，不接受 query token。 |
 | BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS | 30 分钟；1 分钟至 24 小时 | 固定有效期，不滑动续期。 |
 | BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE | HTTPS public URL 时自动 true | TLS 在外层终止时应显式设为 true。 |
+| BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS | 0；仅接受 1-8 的整数，其余一律按 0 处理 | 前面真实有几层反代。限流分桶取客户端地址用它：0 表示压根不读 `x-forwarded-for`，直接按 socket 直连地址分桶；配 1 就只认那层代理自己写下的一跳，客户端在左边伪造多少跳都落不进桶。配大了会回落到实际存在的最远一跳，最差也就是直连地址。工作台票据兑换端点共用同一份取值。 |
 | BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS | 5 分钟；10 秒至 15 分钟 | 单次控制租约，受 H5 session 更早到期时间约束。 |
 | BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH | ~/.botmux/audit/dashboard-control.ndjson | 0700 目录、0600 append-only NDJSON。 |
 
@@ -236,14 +238,14 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 
 | 检查 | 结果 |
 |---|---|
-| pnpm build | 通过；domain audit、TypeScript、scripts 类型检查（`pnpm typecheck:scripts`，安全批 3 起接进构建链）、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：31f9b4146834（安全批 3 验收构建）。 |
+| pnpm build | 通过；domain audit、TypeScript、scripts 类型检查（`pnpm typecheck:scripts`，安全批 3 起接进构建链）、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：da7294e3fa31（安全批 4 验收构建）。 |
 | pnpm exec tsc --noEmit / git diff --check | 通过。 |
 | Workbench 直接边界 | 16 files、262 tests 通过，覆盖 Workbench UI/模型/存储/路由、H5 auth、登录 UI、terminal control、preview 注册/代理与公开投影脱敏。 |
 | 纯模型 runner | 通过：320 sessions、22 virtual items；覆盖 rail-collapsed、focus、chat-jump、mobile-stack。 |
 | 组件 runner | 通过：21 component checks、14 rendered session options。 |
-| pnpm test 全量 unit project | 978 files / 15,954 tests 通过，1 file / 16 tests 按仓库既有条件跳过（整文件跳过的是 `test/fs-policy-seatbelt.e2e.test.ts`，属 macOS seatbelt 专用）；0 failed（安全批 3 验收轮记录）。 |
+| pnpm test 全量 unit project | 979 files / 15,987 tests 通过，1 file / 16 tests 按仓库既有条件跳过（整文件跳过的是 `test/fs-policy-seatbelt.e2e.test.ts`，属 macOS seatbelt 专用；其余 10 条散落在 dashboard-ipc、tmux-backend-env、zmx-backend-helpers、resource-monitor-darwin 四个文件里按平台条件跳过）；0 failed（安全批 4 验收轮记录）。 |
 
-安全批 1 至安全批 3 各验收轮的全量命令均为 `npx vitest run --project unit`（默认并行），全绿。安全批 3 轮次里 `test/workflow-v3-ephemeral-pool.test.ts`（22 例）与 `test/skill-doctor-command.test.ts`（3 例）都实测通过，与前两批结论一致。此前轮次曾用 `pnpm test -- --maxWorkers=1 --no-file-parallelism` 串行执行：由于验证本身运行在活跃 Botmux workflow 内，进程发现类测试使用清空 BOTMUX 上下文的环境、私有 PID `/proc` 和独立 `TMUX_TMPDIR`，避免把外层同 UID worker 误当成 fixture；串行执行也消除了 `/proc` 瞬态并发噪声。两种跑法都属测试进程隔离，不会修改或重启 live daemon。
+安全批 1 至安全批 4 各验收轮的全量命令均为 `npx vitest run --project unit`（默认并行），全绿。安全批 4 轮次里 `test/workflow-v3-ephemeral-pool.test.ts`（22 例）与 `test/skill-doctor-command.test.ts`（3 例）都实测通过，与前三批结论一致——这两处此前被反复怀疑不稳定，四轮实测都没有复现。相对安全批 3 的增量为 +1 file / +33 tests，来源是安全批 4 新增的 `test/session-group-birth-quota.test.ts`（5 例）以及 `dashboard-h5-auth`（32 例）、`workbench-ticket`（34 例）、`overview-card`（35 例）三个既有文件里补的用例。此前轮次曾用 `pnpm test -- --maxWorkers=1 --no-file-parallelism` 串行执行：由于验证本身运行在活跃 Botmux workflow 内，进程发现类测试使用清空 BOTMUX 上下文的环境、私有 PID `/proc` 和独立 `TMUX_TMPDIR`，避免把外层同 UID worker 误当成 fixture；串行执行也消除了 `/proc` 瞬态并发噪声。两种跑法都属测试进程隔离，不会修改或重启 live daemon。
 
 ### 8.2 本地真实浏览器场景（component harness）
 
