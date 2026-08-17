@@ -12393,6 +12393,8 @@ async function spawnCli(
     larkAppId: cfg.larkAppId,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
+    // dsh runner only; other adapters ignore the field.
+    turnTimeoutMs: cfg.turnTimeoutMs,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless

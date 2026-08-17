@@ -241,6 +241,9 @@ async function runNodeImpl(
     cliId: req.botSnapshot.cliId,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     model: req.botSnapshot.model,
+    ...(typeof req.botSnapshot.turnTimeoutMs === 'number'
+      ? { turnTimeoutMs: req.botSnapshot.turnTimeoutMs }
+      : {}),
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,

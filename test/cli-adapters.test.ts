@@ -586,6 +586,18 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).not.toContain('--model');
   });
 
+  it('forwards a per-bot turn timeout to the runner', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 30 * 60 * 1000 });
+    expect(args).toContain('--turn-timeout-ms');
+    expect(args).toContain(String(30 * 60 * 1000));
+  });
+
+  it('omits --turn-timeout-ms when unset or non-positive', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--turn-timeout-ms');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 0 })).not.toContain('--turn-timeout-ms');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: -5 })).not.toContain('--turn-timeout-ms');
+  });
+
   it('has no portable copy-paste resume command', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
   });

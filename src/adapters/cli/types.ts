@@ -131,6 +131,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Optional per-bot turn timeout in milliseconds for runner-based adapters
+     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  adapters without a runner turn timeout ignore the field. */
+    turnTimeoutMs?: number;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
      *  Only codex/codex-app adapters honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';

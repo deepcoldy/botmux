@@ -1249,6 +1249,14 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /**
+   * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
+   * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
+   * default (`DEFAULT_TURN_TIMEOUT_MS` in dsh-runner.ts). Positive integer
+   * only; unset/≤0/non-integer → runner default. Only affects the `dsh` CLI
+   * adapter; other adapters ignore the field.
+   */
+  turnTimeoutMs?: number;
   /** Default Codex reasoning effort for newly created sessions. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
@@ -2843,6 +2851,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
+        : undefined,
+      // Positive integer only; ≤0 / non-int / absent → undefined (= runner default).
+      turnTimeoutMs: typeof entry.turnTimeoutMs === 'number'
+        && Number.isInteger(entry.turnTimeoutMs) && entry.turnTimeoutMs > 0
+        ? entry.turnTimeoutMs
         : undefined,
       reasoningEffort: isCodexReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)

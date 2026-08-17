@@ -157,6 +157,8 @@ export interface BotSnapshot {
   cliId: CliId;
   cliPathOverride?: string;
   model?: string;
+  /** Frozen per-bot dsh runner turn timeout (ms); undefined → runner default. */
+  turnTimeoutMs?: number;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. */
   sandbox?: boolean;
