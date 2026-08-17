@@ -17,7 +17,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  // maxRetries: async pool teardown (pty.log / attempt fence writes) can race
+  // the recursive delete's directory walk, surfacing as a spurious ENOTEMPTY
+  // on loaded CI runners. Node retries exactly this error class with backoff.
+  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe('v3 ephemeral pool', () => {
