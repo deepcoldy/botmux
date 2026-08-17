@@ -118,7 +118,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -132,7 +132,7 @@ import {
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
-import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
+import { spawnDetachedRestart, globalInstallUpdateLockTarget } from './core/maintenance.js';
 import {
   detectGlobalInstallManager,
   formatGlobalInstallCommand,
@@ -157,7 +157,10 @@ import {
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
 import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
-import { spawn } from 'node:child_process';
+// Host children the dashboard forks (start/stop-bot, global install). They live
+// in their own module because every one of them must run on a REDACTED env —
+// see dashboard/managed-spawn.ts.
+import { runGlobalInstall, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -641,99 +644,6 @@ function resolveScheduleOwner(id: string): string | undefined {
   const primary = registry.list().find(d => d.botIndex === 0);
   return primary?.larkAppId;
 }
-/**
- * Bring a freshly-onboarded bot online without a fleet-wide restart by spawning
- * `botmux start-bot <appId> --json` (see cli.ts:ensureBotDaemonStarted). The new
- * daemon is forked+supervised by pm2 (reparented off this process), self-registers
- * and opens its Feishu WSClient, then publishes a descriptor the DaemonRegistry
- * auto-discovers — so no dashboard reload is needed either. Runs `botmux` on the
- * SAME host as the dashboard (shared pm2 home / bots.json — the documented
- * dashboard↔daemon co-location assumption). Resolves best-effort; the caller
- * falls back to the restart hint on failure.
- */
-function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    let out = '';
-    let err = '';
-    let settled = false;
-    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
-    try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'start-bot', appId, '--json'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-        // Run from HOME, not the dashboard's cwd (pm2 `cwd: PKG_ROOT`): a global
-        // package update replaces that dir, so a still-running dashboard would spawn
-        // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
-        cwd: globalInstallUpdateCwd(),
-      });
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        done({ ok: false, message: 'start-bot 超时（30s）' });
-      }, 30_000);
-      timer.unref?.();
-      child.stdout?.on('data', (d) => { out += String(d); });
-      child.stderr?.on('data', (d) => { err += String(d); });
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        // `start-bot --json` prints a single StartBotLiveResult object; prefer its
-        // own message/processName over the raw exit code.
-        let parsed: any;
-        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON → fall through */ }
-        if (code === 0) {
-          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已上线` : undefined });
-        } else {
-          done({ ok: false, message: parsed?.message || err.trim() || `start-bot 退出码 ${code}` });
-        }
-      });
-    } catch (e) {
-      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-    }
-  });
-}
-
-function spawnStopBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    let out = '';
-    let err = '';
-    let settled = false;
-    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
-    try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'stop-bot', appId, '--json'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-        cwd: globalInstallUpdateCwd(),
-      });
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        done({ ok: false, message: 'stop-bot 超时（30s）' });
-      }, 30_000);
-      timer.unref?.();
-      child.stdout?.on('data', (d) => { out += String(d); });
-      child.stderr?.on('data', (d) => { err += String(d); });
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        let parsed: any;
-        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON */ }
-        if (code === 0) {
-          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已停止` : undefined });
-        } else {
-          done({ ok: false, message: parsed?.message || err.trim() || `stop-bot 退出码 ${code}` });
-        }
-      });
-    } catch (e) {
-      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-    }
-  });
-}
-
 const botOnboarding = new BotOnboardingManager({
   botsJsonPath: BOTS_JSON_PATH,
   stopBotLive: spawnStopBotLive,
@@ -1594,38 +1504,6 @@ function currentInstalledVersion(): string {
   if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
   const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
   return version === '0.0.0' ? resolveCurrentVersion() : version;
-}
-
-/**
- * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
- * the event loop (async spawn, not execSync — the dashboard must keep serving
- * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
- * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
- * a fixed literal — no shell interpolation of untrusted input.
- */
-function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn(plan.command, plan.args, {
-      cwd: globalInstallUpdateCwd(),
-      env: { ...process.env, ...plan.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd / bun.exe
-    });
-    let tail = '';
-    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
-    child.stdout?.on('data', capture);
-    child.stderr?.on('data', capture);
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`${plan.manager} install timed out after 180s`));
-    }, 180_000);
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${plan.manager} exited ${code}: ${tail.trim().slice(-500)}`));
-    });
-  });
 }
 
 /**

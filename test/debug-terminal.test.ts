@@ -142,3 +142,83 @@ describe('debug-terminal lifecycle', () => {
     expect((await fetch(`${harness.base}/debug-terminal/${id}`)).status).toBe(404);
   });
 });
+
+describe('debug-terminal shell environment', () => {
+  /**
+   * The debug shell runs INSIDE the dashboard process, which is the machine's
+   * only legitimate holder of the Feishu H5 login family
+   * (BOTMUX_DASHBOARD_FEISHU_H5_*, APP_SECRET included — it can mint
+   * app_access_token for the Dashboard's login app). It used to inherit
+   * process.env verbatim, so a single `env` in this terminal printed the
+   * secret, and so did every process started from it. The shell must get the
+   * same redacted env a session's CLI child gets.
+   *
+   * Real bash over the real WS transport: assert on what the shell can
+   * actually read, not on how the env object was built.
+   */
+  async function readShellVar(name: string): Promise<string> {
+    harness = await startHarness();
+    const { id } = (await post(harness!.base, '/api/debug-terminal', undefined, { workingDir: '/tmp' })).json;
+    const ws = new WebSocket(`${harness!.wsBase}/debug-terminal/${id}/ws`, {
+      headers: { cookie: `botmux_dashboard_token=${TOKEN}` },
+    });
+    await new Promise<void>((resolve, reject) => {
+      ws.on('open', () => resolve());
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('ws open timeout')), 5000);
+    });
+    // Marker-delimited so the echoed command line itself can't be mistaken for
+    // the answer: only the shell's OWN expansion lands between the markers.
+    const probe = `printf 'PROBE<%s>END\\n' "\${${name}:-ABSENT}"\r`;
+    return await new Promise<string>((resolve, reject) => {
+      let buf = '';
+      const timer = setTimeout(() => reject(new Error(`no probe output; saw: ${buf.slice(-200)}`)), 15_000);
+      ws.on('message', (data) => {
+        buf += String(data);
+        // Skip the terminal echo of the command (it contains "PROBE<%s>END").
+        const m = buf.match(/PROBE<([^>]*)>END/g)?.filter(s => !s.includes('%s'));
+        if (m?.length) {
+          clearTimeout(timer);
+          ws.close();
+          resolve(m[0].replace(/^PROBE</, '').replace(/>END$/, ''));
+        }
+      });
+      ws.on('error', (e) => { clearTimeout(timer); reject(e); });
+      // 与前端同协议：{type:'input', data}
+      setTimeout(() => ws.send(JSON.stringify({ type: 'input', data: probe })), 400);
+    });
+  }
+
+  it('the bash session cannot read the Dashboard H5 app secret', async () => {
+    process.env.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET = 'h5-secret-must-not-leak';
+    try {
+      expect(await readShellVar('BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET')).toBe('ABSENT');
+    } finally {
+      delete process.env.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET;
+    }
+  });
+
+  it('the bash session cannot read the bot IM app secret either', async () => {
+    // Same boundary, different family: the debug shell is a repro環境 for a
+    // session's CLI command, so it must see what that CLI would see.
+    process.env.LARK_APP_SECRET = 'lark-secret-must-not-leak';
+    try {
+      expect(await readShellVar('LARK_APP_SECRET')).toBe('ABSENT');
+    } finally {
+      delete process.env.LARK_APP_SECRET;
+    }
+  });
+
+  it('still inherits the ordinary environment — redaction removes only the deny list', async () => {
+    // Redaction must not gut the shell: the whole point of this terminal is
+    // running `botmux` / CLI repro commands. (PATH itself is not asserted here
+    // — `bash -l` re-sources the login profiles and rebuilds it.)
+    process.env.BOTMUX_DEBUG_TERMINAL_KEEPER = 'inherited-ok';
+    try {
+      expect(await readShellVar('BOTMUX_DEBUG_TERMINAL_KEEPER')).toBe('inherited-ok');
+      expect(await readShellVar('BOTMUX_DEBUG_TERMINAL')).toBe('1');
+    } finally {
+      delete process.env.BOTMUX_DEBUG_TERMINAL_KEEPER;
+    }
+  });
+});

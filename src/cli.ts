@@ -96,7 +96,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { pm2CallerEnv } from './cli/pm2-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -356,28 +356,11 @@ function pm2Bin(): string {
   return 'pm2';
 }
 
-/** Env for pm2 invocations with an isolated PM2_HOME. */
+/** Env for pm2 invocations with an isolated PM2_HOME. The scrub set (session
+ *  CLI homes, Claude/workflow markers, Dashboard H5 credentials) lives in
+ *  cli/pm2-env.ts so it stays assertable in a test. */
 function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, PM2_HOME: home };
-  // pm2 persists the caller's env into every managed app (and into dump.pm2
-  // for resurrect), so a `botmux start/restart` invoked from ANY process that
-  // carries a session-level CLI home pointer — most commonly a bot's own
-  // session during self-upgrade, whose env holds its injected
-  // CLAUDE_CONFIG_DIR — would poison ALL workers, making every non-isolated
-  // bot read/write a sibling bot's home. Strip at this boundary so the daemon
-  // stays session-agnostic; daemon/worker boot scrub the same keys against
-  // stale dumps (see SESSION_CLI_HOME_ENV_KEYS for the full story, including
-  // why GROK_HOME is exempt and why deleting beats pinning a default).
-  scrubSessionCliHomeEnv(env);
-  // Claude session markers ride the same pm2 env-persistence vector; baked in
-  // they eventually flip transcript saving off fleet-wide once the tmux server
-  // respawns from a poisoned daemon (see CLAUDE_SESSION_MARKER_ENV_KEYS).
-  scrubClaudeSessionMarkerEnv(env);
-  // Workflow/goal markers identify one short-lived node worker. Persisting
-  // them in PM2 would make every daemon — and then every ordinary chat worker
-  // it forks — run in workflow mode after a restart initiated from that node.
-  scrubWorkflowWorkerEnv(env);
-  return env;
+  return pm2CallerEnv(process.env, home);
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {

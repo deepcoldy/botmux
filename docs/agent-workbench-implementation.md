@@ -103,6 +103,8 @@ BOTMUX_PUBLIC_URL=https://<dashboard-host>
 
 本次只验证配置解析与模拟链路，没有把这些值写入运行中的服务。
 
+Dashboard 进程读 `~/.botmux/.env` 时只按**白名单**取键（H5 族 + 上表这些 dashboard/daemon 设置，见 `src/utils/dashboard-env.ts`）：同一份文件里其它凭据（历史单 bot 的 `LARK_APP_SECRET`、GitHub token、模型 API key 等）不会进入 dashboard 的 `process.env`，因而也进不了它 fork 出来的调试终端、`start-bot/stop-bot`、全局更新安装与插件安装。Bot daemon 仍按原样整份加载，不受影响。
+
 ## 4. 接口契约
 
 ### 4.1 H5 登录

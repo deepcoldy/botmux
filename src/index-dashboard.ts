@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 // PM2 entry point for the `botmux-dashboard` app (see ecosystemConfig in
-// cli.ts). It exists so the dashboard can dotenv-load ~/.botmux/.env ITSELF —
+// cli.ts). It exists so the dashboard can load ~/.botmux/.env ITSELF —
 // in particular the Feishu H5 login family (BOTMUX_DASHBOARD_FEISHU_H5_*,
 // APP_SECRET included), which is deliberately NOT baked into the shared PM2 env
 // block (DAEMON_ENV_KEYS): baked there, the secret would reach every bot daemon
 // and persist on disk in ~/.botmux/ecosystem.config.json.
-import { config as dotenvConfig } from 'dotenv';
+//
+// The load is ALLOWLISTED (utils/dashboard-env.ts), not a wholesale dotenv:
+// this process forks children that inherit its environment, so only keys with a
+// named dashboard consumer are taken from the file.
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { loadDashboardEnvFile } from './utils/dashboard-env.js';
 
 // Same pipe topology as the daemon: under pm2 the dashboard's stdout/stderr are
 // pipes to the God daemon (→ dashboard-out/err.log). A broken pipe would
@@ -20,11 +24,18 @@ installStdioEpipeGuard();
 
 // Load ~/.botmux/.env (same path logic as index-daemon.ts). This is the
 // dashboard's ONLY channel for the H5 credential family and the fallback for
-// any dashboard setting not baked into the PM2 env block. Note dotenv never
-// overrides variables that are already set, so the baked DAEMON_ENV_KEYS
-// snapshot keeps its deterministic resolveDaemonEnv semantics.
+// any dashboard setting not baked into the PM2 env block. Values already set
+// still win, so the baked DAEMON_ENV_KEYS snapshot keeps its deterministic
+// resolveDaemonEnv semantics.
+//
+// ALLOWLISTED, not wholesale (see utils/dashboard-env.ts): that same file
+// commonly holds credentials with no dashboard consumer — legacy
+// LARK_APP_SECRET, GITHUB_TOKEN, model API keys — and this process forks debug
+// shells, start/stop-bot children, a global npm/pnpm/bun install and herdr
+// plugin installs, all of which inherit process.env. Only the keys the
+// dashboard actually reads are merged in; the rest never enters the process.
 const globalEnv = join(homedir(), '.botmux', '.env');
-dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
+loadDashboardEnvFile(existsSync(globalEnv) ? globalEnv : '.env');
 
 // The dashboard is never a session, but it is exposed to the same poisoning
 // vector as the daemons: pm2 persists the env of whichever process ran `botmux

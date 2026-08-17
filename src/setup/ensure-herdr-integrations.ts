@@ -23,6 +23,23 @@ import type { CliId } from '../adapters/cli/types.js';
 import { resolveHerdrTraexPluginConfig } from '../config.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { redactChildEnv } from '../utils/child-env.js';
+
+/**
+ * Env for every `herdr` invocation in this file.
+ *
+ * `plugin install` clones an operator-supplied repo and then runs that repo's
+ * own install action — third-party code, spawned as a grandchild of whoever
+ * called us. Two callers exist: the setup wizard, and the DASHBOARD's
+ * settings-write handler (installTraexPluginNow runs live in the dashboard
+ * process, which is the machine's only holder of the Feishu H5 login family,
+ * APP_SECRET included). Neither herdr nor a plugin has any use for botmux's
+ * credentials, so the whole redaction set applies — the same boundary a session
+ * CLI child gets, so nothing here is a new or narrower rule.
+ */
+export function herdrChildEnv(): NodeJS.ProcessEnv {
+  return redactChildEnv(process.env);
+}
 
 /**
  * Map botmux CliId → herdr integration name. CLIs with no upstream
@@ -88,14 +105,14 @@ function writeTraexMarker(m: TraexMarker): void {
  *  --help` exits non-zero). Returns the current version for the operator hint. */
 function probeHerdrVersion(): string | undefined {
   try {
-    const out = execSync('herdr --version', { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, encoding: 'utf-8' });
+    const out = execSync('herdr --version', { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, encoding: 'utf-8', env: herdrChildEnv() });
     const m = out.match(/(\d+\.\d+\.\d+)/);
     return m ? m[1] : out.trim() || undefined;
   } catch { return undefined; }
 }
 
 function herdrSupportsPlugins(): { ok: true } | { ok: false; version?: string } {
-  const probe = spawnSync('herdr', ['plugin', '--help'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, encoding: 'utf-8' });
+  const probe = spawnSync('herdr', ['plugin', '--help'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, encoding: 'utf-8', env: herdrChildEnv() });
   if (probe.status === 0) return { ok: true };
   return { ok: false, version: probeHerdrVersion() };
 }
@@ -171,6 +188,7 @@ function listInstalledIntegrations(): Set<string> | undefined {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 5000,
+      env: herdrChildEnv(),
     });
     const installed = new Set<string>();
     for (const line of out.split('\n')) {
@@ -195,6 +213,7 @@ function spawnHerdr(args: string[], timeout = 60_000): { ok: true; stdout: strin
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout,
     encoding: 'utf-8',
+    env: herdrChildEnv(),
   });
   const stderr = (result.stderr ?? '').toString().trim();
   const stdout = (result.stdout ?? '').toString().trim();
@@ -237,7 +256,7 @@ export function spawnHerdrAsync(args: string[], timeout = 60_000): Promise<{ ok:
     // WHOLE group (herdr + any git/npm/install-script it spawned) rather than just the
     // direct child — which could otherwise keep writing the plugin dir / ~/.trae in the
     // background and race a retry. POSIX only; Windows would need a different teardown.
-    const child = spawn('herdr', args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const child = spawn('herdr', args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: herdrChildEnv() });
     timer = setTimeout(() => {
       timedOut = true;
       try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }

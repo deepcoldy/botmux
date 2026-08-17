@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
+import { stripDashboardH5Env } from '../../utils/child-env.js';
 
 const require = createRequire(import.meta.url);
 const BOTMUX_HOME = join(homedir(), '.botmux');
@@ -36,6 +37,13 @@ function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   // stripPm2GracefulExitMarker.
   const inherited = stripPm2GracefulExitMarker(process.env);
   delete inherited.kill_timeout;
+  // The dashboard starts/stops plugin services in-process, and it is the one
+  // machine-wide holder of the Feishu H5 login family (BOTMUX_DASHBOARD_FEISHU_H5_*,
+  // APP_SECRET included). A raw process.env copy would hand that credential to
+  // an arbitrary third-party plugin service AND persist it in the plugin PM2
+  // home's metadata/dump. No plugin consumes it — the dashboard is the only
+  // consumer in the fleet.
+  stripDashboardH5Env(inherited);
   return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
 }
 
