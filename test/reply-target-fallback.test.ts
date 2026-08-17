@@ -21,6 +21,7 @@ import {
   frozenReplyContextForTurn,
   isSubstituteTurn,
   pickTurnReplyTarget,
+  rehomeReplyTargetState,
   resolveInboundReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
@@ -111,6 +112,84 @@ describe('fallbackTurnId × resolveSessionReplyTarget (the leak fix)', () => {
     });
     const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds as DaemonSession, undefined));
     expect(target).toEqual({ mode: 'quote', rootMessageId: 'om_trigger' });
+  });
+});
+
+describe('rehomeReplyTargetState', () => {
+  it('removes source-topic routing authority while preserving buffered-turn attribution', () => {
+    const ds = makeDs({
+      scope: 'thread',
+      chatId: 'oc_target',
+      currentReplyTarget: {
+        rootMessageId: 'om_source_topic',
+        turnId: 'turn-source',
+        updatedAt: NOW,
+        quoteOnly: true,
+      },
+      replyThreadAliases: {
+        om_source_topic: { createdAt: NOW, lastUsedAt: NOW },
+      },
+      streamCardReplyTargetKey: 'thread:om_source_topic',
+    });
+    ds.session.chatId = 'oc_target';
+    ds.session.rootMessageId = 'om_target_topic';
+    ds.session.scope = 'thread';
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.replyThreadAliases = ds.replyThreadAliases;
+    ds.session.streamCardReplyTargetKey = 'thread:om_source_topic';
+    ds.session.quoteTargetId = 'om_source_message';
+    ds.session.quoteTargetSenderOpenId = 'ou_source';
+    ds.session.quoteTargetSenderIsBot = false;
+    ds.session.turnReplyContexts = {
+      'turn-source': {
+        target: { mode: 'thread', rootMessageId: 'om_source_topic' },
+        quoteTargetId: 'om_source_message',
+        replyTargetSenderOpenId: 'ou_source',
+        replyTargetSenderIsBot: false,
+      },
+    };
+    ds.session.replyTargets = {
+      'turn-source': {
+        rootMessageId: 'om_source_topic',
+        updatedAt: NOW,
+        quoteOnly: true,
+        substitute: true,
+        senderOpenId: 'ou_source',
+        participants: [{ openId: 'ou_source', isBot: false }],
+        participantsIncomplete: true,
+      },
+    };
+
+    rehomeReplyTargetState(ds as DaemonSession);
+
+    expect(ds.currentReplyTarget).toBeUndefined();
+    expect(ds.replyThreadAliases).toBeUndefined();
+    expect(ds.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(ds.session.replyThreadAliases).toBeUndefined();
+    expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.quoteTargetId).toBeUndefined();
+    expect(ds.session.quoteTargetSenderOpenId).toBeUndefined();
+    expect(ds.session.quoteTargetSenderIsBot).toBeUndefined();
+    expect(ds.session.turnReplyContexts).toEqual({
+      'turn-source': {
+        target: { mode: 'thread', rootMessageId: 'om_target_topic' },
+        replyTargetSenderOpenId: 'ou_source',
+        replyTargetSenderIsBot: false,
+      },
+    });
+    expect(ds.session.replyTargets).toEqual({
+      'turn-source': {
+        updatedAt: NOW,
+        senderOpenId: 'ou_source',
+        participants: [{ openId: 'ou_source', isBot: false }],
+        participantsIncomplete: true,
+      },
+    });
+    expect(frozenReplyContextForTurn(ds as DaemonSession, 'turn-source').target).toEqual({
+      mode: 'thread',
+      rootMessageId: 'om_target_topic',
+    });
   });
 });
 

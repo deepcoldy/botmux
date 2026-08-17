@@ -2634,8 +2634,23 @@ describe('handleCommand', () => {
       const ds = makeDaemonSession({
         pendingRepo: false,
         scope: 'chat',
+        currentReplyTarget: {
+          rootMessageId: 'om_old_reply_topic',
+          turnId: 'turn-old',
+          updatedAt: new Date().toISOString(),
+        },
+        replyThreadAliases: {
+          om_old_reply_topic: {
+            createdAt: new Date().toISOString(),
+            lastUsedAt: new Date().toISOString(),
+          },
+        },
+        streamCardReplyTargetKey: 'thread:om_old_reply_topic',
         session: makeSession({ scope: 'chat', rootMessageId: originalRoot }),
       });
+      ds.session.currentReplyTarget = ds.currentReplyTarget;
+      ds.session.replyThreadAliases = ds.replyThreadAliases;
+      ds.session.streamCardReplyTargetKey = 'thread:om_old_reply_topic';
       const deps = makeDeps(ds);
       deps.activeSessions.clear();
       deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
@@ -2652,6 +2667,12 @@ describe('handleCommand', () => {
       );
       expect(ds.session.scope).toBe('chat');
       expect(ds.session.rootMessageId).toBe(originalRoot);
+      expect(ds.currentReplyTarget).toBeUndefined();
+      expect(ds.replyThreadAliases).toBeUndefined();
+      expect(ds.streamCardReplyTargetKey).toBeUndefined();
+      expect(ds.session.currentReplyTarget).toBeUndefined();
+      expect(ds.session.replyThreadAliases).toBeUndefined();
+      expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
       const persisted = vi.mocked(sessionStore.updateSession).mock.calls.find(
         ([s]) => s.sessionId === 'new-session-123',
       )?.[0];

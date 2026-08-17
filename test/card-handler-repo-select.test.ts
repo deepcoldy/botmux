@@ -1023,12 +1023,27 @@ describe('repo select card — plain switch', () => {
     const originalRoot = 'om_original_chat_start';
     const ds = makeDs({
       scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_old_reply_topic',
+        turnId: 'turn-old',
+        updatedAt: new Date().toISOString(),
+      },
+      replyThreadAliases: {
+        om_old_reply_topic: {
+          createdAt: new Date().toISOString(),
+          lastUsedAt: new Date().toISOString(),
+        },
+      },
+      streamCardReplyTargetKey: 'thread:om_old_reply_topic',
       session: {
         ...makeDs().session,
         scope: 'chat',
         rootMessageId: originalRoot,
       },
     });
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.replyThreadAliases = ds.replyThreadAliases;
+    ds.session.streamCardReplyTargetKey = 'thread:om_old_reply_topic';
     ds.session.workingDir = '/repos/gamma';
     const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
     const sessionReply = vi.fn(async () => 'om_reply');
@@ -1050,6 +1065,12 @@ describe('repo select card — plain switch', () => {
     expect(createSession).toHaveBeenCalledWith(CHAT_ID, originalRoot, 'beta (main)', 'group', 'chat');
     expect(ds.session.scope).toBe('chat');
     expect(ds.session.rootMessageId).toBe(originalRoot);
+    expect(ds.currentReplyTarget).toBeUndefined();
+    expect(ds.replyThreadAliases).toBeUndefined();
+    expect(ds.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(ds.session.replyThreadAliases).toBeUndefined();
+    expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
     const persisted = vi.mocked(updateSession).mock.calls.find(
       ([s]) => s.sessionId.startsWith('uuid-new-'),
     )?.[0];

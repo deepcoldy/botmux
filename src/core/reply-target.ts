@@ -442,3 +442,60 @@ export function syncReplyTargetState(ds: DaemonSession, s?: Session): void {
   ds.replyThreadAliases = source.replyThreadAliases;
   ds.currentReplyTarget = source.currentReplyTarget;
 }
+
+/**
+ * Rebind reply metadata after a live DaemonSession is moved to another Lark
+ * destination or assigned a replacement Session record. Source-chat message
+ * ids must never survive as routing authority in the new destination.
+ *
+ * Per-turn sender/participant attribution is retained for buffered inputs, but
+ * every visible target is rewritten to the session's new canonical surface.
+ * Callers detach/clear the old live card before invoking this helper, so its
+ * persisted destination key is cleared as part of the same lifecycle boundary.
+ */
+export function rehomeReplyTargetState(ds: DaemonSession): void {
+  const target = resolveInboundReplyTarget({
+    scope: ds.scope,
+    chatId: ds.chatId,
+    threadRootId: ds.session.rootMessageId,
+  });
+
+  if (ds.session.turnReplyContexts) {
+    const contexts: NonNullable<Session['turnReplyContexts']> = {};
+    for (const [turnId, context] of Object.entries(ds.session.turnReplyContexts)) {
+      contexts[turnId] = {
+        target,
+        ...(context.replyTargetSenderOpenId
+          ? { replyTargetSenderOpenId: context.replyTargetSenderOpenId }
+          : {}),
+        ...(context.replyTargetSenderIsBot !== undefined
+          ? { replyTargetSenderIsBot: context.replyTargetSenderIsBot }
+          : {}),
+      };
+    }
+    ds.session.turnReplyContexts = contexts;
+  }
+
+  if (ds.session.replyTargets) {
+    const targets: NonNullable<Session['replyTargets']> = {};
+    for (const [turnId, entry] of Object.entries(ds.session.replyTargets)) {
+      targets[turnId] = {
+        updatedAt: entry.updatedAt,
+        ...(entry.senderOpenId ? { senderOpenId: entry.senderOpenId } : {}),
+        ...(entry.participants?.length ? { participants: entry.participants } : {}),
+        ...(entry.participantsIncomplete ? { participantsIncomplete: true } : {}),
+      };
+    }
+    ds.session.replyTargets = targets;
+  }
+
+  ds.replyThreadAliases = undefined;
+  ds.currentReplyTarget = undefined;
+  ds.session.replyThreadAliases = undefined;
+  ds.session.currentReplyTarget = undefined;
+  ds.session.quoteTargetId = undefined;
+  ds.session.quoteTargetSenderOpenId = undefined;
+  ds.session.quoteTargetSenderIsBot = undefined;
+  ds.streamCardReplyTargetKey = undefined;
+  ds.session.streamCardReplyTargetKey = undefined;
+}
