@@ -10,55 +10,55 @@
   "scenarios": {
     "h5_success": {
       "ok": true,
-      "durationMs": 203
+      "durationMs": 206
     },
     "h5_failure": {
       "ok": true,
-      "durationMs": 55
+      "durationMs": 63
     },
     "h5_timeout": {
       "ok": true,
-      "durationMs": 81
+      "durationMs": 82
     },
     "h5_without_sdk": {
       "ok": true,
-      "durationMs": 52
+      "durationMs": 54
     },
     "workbench_route_switch_and_terminal_control": {
       "ok": true,
-      "durationMs": 448
+      "durationMs": 459
     },
     "workbench_failure": {
       "ok": true,
-      "durationMs": 252
+      "durationMs": 255
     },
     "unauthorized": {
       "ok": true,
-      "durationMs": 250
+      "durationMs": 248
     },
     "mobile_and_sidebar_layout": {
       "ok": true,
-      "durationMs": 383
+      "durationMs": 384
     },
     "mobile_preview_interaction": {
       "ok": true,
-      "durationMs": 451
+      "durationMs": 385
     },
     "preview_registration_and_proxy_boundaries": {
       "ok": true,
-      "durationMs": 131
+      "durationMs": 133
     },
     "preview_websocket": {
       "ok": true,
-      "durationMs": 129
+      "durationMs": 130
     },
     "terminal_disconnect_returns_readonly": {
       "ok": true,
-      "durationMs": 152
+      "durationMs": 154
     },
     "preview_idle_timeout_relocks": {
       "ok": true,
-      "durationMs": 108
+      "durationMs": 118
     }
   }
 }
