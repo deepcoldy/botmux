@@ -34,7 +34,7 @@ The terminal pane is keyed by sessionId and control intent. Control and Preview 
 
 - Rail: 300px default, 176–460px resize range, 40px collapsed width. Collapsing is the user's own choice at every desktop width (the toggle is offered at the ≥1280px full step); narrowing the window never force-collapses the list.
 - Workspace: at most one Terminal pane, opened from a row's 终端 (read-only) or 接管 (auto-takeover) button and closed from the workspace header; while it is closed the session list fills the page. There is no in-page split, layout-level badge, info drawer or chat widget.
-- Web preview: WebPane renders on the mobile 网页 page only. Desktop reaches the same /preview/<encoded-session-id>/ URL through the Dock's 网页链接 action or by opening it directly; the same-origin guard shell enforces the overlay there.
+- Web preview: WebPane renders on the mobile 网页 page only. Desktop reaches the same /preview/<encoded-session-id>/ URL through the Dock's 网页链接 action or by opening it directly; that URL is the dashboard-origin guard shell, which enforces the overlay and frames the agent app in an opaque-origin sandbox.
 - Desktop responsive steps full / rail-collapsed / focus / chat-jump derive at 1280/1120/960px and surface as data-responsive-step; with the single-terminal workspace and anchor-based chat they no longer change the page structure.
 - Below 620px: the mobile drill-down stack. The session list is the home level and always renders in full; tapping a row pushes a detail surface with 终端/网页/信息 segments (网页 only when the session has a registered preview) and an explicit ‹ 会话列表 back control.
 
@@ -50,7 +50,7 @@ Dock web_app AppLinks use mode=sidebar, min_width=350 and max_width=520. Full Wo
 
 Terminal starts READ ONLY (只读). 接管输入 calls the server-authoritative lease API; release, expiry or write-WebSocket disconnect returns it to read-only. Touch environments always use the read-only viewToken channel and hide the takeover control. The browser never receives a signed write grant.
 
-Web accepts only the exact /preview/<encoded-session-id>/ descriptor for the selected session. It starts 预览 (PREVIEW), enters 可交互 (INTERACTIVE) only after explicit 开启交互, sends bounded activity updates and fails closed to Preview, relocking after 15 idle minutes. The visible security notice says the overlay prevents accidental interaction but is not an application security sandbox.
+Web accepts only the exact /preview/<encoded-session-id>/ descriptor for the selected session. It starts 预览 (PREVIEW), enters 可交互 (INTERACTIVE) only after explicit 开启交互, sends bounded activity updates and fails closed to Preview, relocking after 15 idle minutes. The visible security notice says the overlay prevents accidental interaction but is not an application security sandbox — the actual trust boundary is the opaque origin the app is framed in, which is what keeps it away from the dashboard DOM, cookies and management APIs.
 
 ## Verification
 

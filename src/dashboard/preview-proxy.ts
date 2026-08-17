@@ -6,21 +6,46 @@ import {
 } from 'node:http';
 import type { Duplex } from 'node:stream';
 import {
-  PREVIEW_CONTENT_QUERY,
+  PREVIEW_CONTENT_SEGMENT,
   PREVIEW_ROUTE_PREFIX,
   isPreviewLoopbackHost,
   isPreviewPort,
   safeSessionPreviewTarget,
+  sessionPreviewContentPath,
   sessionPreviewPath,
   type SessionPreviewTarget,
 } from '../core/session-preview.js';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
+import { PREVIEW_CONTENT_CAPABILITY_PATTERN } from './preview-content-capability.js';
 import type { SessionPreviewResolution } from './preview-contract.js';
 
 /** Dev servers commonly cold-compile their first response for 3–30 seconds.
  * This bounds only the pre-header phase and is cleared once headers arrive. */
 export const PREVIEW_UPSTREAM_RESPONSE_TIMEOUT_MS = 45_000;
 const MAX_WEBSOCKET_REJECTION_BYTES = 64 * 1024;
+
+/**
+ * Sandbox flags forced onto every proxied preview document.
+ *
+ * `allow-same-origin` is deliberately absent: without it the document is an
+ * opaque origin, which is the whole point. It cannot read the dashboard DOM,
+ * cannot attach dashboard cookies to any request (an opaque origin has a null
+ * site-for-cookies, so even SameSite=Lax credentials stay home), and cannot
+ * touch same-origin storage. The same list is applied twice on purpose:
+ *
+ *   • as the iframe `sandbox` attribute in the guard shell, and
+ *   • as a `Content-Security-Policy: sandbox …` response header here,
+ *
+ * so agent-controlled HTML is opaque even when it is reached *without* the
+ * shell — a lured top-level navigation to a preview URL must not hand the
+ * agent a usable dashboard origin either.
+ *
+ * `allow-top-navigation` is absent so a preview can never navigate the
+ * dashboard away, and `allow-popups-to-escape-sandbox` is absent so popups
+ * the preview opens inherit the same opaque origin.
+ */
+export const PREVIEW_SANDBOX_TOKENS = 'allow-scripts allow-forms allow-popups';
+const PREVIEW_SANDBOX_CSP = `sandbox ${PREVIEW_SANDBOX_TOKENS}`;
 
 export type PreviewProxyResolution = SessionPreviewResolution | {
   ok: false;
@@ -35,6 +60,13 @@ export interface SessionPreviewProxyOptions {
   /** Positive session/daemon ownership lookup followed by registered-target
    * resolution. The URL contributes only the session id, never a target. */
   resolve: (sessionId: string) => PreviewProxyResolution;
+  /**
+   * Verify the path-scoped capability that authorises the sandboxed content
+   * stream for exactly this session. Required, not optional: the content path
+   * carries no cookie by construction, so a missing verifier would either be
+   * an open proxy or a dead route — both worse than a compile error.
+   */
+  verifyContentCapability: (capability: string, sessionId: string) => boolean;
 }
 
 type ParsedPreviewPath =
@@ -46,7 +78,8 @@ type ParsedPreviewPath =
       sessionId: string;
       upstreamPath: string;
       basePath: string;
-      guardedContent: boolean;
+      /** Present only on `/preview/<id>/__botmux_preview_content/<cap>/…`. */
+      contentCapability: string | null;
     };
 
 function safeDecodeSessionId(raw: string): string | undefined {
@@ -68,21 +101,33 @@ export function parseSessionPreviewRequest(url: URL): ParsedPreviewPath {
   const rawSessionId = slash >= 0 ? afterPrefix.slice(0, slash) : afterPrefix;
   const sessionId = safeDecodeSessionId(rawSessionId);
   if (!sessionId) return { matched: true, ok: false, error: 'invalid_preview_path' };
-  const rest = slash >= 0 ? afterPrefix.slice(slash) : '/';
-  const guardedContent = url.searchParams.has(PREVIEW_CONTENT_QUERY);
-  let upstreamSearch = url.search;
-  if (guardedContent) {
-    const upstreamParams = new URLSearchParams(url.searchParams);
-    upstreamParams.delete(PREVIEW_CONTENT_QUERY);
-    upstreamSearch = upstreamParams.size > 0 ? `?${upstreamParams.toString()}` : '';
+  let rest = slash >= 0 ? afterPrefix.slice(slash) : '/';
+  let basePath = sessionPreviewPath(sessionId);
+  let contentCapability: string | null = null;
+  const contentPrefix = `/${PREVIEW_CONTENT_SEGMENT}/`;
+  if (rest === `/${PREVIEW_CONTENT_SEGMENT}` || rest.startsWith(contentPrefix)) {
+    // The reserved segment must be followed by a capability; a bare segment is
+    // a malformed URL rather than an unauthenticated one.
+    if (!rest.startsWith(contentPrefix)) {
+      return { matched: true, ok: false, error: 'invalid_preview_path' };
+    }
+    const afterSegment = rest.slice(contentPrefix.length);
+    const capabilitySlash = afterSegment.indexOf('/');
+    const capability = capabilitySlash >= 0 ? afterSegment.slice(0, capabilitySlash) : afterSegment;
+    if (!PREVIEW_CONTENT_CAPABILITY_PATTERN.test(capability)) {
+      return { matched: true, ok: false, error: 'invalid_preview_path' };
+    }
+    contentCapability = capability;
+    basePath = sessionPreviewContentPath(sessionId, capability);
+    rest = capabilitySlash >= 0 ? afterSegment.slice(capabilitySlash) : '/';
   }
   return {
     matched: true,
     ok: true,
     sessionId,
-    upstreamPath: `${rest || '/'}${upstreamSearch}`,
-    basePath: sessionPreviewPath(sessionId),
-    guardedContent,
+    upstreamPath: `${rest || '/'}${url.search}`,
+    basePath,
+    contentCapability,
   };
 }
 
@@ -149,16 +194,12 @@ function localRedirectPath(
   location: string,
   target: SessionPreviewTarget,
   basePath: string,
-  guardedContent: boolean,
 ): string {
-  const preserveGuard = (value: string): string => {
-    if (!guardedContent) return value;
-    const hashAt = value.indexOf('#');
-    const beforeHash = hashAt >= 0 ? value.slice(0, hashAt) : value;
-    const hash = hashAt >= 0 ? value.slice(hashAt) : '';
-    return `${beforeHash}${beforeHash.includes('?') ? '&' : '?'}${PREVIEW_CONTENT_QUERY}=1${hash}`;
-  };
-  if (location.startsWith('/')) return preserveGuard(`${basePath.slice(0, -1)}${location}`);
+  // `basePath` already encodes whether this stream is the sandboxed content
+  // path or a bare preview path, so a rewritten redirect can never escape the
+  // mode it started in — in particular an app-issued `Location: /` cannot
+  // bounce the sandboxed frame back onto the outer guard shell.
+  if (location.startsWith('/')) return `${basePath.slice(0, -1)}${location}`;
   try {
     const parsed = new URL(location);
     const localHosts = new Set([
@@ -175,23 +216,40 @@ function localRedirectPath(
       && localHosts.has(parsed.hostname)
       && effectivePort === String(target.port)
     ) {
-      return preserveGuard(`${basePath.slice(0, -1)}${parsed.pathname}${parsed.search}${parsed.hash}`);
+      return `${basePath.slice(0, -1)}${parsed.pathname}${parsed.search}${parsed.hash}`;
     }
     return location;
   } catch {
     // Relative Location values are already scoped under the current preview path.
   }
-  // Relative redirects remain under the current preview prefix. Preserve the
-  // private content marker as well so `Location: ./` cannot recursively load
-  // the outer guard shell inside its own iframe.
-  return preserveGuard(location);
+  // Relative redirects resolve against the current preview prefix client-side.
+  return location;
+}
+
+/** CORS headers that let the opaque-origin document read its OWN dev server.
+ *
+ * Making the preview an opaque origin also makes every `fetch`/XHR it aims at
+ * its own dev server a cross-origin request, which would break essentially
+ * every real SPA. Echoing `null` back is safe precisely because the origin is
+ * not the credential here: the path-scoped capability is, and a request from
+ * any *real* web origin is refused with `preview_origin_forbidden` before it
+ * ever gets this far. Credentials are deliberately never allowed — an opaque
+ * origin has none to send, and `ACAO: null` plus credentials is the classic
+ * CORS footgun. */
+function applyOpaqueCors(out: OutgoingHttpHeaders): void {
+  out['access-control-allow-origin'] = 'null';
+  out['access-control-expose-headers'] = '*';
+  const vary = out.vary;
+  out.vary = vary === undefined
+    ? 'Origin'
+    : `${Array.isArray(vary) ? vary.join(', ') : String(vary)}, Origin`;
 }
 
 function previewResponseHeaders(
   headers: IncomingHttpHeaders,
   target: SessionPreviewTarget,
   basePath: string,
-  guardedContent: boolean,
+  opaqueRequest: boolean,
 ): OutgoingHttpHeaders {
   const out: OutgoingHttpHeaders = {};
   const nominated = connectionNominatedHeaders(headers.connection);
@@ -200,14 +258,25 @@ function previewResponseHeaders(
     // A local app must not set/clear cookies or storage on the dashboard origin.
     if (lower === 'set-cookie' || lower === 'clear-site-data'
       || HOP_BY_HOP_HEADERS.has(lower) || nominated.has(lower)) continue;
+    // The dashboard decides the CORS answer for its own origin boundary; an
+    // app-supplied one would otherwise be duplicated or widened.
+    if (lower.startsWith('access-control-')) continue;
     if (lower === 'location' && typeof value === 'string') {
-      out[name] = localRedirectPath(value, target, basePath, guardedContent);
+      out[name] = localRedirectPath(value, target, basePath);
       continue;
     }
     if (value !== undefined) out[name] = value;
   }
   out['cache-control'] = 'no-store';
   out['referrer-policy'] = 'no-referrer';
+  // Append rather than replace: multiple CSP headers intersect, so an app that
+  // ships its own policy keeps it AND gets the sandbox. Replacing would let an
+  // agent-chosen policy decide how strict the dashboard's boundary is.
+  const upstreamCsp = out['content-security-policy'];
+  (out as Record<string, string | string[]>)['content-security-policy'] = upstreamCsp === undefined
+    ? PREVIEW_SANDBOX_CSP
+    : [...(Array.isArray(upstreamCsp) ? upstreamCsp : [String(upstreamCsp)]), PREVIEW_SANDBOX_CSP];
+  if (opaqueRequest) applyOpaqueCors(out);
   return out;
 }
 
@@ -250,7 +319,21 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
   ):
     | { ok: true; target: SessionPreviewTarget }
     | { ok: false; status: number; error: string } => {
-    if (!options.authenticated(req)) return { ok: false, status: 401, error: 'authentication_required' };
+    if (parsed.contentCapability !== null) {
+      // Requests issued *by* the opaque-origin document carry `Origin: null`
+      // (fetch/WebSocket) or no Origin at all (navigations, no-cors
+      // subresources). A real web origin presenting a leaked capability is an
+      // attacker replaying it from a page context, so refuse it outright.
+      const origin = req.headers.origin;
+      if (origin !== undefined && origin !== 'null') {
+        return { ok: false, status: 403, error: 'preview_origin_forbidden' };
+      }
+      if (!options.verifyContentCapability(parsed.contentCapability, parsed.sessionId)) {
+        return { ok: false, status: 401, error: 'preview_capability_invalid' };
+      }
+    } else if (!options.authenticated(req)) {
+      return { ok: false, status: 401, error: 'authentication_required' };
+    }
     const resolution = options.resolve(parsed.sessionId);
     if (!resolution.ok) return resolution;
     if (!isPreviewLoopbackHost(resolution.target.host)) {
@@ -277,6 +360,26 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       return true;
     }
     const target = resolved.target;
+    const opaqueRequest = parsed.contentCapability !== null && req.headers.origin === 'null';
+    // Answer the preflight here rather than forwarding it: the capability in
+    // the path is what authorises this stream, so a dev server that never
+    // implemented OPTIONS must not be the reason its own SPA cannot call it.
+    if (opaqueRequest && req.method === 'OPTIONS' && req.headers['access-control-request-method'] !== undefined) {
+      const preflight: OutgoingHttpHeaders = {
+        'access-control-allow-methods': '*',
+        'access-control-allow-headers': typeof req.headers['access-control-request-headers'] === 'string'
+          ? req.headers['access-control-request-headers']
+          : '*',
+        'access-control-max-age': '600',
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer',
+        'content-length': '0',
+      };
+      applyOpaqueCors(preflight);
+      res.writeHead(204, preflight);
+      res.end();
+      return true;
+    }
     const upstream = requestLiteralLoopback(target, {
       method: req.method,
       path: parsed.upstreamPath,
@@ -287,7 +390,7 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       upstream.setTimeout(0);
       res.writeHead(
         up.statusCode ?? 502,
-        previewResponseHeaders(up.headers, target, parsed.basePath, parsed.guardedContent),
+        previewResponseHeaders(up.headers, target, parsed.basePath, opaqueRequest),
       );
       up.pipe(res);
     });

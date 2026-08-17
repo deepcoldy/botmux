@@ -6,8 +6,17 @@ import {
 } from './loopback-target.js';
 
 export const PREVIEW_ROUTE_PREFIX = '/preview';
-/** Reserved dashboard-shell marker; stripped before proxying to the app. */
-export const PREVIEW_CONTENT_QUERY = '__botmux_preview_content';
+/**
+ * Reserved path segment that introduces the sandboxed content stream:
+ * `/preview/<sessionId>/__botmux_preview_content/<capability>/…`.
+ *
+ * It is a path segment rather than a query flag on purpose. The preview
+ * document is served into an opaque-origin sandbox, so its own relative
+ * subresources and WebSockets carry no dashboard cookie; a capability that
+ * lives in the path is inherited by every relative URL the app resolves,
+ * while a query flag would be dropped by the first `./app.js`.
+ */
+export const PREVIEW_CONTENT_SEGMENT = '__botmux_preview_content';
 export const PREVIEW_PROBE_TIMEOUT_MS = 750;
 
 /** DNS names are deliberately excluded: resolving even `localhost` would add a
@@ -55,6 +64,13 @@ export function safeSessionPreviewTarget(value: unknown): SessionPreviewTarget |
 
 export function sessionPreviewPath(sessionId: string): string {
   return `${PREVIEW_ROUTE_PREFIX}/${encodeURIComponent(sessionId)}/`;
+}
+
+/** Base path of the sandboxed content stream. Every relative URL the framed
+ *  app resolves stays under it, which is how the capability survives without
+ *  cookies or query strings. */
+export function sessionPreviewContentPath(sessionId: string, capability: string): string {
+  return `${sessionPreviewPath(sessionId)}${PREVIEW_CONTENT_SEGMENT}/${capability}/`;
 }
 
 export function sessionPreviewDescriptor(

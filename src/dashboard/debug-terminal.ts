@@ -163,6 +163,11 @@ export function createDebugTerminalManager(deps: DebugTerminalDeps): DebugTermin
   function isAuthed(req: IncomingMessage): boolean {
     const active = deps.getActiveToken();
     if (!active) return false;
+    // P0 定向加固：`Origin: null` 只可能来自 opaque origin 文档——沙箱化的网页预览
+    // 就是这么一个来源，而调试终端页面永远带自己的真实 origin。这条 WS 是「拿宿主
+    // 裸 bash」的最后一跳，所以即便 opaque origin 已经带不出 SameSite=Lax cookie，
+    // 也在这里显式拒死，不依赖单一层防线。
+    if (req.headers.origin === 'null') return false;
     // Same credential as the management dashboard: cookie set by the `?t=` gate.
     const cookieTok = parseCookie(req.headers.cookie);
     return !!cookieTok && cookieTok === active;

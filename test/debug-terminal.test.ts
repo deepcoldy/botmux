@@ -97,6 +97,37 @@ describe('debug-terminal WebSocket auth', () => {
     authed.close();
   });
 
+  it('P0: refuses an opaque-origin (Origin: null) handshake even with the management cookie', async () => {
+    harness = await startHarness();
+    const { id } = (await post(harness.base, '/api/debug-terminal', undefined, {})).json;
+
+    // `Origin: null` 只可能来自 opaque origin 文档——沙箱化的网页预览就是这么一个
+    // 来源。它是「预览页 → 宿主裸 bash」这条链的最后一跳，即使 cookie 也一起带上，
+    // 也必须拒死；调试终端页面永远带自己的真实 origin，不受影响。
+    const opaque = new WebSocket(`${harness.wsBase}/debug-terminal/${id}/ws`, {
+      headers: { cookie: `botmux_dashboard_token=${TOKEN}`, origin: 'null' },
+    });
+    const opaqueResult = await new Promise<string>((resolve) => {
+      opaque.on('open', () => resolve('open'));
+      opaque.on('error', () => resolve('error'));
+      opaque.on('close', () => resolve('close'));
+      setTimeout(() => resolve('timeout'), 2000);
+    });
+    expect(opaqueResult).not.toBe('open');
+
+    // 同一个终端、同一个 cookie，带真实 origin 仍然连得上——只封 opaque origin。
+    const realOrigin = new WebSocket(`${harness.wsBase}/debug-terminal/${id}/ws`, {
+      headers: { cookie: `botmux_dashboard_token=${TOKEN}`, origin: harness.base },
+    });
+    const opened = await new Promise<boolean>((resolve) => {
+      realOrigin.on('open', () => resolve(true));
+      realOrigin.on('error', () => resolve(false));
+      setTimeout(() => resolve(false), 2000);
+    });
+    expect(opened).toBe(true);
+    realOrigin.close();
+  });
+
   it('WS to unknown terminal id is refused even with cookie', async () => {
     harness = await startHarness();
     const ws = new WebSocket(`${harness.wsBase}/debug-terminal/ghost/ws`, {

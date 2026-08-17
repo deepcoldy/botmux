@@ -23,6 +23,10 @@ import {
 } from '../src/dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from '../src/dashboard/preview-guard-page.js';
 import { createSessionPreviewProxy, type PreviewProxyResolution } from '../src/dashboard/preview-proxy.js';
+import {
+  mintPreviewContentCapability,
+  verifyPreviewContentCapability,
+} from '../src/dashboard/preview-content-capability.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
 import { isPreviewPort, probeSessionPreviewTarget } from '../src/core/session-preview.js';
 import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/control-audit.js';
@@ -182,13 +186,26 @@ function actor(req: IncomingMessage): TerminalDashboardActor | null {
   return requestActor(req, h5Auth.resolve(req));
 }
 
+const previewCapabilitySecret = 'local-browser-preview-capability-secret-not-a-real-credential';
 const previewProxy = createSessionPreviewProxy({
   authenticated: req => actor(req) !== null,
   resolve: resolvePreview,
+  verifyContentCapability: (capability, sessionId) =>
+    verifyPreviewContentCapability(previewCapabilitySecret, capability, sessionId, previewNow).ok,
 });
 const previewGuard = createPreviewGuardPage({
   authenticated: req => actor(req) !== null,
   resolve: resolvePreview,
+  mintContentCapability: (req, sessionId) => {
+    const identity = actor(req);
+    return identity
+      ? mintPreviewContentCapability(previewCapabilitySecret, sessionId, {
+        userId: identity.userId,
+        authSessionId: identity.authSessionId,
+        expiresAt: identity.expiresAt,
+      }, previewNow)
+      : null;
+  },
 });
 const controlWss = new WebSocketServer({ noServer: true });
 

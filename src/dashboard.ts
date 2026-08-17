@@ -38,6 +38,10 @@ import {
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
 import {
+  mintPreviewContentCapability,
+  verifyPreviewContentCapability,
+} from './dashboard/preview-content-capability.js';
+import {
   previewDescriptorFromRow,
   projectSessionDetailForBrowser,
   projectSessionPreviewEventForBrowser,
@@ -527,10 +531,29 @@ const sessionPreviewProxy = createSessionPreviewProxy({
   // the legacy management cookie or an allow-listed short H5 session.
   authenticated: req => dashboardRequestIdentity(req) !== null,
   resolve: resolveDashboardSessionPreview,
+  // P0: the sandboxed content stream is an opaque origin, so it carries no
+  // cookie of any kind. Its path-scoped capability is the only credential —
+  // signature + session binding + expiry here, plus central revocation
+  // (logout / token rotation / platform unbind) through the same auth-session
+  // liveness the bound terminal read capability uses.
+  verifyContentCapability: (capability, sessionId) => {
+    const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
+    return verified.ok && terminalAuthSessionLive(verified.claims.authSessionId);
+  },
 });
 const previewGuardPage = createPreviewGuardPage({
   authenticated: req => dashboardRequestIdentity(req) !== null,
   resolve: resolveDashboardSessionPreview,
+  mintContentCapability: (req, sessionId) => {
+    const identity = dashboardRequestIdentity(req);
+    return identity
+      ? mintPreviewContentCapability(SECRET, sessionId, {
+        userId: identity.userId,
+        authSessionId: identity.authSessionId,
+        expiresAt: identity.expiresAt,
+      })
+      : null;
+  },
 });
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),

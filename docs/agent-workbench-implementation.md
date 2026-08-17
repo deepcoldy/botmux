@@ -20,7 +20,7 @@ Agent Workbench v1 是 Dashboard 内的单会话操作工作区，已经提供�
 - Chat 始终由飞书客户端承载：入口是行内真实 AppLink 锚点（target=_blank rel=noopener），H5 里没有自绘聊天面板，也不调用 toggleChat/enterChat JSAPI。
 - Terminal 默认只读，写控制由服务端短租约决定，浏览器拿不到 write grant。
 - Web 默认是带可见标签的 Preview；交互必须显式解锁，15 分钟无操作后回锁。
-- Preview 蒙层只防误触，不是应用级强只读、安全沙箱或不可信代码隔离边界。
+- Preview 蒙层只防误触，不是应用级强只读。真正的隔离靠 origin：应用被钉在 opaque origin 的 sandbox 里，够不到 Dashboard 的 DOM、cookie 与管理接口。
 
 ## 2. 使用方式
 
@@ -45,7 +45,7 @@ Full Workbench 的基本流程：
 1. 在会话列表搜索并选择会话；支持六个分组维度（状态/机器人/会话位置/类型/CLI/活跃时间）、组折叠与未读标记。
 2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「终端」以只读打开工作区终端；「接管」打开终端并自动请求写权限。
 3. 工作区一次只有一个终端面板：释放、到期或断连回到只读，「关闭终端」后列表重新铺满。触屏与未登录浏览器走只读 viewToken 通道，不提供接管。
-4. Agent 在自己的 Botmux 会话内注册 Web 开发服务器后，窄屏详情才出现「网页」页；网页预览默认「预览」蒙层，「开启交互」显式解锁，15 分钟无操作回锁。桌面工作区只承载终端，网页预览经会话坞的「网页链接」或直接访问 /preview/<encoded-session-id>/ 打开，由同源 guard shell 维持蒙层与解锁。
+4. Agent 在自己的 Botmux 会话内注册 Web 开发服务器后，窄屏详情才出现「网页」页；网页预览默认「预览」蒙层，「开启交互」显式解锁，15 分钟无操作回锁。桌面工作区只承载终端，网页预览经会话坞的「网页链接」或直接访问 /preview/<encoded-session-id>/ 打开，该 URL 是 Dashboard 同源的 guard shell，它维持蒙层与解锁，并把应用本身框进 opaque-origin sandbox。
 
 ### 2.2 注册会话 Web 预览
 
@@ -147,7 +147,8 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 |---|---|
 | POST /api/sessions/:id/preview | daemon 内部注册当前会话 literal loopback port；成功只返回 browser-safe path 与 registeredAt。 |
 | GET /api/sessions/:id/preview | private metadata，只返回同一 browser-safe descriptor。 |
-| /preview/:sessionId/* | 已认证同源 HTTP/WS 反向代理；exact owner/session/target 校验。 |
+| /preview/:sessionId/ | guard shell（Dashboard 同源）。管理 cookie 认证，签发本次会话的 content capability 并把应用钉进 opaque-origin sandbox iframe。 |
+| /preview/:sessionId/__botmux_preview_content/&lt;capability&gt;/* | 应用内容流的 HTTP/WS 反向代理。只认路径里的 capability（opaque origin 带不出任何 cookie），只接受 Origin 缺省或 `null`；exact owner/session/target 校验不变。 |
 | GET /api/sessions/:id/preview-interaction | 返回 preview 或 interactive、可见 label、securityNotice 与可选 idleExpiresAt。 |
 | POST .../unlock | 显式进入 interactive，启动 15 分钟 idle deadline。 |
 | POST .../activity | 仅对仍有效的 interactive lease 延长 idle deadline。 |
@@ -155,7 +156,7 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 
 交互状态按 authSessionId + sessionId 隔离。UI 为每个 session 建立新的 generation，旧 refresh/activity 响应不能覆盖新选择或显式 Lock；切换 session 会卸载旧 pane。titlebar 内的 Lock/Unlock 点击不会冒泡成 activity。
 
-注册与代理的稳定失败包括 invalid_port、origin_unproven、managed_action_required、remote_host_forbidden、session_not_active、preview_not_registered、preview_unreachable、invalid_preview_target 与 method_not_allowed。损坏 descriptor 或跨 session path 在浏览器 adapter 处也会 fail closed。
+注册与代理的稳定失败包括 invalid_port、origin_unproven、managed_action_required、remote_host_forbidden、session_not_active、preview_not_registered、preview_unreachable、invalid_preview_target 与 method_not_allowed；内容流另有 preview_capability_invalid（capability 缺失/伪造/过期/跨会话，或签发它的 auth session 已结束）、preview_origin_forbidden（真实 web origin 拿着泄漏的 capability 回放）与 preview_capability_unavailable（guard shell 签不出 capability，整页 fail closed）。损坏 descriptor 或跨 session path 在浏览器 adapter 处也会 fail closed。
 
 ## 5. 安全边界
 
@@ -174,9 +175,12 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 - HTTP 与 WebSocket 使用相同认证、owner resolution、runtime revalidation 和 2 秒连接/响应头上限。
 - 转发前删除 Cookie、Authorization、Proxy-Authorization、Referer、Forwarded、全部 X-Forwarded-* 与 X-Botmux-*；Host/Origin 重写为验证后的 loopback target。
 - upstream Set-Cookie 与 Clear-Site-Data 被删除，响应统一 no-store、no-referrer。
-- 代理不改写应用 body；应用必须支持 /preview/<sessionId>/ base path或相对资源。
+- 代理不改写应用 body；应用必须支持内容流 base path 或相对资源。相对资源、相对 WebSocket 与相对 fetch 都会自动继承路径里的 capability，无需应用改代码。
+- 内容流一律带 `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups`（与 iframe 的 sandbox 属性同一份清单，均**不含 allow-same-origin**），所以即便有人被诱导直接顶层打开某个预览 URL，那份 agent HTML 也拿不到可用的 Dashboard origin。应用自带的 CSP 会被保留并与这条求交集，不会被覆盖。
+- opaque origin 让应用访问自己的 dev server 变成跨源请求，因此内容流对 `Origin: null` 回 `Access-Control-Allow-Origin: null`，并就地应答 preflight（不转发给应用）；**从不**附带 credentials，应用自己的 `Access-Control-*` 响应头一律剥掉，避免它扩大 Dashboard 的 CORS 面。
+- 代价（已知取舍）：opaque origin 没有 same-origin storage，强依赖 localStorage/IndexedDB/`document.cookie` 的 dev server 在预览里会抛 SecurityError。这是隔离本身的要求，不是 bug。
 
-Preview guard 的覆盖层不是安全沙箱。同源应用脚本仍可能主动发网络请求或产生副作用。若要运行不可信应用，必须设计独立 origin、容器和应用级授权，不能依赖蒙层或把它表述为强只读。
+Preview guard 的覆盖层只防误触，不是应用级强只读：解锁后应用脚本照样能自己发请求、产生副作用。真正的信任边界是 origin 隔离——应用跑在 opaque origin 上，读不到 Dashboard DOM、发不出带 Dashboard/H5 cookie 的请求、碰不到 same-origin storage，因此够不着 /api/*、/events、终端代理与调试终端。若还要防应用对**它自己**那台 dev server 做的事，仍需容器与应用级授权。
 
 ### 5.3 Chat 边界
 
@@ -254,6 +258,8 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 | preview_websocket — 同源 WebSocket 代理往返 | 通过 |
 | terminal_disconnect_returns_readonly — 写 WebSocket 断开后回只读 | 通过 |
 | preview_idle_timeout_relocks — 15 分钟 idle 到点回锁并落审计 | 通过 |
+
+P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-preview-origin-isolation.ts`（真 Chromium + 真 debug-terminal，会真的 spawn /bin/bash）：恶意预览页依次尝试读 parent DOM、带 cookie 调 /api/sessions、POST /api/debug-terminal 后连 /debug-terminal/&lt;id&gt;/ws、并把战利品外传给外部收集器；断言全部失败，同时断言预览自身的相对脚本、相对 fetch 与自身 WebSocket 仍然工作。机器可读结果见 assets/preview-origin-isolation-results.json。
 
 机器可读结果见 assets/agent-workbench-browser-results.json。
 

@@ -3,14 +3,19 @@ import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
+  PREVIEW_SANDBOX_TOKENS,
   createSessionPreviewProxy,
   previewRequestHeaders,
   type PreviewProxyResolution,
 } from '../src/dashboard/preview-proxy.js';
-import { PREVIEW_CONTENT_QUERY } from '../src/core/session-preview.js';
+import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
 
 const DASHBOARD_TOKEN = 'management-token-must-not-leak';
 const TARGET_TIME = '2026-08-11T12:00:00.000Z';
+/** Stand-in for a minted capability; the proxy only sees an opaque string. */
+const CAPABILITY = 'bmxpv1.valid-capability-for-s1';
+const contentBase = (sessionId: string, capability = CAPABILITY): string =>
+  `/preview/${sessionId}/${PREVIEW_CONTENT_SEGMENT}/${capability}`;
 let front: Server | null = null;
 let upstream: Server | null = null;
 let upstreamWss: WebSocketServer | null = null;
@@ -35,6 +40,7 @@ async function startFront(resolveTarget: (sessionId: string) => PreviewProxyReso
   const manager = createSessionPreviewProxy({
     authenticated: req => req.headers.cookie?.split(';').some(part => part.trim() === managementCookie()) === true,
     resolve: resolveTarget,
+    verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
   });
   front = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://dashboard.test');
@@ -65,6 +71,23 @@ async function startUpstream(): Promise<{
         'clear-site-data': '"cookies"',
       });
       res.end();
+      return;
+    }
+    if (req.url?.startsWith('/wide-cors')) {
+      res.writeHead(200, {
+        'content-type': 'text/plain',
+        'access-control-allow-origin': '*',
+        'access-control-allow-credentials': 'true',
+      });
+      res.end('app cors');
+      return;
+    }
+    if (req.url?.startsWith('/with-csp')) {
+      res.writeHead(200, {
+        'content-type': 'text/html',
+        'content-security-policy': "default-src 'self'",
+      });
+      res.end('app policy');
       return;
     }
     if (req.url?.startsWith('/absolute-redirect')) {
@@ -118,6 +141,7 @@ describe('session preview same-origin reverse proxy', () => {
     const manager = createSessionPreviewProxy({
       authenticated: () => false,
       resolve: () => ({ ok: false, status: 404, error: 'unknown_session' }),
+      verifyContentCapability: () => false,
     });
     const socket = new PassThrough();
     const req = { url: '/preview/s1/ws', method: 'GET', headers: {} } as IncomingMessage;
@@ -180,28 +204,145 @@ describe('session preview same-origin reverse proxy', () => {
     expect(JSON.stringify(seen.headers)).not.toContain(DASHBOARD_TOKEN);
   });
 
-  it('strips the private guard-shell content marker before reaching the app', async () => {
+  it('P0: serves the sandboxed content stream on its capability path with no cookie at all', async () => {
     const target = await startUpstream();
     const port = await startFront(() => okTarget(target.port));
-    const response = await fetch(
-      `http://127.0.0.1:${port}/preview/s1/?${PREVIEW_CONTENT_QUERY}=1&q=kept`,
-      { headers: { cookie: managementCookie() } },
-    );
-    expect(response.status).toBe(200);
-    expect(target.httpRequests[0].url).toBe('/?q=kept');
+
+    // Exactly what the opaque-origin frame sends for a relative subresource:
+    // no Cookie (its site-for-cookies is null) and no Origin (no-cors fetch).
+    const subresource = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/app.js?v=1`);
+    expect(subresource.status).toBe(200);
+    expect(await subresource.text()).toBe('upstream:/app.js?v=1');
+
+    // …and what it sends for a CORS fetch or a WebSocket handshake.
+    const corsStyle = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/data`, {
+      headers: { origin: 'null' },
+    });
+    expect(corsStyle.status).toBe(200);
+    expect(target.httpRequests.map(entry => entry.url)).toEqual(['/app.js?v=1', '/data']);
+    for (const seen of target.httpRequests) expect(seen.headers.cookie).toBeUndefined();
   });
 
-  it('preserves the private content marker across app redirects to prevent a nested guard shell', async () => {
+  it('P0: refuses the content path without a valid capability and from any real web origin', async () => {
     const target = await startUpstream();
     const port = await startFront(() => okTarget(target.port));
-    const response = await fetch(
-      `http://127.0.0.1:${port}/preview/s1/redirect?${PREVIEW_CONTENT_QUERY}=1`,
-      { redirect: 'manual', headers: { cookie: managementCookie() } },
-    );
+
+    const forged = await fetch(`http://127.0.0.1:${port}${contentBase('s1', 'bmxpv1.forged')}/app.js`);
+    expect(forged.status).toBe(401);
+    expect(await forged.json()).toEqual({ ok: false, error: 'preview_capability_invalid' });
+
+    // A capability minted for one session must not open another's dev server.
+    const otherSession = await fetch(`http://127.0.0.1:${port}${contentBase('s2')}/app.js`);
+    expect(otherSession.status).toBe(401);
+
+    // The management cookie is NOT an alternative credential here: the content
+    // path exists only for the opaque-origin frame.
+    const withCookie = await fetch(`http://127.0.0.1:${port}${contentBase('s1', 'bmxpv1.forged')}/app.js`, {
+      headers: { cookie: managementCookie() },
+    });
+    expect(withCookie.status).toBe(401);
+
+    // A leaked capability replayed from a page context (any real origin) is
+    // refused before the target is even resolved.
+    for (const origin of ['http://dashboard.test', 'https://evil.example', 'http://127.0.0.1:1']) {
+      const replay = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/app.js`, {
+        headers: { origin },
+      });
+      expect(replay.status, origin).toBe(403);
+      expect(await replay.json()).toEqual({ ok: false, error: 'preview_origin_forbidden' });
+    }
+
+    const bareSegment = await fetch(`http://127.0.0.1:${port}/preview/s1/${PREVIEW_CONTENT_SEGMENT}`, {
+      headers: { cookie: managementCookie() },
+    });
+    expect(bareSegment.status).toBe(400);
+    expect(await bareSegment.json()).toEqual({ ok: false, error: 'invalid_preview_path' });
+
+    expect(target.httpRequests).toHaveLength(0);
+  });
+
+  it('P0: forces every proxied document into an opaque origin via CSP sandbox', async () => {
+    const target = await startUpstream();
+    const port = await startFront(() => okTarget(target.port));
+
+    for (const path of [`${contentBase('s1')}/`, '/preview/s1/lure.html']) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        headers: { cookie: managementCookie() },
+      });
+      expect(response.status, path).toBe(200);
+      // Even a lured top-level navigation to agent HTML must not land on a
+      // usable dashboard origin.
+      expect(response.headers.get('content-security-policy'), path)
+        .toContain(`sandbox ${PREVIEW_SANDBOX_TOKENS}`);
+      expect(response.headers.get('content-security-policy'), path).not.toContain('allow-same-origin');
+    }
+
+    const withUpstreamPolicy = await fetch(`http://127.0.0.1:${port}/preview/s1/with-csp`, {
+      headers: { cookie: managementCookie() },
+    });
+    // The app's own policy survives; ours is appended, never replaced by it.
+    const policies = withUpstreamPolicy.headers.get('content-security-policy') ?? '';
+    expect(policies).toContain("default-src 'self'");
+    expect(policies).toContain(`sandbox ${PREVIEW_SANDBOX_TOKENS}`);
+  });
+
+  it('lets the opaque-origin app read its OWN dev server without ever allowing credentials', async () => {
+    const target = await startUpstream();
+    const port = await startFront(() => okTarget(target.port));
+
+    const response = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/api/me`, {
+      headers: { origin: 'null' },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe('null');
+    expect(response.headers.get('access-control-allow-credentials')).toBeNull();
+    expect(response.headers.get('vary')).toContain('Origin');
+
+    // Preflights are answered by the proxy so a dev server that never
+    // implemented OPTIONS is not the reason its own SPA cannot call it.
+    const preflight = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/api/me`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'null',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'content-type',
+      },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-origin')).toBe('null');
+    expect(preflight.headers.get('access-control-allow-headers')).toBe('content-type');
+    expect(preflight.headers.get('access-control-allow-credentials')).toBeNull();
+    // The preflight never touched the app.
+    expect(target.httpRequests.map(entry => entry.url)).toEqual(['/api/me']);
+
+    // Bare (cookie-authenticated) preview paths get no CORS grant at all.
+    const bare = await fetch(`http://127.0.0.1:${port}/preview/s1/api/me`, {
+      headers: { cookie: managementCookie() },
+    });
+    expect(bare.headers.get('access-control-allow-origin')).toBeNull();
+
+    // An app that ships a wide-open CORS policy does not get to widen the
+    // dashboard's boundary: the proxy's answer is the only one that survives.
+    const wide = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/wide-cors`, {
+      headers: { origin: 'null' },
+    });
+    expect(wide.headers.get('access-control-allow-origin')).toBe('null');
+    expect(wide.headers.get('access-control-allow-credentials')).toBeNull();
+    const wideOnBare = await fetch(`http://127.0.0.1:${port}/preview/s1/wide-cors`, {
+      headers: { cookie: managementCookie() },
+    });
+    expect(wideOnBare.headers.get('access-control-allow-origin')).toBeNull();
+    expect(wideOnBare.headers.get('access-control-allow-credentials')).toBeNull();
+  });
+
+  it('keeps app redirects inside the capability path so the frame cannot climb back to the shell', async () => {
+    const target = await startUpstream();
+    const port = await startFront(() => okTarget(target.port));
+    const response = await fetch(`http://127.0.0.1:${port}${contentBase('s1')}/redirect`, {
+      redirect: 'manual',
+    });
     expect(response.status).toBe(302);
-    expect(response.headers.get('location')).toBe(
-      `/preview/s1/login?from=preview&${PREVIEW_CONTENT_QUERY}=1`,
-    );
+    expect(response.headers.get('location')).toBe(`${contentBase('s1')}/login?from=preview`);
     expect(target.httpRequests[0].url).toBe('/redirect');
   });
 
@@ -262,6 +403,66 @@ describe('session preview same-origin reverse proxy', () => {
     expect(seen.headers.authorization).toBeUndefined();
     expect(seen.headers['x-botmux-write-token']).toBeUndefined();
     expect(seen.headers.origin).toBe(`http://127.0.0.1:${target.port}`);
+  });
+
+  it('P0: bridges the sandboxed frame WebSocket on Origin: null but never without the capability', async () => {
+    const target = await startUpstream();
+    const port = await startFront(() => okTarget(target.port));
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${contentBase('s1')}/socket?room=hmr`, {
+      origin: 'null',
+    });
+    openSockets.add(ws);
+    const first = await new Promise<string>((resolve, reject) => {
+      ws.on('message', data => resolve(data.toString()));
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('WebSocket proxy timeout')), 4_000).unref();
+    });
+    expect(first).toBe('path:/socket?room=hmr');
+    expect(target.wsRequests[0].headers.cookie).toBeUndefined();
+    ws.terminate();
+    openSockets.delete(ws);
+
+    expect(await websocketStatus(`ws://127.0.0.1:${port}${contentBase('s1', 'bmxpv1.forged')}/socket`, {
+      Origin: 'null',
+    })).toBe(401);
+    // Origin: null is not a credential — a real origin replaying a leaked
+    // capability over WebSocket is refused too.
+    expect(await websocketStatus(`ws://127.0.0.1:${port}${contentBase('s1')}/socket`, {
+      Origin: 'https://evil.example',
+    })).toBe(403);
+    expect(target.wsRequests).toHaveLength(1);
+  });
+
+  it('P0: claims only preview paths, so Origin: null never reaches management or terminal routes', async () => {
+    const manager = createSessionPreviewProxy({
+      authenticated: () => true,
+      resolve: () => okTarget(1),
+      verifyContentCapability: () => true,
+    });
+    const foreign = [
+      '/api/sessions',
+      '/api/debug-terminal',
+      '/debug-terminal/abc/ws',
+      '/events',
+      '/s/sess-1/ws',
+      '/previewer/s1/',
+    ];
+    for (const pathname of foreign) {
+      const url = new URL(pathname, 'http://dashboard.test');
+      const res = { writeHead: () => { throw new Error(`claimed ${pathname}`); } } as unknown as never;
+      expect(await manager.handleHttp(
+        { method: 'GET', headers: { origin: 'null' }, url: pathname } as unknown as IncomingMessage,
+        res,
+        url,
+      ), pathname).toBe(false);
+      const socket = new PassThrough();
+      expect(manager.handleUpgrade(
+        { url: pathname, method: 'GET', headers: { origin: 'null' } } as unknown as IncomingMessage,
+        socket,
+        Buffer.alloc(0),
+      ), pathname).toBe(false);
+    }
   });
 
   it('requires the management cookie for both HTTP and WebSocket', async () => {
