@@ -162,6 +162,7 @@ import {
   DASHBOARD_COMMAND_USAGE,
   executeDashboardCommand,
   formatDashboardFallbackFailure,
+  formatDashboardSuccessLines,
 } from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -4304,9 +4305,9 @@ async function cmdDashboard(args: string[]): Promise<void> {
 
   const { action, result: r } = execution;
   if (r.ok) {
-    // 首行保持纯 URL（脚本/复制取第一行即可）；走中心化平台时再补一行本地直连兜底。
-    console.log(r.url);
-    if (r.localUrl) console.log(`本地直连(平台异常时可用): ${r.localUrl}`);
+    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、以及走
+    // 中心化平台时的本地直连兜底。行顺序与首行契约见 formatDashboardSuccessLines。
+    for (const line of formatDashboardSuccessLines(r)) console.log(line);
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');

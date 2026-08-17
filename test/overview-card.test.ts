@@ -12,6 +12,7 @@ import type { SessionRow } from '../src/core/dashboard-rows.js';
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
 import type { DashboardSettingsInput } from '../src/dashboard/settings-card-model.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
+import { appCenterAppLink } from '../src/im/lark/lark-hosts.js';
 import {
   buildOverviewCard,
   countSessions,
@@ -231,6 +232,130 @@ describe('buildOverviewCard', () => {
     expect(buttonCount).toBe(5);
   });
 
+  // ─── 「打开工作台」入口 ─────────────────────────────────────────────
+  // The card is the ONLY zero-setup way into the Web Workbench from Feishu, so
+  // the link shape is asserted end-to-end: applink prefix + fully-encoded target
+  // carrying both the `?t=` token and the `#/agent-workbench` hash route.
+  describe('open-workbench button', () => {
+    const WORKBENCH_TARGET = 'http://10.0.0.7:7891/?t=tok-abc#/agent-workbench';
+    const WORKBENCH_APPLINK = appCenterAppLink(WORKBENCH_TARGET, 'feishu');
+    const withWorkbench = {
+      ...baseOpts,
+      workbench: { appLink: WORKBENCH_APPLINK, webUrl: WORKBENCH_TARGET },
+    };
+
+    function openWorkbenchButtons(json: string): any[] {
+      const parsed = JSON.parse(json);
+      return (parsed.elements as any[])
+        .filter((e: any) => e.tag === 'action')
+        .flatMap((e: any) => e.actions as any[])
+        .filter((b: any) => b.text?.content === '打开工作台');
+    }
+
+    it('renders exactly one 打开工作台 button whose PC target is the appCenter AppLink', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const buttons = openWorkbenchButtons(json);
+      expect(buttons.length).toBe(1);
+      expect(buttons[0].multi_url.url).toBe(
+        'https://applink.feishu.cn/client/web_url/open?mode=appCenter'
+        + '&url=http%3A%2F%2F10.0.0.7%3A7891%2F%3Ft%3Dtok-abc%23%2Fagent-workbench',
+      );
+      expect(buttons[0].multi_url.pc_url).toBe(buttons[0].multi_url.url);
+    });
+
+    it('the AppLink target round-trips to the token + hash route (nothing truncated at `#`)', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const link = new URL(openWorkbenchButtons(json)[0].multi_url.url as string);
+      expect(link.origin).toBe('https://applink.feishu.cn');
+      expect(link.pathname).toBe('/client/web_url/open');
+      expect(link.searchParams.get('mode')).toBe('appCenter');
+
+      const target = new URL(link.searchParams.get('url') as string);
+      expect(target.searchParams.get('t')).toBe('tok-abc');
+      expect(target.hash).toBe('#/agent-workbench');
+    });
+
+    it('mobile falls back to the plain web URL (no appCenter container on phones)', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const { multi_url: multiUrl } = openWorkbenchButtons(json)[0];
+      expect(multiUrl.android_url).toBe(WORKBENCH_TARGET);
+      expect(multiUrl.ios_url).toBe(WORKBENCH_TARGET);
+    });
+
+    it('is a pure link button — no callback value, no invoker identity on it', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const button = openWorkbenchButtons(json)[0];
+      expect(button.value).toBeUndefined();
+      expect(JSON.stringify(button)).not.toContain(INVOKER);
+    });
+
+    it('renders nothing when no workbench link could be built (no dead button)', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        baseOpts,
+      );
+      expect(openWorkbenchButtons(json).length).toBe(0);
+      expect(json).not.toContain('打开工作台');
+      expect(json).not.toContain('applink');
+    });
+
+    it('leaves the existing navigation buttons untouched', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        withWorkbench,
+      );
+      const parsed = JSON.parse(json);
+      const actionRows = (parsed.elements as any[]).filter((e: any) => e.tag === 'action');
+      // 4 goto rows + refresh + the new workbench row.
+      expect(actionRows.length).toBe(6);
+      for (const action of [
+        OVERVIEW_ACTION_REFRESH,
+        OVERVIEW_ACTION_GOTO_SESSIONS,
+        OVERVIEW_ACTION_GOTO_SCHEDULES,
+        OVERVIEW_ACTION_GOTO_SETTINGS,
+        OVERVIEW_ACTION_GOTO_GROUPS,
+      ]) {
+        expect(json).toContain(action);
+      }
+    });
+
+    it('en locale labels the button "Open Workbench"', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        { ...withWorkbench, locale: 'en' },
+      );
+      expect(json).toContain('Open Workbench');
+    });
+
+    it('a lark-brand bot gets the larksuite applink host', () => {
+      const json = buildOverviewCard(
+        { sessions: [], schedules: [], settings: makeSettings() },
+        {
+          ...baseOpts,
+          workbench: {
+            appLink: appCenterAppLink(WORKBENCH_TARGET, 'lark'),
+            webUrl: WORKBENCH_TARGET,
+          },
+        },
+      );
+      const url = openWorkbenchButtons(json)[0].multi_url.url as string;
+      expect(url.startsWith('https://applink.larksuite.com/client/web_url/open?mode=appCenter')).toBe(true);
+      expect(url).not.toContain('applink.feishu.cn');
+    });
+  });
+
   it('action.value carries action + invoker_open_id and NOTHING identity-like', () => {
     const json = buildOverviewCard(
       { sessions: [], schedules: [], settings: makeSettings() },
@@ -281,6 +406,9 @@ describe('handleOverviewCardAction', () => {
       getOwnerOpenId: () => INVOKER,
       locale: 'zh',
       nowMs: () => 2_000_000,
+      // Production reads the dashboard port/token off disk; pin it here so the
+      // card content doesn't depend on the test machine's ~/.botmux state.
+      resolveWorkbench: () => undefined,
       requestSpy,
       ...over,
     };
@@ -310,6 +438,41 @@ describe('handleOverviewCardAction', () => {
     const cardJson = JSON.stringify(r.card?.data);
     // Result is an overview card (has the overview title).
     expect(cardJson).toContain('Dashboard 总览');
+  });
+
+  it('refresh keeps the 打开工作台 button (clicking 🔄 must not drop the entry)', async () => {
+    const target = 'http://10.0.0.7:7891/?t=tok-abc#/agent-workbench';
+    const deps = makeDeps({
+      resolveWorkbench: vi.fn(() => ({ appLink: appCenterAppLink(target, 'feishu'), webUrl: target })),
+    });
+    const r = await handleOverviewCardAction(
+      makeAction({ action: OVERVIEW_ACTION_REFRESH, invoker_open_id: INVOKER }),
+      LARK_APP_ID,
+      deps,
+    );
+    // Brand is resolved per-bot, so the link resolver is asked for THIS app.
+    expect(deps.resolveWorkbench).toHaveBeenCalledWith(LARK_APP_ID);
+    const cardJson = JSON.stringify(r.card?.data);
+    expect(cardJson).toContain('打开工作台');
+    expect(cardJson).toContain(
+      'https://applink.feishu.cn/client/web_url/open?mode=appCenter'
+      + '&url=http%3A%2F%2F10.0.0.7%3A7891%2F%3Ft%3Dtok-abc%23%2Fagent-workbench',
+    );
+  });
+
+  it('a non-admin refresh never reaches the token-bearing workbench link', async () => {
+    const deps = makeDeps({
+      getDashboardAdminOpenIds: () => [INVOKER],
+      resolveWorkbench: vi.fn(() => ({ appLink: 'https://applink.feishu.cn/x', webUrl: 'http://x/' })),
+    });
+    const r = await handleOverviewCardAction(
+      makeAction({ action: OVERVIEW_ACTION_REFRESH, invoker_open_id: 'ou_stranger' }, 'ou_stranger'),
+      LARK_APP_ID,
+      deps,
+    );
+    expect(deps.resolveWorkbench).not.toHaveBeenCalled();
+    expect(r.card).toBeUndefined();
+    expect(r.toast).toBeDefined();
   });
 
   it('goto_sessions → GET /__daemon/sessions-list, returns sessions card as { card }', async () => {

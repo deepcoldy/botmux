@@ -23,6 +23,10 @@ import { buildSettingsCard } from './settings-card.js';
 import { buildGroupsCard } from './groups-card.js';
 import { composeSections } from '../../dashboard/settings-card-model.js';
 import type { GroupsBotInput, GroupsChatInput } from '../../dashboard/groups-card-model.js';
+import {
+  resolveWorkbenchButtonLinks,
+  type WorkbenchButtonLinks,
+} from '../../core/workbench-link.js';
 import type { CardActionData } from './card-handler.js';
 
 export const OVERVIEW_ACTION_REFRESH = 'dash_overview_refresh' as const;
@@ -167,6 +171,16 @@ function escapeLarkMd(text: string): string {
 export interface BuildOverviewCardOpts {
   invokerOpenId: string;
   locale: Locale;
+  /**
+   * 「打开工作台」按钮的目标。缺省（读不到 dashboard 端口/token）就不渲染按钮，
+   * 而不是渲染一个点了没反应的死链。链接怎么来的见 `core/workbench-link.ts`。
+   *
+   * 注意：这条链接带 Dashboard token，等价于凭证。它只能出现在已经过了
+   * `/dashboard` 管理员门禁的回复里——命令入口在 `dashboard-command/owner-gate.ts`
+   * 拦，回调入口在下面 `handleOverviewCardAction` 的 invoker-lock +
+   * `isDashboardAdmin` 拦。渲染它的地方不得放宽任何一层。
+   */
+  workbench?: { appLink: string; webUrl: string };
 }
 
 export interface OverviewSnapshotInput {
@@ -185,6 +199,32 @@ export function buildOverviewCard(
   const settingsSummary = buildSettingsSummary(snapshot.settings, opts.locale);
 
   const elements: unknown[] = [];
+
+  // ─── 打开工作台 ──────────────────────────────────────────────────────
+  // 排在最前面：这是新用户从飞书进 Web 工作台的唯一入口，排到会话/群组后面就
+  // 等于没有。纯链接按钮，没有 callback，所以不经过 handleOverviewCardAction。
+  // PC 用 appCenter AppLink（可右键固定成常驻标签页），移动端客户端没有这个容器，
+  // 直接给网页 URL。缺链接时整块不渲染，不留死按钮。
+  if (opts.workbench) {
+    elements.push({
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: {
+          tag: 'plain_text',
+          content: t('card.dashboard.overview.open_workbench', undefined, opts.locale),
+        },
+        type: 'primary',
+        multi_url: {
+          url: opts.workbench.appLink,
+          pc_url: opts.workbench.appLink,
+          android_url: opts.workbench.webUrl,
+          ios_url: opts.workbench.webUrl,
+        },
+      }],
+    });
+    elements.push({ tag: 'hr' });
+  }
 
   // ─── Sessions section ────────────────────────────────────────────────
   elements.push({
@@ -353,6 +393,9 @@ export interface OverviewCardHandlerDeps {
   locale?: Locale;
   /** Override `Date.now()` so tests are deterministic. */
   nowMs?: () => number;
+  /** Override the workbench link resolution (reads dashboard port/token from
+   *  disk in production). Tests inject a fixed value. */
+  resolveWorkbench?: (larkAppId: string) => WorkbenchButtonLinks | undefined;
 }
 
 export interface OverviewCardHandlerResult {
@@ -423,7 +466,10 @@ export async function handleOverviewCardAction(
   const nowMs = deps.nowMs ? deps.nowMs() : Date.now();
 
   if (action === OVERVIEW_ACTION_REFRESH) {
-    return rebuildOverview(client, operatorOpenId, locale);
+    // 刷新必须重新带上工作台按钮，否则用户点一下「🔄 刷新」入口就消失了。
+    // 这里已经过了 invoker-lock + isDashboardAdmin 两道门，才允许拼带 token 的链接。
+    const workbench = (deps.resolveWorkbench ?? resolveWorkbenchButtonLinks)(larkAppId);
+    return rebuildOverview(client, operatorOpenId, locale, workbench);
   }
 
   if (action === OVERVIEW_ACTION_GOTO_SESSIONS) {
@@ -534,6 +580,7 @@ async function rebuildOverview(
   client: DaemonClient,
   invokerOpenId: string,
   locale: Locale,
+  workbench?: WorkbenchButtonLinks,
 ): Promise<OverviewCardHandlerResult> {
   let r: Awaited<ReturnType<DaemonClient['request']>>;
   try {
@@ -557,7 +604,7 @@ async function rebuildOverview(
       schedules: body.schedules ?? [],
       settings: body.settings,
     },
-    { invokerOpenId, locale },
+    { invokerOpenId, locale, workbench },
   );
   return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
 }

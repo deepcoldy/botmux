@@ -1112,6 +1112,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 Schedules',
   'card.dashboard.overview.goto_settings': '📂 Settings',
   'card.dashboard.overview.goto_groups': '📂 Groups',
+  // Plain link button (appCenter AppLink) — not a `dash_overview_*` callback.
+  'card.dashboard.overview.open_workbench': 'Open Workbench',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

@@ -1113,6 +1113,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
   'card.dashboard.overview.goto_groups': '📂 群组',
+  // 「打开工作台」是纯链接按钮（appCenter AppLink），不是 dash_overview_* 回调。
+  'card.dashboard.overview.open_workbench': '打开工作台',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
