@@ -958,8 +958,10 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
 
 describe('终端面板：触屏改走 viewToken 链路', () => {
   const NOW = 1_900_000_001_000;
+  /** 两条链接都是同源的——api 层已把 view-link 改写到工作台 origin（反代自身端口未必对
+   *  客户端网段放行）。区别只在鉴权方式：带 viewToken 的走能力凭证，裸路径靠 Cookie。 */
   const VIEW_LINK = 'https://board.example/s/session-0?viewToken=view-cap-abc';
-  const SAME_ORIGIN = 'https://board.example/s/session-0';
+  const COOKIE_TERMINAL_URL = 'https://board.example/s/session-0';
   const TOUCH_FEEDBACK = '只读查看中。手机端为只读视图，需要输入请在电脑上操作。';
   let previousWindow: unknown;
 
@@ -1018,7 +1020,7 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
     const src = String(renderer.root.findByType('iframe').props.src);
     expect(src).toBe(VIEW_LINK);
     expect(src).toContain('viewToken=');
-    expect(src).not.toBe(SAME_ORIGIN);
+    expect(src).not.toBe(COOKIE_TERMINAL_URL);
     // viewToken 通道只读，接管按钮点了也送不进输入，摆出来只会误导。
     expect(buttonLabels(renderer)).not.toContain('接管输入');
     expect(buttonLabels(renderer)).not.toContain('释放输入');
@@ -1032,7 +1034,7 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
 
     // 桌面浏览器的 WS 正常带 Cookie，同源那条还捎带接管授权，没有理由绕道。
     expect(viewLinkCalls).toEqual([]);
-    expect(renderer.root.findByType('iframe').props.src).toBe(SAME_ORIGIN);
+    expect(renderer.root.findByType('iframe').props.src).toBe(COOKIE_TERMINAL_URL);
     expect(buttonLabels(renderer)).toContain('接管输入');
     expect(textOf(renderer.root)).toContain('只读查看中，点「接管输入」可操作。');
     expect(textOf(renderer.root)).not.toContain(TOUCH_FEEDBACK);
@@ -1047,7 +1049,7 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
     expect(renderer.root.findAllByType('iframe')).toHaveLength(0);
     expect(textOf(renderer.root)).toContain('只读链接获取失败');
     expect(renderer.root.findAll(node => node.type === 'a').map(node => node.props.href))
-      .not.toContain(SAME_ORIGIN);
+      .not.toContain(COOKIE_TERMINAL_URL);
     act(() => renderer.unmount());
   });
 });

@@ -27,7 +27,8 @@ export interface WorkbenchApi {
   getH5Context(signal?: AbortSignal): Promise<WorkbenchH5Context | null>;
   /** Capability URL for the read-only terminal (viewToken-bearing). The frame
    *  authenticates by this capability, so it also works where no Dashboard
-   *  cookie exists — a Feishu WebView being the case that motivated it. */
+   *  cookie exists — a Feishu WebView being the case that motivated it.
+   *  Returned rebased onto this page's origin — see `sameOriginViewLink`. */
   getTerminalViewLink(sessionId: string, signal?: AbortSignal): Promise<string | null>;
   /** 让 bot 在会话原话题里发一条 @ 拥有者的定位标记。服务端对每个会话有 30s
    *  限流，超了返回 429 + `retry-after`（见 WorkbenchApiError.retryAfterSeconds）。 */
@@ -139,6 +140,38 @@ function previewInteractionState(value: unknown): PreviewInteractionState {
   };
 }
 
+/** 当前工作台页面的 origin。无 window（SSR、或注入 fetchImpl 的单测）时返回 null，
+ *  此时「同源」无从谈起，调用方原样保留上游地址。 */
+function currentPageOrigin(): string | null {
+  const origin = (globalThis as { window?: { location?: { origin?: unknown } } })
+    .window?.location?.origin;
+  return typeof origin === 'string' && origin ? origin : null;
+}
+
+/** 把上游 view-link 改写成「工作台页面同源」的地址：只留 pathname + search，origin 换成
+ *  当前页面的。
+ *
+ *  上游返回的是**终端反代自身端口**上的绝对 URL（形如 `http://<host>:8801/s/<id>?viewToken=…`），
+ *  而客户端所在网段未必放行那个端口——实际踩到的案例：手机所在办公网只放行 dashboard 的
+ *  端口，对反代端口没有任何可达连接，iframe 直接加载失败、终端一片空白。dashboard 同源
+ *  也挂了同一套终端反代（`/s/*` 的 HTTP 反代 + WebSocket 升级桥接），路径与上游完全一致，
+ *  所以换掉 origin 就能绕开这层网络不可达。凭证在 `?viewToken=` 查询参数里，跟着 search
+ *  一起保留，鉴权链路不受 origin 改写影响。
+ *
+ *  origin 缺失或拼接失败（如沙箱 iframe 的不透明 origin，`window.location.origin` 为
+ *  "null"）时回退原地址：改写是可达性优化，失败不该把链接整个废掉。 */
+function sameOriginViewLink(parsed: URL): string {
+  const origin = currentPageOrigin();
+  if (!origin) return parsed.toString();
+  try {
+    const rebased = new URL(`${parsed.pathname}${parsed.search}`, origin);
+    if (rebased.protocol !== 'http:' && rebased.protocol !== 'https:') return parsed.toString();
+    return rebased.toString();
+  } catch {
+    return parsed.toString();
+  }
+}
+
 function controlPath(sessionId: string, action?: 'takeover' | 'release'): string {
   return `/api/sessions/${encodeURIComponent(sessionId)}/control${action ? `/${action}` : ''}`;
 }
@@ -191,14 +224,15 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
         );
         // Same untrusted-URL discipline the pane applies to riffAccessUrl: the
         // link is built by another daemon, so only http(s) without embedded
-        // credentials may reach the DOM.
+        // credentials may reach the DOM. Validate the upstream URL first, then
+        // rebase it onto this page's origin.
         if (typeof body.url !== 'string' || body.url.length > 2_048) return null;
         const parsed = new URL(body.url);
         if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
           || parsed.username || parsed.password) {
           return null;
         }
-        return parsed.toString();
+        return sameOriginViewLink(parsed);
       } catch {
         return null;
       }
