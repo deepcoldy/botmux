@@ -56,10 +56,44 @@ export function hasCloseResidual(body: unknown): boolean {
 }
 
 /**
- * Short label for the surviving remote session, for log lines and summaries.
- * Never returns an empty string, so a missing id cannot render as a blank.
+ * A LOCAL residual names a host subtree whose containment could not be proven
+ * gone; a REMOTE one names a cloud session that could not be cancelled. They
+ * demand OPPOSITE remediation, so no UI may render one as the other.
+ */
+export function closeResidualIsLocal(residual: ParsedCloseResidual | undefined): boolean {
+  return residual?.reason === 'local_subtree_unprovable_on_platform'
+    || residual?.reason === 'local_subtree_boundary_unproven';
+}
+
+/**
+ * Short label for a residual, for log lines and summaries. Never returns an
+ * empty string, so a missing value cannot render as a blank.
+ *
+ * For a REMOTE residual this is the surviving task id (the thing to clean up).
+ * For a LOCAL one there is no remote id — returning `taskId ?? 'unknown remote
+ * id'` here is exactly how a local host-process concern got mislabelled as a
+ * phantom remote session — so it returns a description of the host subtree
+ * instead.
  */
 export function describeCloseResidual(residual: ParsedCloseResidual | undefined): string {
   if (!residual) return '';
+  if (closeResidualIsLocal(residual)) {
+    return residual.reason === 'local_subtree_unprovable_on_platform'
+      ? '本地残留子进程无法在本平台证明已终止'
+      : '本地残留子进程未取得终止边界证明';
+  }
   return residual.taskId ?? 'unknown remote id';
+}
+
+/**
+ * The full user-facing clause for a close that left a residual, correct for
+ * BOTH kinds. Callers used to hardcode "远端会话未取消（…）", which misdirects an
+ * operator to a nonexistent remote session when the concern is a local host
+ * process still holding the injected credential.
+ */
+export function closeResidualClause(residual: ParsedCloseResidual | undefined): string {
+  if (!residual) return '';
+  return closeResidualIsLocal(residual)
+    ? `本地可能残留带凭证的子进程未确认终止（${describeCloseResidual(residual)}），需人工核查该主机进程`
+    : `远端会话未取消（${describeCloseResidual(residual)}），需人工清理`;
 }

@@ -142,6 +142,37 @@ describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
   });
 });
 
+describe('unrecorded-subtree latch (round-7 finding-2)', () => {
+  it('refuses write() and every close proof after a record failure', async () => {
+    // A long-lived child, so the record failure (not the child exiting) is what
+    // the test observes. The containment path SIGKILLs it — that is the point.
+    const bin = fakeBin('mojo-latch', [
+      `echo '{"type":"system","subtype":"init","session_id":"sid-latch"}'`,
+      'exec sleep 30',
+    ].join('\n'));
+    // Construct BEFORE poisoning: the constructor reads the store to adopt a nonce.
+    const backend = new MojoBackend({ bin } as never, 'sess-latch');
+    // Poison the containment store so recordContainmentHandle throws at spawn:
+    // a real child is running that nothing durable describes, which is exactly
+    // the fail-open the latch exists to prevent.
+    mkdirSync(join(dataDir, 'mojo-containment-handles.json')); // a DIR where a file must be
+    backend.spawn('', [], {} as never);
+    backend.write('turn');
+    // The latch is set synchronously the instant the record throws at spawn.
+    expect(await waitFor(
+      () => (backend as unknown as { containmentUnrecorded: boolean }).containmentUnrecorded,
+    )).toBe(true);
+
+    // write() is refused while latched.
+    expect(backend.write('another credentialed turn')).toBe(false);
+    // And every close proof is refused — the subtree is undescribed.
+    const outcome = await backend.destroySession();
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.error).toBe('containment_unrecorded_subtree');
+    backend.kill();
+  });
+});
+
 /** Real-kernel layer: needs cgroup v2 AND a delegated (writable) hierarchy. */
 const realBoundary = (): ReturnType<typeof prepareContainmentBoundary> => {
   try {

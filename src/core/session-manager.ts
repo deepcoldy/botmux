@@ -1895,9 +1895,21 @@ export async function restoreActiveSessions(
       try {
         const recoveredClose = await closeSession(session.sessionId);
         if (recoveredClose.ok) {
-          logger.info(
-            `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close without re-cancelling`,
-          );
+          // The device-isolation blocker is held by the durable containment
+          // handle regardless, but the recovered close may carry a LOCAL residual
+          // (the crashed daemon proved the remote gone but not the host subtree).
+          // Surface it distinctly at boot rather than swallowing it into a plain
+          // "recovered" line, so the residual the row still carries is visible.
+          if (recoveredClose.outcome === 'closed_with_residual') {
+            logger.warn(
+              `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close WITH residual `
+              + `(${recoveredClose.residual.reason}); the device-isolation blocker is retained`,
+            );
+          } else {
+            logger.info(
+              `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close without re-cancelling`,
+            );
+          }
           continue;
         }
         logger.error(

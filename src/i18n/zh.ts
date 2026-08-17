@@ -983,6 +983,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.close.text': '关闭后会话将无法继续，已有进度可能丢失。会话：{title}',
   'card.dashboard.sessions.close_failed': '⚠️ 关闭失败：{reason}',
   'card.dashboard.sessions.close_residual': '⚠️ **本地已关闭，但远端会话未取消**：`{taskId}`，需人工清理。',
+  'card.dashboard.sessions.close_residual_local': '⚠️ **本地已关闭，但可能残留带凭证的子进程未确认终止**：{taskId}。远端会话已取消，需人工核查本机进程。',
   'card.dashboard.sessions.session_not_found': '⚠️ 会话不存在或已被清理。',
   'card.dashboard.sessions.close.disabled.alreadyClosed': '会话已关闭',
   'card.dashboard.sessions.close.disabled.starting': '会话启动中，暂不可关闭',

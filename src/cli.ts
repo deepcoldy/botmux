@@ -34,7 +34,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
+import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
   findAncestorSessionContext as findLiveAncestorSessionContext,
   resolveSessionContext,
@@ -5494,8 +5494,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           // still holds the injected credential.
           ? {
             style: 'warn',
-            text: `⚠ 本地已删除 ${s.sessionId.substring(0, 8)}，但远端会话未取消`
-              + `（${describeCloseResidual(result.residual)}），需人工清理`,
+            text: `⚠ 本地已删除 ${s.sessionId.substring(0, 8)}，但${closeResidualClause(result.residual)}`,
           }
           : { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` })
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
@@ -5818,14 +5817,13 @@ async function cmdDelete(): Promise<void> {
       // counted in the summary, so a bulk delete cannot bury it.
       residual++;
       console.warn(
-        `⚠ ${s.sessionId.substring(0, 8)} ${s.title}：本地已关闭，但远端会话未取消`
-        + `（${describeCloseResidual(result.residual)}），需人工清理`,
+        `⚠ ${s.sessionId.substring(0, 8)} ${s.title}：本地已关闭，但${closeResidualClause(result.residual)}`,
       );
       continue;
     }
     console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.mode === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
   }
-  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}${residual ? `，${residual} 个远端未取消需人工清理` : ''}`);
+  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}${residual ? `，${residual} 个有残留需人工清理` : ''}`);
   if (failed > 0) process.exitCode = 1;
 }
 

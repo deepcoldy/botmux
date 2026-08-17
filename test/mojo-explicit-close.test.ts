@@ -1387,6 +1387,39 @@ describe('local residual survives durable retry, restart replay and the workerle
     expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'closed' });
   });
 
+  it('idempotent re-close STILL reports the local residual (round-7 finding-3)', async () => {
+    // The residual's runtime home (the journal) is wiped on commit. Without
+    // parking it on the row, a second close of the already-closed row — e.g. a
+    // client that lost the first response and retries — returned a plain `closed`,
+    // a false all-clear while the containment handle and blocker were still held.
+    const fixture = createFixture();
+    cancelMojoMock.mockResolvedValue({
+      kind: 'cancelled',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+
+    const first = await closeSession(fixture.session.sessionId);
+    expect(first).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
+    // The row is now closed and carries the parked local residual.
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'closed',
+      mojoLocalResidual: 'local_subtree_boundary_unproven',
+    });
+
+    const second = await closeSession(fixture.session.sessionId);
+    expect(second).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
+    // No second cancel — the row was already closed.
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+  });
+
   it('workerless durable-retry: the residual survives a failed prepare commit too', async () => {
     const fixture = createFixture();
     cancelMojoMock.mockResolvedValue({

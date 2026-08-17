@@ -7,6 +7,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  closeResidualClause,
+  closeResidualIsLocal,
   describeCloseResidual,
   hasCloseResidual,
   parseCloseResidual,
@@ -65,5 +67,31 @@ describe('parseCloseResidual', () => {
     for (const body of [undefined, null, 'closed', 42, []]) {
       expect(parseCloseResidual(body)).toBeUndefined();
     }
+  });
+});
+
+describe('local vs remote residual copy (round-7 finding-4)', () => {
+  it('classifies local-subtree reasons as local', () => {
+    expect(closeResidualIsLocal({ reason: 'local_subtree_boundary_unproven' })).toBe(true);
+    expect(closeResidualIsLocal({ reason: 'local_subtree_unprovable_on_platform' })).toBe(true);
+    expect(closeResidualIsLocal({ reason: 'mojo_lineage_quarantined', taskId: 'x' })).toBe(false);
+    expect(closeResidualIsLocal({ taskId: 'x' })).toBe(false);
+  });
+
+  it('never renders a local residual as a phantom "unknown remote id"', () => {
+    // The exact mislabel: a local host-subtree concern with no remote id used to
+    // render as "unknown remote id", sending the operator after a nonexistent
+    // remote session.
+    const local = describeCloseResidual({ reason: 'local_subtree_boundary_unproven' });
+    expect(local).not.toContain('remote');
+    expect(local).toContain('本地');
+  });
+
+  it('builds distinct clauses for local vs remote residuals', () => {
+    expect(closeResidualClause({ reason: 'mojo_lineage_quarantined', taskId: 'mojo-9' }))
+      .toContain('远端会话未取消');
+    const localClause = closeResidualClause({ reason: 'local_subtree_unprovable_on_platform' });
+    expect(localClause).toContain('本地');
+    expect(localClause).not.toContain('远端会话未取消');
   });
 });

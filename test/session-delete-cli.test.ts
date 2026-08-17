@@ -241,7 +241,9 @@ describe('botmux delete — daemon-first close', () => {
       expect(output).toContain('mojo-parked-9');
       expect(output).toContain('远端会话未取消');
       // The summary must flag it rather than reporting an unqualified success.
-      expect(output).toContain('远端未取消需人工清理');
+      // (Wording is residual-kind-neutral now that a LOCAL subtree residual can
+      // also appear here — the per-line message above still names the remote one.)
+      expect(output).toContain('有残留需人工清理');
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close(err => err ? reject(err) : resolve());

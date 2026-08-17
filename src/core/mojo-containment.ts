@@ -46,7 +46,8 @@
  * exist yet"; `proveContainmentQuiescent` is that missing mechanism, which is why
  * releasing is allowed here and only against a proven verdict.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
@@ -60,6 +61,78 @@ const FILE_NAME = 'mojo-containment-handles.json';
 /** Where per-session cgroups are created when the host supports cgroup v2. */
 const CGROUP_ROOT = '/sys/fs/cgroup';
 const CGROUP_SLICE = 'botmux.slice';
+
+/**
+ * Every pid enrolled ANYWHERE in a cgroup subtree — the leaf plus every
+ * descendant cgroup, read recursively.
+ *
+ * A single-level `cgroup.procs` read is not a containment proof: a same-uid
+ * process can `mkdir` a child cgroup under a leaf it owns and migrate itself
+ * into it, after which the leaf's own `cgroup.procs` reads empty while the
+ * process runs on in the nested group. Reading the whole subtree closes that
+ * escape. `{ok:false}` on any unreadable level is the fail-closed signal —
+ * "cannot enumerate" must never collapse into "nobody there".
+ *
+ * NOTE ON SCOPE: this proves quiescence of the subtree we OWN. It does not, and
+ * cannot, cover a same-uid adversary that migrates a process OUT to a sibling or
+ * ancestor cgroup — cgroups are not a security boundary against a peer uid, and
+ * only per-session uid isolation would close that. `prepareContainmentBoundary`
+ * nests the boundary under the daemon's own (delegated) cgroup so a non-root
+ * delegated daemon at least blocks UP-migration; the residual sibling case is
+ * held by device-isolation staying fail-closed (the blocker is dropped only on
+ * a proof, never inferred).
+ */
+function cgroupSubtreePids(dir: string): { ok: true; pids: number[] } | { ok: false; reason: string } {
+    let pids: number[];
+    try {
+        pids = readFileSync(`${dir}/cgroup.procs`, 'utf8')
+            .split('\n').map(l => Number(l.trim())).filter(n => Number.isInteger(n) && n > 0);
+    } catch (err) {
+        // ENOENT at a subtree root means that cgroup is genuinely gone.
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, pids: [] };
+        return { ok: false, reason: `cannot read ${dir}/cgroup.procs (${(err as NodeJS.ErrnoException).code ?? 'unknown'})` };
+    }
+    let entries: Dirent[];
+    try {
+        entries = readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, pids };
+        return { ok: false, reason: `cannot enumerate ${dir} (${(err as NodeJS.ErrnoException).code ?? 'unknown'})` };
+    }
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const child = cgroupSubtreePids(join(dir, entry.name));
+        if (!child.ok) return child;
+        pids.push(...child.pids);
+    }
+    return { ok: true, pids };
+}
+
+/**
+ * The cgroup the daemon itself lives in (from /proc/self/cgroup), used as the
+ * PARENT of per-session boundaries.
+ *
+ * Building boundaries at the hierarchy root makes their parent root-owned only
+ * when the daemon is root. Nesting under the daemon's own delegated cgroup means
+ * a non-root delegated daemon's boundaries have a parent it does not own, so a
+ * same-uid child cannot migrate UP and out of the delegated subtree (cgroup v2
+ * migration needs write access to the common ancestor). Falls back to the flat
+ * `botmux.slice` at the root when /proc/self/cgroup is unreadable or names the
+ * root — the caller's `mkdir` still degrades to a weak handle if neither works.
+ */
+function resolveSliceParent(cgroupRoot: string, procRoot = '/proc'): string {
+    try {
+        const rel = readFileSync(`${procRoot}/self/cgroup`, 'utf8')
+            .split('\n').find(l => l.startsWith('0::'))?.slice(3).trim();
+        if (rel && rel !== '/' && rel.startsWith('/')) {
+            const candidate = join(cgroupRoot, rel, CGROUP_SLICE);
+            // The daemon's cgroup dir must exist and be a real cgroup for nesting
+            // to mean anything; otherwise fall back.
+            if (existsSync(join(cgroupRoot, rel, 'cgroup.procs'))) return candidate;
+        }
+    } catch { /* fall through to the flat root slice */ }
+    return join(cgroupRoot, CGROUP_SLICE);
+}
 
 export interface StrongContainmentHandle {
     kind: 'cgroup';
@@ -370,15 +443,18 @@ export interface PreparedContainmentBoundary {
  */
 export function prepareContainmentBoundary(
     input: { sessionId: string; generation: number; nonce: string },
-    opts: { cgroupRoot?: string } = {},
+    opts: { cgroupRoot?: string; procRoot?: string } = {},
 ): PreparedContainmentBoundary | null {
     const cgroupRoot = opts.cgroupRoot ?? CGROUP_ROOT;
     if (!cgroupV2Available({ cgroupRoot })) return null;
+    // Nest under the daemon's own (delegated) cgroup so a non-root delegated
+    // daemon's boundaries have a root-owned parent — blocking a same-uid child
+    // from migrating UP and out. Falls back to the flat root slice.
+    const sliceParent = resolveSliceParent(cgroupRoot, opts.procRoot);
     // A stable, collision-free name: two generations of the same session must
     // not share a directory, or releasing one would release the other's proof.
     const dir = join(
-        cgroupRoot,
-        CGROUP_SLICE,
+        sliceParent,
         `mojo-${sanitizeForPath(input.sessionId)}-g${input.generation}-${randomBytes(4).toString('hex')}`,
     );
     try {
@@ -419,14 +495,22 @@ export function strongHandleFromPreparedBoundary(prepared: PreparedContainmentBo
  * empty (or already gone) afterwards — false means the caller must keep its
  * own fence up.
  */
-export function killPreparedBoundary(prepared: PreparedContainmentBoundary): boolean {
+export async function killPreparedBoundary(prepared: PreparedContainmentBoundary): Promise<boolean> {
     // The ONLY accepted proof of emptiness is a successful rmdir: the kernel
     // refuses to remove a cgroup with members, and once removed no late enroller
     // can enter (its `cgroup.procs` write fails, so the shim exits without
     // exec'ing). Reading `cgroup.procs` and seeing it empty is NOT enough — a
     // shim mid-handshake could enrol between the read and the rmdir, and a
     // freshly SIGKILLed member lingers as a listed zombie until reaped.
+    //
+    // The attempts are SPACED (~50ms): `cgroup.kill` SIGKILLs the members, but a
+    // setsid descendant that reparents to init lingers as a listed zombie until
+    // init reaps it, so a zero-backoff loop would usually exhaust its tries
+    // against a corpse and latch the wedge. Descendant cgroups are killed too —
+    // cgroup.kill is recursive, but a nested cgroup dir must still be rmdir'd
+    // before the parent, which the depth-first sweep below handles.
     for (let attempt = 0; attempt < 5; attempt++) {
+        if (attempt > 0) await new Promise<void>(r => { setTimeout(r, 50).unref?.(); });
         try {
             writeFileSync(`${prepared.cgroupPath}/cgroup.kill`, '1\n');
         } catch (err) {
@@ -434,21 +518,41 @@ export function killPreparedBoundary(prepared: PreparedContainmentBoundary): boo
             // Unwritable kill knob (or a synthetic boundary in tests): fall
             // through — the rmdir below is still the authoritative proof.
         }
-        // On a synthetic (plain-directory) boundary the knob writes above CREATE
-        // files, which a plain rmdir refuses. Unlinking them is a no-op on real
-        // cgroupfs (EPERM, swallowed) and restores rmdir's meaning in tests.
-        for (const knob of ['cgroup.procs', 'cgroup.kill']) {
-            try { unlinkSync(`${prepared.cgroupPath}/${knob}`); } catch { /* cgroupfs refuses; fine */ }
-        }
-        try {
-            rmdirSync(prepared.cgroupPath);
-            return true;
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
-            // EBUSY / ENOTEMPTY: members still live (or racing in) — kill again.
-        }
+        if (rmdirCgroupTree(prepared.cgroupPath)) return true;
+        // EBUSY / ENOTEMPTY: members still live (or racing in) — kill again.
     }
     return false;
+}
+
+/**
+ * Depth-first rmdir of a cgroup subtree: child cgroups must be removed before
+ * their parent. Returns true when the whole tree is gone.
+ *
+ * On a SYNTHETIC (plain-directory) boundary the knob writes leave `cgroup.procs`
+ * / `cgroup.kill` files behind, which a plain rmdir refuses; unlinking them is a
+ * no-op on real cgroupfs (EPERM, swallowed) and restores rmdir's meaning in
+ * tests. Only the two known knob names are unlinked — never arbitrary content —
+ * so a real member file can't be spirited away.
+ */
+function rmdirCgroupTree(dir: string): boolean {
+    let entries: Dirent[];
+    try {
+        entries = readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+    for (const entry of entries) {
+        if (entry.isDirectory() && !rmdirCgroupTree(join(dir, entry.name))) return false;
+    }
+    for (const knob of ['cgroup.procs', 'cgroup.kill']) {
+        try { unlinkSync(`${dir}/${knob}`); } catch { /* cgroupfs refuses; fine */ }
+    }
+    try {
+        rmdirSync(dir);
+        return true;
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    }
 }
 
 /**
@@ -550,21 +654,14 @@ export function proveContainmentQuiescent(
     opts: ProveContainmentOpts = {},
 ): QuiescenceVerdict {
     if (handle.kind === 'cgroup') {
-        let raw: string;
-        try {
-            raw = readFileSync(`${handle.cgroupPath}/cgroup.procs`, 'utf8');
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                return { proven: true, handle, evidence: 'cgroup-empty' };
-            }
-            return {
-                proven: false,
-                handle,
-                reason: `cannot read ${handle.cgroupPath}/cgroup.procs `
-                    + `(${(err as NodeJS.ErrnoException).code ?? 'unknown'})`,
-            };
+        // Read the WHOLE subtree, not just the leaf: a same-uid process can mkdir
+        // a child cgroup and migrate into it, which a single-level read would miss
+        // (it would see the leaf empty and call the tree gone).
+        const subtree = cgroupSubtreePids(handle.cgroupPath);
+        if (!subtree.ok) {
+            return { proven: false, handle, reason: subtree.reason };
         }
-        const pids = raw.split('\n').map(l => Number(l.trim())).filter(n => Number.isInteger(n) && n > 0);
+        const pids = subtree.pids;
         if (pids.length === 0) return { proven: true, handle, evidence: 'cgroup-empty' };
         // A non-empty cgroup is NOT automatically a live tree. `cgroup.procs`
         // keeps listing a zombie until its parent reaps it, and a zombie executes
@@ -963,6 +1060,49 @@ export function releaseContainmentHandle(
         );
         return decision;
     }
+    // ORDER MATTERS: for a cgroup handle the rmdir is the last kernel-side
+    // re-check of the proof, so it runs BEFORE the store record is removed.
+    // Removing the store entry first (as this once did) meant an rmdir that
+    // failed — because a member raced back in between the proof read and here —
+    // could only be logged as a warning, with the handle and the blocker already
+    // gone. Now a failed rmdir on an empty-cgroup proof VETOES the release: the
+    // handle stays, and the caller gets a residual decision.
+    if (handle.kind === 'cgroup') {
+        // Re-read the AUTHORITATIVE subtree membership before forgetting the tree.
+        // A zombie-only cgroup is genuinely quiescent yet still LISTS its zombie
+        // (and is un-rmdir-able until the parent reaps it), so that proof is
+        // allowed to release without an empty read. Every OTHER populated read at
+        // release means a member raced back in between the proof and here — VETO.
+        // The check keys off the kernel membership read, NOT rmdir success: the
+        // knob-unlinking in rmdirCgroupTree is a test accommodation and must never
+        // be what decides whether the tree is empty.
+        if (decision.evidence !== 'cgroup-zombie-only') {
+            const recheck = cgroupSubtreePids(handle.cgroupPath);
+            const live = recheck.ok ? recheck.pids : [-1]; // unreadable → treat as populated
+            if (live.length > 0) {
+                logger.error(
+                    `[mojo] session ${handle.sessionId}: release VETOED — cgroup ${handle.cgroupPath} `
+                    + `still has members (${recheck.ok ? live.join(',') : recheck.reason}); `
+                    + 'keeping the handle and the device-isolation blocker',
+                );
+                return {
+                    boundaryProof: false,
+                    releaseAuthorised: false,
+                    evidence: decision.evidence,
+                    residual: {
+                        deviceIsolation: true,
+                        pids: recheck.ok ? live : undefined,
+                        reason: 'cgroup not provably empty at release (member raced back in)',
+                    },
+                    signalsStopped: true,
+                };
+            }
+        }
+        // Empty (or zombie-only) is confirmed — reclaim the directory. rmdir is a
+        // last kernel-side check but no longer the gate; a failure here on the
+        // zombie-only path is expected and reported below.
+        rmdirCgroupTree(handle.cgroupPath);
+    }
     const path = filePath(dataDir);
     mkdirSync(dirname(path), { recursive: true });
     withFileLockSync(path, () => {
@@ -976,14 +1116,9 @@ export function releaseContainmentHandle(
         writeStrict(data, dataDir);
     });
     if (handle.kind === 'cgroup') {
-        // ENOENT means it was already reclaimed. Anything else leaves a directory
-        // behind that an operator would otherwise find with no explanation: the most
-        // common cause is a ZOMBIE-ONLY cgroup, which this module deliberately
-        // accepts as quiescent (a zombie executes nothing) while the kernel still
-        // refuses rmdir on a non-empty cgroup. Say so rather than swallowing it.
-        //
-        // Not a failure: the handle is already out of the store and the blocker may
-        // be dropped, so the close must not be refused over a leftover directory.
+        // A zombie-only cgroup was released above without a successful rmdir; the
+        // empty directory can be reclaimed once its parent reaps the zombie. Say
+        // so rather than leaving an operator to find it with no explanation.
         try {
             rmdirSync(handle.cgroupPath);
         } catch (err) {

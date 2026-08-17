@@ -49,6 +49,40 @@ function freshDataDir(): string {
     return mkdtempSync(join(tmpdir(), 'mojo-containment-'));
 }
 
+describe('the strong proof reads the WHOLE cgroup subtree (round-7 P0-1, nested escape)', () => {
+    // Runs on ANY platform (synthetic cgroup dirs), so — unlike the Linux-only
+    // real-kernel escape probe — this ACTUALLY runs in CI. It models the migration
+    // variant the single-level read missed: a same-uid process mkdir's a child
+    // cgroup and migrates into it, leaving the leaf's own cgroup.procs empty.
+    it('is NOT proven when a descendant cgroup still holds a LIVE process', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'cg-nested-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');      // leaf reads empty...
+        mkdirSync(join(dir, 'evaded'));
+        writeFileSync(join(dir, 'evaded', 'cgroup.procs'), '4242\n'); // ...child holds pid 4242
+        // A synthetic /proc where 4242 is RUNNING, so the proof's liveness check
+        // (which reads /proc, absent on macOS) sees it as executing rather than
+        // gone. This isolates the RECURSION: the migrated-out pid is surfaced.
+        const proc = mkdtempSync(join(tmpdir(), 'cg-nested-proc-'));
+        mkdirSync(join(proc, '4242'));
+        writeFileSync(join(proc, '4242', 'stat'), '4242 (mojo) R 1 0 0');
+        const handle: StrongContainmentHandle = {
+            kind: 'cgroup', sessionId: 's', generation: 1, cgroupPath: dir, nonce: 'n',
+        };
+        expect(proveContainmentQuiescent(handle, { procRoot: proc }).proven).toBe(false);
+    });
+
+    it('IS proven only when the whole subtree is empty', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'cg-empty-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');
+        mkdirSync(join(dir, 'child'));
+        writeFileSync(join(dir, 'child', 'cgroup.procs'), '');
+        const handle: StrongContainmentHandle = {
+            kind: 'cgroup', sessionId: 's', generation: 1, cgroupPath: dir, nonce: 'n',
+        };
+        expect(proveContainmentQuiescent(handle).proven).toBe(true);
+    });
+});
+
 /** A synthetic /proc with a controllable boot id and one process. */
 function fakeProc(opts: { bootId: string; pids?: Record<number, number> }): string {
     const root = mkdtempSync(join(tmpdir(), 'mojo-proc-'));
@@ -968,31 +1002,48 @@ describe('an impossible verdict is still safe', () => {
     });
 });
 
-describe('a cgroup that cannot be reclaimed is reported, not swallowed', () => {
-    it('warns (once) when rmdir fails, naming the path and the reason', async () => {
-        // The zombie-only case: proven quiescent, so the handle is released and the
-        // blocker may drop -- but the kernel still refuses rmdir on a non-empty
-        // cgroup, leaving a directory an operator would otherwise find unexplained.
-        const { logger } = await import('../src/utils/logger.js');
-        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-warn-'));
-        // A NON-EMPTY directory makes rmdir fail with ENOTEMPTY, which is the same
-        // shape as a cgroup still listing a zombie.
-        const dir = mkdtempSync(join(tmpdir(), 'stuck-cgroup-'));
+describe('release re-checks emptiness BEFORE forgetting the tree (round-7 P1-1)', () => {
+    it('VETOES the release when a member raced back into a cgroup-empty proof', () => {
+        // The exact ordering bug: releasing the store handle first, then finding
+        // rmdir fails, could only warn — with the blocker already gone. Now a
+        // populated cgroup at release time keeps the handle and the blocker.
+        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-veto-'));
+        const dir = mkdtempSync(join(tmpdir(), 'raced-cgroup-'));
+        // A pid appeared after the proof read — release must NOT forget the tree.
+        writeFileSync(join(dir, 'cgroup.procs'), '4242\n');
+        const handle: StrongContainmentHandle = {
+            kind: 'cgroup', sessionId: 'raced-sess', generation: 1, cgroupPath: dir, nonce: 'n',
+        };
+        recordContainmentHandle(handle, dataDir);
+        // Bare proven verdict → evidence defaults to cgroup-empty.
+        const decision = releaseContainmentHandle({ proven: true, handle }, dataDir);
+        expect(decision.releaseAuthorised).toBe(false);
+        expect(decision.residual).not.toBeNull();
+        // Handle and blocker retained.
+        expect(hasUnprovenContainment('raced-sess', dataDir)).toBe(true);
+    });
+
+    it('RELEASES a zombie-only cgroup even when its directory cannot be removed', () => {
+        // Zombie-only is genuinely quiescent (a zombie executes nothing) yet the
+        // kernel refuses rmdir until the parent reaps it. That case must still
+        // release, or a stuck directory would wedge the session forever.
+        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-zombie-'));
+        const dir = mkdtempSync(join(tmpdir(), 'zombie-cgroup-'));
         writeFileSync(join(dir, 'cgroup.procs'), '');
+        // A nested dir with a stray (non-knob) file makes rmdir genuinely fail,
+        // standing in for an un-rmdir-able zombie cgroup.
+        mkdirSync(join(dir, 'leaf'));
+        writeFileSync(join(dir, 'leaf', 'not-a-knob'), 'x');
         const handle: StrongContainmentHandle = {
             kind: 'cgroup', sessionId: 'zombie-sess', generation: 1, cgroupPath: dir, nonce: 'n',
         };
         recordContainmentHandle(handle, dataDir);
-        const warns: string[] = [];
-        const spy = vi.spyOn(logger, 'warn').mockImplementation((m: unknown) => { warns.push(String(m)); });
-        try {
-            releaseContainmentHandle({ proven: true, handle }, dataDir);
-        } finally { spy.mockRestore(); }
-        // Released despite the leftover: a stuck directory must never refuse a close.
+        const decision = releaseContainmentHandle(
+            { proven: true, handle, evidence: 'cgroup-zombie-only' }, dataDir,
+        );
+        expect(decision.releaseAuthorised).toBe(true);
+        // Released despite the leftover: a stuck directory must never wedge a close.
         expect(hasUnprovenContainment('zombie-sess', dataDir)).toBe(false);
-        const hit = warns.find(w => w.includes(dir));
-        expect(hit).toBeDefined();
-        expect(hit).toContain('ENOTEMPTY');
     });
 
     it('stays SILENT when the cgroup was already reclaimed (ENOENT)', async () => {

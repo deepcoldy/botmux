@@ -4355,9 +4355,13 @@ async function prepareMojoExplicitClose(
  * parked together; it is passed through verbatim so manual cleanup sees both.
  */
 export function mojoCloseResidualForRow(session: Session | undefined): CloseResidual | undefined {
+  // A parked REMOTE lineage outranks a local residual: it names a live remote
+  // session burning cloud time, the more urgent cleanup, and the response has a
+  // single residual slot. The local residual surfaces whenever nothing is parked.
   const parked = session?.mojoQuarantinedLineage;
-  if (!parked) return undefined;
-  return { reason: 'mojo_lineage_quarantined', taskId: parked };
+  if (parked) return { reason: 'mojo_lineage_quarantined', taskId: parked };
+  if (session?.mojoLocalResidual) return { reason: session.mojoLocalResidual };
+  return undefined;
 }
 
 /**
@@ -4987,6 +4991,12 @@ export async function closeSession(
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
         ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
+        // Park a LOCAL residual so an idempotent re-close still reports it — the
+        // journal (its runtime home) is wiped by this same transaction.
+        ...(prepared.residual
+          && prepared.residual.reason !== 'mojo_lineage_quarantined'
+          ? { parkLocalResidual: prepared.residual.reason }
+          : {}),
         ...(isOwnedRiffClose || clearMojoLineage || prepared.parkMojoLineage
           ? { clearRiffParentTaskId: true }
           : {}),

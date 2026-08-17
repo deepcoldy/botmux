@@ -25,7 +25,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { config } from '../../config.js';
 import { formatUrlHost } from '../../core/dashboard-url.js';
-import { describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import { terminalMultiUrl } from './card-builder.js';
@@ -852,8 +852,12 @@ export async function handleSessionsCardAction(
       elements?.unshift({
         tag: 'markdown',
         // locale-aware: an English bot must not receive a Chinese warning.
+        // A LOCAL residual is a host subtree, not a remote session — a distinct
+        // key so the operator is not sent after a nonexistent remote id.
         content: t(
-          'card.dashboard.sessions.close_residual',
+          closeResidualIsLocal(residual)
+            ? 'card.dashboard.sessions.close_residual_local'
+            : 'card.dashboard.sessions.close_residual',
           { taskId: describeCloseResidual(residual) },
           locale,
         ),

@@ -1116,7 +1116,7 @@ function ManageDialog(props: {
         const note = closed.length === 0
           ? ''
           : `（关闭 ${ok} 个会话${failed ? `，${failed} 个失败` : ''}`
-            + `${residuals.length ? `，${residuals.length} 个远端未取消需人工清理：${residuals.join(', ')}` : ''}）`;
+            + `${residuals.length ? `，${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}）`;
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
       alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
@@ -1152,7 +1152,7 @@ function ManageDialog(props: {
           const closedNote = closed.length === 0
             ? ''
             : `\n关闭了 ${ok} 个会话${failed ? `，${failed} 个会话关闭失败` : ''}`
-              + `${residuals.length ? `\n⚠️ ${residuals.length} 个远端会话未取消，需人工清理：${residuals.join(', ')}` : ''}。`;
+              + `${residuals.length ? `\n⚠️ ${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}。`;
           alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
           await props.onReloadGroups({ force: true });
           props.onClose();

@@ -18,7 +18,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   parseIdleCleanupHours,
@@ -3062,8 +3062,11 @@ function SessionsPage(): React.JSX.Element {
       // moment the operator can be told.
       const residual = parseCloseResidual(body);
       if (residual) {
-        alert(`⚠️ Closed locally, but the remote session was NOT cancelled: `
-          + `${describeCloseResidual(residual)} — manual cleanup required.`);
+        alert(closeResidualIsLocal(residual)
+          ? `⚠️ Closed locally, but a credentialed host subtree could NOT be proven terminated: `
+            + `${describeCloseResidual(residual)}. The remote session WAS cancelled — inspect the local host process.`
+          : `⚠️ Closed locally, but the remote session was NOT cancelled: `
+            + `${describeCloseResidual(residual)} — manual cleanup required.`);
       }
       setSelected(prev => {
         const next = new Set(prev);

@@ -586,6 +586,15 @@ export interface Session {
    */
   mojoQuarantinedLineage?: string;
   /**
+   * A LOCAL-subtree residual parked on the row at close time, so an idempotent
+   * re-close of an already-closed row still reports `closed_with_residual`
+   * instead of a false all-clear. Distinct from `mojoQuarantinedLineage` (which
+   * names a surviving REMOTE session): this names a host subtree whose
+   * containment handle is still held, and its cleanup is local. Cleared only
+   * when the containment handle is released.
+   */
+  mojoLocalResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+  /**
    * Set alongside `mojoQuarantinedLineage` and cleared once the user has been told.
    *
    * The parking itself is irreversible for that lineage, so a log line is not

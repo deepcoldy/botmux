@@ -868,6 +868,14 @@ export function closeSession(
      * everything else — is what makes "closed + parked" actually atomic.
      */
     parkMojoLineage?: string;
+    /**
+     * Park a LOCAL-subtree residual as PART of this transaction, so an idempotent
+     * re-close of the already-closed row still reports `closed_with_residual`.
+     * The journal (the residual's other home) is wiped on commit below, and a
+     * client that lost the first response and retries would otherwise get a false
+     * all-clear while the containment handle and blocker are still held.
+     */
+    parkLocalResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   } = {},
 ): void {
   loadForWrite();
@@ -880,6 +888,7 @@ export function closeSession(
     const priorQueuedAttachments = session.queuedAttachments;
     const priorQuarantinedLineage = session.mojoQuarantinedLineage;
     const priorQuarantineNoticePending = session.mojoQuarantineNoticePending;
+    const priorLocalResidual = session.mojoLocalResidual;
     const priorMojoCloseJournal = session.mojoCloseJournal
       ? { ...session.mojoCloseJournal }
       : undefined;
@@ -888,6 +897,9 @@ export function closeSession(
     session.dashboardAttachments = undefined;
     session.queuedAttachments = undefined;
     session.mojoCloseJournal = undefined;
+    // Survives close on purpose — the containment handle is still in the durable
+    // store, so the row must keep reporting the residual until the handle clears.
+    if (opts.parkLocalResidual) session.mojoLocalResidual = opts.parkLocalResidual;
     if (opts.parkMojoLineage) {
       // Keep both ids when a different one was already parked: each is the only
       // handle left for manual cleanup of its remote session.
@@ -913,6 +925,7 @@ export function closeSession(
       // a new one — i.e. the "close failed, retry unchanged" guarantee is broken.
       session.mojoQuarantinedLineage = priorQuarantinedLineage;
       session.mojoQuarantineNoticePending = priorQuarantineNoticePending;
+      session.mojoLocalResidual = priorLocalResidual;
       session.mojoCloseJournal = priorMojoCloseJournal;
       throw err;
     }
