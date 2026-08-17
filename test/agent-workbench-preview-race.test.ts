@@ -2,7 +2,11 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PreviewInteractionState, WorkbenchApi } from '../src/dashboard/web/agent-workbench-api.js';
+import type { WorkbenchCapabilities } from '../src/dashboard/web/agent-workbench-capabilities.js';
 import { TerminalPane, WebPane } from '../src/dashboard/web/agent-workbench-panes.js';
+
+/** 本文件全部用例都是「有权身份」的时序问题，三能力齐全（P1-4）。 */
+const FULL_CAPABILITIES: WorkbenchCapabilities = { canLocate: true, canControl: true, canInteract: true };
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
   let resolve!: (value: T) => void;
@@ -48,6 +52,7 @@ describe('Agent Workbench preview request ordering', () => {
         },
         api,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         now: Date.now(),
       }));
     });
@@ -88,6 +93,7 @@ describe('Agent Workbench preview request ordering', () => {
         session: { sessionId: 's1', status: 'working', webPort: 3000, proxyPort: 31151 },
         api,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         now: 1_000,
         location: { protocol: 'http:', origin: 'http://dashboard.test', hostname: 'dashboard.test' },
       }));
@@ -128,6 +134,7 @@ describe('Agent Workbench preview request ordering', () => {
         },
         api,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         now: 1_000,
       }));
     });

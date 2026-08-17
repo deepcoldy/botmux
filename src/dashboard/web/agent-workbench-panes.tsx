@@ -29,11 +29,17 @@ import {
   type TerminalControlState,
   type WorkbenchApi,
 } from './agent-workbench-api.js';
+import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 
 interface PaneCommonProps {
   session: WorkbenchSessionRow;
   api: WorkbenchApi;
   authenticated: boolean;
+  /** P1-4：服务端投影的最小操作能力集。`authenticated` 继续决定观察级链路
+   *  （同源 iframe vs viewToken、控制权状态拉取）；写操作入口各看自己的布尔：
+   *  终端「接管输入/释放输入」看 canControl，Preview「开启交互/立即锁定」看
+   *  canInteract。触屏只读限制是叠加在这之上的，不是替换。 */
+  capabilities: WorkbenchCapabilities;
   now: number;
 }
 
@@ -299,10 +305,12 @@ export function TerminalPane(props: PaneCommonProps & {
   // Fires once per session for the "open writable" shortcut. A platform owner
   // (`fixed`) already writes, and an unauthenticated viewer cannot take over at
   // all, so neither needs the request. 触屏也跳过：那边的 iframe 走 viewToken 只读通道，
-  // 抢来的写权限自己用不上，反而会把别人电脑上的输入权顶掉。
+  // 抢来的写权限自己用不上，反而会把别人电脑上的输入权顶掉。canControl=false 的
+  // 身份（平台 teammate/guest 等）同样跳过——那个 POST 只会 403（P1-4）。
   const autoTakeoverDone = useRef<string | null>(null);
   useEffect(() => {
-    if (!props.autoTakeControl || !props.authenticated || touch || phase !== 'ready') return;
+    if (!props.autoTakeControl || !props.authenticated || !props.capabilities.canControl
+      || touch || phase !== 'ready') return;
     if (!control || control.mode !== 'readonly' || control.fixed) return;
     if (autoTakeoverDone.current === props.session.sessionId) return;
     autoTakeoverDone.current = props.session.sessionId;
@@ -361,8 +369,10 @@ export function TerminalPane(props: PaneCommonProps & {
         <div className="wb-pane-actions">
           {frameUrl ? <a href={frameUrl} target="_blank" rel="noopener noreferrer">新标签页打开</a> : null}
           {/* 触屏不给接管按钮：那边挂的是 viewToken 只读通道，接管到手也送不进输入，
-              摆出来只会让人反复点。 */}
-          {!externalTerminalUrl && terminalUrl && props.authenticated && !touch && !control?.fixed ? (
+              摆出来只会让人反复点。canControl=false（平台 teammate/guest 等）同样不给：
+              那个入口点了只会 403（P1-4，服务端投影的最小能力集）。 */}
+          {!externalTerminalUrl && terminalUrl && props.authenticated
+            && props.capabilities.canControl && !touch && !control?.fixed ? (
             controlled
               ? <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('release')}>释放输入</button>
               : <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('takeover')}>接管输入</button>
@@ -376,8 +386,10 @@ export function TerminalPane(props: PaneCommonProps & {
           : phase === 'loading' ? '正在检查终端权限…' : error || (control?.fixed
             ? '平台所有者身份已登录，可直接输入。'
             : controlled ? '已接管，可键盘输入。'
-              : props.authenticated ? '只读查看中，点「接管输入」可操作。'
-                : '只读查看。登录 Dashboard 后可接管。')}
+              // 没有接管能力的身份别劝人去点一个根本没渲染的按钮。
+              : props.authenticated && props.capabilities.canControl ? '只读查看中，点「接管输入」可操作。'
+                : props.authenticated ? '只读查看中，当前身份不可接管输入。'
+                  : '只读查看。登录 Dashboard 后可接管。')}
       </div>
       <div className="wb-pane-frame-shell">
         {externalTerminalUrl ? (
@@ -570,7 +582,9 @@ export function WebPane(props: PaneCommonProps): JSX.Element {
         </div>
         <div className="wb-pane-actions">
           {previewPath ? <a href={previewPath} target="_blank" rel="noopener noreferrer">新标签页打开</a> : null}
-          {previewPath && props.authenticated ? (
+          {/* canInteract=false（平台 teammate/guest 等）不渲染解锁入口：那个 POST
+              只会 403（P1-4）。只读身份仍可看预览，遮罩保持锁定态。 */}
+          {previewPath && props.authenticated && props.capabilities.canInteract ? (
             interaction.mode === 'interactive'
               ? <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('lock')}>立即锁定</button>
               : <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('unlock')}>开启交互</button>
@@ -647,6 +661,7 @@ function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { t
     session: props.session,
     api: props.api,
     authenticated: props.authenticated,
+    capabilities: props.capabilities,
     now: props.now,
     location: props.location,
     onRatioChange: props.onRatioChange,
@@ -674,8 +689,8 @@ function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { t
 function PaneTreeNode(props: PaneTreeProps): JSX.Element {
   if (props.tree.type === 'split') return <SplitPane {...props} tree={props.tree} />;
   return props.tree.pane === 'terminal'
-    ? <TerminalPane session={props.session} api={props.api} authenticated={props.authenticated} now={props.now} location={props.location} />
-    : <WebPane session={props.session} api={props.api} authenticated={props.authenticated} now={props.now} />;
+    ? <TerminalPane session={props.session} api={props.api} authenticated={props.authenticated} capabilities={props.capabilities} now={props.now} location={props.location} />
+    : <WebPane session={props.session} api={props.api} authenticated={props.authenticated} capabilities={props.capabilities} now={props.now} />;
 }
 
 export function WorkbenchPaneRegion(props: PaneCommonProps & {
@@ -695,6 +710,7 @@ export function WorkbenchPaneRegion(props: PaneCommonProps & {
         session={props.session}
         api={props.api}
         authenticated={props.authenticated}
+        capabilities={props.capabilities}
         now={props.now}
         location={props.location}
         onRatioChange={props.onRatioChange}

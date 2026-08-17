@@ -81,10 +81,11 @@ window.localStorage.setItem(workbenchLayoutStorageKey(sessionId), JSON.stringify
   chatRequested: false,
 }));
 
+const authenticated = params.get('authenticated') !== 'false';
 const common = {
   sessions,
   online: scenario !== 'failure',
-  authenticated: params.get('authenticated') !== 'false',
+  authenticated,
   initialSessionId: sessionId,
   sdk,
   onRouteChange: () => {},
@@ -103,6 +104,9 @@ if (surface === 'dock') {
   root.render(
     <AgentWorkbenchView
       {...common}
+      // 浏览器夹具模拟 legacy owner：登录态即三能力齐全（P1-4 投影值）；
+      // 未登录场景与真实匿名一致，全 false。
+      capabilities={{ canLocate: authenticated, canControl: authenticated, canInteract: authenticated }}
       storage={window.localStorage}
       location={window.location}
     />,

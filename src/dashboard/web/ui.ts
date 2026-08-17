@@ -19,6 +19,10 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  type WorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
 import { larkHosts, normalizeBrand } from '../../im/lark/lark-hosts.js';
 
 type UiListener = () => void;
@@ -39,6 +43,11 @@ class DashboardUiState {
   // latter alone controls host-management affordances across the rest of the
   // Dashboard.
   workbenchAuthed = true;
+  // P1-4：服务端投影的最小操作能力集（GET /api/workbench/capabilities，由
+  // app.tsx 的 loadAuthState 严格解析后写入）。与 workbenchAuthed 相反，它默认
+  // fail-closed 全 false：workbenchAuthed 只证明可进工作台，三类操作入口（定位/
+  // 终端接管/Preview 交互）各自只看对应布尔，绝不回落 true。
+  workbenchCapabilities: WorkbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
   // Effective dashboard sharing policy. When enabled, tokenless visitors may
   // read allow-listed dashboard data; it does not downgrade authenticated users.
   publicReadOnly = false;

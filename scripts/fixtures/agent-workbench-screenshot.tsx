@@ -101,6 +101,7 @@ createRoot(document.getElementById('root')!).render(
     sessions={sessions}
     online
     authenticated
+    capabilities={{ canLocate: true, canControl: true, canInteract: true }}
     initialSessionId={SESSION_ID}
     now={NOW}
     viewportWidth={1440}

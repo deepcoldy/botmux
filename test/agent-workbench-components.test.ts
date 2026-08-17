@@ -9,11 +9,25 @@ import {
   type TerminalFrameStatus,
 } from '../src/dashboard/web/agent-workbench-panes.js';
 import type { WorkbenchApi } from '../src/dashboard/web/agent-workbench-api.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  parseWorkbenchCapabilities,
+  type WorkbenchCapabilities,
+} from '../src/dashboard/web/agent-workbench-capabilities.js';
+// 服务端投影函数：P1-4 六类身份矩阵直接消费它，把组件渲染钉在服务端同一份投影上。
+import {
+  projectWorkbenchOperationCapabilities,
+  type WorkbenchCapabilityActor,
+} from '../src/dashboard/auth.js';
 import { defaultWorkbenchLayout, type WorkbenchSessionRow } from '../src/dashboard/web/agent-workbench-model.js';
 import {
   workbenchLayoutStorageKey,
   type WorkbenchStorage,
 } from '../src/dashboard/web/agent-workbench-storage.js';
+
+/** legacy owner 的服务端投影值（P1-4）：三类操作能力齐全。既有用例统一用它——
+ *  它们验证的都是「有权身份」形态；按能力隐藏入口的矩阵在文件末尾单独一组。 */
+const FULL_CAPABILITIES: WorkbenchCapabilities = { canLocate: true, canControl: true, canInteract: true };
 
 const api: WorkbenchApi = {
   getTerminalControl: async () => ({ mode: 'readonly', owned: false }),
@@ -64,6 +78,7 @@ function kindViewProps(session: WorkbenchSessionRow, overrides: Partial<{ api: W
     sessions: [session],
     online: true,
     authenticated: true,
+    capabilities: FULL_CAPABILITIES,
     initialSessionId: session.sessionId,
     viewportWidth: 1440,
     now: 1_900_000_001_000,
@@ -118,6 +133,7 @@ function railViewProps(storage: WorkbenchStorage) {
     sessions: sessions(3),
     online: true,
     authenticated: true,
+    capabilities: FULL_CAPABILITIES,
     initialSessionId: 'session-0',
     viewportWidth: 1440,
     now: 1_900_000_001_000,
@@ -139,6 +155,7 @@ describe('Agent Workbench components', () => {
         sessions: sessions(6),
         online: true,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         initialSessionId: 'session-0',
         viewportWidth: 1440,
         now: 1_900_000_001_000,
@@ -189,6 +206,7 @@ describe('Agent Workbench components', () => {
         sessions: sessions(),
         online: true,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         initialSessionId: 'session-0',
         viewportWidth: 1440,
         now: 1_900_000_001_000,
@@ -244,6 +262,7 @@ describe('Agent Workbench components', () => {
         sessions: sessions(12),
         online: true,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         initialSessionId: 'session-0',
         viewportWidth: 390,
         api,
@@ -272,6 +291,7 @@ describe('Agent Workbench components', () => {
         sessions: sessions(3),
         online: true,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         initialSessionId: 'session-0',
         viewportWidth: 1440,
         api,
@@ -385,6 +405,7 @@ describe('Agent Workbench components', () => {
       renderer = TestRenderer.create(React.createElement(WebPane, {
         session: { ...selected, preview: { path: '/preview/another-session/', registeredAt: new Date().toISOString() } },
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         api,
         now: Date.now(),
       }));
@@ -397,6 +418,7 @@ describe('Agent Workbench components', () => {
       renderer = TestRenderer.create(React.createElement(WebPane, {
         session: { ...selected, preview: { path: '/preview/session-0/', registeredAt: new Date().toISOString() } },
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         api,
         now: Date.now(),
       }));
@@ -411,6 +433,7 @@ describe('mobile session surfaces', () => {
   const mobileProps = {
     online: true,
     authenticated: true,
+    capabilities: FULL_CAPABILITIES,
     initialSessionId: 'session-0',
     viewportWidth: 390,
     api,
@@ -540,6 +563,7 @@ describe('Agent Workbench 未读与分组维度', () => {
       sessions: rows,
       online: true,
       authenticated: true,
+      capabilities: FULL_CAPABILITIES,
       initialSessionId: 'session-0',
       viewportWidth: 1440,
       now: NOW,
@@ -730,6 +754,7 @@ describe('Agent Workbench 分组折叠', () => {
       sessions: rows,
       online: true,
       authenticated: true,
+      capabilities: FULL_CAPABILITIES,
       initialSessionId: 'session-0',
       viewportWidth: 1440,
       now: NOW,
@@ -904,6 +929,7 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
         session: { ...kindSession({}), webPort: 7681, proxyPort: 7682 },
         api: touchApi,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         now: NOW,
         location: { protocol: 'https:', origin: 'https://board.example', hostname: 'board.example' },
         readFrameStatus: () => read(),
@@ -1005,6 +1031,7 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
         session: { ...kindSession({}), webPort: 7681, proxyPort: 7682 },
         api: paneApi,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         now: NOW,
         location: { protocol: 'https:', origin: 'https://board.example', hostname: 'board.example' },
       }));
@@ -1128,6 +1155,7 @@ describe('Agent Workbench 接管意图只属于按下「接管」的那一行', 
         sessions: pair(),
         online: true,
         authenticated: true,
+        capabilities: FULL_CAPABILITIES,
         initialSessionId: 'session-a',
         viewportWidth: 1440,
         now: NOW,
@@ -1271,5 +1299,216 @@ describe('Agent Workbench 接管意图只属于按下「接管」的那一行', 
     expect(takeovers).toEqual(['session-a']);
     expect(paneMode(renderer)).toBe('readonly');
     act(() => renderer.unmount());
+  });
+});
+
+// ─── P1-4：操作入口按服务端最小能力集渲染（六类身份矩阵）─────────────────────
+//
+// workbenchAuthed 只决定观察级形态；三类操作入口各看服务端投影的对应布尔。
+// 矩阵里的 capabilities **不手写**：直接调服务端投影函数
+// projectWorkbenchOperationCapabilities，把前端渲染钉在服务端同一份投影上——
+// 服务端投影一变，这里的按钮存在性断言立刻跟着红。
+describe('P1-4 操作入口按最小能力集渲染', () => {
+  const NOW = 1_900_000_001_000;
+  const terminalLocation = { protocol: 'http:', origin: 'http://dashboard.test', hostname: 'dashboard.test' };
+
+  /** 话题会话 + 终端可框 + 注册了预览：三类操作入口都具备渲染前提，缺席只可能
+   *  是能力位关掉的结果。 */
+  function fullSurfaceSession(): WorkbenchSessionRow {
+    return {
+      ...kindSession({ chatType: 'group', scope: 'thread' }),
+      webPort: 7681,
+      proxyPort: 7682,
+      preview: { path: '/preview/session-0/', registeredAt: new Date(NOW).toISOString() },
+    };
+  }
+
+  const MATRIX: ReadonlyArray<{
+    name: string;
+    actor: WorkbenchCapabilityActor | null;
+    /** app.tsx：legacy/H5/platform → workbenchAuthed=true；匿名 → false。 */
+    authenticated: boolean;
+  }> = [
+    { name: 'legacy owner', authenticated: true, actor: { kind: 'legacy-dashboard', terminalCapability: 'controlled', previewCapability: 'operate' } },
+    { name: 'feishu H5', authenticated: true, actor: { kind: 'feishu-h5', terminalCapability: 'controlled', previewCapability: 'operate' } },
+    { name: 'platform owner', authenticated: true, actor: { kind: 'platform-dashboard', terminalCapability: 'owner', previewCapability: 'operate' } },
+    { name: 'platform teammate', authenticated: true, actor: { kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly' } },
+    { name: 'platform guest', authenticated: true, actor: { kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly' } },
+    { name: 'anonymous', authenticated: false, actor: null },
+  ];
+
+  function buttonTexts(renderer: TestRenderer.ReactTestRenderer): string[] {
+    return renderer.root.findAllByType('button').map(node => textOf(node));
+  }
+
+  it('六类身份矩阵：定位/接管入口的存在性 = 服务端投影值', async () => {
+    for (const { name, actor, authenticated } of MATRIX) {
+      const capabilities = projectWorkbenchOperationCapabilities(actor);
+      let renderer!: TestRenderer.ReactTestRenderer;
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
+          sessions: [fullSurfaceSession()],
+          online: true,
+          authenticated,
+          capabilities,
+          initialSessionId: 'session-0',
+          viewportWidth: 1440,
+          now: NOW,
+          api,
+          storage: null,
+          location: terminalLocation,
+          sdk: null,
+          h5Context: null,
+          onRouteChange: () => {},
+        }));
+      });
+      // 定位按钮：只随 canLocate 出现（H5/platform 的 capability 表没有 /locate）。
+      expect(locateButtons(renderer).length, `${name} locate`).toBe(capabilities.canLocate ? 1 : 0);
+      // 行内「接管」捷径：只随 canControl 出现；只读「终端」入口对所有身份保留。
+      const rowActions = renderer.root.findAll(node =>
+        node.type === 'button' && String(node.props.className ?? '').includes('wb-session-row-action is-terminal'));
+      expect(
+        rowActions.some(node => node.props.className === 'wb-session-row-action is-terminal-control'),
+        `${name} row takeover shortcut`,
+      ).toBe(capabilities.canControl);
+      expect(
+        rowActions.some(node => node.props.className === 'wb-session-row-action is-terminal'),
+        `${name} readonly terminal entry`,
+      ).toBe(true);
+
+      // 打开终端面板：面板级「接管输入」按钮同样只随 canControl 出现。
+      const openTerminal = rowActions.find(node => node.props.className === 'wb-session-row-action is-terminal')!;
+      await act(async () => { openTerminal.props.onClick({ stopPropagation() {} }); });
+      await act(async () => {});
+      const labels = buttonTexts(renderer);
+      expect(labels.includes('接管输入') || labels.includes('释放输入'), `${name} pane takeover`)
+        .toBe(capabilities.canControl && authenticated);
+      act(() => renderer.unmount());
+    }
+  });
+
+  it('六类身份矩阵：Preview「开启交互」只随 canInteract 出现', async () => {
+    for (const { name, actor, authenticated } of MATRIX) {
+      const capabilities = projectWorkbenchOperationCapabilities(actor);
+      let renderer!: TestRenderer.ReactTestRenderer;
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(WebPane, {
+          session: fullSurfaceSession(),
+          api,
+          authenticated,
+          capabilities,
+          now: NOW,
+        }));
+      });
+      const labels = buttonTexts(renderer);
+      expect(labels.includes('开启交互') || labels.includes('立即锁定'), `${name} preview unlock`)
+        .toBe(capabilities.canInteract && authenticated);
+      // 预览 iframe 本体对可进工作台的身份照常渲染——隐藏的只是写入口。
+      expect(renderer.root.findAllByType('iframe').length, `${name} preview frame`).toBe(1);
+      act(() => renderer.unmount());
+    }
+  });
+
+  it('canControl=false 时行内「接管」意图被压回只读：不发出注定 403 的 takeover', async () => {
+    // teammate/guest 形态。行内捷径已隐藏，这里直接对 TerminalPane 传
+    // autoTakeControl（等价于任何遗留入口递进来的接管意图），断言 POST 不发出。
+    const takeovers: string[] = [];
+    const paneApi: WorkbenchApi = {
+      ...api,
+      takeoverTerminal: async (sessionId: string) => {
+        takeovers.push(sessionId);
+        return { mode: 'controlled', owned: true, expiresAt: Date.now() + 60_000 };
+      },
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: { ...kindSession({}), webPort: 7681, proxyPort: 7682 },
+        api: paneApi,
+        authenticated: true,
+        capabilities: { canLocate: false, canControl: false, canInteract: false },
+        autoTakeControl: true,
+        now: NOW,
+        location: terminalLocation,
+      }));
+    });
+    await act(async () => {});
+    expect(takeovers).toEqual([]);
+    expect(buttonTexts(renderer)).not.toContain('接管输入');
+    // 反馈语也不再劝人点一个不存在的按钮。
+    expect(textOf(renderer.root)).toContain('当前身份不可接管输入');
+    expect(textOf(renderer.root)).not.toContain('点「接管输入」可操作');
+    act(() => renderer.unmount());
+  });
+
+  it('canInteract=false 时 Preview 面板没有解锁入口，锁定态照常展示', async () => {
+    const unlocks: string[] = [];
+    const paneApi: WorkbenchApi = {
+      ...api,
+      unlockPreview: async (sessionId: string) => {
+        unlocks.push(sessionId);
+        return { mode: 'interactive', label: 'INTERACTIVE', securityNotice: 'not a security boundary', idleExpiresAt: Date.now() + 60_000 };
+      },
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(WebPane, {
+        session: fullSurfaceSession(),
+        api: paneApi,
+        authenticated: true,
+        capabilities: { canLocate: false, canControl: true, canInteract: false },
+        now: NOW,
+      }));
+    });
+    expect(buttonTexts(renderer)).not.toContain('开启交互');
+    expect(unlocks).toEqual([]);
+    expect(textOf(renderer.root)).toContain('预览模式已锁定');
+    act(() => renderer.unmount());
+  });
+});
+
+// ─── P1-4：能力 DTO 严格解析（缺字段回落全 false，绝不回落 true）──────────────
+describe('parseWorkbenchCapabilities 严格校验', () => {
+  it('合法响应逐字段透传', () => {
+    expect(parseWorkbenchCapabilities({
+      ok: true,
+      capabilities: { canLocate: true, canControl: true, canInteract: true },
+    })).toEqual({ canLocate: true, canControl: true, canInteract: true });
+    expect(parseWorkbenchCapabilities({
+      ok: true,
+      capabilities: { canLocate: false, canControl: true, canInteract: false },
+    })).toEqual({ canLocate: false, canControl: true, canInteract: false });
+  });
+
+  it('缺字段回落 false，不回落 true', () => {
+    expect(parseWorkbenchCapabilities({ ok: true, capabilities: { canControl: true } }))
+      .toEqual({ canLocate: false, canControl: true, canInteract: false });
+    expect(parseWorkbenchCapabilities({ ok: true, capabilities: {} }))
+      .toEqual({ canLocate: false, canControl: false, canInteract: false });
+  });
+
+  it('只认字面量 true：1 / "true" / null 一律 false', () => {
+    expect(parseWorkbenchCapabilities({
+      ok: true,
+      capabilities: { canLocate: 1, canControl: 'true', canInteract: null },
+    })).toEqual({ canLocate: false, canControl: false, canInteract: false });
+  });
+
+  it('外层不合形（ok!=true、非对象、数组、null）整体回落全 false', () => {
+    for (const value of [
+      { ok: false, capabilities: { canLocate: true, canControl: true, canInteract: true } },
+      { capabilities: { canLocate: true, canControl: true, canInteract: true } },
+      { ok: true, capabilities: [true, true, true] },
+      { ok: true },
+      [], null, undefined, 'x', 42,
+    ]) {
+      expect(parseWorkbenchCapabilities(value), JSON.stringify(value) ?? 'undefined')
+        .toEqual({ canLocate: false, canControl: false, canInteract: false });
+    }
+  });
+
+  it('fail-closed 默认值三项全 false 且被冻结', () => {
+    expect(NO_WORKBENCH_CAPABILITIES).toEqual({ canLocate: false, canControl: false, canInteract: false });
+    expect(Object.isFrozen(NO_WORKBENCH_CAPABILITIES)).toBe(true);
   });
 });

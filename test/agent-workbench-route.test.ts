@@ -48,6 +48,36 @@ describe('Agent Workbench route and surface integration', () => {
     expect(dashboard).toContain("requestIdentity.terminalCapability === 'readonly'");
     expect(dashboard).toContain("requestIdentity.previewCapability === 'readonly'");
   });
+
+  // ── P1-4：能力集投影端点与前端消费链的接线钉死 ────────────────────────────
+  // 语义矩阵在 dashboard-auth.test.ts / agent-workbench-components.test.ts；这里
+  // 只钉「接的是同一根线」：端点调的是共享投影函数（而不是路由旁边再手写一张
+  // 表），前端严格解析后逐能力传给对应入口。
+  it('serves the capability projection from the shared projection function', () => {
+    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
+    expect(dashboard).toContain("url.pathname === '/api/workbench/capabilities'");
+    expect(dashboard).toContain('projectWorkbenchOperationCapabilities(requestIdentity)');
+  });
+
+  it('the SPA parses the projection strictly and hands each entry its own bit', () => {
+    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
+    // 探测走 origFetch（匿名 401 是预期结果，不该触发全局登录浮层），且任何失败
+    // 回落 fail-closed 全 false。
+    expect(app).toContain("origFetch('/api/workbench/capabilities'");
+    expect(app).toContain('parseWorkbenchCapabilities');
+    expect(app).toContain('NO_WORKBENCH_CAPABILITIES');
+
+    const page = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-page.tsx'), 'utf8');
+    expect(page).toContain('capabilities={ui.workbenchCapabilities}');
+
+    const view = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8');
+    expect(view).toContain('props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined');
+    expect(view).toContain('canControlTerminal={props.capabilities.canControl}');
+
+    const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
+    expect(panes).toContain('props.capabilities.canControl');
+    expect(panes).toContain('props.capabilities.canInteract');
+  });
 });
 
 /** Comments legitimately name the APIs being avoided; only code must be clean. */

@@ -40,6 +40,7 @@ import {
 } from './agent-workbench-storage.js';
 import type { FeishuJsApi, WorkbenchH5Context } from './agent-workbench-chat.js';
 import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
+import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 import { WorkbenchSessionList } from './agent-workbench-session-list.js';
 import {
   TerminalPane,
@@ -51,6 +52,11 @@ export interface AgentWorkbenchViewProps {
   sessions: readonly WorkbenchSessionRow[];
   online: boolean;
   authenticated: boolean;
+  /** P1-4：服务端投影的最小操作能力集。`authenticated` 只决定观察级形态（同源
+   *  终端链路、控制权状态拉取）；三类操作入口分别看 canLocate（定位按钮）、
+   *  canControl（终端接管）、canInteract（Preview 解锁）。必填——调用方必须显式
+   *  给出投影值（页面从 ui.workbenchCapabilities 取，缺省已是全 false）。 */
+  capabilities: WorkbenchCapabilities;
   initialSessionId?: string | null;
   locale?: string;
   now?: number;
@@ -188,8 +194,11 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   const terminalSessionId = terminal?.sessionId ?? null;
   const terminalWantsControl = terminal?.wantsControl ?? false;
 
-  /** 只有行内的「终端 / 接管」按钮走这里 —— 接管意图只能由这条路产生。 */
+  /** 只有行内的「终端 / 接管」按钮走这里 —— 接管意图只能由这条路产生。
+   *  没有 canControl 能力时把意图压回只读：既不该发出注定 403 的 takeover，
+   *  也不该让面板顶着一个实现不了的「接管中」状态。 */
   const toggleTerminal = (sessionId: string, wantsControl: boolean) => {
+    if (wantsControl && !props.capabilities.canControl) wantsControl = false;
     setTerminal(current => {
       // Re-clicking the same button closes; switching mode or session keeps it
       // open and applies the new intent. 比较用的是 updater 里的**最新**意图，不是
@@ -459,7 +468,10 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       dimension={dimension}
       onDimensionChange={changeDimension}
       onSeen={markSessionSeen}
-      onLocate={sessionId => api.locateSession(sessionId)}
+      // P1-4：定位是 POST /locate 的入口，只有 canLocate 的身份才渲染（H5/平台
+      // 身份的 capability 表没有 /locate，点了只会 401）。不传即整体不渲染按钮。
+      onLocate={props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined}
+      canControlTerminal={props.capabilities.canControl}
       onSelect={sessionId => {
         selectSession(sessionId);
         // Touch layouts drill in on tap; pointer layouts keep selection and
@@ -516,6 +528,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
             session={terminalSession}
             api={api}
             authenticated={props.authenticated}
+            capabilities={props.capabilities}
             now={now}
             location={location}
             autoTakeControl={terminalWantsControl}
@@ -583,7 +596,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
                 : mobilePage === 'preview' && selected
                   ? (
                     <main className="wb-mobile-preview">
-                      <WebPane session={selected} api={api} authenticated={props.authenticated} now={now} />
+                      <WebPane session={selected} api={api} authenticated={props.authenticated} capabilities={props.capabilities} now={now} />
                     </main>
                   )
                   : workspace}

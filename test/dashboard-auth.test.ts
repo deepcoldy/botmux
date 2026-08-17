@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
   decideWorkbenchH5Auth, workbenchH5Capability,
+  projectWorkbenchOperationCapabilities, WORKBENCH_NO_OPERATION_CAPABILITIES,
+  type WorkbenchCapabilityActor, type WorkbenchOperationCapabilities,
   loadPersistedToken, loadOrCreatePersistedToken, persistToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from '../src/dashboard/auth.js';
@@ -1131,5 +1133,179 @@ describe('Workbench H5 capability boundary', () => {
       expect(rest).not.toHaveProperty('preview');
       expect(rest).not.toHaveProperty('riffAccessUrl');
     });
+  });
+});
+
+// ─── P1-4：最小操作能力集投影（六类身份矩阵 + 投影与路由门禁互钉）────────────
+//
+// workbenchAuthed 只能证明可进工作台；三类操作入口（定位 / 终端接管 / Preview
+// 交互）各自有独立门禁。服务端把它们投影成 canLocate/canControl/canInteract 三
+// 布尔（GET /api/workbench/capabilities），前端只据此渲染入口。这一组测试做三
+// 件事：
+//   1) 六类身份的投影值逐项钉死（期望值手写，谁改了语义谁红）；
+//   2) 同一身份枚举跑「投影函数」与「路由门禁」两边，断言一致——门禁按
+//      dashboard.ts 的真实组合复算：路由级 decide*（workbench-only 走
+//      decideWorkbenchH5Auth，legacy 走 decideDashboardAuth）+ 处理器级
+//      `terminalCapability === 'readonly'` / `previewCapability === 'readonly'`
+//      403 判据（agent-workbench-route.test.ts 以源码断言钉住 dashboard.ts 里
+//      的这两行）；
+//   3) 各身份在三条真实路由上的 401/403 行为与改动前逐条一致——隐藏按钮的同时
+//      API 权限既没放大也没缩小。
+describe('P1-4 workbench operation-capability projection', () => {
+  const TOK = 'active-token-xyz';
+
+  // 六类身份。terminalCapability/previewCapability 取值照抄 dashboard.ts 的
+  // dashboardRequestIdentity：legacy=controlled/operate；H5=controlled/operate；
+  // platform owner=owner/operate；platform teammate/guest=readonly/readonly。
+  const MATRIX: ReadonlyArray<{
+    name: string;
+    actor: WorkbenchCapabilityActor | null;
+    expected: WorkbenchOperationCapabilities;
+  }> = [
+    {
+      name: 'legacy owner',
+      actor: { kind: 'legacy-dashboard', terminalCapability: 'controlled', previewCapability: 'operate' },
+      expected: { canLocate: true, canControl: true, canInteract: true },
+    },
+    {
+      // H5 的 capability 表没有 /locate（workbenchH5Capability 返回 null），所以
+      // canLocate=false；control/preview 的 operate 能力是显式租约入口，保留。
+      name: 'feishu H5',
+      actor: { kind: 'feishu-h5', terminalCapability: 'controlled', previewCapability: 'operate' },
+      expected: { canLocate: false, canControl: true, canInteract: true },
+    },
+    {
+      // platform 身份同走 workbench-only 门禁：owner 有终端/preview 写角色，但
+      // /locate 同样不在 capability 表里——投影必须如实说 false，而不是把
+      // 「owner」角色名当权限。
+      name: 'platform owner',
+      actor: { kind: 'platform-dashboard', terminalCapability: 'owner', previewCapability: 'operate' },
+      expected: { canLocate: false, canControl: true, canInteract: true },
+    },
+    {
+      name: 'platform teammate',
+      actor: { kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly' },
+      expected: { canLocate: false, canControl: false, canInteract: false },
+    },
+    {
+      name: 'platform guest',
+      actor: { kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly' },
+      expected: { canLocate: false, canControl: false, canInteract: false },
+    },
+    {
+      name: 'anonymous',
+      actor: null,
+      expected: { canLocate: false, canControl: false, canInteract: false },
+    },
+  ];
+
+  /** 按 dashboard.ts 的真实门禁组合复算一遍：路由级 decide* + 处理器级角色检查。 */
+  function gateVerdict(actor: WorkbenchCapabilityActor | null): WorkbenchOperationCapabilities {
+    if (!actor) return { canLocate: false, canControl: false, canInteract: false };
+    const routeAllows = (method: string, pathname: string): boolean => (actor.kind === 'legacy-dashboard'
+      // legacy owner = cookie 与 active token 相等（dashboardRequestIdentity 的
+      // 构造前提），门禁上等价于 presentedToken === activeToken。
+      ? decideDashboardAuth({
+          method, pathname, hasTokenParam: false,
+          presentedToken: TOK, activeToken: TOK, publicReadOnly: false,
+        }).kind === 'allow'
+      : decideWorkbenchH5Auth({ method, pathname }).kind === 'allow');
+    return {
+      canLocate: routeAllows('POST', '/api/sessions/s1/locate'),
+      // dashboard.ts 处理器判据原文：`requestIdentity.terminalCapability === 'readonly'` → 403。
+      canControl: routeAllows('POST', '/api/sessions/s1/control/takeover')
+        && actor.terminalCapability !== undefined && actor.terminalCapability !== 'readonly',
+      // 原文：`requestIdentity.previewCapability === 'readonly'` → 403。
+      canInteract: routeAllows('POST', '/api/sessions/s1/preview-interaction/unlock')
+        && actor.previewCapability !== 'readonly',
+    };
+  }
+
+  it('six-identity matrix: projected values are exactly the pinned expectations', () => {
+    for (const { name, actor, expected } of MATRIX) {
+      expect(projectWorkbenchOperationCapabilities(actor), name).toEqual(expected);
+    }
+  });
+
+  it('projection and route gates agree for every identity (no drift in either direction)', () => {
+    for (const { name, actor } of MATRIX) {
+      expect(projectWorkbenchOperationCapabilities(actor), name).toEqual(gateVerdict(actor));
+    }
+  });
+
+  it('API doors are unchanged: hiding a button neither widens nor narrows any route', () => {
+    // H5 / platform（workbench-only 身份）：POST /locate 依旧 401——capability 表
+    // 从未包含它，本次也没有把它加进去。
+    expect(workbenchH5Capability('POST', '/api/sessions/s1/locate')).toBeNull();
+    expect(decideWorkbenchH5Auth({ method: 'POST', pathname: '/api/sessions/s1/locate' }).kind).toBe('deny401');
+    // teammate/guest 的 takeover/unlock：路由级依旧放行（capability 表授予
+    // operate），403 依旧来自处理器级角色检查——投影 false 描述的正是这层，
+    // 而不是把路由级收紧了。
+    expect(decideWorkbenchH5Auth({ method: 'POST', pathname: '/api/sessions/s1/control/takeover' }).kind).toBe('allow');
+    expect(decideWorkbenchH5Auth({ method: 'POST', pathname: '/api/sessions/s1/preview-interaction/unlock' }).kind).toBe('allow');
+    const teammate = MATRIX.find(entry => entry.name === 'platform teammate')!.actor!;
+    expect(teammate.terminalCapability === 'readonly').toBe(true);  // → dashboard.ts 403 分支
+    expect(teammate.previewCapability === 'readonly').toBe(true);   // → dashboard.ts 403 分支
+    // 只读观察路径不受影响：GET control 状态仍是 terminal.view。
+    expect(workbenchH5Capability('GET', '/api/sessions/s1/control')).toBe('terminal.view');
+    // legacy owner：POST /locate 依旧放行。
+    expect(decideDashboardAuth({
+      method: 'POST', pathname: '/api/sessions/s1/locate', hasTokenParam: false,
+      presentedToken: TOK, activeToken: TOK,
+    }).kind).toBe('allow');
+    // 匿名：三条路由全 401，publicReadOnly 也不开口子（POST 从不公开）。
+    for (const pathname of [
+      '/api/sessions/s1/locate',
+      '/api/sessions/s1/control/takeover',
+      '/api/sessions/s1/preview-interaction/unlock',
+    ]) {
+      for (const publicReadOnly of [false, true]) {
+        expect(decideDashboardAuth({
+          method: 'POST', pathname, hasTokenParam: false,
+          presentedToken: undefined, activeToken: TOK, publicReadOnly,
+        }).kind, `${pathname} publicReadOnly=${publicReadOnly}`).toBe('deny401');
+      }
+    }
+  });
+
+  it('the projection endpoint itself is observation-grade and never public', () => {
+    // workbench-only 身份可读（workbench.view）；它只回显既有权限，不授予新权限。
+    expect(workbenchH5Capability('GET', '/api/workbench/capabilities')).toBe('workbench.view');
+    expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/api/workbench/capabilities' }).kind).toBe('allow');
+    // 写方法不放行——观察级路径没有任何 POST 语义。
+    expect(workbenchH5Capability('POST', '/api/workbench/capabilities')).toBeNull();
+    // legacy owner 可读。
+    expect(decideDashboardAuth({
+      method: 'GET', pathname: '/api/workbench/capabilities', hasTokenParam: false,
+      presentedToken: TOK, activeToken: TOK,
+    }).kind).toBe('allow');
+    // 匿名（含 publicReadOnly）404/401 墙外：前端把非 200 一律回落全 false。
+    for (const publicReadOnly of [false, true]) {
+      expect(decideDashboardAuth({
+        method: 'GET', pathname: '/api/workbench/capabilities', hasTokenParam: false,
+        presentedToken: undefined, activeToken: TOK, publicReadOnly,
+      }).kind, `publicReadOnly=${publicReadOnly}`).toBe('deny401');
+    }
+  });
+
+  // P1-6 边界：canControl 只描述「无显式 token 时」的默认能力。显式 write token
+  // 走终端前置代理的独立授权（query token 是唯一授权依据，见 terminal-front-proxy
+  // 的测试），既不经过 control API，也不进入本投影的输入——所以 teammate 投影为
+  // 全 false 与「递了显式 write token 仍可写终端」并不矛盾：投影函数签名里根本
+  // 没有 token 参数，两条通道互不描述。
+  it('P1-6 boundary: the projection has no token input — write-token access is a separate channel', () => {
+    const teammate: WorkbenchCapabilityActor = {
+      kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly',
+    };
+    expect(projectWorkbenchOperationCapabilities(teammate)).toEqual({ ...WORKBENCH_NO_OPERATION_CAPABILITIES });
+    // 一元函数：身份进、三布尔出。任何"带上 token 就变 true"的扩展都必须先改
+    // 这里的契约测试。
+    expect(projectWorkbenchOperationCapabilities.length).toBe(1);
+  });
+
+  it('fails closed on a capability-less actor shape (undefined terminalCapability)', () => {
+    expect(projectWorkbenchOperationCapabilities({
+      kind: 'platform-dashboard', previewCapability: 'readonly',
+    })).toEqual({ ...WORKBENCH_NO_OPERATION_CAPABILITIES });
   });
 });

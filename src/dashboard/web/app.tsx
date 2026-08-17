@@ -38,6 +38,10 @@ import {
   readDashboardClientShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  parseWorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -1354,7 +1358,26 @@ window.fetch = async function patchedFetch(
   return res;
 };
 
+/**
+ * P1-4：拉取服务端投影的最小操作能力集。走 origFetch 绕过全局 401 包装——匿名
+ * （含 publicReadOnly 访客）在这里 401 是预期的能力探测结果，不是登录过期事件。
+ * 任何失败（401、网络错误、响应不合形）严格回落全 false：操作入口宁可少画，
+ * 不给无权身份画出会 401/403 的按钮。
+ */
+async function loadWorkbenchCapabilities(): Promise<void> {
+  try {
+    const r = await origFetch('/api/workbench/capabilities', { cache: 'no-store' });
+    ui.workbenchCapabilities = r.ok
+      ? parseWorkbenchCapabilities(await r.json())
+      : NO_WORKBENCH_CAPABILITIES;
+  } catch {
+    ui.workbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
+  }
+}
+
 async function loadAuthState(): Promise<void> {
+  // 能力探测与 /api/settings 并行：两者互不依赖，也都在首次 route() 之前完成。
+  const capabilitiesProbe = loadWorkbenchCapabilities();
   try {
     // Use the unwrapped request: a valid narrow Workbench identity is supposed
     // to get a scoped 401 here, and that is auth-state data rather than an
@@ -1385,6 +1408,7 @@ async function loadAuthState(): Promise<void> {
       showAuthExpiredOverlay(loginUrl);
     }
   } catch { /* keep defaults */ }
+  await capabilitiesProbe;
 }
 
 async function loadPinnedPluginNavItems(): Promise<void> {

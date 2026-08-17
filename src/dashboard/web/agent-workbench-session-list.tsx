@@ -144,6 +144,10 @@ export interface WorkbenchSessionListProps {
   /** Row-level shortcuts: jump straight to a surface instead of selecting the
    *  session and then hunting for the layout control. */
   onOpenSurface?(sessionId: string, surface: 'terminal' | 'terminal-control' | 'chat'): void;
+  /** P1-4：显式传 false 时不渲染行内「接管」捷径（只留只读「终端」）——没有
+   *  canControl 能力的身份（平台 teammate/guest、触屏 H5）接管必 403。不传按
+   *  旧行为渲染（dock 等不带能力投影的精简形态）。 */
+  canControlTerminal?: boolean;
   /** 话题会话专用：让 bot 在原话题里 @ 会话拥有者，用户点通知即可跳回话题。
    *  不传则不渲染定位按钮（dock 等精简形态就是这么用的）。 */
   onLocate?(sessionId: string): Promise<void>;
@@ -578,9 +582,13 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                         );
                       })() : null}
                       {([
-                        ['terminal', '打开只读终端', '终端'],
-                        ['terminal-control', '打开终端并接管输入', '接管'],
-                      ] as const).map(([surface, label, text]) => (
+                        ['terminal', '打开只读终端', '终端'] as const,
+                        // 接管捷径只对有 canControl 能力的身份渲染（P1-4）；
+                        // undefined（dock/旧调用方）保持旧行为。
+                        ...(props.canControlTerminal !== false
+                          ? [['terminal-control', '打开终端并接管输入', '接管'] as const]
+                          : []),
+                      ]).map(([surface, label, text]) => (
                         <button
                           key={surface}
                           type="button"

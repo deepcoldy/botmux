@@ -15,6 +15,8 @@ Authenticated GET /api/workbench/h5-context exposes enabled, appId, brand and en
 
 The client tracks local management authority separately from narrow Workbench authority. H5/platform identities can use the server-scoped Terminal and Preview leases without gaining Dashboard management controls; expected management 401s do not masquerade as an expired Workbench login.
 
+Operation entries render from the server-projected minimal capability set (GET /api/workbench/capabilities → canLocate/canControl/canInteract), parsed strictly with a fail-closed all-false fallback. `authenticated` alone never shows an operation button: 定位 follows canLocate, the row 接管 shortcut and the pane takeover button follow canControl, and the Preview unlock follows canInteract — layered on top of (not replacing) the existing touch read-only restrictions.
+
 ## Components and state
 
 - agent-workbench-view.tsx owns the full appCenter surface: responsive derivation, rail resize and collapse, per-session layout plus rail/unread persistence, the single-terminal workspace and the mobile drill-down stack.

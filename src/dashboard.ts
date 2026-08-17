@@ -17,6 +17,7 @@ import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   decideWorkbenchH5Auth,
+  projectWorkbenchOperationCapabilities,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
@@ -3282,6 +3283,20 @@ const server = createServer(async (req, res) => {
           brand: dashboardH5AuthConfig.brand,
           entryPath: dashboardH5AuthConfig.entryPath,
         },
+      });
+    }
+
+    // P1-4：最小操作能力集投影。前端只据此渲染操作入口（定位 / 接管输入 / 开启
+    // 交互），投影函数复算的是本文件三条真实路由的同一套门禁（路由级 auth 决策 +
+    // terminalCapability/previewCapability 角色检查），见 auth.ts 的函数注释。
+    // 匿名请求到不了这里（该路径不在 publicReadOnly 白名单，decideDashboardAuth
+    // 已 401）；前端把任何非 200/缺字段一律回落为全 false。注意 canControl 只描述
+    // 无显式 token 的默认能力——显式 write token 走终端前置代理的独立授权（P1-6），
+    // 与本投影无关。
+    if (req.method === 'GET' && url.pathname === '/api/workbench/capabilities') {
+      return jsonRes(res, 200, {
+        ok: true,
+        capabilities: projectWorkbenchOperationCapabilities(requestIdentity),
       });
     }
 

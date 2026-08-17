@@ -135,6 +135,8 @@ BOTMUX_PUBLIC_URL=https://<dashboard-host>
 
 另有两个配套接口：GET /api/sessions/:id/view-link 为触屏或未登录浏览器换取只读 viewToken 终端链接（iOS WebView 的 WebSocket 升级不带 Cookie，同源地址必然握手失败）；POST /api/sessions/:id/locate 让 bot 在话题内 @ 用户定位会话，服务端限流，UI 侧 30 秒冷却。
 
+GET /api/workbench/capabilities 向已认证身份投影最小操作能力集 `{ canLocate, canControl, canInteract }`：三布尔由服务端复算真实路由门禁得出（路由级 auth 决策 + terminalCapability/previewCapability 角色检查），前端只据此渲染定位、终端接管与 Preview 解锁入口——workbenchAuthed 只证明可进工作台，不再被当作操作权限。legacy owner 三项全 true；H5 与平台 owner 为 `{false, true, true}`（capability 表没有 /locate）；平台 teammate/guest 与匿名全 false。该路径不在 publicReadOnly 白名单，匿名恒 401，前端把任何非 200 或缺字段严格回落为全 false。canControl 只描述无显式 token 时的默认能力：显式 write token 走终端前置代理的独立授权，不经过也不受本投影影响。
+
 central proxy 只在 loopback hop 注入签名 read/write grant。租约释放、到期、写 WebSocket 断开、H5 logout/expiry 或 legacy Dashboard token rotation 都会删除租约并关闭登记的写 socket；后续连接回到只读。H5 用户不能通过 legacy write-link 绕过接管。
 
 ### 4.3 Preview 注册、代理与交互
@@ -159,7 +161,7 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 
 - App Secret、飞书 app/user access token、authorization code、Dashboard cookie、daemon HMAC、Terminal grant 和 preview target 不进入浏览器 DTO、URL hash、localStorage、SSE、审计或日志。
 - H5 allowlist 使用 open_id 精确匹配；空列表不是“允许所有人”。
-- control、preview interaction、preview proxy 与 H5 context 都不在 publicReadOnly allowlist。
+- control、preview interaction、preview proxy、H5 context 与 workbench capabilities 投影都不在 publicReadOnly allowlist。
 - Browser API adapter 对 response shape 做运行时校验；非法 mode、deadline、owned、securityNotice 或 H5 context 以 502 型客户端错误 fail closed。
 - 审计只记录时间、open_id、session、窄 action 与 Terminal 输入 UTF-8 字节数，不记录输入正文。
 

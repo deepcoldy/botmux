@@ -55,6 +55,8 @@ await act(async () => {
     sessions,
     online: true,
     authenticated: true,
+    // 本脚本验证的是 legacy owner 形态：三类操作能力齐全（P1-4 服务端投影值）。
+    capabilities: { canLocate: true, canControl: true, canInteract: true },
     initialSessionId: 'session-0',
     viewportWidth: 1440,
     now: 1_900_000_001_000,

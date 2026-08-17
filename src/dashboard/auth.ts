@@ -359,7 +359,11 @@ export type WorkbenchH5Capability =
 export function workbenchH5Capability(method: string, pathname: string): WorkbenchH5Capability | null {
   const normalizedMethod = method.toUpperCase();
   if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
-    && (pathname === '/api/sessions' || pathname === '/events' || pathname === '/api/workbench/h5-context')) {
+    && (pathname === '/api/sessions' || pathname === '/events' || pathname === '/api/workbench/h5-context'
+      // P1-4：只读的能力集投影（canLocate/canControl/canInteract 三布尔）。它
+      // 只描述该身份在本 capability 表 + 角色映射下的既有权限，不授予任何新
+      // 权限，所以归入观察级的 workbench.view。
+      || pathname === '/api/workbench/capabilities')) {
     return 'workbench.view';
   }
 
@@ -517,4 +521,83 @@ export function decideDashboardAuth(opts: {
   }
 
   return { kind: 'allow' };
+}
+
+// ─── P1-4：工作台最小操作能力集投影 ──────────────────────────────────────────
+
+/**
+ * 前端可见的"最小操作能力集"。`workbenchAuthed` 只能证明可进工作台，不代表任何
+ * 一项操作权限；三布尔各自对应一条真实路由的门禁：
+ *
+ *   - `canLocate`   → `POST /api/sessions/:id/locate`（话题定位）。
+ *   - `canControl`  → `POST /api/sessions/:id/control/takeover|release`
+ *                     （终端接管/释放）。
+ *   - `canInteract` → `POST /api/sessions/:id/preview-interaction/unlock|
+ *                     activity|lock`（Preview 交互解锁）。
+ *
+ * 边界（P1-6 write token）：`canControl` 只描述该身份**不带显式 token 时**在
+ * Dashboard control API 上的默认能力。显式 `?token=`（write token）走终端前置
+ * 代理的独立授权链——它既不经过这三条 API，也不受本投影影响；一个 teammate 被
+ * 递了显式 write token 仍可直接写终端，本投影不试图（也不可能）描述那条通道。
+ */
+export interface WorkbenchOperationCapabilities {
+  canLocate: boolean;
+  canControl: boolean;
+  canInteract: boolean;
+}
+
+/** 匿名 / 解析失败时的 fail-closed 值：三项全 false。 */
+export const WORKBENCH_NO_OPERATION_CAPABILITIES: Readonly<WorkbenchOperationCapabilities> =
+  Object.freeze({ canLocate: false, canControl: false, canInteract: false });
+
+/** 投影所需的最小身份切面——与 dashboard.ts 的 DashboardRequestIdentity 结构兼容
+ *  （kind 枚举 + terminal-control.ts 的角色能力字段）。 */
+export interface WorkbenchCapabilityActor {
+  kind: 'legacy-dashboard' | 'platform-dashboard' | 'feishu-h5';
+  terminalCapability?: 'controlled' | 'owner' | 'readonly';
+  previewCapability: 'operate' | 'readonly';
+}
+
+/**
+ * 由身份投影三布尔能力集。**不是一张平行的权限表**：每一项都通过复算真实路由
+ * 的两层门禁得出——
+ *
+ *   1. 路由级 auth 决策：workbench-only 身份（H5 / platform）走
+ *      {@link decideWorkbenchH5Auth}（capability 表里没有 /locate，所以 H5 与
+ *      platform 全员 canLocate=false）；legacy owner 走
+ *      {@link decideDashboardAuth}（cookie == active token，等价于 allow）。
+ *   2. 处理器级角色检查：dashboard.ts 对 control/preview-interaction 写操作分别
+ *      用 `terminalCapability === 'readonly'` / `previewCapability === 'readonly'`
+ *      403，这里逐字复用同一判据。
+ *
+ * 因此「投影为 true 而路由 401/403」或反向漂移只可能来自这两层规则本身的改动，
+ * 而 test/dashboard-auth.test.ts 的矩阵测试把两边钉在一起。
+ */
+export function projectWorkbenchOperationCapabilities(
+  identity: WorkbenchCapabilityActor | null,
+): WorkbenchOperationCapabilities {
+  if (!identity) return { ...WORKBENCH_NO_OPERATION_CAPABILITIES };
+  const legacy = identity.kind === 'legacy-dashboard';
+  // 会话 id 只是路由 pattern 的占位（[^/]+ 全匹配），对决策无影响；legacy 侧的
+  // probe token 复现的是「cookie 与 active token 相等」这一既成事实。
+  const routeAllows = (method: string, pathname: string): boolean => (legacy
+    ? decideDashboardAuth({
+        method,
+        pathname,
+        hasTokenParam: false,
+        presentedToken: 'capability-probe-token',
+        activeToken: 'capability-probe-token',
+        publicReadOnly: false,
+      }).kind === 'allow'
+    : decideWorkbenchH5Auth({ method, pathname }).kind === 'allow');
+  return {
+    canLocate: routeAllows('POST', '/api/sessions/probe/locate'),
+    // terminalCapability 缺失按 readonly 处理（fail closed）；'owner' 与
+    // 'controlled' 都不落入 403 分支，与 dashboard.ts 的判据一字不差。
+    canControl: routeAllows('POST', '/api/sessions/probe/control/takeover')
+      && identity.terminalCapability !== undefined
+      && identity.terminalCapability !== 'readonly',
+    canInteract: routeAllows('POST', '/api/sessions/probe/preview-interaction/unlock')
+      && identity.previewCapability !== 'readonly',
+  };
 }
