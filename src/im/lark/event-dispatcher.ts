@@ -1794,8 +1794,14 @@ export interface RoutingContext {
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
   sessionGroupBirth?: boolean;
-  /** Quota was consumed against the source DM before a session-group side
-   * effect was allowed. The rewritten group turn must not charge it twice. */
+  /** This turn was already AUTHORIZED and CHARGED against the source DM, before
+   * any session-group side effect was allowed (a quota denial must create no
+   * Feishu chat). Set only by the birth flow, immediately after that gate
+   * returned true — so the rewritten group turn must neither charge it twice
+   * NOR re-decide authorization: the new chat cannot yet carry any chat-scoped
+   * grant, so a recheck there only ever produces false negatives, and dropping
+   * an already-charged turn is exactly the "charged, then lost the task"
+   * failure. See enforceMessageQuotaForCliInput's alreadyAuthorizedAndCharged. */
   sessionGroupQuotaConsumed?: boolean;
   /** Session-group birth only: the in-group intro message id used as the
    *  turn's REPLY anchor (quote target / session rootMessageId), so the first

@@ -26,6 +26,7 @@ import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
 import { sendMessage, replyMessage } from '../im/lark/client.js';
 import { extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
+import { stripLeadingMentions } from '../im/lark/message-parser.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 
@@ -56,9 +57,26 @@ export function buildPlaceholderName(text: string | null, prefix: string, locale
  * predicate NARROWER than this one re-opens the charge-a-command bug; a WIDER
  * one silently stops births for messages this function would still birth. Both
  * sides must call this.
+ *
+ * Leading @mentions are stripped FIRST, with the same helper and the same
+ * mention list the router later uses to build `cmdContent`. Without that step
+ * this predicate and the router disagree about the exact same message: Lark
+ * delivers "@Bot /help" as text "@_user_1 /help" (resolved to "@Bot /help"),
+ * which does not start with "/" here — so the message was charged a quota unit
+ * AND birthed a group — while the router, reading the mention-stripped text,
+ * still routed it as /help and never reached a CLI. That is a pure quota loss
+ * on the most natural way to type a command at a bot.
  */
 export function declinesSessionGroupBirthAsSlashCommand(data: any): boolean {
-  return (extractMessageTextForRouting(data?.message) ?? '').trim().startsWith('/');
+  const text = extractMessageTextForRouting(data?.message);
+  if (!text) return false;
+  // Only mentions that actually carry a display name are usable by the
+  // name-based strip; when none do, the empty list lets stripLeadingMentions
+  // fall back to its best-effort `@<token>` regex, which also clears the raw
+  // "@_user_1" placeholders extractMessageTextForRouting could not resolve.
+  const named = (Array.isArray(data?.message?.mentions) ? data.message.mentions : [])
+    .filter((m: any) => typeof m?.name === 'string' && m.name.length > 0);
+  return stripLeadingMentions(text.trim(), named).startsWith('/');
 }
 
 export async function maybeBirthSessionGroup(

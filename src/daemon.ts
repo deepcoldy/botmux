@@ -3452,9 +3452,22 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
-  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean },
+  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean; alreadyAuthorizedAndCharged?: boolean },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) return true;
+  // 会话群出生轮：**同一条消息**的授权判定与扣费，刚刚由本函数在原 DM 上下文里
+  // 一起做完（handleNewTopicAdmitted 的建群前扣费点：扣费被拒必须零外部副作用，
+  // 所以它必须排在 createGroupWithBots 之前）。这一轮绝不能再复查一次：
+  //   • 新群是 bot 刚为这个发送者建的，chat 维度的 talk 来源（chatGrant /
+  //     allowedChatGroup / oncall / p2p 专属的 p2pOpen）按定义不可能已经落在它
+  //     上面，复查只会产出假阴性；
+  //   • 而这条消息**已经扣过一次费**——被假阴性丢掉就成了「扣了费还把任务丢了」：
+  //     用户额度少一格，任务无声消失，连一句拒绝提示都没有（丢弃分支只打 debug 日志）。
+  // 「扣了费就不能丢任务，丢任务就不能扣费」是这道闸的硬不变量，两侧只能同进同退。
+  // 授权本身并没有被放宽：真正的判定就是 DM 那次（真实 chatId + chatType='p2p'），
+  // 这里只是不拿一个必然更严的新上下文去推翻它。跨 chat 的授权继承缺口是另一件事
+  //（新群里的**后续**消息仍按新 chat 判定），不由这条已扣费的出生轮来承担。
+  if (opts?.alreadyAuthorizedAndCharged) return true;
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
   // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
@@ -17522,14 +17535,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     && !ctx.forwardSeedData
     && !messageListener;
   // Session-group birth charges the ORIGINAL DM before creating the Feishu chat
-  // (a quota denial must have zero external side effects), so the rewritten
-  // group turn is already paid for. Suppress the charge rather than the whole
-  // call — the talk-permission recheck above must still run on the group turn.
+  // (a quota denial must have zero external side effects), so by the time the
+  // rewritten group turn gets here THIS message is already authorized AND
+  // already paid for — see `alreadyAuthorizedAndCharged` in
+  // enforceMessageQuotaForCliInput for why re-deciding it here can only lose
+  // the unit we just took. `skipCharge` stays set as well so that even if that
+  // short-circuit is ever removed, the worst case is a redundant recheck, never
+  // a double charge.
   const sessionGroupAlreadyCharged = !!ctx.sessionGroupQuotaConsumed
     || quotaConsumedBeforeSessionGroupBirth;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
+    alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
   })) {
     return;
   }
