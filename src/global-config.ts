@@ -68,6 +68,24 @@ export interface HostOverloadAlertGlobalConfig {
   enterLoadRatio?: number;
   /** 进入过载的已用内存占比阈值(0..1)。缺省 0.92。退出线同样按 95% 派生。 */
   enterMemUsedFrac?: number;
+  /** 过载卡上「重启浏览器」按钮的可配置目标清单。缺省内置 Arc / Chrome / Edge
+   *  （见 core/browser-restart.ts 的 DEFAULT_BROWSER_TARGETS）。此处按 bundleId
+   *  合并覆盖：同 bundleId 覆盖 label/openArgs/enabled；新 bundleId 追加；
+   *  enabled:false 关闭某个默认项。绝不写死浏览器，加新浏览器只改配置。 */
+  browserRestartTargets?: HostOverloadBrowserTargetConfig[];
+}
+
+/** 单个可重启浏览器目标的配置项（全部可选，仅 bundleId 必填才生效）。 */
+export interface HostOverloadBrowserTargetConfig {
+  /** macOS CFBundleIdentifier，如 company.thebrowser.Browser。唯一定位键。 */
+  bundleId: string;
+  /** 卡片显示名，如 Arc / Chrome / Edge。缺省回退为 bundleId。 */
+  label?: string;
+  /** 重启时透传给 `open -b <id> --args …` 的额外参数（如 Chromium 的
+   *  --restore-last-session 强制恢复标签）。 */
+  openArgs?: string[];
+  /** 置 false 则该浏览器永不出现在卡片上（用于关掉某个默认项）。 */
+  enabled?: boolean;
 }
 
 export interface VcMeetingAgentGlobalConfig {
@@ -442,7 +460,33 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
   ) {
     out.enterMemUsedFrac = value.enterMemUsedFrac;
   }
+  const browserTargets = readBrowserRestartTargets(value.browserRestartTargets);
+  if (browserTargets) out.browserRestartTargets = browserTargets;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Parse the `browserRestartTargets` array from config. Keep only entries with a
+ *  non-blank string bundleId; coerce the optional fields defensively so a
+ *  hand-edited config can't inject non-strings. Returns undefined when there's
+ *  nothing usable (so the default set applies). The daemon-side resolver
+ *  (core/browser-restart.ts) does the actual merge-over-defaults. */
+function readBrowserRestartTargets(raw: unknown): HostOverloadBrowserTargetConfig[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HostOverloadBrowserTargetConfig[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const v = item as Record<string, unknown>;
+    const bundleId = typeof v.bundleId === 'string' ? v.bundleId.trim() : '';
+    if (!bundleId) continue;
+    const entry: HostOverloadBrowserTargetConfig = { bundleId };
+    if (typeof v.label === 'string' && v.label.trim()) entry.label = v.label.trim();
+    if (Array.isArray(v.openArgs) && v.openArgs.every(a => typeof a === 'string')) {
+      entry.openArgs = v.openArgs as string[];
+    }
+    if (typeof v.enabled === 'boolean') entry.enabled = v.enabled;
+    out.push(entry);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefined {

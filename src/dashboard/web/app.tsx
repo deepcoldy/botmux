@@ -764,6 +764,16 @@ function TopbarVersionControl(props: {
     try {
       const previousInstance = await dashboardInstance();
       const result = await updateAndRestartBotmux(fetch, setPhase);
+      if (result.bootstrapRequired) {
+        // The new binary is installed, but a normal restart is refused because
+        // live daemons still run the pre-signal-death-autorestart PM2 policy.
+        // Point the operator at the one-time terminal bootstrap instead of
+        // polling a reconnect that can never happen.
+        actionInFlightRef.current = false;
+        setPhase('error');
+        setErrorDetail(t('update.bootstrapRequired'));
+        return;
+      }
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
