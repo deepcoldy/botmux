@@ -165,17 +165,25 @@ export function TerminalPane(props: PaneCommonProps & {
   const requestGeneration = useRef(0);
   const terminalUrl = workbenchTerminalHref(props.session, props.location);
   const externalTerminalUrl = workbenchExternalTerminalHref(props.session);
+  // 触屏和桌面在鉴权方式上彻底分道，详见下面那段注释。
+  const touch = useTouchEnvironment();
 
-  // Two ways to authenticate the frame. With a Dashboard cookie the same-origin
-  // path is right: it carries the takeover grant, so Release/Take control work.
-  // Without one — a Feishu WebView holds no Dashboard cookie — that path 403s,
-  // so fall back to the viewToken capability URL the Feishu card already uses.
-  // It cannot send input, which is exactly the read-only guarantee we want here.
-  // Until that link is in hand the frame stays empty on purpose: the bare
-  // same-origin URL without a cookie only ever renders the worker's plain-text
-  // "Forbidden" body, which is worse than an honest waiting state.
+  // 给 iframe 鉴权有两条路，选哪条不看登录态，看的是「这个浏览器发 WebSocket 时带不带
+  // Cookie」：
+  // - 桌面登录态 → 同源 /s/<id>。Cookie 带得过去，而且它捎带接管授权，接管/释放才有意义。
+  // - 触屏（iOS WebView，飞书内嵌浏览器同理）→ 必须换成带 ?viewToken= 查询参数的能力
+  //   地址。**iOS WebView 发起 WebSocket 升级时不携带 Cookie**，所以同源地址即使页面本身
+  //   能加载（HTTP 请求带 Cookie），紧接着的 WS 握手也会被 403 掉，终端页永远停在
+  //   disconnected、整片空白。viewToken 把凭证放在 URL 查询参数里，与 Cookie 无关，无
+  //   Cookie 也能升级成功——旧版飞书卡片给的就是这条链接，「以前手机上是好用的」正是
+  //   这个原因。代价是这条通道只读，所以触屏下接管按钮一并隐藏。
+  // - 未登录（飞书 WebView 里没有 Dashboard Cookie）→ 同样只能走 viewToken。
+  // 因此这里的取链条件是「非外部终端，且（触屏 或 未登录）」；登录态下拉 view-link 走的是
+  // 普通 HTTP fetch，Cookie 正常带得上，iOS 也拿得到。
+  // 链接到手之前 iframe 故意留空：没有 Cookie 的裸同源地址只会渲染出 worker 的
+  // "Forbidden" 纯文本，比一个诚实的等待态更糟。
   useEffect(() => {
-    if (props.authenticated || externalTerminalUrl) return undefined;
+    if (externalTerminalUrl || (props.authenticated && !touch)) return undefined;
     const controller = new AbortController();
     let retry: ReturnType<typeof setTimeout> | undefined;
     setViewLink(null);
@@ -199,7 +207,7 @@ export function TerminalPane(props: PaneCommonProps & {
       controller.abort();
       if (retry !== undefined) clearTimeout(retry);
     };
-  }, [externalTerminalUrl, props.api, props.authenticated, props.session.sessionId, viewLinkAttempt]);
+  }, [externalTerminalUrl, props.api, props.authenticated, props.session.sessionId, touch, viewLinkAttempt]);
 
   // Bumping the attempt re-runs the effect above, which cancels any pending
   // auto-retry through its cleanup, so the button cannot stack timers.
@@ -208,7 +216,11 @@ export function TerminalPane(props: PaneCommonProps & {
     setViewLinkAttempt(value => value + 1);
   }, []);
 
-  const frameUrl = props.authenticated ? terminalUrl : viewLink;
+  // 触屏没有裸回退：viewLink 还没到手就让空态顶着，绝不退回同源地址——那条路在 iOS 上
+  // 必然是黑屏（WS 不带 Cookie，握手被 403），显示出来只会让人以为是终端坏了。
+  const frameUrl = !externalTerminalUrl && touch
+    ? viewLink
+    : props.authenticated ? terminalUrl : viewLink;
 
   const applyControl = useCallback((next: TerminalControlState, reloadOnDowngrade = true) => {
     const previous = controlRef.current;
@@ -265,10 +277,11 @@ export function TerminalPane(props: PaneCommonProps & {
 
   // Fires once per session for the "open writable" shortcut. A platform owner
   // (`fixed`) already writes, and an unauthenticated viewer cannot take over at
-  // all, so neither needs the request.
+  // all, so neither needs the request. 触屏也跳过：那边的 iframe 走 viewToken 只读通道，
+  // 抢来的写权限自己用不上，反而会把别人电脑上的输入权顶掉。
   const autoTakeoverDone = useRef<string | null>(null);
   useEffect(() => {
-    if (!props.autoTakeControl || !props.authenticated || phase !== 'ready') return;
+    if (!props.autoTakeControl || !props.authenticated || touch || phase !== 'ready') return;
     if (!control || control.mode !== 'readonly' || control.fixed) return;
     if (autoTakeoverDone.current === props.session.sessionId) return;
     autoTakeoverDone.current = props.session.sessionId;
@@ -298,15 +311,16 @@ export function TerminalPane(props: PaneCommonProps & {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const frameKey = `${props.session.sessionId}-${frameGeneration}`;
   const readFrameStatus = props.readFrameStatus ?? readTerminalFrameStatus;
-  const touchEnvironment = useTouchEnvironment();
   const frameWatch = useTerminalFrameWatch({
-    enabled: touchEnvironment,
+    enabled: touch,
     sessionId: props.session.sessionId,
     frameKey,
     read: () => readFrameStatus(frameRef.current),
   });
 
-  const controlled = control?.mode === 'controlled' && control.owned;
+  // 触屏挂的是 viewToken 只读通道：控制权接口哪怕报「已接管」或平台所有者（fixed），这块
+  // iframe 也送不进输入，徽标必须跟着说只读，否则和下面那行反馈自相矛盾。
+  const controlled = !touch && control?.mode === 'controlled' && control.owned;
   const status = controlled ? '可输入' : '只读';
   const expires = controlled && control?.expiresAt
     ? formatWorkbenchRelativeTime(control.expiresAt, props.now, 'zh-CN')
@@ -325,7 +339,9 @@ export function TerminalPane(props: PaneCommonProps & {
         </div>
         <div className="wb-pane-actions">
           {frameUrl ? <a href={frameUrl} target="_blank" rel="noopener noreferrer">新标签页打开</a> : null}
-          {!externalTerminalUrl && terminalUrl && props.authenticated && !control?.fixed ? (
+          {/* 触屏不给接管按钮：那边挂的是 viewToken 只读通道，接管到手也送不进输入，
+              摆出来只会让人反复点。 */}
+          {!externalTerminalUrl && terminalUrl && props.authenticated && !touch && !control?.fixed ? (
             controlled
               ? <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('release')}>释放输入</button>
               : <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('takeover')}>接管输入</button>
@@ -333,11 +349,14 @@ export function TerminalPane(props: PaneCommonProps & {
         </div>
       </header>
       <div className="wb-pane-feedback" role="status" aria-live="polite">
-        {phase === 'loading' ? '正在检查终端权限…' : error || (control?.fixed
-          ? '平台所有者身份已登录，可直接输入。'
-          : controlled ? '已接管，可键盘输入。'
-            : props.authenticated ? '只读查看中，点「接管输入」可操作。'
-              : '只读查看。登录 Dashboard 后可接管。')}
+        {/* 触屏一句话说死，登录与否都一样：这块 iframe 挂的是 viewToken 只读通道，控制权
+            接口报什么都改变不了这个事实，转述它反而误导。 */}
+        {touch ? '只读查看中。手机端为只读视图，需要输入请在电脑上操作。'
+          : phase === 'loading' ? '正在检查终端权限…' : error || (control?.fixed
+            ? '平台所有者身份已登录，可直接输入。'
+            : controlled ? '已接管，可键盘输入。'
+              : props.authenticated ? '只读查看中，点「接管输入」可操作。'
+                : '只读查看。登录 Dashboard 后可接管。')}
       </div>
       <div className="wb-pane-frame-shell">
         {externalTerminalUrl ? (
@@ -376,9 +395,10 @@ export function TerminalPane(props: PaneCommonProps & {
               </div>
             ) : null}
           </>
-        ) : !props.authenticated && !externalTerminalUrl && terminalUrl ? (
+        ) : (touch || !props.authenticated) && !externalTerminalUrl && terminalUrl ? (
           // A terminal exists, we just have no credential for it yet. Say so
-          // instead of framing a URL that would answer "Forbidden".
+          // instead of framing a URL that would answer "Forbidden". 触屏即使已登录也走
+          // 这里：它等的是 viewToken 链接，同源地址对它等同于没有凭证。
           viewLinkPhase === 'failed' ? (
             <div className="wb-pane-empty" role="status">
               <span aria-hidden="true">⚠</span>

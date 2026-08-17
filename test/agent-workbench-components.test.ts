@@ -886,6 +886,11 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
   });
 
   const BLOCKED_HEADLINE = '终端实时连接未建立';
+  /** 触屏下 iframe 挂的是带 viewToken 的只读链接（iOS WebView 的 WS 不带 Cookie，同源
+   *  地址握不上手），所以这里的 api 必须给得出这条链接，否则面板停在空态、连 iframe 都
+   *  没有，覆盖层也就无从谈起。 */
+  const VIEW_LINK = 'https://board.example/s/session-0?viewToken=view-cap-abc';
+  const touchApi: WorkbenchApi = { ...api, getTerminalViewLink: async () => VIEW_LINK };
 
   /** 组件测试拿不到真 iframe 的 internals，所以把「读状态」当 prop 注进去。
    *  生产默认实现读的是同源 iframe 里的 #status 节点。 */
@@ -894,7 +899,7 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(TerminalPane, {
         session: { ...kindSession({}), webPort: 7681, proxyPort: 7682 },
-        api,
+        api: touchApi,
         authenticated: true,
         now: NOW,
         location: { protocol: 'https:', origin: 'https://board.example', hostname: 'board.example' },
@@ -918,7 +923,9 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
     expect(textOf(renderer.root)).toContain(BLOCKED_HEADLINE);
     const links = renderer.root.findAll(node => node.type === 'a' && textOf(node) === '在浏览器中打开');
     expect(links).toHaveLength(1);
-    expect(links[0].props.href).toBe('https://board.example/s/session-0');
+    // 出路给的是 iframe 正在用的那条 viewToken 链接：换成裸同源地址，在系统浏览器里
+    // 一样连不上（无 Cookie 的 WS 会被 403）。
+    expect(links[0].props.href).toBe(VIEW_LINK);
     expect(links[0].props.target).toBe('_blank');
     // iframe 不卸载：底下的页面一直在重连，卸了就永远连不上了。
     expect(renderer.root.findAllByType('iframe')).toHaveLength(1);
@@ -945,6 +952,102 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
     status = 'disconnected';
     await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
     expect(textOf(renderer.root)).not.toContain(BLOCKED_HEADLINE);
+    act(() => renderer.unmount());
+  });
+});
+
+describe('终端面板：触屏改走 viewToken 链路', () => {
+  const NOW = 1_900_000_001_000;
+  const VIEW_LINK = 'https://board.example/s/session-0?viewToken=view-cap-abc';
+  const SAME_ORIGIN = 'https://board.example/s/session-0';
+  const TOUCH_FEEDBACK = '只读查看中。手机端为只读视图，需要输入请在电脑上操作。';
+  let previousWindow: unknown;
+
+  /** 触屏与否只由 useTouchEnvironment 的 matchMedia('(hover: none)') 读数决定。 */
+  function setTouchEnvironment(touch: boolean): void {
+    (globalThis as Record<string, unknown>).window = {
+      matchMedia: (query: string) => ({
+        matches: touch && query === '(hover: none)',
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    };
+  }
+
+  beforeEach(() => { previousWindow = (globalThis as Record<string, unknown>).window; });
+  afterEach(() => {
+    if (previousWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+    else (globalThis as Record<string, unknown>).window = previousWindow;
+  });
+
+  /** 一律用登录态渲染：本组要证明的正是「登录与否不决定走哪条链路，触屏与否才决定」。 */
+  async function renderTerminal(overrides: Partial<WorkbenchApi> = {}): Promise<{
+    renderer: TestRenderer.ReactTestRenderer;
+    viewLinkCalls: string[];
+  }> {
+    const viewLinkCalls: string[] = [];
+    const paneApi: WorkbenchApi = {
+      ...api,
+      getTerminalViewLink: async (sessionId: string) => { viewLinkCalls.push(sessionId); return VIEW_LINK; },
+      ...overrides,
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: { ...kindSession({}), webPort: 7681, proxyPort: 7682 },
+        api: paneApi,
+        authenticated: true,
+        now: NOW,
+        location: { protocol: 'https:', origin: 'https://board.example', hostname: 'board.example' },
+      }));
+    });
+    return { renderer, viewLinkCalls };
+  }
+
+  function buttonLabels(renderer: TestRenderer.ReactTestRenderer): string[] {
+    return renderer.root.findAllByType('button').map(node => textOf(node));
+  }
+
+  it('触屏即使已登录也挂 viewToken 链接，并且不给接管按钮', async () => {
+    setTouchEnvironment(true);
+    const { renderer, viewLinkCalls } = await renderTerminal();
+
+    // iOS WebView 的 WebSocket 升级不带 Cookie，同源 /s/<id> 必然 403 到黑屏；
+    // 凭证必须在查询参数里。
+    expect(viewLinkCalls).toEqual(['session-0']);
+    const src = String(renderer.root.findByType('iframe').props.src);
+    expect(src).toBe(VIEW_LINK);
+    expect(src).toContain('viewToken=');
+    expect(src).not.toBe(SAME_ORIGIN);
+    // viewToken 通道只读，接管按钮点了也送不进输入，摆出来只会误导。
+    expect(buttonLabels(renderer)).not.toContain('接管输入');
+    expect(buttonLabels(renderer)).not.toContain('释放输入');
+    expect(textOf(renderer.root)).toContain(TOUCH_FEEDBACK);
+    act(() => renderer.unmount());
+  });
+
+  it('桌面登录态照旧走同源地址，接管按钮还在', async () => {
+    setTouchEnvironment(false);
+    const { renderer, viewLinkCalls } = await renderTerminal();
+
+    // 桌面浏览器的 WS 正常带 Cookie，同源那条还捎带接管授权，没有理由绕道。
+    expect(viewLinkCalls).toEqual([]);
+    expect(renderer.root.findByType('iframe').props.src).toBe(SAME_ORIGIN);
+    expect(buttonLabels(renderer)).toContain('接管输入');
+    expect(textOf(renderer.root)).toContain('只读查看中，点「接管输入」可操作。');
+    expect(textOf(renderer.root)).not.toContain(TOUCH_FEEDBACK);
+    act(() => renderer.unmount());
+  });
+
+  it('触屏拿不到 viewToken 链接时停在空态，绝不回退到同源地址', async () => {
+    setTouchEnvironment(true);
+    const { renderer } = await renderTerminal({ getTerminalViewLink: async () => null });
+
+    // 裸同源地址在触屏上只会是黑屏，宁可空着也不能挂上去。
+    expect(renderer.root.findAllByType('iframe')).toHaveLength(0);
+    expect(textOf(renderer.root)).toContain('只读链接获取失败');
+    expect(renderer.root.findAll(node => node.type === 'a').map(node => node.props.href))
+      .not.toContain(SAME_ORIGIN);
     act(() => renderer.unmount());
   });
 });
