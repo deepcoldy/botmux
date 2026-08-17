@@ -390,31 +390,52 @@ interface PiModelsCacheEntry {
   mtimeMs: number;
   size: number;
   contextByModelId: Map<string, number>;
+  contextByProviderModel: Map<string, number>;
 }
 
-let piModelsCache: PiModelsCacheEntry | null = null;
+let piModelsCache: (PiModelsCacheEntry & { ambiguousBareIds?: Set<string> }) | null = null;
 
-function readPiModelsContextWindows(): Map<string, number> | null {
+interface PiModelsWindows {
+  byBareId: Map<string, number>;
+  byProviderModel: Map<string, number>;
+  ambiguousBareIds: Set<string>;
+}
+
+function readPiModelsContextWindows(): PiModelsWindows | null {
   try {
     const st = statSync(PI_MODELS_JSON_PATH);
-    if (piModelsCache && piModelsCache.mtimeMs === st.mtimeMs && piModelsCache.size === st.size) return piModelsCache.contextByModelId;
+    if (piModelsCache && piModelsCache.mtimeMs === st.mtimeMs && piModelsCache.size === st.size) {
+      return { byBareId: piModelsCache.contextByModelId, byProviderModel: piModelsCache.contextByProviderModel, ambiguousBareIds: piModelsCache.ambiguousBareIds ?? new Set() };
+    }
     const parsed = JSON.parse(readFileSync(PI_MODELS_JSON_PATH, 'utf-8')) as any;
     const contextByModelId = new Map<string, number>();
+    const contextByProviderModel = new Map<string, number>();
+    const ambiguousBareIds = new Set<string>();
     const providers = parsed?.providers;
     if (providers && typeof providers === 'object') {
-      for (const provider of Object.values<any>(providers)) {
+      for (const [providerName, provider] of Object.entries<any>(providers)) {
         if (!provider || typeof provider !== 'object') continue;
         const models = provider.models;
         if (!Array.isArray(models)) continue;
         for (const model of models) {
           if (model && typeof model.id === 'string' && typeof model.contextWindow === 'number' && model.contextWindow > 0) {
-            contextByModelId.set(model.id, model.contextWindow);
+            const existing = contextByModelId.get(model.id);
+            if (existing !== undefined && existing !== model.contextWindow) {
+              // Same bare id with a different window under another provider: bare-id
+              // lookup would silently pick one, so mark it ambiguous and only allow
+              // provider-qualified resolution.
+              ambiguousBareIds.add(model.id);
+            } else {
+              contextByModelId.set(model.id, model.contextWindow);
+            }
+            contextByProviderModel.set(`${providerName}/${model.id}`, model.contextWindow);
           }
         }
       }
     }
-    piModelsCache = { mtimeMs: st.mtimeMs, size: st.size, contextByModelId };
-    return contextByModelId;
+    for (const id of ambiguousBareIds) contextByModelId.delete(id);
+    piModelsCache = { mtimeMs: st.mtimeMs, size: st.size, contextByModelId, contextByProviderModel, ambiguousBareIds };
+    return { byBareId: contextByModelId, byProviderModel: contextByProviderModel, ambiguousBareIds };
   } catch {
     // models.json missing or unparseable: fall back to used-tokens-only context
     // (no window, no percentage), same as Claude Code sessions.
@@ -424,22 +445,37 @@ function readPiModelsContextWindows(): Map<string, number> | null {
 
 /** Resolve a model's context window, tolerating pi's bare model ids as well as
  *  the "provider/model" and "model:variant" shapes used in configs. */
-function piModelContextWindow(modelId: string): number | undefined {
-  const contextByModelId = readPiModelsContextWindows();
-  if (!contextByModelId) return undefined;
-  if (contextByModelId.has(modelId)) return contextByModelId.get(modelId);
+function piModelContextWindow(modelId: string, provider?: string): number | undefined {
+  const windows = readPiModelsContextWindows();
+  if (!windows) return undefined;
+  // Prefer the exact provider+model identity recorded in the transcript.
+  if (provider) {
+    const qualified = windows.byProviderModel.get(`${provider}/${modelId}`);
+    if (qualified !== undefined) return qualified;
+  }
+  if (windows.byBareId.has(modelId)) return windows.byBareId.get(modelId);
   const bare = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
-  if (contextByModelId.has(bare)) return contextByModelId.get(bare);
+  if (provider) {
+    const qualifiedBare = windows.byProviderModel.get(`${provider}/${bare}`);
+    if (qualifiedBare !== undefined) return qualifiedBare;
+  }
+  if (windows.byBareId.has(bare)) return windows.byBareId.get(bare);
   const withoutVariant = bare.includes(':') ? bare.slice(0, bare.indexOf(':')) : bare;
-  if (withoutVariant !== bare && contextByModelId.has(withoutVariant)) return contextByModelId.get(withoutVariant);
+  if (withoutVariant !== bare) {
+    if (provider) {
+      const qualifiedNoVariant = windows.byProviderModel.get(`${provider}/${withoutVariant}`);
+      if (qualifiedNoVariant !== undefined) return qualifiedNoVariant;
+    }
+    if (windows.byBareId.has(withoutVariant)) return windows.byBareId.get(withoutVariant);
+  }
   return undefined;
 }
 
 /** pi's usage is per-turn prompt-side totals; the latest measurement is the
  *  context gauge. The window (and therefore the percentage) comes from
  *  ~/.pi/agent/models.json when the model id can be resolved. */
-function buildPiContextUsage(usedTokens: number, modelId: string): SessionContextUsage {
-  const windowTokens = piModelContextWindow(modelId);
+function buildPiContextUsage(usedTokens: number, modelId: string, provider?: string): SessionContextUsage {
+  const windowTokens = piModelContextWindow(modelId, provider);
   if (!windowTokens) return { usedTokens };
   const percentUsed = Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100);
   return { usedTokens, windowTokens, percentUsed };
@@ -459,11 +495,17 @@ function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry
   agg.outputTokens += num(u.output);
   agg.cacheReadTokens += num(u.cacheRead);
   agg.cacheCreateTokens += num(u.cacheWrite);
-  const contextTokens = num(u.input) + num(u.cacheRead) + num(u.cacheWrite);
+  // Pi 0.84+ native context accounting prefers usage.totalTokens; fall back to
+  // the four-part sum (input + output + cacheRead + cacheWrite). input alone
+  // excludes the current turn's output, which undercounts the real context.
+  const totalTokens = num(u.totalTokens);
+  const contextTokens = totalTokens > 0
+    ? totalTokens
+    : num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite);
   // Synthetic/empty assistant records (e.g. around compaction) must not erase
   // the last native context measurement.
   if (contextTokens > 0) {
-    agg.latestContextUsage = buildPiContextUsage(contextTokens, typeof msg.model === 'string' ? msg.model : '');
+    agg.latestContextUsage = buildPiContextUsage(contextTokens, typeof msg.model === 'string' ? msg.model : '', typeof msg.provider === 'string' ? msg.provider : '');
   }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
