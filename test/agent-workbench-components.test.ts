@@ -1,9 +1,13 @@
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js';
 import { AgentWorkbenchDockView } from '../src/dashboard/web/agent-workbench-dock-view.js';
-import { WebPane } from '../src/dashboard/web/agent-workbench-panes.js';
+import {
+  TerminalPane,
+  WebPane,
+  type TerminalFrameStatus,
+} from '../src/dashboard/web/agent-workbench-panes.js';
 import type { WorkbenchApi } from '../src/dashboard/web/agent-workbench-api.js';
 import { defaultWorkbenchLayout, type WorkbenchSessionRow } from '../src/dashboard/web/agent-workbench-model.js';
 import {
@@ -854,6 +858,93 @@ describe('Agent Workbench 分组折叠', () => {
     expect(renderer.root.findAll(node =>
       String(node.props.className ?? '') === 'wb-session-empty')).toHaveLength(0);
     expect(JSON.parse(browser.values.get(COLLAPSED_GROUPS_KEY)!)).toEqual(['active', 'needs-you']);
+    act(() => renderer.unmount());
+  });
+});
+
+describe('终端面板：实时通道被拦时的降级提示', () => {
+  const NOW = 1_900_000_001_000;
+  let previousWindow: unknown;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    previousWindow = (globalThis as Record<string, unknown>).window;
+    // 整套探测只在触屏环境启用，所以先把 window 伪装成手机（无 hover）。
+    (globalThis as Record<string, unknown>).window = {
+      matchMedia: (query: string) => ({
+        matches: query === '(hover: none)',
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    };
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (previousWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+    else (globalThis as Record<string, unknown>).window = previousWindow;
+  });
+
+  const BLOCKED_HEADLINE = '终端实时连接未建立';
+
+  /** 组件测试拿不到真 iframe 的 internals，所以把「读状态」当 prop 注进去。
+   *  生产默认实现读的是同源 iframe 里的 #status 节点。 */
+  async function renderTerminal(read: () => TerminalFrameStatus): Promise<TestRenderer.ReactTestRenderer> {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: { ...kindSession({}), webPort: 7681, proxyPort: 7682 },
+        api,
+        authenticated: true,
+        now: NOW,
+        location: { protocol: 'https:', origin: 'https://board.example', hostname: 'board.example' },
+        readFrameStatus: () => read(),
+      }));
+    });
+    // 轮询从 iframe 的 onLoad 起步：页面还没加载完就开始读，读到的只会是 unknown。
+    await act(async () => { renderer.root.findByType('iframe').props.onLoad(); });
+    return renderer;
+  }
+
+  it('持续读不到连接才盖提示，并给出用浏览器打开的出路', async () => {
+    let status: TerminalFrameStatus = 'disconnected';
+    const renderer = await renderTerminal(() => status);
+
+    // 7 秒还没到阈值：终端页自己每 2 秒重连一次，一断就吓唬人只会误报。
+    await act(async () => { await vi.advanceTimersByTimeAsync(7_000); });
+    expect(textOf(renderer.root)).not.toContain(BLOCKED_HEADLINE);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(textOf(renderer.root)).toContain(BLOCKED_HEADLINE);
+    const links = renderer.root.findAll(node => node.type === 'a' && textOf(node) === '在浏览器中打开');
+    expect(links).toHaveLength(1);
+    expect(links[0].props.href).toBe('https://board.example/s/session-0');
+    expect(links[0].props.target).toBe('_blank');
+    // iframe 不卸载：底下的页面一直在重连，卸了就永远连不上了。
+    expect(renderer.root.findAllByType('iframe')).toHaveLength(1);
+
+    // 读不到状态（跨域/时序）不算证据，但也不该把已经显示的提示撤掉。
+    status = 'unknown';
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(textOf(renderer.root)).toContain(BLOCKED_HEADLINE);
+
+    // 页面自己重连上了 → 提示自动消失，不需要用户做任何事。
+    status = 'connected';
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(textOf(renderer.root)).not.toContain(BLOCKED_HEADLINE);
+    act(() => renderer.unmount());
+  });
+
+  it('连上过一次之后再断开也不再打扰', async () => {
+    let status: TerminalFrameStatus = 'connected';
+    const renderer = await renderTerminal(() => status);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(textOf(renderer.root)).not.toContain(BLOCKED_HEADLINE);
+
+    // 连过就说明这个浏览器环境没拦 ws://，后续闪断交给终端页自身的重连。
+    status = 'disconnected';
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(textOf(renderer.root)).not.toContain(BLOCKED_HEADLINE);
     act(() => renderer.unmount());
   });
 });

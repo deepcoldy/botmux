@@ -37,6 +37,99 @@ interface PaneCommonProps {
   now: number;
 }
 
+/** 终端 iframe 内部实时通道的一次读数。`unknown` 表示读不出来（跨域、时序、状态
+ *  节点还没渲染出来），一律不作数：宁可不提示，也不要在连接其实正常的浏览器上盖一层
+ *  假警告。 */
+export type TerminalFrameStatus = 'connected' | 'disconnected' | 'unknown';
+
+/** 生产实现。终端页和工作台同源（都挂在 /s/<id> 前置代理下），所以可以直接读它右下角
+ *  那个 #status 节点——'connected' / 'disconnected' 是终端页自己的 WebSocket 回调写进去
+ *  的，比任何外部探测都准。跨域或时序异常时读取会抛，按未知处理。 */
+export function readTerminalFrameStatus(frame: HTMLIFrameElement | null): TerminalFrameStatus {
+  try {
+    const text = frame?.contentWindow?.document?.getElementById('status')?.textContent?.trim();
+    if (text === 'connected') return 'connected';
+    if (text === 'disconnected') return 'disconnected';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+const FRAME_STATUS_POLL_MS = 1_000;
+/** 连续 8 拍（≈8 秒）都是 disconnected 才提示。终端页自己每 2 秒重连一次，正常网络下
+ *  一两拍就连上了；8 秒还连不上，基本可以断定是这个浏览器环境拦掉了 ws://。 */
+const FRAME_STATUS_BLOCK_TICKS = 8;
+
+/** 整套探测只在触屏环境启用——ws:// 被系统拦截是 iOS（含飞书内嵌浏览器）的毛病，桌面
+ *  和 Chromium 不受影响，没必要为它们付一个 1 秒轮询。写法沿用 session-list 的
+ *  useTouchRowMetrics：matchMedia + change 订阅 + 卸载时退订。 */
+function useTouchEnvironment(): boolean {
+  const [touch, setTouch] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return undefined;
+    const query = window.matchMedia('(hover: none)');
+    const sync = () => setTouch(
+      (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0) || query.matches,
+    );
+    sync();
+    query.addEventListener?.('change', sync);
+    return () => query.removeEventListener?.('change', sync);
+  }, []);
+  return touch;
+}
+
+/** 盯着终端 iframe 内部的实时通道：iframe 明明加载出来了、里面却长时间连不上时，
+ *  给外层一个 blocked 信号去盖提示层。iframe 本身不卸载，连上后提示自动撤掉。 */
+function useTerminalFrameWatch(params: {
+  enabled: boolean;
+  /** 换会话就把本轮结论清空；同一会话内 iframe 重挂（接管/释放触发的 reload）不算换环境。 */
+  sessionId: string;
+  /** 当前这块 iframe 的身份。只有它自己报过 load 才开始轮询，避免拿上一块的结论套新的。 */
+  frameKey: string;
+  read(): TerminalFrameStatus;
+}): { blocked: boolean; onFrameLoad?: () => void } {
+  const { enabled, frameKey, sessionId } = params;
+  const [blocked, setBlocked] = useState(false);
+  const [loadedFrameKey, setLoadedFrameKey] = useState<string | null>(null);
+  // 连上过一次就永久收手：环境本身没问题，之后的闪断交给终端页自己的重连，不再打扰。
+  const connectedRef = useRef(false);
+  const readRef = useRef(params.read);
+  // 每渲染刷新一次读数源，轮询时从 ref 取最新实现。把它写进依赖会让定时器每次渲染重
+  // 建，8 秒的连续计数就永远攒不满了。
+  useEffect(() => { readRef.current = params.read; });
+
+  useEffect(() => {
+    connectedRef.current = false;
+    setBlocked(false);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!enabled || connectedRef.current || loadedFrameKey !== frameKey) return undefined;
+    let streak = 0;
+    const timer = setInterval(() => {
+      const status = readRef.current();
+      if (status === 'connected') {
+        connectedRef.current = true;
+        setBlocked(false);
+        clearInterval(timer);
+        return;
+      }
+      // unknown 既不累计也不撤下已经显示的提示：读不到不等于连上了。
+      if (status !== 'disconnected') {
+        streak = 0;
+        return;
+      }
+      streak += 1;
+      if (streak >= FRAME_STATUS_BLOCK_TICKS) setBlocked(true);
+    }, FRAME_STATUS_POLL_MS);
+    return () => clearInterval(timer);
+  }, [enabled, frameKey, loadedFrameKey]);
+
+  const onFrameLoad = useCallback(() => setLoadedFrameKey(frameKey), [frameKey]);
+  return { blocked: enabled && blocked, onFrameLoad: enabled ? onFrameLoad : undefined };
+}
+
 function apiErrorText(error: unknown): string {
   if (error instanceof WorkbenchApiError) {
     const known: Record<string, string> = {
@@ -57,6 +150,9 @@ export function TerminalPane(props: PaneCommonProps & {
   /** Request control as soon as the pane is ready, for the row shortcut that
    *  opens a writable terminal in one click. */
   autoTakeControl?: boolean;
+  /** 测试注入点：组件测试环境里没有真 iframe 的 internals，注入一个假的读数源即可。
+   *  生产默认走同源 contentWindow（`readTerminalFrameStatus`）。 */
+  readFrameStatus?: (frame: HTMLIFrameElement | null) => TerminalFrameStatus;
 }): JSX.Element {
   const [control, setControl] = useState<TerminalControlState | null>(null);
   const [phase, setPhase] = useState<'loading' | 'ready' | 'busy' | 'error'>('loading');
@@ -199,6 +295,17 @@ export function TerminalPane(props: PaneCommonProps & {
     }
   };
 
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
+  const frameKey = `${props.session.sessionId}-${frameGeneration}`;
+  const readFrameStatus = props.readFrameStatus ?? readTerminalFrameStatus;
+  const touchEnvironment = useTouchEnvironment();
+  const frameWatch = useTerminalFrameWatch({
+    enabled: touchEnvironment,
+    sessionId: props.session.sessionId,
+    frameKey,
+    read: () => readFrameStatus(frameRef.current),
+  });
+
   const controlled = control?.mode === 'controlled' && control.owned;
   const status = controlled ? '可输入' : '只读';
   const expires = controlled && control?.expiresAt
@@ -241,17 +348,34 @@ export function TerminalPane(props: PaneCommonProps & {
             <a href={externalTerminalUrl} target="_blank" rel="noopener noreferrer">打开外部终端</a>
           </div>
         ) : frameUrl ? (
-          // 手机端和桌面走同一条直嵌路径，不做任何 transform 缩放：iOS WKWebView 对被
-          // 缩放的 iframe 内 canvas/WebGL 有不渲染的合成缺陷，终端会整片空白。终端页
-          // 自身会按 iframe 的实际宽度 fit 出列数，窄屏直嵌即可正常显示。
-          <iframe
-            key={`${props.session.sessionId}-${frameGeneration}`}
-            className="wb-pane-frame"
-            src={frameUrl}
-            title={`终端 — ${workbenchSessionTitle(props.session)}`}
-            allow="clipboard-read; clipboard-write"
-            referrerPolicy="no-referrer"
-          />
+          <>
+            {/* 手机端和桌面走同一条直嵌路径，不做任何 transform 缩放：iOS WKWebView 对被
+                缩放的 iframe 内 canvas/WebGL 有不渲染的合成缺陷，终端会整片空白。终端页
+                自身会按 iframe 的实际宽度 fit 出列数，窄屏直嵌即可正常显示。 */}
+            <iframe
+              key={frameKey}
+              ref={frameRef}
+              className="wb-pane-frame"
+              src={frameUrl}
+              title={`终端 — ${workbenchSessionTitle(props.session)}`}
+              allow="clipboard-read; clipboard-write"
+              referrerPolicy="no-referrer"
+              onLoad={frameWatch.onFrameLoad}
+            />
+            {/* iframe 加载得出来、里面的实时通道却始终连不上（iOS 会拦掉 http 页里的
+                ws://）。这时终端区域只会是一片黑，与其让人对着黑屏猜，不如直说，并给一条
+                能自己走通的路。覆盖层盖在 iframe 上而不是替换它：页面自身一直在重连，
+                连上后这层会自动撤掉。 */}
+            {frameWatch.blocked ? (
+              <div className="wb-pane-empty wb-ws-blocked" role="status">
+                <span aria-hidden="true">⚠</span>
+                <strong>终端实时连接未建立</strong>
+                <p>当前浏览器环境限制了非加密的实时连接（iOS 内常见）。可尝试用系统浏览器打开，或在电脑上查看。</p>
+                <a href={frameUrl} target="_blank" rel="noopener">在浏览器中打开</a>
+                <p>飞书内可通过右上角 ⋯ 菜单选择「在浏览器打开」。</p>
+              </div>
+            ) : null}
+          </>
         ) : !props.authenticated && !externalTerminalUrl && terminalUrl ? (
           // A terminal exists, we just have no credential for it yet. Say so
           // instead of framing a URL that would answer "Forbidden".

@@ -28133,7 +28133,9 @@ button.skills-issue-badge:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.wb-pane-frame-shell { min-height: 0; background: #05070a; overflow: hidden; }
+/* position: relative 是 .wb-ws-blocked 的定位基准（实时连接被拦时盖在 iframe 上的那层
+   提示），别去掉。 */
+.wb-pane-frame-shell { position: relative; min-height: 0; background: #05070a; overflow: hidden; }
 .wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: #05070a; }
 .wb-pane-empty {
   display: grid;
@@ -28149,6 +28151,27 @@ button.skills-issue-badge:hover {
 .wb-pane-empty > span { color: var(--wb-faint); font-size: 22px; }
 .wb-pane-empty p { max-width: 460px; margin: 0; color: var(--wb-faint); }
 .wb-pane-empty a { color: var(--wb-accent); }
+
+/* 手机端（尤其飞书 iOS 内嵌浏览器）会拦掉 http 页面里 JS 发起的 ws:// 连接：iframe 照常
+   加载，实时通道却永远连不上，终端区域一片黑。这一层盖在 iframe 上说明情况，iframe 不
+   卸载，页面自己重连成功后这层就撤掉。底色要不透明，否则下面的黑屏透出来会显得像没盖住。 */
+.wb-ws-blocked {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  background: var(--wb-surface);
+}
+.wb-ws-blocked a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--wb-border-strong);
+  border-radius: 2px;
+}
+.wb-ws-blocked a:hover { border-color: var(--wb-accent); }
+/* 末尾那句「⋯ 菜单」是补充说明，压一号字，别和上面的正文抢注意力 */
+.wb-ws-blocked p:last-of-type { font-size: 10px; }
 
 .wb-info-drawer {
   position: absolute;
