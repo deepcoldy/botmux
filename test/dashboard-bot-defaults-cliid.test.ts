@@ -185,6 +185,92 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  const dshCliState = {
+    options: [
+      { id: 'codex', label: 'Codex' },
+      { id: 'dsh', label: 'dsh' },
+    ],
+    ttadkModelDefault: '',
+    ttadkModelSuggestions: [],
+  };
+
+  function renderDsh(bot: Record<string, any>, patchBot = vi.fn()) {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_dsh', model: '', ...bot },
+        sessionFallback: 'dsh',
+        cliState: dshCliState as any,
+        patchBot,
+      }));
+    });
+    return { renderer, root: renderer.root, patchBot };
+  }
+
+  it('shows the dsh turn timeout in minutes and PUTs it as milliseconds', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      // 1_800_000 ms = 30 min
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      expect(input.props.value).toBe('30');
+      act(() => input.props.onChange({ currentTarget: { value: '45' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      // 45 min → 2_700_000 ms
+      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('clears the dsh turn timeout to the runner default when emptied', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      expect(input.props.value).toBe('30');
+      act(() => input.props.onChange({ currentTarget: { value: '' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      // Empty → '' so the daemon deletes the field (revert to 10-min default).
+      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('omits the turn timeout field for non-dsh CLIs', () => {
+    const { root } = renderDsh({ cliId: 'codex' });
+    expect(root.findAllByProps({ 'data-input': 'agentTurnTimeout' })).toHaveLength(0);
+  });
+
   it('shows a legacy path as read-only and omits cliRuntime on a model-only save', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];

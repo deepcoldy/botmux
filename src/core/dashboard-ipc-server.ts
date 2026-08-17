@@ -3522,6 +3522,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let wrapperCli: string | null = null;
   let model: string | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
+  // so the dashboard can render the dsh-only field with its current value.
+  let turnTimeoutMs: number | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3537,6 +3540,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    turnTimeoutMs = typeof cfg.turnTimeoutMs === 'number'
+      && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
+      ? cfg.turnTimeoutMs
+      : null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
@@ -3612,6 +3619,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     wrapperCli,
     model,
     reasoningEffort,
+    turnTimeoutMs,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -3953,8 +3961,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -3973,6 +3981,20 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+  // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
+  // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
+  // field is optional in the body, so distinguish absent (preserve) from
+  // present-but-empty (clear → runner default) like reasoningEffort does.
+  const supportsTurnTimeout = selected.cliId === 'dsh';
+  const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
+  let nextTurnTimeoutMs: number | undefined;
+  if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {
+    const n = Number(body.turnTimeoutMs);
+    if (!Number.isInteger(n) || n <= 0) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_turn_timeout_ms' });
+    }
+    nextTurnTimeoutMs = n;
+  }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
@@ -4097,6 +4119,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
       else delete entry.reasoningEffort;
     }
+    // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
+    // field value writes/clears it, absence preserves the current value.
+    if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
+    else if (turnTimeoutFieldPresent) {
+      if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
+      else delete entry.turnTimeoutMs;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
@@ -4131,6 +4160,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     bot.config.model = model || undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    // Mirror the entry write: non-dsh clears it, dsh with an explicit field
+    // takes the parsed value, dsh without the field preserves the existing one.
+    if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
+    else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (selected.cliId === 'riff') {
       bot.config.backendType = 'riff';
@@ -4151,6 +4184,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       selectionKey,
       closedMismatchedSessions,
       // Report the (possibly auto-cleared) read-isolation state + whether the new

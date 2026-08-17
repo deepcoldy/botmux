@@ -1361,6 +1361,9 @@ export function BotAgentSection(props: {
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty = use
+  // the runner default (10 min).
+  const [turnTimeoutMin, setTurnTimeoutMin] = useState(turnTimeoutMinFromMs(bot.turnTimeoutMs));
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1375,6 +1378,7 @@ export function BotAgentSection(props: {
     setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1384,6 +1388,7 @@ export function BotAgentSection(props: {
     bot.larkAppId,
     bot.model,
     bot.reasoningEffort,
+    bot.turnTimeoutMs,
     runtimeConfigKey,
     bot.wrapperCli,
     bot.skillInjection,
@@ -1474,6 +1479,10 @@ export function BotAgentSection(props: {
         cliId: cliKey,
         model,
         reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        // dsh-only: send minutes→ms, or '' to clear (revert to runner default).
+        // Non-dsh selections omit the field entirely — the daemon drops any
+        // stored value for non-dsh CLIs regardless, so there's nothing to clear.
+        ...(cliKey === 'dsh' ? { turnTimeoutMs: turnTimeoutMsFromMinInput(turnTimeoutMin) } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
@@ -1498,6 +1507,7 @@ export function BotAgentSection(props: {
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
         setRuntimeTouched(false);
@@ -1583,6 +1593,8 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  // The dsh adapter is the only one that forwards a runner turn timeout.
+  const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
 
   useEffect(() => {
@@ -1777,6 +1789,24 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
+      {isDsh && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              inputMode="numeric"
+              data-input="agentTurnTimeout"
+              placeholder={tr('botDefaults.agentTurnTimeoutPlaceholder')}
+              value={turnTimeoutMin}
+              disabled={agentBusy}
+              onChange={event => setTurnTimeoutMin(event.currentTarget.value)}
+            />
+          </label>
+        </div>
+      )}
       {isCodexSelection && (
         <div className="bd-row">
           <div className="bd-field">
@@ -1839,6 +1869,32 @@ export function BotAgentSection(props: {
       )}
     </section>
   );
+}
+
+/**
+ * Convert a stored dsh turn timeout (ms) into the minutes string shown in the
+ * dashboard input. Non-positive / non-integer / absent → empty (runner default).
+ * Sub-minute or non-whole-minute values fall back to empty rather than showing
+ * a misleading rounded figure the operator did not type.
+ */
+function turnTimeoutMinFromMs(ms: unknown): string {
+  if (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0) return '';
+  if (ms % 60_000 !== 0) return '';
+  return String(ms / 60_000);
+}
+
+/**
+ * Parse the minutes input back into a value for the PUT body: a positive
+ * integer number of minutes → ms; empty / invalid → '' (clear → runner
+ * default). The daemon re-validates and rejects bad values, so this only needs
+ * to distinguish "clear" from "set".
+ */
+function turnTimeoutMsFromMinInput(minutes: string): number | '' {
+  const trimmed = minutes.trim();
+  if (!trimmed) return '';
+  const n = Number(trimmed);
+  if (!Number.isInteger(n) || n <= 0) return '';
+  return n * 60_000;
 }
 
 function skillInjectionResolved(bot: BotDefaultsRow): string {
