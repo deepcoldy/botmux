@@ -27642,8 +27642,11 @@ button.skills-issue-badge:hover {
 .feedback-more { margin-top: 12px; }
 @media (max-width: 1100px) { .feedback-kpis { grid-template-columns: repeat(3, 1fr); } .feedback-deliveries > div { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .feedback-kpis, .feedback-grid { grid-template-columns: 1fr; } }
-/* Agent Workbench — flat Orca/terminal surface. Keep this block gradient-free,
-   radius <=4px, and independent from the Dashboard card/aurora vocabulary. */
+/* Agent Workbench — Orca-flavoured terminal surface: soft corners, low-contrast
+   dividers, no gradients, and independent from the Dashboard card/aurora
+   vocabulary. Every border-radius below comes from the four --wb-radius-*
+   tokens; a bare pixel value is a drift bug and the style contract test
+   (test/agent-workbench-style.test.ts) rejects it. */
 .workbench-route-host,
 .workbench-route-host > #root {
   width: 100%;
@@ -27682,6 +27685,21 @@ button.skills-issue-badge:hover {
   --wb-danger: #f18a94;
   --wb-danger-soft: #2d171b;
   --wb-focus: #9bdcff;
+  /* 圆角四级：4 小控件（徽标 / chip）、8 控件（按钮 / 输入 / 下拉 / 行内操作）、
+     10 高亮块与卡片（会话行高亮、组头高亮、行操作浮层）、12 面板与浮层（终端面板、
+     信息抽屉、移动端下钻容器）。.wb-* 里所有 border-radius 只引用这四个令牌，
+     调整整体圆度改这里一处即可。 */
+  --wb-radius-s: 4px;
+  --wb-radius-m: 8px;
+  --wb-radius-l: 10px;
+  --wb-radius-xl: 12px;
+  /* 分割线比 --wb-border 再退一档：会话列表里每行一条的横线原本是整个界面最硬的
+     东西，退到这个色阶后结构还在，但不再抢注意力。--wb-border 继续负责需要被看见
+     的边界（面板描边、栏与栏之间）。 */
+  --wb-divider: #1c2634;
+  /* 面板级阴影只做「浮起一点点」。深色底上黑色阴影几乎只会糊边、看不出层次，所以
+     这里的不透明度比浅色主题更低，靠描边而不是阴影撑层次。 */
+  --wb-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 6px 18px rgba(0, 0, 0, .05);
   color-scheme: dark;
   color: var(--wb-text);
   background: var(--wb-bg);
@@ -27708,6 +27726,9 @@ button.skills-issue-badge:hover {
   --wb-danger: #a92f3b;
   --wb-danger-soft: #f8dfe2;
   --wb-focus: #006da3;
+  /* 半径令牌不分主题，只有颜色相关的两个跟着换。 */
+  --wb-divider: #dde4ea;
+  --wb-shadow: 0 1px 2px rgba(15, 23, 42, .10), 0 6px 18px rgba(15, 23, 42, .08);
   color-scheme: light;
 }
 
@@ -27723,11 +27744,16 @@ button.skills-issue-badge:hover {
   font: inherit;
 }
 
+/* 控件基线：所有按钮和链接一律 8px。个别更小的徽标 / chip 会在下面单独降到 4px，
+   面板级容器单独升到 12px。过渡放在这里统一给：底色、描边、文字三者一起走
+   140ms ease-out，悬浮态不再是瞬间跳变；prefers-reduced-motion 那条 !important
+   会整体关掉。 */
 .agent-workbench-page button,
 .agent-workbench-dock button,
 .agent-workbench-page a,
 .agent-workbench-dock a {
-  border-radius: 2px;
+  border-radius: var(--wb-radius-m);
+  transition: background-color .14s ease-out, border-color .14s ease-out, color .14s ease-out;
 }
 
 .agent-workbench-page button:focus-visible,
@@ -27816,7 +27842,7 @@ button.skills-issue-badge:hover {
   min-width: 18px;
   padding: 2px 3px;
   border: 1px solid var(--wb-danger);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-s);
   color: var(--wb-danger);
   text-align: center;
 }
@@ -27845,8 +27871,10 @@ button.skills-issue-badge:hover {
   background: transparent;
   cursor: pointer;
 }
+/* 图标按钮 hover 现在还带一层底色：24px 的方块只靠描边变色太弱，圆角配上一小块
+   底色才读得出「这里可以点」。 */
 .wb-rail-heading button:hover,
-.wb-session-search button:hover { border-color: var(--wb-border-strong); color: var(--wb-text); }
+.wb-session-search button:hover { border-color: var(--wb-border-strong); color: var(--wb-text); background: var(--wb-surface-2); }
 
 .wb-session-search {
   display: flex;
@@ -27855,9 +27883,10 @@ button.skills-issue-badge:hover {
   margin: 6px 7px 4px;
   padding: 0 5px;
   border: 1px solid var(--wb-border);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-m);
   color: var(--wb-faint);
   background: var(--wb-bg);
+  transition: border-color .14s ease-out;
 }
 
 .wb-session-search:focus-within { border-color: var(--wb-focus); }
@@ -27905,7 +27934,7 @@ button.skills-issue-badge:hover {
   padding: 6px 8px;
   border: 0;
   border-left: 2px solid transparent;
-  border-bottom: 1px solid var(--wb-border);
+  border-bottom: 1px solid var(--wb-divider);
   color: var(--wb-text);
   background: transparent;
   text-align: left;
@@ -27916,8 +27945,29 @@ button.skills-issue-badge:hover {
    rail's own surface, where surface-2 was almost invisible against it. Hover
    stays neutral grey and selection stays the accent blue plus the left bar, so
    the two states never read as the same thing. */
-.wb-session-row:hover { background: var(--wb-surface-3); }
-.wb-session-row.is-selected { border-left-color: var(--wb-accent); background: var(--wb-accent-soft); }
+/* 高亮不再铺满整行：::before 是一块四周留白的圆角底板，行本身始终保持透明。
+   四点说明，动之前先读：
+   ① inset 是相对行的 padding box 量的，所以底板天然让开左侧 2px 的选中条和底部
+      1px 的分隔线，两者不会被圆角切到；
+   ② z-index:-1 让底板落到内容之下。.wb-session-list 的 contain:strict 本身就是
+      层叠上下文，负层只会压在这个列表自己的（透明）底色之上，掉不到会话栏的
+      --wb-surface 背景后面去，所以高亮照常可见；
+   ③ 刻意不给 .wb-session-row 加 position/z-index —— .wb-session-copy-link::after
+      那层撑满整行的点击区拿它当包含块，动一下整行可点就没了；
+   ④ 行高（54 / 84）、padding、grid 列都没动，底板只是画上去的一层，虚拟滚动的
+      摆放模型完全不受影响。 */
+.wb-session-row::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 2px 5px 3px;
+  border-radius: var(--wb-radius-l);
+  background: transparent;
+  transition: background-color .14s ease-out;
+}
+.wb-session-row:hover::before { background: var(--wb-surface-3); }
+.wb-session-row.is-selected::before { background: var(--wb-accent-soft); }
+.wb-session-row.is-selected { border-left-color: var(--wb-accent); }
 .wb-session-row-needs-you .wb-session-state-mark { color: var(--wb-danger); }
 .wb-session-row-active .wb-session-state-mark { color: var(--wb-success); }
 .wb-session-row-recent .wb-session-state-mark { color: var(--wb-faint); }
@@ -27956,11 +28006,25 @@ button.skills-issue-badge:hover {
   padding: 0;
   border: 0;
   color: transparent;
-  background: var(--wb-border);
+  background: var(--wb-divider);
   cursor: col-resize;
 }
+/* 分隔条原本是整条 5px 的实色带 + hover 整条变蓝，是页面上最硬的一笔。改成
+   「淡色细带 + 中间一颗圆角握把」：握把就是原来那个 ⋮ span（父级 color 已经是
+   transparent，字形本来就不显示），给它固定尺寸当色块用，不新增任何 DOM。 */
+.wb-rail-separator > span {
+  display: block;
+  width: 3px;
+  height: 28px;
+  border-radius: var(--wb-radius-s);
+  background: var(--wb-border-strong);
+  overflow: hidden;
+  transition: background-color .14s ease-out;
+}
 .wb-rail-separator:hover,
-.wb-rail-separator:focus-visible { color: var(--wb-text); background: var(--wb-accent); }
+.wb-rail-separator:focus-visible { color: transparent; background: var(--wb-surface-3); }
+.wb-rail-separator:hover > span,
+.wb-rail-separator:focus-visible > span { background: var(--wb-accent); }
 
 /* Two children, two rows: the header and the pane stack. Leaving the old
    toolbar/chat-contract rows in place pushed the stack into an `auto` track,
@@ -27995,7 +28059,8 @@ button.skills-issue-badge:hover {
   height: 25px;
   flex: none;
   border: 1px solid var(--wb-accent);
-  border-radius: 2px;
+  /* 25px 的身份方块按「圆角图标」处理，比徽标再圆一档。 */
+  border-radius: var(--wb-radius-m);
   color: var(--wb-accent);
   font-weight: 800;
 }
@@ -28003,7 +28068,7 @@ button.skills-issue-badge:hover {
   flex: none;
   padding: 3px 6px;
   border: 1px solid var(--wb-border-strong);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-s);
   color: var(--wb-muted);
   font-size: 10px;
   letter-spacing: .04em;
@@ -28019,7 +28084,7 @@ button.skills-issue-badge:hover {
   background: var(--wb-surface-2);
   overflow-x: auto;
 }
-.wb-toolbar-group { display: inline-flex; gap: 2px; padding-right: 5px; border-right: 1px solid var(--wb-border); }
+.wb-toolbar-group { display: inline-flex; gap: 2px; padding-right: 5px; border-right: 1px solid var(--wb-divider); }
 .wb-toolbar-spacer { flex: 1; }
 .wb-pane-toolbar button,
 .wb-pane-actions button,
@@ -28067,12 +28132,20 @@ button.skills-issue-badge:hover {
 .wb-pane-region { min-width: 0; min-height: 0; padding: 5px; overflow: hidden; }
 .wb-pane,
 .wb-pane-split { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+/* 终端面板是这一页唯一的「卡片」：.wb-pane-region 给了它四周 5px 的空隙，所以圆角
+   看得见，也值得有一层极轻的阴影把它从底色上托起来。
+   上下不同半径是被 iframe 逼出来的，不是手滑：面板 overflow:hidden，圆角会真的裁掉
+   iframe 的像素。上面两角落在 .wb-pane-titlebar（纯色条）里，随便圆；下面两角是终端
+   正文，终端页 #term 只有 4px 内边距（见 v3-terminal.ts），最后一行提示符的首字符就
+   贴在距左下角 4px 处 —— 12px 圆角会啃掉它。4px 圆角（算上 1px 描边，内圆角只有
+   3px）裁掉的完全落在终端页自己的 4px padding 里，一个字形像素都不碰。 */
 .wb-pane {
   display: grid;
   grid-template-rows: 34px 25px minmax(0, 1fr);
   border: 1px solid var(--wb-border-strong);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-xl) var(--wb-radius-xl) var(--wb-radius-s) var(--wb-radius-s);
   background: var(--wb-surface);
+  box-shadow: var(--wb-shadow);
   overflow: hidden;
 }
 .wb-pane-split { display: flex; overflow: hidden; }
@@ -28103,7 +28176,7 @@ button.skills-issue-badge:hover {
   gap: 8px;
   min-width: 0;
   padding: 0 7px;
-  border-bottom: 1px solid var(--wb-border);
+  border-bottom: 1px solid var(--wb-divider);
   background: var(--wb-surface-2);
 }
 .wb-pane-identity,
@@ -28115,7 +28188,7 @@ button.skills-issue-badge:hover {
   gap: 4px;
   padding: 2px 5px;
   border: 1px solid var(--wb-border-strong);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-s);
   font-size: 9px;
   letter-spacing: .06em;
 }
@@ -28127,7 +28200,7 @@ button.skills-issue-badge:hover {
 .wb-pane-feedback {
   overflow: hidden;
   padding: 5px 7px;
-  border-bottom: 1px solid var(--wb-border);
+  border-bottom: 1px solid var(--wb-divider);
   color: var(--wb-muted);
   font-size: 10px;
   text-overflow: ellipsis;
@@ -28159,6 +28232,9 @@ button.skills-issue-badge:hover {
   position: absolute;
   inset: 0;
   z-index: 3;
+  /* 这层是不透明的，铺满 .wb-pane-frame-shell，也就是面板最底下那一格。下面两角必须
+     和 .wb-pane 的下两角同半径，否则圆角外那一小块会被它重新填成方角。 */
+  border-radius: 0 0 var(--wb-radius-s) var(--wb-radius-s);
   background: var(--wb-surface);
 }
 .wb-ws-blocked a {
@@ -28167,7 +28243,7 @@ button.skills-issue-badge:hover {
   min-height: 32px;
   padding: 0 12px;
   border: 1px solid var(--wb-border-strong);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-m);
 }
 .wb-ws-blocked a:hover { border-color: var(--wb-accent); }
 /* 末尾那句「⋯ 菜单」是补充说明，压一号字，别和上面的正文抢注意力 */
@@ -28181,7 +28257,10 @@ button.skills-issue-badge:hover {
   z-index: 8;
   width: min(330px, 42%);
   border-left: 1px solid var(--wb-border-strong);
+  /* 抽屉从右边推出来，只有左侧两角露在外面，圆右侧等于圆到屏幕外。 */
+  border-radius: var(--wb-radius-xl) 0 0 var(--wb-radius-xl);
   background: var(--wb-surface-2);
+  box-shadow: var(--wb-shadow);
   overflow: auto;
 }
 .wb-info-drawer > header {
@@ -28192,14 +28271,15 @@ button.skills-issue-badge:hover {
   justify-content: space-between;
   height: 34px;
   padding: 0 8px;
-  border-bottom: 1px solid var(--wb-border);
+  border-bottom: 1px solid var(--wb-divider);
   background: var(--wb-surface-2);
 }
 .wb-info-drawer > header button { width: 25px; height: 25px; border: 1px solid var(--wb-border); color: var(--wb-text); background: transparent; }
+.wb-info-drawer > header button:hover { border-color: var(--wb-border-strong); background: var(--wb-surface-3); }
 .wb-info-content { padding: 12px; }
 .wb-info-content h2 { margin: 0 0 12px; color: var(--wb-text); font-size: 14px; overflow-wrap: anywhere; }
-.wb-info-content dl { display: grid; margin: 0; border-top: 1px solid var(--wb-border); }
-.wb-info-content dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--wb-border); }
+.wb-info-content dl { display: grid; margin: 0; border-top: 1px solid var(--wb-divider); }
+.wb-info-content dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--wb-divider); }
 .wb-info-content dt { color: var(--wb-faint); }
 .wb-info-content dd { margin: 0; overflow: hidden; color: var(--wb-muted); text-overflow: ellipsis; white-space: nowrap; }
 .wb-info-note { padding-left: 8px; border-left: 2px solid var(--wb-accent); color: var(--wb-faint); }
@@ -28293,7 +28373,7 @@ button.skills-issue-badge:hover {
   justify-content: center;
   padding: 0;
   border: 1px solid var(--wb-border);
-  border-radius: 3px;
+  border-radius: var(--wb-radius-m);
   color: var(--wb-muted);
   background: var(--wb-surface-1);
   font-size: 10px;
@@ -28351,7 +28431,7 @@ button.skills-issue-badge:hover {
   height: 18px;
   padding: 0;
   border: 1px solid var(--wb-border);
-  border-radius: 3px;
+  border-radius: var(--wb-radius-m);
   color: var(--wb-muted);
   background: var(--wb-surface);
   font-size: 10px;
@@ -28387,7 +28467,7 @@ button.skills-issue-badge:hover {
 .wb-pane-stack > .wb-pane { flex: 1; min-height: 0; }
 .wb-terminal-toggle {
   border: 1px solid var(--wb-border-strong);
-  border-radius: 3px;
+  border-radius: var(--wb-radius-m);
   color: var(--wb-muted);
   background: var(--wb-surface-2);
   cursor: pointer;
@@ -28528,25 +28608,34 @@ body:has(.workbench-route-host) { min-width: 0; }
 
 /* Mobile drill-down chrome: back control, session name, and a compact segment
    for the surfaces inside one session. */
-.wb-mobile-detail { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; overflow: hidden; }
+/* 下钻容器按「盖上来的一张卡」处理：只圆上两角，下面是贴底的导航/终端，圆了会露缝。 */
+.wb-mobile-detail {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  border-radius: var(--wb-radius-xl) var(--wb-radius-xl) 0 0;
+  overflow: hidden;
+}
 .wb-mobile-detail-bar {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
   padding: 6px 8px;
-  border-bottom: 1px solid var(--wb-border);
+  border-bottom: 1px solid var(--wb-divider);
   background: var(--wb-surface);
 }
 .wb-mobile-back {
   min-height: 44px;
   padding: 0 8px;
   border: 0;
+  border-radius: var(--wb-radius-m);
   color: var(--wb-accent);
   background: transparent;
   font-size: 13px;
   cursor: pointer;
 }
+.wb-mobile-back:hover { background: var(--wb-surface-2); }
 .wb-mobile-detail-title {
   flex: 1;
   min-width: 0;
@@ -28556,11 +28645,14 @@ body:has(.workbench-route-host) { min-width: 0; }
   color: var(--wb-text);
   font-size: 12px;
 }
-.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 1px solid var(--wb-border); border-radius: 4px; overflow: hidden; }
+.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 1px solid var(--wb-border); border-radius: var(--wb-radius-m); overflow: hidden; }
+/* 分段按钮的圆角由外壳的 overflow:hidden 统一裁，自己保持方角，否则两段之间会露出
+   一道由两个圆角拼出来的缝。 */
 .wb-mobile-detail-seg button {
   min-height: 36px;
   padding: 0 10px;
   border: 0;
+  border-radius: 0;
   color: var(--wb-muted);
   background: transparent;
   font-size: 11px;
@@ -28604,12 +28696,14 @@ body:has(.workbench-route-host) { min-width: 0; }
   gap: 3px;
   padding: 2px 3px;
   border: 1px solid var(--wb-border);
-  border-radius: 4px;
+  /* 外壳比里面的按钮（8px）再大一档，包住时圆弧才是同心的。 */
+  border-radius: var(--wb-radius-l);
   background: var(--wb-surface-2);
+  box-shadow: var(--wb-shadow);
   transform: translateY(-50%);
   opacity: 0;
   pointer-events: none;
-  transition: opacity .12s ease;
+  transition: opacity .14s ease-out;
 }
 .wb-session-row:hover .wb-session-row-actions,
 .wb-session-row:focus-within .wb-session-row-actions {
@@ -28627,7 +28721,7 @@ body:has(.workbench-route-host) { min-width: 0; }
   flex: none;
   padding: 0 3px;
   border: 1px solid var(--wb-border);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-s);
   color: var(--wb-faint);
   font-size: 9px;
   line-height: 14px;
@@ -28667,7 +28761,7 @@ body:has(.workbench-route-host) { min-width: 0; }
   padding: 0 16px 0 4px;
   margin-left: auto;
   border: 1px solid var(--wb-border);
-  border-radius: 2px;
+  border-radius: var(--wb-radius-m);
   color: var(--wb-muted);
   background-color: transparent;
   background-position: right 3px center;
@@ -28676,7 +28770,7 @@ body:has(.workbench-route-host) { min-width: 0; }
   line-height: 22px;
   cursor: pointer;
 }
-.wb-group-dim:hover { border-color: var(--wb-border-strong); color: var(--wb-text); }
+.wb-group-dim:hover { border-color: var(--wb-border-strong); color: var(--wb-text); background-color: var(--wb-surface-2); }
 /* 展开的选项列表由浏览器绘制，只保证它跟随当前主题的底色和字色。 */
 .wb-group-dim option { color: var(--wb-text); background: var(--wb-surface-2); }
 
@@ -28707,11 +28801,24 @@ body:has(.workbench-route-host) { min-width: 0; }
   overflow: hidden;
   cursor: pointer;
 }
+/* 组头的 hover 底色和会话行走同一套：::before 是圆角内缩底板，按钮本身保持透明、
+   保持方角（它的 overflow:hidden 按方角裁，裁不到内缩的底板）。
+   同样用 z-index:-1 落到内容之下，理由见 .wb-session-row::before 的注释。 */
+.wb-session-group.wb-session-group-toggle::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 1px 5px 1px 0;
+  border-radius: var(--wb-radius-l);
+  background: transparent;
+  transition: background-color .14s ease-out;
+}
 .wb-session-group-caret { text-align: center; }
 /* 长组名（会话名、仓库名都是自由文本）截断，别压到右边的计数上。 */
 .wb-session-group-toggle > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* hover：中性组提亮文字；语义色的两组只加底色，一 hover 就把红/绿洗成前景色会丢语义。 */
-.wb-session-group-toggle:hover { color: var(--wb-text); background: var(--wb-surface-2); }
+.wb-session-group-toggle:hover { color: var(--wb-text); }
+.wb-session-group-toggle:hover::before { background: var(--wb-surface-2); }
 .wb-session-group-toggle.wb-session-group-needs-you:hover { color: var(--wb-danger); }
 .wb-session-group-toggle.wb-session-group-active:hover { color: var(--wb-success); }
 

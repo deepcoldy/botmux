@@ -25,13 +25,29 @@ describe('Agent Workbench visual contract', () => {
     expect(block).not.toMatch(/(?:linear|radial|conic)-gradient\s*\(/i);
   });
 
-  it('keeps explicit pixel radii at or below 4px', () => {
-    const radii = [...block.matchAll(/border-radius:\s*(\d+)px/g)].map(match => Number(match[1]));
-    expect(radii.length).toBeGreaterThanOrEqual(8);
-    expect(Math.max(...radii)).toBeLessThanOrEqual(4);
+  it('每一个圆角都来自四级令牌，段里不留裸像素值', () => {
+    // 半径是这一段唯一允许出现像素数字的地方：四个令牌，四个值。多一级、少一级、
+    // 或者把 8px 悄悄改成 7px，都会在这里断。
+    const tokens = new Map(
+      [...block.matchAll(/--wb-radius-(s|m|l|xl):\s*(\d+)px/g)].map(match => [match[1], Number(match[2])]),
+    );
+    expect([...tokens.keys()].sort()).toEqual(['l', 'm', 's', 'xl']);
+    expect(tokens.get('s')).toBe(4);
+    expect(tokens.get('m')).toBe(8);
+    expect(tokens.get('l')).toBe(10);
+    expect(tokens.get('xl')).toBe(12);
+
+    // 其余每一条 border-radius 的每一个分量只能是令牌、0（方角重置）或 50%（未读圆点）。
+    // 注释先剥掉：说明文字里出现的 `border-radius: …` 不是声明，不该被当成漂移。
+    const declarations = block.replace(/\/\*[\s\S]*?\*\//g, '');
+    const values = [...declarations.matchAll(/border-radius:\s*([^;}]+)/g)].map(match => match[1].trim());
+    expect(values.length).toBeGreaterThanOrEqual(20);
+    const allowed = /^(?:0|50%|var\(--wb-radius-(?:s|m|l|xl)\))$/;
+    const drifted = values.filter(value => !value.split(/\s+/).every(part => allowed.test(part)));
+    expect(drifted).toEqual([]);
   });
 
-  it('keeps the H5 login and Preview guard flat as part of the same UI contract', () => {
+  it('H5 登录与 Preview 拦截页是各自独立的极简契约，不跟随工作台圆角', () => {
     for (const relative of ['src/dashboard/h5-auth.ts', 'src/dashboard/preview-guard-page.ts']) {
       const source = readFileSync(join(process.cwd(), relative), 'utf8');
       const radii = [...source.matchAll(/border-radius:\s*(\d+)px/g)].map(match => Number(match[1]));
