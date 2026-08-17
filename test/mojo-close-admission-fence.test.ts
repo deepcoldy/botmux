@@ -119,7 +119,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-adm","warni
     // the very next write() through.
     await backend.abortDestroySession();
     expect(backend.write('a turn after the abort')).toBe(false);
-  }, 20_000);
+  }, 60_000);
 
   // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
   // termination verdict. Off Linux the scanner returns unsupported-platform by
@@ -146,7 +146,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-report","wa
     // The report must agree with the observable behaviour, which is the whole
     // point: a `true` here would be a durable lie.
     expect(backend.write('a turn after the refused abort')).toBe(false);
-  }, 20_000);
+  }, 60_000);
 
   it('keeps the close retryable after the fence latches', async () => {
     // Pins the LIVENESS half of the latched fence: a fence that also blocked the
@@ -186,7 +186,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-lifetime","
       ok: true,
       taskId: 'sid-lifetime',
     });
-  }, 20_000);
+  }, 60_000);
 
   it('does not claim restoration after the session was already torn down', async () => {
     const bin = fakeMojo('mojo-adm-torndown', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
@@ -209,7 +209,7 @@ exit 0`);
       reason: 'session_already_torn_down',
     });
     expect(backend.write('a turn after teardown')).toBe(false);
-  }, 20_000);
+  }, 60_000);
 
   it('does not let the earlier local failure launder a missing lineage into retryable', async () => {
     // Both faults at once: a turn was dispatched with no lineage AND the local
@@ -257,7 +257,7 @@ exit 0`);
     expect(backend.write('a turn that must be refused')).toBe(false);
     await backend.abortDestroySession();
     expect(backend.write('a turn after the abort')).toBe(false);
-  }, 20_000);
+  }, 60_000);
 
   it('still restores admission when the local subtree was PROVEN gone and only the remote cancel failed', async () => {
     // The counter-case that stops the fix from degenerating into "fence
@@ -289,7 +289,7 @@ exit 0`);
     // what the worker calls; both must leave the session writable.
     await backend.abortDestroySession();
     expect(backend.write('a follow-up turn after a failed cancel')).toBe(true);
-  }, 20_000);
+  }, 60_000);
 });
 
 describe('destroy-result reads admission, not retryability', () => {

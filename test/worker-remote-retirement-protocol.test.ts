@@ -25,12 +25,19 @@ describe('worker remote retirement protocol', () => {
     expect(replacement).toBeGreaterThan(guardBreak);
   });
 
-  it('routes explicit Mojo close through prepare/commit while retaining request-less lifecycle teardown', () => {
+  it('routes every remote close through prepare/commit and refuses request-less remote teardown', () => {
+    // P0-2: request-less lifecycle teardown is NOT retained for remote backends
+    // any more. The old branch let a request-less Mojo close fall through to the
+    // legacy destroySession() path — `mojo session cancel` — so every generic
+    // retirement silently and irreversibly cancelled the remote session. The
+    // fence now covers isRemoteBackendType wholesale: with a requestId the close
+    // is prepare/commit, without one it is refused outright, and the legacy
+    // destroy-and-exit tail below stays reachable for LOCAL backends only.
     const start = workerSource.indexOf("case 'close':");
     const end = workerSource.indexOf("case 'close_commit':", start);
     const close = workerSource.slice(start, end);
 
-    const remoteBranch = close.indexOf("if (effectiveBackendType === 'riff'\n          || (effectiveBackendType === 'mojo' && msg.requestId))");
+    const remoteBranch = close.indexOf('if (isRemoteBackendType(effectiveBackendType))');
     const requestlessGuard = close.indexOf('if (!msg.requestId)', remoteBranch);
     const refusal = close.indexOf('Refused unsafe request-less ${effectiveBackendType} close', requestlessGuard);
     const guardBreak = close.indexOf('break;', refusal);

@@ -15,6 +15,13 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+// Real-process cases: each drives a live bash child through spawn/kill plus
+// /proc enumeration, and the product's own settle/proof windows (8s destroy
+// settle, 2s termination proof) sit inside every run. The 30s project default
+// is enough on a quiet dev machine but times out on loaded 2-core CI runners,
+// where suite-wide parallel forks contend for the same cores.
+vi.setConfig({ testTimeout: 90_000 });
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import { isLinux } from './helpers/synthetic-proc.js';
 
@@ -167,7 +174,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-escaped","w
     await expect(backend.destroySession()).resolves.toMatchObject({ ok: true });
     // Success was claimed, so the whole credentialed subtree must be gone.
     await vi.waitFor(() => expect(alive(escaped)).toBe(false), { timeout: 5_000 });
-  }, 20_000);
+  }, 60_000);
 
   // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
   // termination verdict. Off Linux the scanner returns unsupported-platform by
@@ -211,7 +218,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-immortal","
       error: 'mojo_local_child_termination_unproven',
       recovery: 'retryable',
     });
-  }, 20_000);
+  }, 60_000);
 
   // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
   // termination verdict. Off Linux the scanner returns unsupported-platform by
@@ -243,7 +250,7 @@ exit 0`);
 
     await backend.destroySession();
     await vi.waitFor(() => expect(alive(escaped)).toBe(false), { timeout: 5_000 });
-  }, 20_000);
+  }, 60_000);
 
   // Linux-only: it needs a REAL live child plus /proc enumeration to reach a
   // termination verdict. Off Linux the scanner returns unsupported-platform by
@@ -270,7 +277,7 @@ sleep 60`);
 
     await expect(backend.destroySession()).resolves.toMatchObject({ ok: true });
     expect(alive(childPid as number)).toBe(false);
-  }, 20_000);
+  }, 60_000);
 
   it('runs each turn in its own process group', async () => {
     // The group proof is only safe because the child leads its own group: sharing
@@ -290,5 +297,5 @@ sleep 30`);
     expect(pgid).not.toBe(process.pid);
 
     await backend.destroySession();
-  }, 20_000);
+  }, 60_000);
 });

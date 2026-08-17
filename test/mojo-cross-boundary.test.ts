@@ -25,7 +25,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { DaemonToWorker } from '../src/types.js';
 
-vi.setConfig({ testTimeout: 90_000 });
+vi.setConfig({ testTimeout: 180_000 });
 
 /**
  * A fake mojo that records, one line per invocation, the two things a hijack

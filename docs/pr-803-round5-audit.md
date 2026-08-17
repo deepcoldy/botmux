@@ -438,6 +438,13 @@ change was reverted from the finder's branch and the repair reassigned. Verified
 `:183` and neither `DEFAULT_PROC_ROOT` nor `isProcRootOverridden` exists in `src/`. This
 finding is therefore recorded as **open**. It must not be read as fixed.
 
+> **状态更新（2026-08-17，head `a8988cb4` 及之后）：C-7 已落地并关闭。**
+> 上一段描述的是 `a4b95950` 时点的状态。当前树中
+> `src/adapters/backend/mojo-process-tree.ts` 已导出 `DEFAULT_PROC_ROOT` 与
+> `isProcRootOverridden`，backend 经 `procRoot` seam 传递平台判定，非 Linux 主机
+> 路由到 `unsupported-platform` → `residual-close`。上文列出的四个失败用例在
+> Linux 全部转绿。本条不再是 open 项；保留原文仅作审计记录。
+
 ### C-7 is a measurable defect — but the measurement no longer reproduces at the delivery sha
 
 This finding first rested on reading the code. It then gained failing tests, once the
