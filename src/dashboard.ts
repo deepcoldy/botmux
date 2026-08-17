@@ -16,7 +16,7 @@ import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
-  projectWorkbenchOperationCapabilities,
+  projectWorkbenchOperationCapabilities, previewInteractionWriteAllowed,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
@@ -644,6 +644,11 @@ const previewGuardPage = createPreviewGuardPage({
     const identity = dashboardRequestIdentity(req);
     return identity ? controlCsrfTokens.mint(identity.authSessionId) : null;
   },
+  // P2：解锁按钮按能力渲染，与工作台面板用同一份投影（canInteract）。平台
+  // teammate/guest 这类 previewCapability=readonly 的身份，解锁 POST 本来就会被
+  // 下面的 preview-interaction 路由 403；壳里不再画那个按钮，避免「点了才知道
+  // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
+  canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
@@ -3406,7 +3411,10 @@ const server = createServer(async (req, res) => {
       if (req.method === 'GET' && !action) {
         return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.state(requestIdentity, sessionId) });
       }
-      if (requestIdentity.previewCapability === 'readonly') {
+      // 唯一权威的角色门禁。guard 壳与工作台是否渲染解锁按钮，走的是同一个
+      // previewInteractionWriteAllowed（经 canInteract 投影），所以「按能力隐藏
+      // 按钮」永远只是把一次必然 403 的点击省掉，不会替代这里的检查。
+      if (!previewInteractionWriteAllowed(requestIdentity)) {
         return dashboardControlJson(res, 403, { ok: false, error: 'preview_operation_forbidden' });
       }
       if (req.method === 'POST' && action === 'unlock') {

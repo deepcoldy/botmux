@@ -312,6 +312,8 @@ const previewGuard = createPreviewGuardPage({
       expiresAt: Date.now() + 60 * 60_000,
     })
     : null),
+  // 这条链验的是 owner 身份下的 origin 隔离，解锁入口照常渲染。
+  canInteract: ownerCookiePresent,
 });
 
 async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<void> {

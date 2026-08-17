@@ -1,4 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import {
+  previewInteractionWriteAllowed,
+  projectWorkbenchOperationCapabilities,
+  type WorkbenchCapabilityActor,
+} from '../src/dashboard/auth.js';
 import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/control-audit.js';
 import {
   PREVIEW_DEFAULT_MODE_LABEL,
@@ -99,5 +104,53 @@ describe('web preview interaction state machine', () => {
     // resume 之后重新注册预览：必须重新显式解锁才回到交互模式。
     expect(manager.state(actor, 's1').mode).toBe('preview');
     expect(manager.unlock(actor, 's1').mode).toBe('interactive');
+  });
+});
+
+// P2（readonly 解锁按钮）：guard 壳/工作台画不画解锁入口，和服务端会不会 403，
+// 必须是同一条判据的两种表现。这里把六类身份逐个过一遍：任何「投影说能解锁、
+// 写门禁却会 403」的漂移都会被抓住——那正是「点了才知道没权限」的成因。
+describe('preview interaction write gate', () => {
+  const identities: Array<{ name: string; identity: WorkbenchCapabilityActor | null; writable: boolean }> = [
+    {
+      name: 'legacy owner',
+      identity: { kind: 'legacy-dashboard', terminalCapability: 'controlled', previewCapability: 'operate' },
+      writable: true,
+    },
+    {
+      name: 'platform owner',
+      identity: { kind: 'platform-dashboard', terminalCapability: 'owner', previewCapability: 'operate' },
+      writable: true,
+    },
+    {
+      name: 'platform teammate',
+      identity: { kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly' },
+      writable: false,
+    },
+    {
+      name: 'platform guest',
+      identity: { kind: 'platform-dashboard', terminalCapability: 'readonly', previewCapability: 'readonly' },
+      writable: false,
+    },
+    {
+      name: 'feishu H5',
+      identity: { kind: 'feishu-h5', terminalCapability: 'controlled', previewCapability: 'operate' },
+      writable: true,
+    },
+    { name: 'anonymous', identity: null, writable: false },
+  ];
+
+  for (const { name, identity, writable } of identities) {
+    it(`${name}: 解锁写门禁与 canInteract 投影一致`, () => {
+      expect(previewInteractionWriteAllowed(identity)).toBe(writable);
+      // 壳上那个按钮就是按 canInteract 渲染的：两边必须永远同真同假。
+      expect(projectWorkbenchOperationCapabilities(identity).canInteract).toBe(writable);
+    });
+  }
+
+  it('身份形状异常时 fail closed（缺字段、脏值都不算 operate）', () => {
+    expect(previewInteractionWriteAllowed(undefined)).toBe(false);
+    expect(previewInteractionWriteAllowed({})).toBe(false);
+    expect(previewInteractionWriteAllowed({ previewCapability: 'operate ' as 'operate' })).toBe(false);
   });
 });

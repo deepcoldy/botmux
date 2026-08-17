@@ -49,7 +49,9 @@ describe('Agent Workbench route and surface integration', () => {
     // 语义断言在下面，用共享函数直接跑，而不是比对源码字符串。
     expect(dashboard).toContain('resolveDashboardRequestGate({');
     expect(dashboard).toContain("requestIdentity.terminalCapability === 'readonly'");
-    expect(dashboard).toContain("requestIdentity.previewCapability === 'readonly'");
+    // 预览写操作的角色门禁改用共享判据（与 canInteract 投影、guard 壳的解锁按钮
+    // 同一个函数），语义矩阵在 test/preview-interaction.test.ts 里逐身份跑。
+    expect(dashboard).toContain('!previewInteractionWriteAllowed(requestIdentity)');
 
     const ACTIVE = 'active-management-token';
     const platformIdentity = resolveDashboardIdentity({

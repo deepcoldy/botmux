@@ -559,6 +559,24 @@ export interface WorkbenchOperationCapabilities {
 export const WORKBENCH_NO_OPERATION_CAPABILITIES: Readonly<WorkbenchOperationCapabilities> =
   Object.freeze({ canLocate: false, canControl: false, canInteract: false });
 
+/**
+ * 处理器级角色门禁：谁能对预览交互做写操作（unlock / activity / lock）。
+ *
+ * 这一条判据同时被三处消费，必须只有一份实现，否则「画不画解锁按钮」和「POST 会
+ * 不会 403」会各走各的：
+ *   1. `dashboard.ts` 的 `/api/sessions/:id/preview-interaction/*` 路由（唯一权威，
+ *      false → 403 `preview_operation_forbidden`）；
+ *   2. 下面 {@link projectWorkbenchOperationCapabilities} 的 `canInteract`；
+ *   3. 由 2 驱动的工作台「开启交互」按钮与 Preview guard 壳里的解锁按钮。
+ *
+ * 身份缺失或 `previewCapability` 不是明确的 `'operate'` 一律 false（fail closed）。
+ */
+export function previewInteractionWriteAllowed(
+  identity: { previewCapability?: 'operate' | 'readonly' } | null | undefined,
+): boolean {
+  return identity?.previewCapability === 'operate';
+}
+
 /** 投影所需的最小身份切面——与 dashboard.ts 的 DashboardRequestIdentity 结构兼容
  *  （kind 枚举 + terminal-control.ts 的角色能力字段）。 */
 export interface WorkbenchCapabilityActor {
@@ -606,7 +624,9 @@ export function projectWorkbenchOperationCapabilities(
     canControl: routeAllows('POST', '/api/sessions/probe/control/takeover')
       && identity.terminalCapability !== undefined
       && identity.terminalCapability !== 'readonly',
+    // 与 dashboard.ts 路由里那次 403 判断共用 previewInteractionWriteAllowed，
+    // 不再各写一遍「!== 'readonly'」。
     canInteract: routeAllows('POST', '/api/sessions/probe/preview-interaction/unlock')
-      && identity.previewCapability !== 'readonly',
+      && previewInteractionWriteAllowed(identity),
   };
 }

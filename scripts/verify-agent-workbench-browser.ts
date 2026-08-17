@@ -243,6 +243,10 @@ const previewGuard = createPreviewGuardPage({
       }, previewNow)
       : null;
   },
+  // 这套 harness 的身份都是可交互的本机 owner / H5 会话，解锁入口照常渲染；
+  // 只读身份不渲染解锁按钮那条路由由 preview-guard-page.test.ts 与
+  // verify-preview-guard-race.ts 覆盖。
+  canInteract: req => actor(req) !== null,
 });
 const controlWss = new WebSocketServer({ noServer: true });
 

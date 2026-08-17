@@ -270,6 +270,8 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 
 P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-preview-origin-isolation.ts`（真 Chromium + 真 debug-terminal，会真的 spawn /bin/bash）：恶意预览页依次尝试读 parent DOM、带 cookie 调 /api/sessions、POST /api/debug-terminal 后连 /debug-terminal/&lt;id&gt;/ws、并把战利品外传给外部收集器；断言全部失败，同时断言预览自身的相对脚本、相对 fetch 与自身 WebSocket 仍然工作。机器可读结果见 assets/preview-origin-isolation-results.json。
 
+guard 蒙层的时序与能力渲染另有 `scripts/verify-preview-guard-race.ts`（真 Chromium + 真 guard 壳 + 真交互状态机 + 真角色门禁）：① 一份在点击「返回预览模式」**之前**就已经落到浏览器手里的 activity 响应，在锁定之后才被交给壳，蒙层必须保持锁定（这类响应 AbortController 已经拦不住，只能靠请求代号丢弃）；② 不做任何注入的原生路径上，服务端挂住的 activity 被客户端 abort，放行后同样掀不开蒙层；③ 只读身份（platform teammate）的壳里没有解锁/锁定按钮、蒙层锁定、预览内容照常可见，同时直接 POST unlock 仍是 403。截图 assets/preview-guard-race-unlocked.png、assets/preview-guard-race-locked.png、assets/preview-guard-readonly.png，机器可读结果见 assets/preview-guard-race-results.json。
+
 机器可读结果见 assets/agent-workbench-browser-results.json。
 
 ### 8.3 截图
