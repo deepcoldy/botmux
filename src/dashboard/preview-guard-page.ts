@@ -23,6 +23,12 @@ export interface PreviewGuardPageOptions {
     req: IncomingMessage,
     sessionId: string,
   ): { token: string; expiresAt: number } | null;
+  /**
+   * P1-11：给这张壳现签一枚绑定当前认证会话的 CSRF 票据。壳自己会 POST
+   * unlock/activity/lock，是控制类端点的合法调用方之一，必须带票据；返回 null
+   * 时壳照常渲染（预览只读可用），解锁按钮会被服务端 403 挡住。
+   */
+  mintCsrfToken?(req: IncomingMessage): string | null;
 }
 
 function exactRootSessionId(url: URL): string | undefined {
@@ -45,12 +51,15 @@ export function previewGuardHtml(
   sessionId: string,
   capability: { token: string; expiresAt: number },
   now = Date.now(),
+  csrfToken: string | null = null,
 ): string {
   const encoded = encodeURIComponent(sessionId);
   const contentPath = sessionPreviewContentPath(sessionId, capability.token);
   const statePath = `/api/sessions/${encoded}/preview-interaction`;
   const defaultLabel = escapeJsonForScript(PREVIEW_DEFAULT_MODE_LABEL);
   const notice = escapeJsonForScript(PREVIEW_OVERLAY_SECURITY_NOTICE);
+  // P1-11：票据只进本壳自己的 fetch 头，不落 DOM 属性、不进 URL。
+  const csrf = escapeJsonForScript(csrfToken ?? '');
   // Relative deadline, not an absolute timestamp: the browser clock may be
   // skewed against the dashboard's and a wrong sign would mean either an
   // instant reload loop or an expired frame.
@@ -66,10 +75,10 @@ export function previewGuardHtml(
 <div class="bar"><span class="badge" id="badge">${PREVIEW_DEFAULT_MODE_LABEL}</span><button class="lock hidden" id="lock" type="button">返回预览模式</button></div>
 <div class="overlay" id="overlay"><section class="panel"><h1>${PREVIEW_DEFAULT_MODE_LABEL}</h1><p>当前蒙层用于避免误触。需要操作应用时，请显式解锁交互。</p><p class="notice">${PREVIEW_OVERLAY_SECURITY_NOTICE}</p><button id="unlock" type="button">解锁交互（15 分钟无操作后回锁）</button></section></div></main>
 <script>(function(){
-var api=${escapeJsonForScript(statePath)},labelDefault=${defaultLabel},securityNotice=${notice};
+var api=${escapeJsonForScript(statePath)},labelDefault=${defaultLabel},securityNotice=${notice},csrf=${csrf};
 var frame=document.getElementById('app'),overlay=document.getElementById('overlay'),badge=document.getElementById('badge'),unlock=document.getElementById('unlock'),lock=document.getElementById('lock');
 var deadlineTimer=0,statePollTimer=0,lastActivitySent=0,interactive=false;
-function request(path,method){return fetch(api+(path||''),{method:method||'GET',credentials:'same-origin',headers:{'accept':'application/json'}}).then(function(r){if(!r.ok)throw new Error('state');return r.json()})}
+function request(path,method){var h={'accept':'application/json'};if(csrf)h['x-botmux-csrf']=csrf;return fetch(api+(path||''),{method:method||'GET',credentials:'same-origin',headers:h}).then(function(r){if(!r.ok)throw new Error('state');return r.json()})}
 function schedule(deadline){clearTimeout(deadlineTimer);if(!deadline)return;deadlineTimer=setTimeout(function(){request('', 'GET').then(apply).catch(failClosed)},Math.max(0,deadline-Date.now())+25)}
 function apply(state){interactive=state.mode==='interactive';overlay.classList.toggle('hidden',interactive);lock.classList.toggle('hidden',!interactive);badge.textContent=state.label||labelDefault;schedule(state.idleExpiresAt)}
 function failClosed(){interactive=false;overlay.classList.remove('hidden');lock.classList.add('hidden');badge.textContent=labelDefault;clearTimeout(deadlineTimer)}
@@ -129,7 +138,12 @@ export function createPreviewGuardPage(options: PreviewGuardPageOptions): {
         jsonError(res, 503, 'preview_capability_unavailable');
         return true;
       }
-      const html = previewGuardHtml(sessionId, capability);
+      const html = previewGuardHtml(
+        sessionId,
+        capability,
+        Date.now(),
+        options.mintCsrfToken?.(req) ?? null,
+      );
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',

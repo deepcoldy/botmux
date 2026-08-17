@@ -15,12 +15,24 @@ import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  decideWorkbenchH5Auth,
+  parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
   projectWorkbenchOperationCapabilities,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
+import {
+  resolveDashboardIdentity,
+  resolveDashboardRequestGate,
+  type DashboardRequestIdentity,
+} from './dashboard/request-identity.js';
+import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connections.js';
+import { createDashboardEventsStream } from './dashboard/events-sse.js';
+import {
+  ControlCsrfTokens,
+  guardControlRequest,
+  injectControlCsrfMeta,
+  managementUpgradeOrigin,
+} from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
@@ -83,13 +95,11 @@ import {
   createDashboardH5AuthController,
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
-  type DashboardAuthIdentity,
 } from './dashboard/h5-auth.js';
 import { FileControlAuditSink } from './dashboard/control-audit.js';
 import {
   TerminalControlManager,
   terminalControlTtlFromEnv,
-  type TerminalDashboardActor,
 } from './dashboard/terminal-control.js';
 import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
@@ -363,11 +373,6 @@ const terminalControl = new TerminalControlManager({
 });
 const previewInteraction = new PreviewInteractionManager({ audit: dashboardControlAudit });
 
-interface DashboardRequestIdentity extends TerminalDashboardActor {
-  kind: 'legacy-dashboard' | 'platform-dashboard' | DashboardAuthIdentity['kind'];
-  previewCapability: 'operate' | 'readonly';
-}
-
 function legacyDashboardAuthSessionId(token: string): string {
   return createHmac('sha256', SECRET)
     .update('botmux-legacy-dashboard-session-id-v1\0')
@@ -407,50 +412,61 @@ function terminalAuthSessionLive(authSessionId: string): boolean {
   return false;
 }
 
+/** P1-8：预览内容凭据所属的认证会话（校验失败 → null，不予绑定）。 */
+function previewContentCapabilityAuthSession(capability: string, sessionId: string): string | null {
+  const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
+  return verified.ok ? verified.claims.authSessionId : null;
+}
+
+/** P1-7：身份判定只此一处（legacy > 平台角色 > H5），门禁选择也只读它的结论。 */
 function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentity | null {
-  const legacyCookie = parseCookie(req.headers.cookie);
-  // The persisted file is the active-token authority (currentDashboardToken);
-  // there is no module-level mirror to compare against any more.
-  const activeToken = currentDashboardToken();
-  if (activeToken && legacyCookie === activeToken) {
-    // The central platform proves its boundary by injecting the active machine
-    // cookie after stripping the browser's Cookie header. Preserve its role in
-    // the signed loopback actor instead of collapsing owner/guest to one
-    // legacy-owner. A direct local owner can only lower their own privilege by
-    // adding this header; knowing the active cookie is already owner authority.
-    const rawRole = req.headers['x-botmux-role'];
-    const platformBinding = readPlatformBinding();
-    const platformRole = platformBinding && typeof rawRole === 'string'
-      && (rawRole === 'owner' || rawRole === 'teammate' || rawRole === 'guest')
-      ? rawRole
-      : undefined;
-    if (platformRole && platformBinding) {
-      const machineScope = platformDashboardActorScope(platformBinding.machineId);
-      return {
-        kind: 'platform-dashboard',
-        userId: `platform:${machineScope}:${platformRole}`,
-        authSessionId: `${machineScope}:${platformRole}`,
-        expiresAt: Number.MAX_SAFE_INTEGER,
-        terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
-        previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',
-      };
+  return resolveDashboardIdentity({
+    legacyCookie: parseCookie(req.headers.cookie),
+    // The persisted file is the active-token authority (currentDashboardToken);
+    // there is no module-level mirror to compare against any more.
+    activeToken: currentDashboardToken(),
+    roleHeader: req.headers['x-botmux-role'],
+    platformMachineId: readPlatformBinding()?.machineId ?? null,
+    platformActorScope: platformDashboardActorScope,
+    legacyAuthSessionId: legacyDashboardAuthSessionId,
+    h5: dashboardH5Auth.resolve(req),
+  });
+}
+
+/** P1-8：authSession → 已建立的长连接（/events SSE、Preview SSE/长响应、
+ *  Preview WS）。身份一结束就遍历关闭，不等对端自己断。 */
+const authSessionConnections = new AuthSessionConnectionRegistry();
+/** P1-11：控制类端点的一次性 CSRF 票据（页面加载现签、绑定认证会话）。 */
+const controlCsrfTokens = new ControlCsrfTokens();
+
+/**
+ * 身份结束的统一收口：H5 logout/到期、legacy token rotate、平台解绑三条来源都
+ * 走这里，少走一条就等于留一扇后窗（P1-5 关写租约/读 socket，P1-8 关其余长连接，
+ * P1-11 作废该会话签出的 CSRF 票据）。
+ */
+function endDashboardAuthSession(authSessionId: string): void {
+  terminalControl.releaseByAuthSession(authSessionId);
+  previewInteraction.relockAuthSession(authSessionId);
+  authSessionConnections.closeAuthSession(authSessionId);
+  controlCsrfTokens.revokeAuthSession(authSessionId);
+}
+
+/**
+ * P1-8 平台解绑/改绑：`botmux bind|unbind` 先写 platform.json 再捅
+ * `/__cli/reload-binding`，所以进入 handler 时磁盘上已经是**新**值——想知道刚
+ * 才被吊销的是谁，只能由本进程自己记住上一次认可的 machineId。
+ */
+let observedPlatformMachineId: string | null = readPlatformBinding()?.machineId ?? null;
+
+function syncPlatformBindingRevocation(): void {
+  const current = readPlatformBinding()?.machineId ?? null;
+  if (observedPlatformMachineId && observedPlatformMachineId !== current) {
+    const scope = platformDashboardActorScope(observedPlatformMachineId);
+    for (const role of ['owner', 'teammate', 'guest'] as const) {
+      endDashboardAuthSession(`${scope}:${role}`);
     }
-    return {
-      kind: 'legacy-dashboard',
-      userId: 'legacy-owner',
-      authSessionId: legacyDashboardAuthSessionId(activeToken),
-      // Terminal leases are independently capped to fifteen minutes or less.
-      expiresAt: Number.MAX_SAFE_INTEGER,
-      terminalCapability: 'controlled',
-      previewCapability: 'operate',
-    };
   }
-  const h5 = dashboardH5Auth.resolve(req);
-  return h5 ? {
-    ...h5,
-    terminalCapability: 'controlled',
-    previewCapability: 'operate',
-  } : null;
+  observedPlatformMachineId = current;
 }
 
 dashboardSessions.onEnd(identity => {
@@ -458,8 +474,7 @@ dashboardSessions.onEnd(identity => {
   // read socket the auth session opened (bound view-link capabilities included,
   // via the front proxy's read-socket index). New connections with a capability
   // minted under this authSessionId are refused by terminalAuthSessionLive.
-  terminalControl.releaseByAuthSession(identity.authSessionId);
-  previewInteraction.relockAuthSession(identity.authSessionId);
+  endDashboardAuthSession(identity.authSessionId);
 });
 
 function tcpPortAvailable(host: string, port: number): Promise<boolean> {
@@ -542,6 +557,16 @@ const sessionPreviewProxy = createSessionPreviewProxy({
     const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
     return verified.ok && terminalAuthSessionLive(verified.claims.authSessionId);
   },
+  // P1-8: preview SSE / long responses / WebSocket bridges outlive the handshake
+  // that authorised them. Index each stream under its auth session so logout /
+  // rotation / unbind tears it down immediately. The content path carries no
+  // cookie, so its owner is the capability's own authSessionId.
+  bindStream: (req, ctx, close) => {
+    const authSessionId = ctx.contentCapability
+      ? previewContentCapabilityAuthSession(ctx.contentCapability, ctx.sessionId)
+      : dashboardRequestIdentity(req)?.authSessionId ?? null;
+    return authSessionId ? authSessionConnections.register(authSessionId, close) : null;
+  },
 });
 const previewGuardPage = createPreviewGuardPage({
   authenticated: req => dashboardRequestIdentity(req) !== null,
@@ -555,6 +580,12 @@ const previewGuardPage = createPreviewGuardPage({
         expiresAt: identity.expiresAt,
       })
       : null;
+  },
+  // P1-11: the guard shell is same-origin with the dashboard and POSTs
+  // unlock/activity/lock itself, so it needs its own control ticket.
+  mintCsrfToken: req => {
+    const identity = dashboardRequestIdentity(req);
+    return identity ? controlCsrfTokens.mint(identity.authSessionId) : null;
   },
 });
 const terminalFrontProxy = createTerminalFrontProxy({
@@ -1723,7 +1754,12 @@ function injectDevReload(html: string): string {
   return html.includes('</body>') ? html.replace('</body>', `${snippet}\n</body>`) : `${html}\n${snippet}`;
 }
 
-function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+function serveStatic(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathname: string,
+  options: { injectHtml?: (html: string) => string } = {},
+): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
   const webRoot = resolve(WEB_DIR);
@@ -1738,13 +1774,17 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
-    const devIndex = relToRoot === 'index.html' && dashboardDevReloadEnabled();
+    const isIndex = relToRoot === 'index.html';
+    const devIndex = isIndex && dashboardDevReloadEnabled();
+    // 注入 CSRF 票据的壳是每次请求现生成的：ETag 只反映磁盘文件，走 304 会让浏览
+    // 器复用上一次（可能已随认证结束作废）的票据，所以这条路径不缓存、不 304。
+    const dynamicIndex = devIndex || (isIndex && !!options.injectHtml);
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': devIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
+      'cache-control': dynamicIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
-    if (!devIndex && req.headers['if-none-match'] === etag) {
+    if (!dynamicIndex && req.headers['if-none-match'] === etag) {
       res.writeHead(304, headers);
       res.end();
       return true;
@@ -1754,8 +1794,11 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
       res.end();
       return true;
     }
-    if (devIndex) {
-      res.end(injectDevReload(readFileSync(fp, 'utf8')));
+    if (dynamicIndex) {
+      let html = readFileSync(fp, 'utf8');
+      if (options.injectHtml) html = options.injectHtml(html);
+      if (devIndex) html = injectDevReload(html);
+      res.end(html);
     } else {
       res.end(readFileSync(fp));
     }
@@ -2821,6 +2864,30 @@ function dashboardControlJson(res: ServerResponse, status: number, body: unknown
   res.end(JSON.stringify(body));
 }
 
+/**
+ * P1-11：控制类端点的跨站伪造门禁。返回 false 表示已经写完 403 响应，调用方直接
+ * return。只作用于「有副作用且可被无 body 表单触发」的 POST：终端接管/释放、
+ * 预览交互 unlock/activity/lock、话题定位。
+ *
+ * GET 不进门禁（读没有副作用，且壳/前端的状态轮询本身就是 GET）；Preview 自身的
+ * 不透明来源请求走 preview 专用路径的路径内凭据，不经过这里。
+ */
+function enforceControlCsrf(
+  req: IncomingMessage,
+  res: ServerResponse,
+  identity: DashboardRequestIdentity,
+): boolean {
+  if ((req.method ?? 'GET').toUpperCase() === 'GET') return true;
+  const verdict = guardControlRequest({
+    headers: req.headers,
+    authSessionId: identity.authSessionId,
+    tokens: controlCsrfTokens,
+  });
+  if (verdict.ok) return true;
+  dashboardControlJson(res, verdict.status, { ok: false, error: verdict.error });
+  return false;
+}
+
 function terminalControlAvailability(sessionId: string):
   | { ok: true }
   | { ok: false; status: number; error: string } {
@@ -3039,13 +3106,14 @@ const server = createServer(async (req, res) => {
       try {
         const token = rotatePersistedToken(TOKEN_PATH);
         // The previous link is dead once the write lands: drop terminal control
-        // leases and re-lock preview interaction held by its auth session.
+        // leases, re-lock preview interaction, and (P1-8) close every long-lived
+        // connection the old link opened — otherwise the old management SSE
+        // keeps streaming rows minted AFTER the rotation, including freshly
+        // issued `riffAccessUrl` write credentials.
         // Ordered after the durable write so a failed rotation keeps both the
         // old token and its live grants intact.
-        if (previousToken) {
-          const previousSessionId = legacyDashboardAuthSessionId(previousToken);
-          terminalControl.releaseByAuthSession(previousSessionId);
-          previewInteraction.relockAuthSession(previousSessionId);
+        if (previousToken && previousToken !== token) {
+          endDashboardAuthSession(legacyDashboardAuthSessionId(previousToken));
         }
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
@@ -3100,39 +3168,33 @@ const server = createServer(async (req, res) => {
         /* ignore */
       }
       platformTunnel = null;
+      // P1-8：解绑/改绑之后旧平台身份的短请求立刻 401，但它建立的 SSE / Preview
+      // 长连接不会自己断，三个角色作用域在这里一起收口。
+      syncPlatformBindingRevocation();
       startPlatformTunnelIfBound();
       return jsonRes(res, 200, { ok: true });
     }
 
     const activeToken = currentDashboardToken();
-    const h5Identity = dashboardH5Auth.resolve(req);
     const requestIdentity = dashboardRequestIdentity(req);
-    // Only the local legacy Dashboard cookie is management authority. Platform
-    // identities — owner included — retain terminal/preview capability through
-    // signed proxy grants, but cannot cross into host administration APIs.
-    const legacyAuthed = requestIdentity?.kind === 'legacy-dashboard';
-    const workbenchOnlyIdentity = !!h5Identity
-      || requestIdentity?.kind === 'platform-dashboard';
-    // For a trusted platform viewer, the injected owner cookie authenticates
-    // the machine hop but the platform role is the user's authority. Do not
-    // let authedToken reinterpret that cookie as the legacy owner capability.
-    const presentedToken = workbenchOnlyIdentity ? undefined : authedToken(req, url, activeToken);
     const globalDashboardConfig = readGlobalConfig().dashboard;
     const publicReadOnly = globalDashboardConfig?.publicReadOnly
       ?? config.dashboard.publicReadOnly;
-    const decision = workbenchOnlyIdentity
-      ? decideWorkbenchH5Auth({
-          method: req.method ?? 'GET',
-          pathname: url.pathname,
-        })
-      : decideDashboardAuth({
-          method: req.method ?? 'GET',
-          pathname: url.pathname,
-          hasTokenParam: url.searchParams.has('t'),
-          presentedToken,
-          activeToken: activeToken ?? '',
-          publicReadOnly,
-        });
+    // P1-7：门禁选择与身份判定同源。旧代码在这里另算一遍 `h5Identity`，于是
+    // 「legacy owner + H5 cookie 并存」的浏览器被判成 workbench-only，管理读写
+    // 全 401，连正确的 `?t=` 也被一起清掉（详见 request-identity.ts 顶注）。
+    // Only the local legacy Dashboard cookie is management authority. Platform
+    // identities — owner included — retain terminal/preview capability through
+    // signed proxy grants, but cannot cross into host administration APIs.
+    const { legacyAuthed, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+      method: req.method ?? 'GET',
+      pathname: url.pathname,
+      hasTokenParam: url.searchParams.has('t'),
+      identity: requestIdentity,
+      tokenFromRequest: authedToken(req, url, activeToken),
+      activeToken,
+      publicReadOnly,
+    });
     // `authed` is deliberately the local management capability, not merely a
     // valid Workbench/platform identity. Privileged mutations and management
     // reads (settings, schedules, groups) therefore cannot be widened by H5
@@ -3232,6 +3294,7 @@ const server = createServer(async (req, res) => {
       if (!requestIdentity) {
         return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
       }
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
       let sessionId: string;
       try { sessionId = decodeURIComponent(controlMatch[1]); }
       catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
@@ -3274,6 +3337,7 @@ const server = createServer(async (req, res) => {
       if (!requestIdentity) {
         return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
       }
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
       let sessionId: string;
       try { sessionId = decodeURIComponent(controlMatch[1]); }
       catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
@@ -3429,7 +3493,13 @@ const server = createServer(async (req, res) => {
         : url.pathname === '/favicon.ico'
           ? '/favicon.png'
         : url.pathname;
-      if (serveStatic(req, res, lookupPath)) return;
+      if (serveStatic(req, res, lookupPath, {
+        // P1-11：只给已认证身份签票据；匿名 public-read 壳不含票据，控制类端点
+        // 对它本来就 401/403。
+        injectHtml: requestIdentity
+          ? html => injectControlCsrfMeta(html, controlCsrfTokens.mint(requestIdentity.authSessionId))
+          : undefined,
+      })) return;
       if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
     }
 
@@ -4602,6 +4672,8 @@ const server = createServer(async (req, res) => {
     let m: RegExpMatchArray | null;
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
+      // P1-11：locate 与接管/解锁同属工作台三项操作能力，同样是无 body POST。
+      if (op === 'locate' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       // Defensive client-side deadline: the daemon side of every op here replies
@@ -6239,6 +6311,17 @@ const server = createServer(async (req, res) => {
         'connection': 'keep-alive',
       });
       res.write('retry: 5000\n\n');
+      // P1-8：这条流的寿命必须等于建立它的那次认证的寿命。建流时登记进
+      // authSession→长连接索引（logout/rotate/解绑时被主动 destroy），并在每帧
+      // 推送前复核身份仍有效——否则 rotate 之后新签的 `riffAccessUrl`（Riff 沙箱
+      // 写凭据）会顺着这条老连接送给上一任持有者。匿名 public-read 连接没有认证
+      // 会话，行为不变。
+      const stream = createDashboardEventsStream({
+        res,
+        authSessionId: requestIdentity?.authSessionId ?? null,
+        isAuthSessionLive: terminalAuthSessionLive,
+        bind: (authSessionId, close) => authSessionConnections.register(authSessionId, close),
+      });
       const off = aggregator.on(ev => {
         // Session rows follow the same three-way audience as GET /api/sessions,
         // or a Workbench viewer would receive the preview descriptor on the
@@ -6263,10 +6346,10 @@ const server = createServer(async (req, res) => {
             ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
           } as typeof ev.body;
         }
-        res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body })}\n\n`);
+        stream.write(ev.type, { larkAppId: ev.larkAppId, body });
       });
       const hb = setInterval(() => {
-        res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+        stream.write('heartbeat', { ts: Date.now() });
       }, 15_000);
       // Push a bots.changed frame whenever the online bot roster actually
       // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
@@ -6278,9 +6361,9 @@ const server = createServer(async (req, res) => {
         const sig = botsRosterSignature(online);
         if (sig === lastRoster) return;
         lastRoster = sig;
-        res.write(`event: bots.changed\ndata: ${JSON.stringify({ body: { signature: sig } })}\n\n`);
+        stream.write('bots.changed', { body: { signature: sig } });
       });
-      res.on('close', () => { off(); offRoster(); clearInterval(hb); });
+      res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
       return;
     }
 
@@ -6336,7 +6419,26 @@ oauthCallbackServer.listen(9768, '127.0.0.1', () => {
 server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
+    // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
+    // 凭据是路径里的 content capability，绝不能被下面的管理类 Origin 校验误杀。
     if (sessionPreviewProxy.handleUpgrade(req, clientSocket, head)) return;
+    // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
+    // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
+    // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
+    const upgradeOrigin = managementUpgradeOrigin(req.headers);
+    if (!upgradeOrigin.ok) {
+      const body = JSON.stringify({ ok: false, error: upgradeOrigin.error });
+      clientSocket.end([
+        'HTTP/1.1 403 Forbidden',
+        'content-type: application/json; charset=utf-8',
+        'cache-control: no-store',
+        'connection: close',
+        `content-length: ${Buffer.byteLength(body)}`,
+        '',
+        body,
+      ].join('\r\n'));
+      return;
+    }
     // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
     if (rawUrl.startsWith('/debug-terminal/')) {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;

@@ -1,8 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
 import {
   issueTerminalControlGrant,
   verifyTerminalControlGrant,
 } from '../src/core/terminal-control-grant.js';
+import {
+  ControlCsrfTokens,
+  controlRequestOriginState,
+  guardControlRequest,
+  injectControlCsrfMeta,
+  managementUpgradeOrigin,
+} from '../src/dashboard/control-csrf.js';
 import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/control-audit.js';
 import {
   TerminalControlManager,
@@ -240,5 +248,251 @@ describe('terminal server-side takeover lifecycle', () => {
       bytes: 17,
     });
     expect(Object.keys(record).sort()).toEqual(['action', 'bytes', 'session', 'timestamp', 'user']);
+  });
+});
+
+// ─── P1-11：控制类 POST 的 CSRF / Origin 门禁（真实 HTTP 请求） ───────────────
+//
+// `SameSite=Lax` 只挡跨「站」：同站兄弟子域（中心化平台把每台机器放在
+// `m-<id>.<host>` 下）和 localhost 的其它端口都算 same-site，cookie 照送。而
+// takeover / release / preview 解锁全是**无 body** 的 POST，一个 `<form
+// method=post>` 就能从任意页面触发，受害者甚至看不到响应——但终端写租约已经被
+// 抢走、预览蒙层已经被解开。
+//
+// 这里起真实 HTTP 服务，跑与 dashboard.ts 同一套门禁（guardControlRequest +
+// ControlCsrfTokens + injectControlCsrfMeta），断言真实请求的状态码与
+// TerminalControlManager 的真实租约状态。
+describe('P1-11 control POST CSRF/Origin gate (real requests)', () => {
+  const SHELL = '<!doctype html><html><head><title>Botmux</title></head><body></body></html>';
+  const OWNER_COOKIE = 'botmux_dashboard_token=active-management-token';
+  let controlServer: Server | null = null;
+
+  afterEach(async () => {
+    if (controlServer) await new Promise<void>(resolve => controlServer!.close(() => resolve()));
+    controlServer = null;
+  });
+
+  async function startControl(): Promise<{
+    base: string;
+    host: string;
+    manager: TerminalControlManager;
+    tokens: ControlCsrfTokens;
+  }> {
+    const manager = new TerminalControlManager({
+      secret: SECRET, audit: new MemoryAudit(), ttlMs: 600_000, now: () => 1_000,
+    });
+    const tokens = new ControlCsrfTokens();
+    const identityOf = (req: IncomingMessage) => (
+      req.headers.cookie?.split(';').some(part => part.trim() === OWNER_COOKIE)
+        ? { userId: 'legacy-owner', authSessionId: 'legacy-auth-session', expiresAt: 2_000_000 }
+        : null
+    );
+    controlServer = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      const identity = identityOf(req);
+      const json = (status: number, body: unknown) => {
+        res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(body));
+      };
+      if (!identity) return json(401, { ok: false, error: 'authentication_required' });
+      // 页面加载：现签一枚票据注入壳（dashboard.ts 的 serveStatic 同款）。
+      if (url.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(injectControlCsrfMeta(SHELL, tokens.mint(identity.authSessionId)));
+        return;
+      }
+      const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
+      if (!match) return json(404, { ok: false, error: 'not_found' });
+      if ((req.method ?? 'GET').toUpperCase() !== 'GET') {
+        const verdict = guardControlRequest({
+          headers: req.headers,
+          authSessionId: identity.authSessionId,
+          tokens,
+        });
+        if (!verdict.ok) return json(verdict.status, { ok: false, error: verdict.error });
+      }
+      const sessionId = match[1];
+      if (req.method === 'GET') return json(200, { ok: true, ...manager.state(identity, sessionId) });
+      if (req.method === 'POST' && match[2] === 'takeover') {
+        const result = manager.takeover(identity, sessionId);
+        return json(result.ok ? 200 : 409, result.ok ? { ...result, owned: true } : { ok: false, error: result.error });
+      }
+      return json(405, { ok: false, error: 'method_not_allowed' });
+    });
+    await new Promise<void>(resolve => controlServer!.listen(0, '127.0.0.1', resolve));
+    const port = (controlServer.address() as { port: number }).port;
+    return { base: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, manager, tokens };
+  }
+
+  async function pageToken(base: string): Promise<string> {
+    const shell = await (await fetch(base, { headers: { cookie: OWNER_COOKIE } })).text();
+    const match = shell.match(/<meta name="botmux-csrf" content="([^"]+)">/);
+    expect(match, 'shell must carry an injected CSRF ticket').toBeTruthy();
+    return match![1];
+  }
+
+  it('accepts a same-origin takeover carrying the page-injected ticket', async () => {
+    const { base, host, manager } = await startControl();
+    const csrf = await pageToken(base);
+    const response = await fetch(`${base}/api/sessions/s1/control/takeover`, {
+      method: 'POST',
+      headers: {
+        cookie: OWNER_COOKIE,
+        origin: `http://${host}`,
+        'sec-fetch-site': 'same-origin',
+        'x-botmux-csrf': csrf,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, owned: true });
+    expect(manager.state({ userId: 'legacy-owner', authSessionId: 'legacy-auth-session', expiresAt: 2_000_000 }, 's1'))
+      .toMatchObject({ mode: 'controlled', owned: true });
+  });
+
+  it('refuses a cross-site form-style takeover and leaves the terminal read-only', async () => {
+    const { base, host, manager } = await startControl();
+    const csrf = await pageToken(base);
+    const actor = { userId: 'legacy-owner', authSessionId: 'legacy-auth-session', expiresAt: 2_000_000 };
+    const cases: Array<{ name: string; headers: Record<string, string>; error: string }> = [
+      {
+        // 攻击页 `<form action=…/takeover method=post>`：浏览器带 cookie，
+        // 也带一个对不上的 Origin，且无论如何设不了自定义头。
+        name: 'cross-site form post',
+        headers: { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
+        error: 'control_origin_forbidden',
+      },
+      {
+        // 同站兄弟子域 / localhost 其它端口——SameSite=Lax 完全挡不住这一类。
+        name: 'sibling subdomain (same-site, different host)',
+        headers: { origin: `https://evil.${host}`, 'sec-fetch-site': 'same-site', 'x-botmux-csrf': csrf },
+        error: 'control_origin_forbidden',
+      },
+      {
+        name: 'localhost, other port',
+        headers: { origin: 'http://127.0.0.1:1', 'sec-fetch-site': 'same-site', 'x-botmux-csrf': csrf },
+        error: 'control_origin_forbidden',
+      },
+      {
+        // 完全剥掉来源信号：fail closed，不给「删头即绕过」的口子。
+        name: 'no Origin / no Fetch-Metadata',
+        headers: {},
+        error: 'control_origin_forbidden',
+      },
+      {
+        // 沙箱化预览（不透明来源）也不能反过来驱动管理端点。
+        name: 'opaque origin',
+        headers: { origin: 'null', 'sec-fetch-site': 'cross-site' },
+        error: 'control_origin_forbidden',
+      },
+      {
+        name: 'same-origin without the ticket',
+        headers: { origin: `http://${host}`, 'sec-fetch-site': 'same-origin' },
+        error: 'control_csrf_invalid',
+      },
+      {
+        name: 'same-origin with a forged ticket',
+        headers: { origin: `http://${host}`, 'sec-fetch-site': 'same-origin', 'x-botmux-csrf': 'not-a-real-ticket' },
+        error: 'control_csrf_invalid',
+      },
+    ];
+    for (const testCase of cases) {
+      const response = await fetch(`${base}/api/sessions/s1/control/takeover`, {
+        method: 'POST',
+        headers: { cookie: OWNER_COOKIE, ...testCase.headers },
+      });
+      expect(response.status, testCase.name).toBe(403);
+      expect(await response.json(), testCase.name).toEqual({ ok: false, error: testCase.error });
+      expect(manager.state(actor, 's1'), testCase.name).toMatchObject({ mode: 'readonly', owned: false });
+    }
+  });
+
+  it('binds the ticket to its own auth session and drops it when that session ends', async () => {
+    const { base, host, tokens } = await startControl();
+    const csrf = await pageToken(base);
+    // 另一个认证会话签出的票据换不到本会话的操作。
+    const foreign = tokens.mint('another-auth-session');
+    const crossSession = await fetch(`${base}/api/sessions/s1/control/takeover`, {
+      method: 'POST',
+      headers: { cookie: OWNER_COOKIE, origin: `http://${host}`, 'x-botmux-csrf': foreign },
+    });
+    expect(crossSession.status).toBe(403);
+    expect(await crossSession.json()).toEqual({ ok: false, error: 'control_csrf_invalid' });
+    // 认证结束 → 该会话签出的票据全部作废（dashboard.ts 在 onEnd/rotate/解绑
+    // 时调用同一个方法）。
+    expect(tokens.revokeAuthSession('legacy-auth-session')).toBeGreaterThan(0);
+    const afterLogout = await fetch(`${base}/api/sessions/s1/control/takeover`, {
+      method: 'POST',
+      headers: { cookie: OWNER_COOKIE, origin: `http://${host}`, 'x-botmux-csrf': csrf },
+    });
+    expect(afterLogout.status).toBe(403);
+    expect(await afterLogout.json()).toEqual({ ok: false, error: 'control_csrf_invalid' });
+  });
+
+  it('leaves read-only state polling ungated (the shell polls it on a timer)', async () => {
+    const { base } = await startControl();
+    const response = await fetch(`${base}/api/sessions/s1/control`, { headers: { cookie: OWNER_COOKIE } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, mode: 'readonly' });
+  });
+});
+
+// 反代 / 平台隧道：浏览器看到的域名在 X-Forwarded-Host 里，Host 可能已被改写成
+// 回环地址。同源判定必须认这一条，否则平台上的工作台会被自己的门禁全部挡掉。
+// 这不削弱防线：跨站页面既设不了 Origin，也设不了自定义的 X-Forwarded-Host。
+describe('P1-11 same-origin behind a reverse proxy / platform tunnel', () => {
+  const SHELL_ORIGIN = 'https://m-abc.platform.example';
+  it('accepts the browser-visible origin when Host was rewritten by the hop', () => {
+    expect(controlRequestOriginState({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'm-abc.platform.example',
+      origin: SHELL_ORIGIN,
+      'sec-fetch-site': 'same-origin',
+    })).toBe('same-origin');
+    expect(managementUpgradeOrigin({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'm-abc.platform.example',
+      origin: SHELL_ORIGIN,
+    })).toEqual({ ok: true });
+  });
+
+  it('still refuses a sibling machine subdomain on the same platform host', () => {
+    expect(controlRequestOriginState({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'm-abc.platform.example',
+      origin: 'https://m-victim.platform.example',
+      'sec-fetch-site': 'same-site',
+    })).toBe('foreign');
+    expect(managementUpgradeOrigin({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'm-abc.platform.example',
+      origin: 'https://m-victim.platform.example',
+    })).toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+  });
+});
+
+// 票据的闲置寿命：还在用的页面续期，没人再用的自动回收。工作台常年挂在手机上
+// 不刷新，固定寿命会让一个用了几天的页面突然「解锁交互」失败。
+describe('P1-11 control ticket idle lifetime', () => {
+  it('renews on use and expires only after an idle window', () => {
+    let now = 1_000;
+    const tokens = new ControlCsrfTokens({ ttlMs: 10_000, now: () => now });
+    const ticket = tokens.mint('auth-1');
+    now = 9_000;
+    expect(tokens.verify(ticket, 'auth-1')).toBe(true);   // 续期到 19_000
+    now = 18_000;
+    expect(tokens.verify(ticket, 'auth-1')).toBe(true);   // 续期到 28_000
+    now = 38_001;
+    expect(tokens.verify(ticket, 'auth-1')).toBe(false);  // 闲置超窗 → 作废
+    expect(tokens.size()).toBe(0);
+  });
+
+  it('bounds memory with FIFO eviction so page reloads cannot grow it without limit', () => {
+    const tokens = new ControlCsrfTokens({ maxTokens: 3 });
+    const first = tokens.mint('auth-1');
+    tokens.mint('auth-1');
+    tokens.mint('auth-1');
+    tokens.mint('auth-1');
+    expect(tokens.size()).toBe(3);
+    expect(tokens.verify(first, 'auth-1')).toBe(false);
   });
 });

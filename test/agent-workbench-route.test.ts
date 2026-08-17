@@ -3,6 +3,10 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { safeDashboardH5ReturnTo } from '../src/dashboard/h5-auth.js';
+import {
+  resolveDashboardIdentity,
+  resolveDashboardRequestGate,
+} from '../src/dashboard/request-identity.js';
 
 describe('Agent Workbench route and surface integration', () => {
   it('registers separate lazy main and Dock modules before prefix collisions', () => {
@@ -41,12 +45,38 @@ describe('Agent Workbench route and surface integration', () => {
 
   it('does not reinterpret a Workbench-only platform cookie as legacy owner authority', () => {
     const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    // authedToken now takes the persisted active token explicitly (the module-level
-    // `activeToken` mirror is gone); the guard under test is the ternary itself.
-    expect(dashboard).toContain('const presentedToken = workbenchOnlyIdentity ? undefined : authedToken(req, url, activeToken)');
-    expect(dashboard).toContain('decideWorkbenchH5Auth');
+    // P1-7 之后门禁选择与身份判定共用同一处结论，dashboard.ts 只负责接线；
+    // 语义断言在下面，用共享函数直接跑，而不是比对源码字符串。
+    expect(dashboard).toContain('resolveDashboardRequestGate({');
     expect(dashboard).toContain("requestIdentity.terminalCapability === 'readonly'");
     expect(dashboard).toContain("requestIdentity.previewCapability === 'readonly'");
+
+    const ACTIVE = 'active-management-token';
+    const platformIdentity = resolveDashboardIdentity({
+      legacyCookie: ACTIVE,
+      activeToken: ACTIVE,
+      roleHeader: 'owner',
+      platformMachineId: 'machine-1',
+      platformActorScope: machineId => `scope-${machineId}`,
+      legacyAuthSessionId: token => `legacy-${token}`,
+      h5: null,
+    });
+    expect(platformIdentity?.kind).toBe('platform-dashboard');
+    // 平台跳板注入的那枚 cookie 认证的是机器，不是用户权限：即使它等于活跃
+    // token，也不能被重新解读成本机 owner。
+    const platformGate = resolveDashboardRequestGate({
+      method: 'GET',
+      pathname: '/api/settings',
+      hasTokenParam: false,
+      identity: platformIdentity,
+      tokenFromRequest: ACTIVE,
+      activeToken: ACTIVE,
+      publicReadOnly: false,
+    });
+    expect(platformGate.presentedToken).toBeUndefined();
+    expect(platformGate.workbenchOnlyIdentity).toBe(true);
+    expect(platformGate.legacyAuthed).toBe(false);
+    expect(platformGate.decision.kind).toBe('deny401');
   });
 
   // ── P1-4：能力集投影端点与前端消费链的接线钉死 ────────────────────────────

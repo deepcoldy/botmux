@@ -67,6 +67,21 @@ export interface SessionPreviewProxyOptions {
    * an open proxy or a dead route — both worse than a compile error.
    */
   verifyContentCapability: (capability: string, sessionId: string) => boolean;
+  /**
+   * P1-8：把一条已授权的长连接（SSE / 长响应 / WebSocket 桥）挂到签发它的认证
+   * 会话下，返回注销闭包（连接自然结束时调用）。认证结束时由外层索引统一
+   * `close()`。返回 null 表示这条流没有可绑定的身份（不该发生，调用方自行决定
+   * 是否记录），此时行为与不提供本钩子一致。
+   *
+   * 授权与撤销是两件事：`authenticated` / `verifyContentCapability` 只在握手那
+   * 一刻说话，而预览的 SSE 与 WebSocket 一握手就能流上几个小时。没有这个钩子，
+   * 登出只能等对端自己断开。
+   */
+  bindStream?: (
+    req: IncomingMessage,
+    context: { sessionId: string; contentCapability: string | null },
+    close: () => void,
+  ) => (() => void) | null;
 }
 
 type ParsedPreviewPath =
@@ -392,6 +407,14 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
         up.statusCode ?? 502,
         previewResponseHeaders(up.headers, target, parsed.basePath, opaqueRequest),
       );
+      // P1-8：headers 之后才登记——此刻才确定这是一条真的在流的响应（预览页常
+      // 见的 SSE / 长轮询都在这条路上）。短响应会立刻 close 并自行注销。
+      const unbind = options.bindStream?.(
+        req,
+        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
+        () => { upstream.destroy(); res.destroy(); },
+      );
+      if (unbind) res.on('close', unbind);
       up.pipe(res);
     });
     let failed = false;
@@ -458,15 +481,23 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       clientSocket.write(lines.join('\r\n'));
       if (upstreamHead.length) clientSocket.write(upstreamHead);
       if (head.length) upstreamSocket.write(head);
+      // P1-8：预览 WebSocket 是最典型的「握手一次、流很久」——登出后不主动关，
+      // 它就一直把 agent 页面的内容送给已经登出的浏览器。
+      const unbind = options.bindStream?.(
+        req,
+        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
+        () => { upstreamSocket.destroy(); clientSocket.destroy(); },
+      );
       upstreamSocket.pipe(clientSocket);
       clientSocket.pipe(upstreamSocket);
       const cleanup = () => {
+        unbind?.();
         upstreamSocket.destroy();
         clientSocket.destroy();
       };
       upstreamSocket.on('error', cleanup);
-      upstreamSocket.on('close', () => clientSocket.destroy());
-      clientSocket.on('close', () => upstreamSocket.destroy());
+      upstreamSocket.on('close', () => { unbind?.(); clientSocket.destroy(); });
+      clientSocket.on('close', () => { unbind?.(); upstreamSocket.destroy(); });
     });
     upstream.on('response', (upRes) => {
       responded = true;

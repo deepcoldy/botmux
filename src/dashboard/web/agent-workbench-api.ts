@@ -1,4 +1,5 @@
 import type { WorkbenchH5Context } from './agent-workbench-chat.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 export interface TerminalControlState {
   mode: 'readonly' | 'controlled';
@@ -66,7 +67,13 @@ function parseRetryAfter(response: Response, body: Record<string, unknown> | nul
 }
 
 async function jsonRequest<T>(fetchImpl: typeof fetch, path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetchImpl(path, { cache: 'no-store', ...init });
+  // P1-11：写请求（takeover/release、preview 解锁、locate）带上页面注入的一次性
+  // CSRF 票据。读请求不需要，服务端也不校验。
+  const method = String(init.method ?? 'GET').toUpperCase();
+  const headers = method === 'GET'
+    ? init.headers
+    : { ...controlCsrfHeaders(), ...(init.headers as Record<string, string> | undefined) };
+  const response = await fetchImpl(path, { cache: 'no-store', ...init, headers });
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
   if (!response.ok || !body || body.ok === false) {
     throw new WorkbenchApiError(

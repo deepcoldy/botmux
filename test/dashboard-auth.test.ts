@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
 import {
   chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
@@ -9,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  verifyHmac, generateToken, parseCookie, decideDashboardAuth,
+  verifyHmac, generateToken, parseCookie, buildSetCookie, decideDashboardAuth,
   decideWorkbenchH5Auth, workbenchH5Capability,
   projectWorkbenchOperationCapabilities, WORKBENCH_NO_OPERATION_CAPABILITIES,
   type WorkbenchCapabilityActor, type WorkbenchOperationCapabilities,
@@ -22,6 +23,15 @@ import {
   sessionBoardAudienceFor,
 } from '../src/dashboard/public-redact.js';
 import { UnsafeHostAuthorityFileError } from '../src/platform/secure-host-file.js';
+import {
+  resolveDashboardIdentity,
+  resolveDashboardRequestGate,
+} from '../src/dashboard/request-identity.js';
+import {
+  DashboardSessionStore,
+  DASHBOARD_SESSION_COOKIE,
+  parseNamedCookie,
+} from '../src/dashboard/h5-auth.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
 
@@ -1350,5 +1360,140 @@ describe('P1-4 workbench operation-capability projection', () => {
     expect(projectWorkbenchOperationCapabilities({
       kind: 'platform-dashboard', previewCapability: 'readonly',
     })).toEqual({ ...WORKBENCH_NO_OPERATION_CAPABILITIES });
+  });
+});
+
+// ─── P1-7：双 Cookie（legacy + H5）并存时的身份/门禁一致性 ────────────────────
+//
+// 复现的是真实链路：先在飞书里扫码进 H5 工作台（种下 H5 会话 cookie），再从本机
+// 点管理链接 / 卡片票据进 Dashboard（种下 legacy 管理 cookie）。旧代码在主
+// handler 里另算一遍 `h5Identity`，只要 H5 cookie 在，就一律走窄门禁并把
+// `presentedToken` 清空——于是真 owner 的 /api/settings、/api/sessions/:id/
+// write-link 全 401，连正确的 ?t= 也被清掉，没法自救。
+//
+// 这里起真实 HTTP 服务，用与 dashboard.ts **同一对**函数（resolveDashboardIdentity
+// + resolveDashboardRequestGate）跑真实请求，断言状态码与 Set-Cookie。
+describe('P1-7 dual-cookie identity (real requests)', () => {
+  const ACTIVE = 'active-management-token';
+  let gateServer: Server | null = null;
+
+  afterEach(async () => {
+    if (gateServer) await new Promise<void>(resolve => gateServer!.close(() => resolve()));
+    gateServer = null;
+  });
+
+  async function startGate(
+    sessions: DashboardSessionStore,
+    opts: { platformMachineId?: string } = {},
+  ): Promise<string> {
+    gateServer = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      const h5Token = parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE);
+      const identity = resolveDashboardIdentity({
+        legacyCookie: parseCookie(req.headers.cookie),
+        activeToken: ACTIVE,
+        roleHeader: req.headers['x-botmux-role'],
+        platformMachineId: opts.platformMachineId ?? null,
+        platformActorScope: (machineId: string) => `scope-${machineId}`,
+        legacyAuthSessionId: (token: string) => `legacy-${token}`,
+        h5: sessions.resolveToken(h5Token),
+      });
+      // dashboard.ts 里的 authedToken：正确的 ?t= 优先，否则 cookie。
+      const q = url.searchParams.get('t');
+      const tokenFromRequest = q && q === ACTIVE ? q : parseCookie(req.headers.cookie);
+      const gate = resolveDashboardRequestGate({
+        method: req.method ?? 'GET',
+        pathname: url.pathname,
+        hasTokenParam: url.searchParams.has('t'),
+        identity,
+        tokenFromRequest,
+        activeToken: ACTIVE,
+        publicReadOnly: false,
+      });
+      if (gate.decision.kind === 'deny401') {
+        res.writeHead(401, {
+          'content-type': 'text/html; charset=utf-8',
+          ...(gate.workbenchOnlyIdentity ? { 'x-botmux-auth-scope': 'workbench' } : {}),
+        });
+        res.end('denied');
+        return;
+      }
+      if (gate.decision.kind === 'allow+set-cookie') {
+        res.writeHead(302, {
+          'set-cookie': buildSetCookie(gate.decision.token),
+          location: gate.decision.redirectTo,
+        });
+        res.end();
+        return;
+      }
+      // 管理读：settings / write-link 只认 legacy 管理能力。
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        authed: gate.legacyAuthed,
+        workbenchOnly: gate.workbenchOnlyIdentity,
+        identity: identity?.kind ?? null,
+      }));
+    });
+    await new Promise<void>(resolve => gateServer!.listen(0, '127.0.0.1', resolve));
+    return `http://127.0.0.1:${(gateServer.address() as { port: number }).port}`;
+  }
+
+  it('a legacy owner keeps management access even with a live H5 cookie alongside it', async () => {
+    const sessions = new DashboardSessionStore({ ttlMs: 600_000 });
+    const { token: h5Token } = sessions.create('ou_workbench_user');
+    const base = await startGate(sessions);
+
+    // 只有 H5 cookie：窄门禁，管理读 401（这条行为必须保持不变）。
+    const h5Only = await fetch(`${base}/api/settings`, {
+      headers: { cookie: `${DASHBOARD_SESSION_COOKIE}=${h5Token}` },
+      redirect: 'manual',
+    });
+    expect(h5Only.status).toBe(401);
+    expect(h5Only.headers.get('x-botmux-auth-scope')).toBe('workbench');
+
+    // 双 cookie：身份已是 legacy owner，不能因为 H5 cookie 在场就被降级。
+    for (const pathname of ['/api/settings', '/api/sessions/s1/write-link']) {
+      const both = await fetch(`${base}${pathname}`, {
+        headers: { cookie: `botmux_dashboard_token=${ACTIVE}; ${DASHBOARD_SESSION_COOKIE}=${h5Token}` },
+        redirect: 'manual',
+      });
+      expect(both.status, pathname).toBe(200);
+      expect(await both.json(), pathname).toMatchObject({
+        authed: true, workbenchOnly: false, identity: 'legacy-dashboard',
+      });
+    }
+  });
+
+  it('a correct ?t= still exchanges into the management cookie while an H5 cookie is present', async () => {
+    const sessions = new DashboardSessionStore({ ttlMs: 600_000 });
+    const { token: h5Token } = sessions.create('ou_workbench_user');
+    const base = await startGate(sessions);
+
+    const exchanged = await fetch(`${base}/?t=${ACTIVE}`, {
+      headers: { cookie: `${DASHBOARD_SESSION_COOKIE}=${h5Token}` },
+      redirect: 'manual',
+    });
+    expect(exchanged.status).toBe(302);
+    expect(exchanged.headers.get('set-cookie') ?? '').toContain(`botmux_dashboard_token=${ACTIVE}`);
+
+    // 票据/?t= 种完 cookie 之后，管理读随即可用（旧代码这里仍是 401）。
+    const after = await fetch(`${base}/api/settings`, {
+      headers: { cookie: `botmux_dashboard_token=${ACTIVE}; ${DASHBOARD_SESSION_COOKIE}=${h5Token}` },
+      redirect: 'manual',
+    });
+    expect(after.status).toBe(200);
+    expect(await after.json()).toMatchObject({ authed: true });
+  });
+
+  it('the platform hop is still not upgraded by its injected cookie', async () => {
+    const sessions = new DashboardSessionStore({ ttlMs: 600_000 });
+    const base = await startGate(sessions, { platformMachineId: 'machine-1' });
+    const platform = await fetch(`${base}/api/settings`, {
+      headers: { cookie: `botmux_dashboard_token=${ACTIVE}`, 'x-botmux-role': 'owner' },
+      redirect: 'manual',
+    });
+    expect(platform.status).toBe(401);
+    expect(platform.headers.get('x-botmux-auth-scope')).toBe('workbench');
   });
 });

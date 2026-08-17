@@ -15,6 +15,16 @@ import {
   type FeishuH5CodeExchanger,
 } from '../src/dashboard/h5-auth.js';
 import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/control-audit.js';
+import { WebSocket, WebSocketServer } from 'ws';
+import { AuthSessionConnectionRegistry } from '../src/dashboard/auth-session-connections.js';
+import { createDashboardEventsStream } from '../src/dashboard/events-sse.js';
+import { createSessionPreviewProxy } from '../src/dashboard/preview-proxy.js';
+import {
+  mintPreviewContentCapability,
+  verifyPreviewContentCapability,
+} from '../src/dashboard/preview-content-capability.js';
+import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
+import { parseNamedCookie } from '../src/dashboard/h5-auth.js';
 
 const config: DashboardH5AuthConfig = {
   enabled: true,
@@ -418,5 +428,225 @@ describe('dashboardH5ClientIp', () => {
     expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': '  ' }, '192.168.1.9'))).toBe('192.168.1.9');
     expect(dashboardH5ClientIp(fakeReq({}, '::ffff:192.168.1.9'))).toBe('192.168.1.9');
     expect(dashboardH5ClientIp(fakeReq({}))).toBe('unknown');
+  });
+});
+
+// ─── P1-8：身份结束（logout / token rotate）关闭全部长连接 ────────────────────
+//
+// 认证结束只关了前门：短请求立刻 401，但**已经建立**的 `/events` SSE 与 Preview
+// WebSocket 是登出前握好的手，握完就一直流。旧的 management SSE 甚至会收到 rotate
+// **之后**新产生的 `riffAccessUrl`——那是 Riff 沙箱的写凭据，rotate 的全部意义就是
+// 让上一条链接失效。
+//
+// 这里起真实 HTTP 服务，跑真实的 SSE 与 WebSocket 握手，用真实的 logout 请求 /
+// token rotate 触发吊销，断言连接真的断了、吊销后的帧一个字节也没送出去。
+describe('P1-8 auth end closes every long-lived connection', () => {
+  const PREVIEW_SECRET = 'preview-capability-secret-for-tests';
+  let hub: Server | null = null;
+  let previewUpstream: Server | null = null;
+  let previewWss: WebSocketServer | null = null;
+  const liveSockets = new Set<WebSocket>();
+
+  afterEach(async () => {
+    for (const ws of liveSockets) ws.terminate();
+    liveSockets.clear();
+    if (previewWss) await new Promise<void>(resolve => previewWss!.close(() => resolve()));
+    previewWss = null;
+    if (hub) await new Promise<void>(resolve => hub!.close(() => resolve()));
+    hub = null;
+    if (previewUpstream) await new Promise<void>(resolve => previewUpstream!.close(() => resolve()));
+    previewUpstream = null;
+  });
+
+  interface Hub {
+    base: string;
+    sessions: DashboardSessionStore;
+    /** 当前活跃管理 token；rotate 就是换掉它。 */
+    activeToken: { value: string };
+    legacyAuthSessionId(token: string): string;
+    /** dashboard.ts 的 endDashboardAuthSession 等价物。 */
+    endAuthSession(authSessionId: string): void;
+    emit(type: string, body: unknown): void;
+    mintPreviewCapability(sessionId: string, authSessionId: string): string;
+  }
+
+  async function startHub(): Promise<Hub> {
+    previewUpstream = createServer((_req, res) => { res.writeHead(200); res.end('preview'); });
+    previewWss = new WebSocketServer({ server: previewUpstream });
+    previewWss.on('connection', ws => ws.send('preview-open'));
+    await new Promise<void>(resolve => previewUpstream!.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (previewUpstream.address() as { port: number }).port;
+
+    const sessions = new DashboardSessionStore({ ttlMs: 600_000 });
+    const audit = new MemoryAudit();
+    const controller = createDashboardH5AuthController({
+      config,
+      sessions,
+      audit,
+      exchanger: { exchange: async () => ({ openId: 'ou_allowed' }) },
+    });
+    const registry = new AuthSessionConnectionRegistry();
+    const activeToken = { value: 'management-token-generation-1' };
+    const legacyAuthSessionId = (token: string) => `legacy:${token}`;
+    const isAuthSessionLive = (authSessionId: string) =>
+      sessions.liveAuthSession(authSessionId) || authSessionId === legacyAuthSessionId(activeToken.value);
+    const endAuthSession = (authSessionId: string) => { registry.closeAuthSession(authSessionId); };
+    sessions.onEnd(identity => endAuthSession(identity.authSessionId));
+
+    const identityOf = (req: IncomingMessage): { authSessionId: string } | null => {
+      const legacy = parseNamedCookie(req.headers.cookie, 'botmux_dashboard_token');
+      if (legacy && legacy === activeToken.value) return { authSessionId: legacyAuthSessionId(legacy) };
+      const h5 = sessions.resolveToken(parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE));
+      return h5 ? { authSessionId: h5.authSessionId } : null;
+    };
+
+    const listeners = new Set<(type: string, body: unknown) => void>();
+    const previewProxy = createSessionPreviewProxy({
+      authenticated: req => identityOf(req) !== null,
+      resolve: () => ({ ok: true, target: { host: '127.0.0.1', port: upstreamPort, registeredAt: new Date().toISOString() } }),
+      verifyContentCapability: (capability, sessionId) => {
+        const verified = verifyPreviewContentCapability(PREVIEW_SECRET, capability, sessionId);
+        return verified.ok && isAuthSessionLive(verified.claims.authSessionId);
+      },
+      bindStream: (req, ctx, close) => {
+        const authSessionId = ctx.contentCapability
+          ? (() => {
+            const verified = verifyPreviewContentCapability(PREVIEW_SECRET, ctx.contentCapability, ctx.sessionId);
+            return verified.ok ? verified.claims.authSessionId : null;
+          })()
+          : identityOf(req)?.authSessionId ?? null;
+        return authSessionId ? registry.register(authSessionId, close) : null;
+      },
+    });
+
+    hub = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      void (async () => {
+        if (await controller.handle(req, res, url)) return;
+        if (await previewProxy.handleHttp(req, res, url)) return;
+        if (url.pathname === '/events') {
+          const identity = identityOf(req);
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache, no-transform' });
+          res.write('retry: 5000\n\n');
+          const stream = createDashboardEventsStream({
+            res,
+            authSessionId: identity?.authSessionId ?? null,
+            isAuthSessionLive,
+            bind: (authSessionId, close) => registry.register(authSessionId, close),
+          });
+          const listener = (type: string, body: unknown) => { stream.write(type, body); };
+          listeners.add(listener);
+          res.on('close', () => { listeners.delete(listener); stream.dispose(); });
+          return;
+        }
+        res.writeHead(404); res.end();
+      })();
+    });
+    hub.on('upgrade', (req, socket, head) => {
+      if (!previewProxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>(resolve => hub!.listen(0, '127.0.0.1', resolve));
+    return {
+      base: `http://127.0.0.1:${(hub.address() as { port: number }).port}`,
+      sessions,
+      activeToken,
+      legacyAuthSessionId,
+      endAuthSession,
+      emit: (type, body) => { for (const listener of [...listeners]) listener(type, body); },
+      mintPreviewCapability: (sessionId, authSessionId) => {
+        const minted = mintPreviewContentCapability(PREVIEW_SECRET, sessionId, {
+          userId: 'ou_allowed', authSessionId, expiresAt: Date.now() + 600_000,
+        });
+        if (!minted) throw new Error('capability mint failed');
+        return minted.token;
+      },
+    };
+  }
+
+  /** 读一条 SSE 帧；`null` 表示流已经结束（服务端主动关闭）。 */
+  async function readFrame(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string | null> {
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise<{ done: true; value: undefined }>(resolve =>
+        setTimeout(() => resolve({ done: true, value: undefined }), 1_500).unref()),
+    ]);
+    if (chunk.done) return null;
+    return new TextDecoder().decode(chunk.value);
+  }
+
+  it('H5 logout tears down both the /events SSE and the sandboxed preview WebSocket', async () => {
+    const h5 = await startHub();
+    const created = h5.sessions.create('ou_allowed');
+    const cookie = `${DASHBOARD_SESSION_COOKIE}=${created.token}`;
+
+    const sse = await fetch(`${h5.base}/events`, { headers: { cookie } });
+    expect(sse.status).toBe(200);
+    const reader = sse.body!.getReader();
+    expect(await readFrame(reader)).toContain('retry: 5000');
+    h5.emit('session.updated', { sessionId: 's1' });
+    expect(await readFrame(reader)).toContain('session.updated');
+
+    const capability = h5.mintPreviewCapability('s1', created.identity.authSessionId);
+    const ws = new WebSocket(
+      `${h5.base.replace('http', 'ws')}/preview/s1/${PREVIEW_CONTENT_SEGMENT}/${capability}/socket`,
+      { origin: 'null' },
+    );
+    liveSockets.add(ws);
+    await new Promise<void>((resolve, reject) => {
+      ws.on('message', () => resolve());
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('preview WebSocket never opened')), 4_000).unref();
+    });
+    const wsClosed = new Promise<void>((resolve, reject) => {
+      ws.on('close', () => resolve());
+      setTimeout(() => reject(new Error('preview WebSocket survived logout')), 4_000).unref();
+    });
+
+    // 真实登出请求 → 真实会话吊销 → onEnd → 关闭该身份名下全部长连接。
+    const logout = await fetch(`${h5.base}/auth/feishu/logout`, { method: 'POST', headers: { cookie } });
+    expect(logout.status).toBe(200);
+
+    await wsClosed;
+    liveSockets.delete(ws);
+    // SSE 流结束（read 返回 done / 连接错误），登出后的新帧一个都收不到。
+    h5.emit('session.updated', { sessionId: 's2', riffAccessUrl: 'https://riff.example/after-logout' });
+    const tail = await readFrame(reader).catch(() => null);
+    expect(tail == null || !tail.includes('after-logout')).toBe(true);
+  });
+
+  it('token rotation stops an old management SSE from receiving newly minted riffAccessUrl frames', async () => {
+    const h5 = await startHub();
+    const cookie = `botmux_dashboard_token=${h5.activeToken.value}`;
+    const previousAuthSession = h5.legacyAuthSessionId(h5.activeToken.value);
+
+    const sse = await fetch(`${h5.base}/events`, { headers: { cookie } });
+    const reader = sse.body!.getReader();
+    expect(await readFrame(reader)).toContain('retry: 5000');
+    h5.emit('session.updated', { sessionId: 's1', riffAccessUrl: 'https://riff.example/before-rotate' });
+    expect(await readFrame(reader)).toContain('before-rotate');
+
+    // `botmux dashboard rotate`：换 token，随即吊销旧认证会话。
+    h5.activeToken.value = 'management-token-generation-2';
+    h5.endAuthSession(previousAuthSession);
+
+    h5.emit('session.updated', { sessionId: 's2', riffAccessUrl: 'https://riff.example/after-rotate' });
+    const tail = await readFrame(reader).catch(() => null);
+    expect(tail == null || !tail.includes('after-rotate')).toBe(true);
+  });
+
+  it('even without the active close, a rotated-away SSE is re-checked before every frame', async () => {
+    const h5 = await startHub();
+    const cookie = `botmux_dashboard_token=${h5.activeToken.value}`;
+
+    const sse = await fetch(`${h5.base}/events`, { headers: { cookie } });
+    const reader = sse.body!.getReader();
+    expect(await readFrame(reader)).toContain('retry: 5000');
+
+    // 只 rotate、故意不调用主动关闭：推送前复核必须自己拦住这一帧。
+    h5.activeToken.value = 'management-token-generation-3';
+    h5.emit('session.updated', { sessionId: 's2', riffAccessUrl: 'https://riff.example/after-rotate' });
+
+    const tail = await readFrame(reader).catch(() => null);
+    expect(tail == null || !tail.includes('after-rotate')).toBe(true);
   });
 });

@@ -9,6 +9,8 @@ import {
   type PreviewProxyResolution,
 } from '../src/dashboard/preview-proxy.js';
 import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
+import { AuthSessionConnectionRegistry } from '../src/dashboard/auth-session-connections.js';
+import { managementUpgradeOrigin } from '../src/dashboard/control-csrf.js';
 
 const DASHBOARD_TOKEN = 'management-token-must-not-leak';
 const TARGET_TIME = '2026-08-11T12:00:00.000Z';
@@ -567,5 +569,208 @@ describe('session preview same-origin reverse proxy', () => {
     expect(JSON.parse(body)).toEqual({ ok: false, error: 'query_token_forbidden' });
     expect(body).not.toContain(DASHBOARD_TOKEN);
     expect(target.httpRequests).toHaveLength(0);
+  });
+});
+
+// ─── P1-8：预览长连接随认证结束一起关闭 ───────────────────────────────────────
+//
+// 授权只在握手那一刻说话，而预览的 WebSocket 与 SSE 一握手就能流几个小时。登出
+// 之后短请求立刻 401，这些流却还在把 agent 页面的内容送给已经登出的浏览器。
+// `bindStream` 把每条流挂到签发它的认证会话下，吊销时由索引统一 destroy。
+describe('P1-8 preview streams die with the auth session that opened them', () => {
+  let revocable: Server | null = null;
+  let streamUpstream: Server | null = null;
+  let streamWss: WebSocketServer | null = null;
+  const liveSockets = new Set<WebSocket>();
+
+  afterEach(async () => {
+    for (const ws of liveSockets) ws.terminate();
+    liveSockets.clear();
+    if (streamWss) await new Promise<void>(resolve => streamWss!.close(() => resolve()));
+    streamWss = null;
+    if (revocable) await new Promise<void>(resolve => revocable!.close(() => resolve()));
+    revocable = null;
+    if (streamUpstream) await new Promise<void>(resolve => streamUpstream!.close(() => resolve()));
+    streamUpstream = null;
+  });
+
+  async function startRevocable(): Promise<{ port: number; registry: AuthSessionConnectionRegistry }> {
+    // 上游：一条永不结束的 SSE + 一个 echo WebSocket，模拟真实 dev server。
+    streamUpstream = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(`event: hello\ndata: ${req.url}\n\n`);
+      // 故意不 end：这正是「握手后长期流」的形状。
+    });
+    streamWss = new WebSocketServer({ server: streamUpstream });
+    streamWss.on('connection', ws => { ws.send('upstream-open'); });
+    await new Promise<void>(resolve => streamUpstream!.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (streamUpstream.address() as { port: number }).port;
+
+    const registry = new AuthSessionConnectionRegistry();
+    const manager = createSessionPreviewProxy({
+      authenticated: req => req.headers.cookie?.split(';').some(part => part.trim() === managementCookie()) === true,
+      resolve: () => okTarget(upstreamPort),
+      verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
+      // dashboard.ts 的同款接线：content 路径归属凭据里的 authSession，
+      // cookie 路径归属当前请求身份。
+      bindStream: (_req, ctx, close) => registry.register(
+        ctx.contentCapability ? 'capability-auth-session' : 'cookie-auth-session',
+        close,
+      ),
+    });
+    revocable = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      void manager.handleHttp(req, res, url).then(handled => {
+        if (!handled && !res.headersSent) { res.writeHead(404); res.end(); }
+      });
+    });
+    revocable.on('upgrade', (req, socket, head) => {
+      if (!manager.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>(resolve => revocable!.listen(0, '127.0.0.1', resolve));
+    return { port: (revocable.address() as { port: number }).port, registry };
+  }
+
+  it('closes the sandboxed preview WebSocket the moment its auth session ends', async () => {
+    const { port, registry } = await startRevocable();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${contentBase('s1')}/socket`, { origin: 'null' });
+    liveSockets.add(ws);
+    await new Promise<void>((resolve, reject) => {
+      ws.on('message', () => resolve());
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('preview WebSocket never opened')), 4_000).unref();
+    });
+    expect(registry.count('capability-auth-session')).toBe(1);
+
+    const closed = new Promise<void>((resolve, reject) => {
+      ws.on('close', () => resolve());
+      setTimeout(() => reject(new Error('preview WebSocket survived revocation')), 4_000).unref();
+    });
+    expect(registry.closeAuthSession('capability-auth-session')).toBe(1);
+    await closed;
+    liveSockets.delete(ws);
+    // 索引在关闭后不留残留（连接自然关闭也会注销）。
+    expect(registry.count('capability-auth-session')).toBe(0);
+  });
+
+  it('closes an in-flight preview SSE response on revocation without touching other sessions', async () => {
+    const { port, registry } = await startRevocable();
+    const response = await fetch(`http://127.0.0.1:${port}/preview/s1/stream`, {
+      headers: { cookie: managementCookie() },
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain('event: hello');
+    expect(registry.count('cookie-auth-session')).toBe(1);
+
+    // 别的认证会话被吊销时，这条流一点不受影响。
+    expect(registry.closeAuthSession('someone-else')).toBe(0);
+    expect(registry.count('cookie-auth-session')).toBe(1);
+
+    expect(registry.closeAuthSession('cookie-auth-session')).toBe(1);
+    // 真实断流：读取端要么拿到 done，要么拿到网络错误——两者都证明流已终止。
+    await expect(Promise.race([
+      reader.read(),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('preview SSE survived revocation')), 4_000).unref()),
+    ])).rejects.toThrow(/terminated|aborted|socket|network|closed/i);
+  });
+});
+
+// ─── P1-11：管理类 WS 校验 Origin，预览自身的不透明来源 WS 不被误杀 ──────────
+describe('P1-11 management WebSocket upgrades check Origin (preview stays exempt)', () => {
+  let chain: Server | null = null;
+  let chainUpstream: Server | null = null;
+  let chainUpstreamWss: WebSocketServer | null = null;
+  let managementWss: WebSocketServer | null = null;
+  const liveSockets = new Set<WebSocket>();
+
+  afterEach(async () => {
+    for (const ws of liveSockets) ws.terminate();
+    liveSockets.clear();
+    if (managementWss) await new Promise<void>(resolve => managementWss!.close(() => resolve()));
+    managementWss = null;
+    if (chainUpstreamWss) await new Promise<void>(resolve => chainUpstreamWss!.close(() => resolve()));
+    chainUpstreamWss = null;
+    if (chain) await new Promise<void>(resolve => chain!.close(() => resolve()));
+    chain = null;
+    if (chainUpstream) await new Promise<void>(resolve => chainUpstream!.close(() => resolve()));
+    chainUpstream = null;
+  });
+
+  /** 与 dashboard.ts 的 `server.on('upgrade')` 同序：预览先判，再管理 Origin 门禁。 */
+  async function startChain(): Promise<{ port: number }> {
+    chainUpstream = createServer();
+    chainUpstreamWss = new WebSocketServer({ server: chainUpstream });
+    chainUpstreamWss.on('connection', ws => ws.send('preview-upstream'));
+    await new Promise<void>(resolve => chainUpstream!.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (chainUpstream.address() as { port: number }).port;
+
+    const manager = createSessionPreviewProxy({
+      authenticated: () => false,
+      resolve: () => okTarget(upstreamPort),
+      verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
+    });
+    chain = createServer((_req, res) => { res.writeHead(404); res.end(); });
+    managementWss = new WebSocketServer({ noServer: true });
+    managementWss.on('connection', ws => ws.send('management-terminal'));
+    chain.on('upgrade', (req, socket, head) => {
+      if (manager.handleUpgrade(req, socket, head)) return;
+      const verdict = managementUpgradeOrigin(req.headers);
+      if (!verdict.ok) {
+        const body = JSON.stringify({ ok: false, error: verdict.error });
+        socket.end([
+          'HTTP/1.1 403 Forbidden',
+          'content-type: application/json; charset=utf-8',
+          'connection: close',
+          `content-length: ${Buffer.byteLength(body)}`,
+          '',
+          body,
+        ].join('\r\n'));
+        return;
+      }
+      managementWss!.handleUpgrade(req, socket as never, head, ws => {
+        managementWss!.emit('connection', ws, req);
+      });
+    });
+    await new Promise<void>(resolve => chain!.listen(0, '127.0.0.1', resolve));
+    return { port: (chain.address() as { port: number }).port };
+  }
+
+  async function firstMessage(ws: WebSocket): Promise<string> {
+    liveSockets.add(ws);
+    return new Promise<string>((resolve, reject) => {
+      ws.on('message', data => resolve(data.toString()));
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('WebSocket never delivered a frame')), 4_000).unref();
+    });
+  }
+
+  it('rejects a foreign-origin terminal upgrade and admits the same-origin one', async () => {
+    const { port } = await startChain();
+    // 同站兄弟子域 / 别的 localhost 端口 / 跨站页面 / 不透明来源：全部拒。
+    for (const origin of [
+      'https://evil.example',
+      `http://evil.127.0.0.1:${port}`,
+      `http://127.0.0.1:${port + 1}`,
+      'null',
+    ]) {
+      expect(await websocketStatus(`ws://127.0.0.1:${port}/s/sess-1/ws`, { Origin: origin }), origin).toBe(403);
+    }
+    // 真正同源的工作台页面照常连上。
+    const ok = new WebSocket(`ws://127.0.0.1:${port}/s/sess-1/ws`, { origin: `http://127.0.0.1:${port}` });
+    expect(await firstMessage(ok)).toBe('management-terminal');
+    ok.terminate();
+    liveSockets.delete(ok);
+  });
+
+  it('never applies the management Origin gate to the sandboxed preview WebSocket', async () => {
+    const { port } = await startChain();
+    // 预览自身的 WS 是不透明来源（Origin: null），凭据在路径里；它必须在管理
+    // Origin 门禁之前被认领，否则同一个 `null` 会被上面那条规则误杀。
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${contentBase('s1')}/socket`, { origin: 'null' });
+    expect(await firstMessage(ws)).toBe('preview-upstream');
+    ws.terminate();
+    liveSockets.delete(ws);
   });
 });
