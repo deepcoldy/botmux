@@ -12,6 +12,9 @@
  *      Dashboard 验票后才种 legacy cookie。长期 `.dashboard-token` 直拼 URL 的
  *      形态只保留给 `botmux dashboard` 的**终端输出**（cli/dashboard-command.ts
  *      经 workbenchEntryUrl 拼，终端是私人环境）；本模块不再读那份文件。
+ *      （P1-6 起 mint 内部会读一次 `.dashboard-token` 算 generation 标签，把票据
+ *      钉在「发票那一刻的那份 token」上——rotate 之后旧票立刻作废。token 明文
+ *      既不进链接也不进票据文件，只有它的 hash 标签进。）
  *   3. **applink host 跟着 bot 的 brand 走**：飞书 bot → applink.feishu.cn，
  *      Lark bot → applink.larksuite.com（见 im/lark/lark-hosts.ts）。
  *
@@ -56,8 +59,9 @@ export function resolveWorkbenchUrl(): string | undefined {
     try {
       ticket = mintWorkbenchTicket();
     } catch {
-      // 票据写不进 ~/.botmux（目录形状不安全等）：dashboard 侧必然验不了票，
-      // 与其发一个注定失败的死链，不如退回无凭证链接让用户走登录墙。
+      // 票据写不进 ~/.botmux、或者读不出当前 token 的 generation（目录形状不安全
+      // 等）：dashboard 侧必然验不了票，与其发一个注定失败的死链，不如退回无凭证
+      // 链接让用户走登录墙。
       ticket = undefined;
     }
     if (!ticket) return workbenchSpaUrl(url) ?? undefined;

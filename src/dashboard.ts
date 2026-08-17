@@ -105,7 +105,11 @@ import {
 import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
 import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
-import { handleWorkbenchTicketRedemption } from './dashboard/workbench-ticket.js';
+import {
+  handleWorkbenchTicketRedemption,
+  revokeWorkbenchTicketsOutsideGeneration,
+  workbenchTicketGeneration,
+} from './dashboard/workbench-ticket.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
   centralViewLinkPath,
@@ -3177,6 +3181,14 @@ const server = createServer(async (req, res) => {
         if (previousToken && previousToken !== token) {
           endDashboardAuthSession(legacyDashboardAuthSessionId(previousToken));
         }
+        // P1-6: the same reasoning covers the workbench entry tickets sitting in
+        // Feishu card history. They redeem into "whatever token is active now",
+        // so without this a ticket leaked BEFORE the rotation would hand out the
+        // freshly minted management cookie — rotation would protect nothing in
+        // exactly the case it is used for. Ticket verification independently
+        // requires the bound generation to still be current, so this call is the
+        // cleanup (drop dead rows from the shared file), not the guarantee.
+        revokeWorkbenchTicketsOutsideGeneration(workbenchTicketGeneration(token));
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
@@ -3306,8 +3318,13 @@ const server = createServer(async (req, res) => {
     // /dashboard 卡片构建时现 mint（TTL 30 分钟、可多端重复打开，落盘只存 hash，
     // 见 dashboard/workbench-ticket.ts），长期管理 token 从此不再写进持久化卡片；
     // 无效/过期回一个无凭据中文提示页。该 GET 在 decideDashboardAuth 里与静态壳
-    // 同级放行（票据本身就是凭证），其余方法不豁免。
-    if (handleWorkbenchTicketRedemption(req, res, url, { activeToken: () => activeToken })) {
+    // 同级放行（票据本身就是凭证），其余方法不豁免。P1-10：正因为它在 auth gate
+    // 之前放行，端点自带每 IP + 全局限流，IP 口径与 H5 兑换口共用同一份可信代理
+    // 配置——否则两个公开面对同一个 `x-forwarded-for` 会得出不同结论。
+    if (handleWorkbenchTicketRedemption(req, res, url, {
+      activeToken: () => activeToken,
+      trustedProxyHops: dashboardH5AuthConfig.trustedProxyHops,
+    })) {
       return;
     }
 

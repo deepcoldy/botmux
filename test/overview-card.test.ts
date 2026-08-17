@@ -16,6 +16,7 @@ import type { SessionRow } from '../src/core/dashboard-rows.js';
 import { resolveWorkbenchButtonLinks } from '../src/core/workbench-link.js';
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
 import type { DashboardSettingsInput } from '../src/dashboard/settings-card-model.js';
+import { rotatePersistedToken } from '../src/dashboard/auth.js';
 import {
   resetWorkbenchTicketStoreForTests,
   verifyWorkbenchTicket,
@@ -692,6 +693,21 @@ describe('workbench link never embeds the persisted dashboard token (P2-1)', () 
     // 老形态 `?t=<token>` 整体退场：卡片 JSON 里不允许再出现 ?t=/%3Ft%3D 入口。
     expect(json).not.toContain('?t=');
     expect(json).not.toContain('%3Ft%3D');
+  });
+
+  it('a card link minted before `dashboard rotate` stops redeeming afterwards (P1-6)', () => {
+    const ticketOf = (u: string) => new URL(u).pathname.split('/workbench-ticket/')[1];
+    const leaked = ticketOf(resolveWorkbenchButtonLinks(LARK_APP_ID)!.webUrl);
+    expect(verifyWorkbenchTicket(leaked)).toBe(true);
+
+    // 管理员因为「卡片/链接泄漏了」而轮换 token——泄漏出去的那张卡片按钮必须当场
+    // 作废，绝不能反过来兑出 rotate 之后的新管理凭证。
+    const rotated = rotatePersistedToken(join(homeDir, '.botmux', '.dashboard-token'));
+    expect(rotated).not.toBe(LEAKY_TOKEN);
+    expect(verifyWorkbenchTicket(leaked)).toBe(false);
+
+    // 重新发一张卡片就恢复正常入口。
+    expect(verifyWorkbenchTicket(ticketOf(resolveWorkbenchButtonLinks(LARK_APP_ID)!.webUrl))).toBe(true);
   });
 
   it('every card build mints a FRESH ticket (refresh rotates the entry link)', () => {

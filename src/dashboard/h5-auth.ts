@@ -414,7 +414,12 @@ export type H5ExchangeAdmission = { ok: true } | { ok: false; retryAfterMs: numb
 /**
  * In-process brakes for the public, unauthenticated H5 exchange endpoint.
  * One exchange can cost up to three open-platform requests, so several
- * independent limits apply (LocateRateLimiter-style, zero dependencies):
+ * independent limits apply (LocateRateLimiter-style, zero dependencies).
+ *
+ * The admission half (`admit`/`prune`) is deliberately generic and is reused by
+ * the other pre-auth public surface, `GET /workbench-ticket/<ticket>` (see
+ * dashboard/workbench-ticket.ts), with its own budgets; only the code-specific
+ * halves (`share`/`markSpent`) are exchange-only:
  *
  *  - per-IP sliding window (`admit`) — only admitted hits consume slots, so
  *    a refused burst cannot lock a NAT'd office out forever;
