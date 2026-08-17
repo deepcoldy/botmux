@@ -1603,7 +1603,14 @@ void (async () => {
   }, 30 * 60_000);
   initOwnerAvatar();
   try {
-    await bootstrap();
+    await bootstrap({
+      // P1-14：排程只对「本机管理身份」和「publicReadOnly 匿名访客」开放。
+      // Workbench-only 身份（飞书 H5 / 平台 teammate|guest，loadAuthState 里把
+      // authed 置 false、workbenchAuthed 置 true）对 /api/schedules 是既定的
+      // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
+      // 依赖它对不对。
+      canReadSchedules: () => ui.authed || ui.publicReadOnly,
+    });
   } catch (err) {
     console.error('botmux dashboard bootstrap failed', err);
     store.setOnline(false);

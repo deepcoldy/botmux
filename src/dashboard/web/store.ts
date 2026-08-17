@@ -11,6 +11,11 @@ export interface StoreSnapshot {
    *  schedule nextRunAt/lastRunAt in the SAME zone regardless of browser zone.
    *  Empty ⇒ fall back to the browser's local zone (legacy behavior). */
   scheduleTimeZone: string;
+  /** P1-14：本次身份能否读到排程。Workbench-only（飞书 H5 / 平台 teammate|guest）
+   *  身份对 `/api/schedules` 是明确的 401，取不到就是取不到——UI 该隐藏排程区块，
+   *  而不是画一个永远为空的面板。false 同时覆盖「没有能力所以没请求」和「请求
+   *  失败」两种情况。 */
+  schedulesAvailable: boolean;
 }
 
 class Store {
@@ -18,6 +23,7 @@ class Store {
   schedules = new Map<string, Schedule>();
   online = true;
   scheduleTimeZone = '';
+  schedulesAvailable = true;
   private version = 0;
   private snapshot: StoreSnapshot = {
     sessions: this.sessions,
@@ -25,6 +31,7 @@ class Store {
     online: this.online,
     version: this.version,
     scheduleTimeZone: this.scheduleTimeZone,
+    schedulesAvailable: this.schedulesAvailable,
   };
   private listeners = new Set<() => void>();
   // Bot roster changes don't live in this cache (the Bot 配置 page owns its own
@@ -39,11 +46,17 @@ class Store {
     }
   }
 
-  replaceSnapshot(rows: Session[], schedules: Schedule[], scheduleTimeZone?: string) {
+  /**
+   * `schedules === null` ⇒ 本次身份读不到排程（无能力，或请求 401/403/非 JSON）。
+   * 排程表清空并标记 {@link StoreSnapshot.schedulesAvailable} 为 false，但**会话
+   * 快照照常落库**——P1-14 的整个要害就是别让排程的失败连累会话列表。
+   */
+  replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string) {
     this.sessions.clear();
     for (const row of rows) this.sessions.set(row.sessionId, row);
     this.schedules.clear();
-    for (const schedule of schedules) this.schedules.set(schedule.id, schedule);
+    for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
+    this.schedulesAvailable = schedules !== null;
     if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
     this.emit();
   }
@@ -91,6 +104,7 @@ class Store {
       online: this.online,
       version: this.version,
       scheduleTimeZone: this.scheduleTimeZone,
+      schedulesAvailable: this.schedulesAvailable,
     };
     for (const fn of this.listeners) fn();
   }
@@ -98,7 +112,53 @@ class Store {
 
 export const store = new Store();
 
-export async function bootstrap() {
+export interface DashboardBootstrapOptions {
+  /**
+   * P1-14：本次身份是否具备 `/api/schedules` 读能力。
+   *
+   * 本机管理身份有；`publicReadOnly` 下的匿名访客有（脱敏版）；**Workbench-only
+   * 身份没有**——飞书 H5 会话与平台 teammate/guest 走的是 `decideWorkbenchH5Auth`
+   * 窄门禁，排程不在能力表里，服务端明确回 401 + HTML 登录页。所以这里先按能力
+   * 决定要不要发这一跳请求，省掉一次注定 401 的往返。
+   *
+   * 缺省 true 只是保持既有调用方的行为：**无论返回真假，排程都不会拖垮会话
+   * 快照**——那条容错在 {@link fetchSchedulesSnapshot} 里兜底。
+   */
+  canReadSchedules?: () => boolean;
+}
+
+interface SchedulesSnapshot {
+  schedules: Schedule[];
+  timezone?: string;
+}
+
+/**
+ * 拉排程快照，且**永不 reject**。
+ *
+ * 这是 P1-14 的修复点：旧代码写 `fetch('/api/schedules').then(r => r.json())` 并
+ * 塞进 `Promise.all`，于是 Workbench-only 身份拿到的那份 401 HTML 让 `.json()`
+ * 抛 SyntaxError，整个 `Promise.all` 连同已经成功的 `/api/sessions` 一起废掉，
+ * `replaceSnapshot` 永远不执行——生产环境的工作台一进去就是空会话列表。
+ *
+ * 现在任何形式的拿不到（非 2xx、网络错误、响应不是 JSON）统一降级成 `null`，
+ * 由调用方标记「排程不可用」，会话快照照常落库。
+ */
+async function fetchSchedulesSnapshot(): Promise<SchedulesSnapshot | null> {
+  try {
+    const res = await fetch('/api/schedules');
+    if (!res.ok) return null;
+    const body = await res.json();
+    return {
+      schedules: Array.isArray(body?.schedules) ? body.schedules as Schedule[] : [],
+      timezone: typeof body?.timezone === 'string' ? body.timezone : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function bootstrap(options: DashboardBootstrapOptions = {}) {
+  const canReadSchedules = options.canReadSchedules ?? (() => true);
   // Establish SSE before fetching snapshots, then buffer events while each
   // authoritative snapshot is installed.
   const buffered: Array<{ type: string; body: any }> = [];
@@ -131,14 +191,17 @@ export async function bootstrap() {
         const generation = requestedReconcile;
         snapshotReady = false;
         try {
+          // 会话快照是**必需**资源：它失败仍然让 bootstrap reject，EventSource
+          // 保持打开、下一次 open 重试（见文件末尾注释与对应测试）。排程是**可选**
+          // 资源：拿不到只是这一块降级，绝不能反过来吃掉会话快照。
           const [s, sch] = await Promise.all([
             fetch('/api/sessions').then(r => r.json()),
-            fetch('/api/schedules').then(r => r.json()),
+            canReadSchedules() ? fetchSchedulesSnapshot() : Promise.resolve(null),
           ]);
           store.replaceSnapshot(
             s.sessions ?? [],
-            sch.schedules ?? [],
-            typeof sch.timezone === 'string' ? sch.timezone : undefined,
+            sch ? sch.schedules : null,
+            sch?.timezone,
           );
           completedReconcile = generation;
         } finally {

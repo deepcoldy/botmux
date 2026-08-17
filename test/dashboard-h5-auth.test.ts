@@ -446,8 +446,13 @@ describe('P1-8 auth end closes every long-lived connection', () => {
   let previewUpstream: Server | null = null;
   let previewWss: WebSocketServer | null = null;
   const liveSockets = new Set<WebSocket>();
+  // 服务端**没有**主动关闭的 SSE 流（例如只做能力过滤、身份始终有效的用例）会一直
+  // 挂着，hub.close() 等不到它，afterEach 就超时。统一在这里取消读端放连接。
+  const liveReaders = new Set<ReadableStreamDefaultReader<Uint8Array>>();
 
   afterEach(async () => {
+    for (const reader of liveReaders) await reader.cancel().catch(() => {});
+    liveReaders.clear();
     for (const ws of liveSockets) ws.terminate();
     liveSockets.clear();
     if (previewWss) await new Promise<void>(resolve => previewWss!.close(() => resolve()));
@@ -493,11 +498,15 @@ describe('P1-8 auth end closes every long-lived connection', () => {
     const endAuthSession = (authSessionId: string) => { registry.closeAuthSession(authSessionId); };
     sessions.onEnd(identity => endAuthSession(identity.authSessionId));
 
-    const identityOf = (req: IncomingMessage): { authSessionId: string } | null => {
+    // `kind` 与 dashboard.ts 的 `legacyAuthed` / `workbenchOnlyIdentity` 一一对应：
+    // 本机管理 cookie ⇒ management，H5 会话 cookie ⇒ workbench-only。
+    const identityOf = (req: IncomingMessage): { authSessionId: string; kind: 'legacy' | 'workbench' } | null => {
       const legacy = parseNamedCookie(req.headers.cookie, 'botmux_dashboard_token');
-      if (legacy && legacy === activeToken.value) return { authSessionId: legacyAuthSessionId(legacy) };
+      if (legacy && legacy === activeToken.value) {
+        return { authSessionId: legacyAuthSessionId(legacy), kind: 'legacy' };
+      }
       const h5 = sessions.resolveToken(parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE));
-      return h5 ? { authSessionId: h5.authSessionId } : null;
+      return h5 ? { authSessionId: h5.authSessionId, kind: 'workbench' } : null;
     };
 
     const listeners = new Set<(type: string, body: unknown) => void>();
@@ -544,6 +553,10 @@ describe('P1-8 auth end closes every long-lived connection', () => {
           const stream = createDashboardEventsStream({
             res,
             authSessionId: identity?.authSessionId ?? null,
+            // 与 dashboard.ts 同一行口径：authed ? management : workbenchOnly ? workbench : anonymous。
+            audience: identity?.kind === 'legacy'
+              ? 'management'
+              : identity ? 'workbench' : 'anonymous',
             isAuthSessionLive,
             bind: (authSessionId, close) => registry.register(authSessionId, close),
           });
@@ -585,6 +598,21 @@ describe('P1-8 auth end closes every long-lived connection', () => {
     ]);
     if (chunk.done) return null;
     return new TextDecoder().decode(chunk.value);
+  }
+
+  /** 累积读到出现 `marker` 为止（或流结束/超时），返回这期间收到的全部字节。
+   *  多帧是否合并进同一个 TCP chunk 由内核决定，所以断言必须看累积文本。 */
+  async function readUntil(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    marker: string,
+  ): Promise<string> {
+    let text = '';
+    for (let i = 0; i < 20 && !text.includes(marker); i += 1) {
+      const chunk = await readFrame(reader);
+      if (chunk == null) break;
+      text += chunk;
+    }
+    return text;
   }
 
   it('H5 logout tears down both the /events SSE and the sandboxed preview WebSocket', async () => {
@@ -661,5 +689,60 @@ describe('P1-8 auth end closes every long-lived connection', () => {
 
     const tail = await readFrame(reader).catch(() => null);
     expect(tail == null || !tail.includes('after-rotate')).toBe(true);
+  });
+
+  // ─── P1-14 姊妹项：/events 按身份能力过滤 schedule.* ──────────────────────
+  //
+  // `GET /api/schedules` 对 Workbench-only 身份是明确的 401（排程行带 prompt =
+  // 业务指令、workingDir = 仓库/客户路径，`schedule.fired` 还带 error 原文）。
+  // SSE 的门禁只在建流那一刻跑过一次，之后是服务端主动推——REST 拒绝、SSE 放行，
+  // 就是同一份数据换了个管子出去。
+  it('a Workbench-only /events stream receives zero schedule.* frames while a legacy owner still gets them', async () => {
+    const h5 = await startHub();
+    const created = h5.sessions.create('ou_allowed');
+
+    const workbench = await fetch(`${h5.base}/events`, {
+      headers: { cookie: `${DASHBOARD_SESSION_COOKIE}=${created.token}` },
+    });
+    expect(workbench.status).toBe(200);
+    const workbenchReader = workbench.body!.getReader();
+    liveReaders.add(workbenchReader);
+    expect(await readFrame(workbenchReader)).toContain('retry: 5000');
+
+    const owner = await fetch(`${h5.base}/events`, {
+      headers: { cookie: `botmux_dashboard_token=${h5.activeToken.value}` },
+    });
+    expect(owner.status).toBe(200);
+    const ownerReader = owner.body!.getReader();
+    liveReaders.add(ownerReader);
+    expect(await readFrame(ownerReader)).toContain('retry: 5000');
+
+    // 排程盘点 + 时区 + 触发失败，最后跟一帧会话事件当水位线：会话帧必须照常
+    // 送达，才能证明前面几帧是被**过滤**掉，而不是流卡住/断了。
+    h5.emit('schedule.created', {
+      schedule: { id: 'sch-1', prompt: '给客户 ACME 发对账单', workingDir: '/srv/acme' },
+    });
+    h5.emit('schedule.timezone', { timezone: 'Asia/Shanghai' });
+    h5.emit('schedule.fired', {
+      id: 'sch-1', runAt: 1, status: 'error', error: 'ENOENT /srv/acme/secret.env',
+    });
+    h5.emit('session.updated', { sessionId: 's-after-schedules' });
+
+    const seenByWorkbench = await readUntil(workbenchReader, 's-after-schedules');
+    expect(seenByWorkbench).toContain('s-after-schedules');
+    expect(seenByWorkbench).not.toContain('schedule.created');
+    expect(seenByWorkbench).not.toContain('schedule.timezone');
+    expect(seenByWorkbench).not.toContain('schedule.fired');
+    expect(seenByWorkbench).not.toContain('ACME');
+    expect(seenByWorkbench).not.toContain('/srv/acme');
+    expect(seenByWorkbench).not.toContain('secret.env');
+
+    // 管理身份不受影响：三帧照旧，一个字段都没少。
+    const seenByOwner = await readUntil(ownerReader, 's-after-schedules');
+    expect(seenByOwner).toContain('schedule.created');
+    expect(seenByOwner).toContain('schedule.timezone');
+    expect(seenByOwner).toContain('schedule.fired');
+    expect(seenByOwner).toContain('secret.env');
+    expect(seenByOwner).toContain('s-after-schedules');
   });
 });

@@ -26,7 +26,7 @@ import {
   type DashboardRequestIdentity,
 } from './dashboard/request-identity.js';
 import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connections.js';
-import { createDashboardEventsStream } from './dashboard/events-sse.js';
+import { createDashboardEventsStream, type DashboardEventAudience } from './dashboard/events-sse.js';
 import {
   ControlCsrfTokens,
   guardControlRequest,
@@ -6373,9 +6373,17 @@ const server = createServer(async (req, res) => {
       // 推送前复核身份仍有效——否则 rotate 之后新签的 `riffAccessUrl`（Riff 沙箱
       // 写凭据）会顺着这条老连接送给上一任持有者。匿名 public-read 连接没有认证
       // 会话，行为不变。
+      // P1-14 姊妹项：这条流的能力口径必须与 REST 同源。Workbench-only 身份对
+      // `GET /api/schedules` 是明确的 401，`/events` 就不能把同一份排程（含
+      // prompt / workingDir / fired 的 error 原文）换个管子送出去——过滤在
+      // createDashboardEventsStream 内部按 audience 执行，见 events-sse.ts。
+      const eventsAudience: DashboardEventAudience = authed
+        ? 'management'
+        : workbenchOnlyIdentity ? 'workbench' : 'anonymous';
       const stream = createDashboardEventsStream({
         res,
         authSessionId: requestIdentity?.authSessionId ?? null,
+        audience: eventsAudience,
         isAuthSessionLive: terminalAuthSessionLive,
         bind: (authSessionId, close) => authSessionConnections.register(authSessionId, close),
       });
@@ -6395,6 +6403,10 @@ const server = createServer(async (req, res) => {
         // `/api/schedules` is not a Workbench capability, so widening this to
         // `sessionBoardAudience` would let an H5 identity read over `/events`
         // what the REST route refuses it.
+        // Workbench-only identities never reach this redaction at all — the
+        // stream drops every `schedule.*` frame for them (P1-14 sibling); this
+        // branch is the ANONYMOUS publicReadOnly path, which the REST route
+        // does serve, redacted the same way.
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {

@@ -18,10 +18,38 @@
  */
 import type { ServerResponse } from 'node:http';
 
+/**
+ * 这条流的受众口径，必须与 REST 门禁同源：
+ *  - `management`：本机管理 cookie（legacy owner），能力等同 `/api/*` 全集。
+ *  - `workbench`：只有工作台能力的身份（飞书 H5 会话、平台注入角色，owner 也算）
+ *    —— 走 `decideWorkbenchH5Auth` 窄门禁，能力表里**没有** `/api/schedules`。
+ *  - `anonymous`：`publicReadOnly` 下的无身份访客，走既有的脱敏投影。
+ */
+export type DashboardEventAudience = 'management' | 'workbench' | 'anonymous';
+
+/**
+ * P1-14 姊妹项：`/events` 的推送必须服从与 REST 同一份能力表。
+ *
+ * `GET /api/schedules` 对 Workbench-only 身份是明确的 401（排程行带 `prompt`
+ * 业务指令与 `workingDir` 仓库/客户路径，`schedule.fired` 还带 `error` 原文），
+ * 但 SSE 的门禁只在建流那一刻跑过一次，之后帧是服务端主动推的——于是同一份数据
+ * 换个管子照样出去了。这里在写出前按受众整类丢弃 `schedule.*`：REST 说不行的，
+ * SSE 也一帧不给。
+ *
+ * 匿名 public-read 不变（`/api/schedules` 在 publicReadOnly 允许表里，帧由
+ * dashboard.ts 做同款脱敏）；management 不变。
+ */
+export function dashboardEventVisibleTo(event: string, audience: DashboardEventAudience): boolean {
+  if (audience !== 'workbench') return true;
+  return !(event === 'schedule' || event.startsWith('schedule.'));
+}
+
 export interface DashboardEventsStreamOptions {
   res: ServerResponse;
   /** 本流归属的认证会话；匿名 public-read 连接为 null。 */
   authSessionId: string | null;
+  /** 本流的受众能力口径。必填：漏传就等于默默放宽，所以不给缺省值。 */
+  audience: DashboardEventAudience;
   /** 认证会话是否仍然有效（H5 会话表 / 活跃 token / 平台绑定的统一口径）。 */
   isAuthSessionLive: (authSessionId: string) => boolean;
   /** 登记进 authSession→长连接索引，返回注销闭包。 */
@@ -65,10 +93,14 @@ export function createDashboardEventsStream(options: DashboardEventsStreamOption
     write(event, data) {
       if (closed || options.res.writableEnded) return false;
       const authSessionId = options.authSessionId;
+      // 先复核身份寿命：即使这一帧本来就要被能力过滤掉，也要借它发现流已经该关了。
       if (authSessionId && !options.isAuthSessionLive(authSessionId)) {
         revoke();
         return false;
       }
+      // 能力过滤放在写出前、且放在 stream 内部而不是调用方：调用方可以忘，
+      // 这里忘不了。
+      if (!dashboardEventVisibleTo(event, options.audience)) return false;
       options.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
       return true;
     },
