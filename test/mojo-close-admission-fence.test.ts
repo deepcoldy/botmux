@@ -74,9 +74,21 @@ async function withUnprovableChild<T>(
     signalCode: null,
     kill: () => true,
   });
+  // Production invariant, which the transplant must model too: turnIdentity is
+  // always read from the SAME pid as this.child at spawn time. Since P0-3 the
+  // scanner honours PGID membership only while that recorded identity still
+  // verifies — a transplanted victim with a stale identity is (correctly) never
+  // claimed, so without this the verdict collapses to diagnostic-clean and the
+  // ladder waits forever on a child whose kills this fixture swallows.
+  const { readProcessIdentity } = await import('../src/adapters/backend/mojo-process-tree.js');
+  const victimIdentity = readProcessIdentity(victimPid);
+  const priorIdentity = (backend as unknown as { turnIdentity: unknown }).turnIdentity;
+  (backend as unknown as { turnIdentity: unknown }).turnIdentity =
+    victimIdentity.ok ? victimIdentity.identity : null;
   try {
     return await fn();
   } finally {
+    (backend as unknown as { turnIdentity: unknown }).turnIdentity = priorIdentity;
     killSpy.mockRestore();
     try { realKill(-victimPid, 'SIGKILL'); } catch { /* already gone */ }
   }

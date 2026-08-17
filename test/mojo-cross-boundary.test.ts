@@ -289,12 +289,16 @@ describe('mojo cross-boundary contracts', () => {
       const afterTurn = lines(h.dump).length;
 
       // 4. Now the lifecycle op review asked for, on a backend that has a remote
-      //    session to cancel.
-      h.child.send({ type: 'close' } as DaemonToWorker);
+      //    session to cancel. Since P0-2 a request-less remote close is REFUSED
+      //    outright (the legacy path silently cancelled remote sessions on every
+      //    generic retirement), so `/close` → destroySession → `mojo session
+      //    cancel` now travels as the prepare leg of prepare/commit — the only
+      //    supported vehicle, and the same code path that reads the credential.
+      h.child.send({ type: 'close', requestId: 'xb-close-1' } as DaemonToWorker);
       await waitFor(
         () => lines(h.dump).length > afterTurn,
         30_000,
-        () => `close never reached the CLI\n${lines(h.dump).join(' ')}\n${h.logs.join('')}`,
+        () => `close prepare never reached the CLI\n${lines(h.dump).join(' ')}\n${h.logs.join('')}`,
       );
 
       // Index-free: every credential use from the clear onwards must be empty.

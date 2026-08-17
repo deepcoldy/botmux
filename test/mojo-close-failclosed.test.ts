@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 // where suite-wide parallel forks contend for the same cores.
 vi.setConfig({ testTimeout: 90_000 });
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
+import { readProcessIdentity } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux } from './helpers/synthetic-proc.js';
 
 let binDir: string;
@@ -120,6 +121,14 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-stuck","war
       kill: () => true,
     });
     (backend as unknown as { child: unknown }).child = unkillable;
+    // Production invariant the transplant must model: turnIdentity is always
+    // bound to the SAME pid as this.child at spawn. Since P0-3 the scanner only
+    // honours PGID membership while that identity verifies, so the victim needs
+    // its real identity attached or it is (correctly) never claimed and the
+    // ladder waits forever on a child whose kills this fixture swallows.
+    const victimIdentity = readProcessIdentity(victimPid);
+    (backend as unknown as { turnIdentity: unknown }).turnIdentity =
+      victimIdentity.ok ? victimIdentity.identity : null;
 
     let result: Awaited<ReturnType<typeof backend.destroySession>>;
     try {
