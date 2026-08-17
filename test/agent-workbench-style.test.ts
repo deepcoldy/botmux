@@ -53,7 +53,7 @@ describe('Agent Workbench visual contract', () => {
     };
     const heights = rowHeights(block);
     expect(heights.length).toBeGreaterThanOrEqual(2);
-    // 第一条是唯一不在断点里的那条，也就是桌面行高；767px 断点里最后一条生效的是触屏行高。
+    // 第一条是唯一不在断点里的那条，也就是桌面行高；620px 断点里最后一条生效的是触屏行高。
     // 两个数必须和 workbenchListItemHeight 一字不差：虚拟滚动按它摆放每一行，
     // 对不上列表就会滚过自己的末尾（62→54 那次改动正是从这里开始出问题的）。
     expect(heights[0]).toBe(54);

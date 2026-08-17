@@ -101,8 +101,13 @@ export function buildWorkbenchLoginUrl(
   return `${path}?returnTo=${encodeURIComponent(`/${buildWorkbenchHash(surface, sessionId)}`)}`;
 }
 
-/** Three-state on purpose: a timeout needs a stable diagnostic and must ignore
- * late callbacks even though the canonical fallback sequence continues. */
+/**
+ * Three-state on purpose. Opening a chat is a side effect that has already
+ * happened by the time we are waiting: a client that performs the action but
+ * never invokes `success` is not the same as one that reports `fail`. Collapsing
+ * both into false made the caller run its fallback on top of a chat the client
+ * had already opened — the visible double navigation.
+ */
 type JsApiOutcome = 'ok' | 'failed' | 'no-response';
 
 /** Why the call ended that way. `detail` carries the client's own error (errno
@@ -164,19 +169,23 @@ function invokeJsApi(
 export async function openWorkbenchChat(options: OpenWorkbenchChatOptions): Promise<OpenWorkbenchChatResult> {
   const sdk = options.sdk ?? (typeof window !== 'undefined' ? window.tt ?? null : null);
   const timeoutMs = Math.max(250, options.timeoutMs ?? 1_500);
+  // Only an explicit `fail` justifies trying the next mechanism. Silence means
+  // the client most likely acted without reporting back, and stacking enterChat
+  // (a full-page jump) on top of an already-open side panel is worse than
+  // stopping here.
   let rejection: string | undefined;
   const native = options.nativeEnabled !== false;
   if (sdk && native && options.preferSplit) {
     const result = await invokeJsApi(sdk.toggleChat, sdk, options.chatId, timeoutMs);
-    if (result.outcome === 'ok') return { kind: 'native-split', method: 'toggleChat' };
-    rejection = result.detail ?? (result.outcome === 'no-response' ? 'toggleChat timeout' : undefined);
-  }
-  if (sdk && native) {
+    if (result.outcome !== 'failed') return { kind: 'native-split', method: 'toggleChat' };
+    rejection = result.detail;
+    // toggleChat was rejected. enterChat needs the same JSAPI authorisation, so
+    // it would fail identically while additionally navigating the whole page —
+    // go straight to the AppLink and let the client place the chat instead.
+  } else if (sdk && native) {
     const result = await invokeJsApi(sdk.enterChat, sdk, options.chatId, timeoutMs);
-    if (result.outcome === 'ok') return { kind: 'native-jump', method: 'enterChat' };
-    const enterRejection = result.detail
-      ?? (result.outcome === 'no-response' ? 'enterChat timeout' : undefined);
-    rejection = [rejection, enterRejection].filter(Boolean).join('; ') || undefined;
+    if (result.outcome !== 'failed') return { kind: 'native-jump', method: 'enterChat' };
+    rejection = result.detail;
   }
   let url = buildChatAppLink(options.chatId);
   if (options.appLink) {

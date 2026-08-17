@@ -191,13 +191,13 @@ function sessionSecondary(session: WorkbenchSessionRow): string {
   return [session.botName, session.cliId, session.repoName].filter(Boolean).join(' · ') || session.sessionId;
 }
 
-/** Mirrors the fixed mobile-stack breakpoint. Every mobile layout needs the
- *  same 44px touch targets, and virtualisation must use its painted row height. */
+/** Mirrors the 620px breakpoint the stylesheet uses for taller touch rows, so
+ *  virtualisation and CSS never disagree about how tall a row is. */
 function useTouchRowMetrics(): boolean {
   const [touch, setTouch] = useState(false);
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined;
-    const query = window.matchMedia('(max-width: 767px)');
+    const query = window.matchMedia('(max-width: 620px)');
     const sync = () => setTouch(query.matches);
     sync();
     query.addEventListener('change', sync);
@@ -531,20 +531,23 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                       >{copy}</FeishuChatAnchor>
                     );
                   })()}
-                  {openSurface && selected ? (
+                  {openSurface ? (
                     <span className="wb-session-row-actions">
+                      {/* A real anchor, not a scripted open: handing the AppLink
+                          to the browser lets the Feishu client claim it and place
+                          the chat in its own panel, leaving this page untouched.
+                          This is exactly how the Dashboard's own "open chat"
+                          control has always worked. */}
                       {chatHref ? (
-                        <button
-                          type="button"
+                        <FeishuChatAnchor
                           className="wb-session-row-action is-chat"
+                          href={chatHref}
                           title="打开飞书聊天"
-                          aria-label={`打开飞书聊天 — ${title}`}
-                          onClick={event => {
-                            event.stopPropagation();
-                            props.onSeen?.(session.sessionId);
-                            openSurface(session.sessionId, 'chat');
-                          }}
-                        >聊天</button>
+                          ariaLabel={`打开飞书聊天 — ${title}`}
+                          // 去飞书看聊天就是看过了；但不动选中态——移动端选中会直接
+                          // 钻进工作区，一次点击给两个目的地。
+                          onActivate={() => props.onSeen?.(session.sessionId)}
+                        >聊天</FeishuChatAnchor>
                       ) : null}
                       {/* 定位只对话题会话有意义：群/单聊会话没有可回跳的话题锚点。
                           聊天按钮照旧开群，定位是它旁边的另一条路。 */}

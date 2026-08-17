@@ -127,13 +127,9 @@ function railViewProps(storage: WorkbenchStorage) {
 }
 
 describe('Agent Workbench components', () => {
-  it('routes row Chat through toggleChat capability detection before fallbacks', async () => {
+  it('chat-follow rows are real chat anchors, never scripted opens', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
-    const calls: string[] = [];
-    const sdk = {
-      toggleChat(options: { success?: () => void }) { calls.push('toggleChat'); options.success?.(); },
-      enterChat(options: { success?: () => void }) { calls.push('enterChat'); options.success?.(); },
-    };
+    const picked: string[] = [];
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
         sessions: sessions(6),
@@ -145,22 +141,41 @@ describe('Agent Workbench components', () => {
         api,
         storage: null,
         location: null,
-        sdk,
-        h5Context: { enabled: true, appId: 'cli_x', brand: 'feishu', entryPath: '/auth/feishu' },
+        sdk: null,
+        h5Context: null,
         onRouteChange: () => {},
       }));
     });
-    expect(renderer.root.findAll(node =>
-      node.type === 'a' && String(node.props.className ?? '').includes('wb-session-copy-link'))).toHaveLength(0);
-    const chatButtons = renderer.root.findAll(node =>
-      node.type === 'button' && String(node.props.className ?? '').includes('is-chat'));
-    expect(chatButtons.length).toBeGreaterThan(0);
+    // Desktop + follow-on (the default): the row body itself is the link, so
+    // the open rides the user's trusted click — the only unsigned dispatch the
+    // Feishu client does not demote to the narrow attached panel.
+    const rowLinks = renderer.root.findAll(node =>
+      node.type === 'a' && String(node.props.className ?? '').includes('wb-session-copy-link'));
+    expect(rowLinks.length).toBeGreaterThan(0);
+    expect(rowLinks[0].props.href).toContain('/client/chat/open?openChatId=');
+    expect(rowLinks[0].props.target).toBe('_blank');
+    expect(rowLinks[0].props.rel).toBe('noopener');
+    // Same session, two entry points, one implementation: the row body and the
+    // row-end chat icon must carry the identical href — the Dashboard-proven
+    // shape, not a parallel reinvention.
+    const iconLinks = renderer.root.findAll(node =>
+      node.type === 'a' && String(node.props.className ?? '').includes('is-chat'));
+    expect(iconLinks.length).toBeGreaterThan(0);
+    expect(iconLinks[0].props.href).toBe(rowLinks[0].props.href);
+    expect(iconLinks[0].props.rel).toBe('noopener');
     await act(async () => {
-      chatButtons[0].props.onClick({ stopPropagation() {} });
+      rowLinks[0].props.onClick({ stopPropagation: () => picked.push('stopped') });
     });
-    expect(calls).toEqual(['toggleChat']);
-    expect(textOf(renderer.root)).toContain('原生聊天已在飞书右侧槽位打开');
-    act(() => renderer.unmount());
+    expect(picked).toContain('stopped');
+    // The scripted fallback is gone for good: nothing in the view synthesises
+    // anchor clicks any more (that path opened chats in the demoted container).
+    // The FOLLOW switch that used to turn the anchor shape off is gone too —
+    // chatFollowNavigates is now permanently on for every non-mobile layout, so
+    // the row body stays a real link and there is no way back to the old path.
+    expect(renderer.root.findAll(node =>
+      node.type === 'button' && textOf(node).includes('FOLLOW'))).toHaveLength(0);
+    expect(renderer.root.findAll(node =>
+      node.type === 'a' && String(node.props.className ?? '').includes('wb-session-copy-link')).length).toBeGreaterThan(0);
   });
 
   it('renders a windowed accessible session list and keeps Info outside panes', async () => {
@@ -186,11 +201,12 @@ describe('Agent Workbench components', () => {
     expect(options.length).toBeLessThan(30);
     expect(options[0].props['aria-label']).toContain('Approve deployment');
     expect(options[0].findByProps({ className: 'wb-session-title' }).props.title).toContain('Full title');
+    // The workspace starts empty: session management is the home surface and a
+    // terminal only appears once a row button asks for one.
+    expect(renderer.root.findAllByProps({ 'aria-label': '终端面板' })).toHaveLength(0);
+    const openTerminal = renderer.root.findAll(node => node.props.className === 'wb-session-row-action is-terminal')[0];
+    await act(async () => { openTerminal.props.onClick({ stopPropagation() {} }); });
     expect(renderer.root.findByProps({ 'aria-label': '终端面板' })).toBeTruthy();
-    const info = renderer.root.findAllByType('button').find(button => textOf(button).includes('信息抽屉'))!;
-    await act(async () => { info.props.onClick(); });
-    expect(renderer.root.findByProps({ className: 'wb-info-drawer' })).toBeTruthy();
-    expect(renderer.root.findAll(node => node.props.className === 'wb-pane').some(node => textOf(node).includes('会话信息'))).toBe(false);
     act(() => renderer.unmount());
   });
 
@@ -235,9 +251,11 @@ describe('Agent Workbench components', () => {
       }));
     });
     expect(renderer.root.findByProps({ 'data-responsive-step': 'mobile-stack' })).toBeTruthy();
-    expect(renderer.root.findAllByProps({ className: 'wb-mobile-nav' })).toHaveLength(1);
-    expect(renderer.root.findByProps({ className: 'wb-mobile-nav' }).findAllByType('button').map(textOf))
-      .toEqual(['会话', '工作区', '信息']);
+    // The chat-contract banner was removed with the pane toolbar: chat is a link
+    // on each row now, and narrow layouts open on the session list itself.
+    // Mobile is a drill-down now, not an in-page tab bar: the list is the home
+    // level, so a second navigation does not compete with Feishu's own tab bar.
+    expect(renderer.root.findAllByProps({ className: 'wb-mobile-nav' })).toHaveLength(0);
     expect(renderer.root.findByProps({ className: 'wb-session-list' })).toBeTruthy();
     expect(renderer.root.findAllByProps({ className: 'wb-rail-expand' })).toHaveLength(0);
     act(() => renderer.unmount());
@@ -271,7 +289,7 @@ describe('Agent Workbench components', () => {
     const storage = new MemoryStorage();
     // 两个会话各自存着不同的旧栏宽：以前切换会话会把这份 per-session 值读回来，宽度就跳了。
     storage.setItem(workbenchLayoutStorageKey('session-0'), JSON.stringify({ ...defaultWorkbenchLayout(), railWidth: 200 }));
-    storage.setItem(workbenchLayoutStorageKey('session-1'), JSON.stringify({ ...defaultWorkbenchLayout(), railWidth: 260 }));
+    storage.setItem(workbenchLayoutStorageKey('session-1'), JSON.stringify({ ...defaultWorkbenchLayout(), railWidth: 440 }));
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, railViewProps(storage)));
@@ -285,7 +303,7 @@ describe('Agent Workbench components', () => {
 
     // 先确认切换真的发生了，否则下面那条断言会因为压根没切而假绿。
     expect(renderer.root.findAll(node => String(node.props['aria-label']).includes('工作台 — Full title for session 1'))).toHaveLength(1);
-    // session-1 自己那份记录写的是 260px，但栏宽属于窗口，不许跟着会话走。
+    // session-1 自己那份记录写的是 440px，但栏宽属于窗口，不许跟着会话走。
     expect(railWidthVar(renderer)).toBe('200px');
     act(() => renderer.unmount());
   });
@@ -293,12 +311,12 @@ describe('Agent Workbench components', () => {
   it('prefers the window-global rail record over the per-session copy', async () => {
     const storage = new MemoryStorage();
     storage.setItem(workbenchLayoutStorageKey('session-0'), JSON.stringify({ ...defaultWorkbenchLayout(), railWidth: 200 }));
-    storage.setItem(RAIL_PREFS_KEY, JSON.stringify({ railWidth: 260, railCollapsed: false }));
+    storage.setItem(RAIL_PREFS_KEY, JSON.stringify({ railWidth: 380, railCollapsed: false }));
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, railViewProps(storage)));
     });
-    expect(railWidthVar(renderer)).toBe('260px');
+    expect(railWidthVar(renderer)).toBe('380px');
     act(() => renderer.unmount());
   });
 
@@ -308,7 +326,7 @@ describe('Agent Workbench components', () => {
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, kindViewProps(
         kindSession({ chatType: 'group', scope: 'thread' }),
-        { canLocate: true, api: { ...api, locateSession: async sessionId => { located.push(sessionId); } } },
+        { api: { ...api, locateSession: async sessionId => { located.push(sessionId); } } },
       )));
     });
     const badges = kindBadges(renderer);
@@ -336,19 +354,6 @@ describe('Agent Workbench components', () => {
     act(() => renderer.unmount());
   });
 
-  it('hides the Feishu-mutating locate action without management authority', async () => {
-    let renderer!: TestRenderer.ReactTestRenderer;
-    await act(async () => {
-      renderer = TestRenderer.create(React.createElement(
-        AgentWorkbenchView,
-        kindViewProps(kindSession({ chatType: 'group', scope: 'thread' }), { canLocate: false }),
-      ));
-    });
-    expect(kindBadges(renderer).map(textOf)).toEqual(['话题']);
-    expect(locateButtons(renderer)).toHaveLength(0);
-    act(() => renderer.unmount());
-  });
-
   it('leaves a group-chat row without a locate action', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
@@ -365,7 +370,7 @@ describe('Agent Workbench components', () => {
     expect(locateButtons(renderer)).toHaveLength(0);
     // 但聊天入口照旧在，否则这条断言会把「按钮全没了」也当成通过。
     expect(renderer.root.findAll(node =>
-      node.type === 'button' && String(node.props.className ?? '').includes('is-chat')).length).toBeGreaterThan(0);
+      node.type === 'a' && String(node.props.className ?? '').includes('is-chat')).length).toBeGreaterThan(0);
     act(() => renderer.unmount());
   });
 
@@ -412,14 +417,13 @@ describe('mobile session surfaces', () => {
     onRouteChange: () => {},
   };
 
-  function mobileNavLabels(renderer: TestRenderer.ReactTestRenderer): string[] {
+  function segmentLabels(renderer: TestRenderer.ReactTestRenderer): string[] {
     return renderer.root
-      .findByProps({ className: 'wb-mobile-nav' })
-      .findAllByType('button')
-      .map(textOf);
+      .findAll(node => node.props.className === 'wb-mobile-detail-seg')
+      .flatMap(seg => seg.findAllByType('button').map(textOf));
   }
 
-  it('keeps the fixed Sessions/Workspace/Info stack and opens a registered Web pane', async () => {
+  it('offers Web only for a session that registered a preview', async () => {
     const withPreview = sessions(2);
     withPreview[0] = {
       ...withPreview[0],
@@ -429,32 +433,20 @@ describe('mobile session surfaces', () => {
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, { ...mobileProps, sessions: withPreview }));
     });
-    expect(mobileNavLabels(renderer)).toEqual(['会话', '工作区', '信息']);
     const row = renderer.root.findAll(node => node.props.role === 'option')[0];
     await act(async () => { row.props.onClick(); });
-    const web = renderer.root.findAllByType('button').find(button => textOf(button) === '网页')!;
-    await act(async () => { web.props.onClick(); });
-    expect(renderer.root.findByType('iframe').props.src).toBe('/preview/session-0/');
-    const info = renderer.root.findByProps({ className: 'wb-pane-toolbar' })
-      .findAllByType('button').find(button => textOf(button) === '信息')!;
-    await act(async () => { info.props.onClick(); });
-    const mobileInfo = renderer.root.findByProps({ className: 'wb-mobile-info' });
-    expect(textOf(mobileInfo)).toContain('会话 ID');
-    expect(renderer.root.findByProps({ className: 'wb-mobile-nav' }).findAllByType('button')
-      .find(button => textOf(button) === '信息')!.props['aria-current']).toBe('page');
+    expect(segmentLabels(renderer)).toEqual(['终端', '网页', '信息']);
     act(() => renderer.unmount());
   });
 
-  it('keeps Web addressable without a registration and shows the explicit empty state', async () => {
+  it('hides Web when no preview is registered, so the tab never opens empty', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, { ...mobileProps, sessions: sessions(2) }));
     });
     const row = renderer.root.findAll(node => node.props.role === 'option')[0];
     await act(async () => { row.props.onClick(); });
-    const web = renderer.root.findAllByType('button').find(button => textOf(button) === '网页')!;
-    await act(async () => { web.props.onClick(); });
-    expect(textOf(renderer.root)).toContain('未注册网页预览');
+    expect(segmentLabels(renderer)).toEqual(['终端', '信息']);
     act(() => renderer.unmount());
   });
 

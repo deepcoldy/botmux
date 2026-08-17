@@ -53,8 +53,8 @@ await act(async () => {
 const options = main.root.findAll(node => node.props.role === 'option');
 assert.ok(options.length > 1 && options.length < 30);
 assert.match(options[0].props['aria-label'], /Approve deployment/);
-assert.ok(main.root.findByProps({ 'aria-label': '终端面板' }));
-const infoButton = main.root.findAllByType('button').find(button => textOf(button).includes('信息抽屉'))!;
+assert.ok(main.root.findByProps({ 'aria-label': 'Terminal pane' }));
+const infoButton = main.root.findAllByType('button').find(button => textOf(button).includes('Info drawer'))!;
 await act(async () => { infoButton.props.onClick(); });
 assert.ok(main.root.findByProps({ className: 'wb-info-drawer' }));
 assert.equal(main.root.findAll(node => node.props.className === 'wb-pane').some(node => textOf(node).includes('SESSION INFO')), false);

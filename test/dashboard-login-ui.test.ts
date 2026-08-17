@@ -47,7 +47,6 @@ describe('Dashboard one-click login wiring', () => {
     expect(app).toContain('ui.workbenchAuthed = true');
     expect(app).toContain('ui.authed = false');
     expect(main).toContain('authenticated={ui.workbenchAuthed}');
-    expect(main).toContain('canLocate={ui.authed}');
     expect(dock).toContain('authenticated={ui.workbenchAuthed}');
   });
 });

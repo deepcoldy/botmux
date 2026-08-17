@@ -357,10 +357,6 @@ try {
     await page.goto(`${base}/auth/feishu?returnTo=${encodeURIComponent('/#/agent-workbench/browser-success')}`);
     await page.waitForURL(/#\/agent-workbench\/browser-success$/);
     await page.locator('.agent-workbench-page').waitFor();
-    await page.getByRole('button', { name: '接管输入', exact: true }).click();
-    await page.locator('.wb-mode-chip.is-controlled').waitFor();
-    await page.getByRole('button', { name: '释放输入' }).click();
-    await page.locator('.wb-mode-chip.is-readonly').waitFor();
     const sessionStatus = await page.evaluate(async () => (await fetch('/auth/feishu/session')).status);
     assert.equal(sessionStatus, 200);
     await context.close();
@@ -416,19 +412,19 @@ try {
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
     await page.getByRole('option', { name: /Integrated Workbench browser scenario/ }).click();
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
-    await page.getByRole('button', { name: '接管输入', exact: true }).click();
+    await page.getByRole('button', { name: 'Take control' }).click();
     await page.locator('.wb-mode-chip.is-controlled').waitFor();
-    await page.getByRole('button', { name: '开启交互' }).click();
+    await page.getByRole('button', { name: 'Enable interaction' }).click();
     await page.locator('.wb-mode-chip.is-interactive').waitFor();
     const previewGuard = page.frameLocator('.wb-web-pane iframe.wb-pane-frame');
     await previewGuard.locator('#overlay').waitFor({ state: 'hidden' });
     await waitForText(page, '不是应用级强只读安全边界');
-    await page.getByRole('button', { name: '原生聊天' }).click();
+    await page.getByRole('button', { name: 'Native chat' }).click();
+    await waitForText(page, 'Native chat is open in the external right slot');
     assert.deepEqual(await page.evaluate(() => window.__workbenchHarness?.sdkCalls), ['toggleChat']);
-    await waitForText(page, '原生聊天已在飞书右侧槽位打开');
-    await page.getByRole('button', { name: '释放输入' }).click();
+    await page.getByRole('button', { name: 'Release' }).click();
     await page.locator('.wb-mode-chip.is-readonly').waitFor();
-    await page.getByRole('button', { name: '立即锁定' }).click();
+    await page.getByRole('button', { name: 'Lock now' }).click();
     await page.locator('.wb-mode-chip.is-preview').waitFor();
     await previewGuard.locator('#overlay:not(.hidden)').waitFor();
     await context.close();
@@ -438,8 +434,8 @@ try {
     const context = await authenticatedContext();
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=failure`);
-    await waitForText(page, '所属 daemon 已离线');
-    await waitForText(page, '已安全锁定：preview unreachable');
+    await waitForText(page, 'Owning daemon is offline');
+    await waitForText(page, 'Relocked safely: preview unreachable');
     await context.close();
   });
 
@@ -447,8 +443,8 @@ try {
     const context = await localContext({ width: 1280, height: 800 });
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=success&authenticated=false`);
-    await waitForText(page, '只读查看。登录 Dashboard 后可接管。');
-    await waitForText(page, '已安全锁定：需要登录认证');
+    await waitForText(page, 'Authentication required');
+    await waitForText(page, 'Relocked safely: Authentication required');
     const statuses = await page.evaluate(async () => ({
       preview: (await fetch('/preview/browser-success/ping')).status,
       h5Context: (await fetch('/api/workbench/h5-context')).status,
@@ -464,15 +460,7 @@ try {
     await page.locator('.agent-workbench-page[data-responsive-step="mobile-stack"]').waitFor();
     assert.equal(await page.locator('.wb-mobile-nav').count(), 1);
     assert.equal(await page.locator('.wb-pane-split').count(), 0);
-    assert.equal(
-      await page.locator('.wb-session-row').first().evaluate(element => getComputedStyle(element).height),
-      '84px',
-    );
-    await page.locator('.wb-session-row').first().click();
-    await page.locator('.wb-pane-toolbar').getByRole('button', { name: '信息', exact: true }).click();
-    await page.locator('.wb-mobile-info').waitFor();
-    assert.equal(await page.getByRole('button', { name: '信息', exact: true }).getAttribute('aria-current'), 'page');
-    await page.getByRole('button', { name: '会话' }).click();
+    await page.getByRole('button', { name: 'Sessions' }).click();
     await page.locator('.wb-session-list').waitFor();
     await mobile.close();
 

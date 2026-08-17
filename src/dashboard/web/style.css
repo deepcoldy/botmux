@@ -27962,10 +27962,13 @@ button.skills-issue-badge:hover {
 .wb-rail-separator:hover,
 .wb-rail-separator:focus-visible { color: var(--wb-text); background: var(--wb-accent); }
 
+/* Two children, two rows: the header and the pane stack. Leaving the old
+   toolbar/chat-contract rows in place pushed the stack into an `auto` track,
+   which is why the terminal iframe collapsed to its 150px intrinsic height. */
 .wb-workspace {
   position: relative;
   display: grid;
-  grid-template-rows: 46px auto auto minmax(0, 1fr);
+  grid-template-rows: 46px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -28197,19 +28200,17 @@ button.skills-issue-badge:hover {
 .wb-no-selection h2 { margin: 8px 0 3px; color: var(--wb-text); font-size: 15px; }
 .wb-no-selection p { margin: 0; color: var(--wb-faint); }
 
-/* Fixed mobile page stack: one content page plus a persistent bottom switcher. */
-.wb-mobile-stack { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; overflow: hidden; }
-.wb-mobile-nav {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  border-top: 1px solid var(--wb-border-strong);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-  background: var(--wb-surface);
-}
+/* Drill-down, not tabs: the stack renders exactly one in-flow child — the session
+   list at the home level, or .wb-mobile-detail once a session is pushed.
+   .wb-mobile-nav was removed from the component, so the old 38px nav row had no
+   owner and would have parked that single child on it, leaving the 1fr row
+   empty. One row, and the child gets the full height. */
+.wb-mobile-stack { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; overflow: hidden; }
+.wb-mobile-nav { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--wb-border); background: var(--wb-surface); }
 .wb-mobile-nav button { border: 0; border-right: 1px solid var(--wb-border); color: var(--wb-muted); background: transparent; }
 .wb-mobile-nav button[aria-current="page"] { color: var(--wb-accent); background: var(--wb-accent-soft); }
 .wb-mobile-stack .wb-session-rail { width: 100%; border-right: 0; }
-.wb-mobile-stack .wb-workspace { grid-template-rows: 46px auto auto minmax(0, 1fr); }
+.wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
 .wb-mobile-info { overflow: auto; }
 
 .agent-workbench-dock {
@@ -28306,6 +28307,96 @@ button.skills-issue-badge:hover {
   box-shadow: none;
 }
 
+/* Panes accumulate left-to-right; each keeps its own scroll and close control. */
+.wb-pane-stack {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.wb-stacked-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 320px;
+  min-height: 0;
+  border-left: 1px solid var(--wb-border);
+}
+.wb-stacked-pane:first-child { border-left: 0; }
+.wb-stacked-pane > .wb-pane { flex: 1; min-height: 0; }
+.wb-pane-close {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  z-index: 2;
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--wb-border);
+  border-radius: 3px;
+  color: var(--wb-muted);
+  background: var(--wb-surface);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-pane-close:hover { border-color: var(--wb-danger, #e0af68); color: var(--wb-text); }
+.wb-pane-placeholder {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--wb-faint);
+  font-size: 12px;
+}
+.wb-pane-placeholder span { font-size: 20px; }
+
+/* The toolbar and chat-contract rows were removed; the workspace is exactly a
+   header plus the pane stack, and the stack must land on the 1fr track or the
+   terminal iframe falls back to its 150px intrinsic height. */
+.wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+.wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+
+/* The close control floats over the pane's own titlebar; reserve room so it
+   never lands on top of the Take control / Open tab actions. */
+.wb-stacked-pane .wb-pane-titlebar { padding-right: 32px; }
+
+/* Single terminal fills the workspace: the row button is a toggle, and Feishu —
+   not this document — owns any multi-column arrangement. */
+.wb-pane-stack { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.wb-pane-stack > .wb-pane { flex: 1; min-height: 0; }
+.wb-terminal-toggle {
+  border: 1px solid var(--wb-border-strong);
+  border-radius: 3px;
+  color: var(--wb-muted);
+  background: var(--wb-surface-2);
+  cursor: pointer;
+}
+.wb-terminal-toggle:hover { border-color: var(--wb-accent); color: var(--wb-text); }
+
+/* Terminal closed: the rail is the whole product surface, so it takes the full
+   width and the workspace column disappears entirely. In the Feishu side panel
+   this is the "session list + native chat" arrangement — chat lives in Feishu's
+   own column, so we simply stop reserving space we are not drawing into. */
+.wb-desktop-layout.is-terminal-closed { grid-template-columns: minmax(0, 1fr); }
+.wb-desktop-layout.is-terminal-closed > .wb-rail-separator,
+.wb-desktop-layout.is-terminal-closed > .wb-workspace { display: none; }
+/* With the terminal closed the rail is the only thing we draw. Cap it so the
+   page stops claiming width it does not need — in a Feishu column that surplus
+   is what squeezes the native chat next to it. */
+.wb-desktop-layout.is-terminal-closed .wb-session-rail {
+  width: 100%;
+  max-width: var(--wb-rail-width);
+}
+
+/* The chat control is an anchor so the client receives a genuine link
+   activation; it still has to read as one of the row buttons. */
+a.wb-session-row-action { text-decoration: none; }
+
 /* Virtualisation positions every row from a fixed 54px estimate (see
    workbenchListItemHeight in agent-workbench-model.ts — the two numbers must
    move together), so a row that grows — a wrapping title, or action buttons
@@ -28313,8 +28404,8 @@ button.skills-issue-badge:hover {
    from what is painted. That drift is what let the list keep scrolling past its
    own top. Pin the height and let the contents clip instead.
    54 = 6px + 6px padding + 1px bottom border + 41px content, and the content is
-   one 15.6px title line + 4px gap + a 14px meta line = 33.6px. Mobile layouts
-   keep their taller rows in the 767px block below. */
+   one 15.6px title line + 4px gap + a 14px meta line = 33.6px. Touch layouts
+   keep their taller rows; see the 620px block above. */
 .wb-session-row {
   height: 54px;
   overflow: hidden;
@@ -28324,6 +28415,13 @@ button.skills-issue-badge:hover {
 /* Keep wheel momentum inside the list: at the boundary it would otherwise chain
    to the host document, which in the Feishu WebView reads as endless scrolling. */
 .wb-session-list { overscroll-behavior: contain; }
+
+/* Terminal closed: use the whole column we were given rather than leaving a
+   dead band beside a 300px rail — the session list is the entire product here. */
+.wb-desktop-layout.is-terminal-closed .wb-session-rail {
+  width: 100%;
+  max-width: none;
+}
 
 /* Fit the row's contents inside that fixed height: one title line plus one meta
    line; the actions float above them rather than taking a column.
@@ -28369,13 +28467,22 @@ button.skills-issue-badge:hover {
   background: var(--wb-surface-2);
 }
 
+.wb-workspace-controls { display: flex; align-items: center; gap: 6px; }
+
 /* The rail must never push the row wider than the column it was given. */
 .wb-session-rail, .wb-session-list { max-width: 100%; overflow-x: hidden; }
 
+/* The Dashboard sets body { min-width: 320px } for its own multi-column pages.
+   A Feishu side panel can be narrower than that, and the floor made the whole
+   document overflow rather than letting the rail compress. Lift it only while a
+   Workbench surface is mounted. */
+body:has(.workbench-route-host) { min-width: 0; }
+
 /* Mobile workspace header: title and the terminal toggle cannot always sit on
    one 390px line. Let it wrap and keep the controls reachable. */
-@media (max-width: 767px) {
+@media (max-width: 620px) {
   .wb-workspace-header { flex-wrap: wrap; gap: 4px; padding: 6px 8px; height: auto; }
+  .wb-workspace-controls { flex-wrap: wrap; }
   .wb-workspace-title { min-width: 0; flex: 1 1 100%; }
   .wb-layout-level { font-size: 10px; padding: 2px 6px; }
 }
@@ -28384,14 +28491,92 @@ button.skills-issue-badge:hover {
    held one-handed. Content first, nav last, and the bar keeps clear of the home
    indicator. Targets go to 44px — the row actions are 20px tall on desktop,
    fine for a mouse and too small for a fingertip. */
-@media (max-width: 767px) {
-  .wb-mobile-stack > :not(.wb-mobile-nav) { min-height: 0; }
+@media (max-width: 620px) {
+  .wb-mobile-stack {
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas: "content" "nav";
+  }
+  .wb-mobile-stack > .wb-mobile-nav {
+    grid-area: nav;
+    border-top: 1px solid var(--wb-border-strong);
+    border-bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .wb-mobile-stack > :not(.wb-mobile-nav) { grid-area: content; min-height: 0; }
   .wb-mobile-nav button { min-height: 44px; font-size: 12px; }
 
-  .wb-session-row-action { height: 44px; padding: 0 10px; font-size: 13px; }
-  .wb-session-row { height: 84px; }
+  .wb-session-row-action { height: 34px; padding: 0 8px; font-size: 12px; }
+  .wb-session-row { height: 72px; }
   .wb-session-search input { height: 34px; font-size: 13px; }
 }
+
+/* Mobile drill-down chrome: back control, session name, and a compact segment
+   for the surfaces inside one session. */
+.wb-mobile-detail { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; overflow: hidden; }
+.wb-mobile-detail-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--wb-border);
+  background: var(--wb-surface);
+}
+.wb-mobile-back {
+  min-height: 44px;
+  padding: 0 8px;
+  border: 0;
+  color: var(--wb-accent);
+  background: transparent;
+  font-size: 13px;
+  cursor: pointer;
+}
+.wb-mobile-detail-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--wb-text);
+  font-size: 12px;
+}
+.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 1px solid var(--wb-border); border-radius: 4px; overflow: hidden; }
+.wb-mobile-detail-seg button {
+  min-height: 36px;
+  padding: 0 10px;
+  border: 0;
+  color: var(--wb-muted);
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+.wb-mobile-detail-seg button[aria-current="page"] { color: var(--wb-accent); background: var(--wb-accent-soft); }
+
+/* Fingertip targets for the row actions on touch layouts. */
+@media (max-width: 620px) {
+  .wb-session-row-action { height: 44px; padding: 0 10px; font-size: 13px; }
+  .wb-session-row { height: 84px; }
+}
+
+/* Mobile detail already shows the session name and its surface switcher, so the
+   workspace's own header would repeat both and cost ~46px of the little height
+   a phone terminal has. One bar, not two.
+
+   The header is display:none at this breakpoint, so it is out of flow and takes
+   no grid cell at all — .wb-pane-stack is the workspace's only in-flow child.
+   The template therefore has to be a single row. A leading auto row would eat
+   the stack (it lands on row 1, ~61px) and leave the 1fr row empty, which
+   collapses .wb-pane-frame-shell → .wb-pane-frame-fit to 0 height and renders
+   no terminal on a phone. */
+@media (max-width: 620px) {
+  .wb-mobile-detail .wb-workspace-header { display: none; }
+  .wb-mobile-detail .wb-workspace { grid-template-rows: minmax(0, 1fr); }
+  .wb-mobile-detail-bar { padding: 4px 8px; gap: 6px; }
+  .wb-mobile-back { min-height: 40px; padding: 0 6px; }
+}
+
+.wb-mobile-preview { display: flex; min-height: 0; overflow: hidden; }
+.wb-mobile-preview > .wb-pane { flex: 1; min-height: 0; }
 
 /* 行操作浮层：平时隐藏，悬停/聚焦出现，垂直居中不与时间戳抢位 */
 .wb-session-row-actions {

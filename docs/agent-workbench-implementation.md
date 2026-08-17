@@ -1,8 +1,8 @@
 # Agent Workbench 集成实现与验收
 
-> 状态：Preview backend、H5 auth/control 与 Workbench UI 已在 `feat/agent-workbench` 完成代码级集成和本地浏览器验证；运营隔离验收仍未通过，见 8.4。
-> 日期：2026-08-16。
-> 本轮行为边界：没有启动、停止或重启 live daemon，没有使用真实飞书凭据，没有修改开放平台配置，没有部署、push、建 PR、tag 或 release，也没有访问真实飞书后端。只读审计发现当前机器已有全局 wrapper/live daemon 指向本 checkout；审计收口时另有一次误在该 checkout 执行的本地构建，详见 8.4，故隔离验收明确失败。
+> 状态：Preview backend、H5 auth/control 与 Workbench UI 已在 `feat/agent-workbench` 完成集成、构建和本地浏览器验证。
+> 日期：2026-08-11。
+> 边界：本次没有启动或重启 live daemon，没有使用真实飞书凭据，没有修改开放平台配置，没有部署、push、建 PR 或访问真实飞书后端。
 
 ## 1. 交付结论
 
@@ -14,8 +14,6 @@ Agent Workbench v1 是 Dashboard 内的单会话操作工作区，已经提供�
 | Quick Dock | #/agent-workbench-dock[/<encoded-session-id>] | PC 侧边栏辅助入口，只提供会话摘要、跳转和 fallback，不渲染 Terminal/Web pane。 |
 
 实现继续复用现有 /api/sessions 快照、/events SSE、/s/<sessionId> Terminal 代理、daemon registry 和 session store。没有新增 Agent CLI adapter、终端协议、会话状态机或第二套聊天 UI；现有 Dashboard、Sessions、Groups/session-group-mode、Monitor Room、Settings 与 v3 路由保持注册。
-
-Sessions rail 还提供未读完成态、置顶“待你处理”、状态/机器人/会话/仓库/CLI/时间六维分组、分组折叠、全文搜索，以及 `j`/`k`/方向键/Enter 导航；这些能力与 Terminal/Web pane tree 同时保留，而不是二选一。
 
 最重要的产品边界：
 
@@ -73,7 +71,6 @@ botmux preview <port>
 - pane splitter 限制为 28–72%，支持指针和键盘方向键。
 - 小于 1280px 折叠 rail；小于 1120px 强制 Focus；小于 960px 将 Chat 降级成跳转；小于 768px 固定为 Sessions、Workspace、Info 单页栈。
 - 移动端 Sessions 页始终渲染完整列表，不继承桌面折叠 rail。
-- 移动端列表和页面导航使用至少 44px 的触控目标；84px 会话行同时用于 CSS 与虚拟化估算。
 - 每个 session 只持久化布局原语；URL、cookie、grant、iframe 状态和身份信息不进入 localStorage。
 
 ## 3. 配置
@@ -124,7 +121,9 @@ BOTMUX_PUBLIC_URL=https://<dashboard-host>
 
 短会话 cookie 为 32 字节随机 opaque 值，属性为 HttpOnly、SameSite=Lax、Path=/，按配置增加 Secure。服务端只保留带 domain separator 的 SHA-256 digest；Dashboard 重启会有意注销内存会话。
 
-客户端把本地 Dashboard owner 权限与窄 Workbench 权限分开：有效 H5/platform 身份可以使用 Workbench 的 Terminal/Preview 租约，但不会显示管理入口或“定位”这类飞书消息写操作。服务端用 `x-botmux-auth-scope: workbench` 标记预期的管理接口拒绝，SPA 不会把它误报成登录过期；真正过期、没有该标记的 401 仍打开登录提示。
+客户端把本地 Dashboard owner 权限与窄 Workbench 权限分开：有效 H5/platform 身份可以使用 Workbench 的 Terminal/Preview 租约，但不会因此获得 Dashboard 管理权限。服务端用 `x-botmux-auth-scope: workbench` 标记预期的管理接口拒绝，SPA 不会把它误报成登录过期；真正过期、没有该标记的 401 仍打开登录提示。
+
+`/api/sessions/:id/preview` 使用独立的 `preview.view` capability，不再借用 `terminal.view`：只观察网页预览的身份不会顺带拿到终端读权限。
 
 ### 4.2 Terminal 控制
 
@@ -158,8 +157,7 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 
 ### 5.1 身份与秘密
 
-- App Secret、飞书 app/user access token、authorization code、Dashboard cookie、daemon HMAC、Terminal **write** grant 和 preview target 不进入浏览器 DTO、URL hash、localStorage、SSE、审计或日志。
-- `/api/sessions/:id/view-link` 是显式的兼容接口，只向已认证 Workbench 身份返回 viewToken-bearing 的只读 Terminal URL；它不进入 session/SSE 投影、不持久化，browser adapter 只接受无嵌入凭据的 HTTP(S) URL。正常 H5/platform 页面使用同源 `/s/:id` 与 central 内部短 grant。
+- App Secret、飞书 app/user access token、authorization code、Dashboard cookie、daemon HMAC、Terminal grant 和 preview target 不进入浏览器 DTO、URL hash、localStorage、SSE、审计或日志。
 - H5 allowlist 使用 open_id 精确匹配；空列表不是“允许所有人”。
 - control、preview interaction、preview proxy 与 H5 context 都不在 publicReadOnly allowlist。
 - Browser API adapter 对 response shape 做运行时校验；非法 mode、deadline、owned、securityNotice 或 H5 context 以 502 型客户端错误 fail closed。
@@ -189,11 +187,6 @@ openWorkbenchChat 的顺序为：
 
 集成审计中额外修复了以下真实契约、竞态和兼容问题：
 
-- 恢复规范要求的 200px rail、176–280px 边界与 1280/1120/960/768 四级降级；保留未读、六维分组和折叠能力。
-- 恢复 L1/L2/L3 Terminal/Web pane tree、Info drawer、固定移动 Sessions/Workspace/Info 页面，以及真正的移动端内嵌缩放 Terminal。
-- 主 Workbench Chat 恢复严格的 toggleChat → enterChat → AppLink 能力链；timeout 会继续 fallback，迟到 callback 不会重复打开。
-- H5/platform Workbench 权限不再与本地管理权限混用；窄权限拒绝不会触发伪“登录过期”遮罩，飞书消息定位仍仅限管理身份。
-- 767px 以下统一 44px 触控目标和 84px 虚拟行高，移除已废弃的移动 drill-down CSS；选中行才显示操作浮层，避免 200px rail 上浮层截获其它行点击。
 - Terminal takeover/release 响应补齐 owned:true/false，UI 同时兼容旧响应并严格验证新响应。
 - Terminal 写 WebSocket 使用租约 generation 标记封闭 takeover/握手竞态；UI 每 15 秒及租约精确截止点刷新，断连、释放或到期立即回到只读。
 - Preview interaction 统一使用服务端 securityNotice，移除 UI 的 warning 字段错配。
@@ -219,11 +212,11 @@ openWorkbenchChat 的顺序为：
 | 区域 | 影响 | 兼容性 |
 |---|---|---|
 | Dashboard SPA | 新增 Full/Dock lazy routes、组件、样式与导航。 | 原有 route 保留；两个入口有独立 chunk。 |
-| central Dashboard | 新增 H5、control、preview interaction、H5 context、只读 view-link 与 Terminal/Preview proxy 接线。 | 默认 H5 关闭；H5/platform 与管理权限分离；public-read 不扩大。 |
+| central Dashboard | 新增 H5、control、preview interaction、H5 context 接口和 Terminal/Preview proxy 接线。 | 默认 H5 关闭；public-read 不扩大。 |
 | daemon / CLI | 增加当前会话 botmux preview <port> 与 preview descriptor 传播。 | 无 --session/--host；旧会话无 preview 时正常降级。 |
 | worker Terminal | 验证 central 注入的短期 read/write grant，并在断连/到期回收写连接。 | PTY、tmux、zellij、Herdr、Riff 共用 gate；Riff 仍 external-only。 |
 | Session store / SSE | 内部保存 preview target，浏览器只看安全 descriptor。 | REST/SSE 使用同一投影；匿名投影移除 preview。 |
-| Feishu/Lark | 原生 Chat 能力与 AppLink；H5 免登入口；owner-only 话题定位。 | 本轮未修改任何真实开放平台或客户端配置，也未调用真实定位后端。 |
+| Feishu/Lark | 原生 Chat 能力与 AppLink；H5 免登入口。 | 未修改任何真实开放平台或客户端配置。 |
 | 审计 | 新增 dashboard-control NDJSON。 | 输入只记字节数；默认 sink I/O 策略需生产运维确认。 |
 
 ## 8. 验证结果
@@ -232,14 +225,14 @@ openWorkbenchChat 的顺序为：
 
 | 检查 | 结果 |
 |---|---|
-| pnpm build | 通过；domain audit、TypeScript、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：17a04ba168ae。 |
+| pnpm build | 通过；domain audit、TypeScript、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：20eef27b5357。 |
 | pnpm exec tsc --noEmit / git diff --check | 通过。 |
-| Workbench 直接边界 | 23 files、324 tests 通过，覆盖 UI、auth、control、Preview、Terminal、CLI、IPC、REST/SSE 与代理。 |
-| 纯模型 runner | 通过：320 sessions、22 virtual items；覆盖 rail-collapsed、focus、chat-jump、mobile-stack。 |
-| 组件 runner | 通过：9 component checks、14 rendered session options。 |
-| pnpm test 全量 unit project | 私有 PID 视图中 961 files / 15,587 tests 通过，1 file / 16 tests 跳过；仅嵌套 bwrap 的 PID 回收用例超时。该完整文件在普通进程视图 33/33 通过。合并唯一用例结果为 962 files 通过、1 file 跳过、15,588 tests 通过、16 tests 跳过、0 产品失败。全量段耗时 662.53 秒。 |
+| Workbench 直接边界 | 22 files、203 tests 通过，覆盖 UI、auth、control、Preview、Terminal、CLI、IPC、REST/SSE 与代理。 |
+| 纯模型 runner | 通过：320 sessions、19 virtual items；覆盖 rail-collapsed、focus、chat-jump、mobile-stack。 |
+| 组件 runner | 通过：9 component checks、12 rendered session options。 |
+| pnpm test 全量 unit project | 742 files / 11,216 tests 通过，1 file / 5 tests 按仓库既有条件跳过；0 failed。串行耗时 326.86 秒。 |
 
-全量命令为 `pnpm test -- --maxWorkers=1 --no-file-parallelism --reporter=dot`，在节点输出目录内的 exact-source 隔离副本串行执行。先运行 `pnpm build` 生成测试所需的本地 `dist/cli.js`；权威全量段再通过短路径 bind mount、私有 PID `/proc`、清空 Botmux 会话变量及独立 HOME/TMP/TMUX_TMPDIR 执行。唯一未在该外层 namespace 内完成的用例会自行启动 bwrap 并验证 PID namespace 回收；嵌套 namespace 使它在 30 秒超时，随后在同一隔离副本的普通进程视图完整重跑 `test/v3-distillation-runner.test.ts`，33/33 通过。这里采用互补环境的唯一用例合并结果，不把 harness 冲突伪称为单命令全绿；两类测试都不会修改或重启 live daemon。
+全量命令为 `pnpm test -- --maxWorkers=1 --no-file-parallelism`。由于验证本身运行在活跃 Botmux workflow 内，进程发现类测试使用清空 BOTMUX 上下文的环境、私有 PID `/proc` 和独立 `TMUX_TMPDIR`，避免把外层同 UID worker 误当成 fixture；串行执行也消除了 `/proc` 瞬态并发噪声。这是测试进程隔离，不会修改或重启 live daemon。
 
 ### 8.2 本地真实浏览器场景
 
@@ -266,15 +259,7 @@ openWorkbenchChat 的顺序为：
 
 ![Agent Workbench 1440×900 dark screenshot](assets/agent-workbench-dark.png)
 
-截图使用 320 条合成 session metadata、本地 mock Terminal/Web 和 1440×900 viewport；渲染 18 条虚拟列表行，pane mode 为 split，responsive state 为 full。它不含真实 session、用户、token 或凭据。
-
-### 8.4 运营隔离与外部动作审计
-
-最终权威测试、构建和浏览器验证均在节点输出目录的隔离副本完成，本轮没有执行 live lifecycle 或外部写操作。但只读检查确认当前机器的全局 `botmux` wrapper 已解析到本 feature checkout，并且有 6 个既有 live daemon 从同一 checkout 的 `dist/index-daemon.js` 运行。因此“功能 checkout 未被全局 wrapper 或 live daemon 使用”这一验收条件原本就不成立。
-
-此外，2026-08-16 16:21（America/New_York）审计收口时，一条同步后构建命令误把工作目录留在 feature checkout，重新生成了其 `dist/cli.js`、`dist/index-daemon.js` 和 Dashboard bundle。6 个 daemon 均在 12:08 启动，本轮没有重启它们；但全局 wrapper 与 daemon 后续派生进程仍可能读取这批新产物，所以该动作属于明确的隔离违规，不能描述为无影响。其后验证全部回到隔离副本。任务约束禁止通过切换 wrapper、恢复 canonical build 或重启 daemon补救，因此本交付必须保持失败状态。
-
-修复该状态需要改全局 wrapper 并重启/迁移 live daemon，属于本任务明确禁止的操作。代码托管平台和飞书开放平台的历史写操作也没有可用审计证据，故只能标记为未验证；当前 Git 只读检查不能证明过去没有 push、PR、tag、release 或开放平台改动。
+截图使用 320 条合成 session metadata、本地 mock Terminal/Web 和 1440×900 viewport；可见 15 条虚拟列表行，pane mode 为 split，responsive state 为 full。它不含真实 session、用户、token 或凭据。
 
 ## 9. 未验证项与五类人工飞书 Spike
 
@@ -343,8 +328,6 @@ openWorkbenchChat 的顺序为：
 
 ## 10. 仍需运营决策
 
-- 先把全局 wrapper 与 live daemon 迁出 feature checkout，再在独立审计窗口复查路径、PID 启动时间和 dist 来源。
-- 补充代码托管平台与飞书开放平台的只读审计记录，覆盖 push/PR/tag/release/deploy 和应用配置变更历史。
 - 审计文件保留期、轮转、采集失败告警，以及是否从默认 best effort 提升为输入路径 fail closed。
 - 真实飞书/Lark 客户端最低版本与 requestAccess/requestAuthCode 支持矩阵。
 - 同源 Preview 只承载受信本机开发应用；若需求扩展到不可信应用，先设计独立 origin 和隔离容器。

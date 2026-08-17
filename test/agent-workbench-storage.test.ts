@@ -120,14 +120,14 @@ describe('Agent Workbench rail preferences', () => {
   it('stays independent of the per-session layout records', () => {
     const storage = new MemoryStorage();
     saveWorkbenchLayout('a/b', { ...defaultWorkbenchLayout(), railWidth: 200 }, storage);
-    saveWorkbenchLayout('c/d', { ...defaultWorkbenchLayout(), railWidth: 260 }, storage);
+    saveWorkbenchLayout('c/d', { ...defaultWorkbenchLayout(), railWidth: 440 }, storage);
     // 会话记录再多也不会凭空生出全局记录：老用户首次进来要走 per-session 迁移兜底。
     expect(loadWorkbenchRailPrefs(storage)).toBeNull();
-    saveWorkbenchRailPrefs(storage, { railWidth: 270, railCollapsed: false });
+    saveWorkbenchRailPrefs(storage, { railWidth: 320, railCollapsed: false });
     // 反过来，写全局栏宽也不许改动任何会话记录。
     expect(loadWorkbenchLayout('a/b', storage).railWidth).toBe(200);
-    expect(loadWorkbenchLayout('c/d', storage).railWidth).toBe(260);
-    expect(loadWorkbenchRailPrefs(storage)).toEqual({ railWidth: 270, railCollapsed: false });
+    expect(loadWorkbenchLayout('c/d', storage).railWidth).toBe(440);
+    expect(loadWorkbenchRailPrefs(storage)).toEqual({ railWidth: 320, railCollapsed: false });
   });
 });
 
@@ -247,7 +247,7 @@ describe('Agent Workbench 分组维度 group-dim.v1', () => {
   it('和栏宽、未读账本、会话布局互不干扰', () => {
     const storage = new MemoryStorage();
     saveWorkbenchLayout('a/b', { ...defaultWorkbenchLayout(), railWidth: 200 }, storage);
-    saveWorkbenchRailPrefs(storage, { railWidth: 270, railCollapsed: true });
+    saveWorkbenchRailPrefs(storage, { railWidth: 320, railCollapsed: true });
     saveWorkbenchSeenLedger(storage, { seen: { 'a/b': 7 }, unread: {} });
     saveWorkbenchGroupDimension(storage, 'cli');
 
@@ -256,7 +256,7 @@ describe('Agent Workbench 分组维度 group-dim.v1', () => {
     ].sort());
     expect(loadWorkbenchGroupDimension(storage)).toBe('cli');
     expect(loadWorkbenchSeenLedger(storage)).toEqual({ seen: { 'a/b': 7 }, unread: {} });
-    expect(loadWorkbenchRailPrefs(storage)).toEqual({ railWidth: 270, railCollapsed: true });
+    expect(loadWorkbenchRailPrefs(storage)).toEqual({ railWidth: 320, railCollapsed: true });
     expect(loadWorkbenchLayout('a/b', storage).railWidth).toBe(200);
   });
 
@@ -351,7 +351,7 @@ describe('Agent Workbench 折叠分组 collapsed.v1', () => {
   it('和栏宽、未读账本、分组维度、会话布局互不干扰', () => {
     const storage = new MemoryStorage();
     saveWorkbenchLayout('a/b', { ...defaultWorkbenchLayout(), railWidth: 200 }, storage);
-    saveWorkbenchRailPrefs(storage, { railWidth: 270, railCollapsed: true });
+    saveWorkbenchRailPrefs(storage, { railWidth: 320, railCollapsed: true });
     saveWorkbenchSeenLedger(storage, { seen: { 'a/b': 7 }, unread: {} });
     saveWorkbenchGroupDimension(storage, 'cli');
     saveWorkbenchCollapsedGroups(storage, ['cli:codex']);
@@ -362,7 +362,7 @@ describe('Agent Workbench 折叠分组 collapsed.v1', () => {
     expect(loadWorkbenchCollapsedGroups(storage)).toEqual(['cli:codex']);
     expect(loadWorkbenchGroupDimension(storage)).toBe('cli');
     expect(loadWorkbenchSeenLedger(storage)).toEqual({ seen: { 'a/b': 7 }, unread: {} });
-    expect(loadWorkbenchRailPrefs(storage)).toEqual({ railWidth: 270, railCollapsed: true });
+    expect(loadWorkbenchRailPrefs(storage)).toEqual({ railWidth: 320, railCollapsed: true });
     expect(loadWorkbenchLayout('a/b', storage).railWidth).toBe(200);
   });
 
