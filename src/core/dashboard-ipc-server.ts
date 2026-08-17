@@ -4241,7 +4241,7 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   try {
     const cfg = getBot(cachedLarkAppId).config;
     const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
-    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'chat-tag' });
+    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group' });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
@@ -4249,9 +4249,10 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
 
 // PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
 // selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
-// 'chat-tag'（默认，应用租户身份，无需用户授权）| 'feed-group'（个人侧边栏
-// 分组，需一次 OAuth）| 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更
-// 内存注册表，与 /botconfig 同一持久化通道。
+// 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
+// 'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）|
+// 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更内存注册表，与
+// /botconfig 同一持久化通道。
 ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { mode?: unknown };

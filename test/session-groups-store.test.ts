@@ -40,6 +40,7 @@ import {
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
+import { resolveTagMode } from '../src/services/feed-group-tagger.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-groups-store-test-'));
@@ -225,5 +226,20 @@ describe('buildTitlePrompt', () => {
   it('caps the excerpt at 500 chars', () => {
     const p = buildTitlePrompt('y'.repeat(2000), 12, 'en');
     expect(p.length).toBeLessThan(700);
+  });
+});
+
+describe('resolveTagMode', () => {
+  it('defaults to feed-group when tag.mode is unset', () => {
+    // feed-group 不依赖租户权限目录（chat-tag 的 im:tag scope 部分租户根本
+    // 没有），任何用户 OAuth 一次即可用 —— 因此是未配置时的默认模式。
+    expect(resolveTagMode(undefined)).toBe('feed-group');
+    expect(resolveTagMode({})).toBe('feed-group');
+  });
+
+  it('honours an explicitly configured mode', () => {
+    expect(resolveTagMode({ mode: 'chat-tag' })).toBe('chat-tag');
+    expect(resolveTagMode({ mode: 'feed-group' })).toBe('feed-group');
+    expect(resolveTagMode({ mode: 'off' })).toBe('off');
   });
 });

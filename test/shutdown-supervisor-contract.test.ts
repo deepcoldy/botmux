@@ -268,7 +268,7 @@ describe('graceful shutdown supervisor contract', () => {
     const restart = cli.slice(start, end);
     const staged = restart.indexOf('consumeRestartIntentTo(');
     const preflight = restart.indexOf('assertNoDuplicatePm2GodDaemons()', staged);
-    const retirement = restart.indexOf('deleteAllBotmuxProcesses()');
+    const retirement = restart.lastIndexOf('deleteAllBotmuxProcesses()');
     const descriptorCheck = restart.indexOf(
       "assertNoUnregisteredLiveDaemonDescriptors('restart-start'",
       retirement,
@@ -293,6 +293,20 @@ describe('graceful shutdown supervisor contract', () => {
     expect(compensate).toBeGreaterThan(verify);
     expect(rollback).toBeGreaterThan(compensate);
     expect(commit).toBeGreaterThan(rollback);
+  });
+
+  it('persists and notifies bootstrap-required failure from the new CLI before retirement', () => {
+    const start = cli.indexOf('async function cmdRestart()');
+    const end = cli.indexOf('/**\n * Bring a SINGLE bot', start);
+    const restart = cli.slice(start, end);
+    const staged = restart.indexOf('consumeRestartIntentTo(');
+    const probe = restart.indexOf('evaluateRestartShutdownPreflight()', staged);
+    const persist = restart.indexOf('persistAndNotifyRestartBootstrapFailure(', probe);
+    const retirement = restart.indexOf('deleteAllBotmuxProcesses()', persist);
+    expect(staged).toBeGreaterThanOrEqual(0);
+    expect(probe).toBeGreaterThan(staged);
+    expect(persist).toBeGreaterThan(probe);
+    expect(retirement).toBeGreaterThan(persist);
   });
 
   it('bounds and freshly verifies every public PM2 start surface with compensation', () => {
@@ -387,7 +401,9 @@ describe('graceful shutdown supervisor contract', () => {
     expect(restart).toContain("process.argv.includes('--bootstrap-shutdown-protocol')");
     expect(restart).toContain("process.argv.includes('--yes')");
     expect(restart).toContain("bootstrapDeleteAllBotmuxProcesses('restart')");
-    expect(restart).toContain('else deleteAllBotmuxProcesses()');
+    expect(restart).toContain('deleteAllBotmuxProcesses()');
+    expect(restart.lastIndexOf('deleteAllBotmuxProcesses()'))
+      .toBeGreaterThan(restart.indexOf('if (bootstrapShutdownProtocol)'));
     expect(cli).toContain('botmux restart --bootstrap-shutdown-protocol --yes');
   });
 

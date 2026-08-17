@@ -9,9 +9,14 @@ import {
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
   shouldSuppressBridgeEmit,
+  structuredFallbackKind,
   stripTrailingBridgeSentinelLine,
   type BridgeSendMarker,
 } from '../src/services/bridge-fallback-gate.js';
+import {
+  CODEX_CONNECTION_ERROR_CODE,
+  CODEX_RATE_LIMIT_ERROR_CODE,
+} from '../src/services/codex-transcript.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -550,5 +555,74 @@ describe('shouldEmitFailedBridgeFallback', () => {
       [],
       false,
     )).toBe(true);
+  });
+});
+
+describe('structuredFallbackKind', () => {
+  it('TRAE 429 (no dedicated rate-limit chain) falls through to the generic failed fallback', () => {
+    // The regression this guards: TRAE has no structured rate-limit chain, so
+    // skipping the generic failed fallback for codex_rate_limited posted
+    // nothing at all — "misleading but visible" regressed into "silent".
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE },
+      undefined,
+      [],
+      false,
+      false, // hasDedicatedRateLimitChain=false (TRAE)
+    )).toBe('failed');
+  });
+
+  it('Codex 429 (dedicated chain) skips the generic failed fallback', () => {
+    // Codex's maybeEmitCodexStructuredRateLimit already surfaces the limit, so
+    // the generic failed fallback must not double-post.
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE },
+      undefined,
+      [],
+      false,
+      true, // hasDedicatedRateLimitChain=true (Codex)
+    )).not.toBe('failed');
+  });
+
+  it('a non-rate-limit failure maps to the failed fallback with or without a chain', () => {
+    for (const hasChain of [false, true]) {
+      expect(structuredFallbackKind(
+        { ...turn(100), finalText: '', terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE },
+        undefined,
+        [],
+        false,
+        hasChain,
+      )).toBe('failed');
+    }
+  });
+
+  it('a non-empty final maps to final', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: 'answer' },
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('final');
+  });
+
+  it('an empty completed turn with no markers maps to empty_completed', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+      false,
+    )).toBe('empty_completed');
+  });
+
+  it('a turn suppressed by an in-window send marker maps to none', () => {
+    expect(structuredFallbackKind(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [{ sentAtMs: 150 }],
+      false,
+      false,
+    )).toBe('none');
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createOpenCode2Adapter } from '../src/adapters/cli/opencode2.js';
 import { rawCommandWriteOptionsFor } from '../src/core/raw-command-write-options.js';
 import { writeRawCommandLine } from '../src/core/raw-command-writer.js';
 
@@ -52,5 +53,10 @@ describe('OpenCode raw slash command passthrough', () => {
       'delay:300',
       'sendSpecialKeys:Enter',
     ]);
+  });
+
+  it('declares read-only remote wheel scroll for OpenCode alternate-screen transcript panes', () => {
+    expect(createOpenCodeAdapter('/bin/opencode').readOnlyRemoteScroll).toBe(true);
+    expect(createOpenCode2Adapter('/bin/opencode2').readOnlyRemoteScroll).toBe(true);
   });
 });

@@ -124,6 +124,7 @@ import {
   writeRestartIntent,
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
 import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
@@ -3630,6 +3631,25 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      // The real restart runs in a detached `botmux restart` child, whose
+      // shutdown-capability throw would only reach the maintenance-restart log
+      // — the UI would then poll a reconnect that never happens and mislabel it
+      // as "restart is slow". Detect that fail-closed boundary synchronously so
+      // we can return a precise, actionable error instead of firing a restart
+      // that is guaranteed to die silently. A read failure is non-authoritative
+      // and falls through to the existing behavior (never fabricate a block).
+      try {
+        const preflight = evaluateRestartShutdownPreflight();
+        if (preflight.bootstrapRequired) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'bootstrap_shutdown_protocol_required',
+            unsafeDaemons: preflight.unsafeDaemonNames,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[dashboard] restart shutdown-capability preflight unavailable: ${error instanceof Error ? error.message : error}`);
+      }
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);

@@ -421,6 +421,12 @@ export interface CliAdapter {
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 
+  /** Whether read-only Web Terminal viewers may forward SGR wheel events.
+   *  This is narrower than write access: the worker accepts only validated
+   *  mouse-wheel escape sequences, for TUIs whose transcript can only scroll
+   *  inside the alternate-screen app viewport. */
+  readonly readOnlyRemoteScroll?: boolean;
+
   /** Curated model candidates surfaced in `botmux setup`. When undefined the
    *  setup flow skips the model prompt for this CLI entirely (e.g. CLIs whose
    *  model is fixed or set via a config file we don't manage). The order is

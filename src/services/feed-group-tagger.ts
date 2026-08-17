@@ -1,18 +1,20 @@
 /**
  * Session-group tagging (p2pMode='group').
  *
- * Default mode `chat-tag` — tenant chat tags (企业自定义群标签): the tag is a
+ * Default mode `feed-group` — the owner's personal sidebar 消息分组 (feed
+ * group, ofg_xxx): per-user message grouping that works on ANY tenant, since
+ * no tenant scope catalog is involved. Feishu only accepts a user_access_token
+ * there, so it runs under the owner's OAuth token (utils/user-token) — a
+ * one-time authorization (nudged when missing, throttled), auto-refreshed
+ * afterwards.
+ *
+ * Opt-in mode `chat-tag` — tenant chat tags (企业自定义群标签): the tag is a
  * property of the GROUP itself, applied with the bot's own tenant token via
  * `im/v2/tags` + `im/v2/biz_entity_tag_relation`. No user OAuth involved; the
- * app just needs the `im:tag:write` and `im:biz_entity_tag_relation:write`
- * tenant scopes (setup/lark-scopes.json lists both). When a scope is missing
+ * app needs the `im:tag:write` and `im:biz_entity_tag_relation:write` tenant
+ * scopes (setup/lark-scopes.json lists both) — which some tenants' scope
+ * catalogs don't offer at all, hence not the default. When a scope is missing
  * the bot DMs the owner a ready-to-click console enable link (throttled).
- *
- * Opt-in mode `feed-group` — the owner's personal sidebar 消息分组 (feed
- * group, ofg_xxx). Feishu only accepts a user_access_token there, so it runs
- * under the owner's OAuth token (utils/user-token) and nudges for
- * authorization when missing. Kept opt-in because it writes to the user's
- * personal sidebar data.
  *
  * Everything is best-effort and fire-and-forget: failures degrade to
  * "group created, not tagged" with a log line — never block a birth.
@@ -380,6 +382,18 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
 // ─── entry point ─────────────────────────────────────────────────────────────
 
 /**
+ * Effective tag mode for a `sessionGroup.tag` config block. Default
+ * `feed-group`: per-user message grouping usable on any tenant with a
+ * one-time OAuth — unlike `chat-tag`, whose tenant scopes some tenants'
+ * scope catalogs don't offer at all.
+ */
+export function resolveTagMode(
+  tag: { mode?: 'chat-tag' | 'feed-group' | 'off' } | undefined,
+): 'chat-tag' | 'feed-group' | 'off' {
+  return tag?.mode ?? 'feed-group';
+}
+
+/**
  * Tag one freshly-born session group per the bot's `sessionGroup.tag` config.
  * Fire-and-forget from the birth flow — never throws.
  */
@@ -387,7 +401,7 @@ export async function tagSessionGroup(larkAppId: string, chatId: string, ownerOp
   try {
     const cfg = getBot(larkAppId).config;
     const tag = cfg.sessionGroup?.tag ?? {};
-    const mode = tag.mode ?? 'chat-tag';
+    const mode = resolveTagMode(tag);
     if (mode === 'off') return;
     const name = tag.name?.trim() || DEFAULT_TAG_NAME;
     if (mode === 'feed-group') {

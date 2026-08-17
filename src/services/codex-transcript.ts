@@ -305,7 +305,10 @@ function codexFailureLeaf(error: unknown): unknown {
   return current;
 }
 
-function safeFailureSummary(error: unknown): string | undefined {
+/** Bounded, redacted user-facing summary of a structured task_complete error.
+ *  Exported for the TRAE drainer, which mirrors the Codex error→failed
+ *  terminal mapping on the same payload shape. */
+export function safeFailureSummary(error: unknown): string | undefined {
   const leaf = codexFailureLeaf(error);
   let message = '';
   let code = '';
@@ -389,7 +392,11 @@ function safeFailureSummary(error: unknown): string | undefined {
     : summary;
 }
 
-function codexTaskFailureCode(error: unknown): string {
+/** Classify a structured task_complete error into a stable failure code.
+ *  Shared with the TRAE drainer (traex-transcript.ts), whose task_complete
+ *  error payloads use the same Codex-family shape — keep one classifier so
+ *  both bridges map e.g. connection failures to the same code. */
+export function codexTaskFailureCode(error: unknown): string {
   let serialized = '';
   try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
   const normalized = serialized.toLowerCase();

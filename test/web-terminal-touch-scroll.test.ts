@@ -26,7 +26,7 @@ describe('web terminal touch scrolling', () => {
   it('restores the real Herdr attach cursor after snapshot rendering', () => {
     expect(workerSource).toContain('be.onWebTerminalCursor(relayHerdrWebCursor);');
     expect(workerSource).toContain('scrollback}${herdrWebCursorSequence()}');
-    expect(workerSource).toContain('ws.send(seed + herdrWebCursorSequence());');
+    expect(workerSource).toContain('ws.send(seed + modeSeed + herdrWebCursorSequence());');
   });
 
   it('forces Herdr alternate-screen CLIs to remote-scroll after a snapshot-only refresh', () => {
@@ -66,7 +66,7 @@ describe('web terminal touch scrolling', () => {
       + "        || effectiveBackendType === 'zellij';",
     );
     expect(workerSource).toContain(
-      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend)',
+      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll)',
     );
     expect(workerSource).toContain('var localTerminalBackend=${localTerminalBackend};');
     // Guard the exclusion explicitly: neither Herdr nor Riff may appear in the gate.
@@ -145,6 +145,35 @@ describe('web terminal touch scrolling', () => {
     expect(wheelBlock).toContain('return px>0||b.viewportY>0');
     expect(wheelBlock).toContain('if(_canScrollLocal(px)){');
     expect(touchBlock).toContain('if(_canScrollLocal(px)){');
+  });
+
+  it('allows declared read-only remote wheel scroll without opening general input', () => {
+    const wheelBlock = scriptBlock('// ── Wheel / touch scroll handling ──');
+
+    expect(workerSource).toContain('function canHandleReadOnlyRemoteScroll(): boolean {');
+    expect(workerSource).toContain('const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();');
+    expect(workerSource).toContain('var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};');
+    expect(workerSource).toContain("} else if (msg.type === 'scroll' && typeof msg.data === 'string') {");
+    expect(workerSource).toContain('if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;');
+    expect(workerSource).toContain('const parsed = parseReadOnlyRemoteScrollPayload(msg.data);');
+    expect(workerSource).toContain('if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;');
+    expect(wheelBlock).toContain("ws_.send(JSON.stringify({type:hasToken?'input':'scroll',data:data}))");
+    expect(wheelBlock).toContain(
+      'if(!hasToken){\n'
+      + '      e.preventDefault();e.stopPropagation();\n'
+      + '      if(readOnlyRemoteScroll)_fwdScroll(px,_cellAt(e.clientX,e.clientY));\n'
+      + '      else term.scrollLines(e.deltaY>0?3:-3);return;\n'
+      + '    }',
+    );
+  });
+
+  it('does not advertise read-only remote scroll for zellij per-client attach', () => {
+    const helperStart = workerSource.indexOf('function canHandleReadOnlyRemoteScroll(): boolean {');
+    const helperEnd = workerSource.indexOf('\n}\n\nfunction wireHerdrWebTerminalRelays', helperStart) + 2;
+    const helperBlock = workerSource.slice(helperStart, helperEnd);
+
+    expect(helperBlock).toContain("cliAdapter?.readOnlyRemoteScroll === true");
+    expect(helperBlock).toContain("!(lastInitConfig?.adoptMode && lastInitConfig.adoptZellijPaneId)");
   });
 
   it('replaces merged Herdr history and preserves the reader anchor', () => {

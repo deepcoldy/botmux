@@ -112,6 +112,13 @@ export interface SessionBackend {
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;
   /**
+   * Escape sequence re-asserting the pane's live input modes (mouse tracking,
+   * app cursor keys, …) on a fresh web-terminal client. Snapshot seeds carry
+   * screen cells but no DECSET state; backends that can query it (tmux) expose
+   * this so mouse-mode TUIs keep receiving clicks after a page (re)load.
+   */
+  capturePaneInputModes?(): string;
+  /**
    * Complete one authoritative screen refresh that starts after this call.
    * Snapshot-only backends use this as a completion fence before the worker
    * declares a turn idle, so a final burst cannot be lost to polling phase.

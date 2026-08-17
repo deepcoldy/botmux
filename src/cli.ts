@@ -143,6 +143,12 @@ import {
 import { assertLinuxPm2GodExecutableUsable } from './cli/pm2-preflight.js';
 import { assertNoUnregisteredLiveDaemonDescriptorsIn } from './cli/pm2-descriptor-guard.js';
 import { assertPm2DaemonShutdownCapabilitiesIn } from './cli/pm2-shutdown-capability.js';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
+import {
+  recordAndNotifyRestartBootstrapFailure,
+  restartFailurePathIn,
+} from './cli/restart-failure-notification.js';
+import { resolveRestartFailureOwner } from './cli/restart-failure-owner.js';
 import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
 import {
   requestAttestedDaemonShutdown,
@@ -580,6 +586,60 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+/**
+/**
+ * Resolve one DM target inside the SAME bot application that will send it,
+ * registering that app in this fresh CLI process's bot registry first. See
+ * cli/restart-failure-owner.ts for why registration must happen on both the
+ * ownerOpenId and allowedUsers paths.
+ */
+async function resolveRestartFailureOwnerInProcess(bot: any): Promise<string | undefined> {
+  const { registerBot } = await import('./bot-registry.js');
+  const { resolveAllowedUsers } = await import('./im/lark/client.js');
+  return resolveRestartFailureOwner(bot, { registerBot, resolveAllowedUsers });
+}
+
+async function persistAndNotifyRestartBootstrapFailure(
+  dataDir: string,
+  bots: any[],
+  stagedRestartIntent: RestartIntent | null,
+  unsafeDaemonNames: string[],
+  detail: string,
+): Promise<void> {
+  // Persistence + delivery are best-effort telemetry around a failure that is
+  // ALSO surfaced by the throw below. If anything here throws (file write,
+  // dynamic import, SDK), never let it mask the clear bootstrap-required error
+  // the caller is about to raise — degrade to a logged warning instead.
+  try {
+    const { sendUserMessage } = await import('./im/lark/client.js');
+    const outcome = await recordAndNotifyRestartBootstrapFailure({
+      dataDir,
+      bots,
+      unsafeDaemonNames,
+      detail,
+      restartIntent: stagedRestartIntent,
+      resolveOwner: resolveRestartFailureOwnerInProcess,
+      sendText: ({ larkAppId, ownerOpenId }, text) => (
+        sendUserMessage(larkAppId, ownerOpenId, text)
+      ),
+    });
+    const status = outcome.notification.status;
+    const destination = outcome.notification.larkAppId
+      ? ` via app ${outcome.notification.larkAppId}`
+      : '';
+    console.error(
+      `[restart] bootstrap-required failure persisted at ${restartFailurePathIn(dataDir)}; `
+      + `owner notification=${status}${destination}`,
+    );
+  } catch (error) {
+    console.error(
+      `[restart] bootstrap-required failure notification could not be persisted/sent `
+      + `(${error instanceof Error ? error.message : String(error)}); `
+      + 'the terminal error below remains authoritative',
+    );
+  }
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
@@ -3662,8 +3722,36 @@ async function cmdRestart(): Promise<void> {
     preflightNodeSanity();
     await ensureSystemDependencies();
     cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
-    if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
-    else deleteAllBotmuxProcesses();
+    if (bootstrapShutdownProtocol || includePm2) {
+      // An include-pm2 restart was admitted only when no live PM2 God existed;
+      // a read-only jlist probe would start one and invalidate that admission.
+      // Keep the existing include-pm2 clean-start path unchanged.
+      if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
+      else deleteAllBotmuxProcesses();
+    } else {
+      // This process is the newly installed code generation even when the
+      // Dashboard that spawned it is still the old in-memory generation. Do
+      // the policy probe here, before the generic retirement path throws, so
+      // the first-upgrade failure becomes durable and reaches the owner.
+      const preflight = evaluateRestartShutdownPreflight();
+      if (preflight.bootstrapRequired) {
+        const detail = 'current daemon PM2 policy requires the one-time shutdown-protocol bootstrap';
+        await persistAndNotifyRestartBootstrapFailure(
+          restartIntentDir,
+          loadBotsJson(),
+          stagedRestartIntent,
+          preflight.unsafeDaemonNames,
+          detail,
+        );
+        throw new Error(
+          `[restart] daemon PM2 policy requires one-time bootstrap; unsafe: `
+          + `${preflight.unsafeDaemonNames.join(', ') || 'unknown'}. `
+          + 'After confirming every Session/Riff workload is idle, run: '
+          + 'botmux restart --bootstrap-shutdown-protocol --yes',
+        );
+      }
+      deleteAllBotmuxProcesses();
+    }
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
 

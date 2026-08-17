@@ -719,6 +719,11 @@ function cardActionKey(larkAppId: string, data: any): string {
     // managing bot A in group X doesn't dedupe bot B in group Y.
     chatId: value?.chat_id,
     appId: value?.app_id,
+    // Overload browser-restart buttons all share one action label
+    // (`overload_restart_browser`) but target different browsers; include the
+    // bundleId so rapidly clicking Arc then Chrome isn't collapsed into one
+    // in-flight dedupe key that drops the second click.
+    bundleId: value?.bundleId,
   })}`;
 }
 

@@ -122,9 +122,14 @@ describe('worker structured-turn status wiring', () => {
 
   it('settles terminals after optional output and preserves the empty-completed fallback', () => {
     const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
-    const emptyFallback = emit.indexOf('shouldEmitEmptyCompletedBridgeFallback');
+    // The empty-completed fallback is still wired before the output guard —
+    // now via the extracted structuredFallbackKind decision, whose
+    // 'empty_completed' branch posts emptyCompletedBridgeFallbackContent().
+    const fallbackKind = emit.indexOf('structuredFallbackKind');
+    const emptyFallback = emit.indexOf('emptyCompletedBridgeFallbackContent()', fallbackKind);
     const outputGuard = emit.indexOf('if (!content) continue;', emptyFallback);
     const terminalLoop = emit.indexOf('for (const turn of ready)', outputGuard);
+    expect(fallbackKind).toBeGreaterThanOrEqual(0);
     expect(emptyFallback).toBeGreaterThanOrEqual(0);
     expect(outputGuard).toBeGreaterThan(emptyFallback);
     expect(terminalLoop).toBeGreaterThan(outputGuard);
