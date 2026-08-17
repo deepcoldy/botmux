@@ -919,14 +919,31 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
   }
   return (
     <section className="bd-section" aria-busy={busy}>
-      <h3 className="bd-section-title">最终回答反馈</h3>
-      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help="默认关闭；只对这个 bot 的最终回答生效" onChange={checked => { setOn(checked); void save(checked); }} />
-      <label className="bd-row"><span>高级 JSON</span><textarea value={json} disabled={busy || !on} rows={10} onChange={e => setJson(e.target.value)} /></label>
-      <div className="actions"><button type="button" className="primary" disabled={busy || !on} onClick={() => void save()}>保存反馈配置</button><StatusSpan status={status} /></div>
-      <h4>每聊天覆盖</h4>
-      <label className="bd-row"><span>聊天</span><select value={chatId} onChange={e => setChatId(e.target.value)}><option value="">选择聊天</option>{chats.map(chat => <option key={chat.chatId} value={chat.chatId}>{chat.name || chat.chatId}</option>)}</select></label>
-      <div className="actions"><button type="button" disabled={busy || !chatId.trim()} onClick={() => void saveChat()}>保存聊天覆盖</button><button type="button" disabled={busy} onClick={() => void loadPreview()}>生效预览</button></div>
-      {preview ? <pre className="code-block">{JSON.stringify(preview, null, 2)}</pre> : null}
+      <h3 className="bd-section-title">
+        <FieldTitle help="开启后，最终回答卡片会显示“结论可用 / 有效推进 / 结论有误”等反馈按钮，用于收集回答质量评价。默认关闭；只影响这个 bot 的最终回答，不影响过程消息。">最终回答反馈</FieldTitle>
+      </h3>
+      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+      <StatusSpan status={status} />
+      {on ? (
+        <details className="bd-feedback-advanced">
+          <summary>高级配置（JSON 与聊天覆盖）</summary>
+          <div className="bd-feedback-advanced-body">
+            <label className="bd-row"><FieldTitle help="用于自定义反馈按钮、文案、负向原因和是否允许改选。不了解 JSON 配置时保持默认即可。">高级 JSON</FieldTitle><textarea className="bd-feedback-json" value={json} disabled={busy} rows={6} onChange={e => setJson(e.target.value)} /></label>
+            <div className="actions"><button type="button" className="primary" disabled={busy} onClick={() => void save()}>保存反馈配置</button></div>
+            <div className="bd-feedback-chat-override">
+              <h4><FieldTitle help="让同一个 bot 在不同飞书聊天中使用不同反馈规则；聊天配置优先于 bot 默认配置。只有各群规则不同时才需要设置。">每聊天覆盖</FieldTitle></h4>
+              <p className="hint">仅当这个 bot 在不同聊天中需要不同反馈规则时设置。</p>
+              <label className="bd-row"><span>聊天</span><select value={chatId} onChange={e => { setChatId(e.target.value); setPreview(null); }}><option value="">选择聊天</option>{chats.map(chat => <option key={chat.chatId} value={chat.chatId}>{chat.name || chat.chatId}</option>)}</select></label>
+              {chatId.trim() ? (
+                <>
+                  <div className="actions"><button type="button" disabled={busy} onClick={() => void saveChat()}>保存聊天覆盖</button><button type="button" disabled={busy} onClick={() => void loadPreview()}>生效预览</button></div>
+                  {preview ? <pre className="code-block">{JSON.stringify(preview, null, 2)}</pre> : null}
+                </>
+              ) : null}
+            </div>
+          </div>
+        </details>
+      ) : null}
     </section>
   );
 }
