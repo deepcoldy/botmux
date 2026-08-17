@@ -670,6 +670,38 @@ describe('mojo explicit close', () => {
     expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
   });
 
+  it('restores the runtime fence when the takeover journal write fails (round-5 zero-coverage fix)', async () => {
+    // The takeover clears ds.remoteCloseState BEFORE the fresh attempt's
+    // durable write. If that write throws, the fence must come back — guards
+    // keyed on remoteCloseState (shutdown-detach's explicit-close check)
+    // otherwise silently lose their signal while disk still says uncertain.
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-restore', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-restore', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+    const fence = {
+      phase: 'uncertain' as const,
+      requestId: 'req-restore',
+      taskId: 'mojo-sid-123',
+    };
+    fixture.ds.remoteCloseState = fence;
+    vi.spyOn(sessionStore, 'beginMojoCloseJournal')
+      .mockImplementationOnce(() => { throw new Error('journal disk full'); });
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+    });
+    // The SAME fence object is back — not a lookalike rebuilt from guesses.
+    expect(fixture.ds.remoteCloseState).toBe(fence);
+    expect(fixture.worker.send).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
+  });
+
   it('keeps refusing when the runtime uncertain fence does not match the durable journal', async () => {
     // The takeover requires runtime and disk to describe the SAME failed
     // attempt (phase + requestId + lineage). A mismatched pair means they

@@ -154,6 +154,7 @@ import {
   sendWorkerSessionInput,
   killWorker,
   retireWorkerProcessOnly,
+  retiringWorkersForSession,
   reapOrphanWorkers,
   scheduleCardPatch,
   setCurrentCliVersion,
@@ -1055,6 +1056,11 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
     message: Extract<DaemonToWorker, { type: 'expire_durable_turn' }>,
   ) => void;
   killWorker: (ds: DaemonSession) => void;
+  /** Worker processes still dying for this session id even though the registry
+   *  no longer resolves a ds (process-only retirements). The producer-liveness
+   *  gate must keep seeing them (fifth-round review, A1: a fence armed AFTER
+   *  the registry delete had no worker reference at all). */
+  resolveRetiringWorkers?: (sessionId: string) => readonly (DaemonSession['worker'])[];
   resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
   resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
@@ -1131,7 +1137,24 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       && fence.armedWorker.exitCode === null
       && fence.armedWorker.signalCode === null
       ? fence.armedWorker : null;
-    const workerBefore = (ds?.worker && !ds.worker.killed ? ds.worker : null) ?? armedAlive;
+    // Third source, for a fence armed AFTER the registry delete (the other
+    // half of the collision-loser timing): a process-only retirement is still
+    // dying for this session id, and neither ds nor arm-time capture ever saw
+    // it. Pin it onto the fence so later reprobes keep tracking the same
+    // process.
+    let retiringAlive: NonNullable<DaemonSession['worker']> | null = null;
+    if (!armedAlive && !(ds?.worker && !ds.worker.killed)) {
+      for (const w of deps.resolveRetiringWorkers?.(fence.receiverSessionId) ?? []) {
+        if (w && !w.killed && w.exitCode === null && w.signalCode === null) {
+          retiringAlive = w;
+          fence.armedWorker = w;
+          break;
+        }
+      }
+    }
+    const workerBefore = (ds?.worker && !ds.worker.killed ? ds.worker : null)
+      ?? armedAlive
+      ?? retiringAlive;
     if (ds) {
       try { deps.killWorker(ds); }
       catch (err) {
@@ -1463,6 +1486,7 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
     ds.worker.send(message);
   },
   killWorker: teardownVcReceiverWorker,
+  resolveRetiringWorkers: retiringWorkersForSession,
   resolvePersistentScope(ds) {
     const backendType = getSessionPersistentBackendType(ds);
     if (backendType) return backendType;

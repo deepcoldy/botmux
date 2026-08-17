@@ -586,8 +586,13 @@ describe('killWorker — with a live worker (unchanged path)', () => {
     expect(send).not.toHaveBeenCalled();
     expect(loser.worker).toBeNull();
     expect(map.get(key)).toBe(winner);
-    // The remote lineage was NOT cancelled — it stays for manual cleanup.
+    // The remote lineage was NOT cancelled — it stays for manual cleanup, and
+    // the warn log NAMES it so an operator can actually find it (the
+    // visibility surface, round-5 zero-coverage item).
     expect(loser.session.riffParentTaskId).toBe('mojo-task-loser');
+    const { logger } = await import('../src/utils/logger.js');
+    expect(vi.mocked(logger.warn).mock.calls.map(c => String(c[0])).join('\n'))
+      .toContain('mojo-task-loser');
   });
 
   it('still retires a live remote worker when the prepare/commit requestId is carried (P0-2)', () => {

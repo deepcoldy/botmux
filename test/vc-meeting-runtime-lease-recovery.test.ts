@@ -90,6 +90,9 @@ function harness(input: {
   /** Override the teardown; the default kills. A no-op models killWorker's
    *  refusal of an unprepared live remote worker (P0-2). */
   killWorker?: (ds: FakeSession) => void;
+  /** Worker processes still dying for a session id after its registry entry
+   *  is gone (process-only retirements). */
+  resolveRetiringWorkers?: (sessionId: string) => readonly unknown[];
 } = {}) {
   const sessions = new Map((input.sessions ?? []).map(ds => [ds.session.sessionId, ds]));
   const sent: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
@@ -114,6 +117,7 @@ function harness(input: {
       if (input.killWorker) input.killWorker(ds);
       else ds.worker = null;
     },
+    resolveRetiringWorkers: input.resolveRetiringWorkers,
     resolvePersistentScope: (ds: FakeSession) => ds.testPersistentScope ?? 'unknown',
     resolveMissingPersistentScope: () => input.missingPersistentScope ?? 'unknown',
     backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => input.backendAvailable?.(backend) ?? true,
@@ -230,6 +234,34 @@ describe('VC meeting runtime lease recovery', () => {
     // The retirement backstop finally lands: the process exits, and the next
     // reprobe clears the fence.
     (live.worker as unknown as { exitCode: number | null }).exitCode = 0;
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(h.recovery.snapshot()).toEqual([]);
+  });
+
+  it('stays gated when armed AFTER deregistration while a retirement is still dying (round-5 A1)', async () => {
+    // The other half of the collision-loser timing: the registry entry is
+    // deleted first, the process-only retirement dies asynchronously, and an
+    // ambiguous receipt arms the fence in between. findSession resolves
+    // nothing, so neither ds nor arm-time capture ever saw the producer — the
+    // retiring-worker index is the only remaining reference, and skipping it
+    // cleared the fence over a still-live producer.
+    const dying = { killed: false, exitCode: null as number | null, signalCode: null as string | null };
+    const h = harness({
+      sessions: [],                       // registry entry already gone
+      backendAvailable: () => false,      // mojo-shaped: no panes to probe
+      missingPersistentScope: 'unknown',
+      resolveRetiringWorkers: (sessionId: string) =>
+        sessionId === 'session_a' ? [dying] : [],
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    // Zero panes and zero registry state — but the producer process from the
+    // in-flight retirement is alive, so the fence must stay gated.
+    expect(h.recovery.snapshot()).not.toEqual([]);
+    expect(h.errors.some(m => m.includes('worker process still live'))).toBe(true);
+
+    // The retirement backstop lands: next reprobe clears.
+    dying.exitCode = 0;
     await vi.advanceTimersByTimeAsync(180_000);
     expect(h.recovery.snapshot()).toEqual([]);
   });

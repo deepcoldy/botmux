@@ -106,6 +106,13 @@ function workerForkExecArgv(): string[] {
   return [...process.execArgv, '--import', pathToFileURL(preloadPath).href];
 }
 
+/** Secondary index of the same retirements by session id: the WeakMap above is
+ *  keyed by ds OBJECT and not iterable, but the VC fence's producer-liveness
+ *  gate must find a dying process after the registry entry (and possibly the
+ *  ds reference itself) is gone. Entries release on worker exit, so the map
+ *  stays bounded by in-flight retirements. */
+const lifecycleRetiringBySessionId = new Map<string, Set<ChildProcess>>();
+
 function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   let workers = lifecycleRetiringWorkers.get(ds);
   if (!workers) {
@@ -114,18 +121,42 @@ function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
   }
   if (workers.has(worker)) return;
   workers.add(worker);
+  const sessionId = ds.session.sessionId;
+  let byId = lifecycleRetiringBySessionId.get(sessionId);
+  if (!byId) {
+    byId = new Set();
+    lifecycleRetiringBySessionId.set(sessionId, byId);
+  }
+  byId.add(worker);
   const release = (): void => {
     const current = lifecycleRetiringWorkers.get(ds);
     current?.delete(worker);
     if (current?.size === 0) lifecycleRetiringWorkers.delete(ds);
+    const currentById = lifecycleRetiringBySessionId.get(sessionId);
+    currentById?.delete(worker);
+    if (currentById?.size === 0) lifecycleRetiringBySessionId.delete(sessionId);
   };
   worker.once('exit', release);
+}
+
+/**
+ * Retiring worker processes for a session id — for liveness gates that outlive
+ * the registry entry. A collision loser (or any process-only retirement) is
+ * deleted from the registry while its process is still dying; a VC fence armed
+ * in that window would otherwise find no ds, skip its producer-liveness gate,
+ * and clear on pane probes alone (fifth-round review, A1 residual).
+ */
+export function retiringWorkersForSession(sessionId: string): ChildProcess[] {
+  return [...(lifecycleRetiringBySessionId.get(sessionId) ?? [])];
 }
 
 function clearLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   const workers = lifecycleRetiringWorkers.get(ds);
   workers?.delete(worker);
   if (workers?.size === 0) lifecycleRetiringWorkers.delete(ds);
+  const byId = lifecycleRetiringBySessionId.get(ds.session.sessionId);
+  byId?.delete(worker);
+  if (byId?.size === 0) lifecycleRetiringBySessionId.delete(ds.session.sessionId);
 }
 
 /**

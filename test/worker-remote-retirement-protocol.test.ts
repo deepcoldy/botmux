@@ -8,6 +8,7 @@ const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-serve
 const cardHandlerSource = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
 const cardBuilderSource = readFileSync(new URL('../src/im/lark/card-builder.ts', import.meta.url), 'utf8');
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+const webSessionsSource = readFileSync(new URL('../src/dashboard/web/sessions.ts', import.meta.url), 'utf8');
 
 describe('worker remote retirement protocol', () => {
   it('refuses Riff generation restart before the local restart helper can run', () => {
@@ -185,28 +186,35 @@ describe('worker remote retirement protocol', () => {
     expect(exitHandler).not.toContain('ds.remoteCloseState = undefined');
   });
 
-  it('leaves NO riff-only retirement guard anywhere: every generation-replacing entry point gates on isRemoteBackendSession', () => {
-    // Round-4 exhaustive close-out. Four rounds of review found riff-only
-    // guards one entry point at a time (/cd, then /restart+/repo, then the
-    // cards and the crash loop). This assertion inverts the process: outside
-    // the helper's own definition, `isRiffBackendSession(` may survive only in
-    // sites that are GENUINELY riff-specific (none today), so a new
-    // generation-replacing entry point copied from an old riff guard goes red
-    // here instead of waiting for a reviewer to name it.
+  it('keeps known riff-only retirement guards at zero across the scanned entry-point files', () => {
+    // Round-4/5 exhaustive close-out. Honest scope of this pin (fifth-round
+    // review): it is a string count over the SCANNED FILES below — it does not
+    // parse the AST, does not cover `=== 'riff'` literals used for non-guard
+    // purposes, and a file outside this list is not protected. What it does
+    // guarantee: the entry-point files where four review rounds found riff-only
+    // retirement guards one at a time (/cd → /restart+/repo → cards → crash
+    // loop → web dashboard) can never regrow one silently — a copied riff-only
+    // guard in any of them goes red here instead of waiting for a reviewer.
     for (const [name, source] of [
       ['worker-pool', workerPoolSource],
       ['command-handler', commandHandlerSource],
       ['dashboard-ipc-server', dashboardIpcSource],
       ['card-handler', cardHandlerSource],
+      ['daemon', daemonSource],
+      ['worker', workerSource],
+      ['dashboard-web-sessions', webSessionsSource],
     ] as const) {
       const uses = source.split('isRiffBackendSession(').length - 1;
       expect(uses, `${name} still calls isRiffBackendSession`).toBe(0);
     }
-    // The card RENDER side must agree with the click handler: no restart
-    // button for any remote CLI (a riff worker refuses the IPC; a mojo worker
-    // EXECUTES it and cancels the remote session).
+    // RENDER surfaces must agree with their click/route handlers: no restart
+    // affordance for any remote CLI (a riff worker refuses the IPC; a mojo
+    // worker EXECUTES it and cancels the remote session). Both the Feishu card
+    // and the web dashboard — the web one was the round-5 miss.
     expect(cardBuilderSource).toContain('!isRemoteCliId(effectiveCliId)');
     expect(cardBuilderSource).not.toContain("effectiveCliId !== 'riff'");
+    expect(webSessionsSource).toContain('!isRemoteCliId(s.cliId)');
+    expect(webSessionsSource).not.toContain("s.cliId !== 'riff'");
     // Card click + takeover guards on the generalized predicate.
     expect(cardHandlerSource.split('isRemoteBackendSession(').length - 1).toBeGreaterThanOrEqual(3);
     expect(commandHandlerSource).toContain('if (!isRemoteBackendSession(ds)) return false;'); // blockRiffTakeover body
