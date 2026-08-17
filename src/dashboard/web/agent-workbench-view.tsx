@@ -499,7 +499,6 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
             now={now}
             location={location}
             autoTakeControl={terminalWantsControl}
-            handOffToFullScreen={responsive.mode === 'mobile'}
           />
         ) : (
           <div className="wb-pane-placeholder" role="status">

@@ -28135,13 +28135,6 @@ button.skills-issue-badge:hover {
 }
 .wb-pane-frame-shell { min-height: 0; background: #05070a; overflow: hidden; }
 .wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: #05070a; }
-/* 手机端缩放内嵌终端的定位容器：iframe 按 720px 虚拟宽度布局后整体 transform: scale
-   缩小，缩放前的盒子比容器大，靠这里的 overflow: hidden 裁掉。 */
-.wb-pane-frame-fit { position: relative; width: 100%; height: 100%; overflow: hidden; background: #05070a; }
-/* 该 iframe 的宽高由 React 内联 style 给（虚拟宽 + 反算高）。内联样式优先级高于上面
-   .wb-pane-frame 的 width/height: 100%，所以那条规则不会覆盖它，也不需要 !important；
-   这里只补盒子表现，切勿再写 width/height。 */
-.wb-pane-frame-fit > iframe.wb-pane-frame { display: block; border: 0; }
 .wb-pane-empty {
   display: grid;
   place-content: center;
@@ -28566,7 +28559,7 @@ body:has(.workbench-route-host) { min-width: 0; }
    no grid cell at all — .wb-pane-stack is the workspace's only in-flow child.
    The template therefore has to be a single row. A leading auto row would eat
    the stack (it lands on row 1, ~61px) and leave the 1fr row empty, which
-   collapses .wb-pane-frame-shell → .wb-pane-frame-fit to 0 height and renders
+   collapses .wb-pane-frame-shell → .wb-pane-frame to 0 height and renders
    no terminal on a phone. */
 @media (max-width: 620px) {
   .wb-mobile-detail .wb-workspace-header { display: none; }

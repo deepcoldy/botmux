@@ -462,7 +462,14 @@ describe('mobile session surfaces', () => {
       node.type === 'iframe' && String(node.props.className ?? '').includes('wb-pane-frame'))[0] ?? null;
   }
 
-  it('embeds the phone terminal as a scaled iframe instead of a hand-off card', async () => {
+  /** 直嵌契约：iframe 就挂在面板容器下，中间没有任何做缩放的包一层。 */
+  function expectPlainEmbed(frame: ReactTestInstance): void {
+    expect(frame.props.className).toBe('wb-pane-frame');
+    expect(frame.props.style).toBeUndefined();
+    expect(frame.parent?.props.className).toBe('wb-pane-frame-shell');
+  }
+
+  it('embeds the phone terminal directly, with no scaling wrapper around the frame', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
@@ -473,24 +480,18 @@ describe('mobile session surfaces', () => {
     });
     const row = renderer.root.findAll(node => node.props.role === 'option')[0];
     await act(async () => { row.props.onClick(); });
-    // The terminal renders in place now. The old flow put an interstitial card
-    // here whose only affordance was leaving the page for a full-screen tab.
-    const fit = renderer.root.findAllByProps({ className: 'wb-pane-frame-fit' });
-    expect(fit).toHaveLength(1);
+    // Phones take the same plain-iframe path as pointer layouts. A transform
+    // scale here is what blanked the terminal on iOS: WKWebView does not
+    // composite canvas/WebGL inside a scaled iframe. The terminal page fits
+    // itself to whatever width the iframe actually has, so none is needed.
     const frame = terminalFrame(renderer)!;
     expect(frame).toBeTruthy();
     expect(String(frame.props.src)).toContain('/s/session-0');
-    // Virtual width keeps the TUI column count a phone could never lay out on
-    // its own; the transform shrinks that fixed box back onto the real screen.
-    const style = frame.props.style as Record<string, string | number>;
-    expect(style.width).toBe(720);
-    expect(String(style.transform)).toMatch(/^scale\(([\d.]+)\)$/);
-    expect(Number(/^scale\(([\d.]+)\)$/.exec(String(style.transform))![1])).toBeLessThan(1);
-    expect(style.transformOrigin).toBe('0 0');
+    expectPlainEmbed(frame);
     act(() => renderer.unmount());
   });
 
-  it('leaves the pointer-layout terminal unscaled, so scaling stays a phone-only concession', async () => {
+  it('leaves the pointer-layout terminal unscaled too, matching the phone contract', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
@@ -502,10 +503,9 @@ describe('mobile session surfaces', () => {
     });
     const openTerminal = renderer.root.findAll(node => node.props.className === 'wb-session-row-action is-terminal')[0];
     await act(async () => { openTerminal.props.onClick({ stopPropagation() {} }); });
-    expect(renderer.root.findAllByProps({ className: 'wb-pane-frame-fit' })).toHaveLength(0);
     const frame = terminalFrame(renderer)!;
     expect(frame).toBeTruthy();
-    expect(frame.props.style).toBeUndefined();
+    expectPlainEmbed(frame);
     act(() => renderer.unmount());
   });
 });

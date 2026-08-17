@@ -52,66 +52,11 @@ function apiErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 虚拟布局宽度：保证 TUI 列数，等比缩放贴合手机屏。 */
-const VIRTUAL_W = 720;
-
-/** 没有 ResizeObserver（SSR / 老浏览器）时的兜底尺寸：直接按 390 宽算 scale，不抛错。 */
-const FALLBACK_FIT = { w: 390, h: 640 };
-
-/** 手机端内嵌终端。iframe 固定按 VIRTUAL_W 宽布局，xterm 由此自适应出够用的列数，
- *  再整体 transform: scale(实际宽 / VIRTUAL_W) 等比缩小贴合容器；高度反向放大
- *  （容器高 / scale），保证缩放后恰好占满，不留白也不溢出。这正是全屏终端页靠
- *  meta viewport 做的事——而 meta viewport 在 iframe 里不生效，只能自己来。
- *  滚动和点击坐标浏览器会按 transform 自动映射，触屏输入无需额外处理。 */
-function ScaledTerminalFrame(props: { frameKey: string; src: string; title: string }): JSX.Element {
-  const fitRef = useRef<HTMLDivElement | null>(null);
-  const [fit, setFit] = useState({ w: 0, h: 0 });
-  useEffect(() => {
-    const node = fitRef.current;
-    if (!node) return undefined;
-    const update = () => setFit({ w: node.clientWidth || 0, h: node.clientHeight || 0 });
-    update();
-    // 转屏、分栏拖动都靠它重算 scale；没有 ResizeObserver 就退回上面那次测量。
-    if (typeof ResizeObserver === 'undefined') return undefined;
-    const observer = new ResizeObserver(update);
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, []);
-  const box = fit.w > 0 && fit.h > 0
-    ? fit
-    : (typeof ResizeObserver === 'undefined' ? FALLBACK_FIT : null);
-  const scale = box ? box.w / VIRTUAL_W : 1;
-  return (
-    <div ref={fitRef} className="wb-pane-frame-fit">
-      {/* 量到宽高之前只渲染空占位：scale 未知时挂 iframe 只会先按错误尺寸闪一下。 */}
-      {box ? (
-        <iframe
-          key={props.frameKey}
-          className="wb-pane-frame"
-          src={props.src}
-          title={props.title}
-          allow="clipboard-read; clipboard-write"
-          referrerPolicy="no-referrer"
-          style={{
-            width: VIRTUAL_W,
-            height: Math.round(box.h / scale),
-            transform: `scale(${scale})`,
-            transformOrigin: '0 0',
-          }}
-        />
-      ) : null}
-    </div>
-  );
-}
-
 export function TerminalPane(props: PaneCommonProps & {
   location: WorkbenchTerminalLocation | null;
   /** Request control as soon as the pane is ready, for the row shortcut that
    *  opens a writable terminal in one click. */
   autoTakeControl?: boolean;
-  /** 触屏容器（手机端）改用虚拟宽度等比缩放内嵌终端，见 ScaledTerminalFrame；
-   *  标题栏的「新标签页打开」仍然是全屏入口。 */
-  handOffToFullScreen?: boolean;
 }): JSX.Element {
   const [control, setControl] = useState<TerminalControlState | null>(null);
   const [phase, setPhase] = useState<'loading' | 'ready' | 'busy' | 'error'>('loading');
@@ -295,13 +240,10 @@ export function TerminalPane(props: PaneCommonProps & {
             <p>该后端不在工作台面板内展示。</p>
             <a href={externalTerminalUrl} target="_blank" rel="noopener noreferrer">打开外部终端</a>
           </div>
-        ) : frameUrl && props.handOffToFullScreen ? (
-          <ScaledTerminalFrame
-            frameKey={`${props.session.sessionId}-${frameGeneration}`}
-            src={frameUrl}
-            title={`终端 — ${workbenchSessionTitle(props.session)}`}
-          />
         ) : frameUrl ? (
+          // 手机端和桌面走同一条直嵌路径，不做任何 transform 缩放：iOS WKWebView 对被
+          // 缩放的 iframe 内 canvas/WebGL 有不渲染的合成缺陷，终端会整片空白。终端页
+          // 自身会按 iframe 的实际宽度 fit 出列数，窄屏直嵌即可正常显示。
           <iframe
             key={`${props.session.sessionId}-${frameGeneration}`}
             className="wb-pane-frame"
