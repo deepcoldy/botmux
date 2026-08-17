@@ -97,11 +97,20 @@ describe('shim contract (layer 1)', () => {
 
 describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
   class SyntheticCgroupBackend extends MojoBackend {
-    constructor(cfg: never, sessionId: string, private readonly root: string) {
+    constructor(
+      cfg: never,
+      sessionId: string,
+      private readonly root: string,
+      private readonly fakeProcRoot: string,
+    ) {
       super(cfg, sessionId);
     }
 
     protected override get cgroupRoot(): string { return this.root; }
+    // Deterministic: without this the real /proc/self/cgroup is read, which on a
+    // Linux runner nests the boundary under a real cgroup path the test's glob
+    // does not match (macOS has no /proc, so it always fell back and passed).
+    protected override get cgroupProcRoot(): string { return this.fakeProcRoot; }
   }
 
   function boundaryDirs(root: string): string[] {
@@ -114,6 +123,11 @@ describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
     // cgroup.controllers is what cgroupV2Available probes for.
     mkdirSync(cgroupRoot, { recursive: true });
     writeFileSync(join(cgroupRoot, 'cgroup.controllers'), 'cpu memory\n');
+    // A synthetic /proc whose self/cgroup is the root, so resolveSliceParent
+    // deterministically falls back to <cgroupRoot>/botmux.slice on any platform.
+    const procRoot = join(dataDir, 'proc');
+    mkdirSync(join(procRoot, 'self'), { recursive: true });
+    writeFileSync(join(procRoot, 'self', 'cgroup'), '0::/\n');
     const seen = join(dataDir, 'seen-at-exec');
     // The fake mojo's FIRST act is to check whether it is ALREADY enrolled: under
     // pre-exec enrolment this is deterministic ("yes"), under the old post-spawn
@@ -126,7 +140,7 @@ describe('backend wiring through a synthetic cgroup root (layer 2)', () => {
       `echo '{"type":"result","status":"ok","result":"done","session_id":"sid-synth","warnings":[]}'`,
       'exit 0',
     ].join('\n'));
-    const backend = new SyntheticCgroupBackend({ bin } as never, 'sess-preexec-synth', cgroupRoot);
+    const backend = new SyntheticCgroupBackend({ bin } as never, 'sess-preexec-synth', cgroupRoot, procRoot);
     backend.spawn('', [], {} as never);
     backend.write('turn');
     expect(await waitFor(() => existsSync(seen))).toBe(true);

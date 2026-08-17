@@ -673,6 +673,10 @@ export class MojoBackend implements SessionBackend {
      *  cgroup root. `undefined` = the real /sys/fs/cgroup. */
     protected get cgroupRoot(): string | undefined { return undefined; }
 
+    /** Overridable so a test can point the delegated-parent lookup
+     *  (/proc/self/cgroup) at a synthetic /proc. `undefined` = the real /proc. */
+    protected get cgroupProcRoot(): string | undefined { return undefined; }
+
     /**
      * SIGTERM the whole turn SUBTREE, then gather the best evidence this host can
      * give that nothing in it survives (escalating to SIGKILL).
@@ -1676,7 +1680,10 @@ export class MojoBackend implements SessionBackend {
                         generation: this.containmentGeneration,
                         nonce: this.treeNonce,
                     },
-                    this.cgroupRoot !== undefined ? { cgroupRoot: this.cgroupRoot } : {},
+                    {
+                        ...(this.cgroupRoot !== undefined ? { cgroupRoot: this.cgroupRoot } : {}),
+                        ...(this.cgroupProcRoot !== undefined ? { procRoot: this.cgroupProcRoot } : {}),
+                    },
                 );
             this.usedEnrolShim = this.preparedBoundary !== null;
             const launchBin = this.preparedBoundary ? '/bin/sh' : bin;
