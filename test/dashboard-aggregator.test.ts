@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Aggregator } from '../src/dashboard/aggregator.js';
+import { Aggregator, subscribeDaemon } from '../src/dashboard/aggregator.js';
 
 describe('Aggregator cache merge', () => {
   it('upsert via session.spawned and session.update', () => {
@@ -127,5 +127,56 @@ describe('Aggregator cache merge', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0].larkAppId).toBe('appB');
     expect(seen[0].type).toBe('session.spawned');
+  });
+});
+
+describe('subscribeDaemon reconnect', () => {
+  const daemon = { larkAppId: 'appA', ipcPort: 19999, botName: 'A' } as any;
+
+  /** A never-ending SSE stream (prevents tight reconnect loops in tests). */
+  function neverEndingSSE(): Response {
+    const stream = new ReadableStream({
+      start(controller) {
+        // Enqueue one event then hold the stream open forever.
+        controller.enqueue(new TextEncoder().encode('event: ping\ndata: {}\n\n'));
+        // Never close — the abort will release the reader.
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  }
+
+  it('does not fire onReconnect on the first successful connection', async () => {
+    let reconnects = 0;
+    const abort = subscribeDaemon(
+      daemon, new Aggregator(),
+      () => {},
+      () => Promise.resolve(neverEndingSSE()),
+      () => { reconnects++; },
+    );
+    await new Promise(r => setTimeout(r, 100));
+    abort();
+    expect(reconnects).toBe(0);
+  });
+
+  it('fires onReconnect after a fetch failure and successful retry', async () => {
+    let reconnects = 0;
+    let call = 0;
+    const abort = subscribeDaemon(
+      daemon, new Aggregator(),
+      () => {},
+      () => {
+        call++;
+        if (call === 1) return Promise.reject(new Error('connection refused'));
+        return Promise.resolve(neverEndingSSE());
+      },
+      () => { reconnects++; },
+    );
+    // Wait for: initial fail → 1s backoff → reconnect → onReconnect
+    await new Promise(r => setTimeout(r, 1_500));
+    abort();
+    expect(reconnects).toBe(1);
   });
 });

@@ -135,21 +135,37 @@ export class Aggregator {
 /**
  * Subscribe to one daemon's SSE stream and feed events into the aggregator.
  * Auto-reconnects on error with 1s backoff. Returns an abort function.
+ *
+ * `onReconnect` fires after the stream is re-established following a drop,
+ * so the caller can re-hydrate and recover events missed while disconnected.
  */
 export function subscribeDaemon(
   d: DaemonInfo,
   agg: Aggregator,
   onError: (e: Error) => void,
   fetchImpl: typeof fetch = fetch,
+  onReconnect?: () => void,
 ): () => void {
   const ctrl = new AbortController();
   const url = `http://127.0.0.1:${d.ipcPort}/api/events`;
+  let hadFailure = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Clear the reconnect backoff immediately on abort so the loop exits
+  // without waiting the full second.
+  ctrl.signal.addEventListener('abort', () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+  }, { once: true });
 
   (async () => {
     while (!ctrl.signal.aborted) {
       try {
         const res = await fetchImpl(url, { signal: ctrl.signal });
         if (!res.ok || !res.body) throw new Error(`bad status ${res.status}`);
+        if (hadFailure) {
+          hadFailure = false;
+          onReconnect?.();
+        }
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
@@ -179,8 +195,12 @@ export function subscribeDaemon(
           }
         }
       } catch (e) {
-        if (!ctrl.signal.aborted) onError(e as Error);
-        await new Promise(r => setTimeout(r, 1_000));
+        if (!ctrl.signal.aborted) {
+          onError(e as Error);
+          hadFailure = true;
+        }
+        await new Promise(r => { reconnectTimer = setTimeout(r, 1_000); });
+        reconnectTimer = undefined;
       }
     }
   })();

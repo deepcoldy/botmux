@@ -1451,6 +1451,13 @@ function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
  * would let snapshot data clobber events that arrived between subscribe and
  * the snapshot fetch.
  *
+ * However, hydrate-then-subscribe leaves a race window: events that fire
+ * between the snapshot fetch and the SSE handshake are missed entirely. To
+ * close it, a second lightweight hydration runs after the subscription is
+ * established. Its snapshot is newer than the first, so it picks up every
+ * missed event; any event arriving after the subscription is delivered via
+ * SSE and is at least as new as the second snapshot.
+ *
  * Idempotent: a second call for the same daemon while one is in flight is a
  * no-op; a call after attach finished re-hydrates (useful when a daemon
  * restarts and we want to refresh its slice of the cache).
@@ -1483,11 +1490,39 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
+          // On SSE reconnect, re-hydrate to recover events missed while the
+          // stream was down.
+          () => { void rehydrateDaemon(d); },
         ),
       );
     }
+    // 3. Re-hydrate to close the hydrate→subscribe race window. Events that
+    //    fired between step 1 and step 2 were not delivered over SSE; this
+    //    second snapshot is fetched *after* the subscription, so it reflects
+    //    those events. SSE events arriving after step 2 are applied on top
+    //    and are at least as fresh as this snapshot.
+    await rehydrateDaemon(d);
   } finally {
     attaching.delete(d.larkAppId);
+  }
+}
+
+/**
+ * Fetch the current session snapshot from one daemon and merge it into the
+ * aggregator. Used both for the post-subscribe race-window close and for
+ * SSE reconnect recovery.
+ */
+async function rehydrateDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
+  try {
+    const sRes = await fetchDaemonIpc(d.ipcPort, '/api/sessions');
+    const s = await sRes.json() as { sessions: any[] };
+    const rows = (s.sessions ?? []).map((row) => (
+      d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
+    ));
+    aggregator.hydrateSessions(d.larkAppId, rows);
+    for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
+  } catch (e: any) {
+    logger.warn(`[dashboard] re-hydrate ${d.larkAppId}: ${e.message ?? e}`);
   }
 }
 
