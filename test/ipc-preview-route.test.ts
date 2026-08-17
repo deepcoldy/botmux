@@ -24,6 +24,11 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+/**
+ * P1-12：注册路由现在要求「监听这个端口的进程属于本会话的血缘」。测试里的
+ * `reachablePort()` 服务器就是本测试进程开的，所以把本进程 pid 当作 worker pid —— 归属
+ * 校验会真的去读 /proc/net/tcp + /proc/<pid>/fd 得出证明，不是任何形式的桩。
+ */
 function activeSession(sessionId = 's-preview', capability = CAPABILITY): any {
   return {
     session: {
@@ -33,8 +38,11 @@ function activeSession(sessionId = 's-preview', capability = CAPABILITY): any {
       rootMessageId: 'om_preview',
       title: 'Preview session',
       createdAt: '2026-08-11T12:00:00.000Z',
+      workerGeneration: 5,
     },
     larkAppId: 'app-preview',
+    workerGeneration: 5,
+    worker: { pid: process.pid, killed: false },
     managedTurnOrigin: { capability },
   };
 }
@@ -101,7 +109,12 @@ describe('POST /api/sessions/:sessionId/preview', () => {
       expect(publicJson).not.toContain(secret);
     }
 
-    expect(ds.session.previewTarget).toMatchObject({ host: '127.0.0.1', port });
+    expect(ds.session.previewTarget).toMatchObject({
+      host: '127.0.0.1',
+      port,
+      workerGeneration: 5,
+      owner: { pid: process.pid },
+    });
     expect(update).toHaveBeenCalledWith(ds.session);
     expect(publish).toHaveBeenCalledWith({
       type: 'session.update',
@@ -181,10 +194,92 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     expect(update).not.toHaveBeenCalled();
   });
 
+  it('P1-13: discards a registration whose worker generation advanced during the probe', async () => {
+    const port = await reachablePort();
+    const ds = activeSession();
+    let lookups = 0;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(() => {
+      lookups++;
+      // 第一次查询 = handler 捕获 ds/代次，紧接着就进入 probe 的 await。在那个窗口里
+      // 会话被 refork（或切了 CLI / 被 adopt），新一代 worker 上线、代次推进。
+      if (lookups === 1) {
+        queueMicrotask(() => {
+          ds.workerGeneration = 6;
+          ds.session.workerGeneration = 6;
+        });
+      }
+      return ds;
+    });
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+
+    const res = await postPreview(ds.session.sessionId, { port });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'preview_generation_changed' });
+    // 上一代 CLI 的注册绝不能回填到新一代身上。
+    expect(ds.session).not.toHaveProperty('previewTarget');
+    expect(update).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('P1-13: discards a registration whose session was closed during the probe', async () => {
+    const port = await reachablePort();
+    const ds = activeSession();
+    let lookups = 0;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(() => {
+      lookups++;
+      if (lookups === 1) queueMicrotask(() => { ds.session.status = 'closed'; });
+      return ds;
+    });
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+
+    const res = await postPreview(ds.session.sessionId, { port });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'preview_generation_changed' });
+    expect(ds.session).not.toHaveProperty('previewTarget');
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('Riff 矩阵: a remote sandbox session is explicitly unsupported, not "unreachable"', async () => {
+    const port = await reachablePort();
+    const ds = activeSession();
+    ds.session.backendType = 'riff';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+
+    const res = await postPreview(ds.session.sessionId, { port });
+
+    // 远端 sandbox 的 Web 服务不在这台机器上：这不是偶发故障，重试多少次都一样。
+    expect(res.status).toBe(501);
+    expect(await res.json()).toEqual({ ok: false, error: 'preview_unsupported' });
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('本机后端矩阵: pty/tmux/zellij still register normally', async () => {
+    for (const backendType of ['pty', 'tmux', 'zellij']) {
+      const port = await reachablePort();
+      const ds = activeSession(`s-${backendType}`);
+      ds.session.backendType = backendType;
+      vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+      vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+
+      const res = await postPreview(ds.session.sessionId, { port });
+
+      expect(res.status, backendType).toBe(200);
+      expect(ds.session.previewTarget, backendType).toMatchObject({ port });
+      vi.restoreAllMocks();
+      await new Promise<void>(resolve => targetServer!.close(() => resolve()));
+      targetServer = null;
+    }
+  });
+
   it('restores in-memory state when durable persistence fails', async () => {
     const port = await reachablePort();
     const previous = {
       host: '127.0.0.1', port: 1111, registeredAt: '2026-08-10T00:00:00.000Z',
+      owner: { pid: 4242, procStart: '918273', inode: '556677' }, workerGeneration: 4,
     };
     const ds = activeSession();
     ds.session.previewTarget = previous;
@@ -199,12 +294,49 @@ describe('POST /api/sessions/:sessionId/preview', () => {
   });
 });
 
+describe('DELETE /api/sessions/:sessionId/preview', () => {
+  it('P1-12: lets the central proxy retire a target whose port changed hands', async () => {
+    const handle = await ensureIpc();
+    const ds = activeSession();
+    ds.session.previewTarget = {
+      host: '127.0.0.1', port: 4173, registeredAt: '2026-08-11T12:00:00.000Z',
+      owner: { pid: 4242, procStart: '918273', inode: '556677' }, workerGeneration: 5,
+    };
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+    const path = `/api/sessions/${ds.session.sessionId}/preview`;
+
+    // 未签名调用改不了任何东西。
+    const denied = await fetch(`http://127.0.0.1:${handle.port}${path}`, { method: 'DELETE' });
+    expect(denied.status).toBe(401);
+    expect(ds.session.previewTarget).toBeDefined();
+
+    const allowed = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'DELETE',
+      headers: daemonIpcAuthHeaders({
+        secret: HOST_SECRET, port: handle.port, method: 'DELETE', path,
+      }),
+    });
+
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual({ ok: true, cleared: true });
+    expect(ds.session.previewTarget).toBeUndefined();
+    expect(update).toHaveBeenCalledWith(ds.session);
+    expect(publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: { sessionId: 's-preview', patch: { previewTarget: null } },
+    });
+  });
+});
+
 describe('GET /api/sessions/:sessionId/preview', () => {
   it('requires trusted-host HMAC and returns no literal target', async () => {
     const handle = await ensureIpc();
     const ds = activeSession();
     ds.session.previewTarget = {
       host: '127.0.0.1', port: 4173, registeredAt: '2026-08-11T12:00:00.000Z',
+      owner: { pid: 4242, procStart: '918273', inode: '556677' }, workerGeneration: 5,
     };
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     const path = `/api/sessions/${ds.session.sessionId}/preview`;

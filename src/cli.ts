@@ -6073,6 +6073,17 @@ async function cmdPreview(rest: string[]): Promise<void> {
   const error = body.error ?? `HTTP ${response.status}`;
   if (error === 'preview_unreachable') {
     console.error('✗ 端口不可达；请先让 Web 服务监听本机 loopback/0.0.0.0 后再注册');
+  } else if (error === 'preview_owner_unverified') {
+    // P1-12：端口上确实有人在监听，但证明不了那是本会话起的进程。宁可没有预览，
+    // 也不把 Dashboard 用户代理进一个来路不明的本机服务。
+    console.error(
+      '✗ 无法确认该端口由本会话的进程持有；请在会话内直接启动 Web 服务后再注册'
+      + '（不要用 setsid/nohup 脱离进程树，也不要注册别的程序占用的端口）',
+    );
+  } else if (error === 'preview_unsupported') {
+    console.error('✗ 当前会话后端（远端 sandbox）的 Web 服务不在本机，Dashboard 预览不支持');
+  } else if (error === 'preview_generation_changed') {
+    console.error('✗ 注册期间会话已换代或已关闭；请在新一轮里重新注册');
   } else if (error === 'remote_host_forbidden') {
     console.error('✗ 只允许注册本机 loopback 服务');
   } else if (error === 'origin_unproven' || error === 'managed_action_required') {
@@ -6934,7 +6945,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
                    单个活跃会话可省略 id
   preview <port>   （会话内）注册当前会话已启动的本机 Web 服务；Dashboard 登录后通过
-                   同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token
+                   同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token。
+                   端口必须由本会话的进程持有（在会话内直接启动，别 setsid/nohup
+                   脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态

@@ -118,10 +118,17 @@ async function startUpstream(): Promise<{
   };
 }
 
+/** P1-12：注册时留下的 listener 归属证明。代理侧只把它当不透明数据透传，真实
+ *  procfs 复核由 dashboard.ts 的 resolve 负责（见 session-preview-ownership 测试）。 */
+const TARGET_OWNER = { pid: 424242, procStart: '918273', inode: '556677' } as const;
+
 function okTarget(port: number): PreviewProxyResolution {
   return {
     ok: true,
-    target: { host: '127.0.0.1', port, registeredAt: TARGET_TIME },
+    target: {
+      host: '127.0.0.1', port, registeredAt: TARGET_TIME,
+      owner: { ...TARGET_OWNER }, workerGeneration: 7,
+    },
   };
 }
 
@@ -153,7 +160,10 @@ describe('session preview same-origin reverse proxy', () => {
   });
 
   it('drops hop-by-hop and Connection-nominated headers while preserving a WS upgrade', () => {
-    const target = { host: '127.0.0.1' as const, port: 3000, registeredAt: TARGET_TIME };
+    const target = {
+      host: '127.0.0.1' as const, port: 3000, registeredAt: TARGET_TIME,
+      owner: { ...TARGET_OWNER }, workerGeneration: 7,
+    };
     const headers = previewRequestHeaders({
       host: 'dashboard.example',
       connection: 'keep-alive, x-hop-secret',
@@ -613,9 +623,11 @@ describe('P1-8 preview streams die with the auth session that opened them', () =
       verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
       // dashboard.ts 的同款接线：content 路径归属凭据里的 authSession，
       // cookie 路径归属当前请求身份。
+      // 第三个参数是 P1-13 的会话索引：身份没结束、但预览目标失效时靠它定点断流。
       bindStream: (_req, ctx, close) => registry.register(
         ctx.contentCapability ? 'capability-auth-session' : 'cookie-auth-session',
         close,
+        ctx.sessionId,
       ),
     });
     revocable = createServer((req, res) => {
@@ -673,6 +685,57 @@ describe('P1-8 preview streams die with the auth session that opened them', () =
     await expect(Promise.race([
       reader.read(),
       new Promise((_resolve, reject) => setTimeout(() => reject(new Error('preview SSE survived revocation')), 4_000).unref()),
+    ])).rejects.toThrow(/terminated|aborted|socket|network|closed/i);
+  });
+
+  // ─── P1-13：身份还在，但预览目标失效（换代 / 关闭 / 端口易主）──────────────
+  it('closes this session preview WebSocket when its target is retired, leaving other sessions alone', async () => {
+    const { port, registry } = await startRevocable();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${contentBase('s1')}/socket`, { origin: 'null' });
+    liveSockets.add(ws);
+    await new Promise<void>((resolve, reject) => {
+      ws.on('message', () => resolve());
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('preview WebSocket never opened')), 4_000).unref();
+    });
+    // 同一个登录身份下、另一个会话的预览流：不能被误伤。
+    const other = await fetch(`http://127.0.0.1:${port}/preview/s2/stream`, {
+      headers: { cookie: managementCookie() },
+    });
+    const otherReader = other.body!.getReader();
+    expect(new TextDecoder().decode((await otherReader.read()).value)).toContain('event: hello');
+    expect(registry.countSessionStreams('s1')).toBe(1);
+    expect(registry.countSessionStreams('s2')).toBe(1);
+
+    const closed = new Promise<void>((resolve, reject) => {
+      ws.on('close', () => resolve());
+      setTimeout(() => reject(new Error('preview WebSocket survived target retirement')), 4_000).unref();
+    });
+    expect(registry.closeSessionStreams('s1')).toBe(1);
+    await closed;
+    liveSockets.delete(ws);
+    expect(registry.countSessionStreams('s1')).toBe(0);
+    // 两个索引不漂移：会话索引关掉的连接，也从 authSession 索引里摘干净了。
+    expect(registry.count('capability-auth-session')).toBe(0);
+    expect(registry.countSessionStreams('s2')).toBe(1);
+    expect(registry.count('cookie-auth-session')).toBe(1);
+    // 收尾：这条 SSE 永不自结束，留着会挂住 afterEach 的 server.close()。
+    expect(registry.closeSessionStreams('s2')).toBe(1);
+    await otherReader.cancel().catch(() => { /* 已被服务端销毁 */ });
+  });
+
+  it('closes an in-flight preview SSE when the session target is retired', async () => {
+    const { port, registry } = await startRevocable();
+    const response = await fetch(`http://127.0.0.1:${port}/preview/s1/stream`, {
+      headers: { cookie: managementCookie() },
+    });
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('event: hello');
+
+    expect(registry.closeSessionStreams('s1')).toBe(1);
+    await expect(Promise.race([
+      reader.read(),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('preview SSE survived target retirement')), 4_000).unref()),
     ])).rejects.toThrow(/terminated|aborted|socket|network|closed/i);
   });
 });

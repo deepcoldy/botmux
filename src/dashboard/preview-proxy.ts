@@ -311,6 +311,7 @@ function socketError(socket: Duplex, status: number, error: string): void {
     : status === 403 ? 'Forbidden'
     : status === 404 ? 'Not Found'
     : status === 409 ? 'Conflict'
+    : status === 501 ? 'Not Implemented'
     : status === 503 ? 'Service Unavailable'
     : 'Bad Gateway';
   socket.end([

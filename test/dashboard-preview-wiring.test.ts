@@ -11,6 +11,17 @@ describe('central dashboard preview wiring', () => {
     expect(dashboardSource).toContain('sessionPreviewProxy.handleUpgrade(req, clientSocket, head)');
   });
 
+  // 行为证据在 session-preview-ownership / -lifecycle / -close 三个套件里；这里只钉
+  // 「中央 Dashboard 确实把生产依赖接到了那些函数上」这一件源码事实。
+  it('re-checks listener ownership on every hop and tears the session down when it changes', () => {
+    expect(dashboardSource).toContain('resolveSessionPreviewForProxy({');
+    expect(dashboardSource).toContain('isTargetOwned: target => sessionPreviewTargetStillOwned(target)');
+    expect(dashboardSource).toContain('onStaleTarget: staleSessionId => invalidateStalePreviewTarget(staleSessionId, owner)');
+    expect(dashboardSource).toContain('authSessionConnections.closeSessionStreams(sessionId)');
+    expect(dashboardSource).toContain('previewInteraction.relockSession(sessionId)');
+    expect(dashboardSource).toContain('authSessionConnections.register(authSessionId, close, ctx.sessionId)');
+  });
+
   it('projects internal targets out of both REST snapshots and SSE events', () => {
     expect(dashboardSource).toContain('projectSessionPreviewsForBrowser(sessions)');
     expect(dashboardSource).toContain('projectSessionPreviewEventForBrowser(ev.type, ev.body)');

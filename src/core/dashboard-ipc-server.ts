@@ -207,9 +207,11 @@ import { requestAgentSessionRename } from './session-rename.js';
 import {
   isPreviewLoopbackHost,
   isPreviewPort,
+  previewBackendSupported,
   probeSessionPreviewTarget,
   sessionPreviewDescriptor,
 } from './session-preview.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
@@ -1368,6 +1370,27 @@ function sessionCliIpcAuth(
   return decision.ok ? { ok: true } : { ok: false, error: decision.error };
 }
 
+/**
+ * P1-12：会话血缘的根 pid——「谁有资格持有预览端口」的起点。
+ *
+ * worker fork 出来的进程树覆盖 pty 后端；tmux / zellij / herdr 这类后端的 CLI 是复用
+ * 器服务端的子进程、不在 worker 树下，所以 worker 通过私有 IPC 上报的 cliPid（以及
+ * adopt 会话接管的那个 CLI pid）必须单独作根，否则这些后端会被误判成「来路不明」。
+ */
+function previewOwnerPids(ds: DaemonSession): Array<number | undefined> {
+  return [
+    ds.worker?.pid,
+    ds.localProcessAttestation?.cliPid,
+    ds.session.pid,
+    ds.adoptedFrom?.originalCliPid,
+  ];
+}
+
+/** 当前权威代次。CAS 与 target 落盘都以它为准。 */
+function previewWorkerGeneration(ds: DaemonSession): number {
+  return ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+}
+
 /** Register one reachable loopback Web service for the exact calling session.
  * This is the only route that can create preview routing state. An isolated CLI
  * enters through the narrow capability aperture; a trusted host call is still
@@ -1389,18 +1412,56 @@ ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) =>
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Riff 矩阵：远端 sandbox 的 Web 服务跑在远程主机上，daemon 这侧的 loopback 上
+  // 永远不会有它的监听。明确回 `preview_unsupported`，不要让它落进
+  // `preview_unreachable` 冒充「偶发故障」让 agent 反复重试。
+  if (!previewBackendSupported(ds.initConfig?.backendType ?? ds.session.backendType)) {
+    return jsonRes(res, 501, { ok: false, error: 'preview_unsupported' });
+  }
   if (!isPreviewPort(body.port)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_port' });
   }
   if (body.host !== undefined && !isPreviewLoopbackHost(body.host)) {
     return jsonRes(res, 403, { ok: false, error: 'remote_host_forbidden' });
   }
-  const target = await probeSessionPreviewTarget({
+  // P1-13：probe 是一次 await。鉴权发生在 await **之前**，而 await 期间这个会话可能
+  // 已经被 close、被 refork、切了 CLI——那些路径都会推进代次并清掉 previewTarget。
+  // 捕获本次请求看到的对象与代次，回填前做 CAS 复核，不一致就整条丢弃：否则一个属于
+  // 上一代 CLI 的注册会被写进新一代（甚至已关闭）的会话里。
+  const generationAtEntry = previewWorkerGeneration(ds);
+  const workerAtEntry = ds.worker;
+  const probe = await probeSessionPreviewTarget({
     port: body.port,
     ...(isPreviewLoopbackHost(body.host) ? { host: body.host } : {}),
+    ownerPids: previewOwnerPids(ds),
+    workerGeneration: generationAtEntry,
   });
-  if (!target) {
+  if (!probe.ok) {
+    if (probe.error === 'invalid_port') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_port' });
+    }
+    if (probe.error === 'preview_owner_unverified') {
+      // fail closed：有人在监听，但证明不了是本会话的进程（血缘外、procfs 不可读、
+      // 非 Linux 平台）。宁可没有预览，也不给出一条指向不明进程的代理路由。
+      return jsonRes(res, 422, {
+        ok: false,
+        error: 'preview_owner_unverified',
+        ...(probe.reason ? { reason: probe.reason } : {}),
+      });
+    }
     return jsonRes(res, 422, { ok: false, error: 'preview_unreachable' });
+  }
+  const target = probe.target;
+  const current = findActiveBySessionId(params.sessionId);
+  const recheck = sessionCliIpcAuth(req, current, params.sessionId, body);
+  if (
+    current !== ds
+    || ds.session.status === 'closed'
+    || previewWorkerGeneration(ds) !== generationAtEntry
+    || ds.worker !== workerAtEntry
+    || !recheck.ok
+  ) {
+    return jsonRes(res, 409, { ok: false, error: 'preview_generation_changed' });
   }
 
   const previous = ds.session.previewTarget;
@@ -1419,6 +1480,23 @@ ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) =>
     ok: true,
     preview: sessionPreviewDescriptor(params.sessionId, target),
   });
+});
+
+/**
+ * P1-12/P1-13：作废一个会话的预览目标。
+ *
+ * 由中央 Dashboard 在**代理落地前**发现归属已变（端口换了进程持有）时调用：代理侧
+ * 只有本机 procfs 的只读视角，改不了会话行，必须由持有会话的 daemon 来清字段 + 落盘
+ * + 广播 `preview: null`。仅 trusted host / HMAC 可用；幂等——本来就没有目标时回 200。
+ */
+ipcRoute('DELETE', '/api/sessions/:sessionId/preview', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const cleared = clearSessionPreviewTarget(ds.session, 'listener ownership changed');
+  return jsonRes(res, 200, { ok: true, cleared });
 });
 
 /** Host-only daemon read API. It intentionally returns the browser-safe

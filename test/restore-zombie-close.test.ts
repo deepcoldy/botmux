@@ -827,6 +827,9 @@ describe('restoreActiveSessions — stale preview target cleanup', () => {
     host: '127.0.0.1' as const,
     port: 4173,
     registeredAt: '2026-08-11T12:00:00.000Z',
+    // 上一代留下的完整持有证明：即便形状完全合法，也不能跨 restore 继续使用。
+    owner: { pid: 4242, procStart: '918273', inode: '556677' },
+    workerGeneration: 3,
   };
 
   it('does not carry a previous generation\'s preview target into the restored row', async () => {

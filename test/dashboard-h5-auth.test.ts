@@ -503,7 +503,17 @@ describe('P1-8 auth end closes every long-lived connection', () => {
     const listeners = new Set<(type: string, body: unknown) => void>();
     const previewProxy = createSessionPreviewProxy({
       authenticated: req => identityOf(req) !== null,
-      resolve: () => ({ ok: true, target: { host: '127.0.0.1', port: upstreamPort, registeredAt: new Date().toISOString() } }),
+      resolve: () => ({
+        ok: true,
+        target: {
+          host: '127.0.0.1',
+          port: upstreamPort,
+          registeredAt: new Date().toISOString(),
+          // P1-12：注册时的 listener 归属证明，代理侧按不透明数据透传。
+          owner: { pid: 424242, procStart: '918273', inode: '556677' },
+          workerGeneration: 7,
+        },
+      }),
       verifyContentCapability: (capability, sessionId) => {
         const verified = verifyPreviewContentCapability(PREVIEW_SECRET, capability, sessionId);
         return verified.ok && isAuthSessionLive(verified.claims.authSessionId);

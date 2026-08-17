@@ -41,6 +41,7 @@ import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
   composeSpawnCodexAppContext,
@@ -232,16 +233,9 @@ async function resumeRestoredPendingRepoSetup(
  * next successful save converges the file.
  */
 function clearRestoredPreviewTarget(session: Session): void {
-  if (session.previewTarget === undefined) return;
-  session.previewTarget = undefined;
-  try {
-    sessionStore.updateSession(session);
-  } catch (err) {
-    logger.error(
-      `[${session.sessionId.substring(0, 8)}] Could not persist preview-target cleanup on restore: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  // P1-13：与 worker 换代 / suspend / exit / close 走同一个收口（清字段 + 落盘 +
+  // 广播 `preview: null`），restore 只是「代次边界」的又一种形态，不该有第二份实现。
+  if (!clearSessionPreviewTarget(session, 'restore opens a new worker generation')) return;
   logger.debug(
     `[${session.sessionId.substring(0, 8)}] Dropped preview target registered by the previous worker `
     + `generation; the session must re-register with \`botmux preview <port>\``,

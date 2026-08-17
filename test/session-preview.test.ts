@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -9,11 +10,13 @@ import {
   sessionPreviewPath,
 } from '../src/core/session-preview.js';
 import {
+  previewDescriptorFromRow,
   projectSessionPreviewEventForBrowser,
   projectSessionPreviewForBrowser,
   projectSessionDetailForBrowser,
   resolveSessionPreviewFromRow,
 } from '../src/dashboard/preview-contract.js';
+import { workbenchPreviewHref } from '../src/dashboard/web/agent-workbench-model.js';
 import {
   projectSessionEventForAudience,
   projectSessionsForAudience,
@@ -22,10 +25,13 @@ import {
 } from '../src/dashboard/public-redact.js';
 
 let server: Server | null = null;
+let outsider: ChildProcess | null = null;
 
 afterEach(async () => {
   if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
   server = null;
+  if (outsider) { try { outsider.kill('SIGKILL'); } catch { /* gone */ } }
+  outsider = null;
 });
 
 describe('session preview target validation', () => {
@@ -42,45 +48,109 @@ describe('session preview target validation', () => {
     }
   });
 
-  it('probes a reachable IPv4 loopback service before producing a target', async () => {
+  it.skipIf(process.platform !== 'linux')('probes a reachable IPv4 loopback service before producing a target', async () => {
     server = createServer((_req, res) => res.end('ok'));
     await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
     const port = (server.address() as { port: number }).port;
 
-    const target = await probeSessionPreviewTarget({
+    // 真实归属：监听 socket 就是本进程开的，所以本进程 pid 作血缘根必须验得过。
+    const probe = await probeSessionPreviewTarget({
       port,
+      ownerPids: [process.pid],
+      workerGeneration: 4,
       now: () => new Date('2026-08-11T12:00:00.000Z'),
     });
 
-    expect(target).toEqual({
+    expect(probe.ok).toBe(true);
+    if (!probe.ok) return;
+    expect(probe.target).toMatchObject({
       host: '127.0.0.1',
       port,
       registeredAt: '2026-08-11T12:00:00.000Z',
+      workerGeneration: 4,
     });
+    expect(probe.target.owner.pid).toBe(process.pid);
+    expect(probe.target.owner.inode).toMatch(/^\d+$/);
+    expect(probe.target.owner.procStart).toMatch(/^\d+$/);
   });
 
-  it('fails closed for an unreachable port', async () => {
+  it.skipIf(process.platform !== 'linux')(
+    'P1-12: refuses a reachable port held outside the session lineage',
+    async () => {
+      server = createServer((_req, res) => res.end('ok'));
+      await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
+      const port = (server.address() as { port: number }).port;
+      // 一个活着的、但与监听者毫无血缘关系的进程，充当「本会话的 worker」。
+      outsider = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+
+      // 端口完全可达（上面那台服务器还开着），但持有它的不是本会话血缘里的进程：
+      // 这正是 agent 注册 Docker API / 别人 dev server 的形状——必须 fail closed，
+      // 且与「不可达」区分开。
+      const probe = await probeSessionPreviewTarget({
+        port,
+        ownerPids: [outsider.pid],
+        workerGeneration: 1,
+      });
+
+      expect(probe).toEqual({ ok: false, error: 'preview_owner_unverified', reason: 'owner_unknown' });
+
+      // init 也不能当血缘根：那等于「本机任何进程都算数」，形同没有证明。
+      await expect(probeSessionPreviewTarget({ port, ownerPids: [1], workerGeneration: 1 }))
+        .resolves.toMatchObject({ ok: false, error: 'preview_owner_unverified' });
+    },
+  );
+
+  it.skipIf(process.platform !== 'linux')('fails closed for an unreachable port', async () => {
     server = createServer();
     await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
     const port = (server.address() as { port: number }).port;
     await new Promise<void>(resolve => server!.close(() => resolve()));
     server = null;
 
-    await expect(probeSessionPreviewTarget({ port, timeoutMs: 100 })).resolves.toBeUndefined();
+    await expect(probeSessionPreviewTarget({
+      port, timeoutMs: 100, ownerPids: [process.pid], workerGeneration: 1,
+    })).resolves.toEqual({ ok: false, error: 'preview_unreachable' });
   });
 
-  it('rejects malformed/remote persisted targets at the use boundary', () => {
+  it('rejects malformed/remote/unproven persisted targets at the use boundary', () => {
+    const owner = { pid: 4242, procStart: '918273', inode: '556677' };
     expect(safeSessionPreviewTarget({
-      host: '127.0.0.1', port: 3000, registeredAt: '2026-08-11T12:00:00.000Z', extra: 'ignored',
-    })).toEqual({ host: '127.0.0.1', port: 3000, registeredAt: '2026-08-11T12:00:00.000Z' });
+      host: '127.0.0.1',
+      port: 3000,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+      owner,
+      workerGeneration: 2,
+      extra: 'ignored',
+    })).toEqual({
+      host: '127.0.0.1',
+      port: 3000,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+      owner,
+      workerGeneration: 2,
+    });
     expect(safeSessionPreviewTarget({
-      host: '169.254.169.254', port: 80, registeredAt: '2026-08-11T12:00:00.000Z',
+      host: '169.254.169.254', port: 80, registeredAt: '2026-08-11T12:00:00.000Z', owner, workerGeneration: 2,
     })).toBeUndefined();
     expect(safeSessionPreviewTarget({
-      host: '127.0.0.1', port: 0, registeredAt: '2026-08-11T12:00:00.000Z',
+      host: '127.0.0.1', port: 0, registeredAt: '2026-08-11T12:00:00.000Z', owner, workerGeneration: 2,
     })).toBeUndefined();
     expect(safeSessionPreviewTarget({
-      host: '127.0.0.1', port: 3000, registeredAt: 'August 11, 2026',
+      host: '127.0.0.1', port: 3000, registeredAt: 'August 11, 2026', owner, workerGeneration: 2,
+    })).toBeUndefined();
+    // P1-12：老版本（或攻击者）写下的、没有持有证明的 target 一律归零 —— 代理不能
+    // 凭「曾经 connect 通过」把用户导进一个无法再核验的端口。
+    expect(safeSessionPreviewTarget({
+      host: '127.0.0.1', port: 3000, registeredAt: '2026-08-11T12:00:00.000Z', workerGeneration: 2,
+    })).toBeUndefined();
+    expect(safeSessionPreviewTarget({
+      host: '127.0.0.1',
+      port: 3000,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+      owner: { pid: 4242, procStart: 'not-a-number', inode: '556677' },
+      workerGeneration: 2,
+    })).toBeUndefined();
+    expect(safeSessionPreviewTarget({
+      host: '127.0.0.1', port: 3000, registeredAt: '2026-08-11T12:00:00.000Z', owner,
     })).toBeUndefined();
   });
 });
@@ -90,6 +160,8 @@ describe('session preview REST/SSE contract', () => {
     host: '127.0.0.1',
     port: 4173,
     registeredAt: '2026-08-11T12:00:00.000Z',
+    owner: { pid: 4242, procStart: '918273', inode: '556677' },
+    workerGeneration: 3,
   } as const;
 
   it('projects the internal target to a same-origin descriptor with no host, port, or credential', () => {
@@ -189,7 +261,13 @@ describe('session preview REST/SSE contract', () => {
 });
 
 describe('session preview ownership resolution', () => {
-  const target = { host: '127.0.0.1', port: 3000, registeredAt: '2026-08-11T12:00:00.000Z' } as const;
+  const target = {
+    host: '127.0.0.1',
+    port: 3000,
+    registeredAt: '2026-08-11T12:00:00.000Z',
+    owner: { pid: 4242, procStart: '918273', inode: '556677' },
+    workerGeneration: 3,
+  } as const;
 
   it('requires exact session and owning daemon identity', () => {
     expect(resolveSessionPreviewFromRow({
@@ -204,6 +282,51 @@ describe('session preview ownership resolution', () => {
       row: { sessionId: 's1', larkAppId: 'app-b', status: 'idle', previewTarget: target },
       sessionId: 's1', ownerLarkAppId: 'app-a',
     })).toMatchObject({ ok: false, status: 404, error: 'session_owner_mismatch' });
+  });
+
+  it('Riff 矩阵: remote sandbox sessions are unsupported, local backends still resolve', () => {
+    // riff 的 Web 服务在远端主机上，daemon 的 loopback 上永远不会有它的监听。回
+    // preview_unsupported（501），而不是把它混进「不可达」让用户以为是偶发故障。
+    expect(resolveSessionPreviewFromRow({
+      row: { sessionId: 's1', larkAppId: 'app-a', status: 'idle', backendType: 'riff', previewTarget: target },
+      sessionId: 's1', ownerLarkAppId: 'app-a',
+    })).toEqual({ ok: false, status: 501, error: 'preview_unsupported' });
+    // 没注册过预览的 riff 会话同样是「不支持」，不是「未注册」。
+    expect(resolveSessionPreviewFromRow({
+      row: { sessionId: 's1', larkAppId: 'app-a', status: 'idle', backendType: 'riff' },
+      sessionId: 's1', ownerLarkAppId: 'app-a',
+    })).toEqual({ ok: false, status: 501, error: 'preview_unsupported' });
+    for (const backendType of ['pty', 'tmux', 'zellij', 'herdr', 'zmx', undefined]) {
+      expect(resolveSessionPreviewFromRow({
+        row: { sessionId: 's1', larkAppId: 'app-a', status: 'idle', backendType, previewTarget: target },
+        sessionId: 's1', ownerLarkAppId: 'app-a',
+      }), String(backendType)).toEqual({ ok: true, target });
+    }
+  });
+
+  it('Riff 矩阵: the browser never gets a preview entry for a remote-backend session', () => {
+    const riffRow = projectSessionPreviewForBrowser({
+      sessionId: 's1', backendType: 'riff', previewTarget: target,
+    }) as any;
+    expect(riffRow).not.toHaveProperty('preview');
+    expect(riffRow).not.toHaveProperty('previewTarget');
+    expect(previewDescriptorFromRow({ sessionId: 's1', backendType: 'riff', previewTarget: target }))
+      .toBeUndefined();
+
+    // 入口隐藏是真实的：Workbench 用同一个 href 判定要不要显示「网页」面。
+    expect(workbenchPreviewHref(riffRow)).toBeNull();
+
+    for (const backendType of ['pty', 'tmux']) {
+      const localRow = projectSessionPreviewForBrowser({
+        sessionId: 's1', backendType, previewTarget: target,
+      }) as any;
+      expect(localRow.preview, backendType).toEqual({
+        path: '/preview/s1/', registeredAt: target.registeredAt,
+      });
+      expect(previewDescriptorFromRow({ sessionId: 's1', backendType, previewTarget: target }), backendType)
+        .toEqual({ path: '/preview/s1/', registeredAt: target.registeredAt });
+      expect(workbenchPreviewHref(localRow), backendType).toBe('/preview/s1/');
+    }
   });
 
   it('rejects closed, unregistered, and attacker-shaped remote targets explicitly', () => {

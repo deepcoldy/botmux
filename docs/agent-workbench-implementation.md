@@ -63,6 +63,12 @@ botmux preview <port>
 
 无效端口在联系 daemon 前被拒绝；未注册端口、不可达端口和失活会话返回稳定错误，不打印 loopback target、capability 或 daemon credential。
 
+注册不只看「连得上」，还要证明**这个端口由本会话的进程持有**：daemon 从 `/proc/net/tcp{,6}` 取该监听 socket 的 inode，再在会话进程血缘（worker fork pid、worker 私有 IPC 上报的 CLI pid、adopt 的 CLI pid 及其子孙）里找出持有该 inode 的进程，连同它的 `starttime` 一起随 target 落盘。probe 之后与**每一次代理落地之前**都重新核对；inode 变了、pid 复用了、或者拿不到证明（血缘外的进程、procfs 不可读、非 Linux 平台）一律 fail closed：注册返回 `preview_owner_unverified`，代理返回 `preview_target_stale` 并让 daemon 清掉 target、广播 `preview: null`。这挡住两类真实情况——agent 把 Docker API/别人的 dev server 注册成自己的预览，以及自己的 dev server 退出后端口号被别的宿主进程接管。依赖 Linux procfs 与同一 network namespace；复核只读全体可读的 `/proc/net/tcp{,6}` 与 `/proc/<pid>/stat`，因此 Dashboard 进程与 daemon 不同用户也能复核。
+
+previewTarget 是**当代 worker 的路由状态**：worker 换代（refork / 切 CLI / adopt）、suspend、worker 退出、会话关闭都会在同一次落盘里清掉它并广播 `preview: null`，同时断开该会话既有的预览 SSE/WebSocket 并收回交互解锁租约（resume 不继承旧授权）。注册路由在 probe 的 await 之后按捕获的代次/会话对象/capability 做 CAS 复核，await 期间发生的 close/refork 会让这次注册整条作废（`preview_generation_changed`）。
+
+后端矩阵：pty / tmux / zellij / herdr / zmx 的 Web 服务在本机 loopback 上，行为如上；riff 等远端 sandbox 的 Web 服务在远端主机，daemon loopback 天然不可达，注册与解析统一返回 `preview_unsupported`（501），浏览器行不带 preview descriptor，Workbench 据此隐藏「网页」入口。
+
 ### 2.3 响应式布局
 
 - 桌面 rail 默认 300px，可在 176–460px 内拖拽或键盘调整，折叠宽度 40px；是否折叠是用户自己的选择（≥1280px 的 full 档提供开关），窗口变窄不再自动折叠列表。

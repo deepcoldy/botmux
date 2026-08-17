@@ -113,6 +113,35 @@ export class PreviewInteractionManager {
     return this.previewState();
   }
 
+  /**
+   * P1-13：把某个**业务会话**上的交互授权全部收回，不论持有者是谁。
+   *
+   * 交互解锁是「我确认要操作**这个**预览目标」的授权，绑定的是当时那一代 worker 起
+   * 的那个 Web 服务。worker 换代、切 CLI、会话 close→resume、端口易主之后，目标已经
+   * 是另一个进程，旧租约不能顺延：否则 resume 出来的新一代 CLI（或抢到同一端口的别的
+   * 进程）一上来就落在「交互模式」里，用户从未对它点过解锁。收回后回到默认预览模式，
+   * 需要重新显式解锁。
+   */
+  relockSession(sessionId: string): number {
+    let count = 0;
+    for (const [key, lease] of [...this.leases]) {
+      if (lease.sessionId !== sessionId) continue;
+      this.remove(key, lease);
+      try {
+        this.audit.append(controlAuditRecord(
+          lease.userId,
+          lease.sessionId,
+          'preview.target_relock',
+          { now: new Date(this.now()) },
+        ));
+      } catch {
+        // 继续撤销这个会话上剩下的租约。
+      }
+      count++;
+    }
+    return count;
+  }
+
   relockAuthSession(authSessionId: string): number {
     let count = 0;
     for (const [key, lease] of [...this.leases]) {

@@ -253,6 +253,10 @@ export function getDaemonStreamingCardUsageSnapshot(
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import {
+  publishSessionPreviewCleared,
+  takeSessionPreviewTarget,
+} from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
@@ -2964,8 +2968,13 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // probes. See sweepIdleWorkers + restoreActiveSessions.
   ds.hasHistory = true;
   ds.session.suspendedColdResume = true;
+  // P1-13：suspend 会销毁 CLI 与其子进程，那一代 dev server 随之消失（端口号交还
+  // 内核）。会话本身还活着，所以不会走 close 路径——预览必须在这里同步失效，否则
+  // 「休眠中」的会话卡片仍然挂着一条指向空端口/别人进程的预览入口。
+  const suspendedPreviewTarget = takeSessionPreviewTarget(ds.session);
   sessionStore.updateSessionPid(ds.session.sessionId, null);
   sessionStore.updateSession(ds.session);
+  if (suspendedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
 
   if (!ds.exitEventEmitted) {
     ds.exitEventEmitted = true;
@@ -3339,6 +3348,11 @@ export async function closeSession(
   // sessionStore commonly holds the very same Session reference as `ds`.
   const known = !!ds || !!stored;
   const wasOpen = !!stored && stored.status !== 'closed';
+  // P1-13：关闭必须显式广播 `preview: null`。sessionStore.closeSession 会把字段从磁盘
+  // 上抹掉，但没有事件——浏览器侧只会收到 `session.exited`，会话卡片上的预览入口就
+  // 那么留着，Dashboard 的 preview SSE/WS 也拿不到断流信号。
+  const hadPreviewTarget = ds?.session.previewTarget !== undefined
+    || stored?.previewTarget !== undefined;
   const storedHadDocCommentTargets = Object.keys(stored?.docCommentTargets ?? {}).length > 0;
   const docReactionTargets = collectDocCommentReactionTargets(ds, stored);
 
@@ -3404,7 +3418,10 @@ export async function closeSession(
     if (ds) {
       ds.session.status = 'closed';
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+      // 活对象与 store 里的行未必是同一个引用；durable close 只清了后者。
+      takeSessionPreviewTarget(ds.session);
     }
+    if (hadPreviewTarget) publishSessionPreviewCleared(sessionId);
   }
 
   if (ds) {
@@ -9546,7 +9563,11 @@ function setupWorkerHandlers(
       ds.workerGeneration = fencedGeneration;
       ds.session.workerGeneration = fencedGeneration;
       ds.session.pid = undefined;
+      // P1-13：worker 退出（崩溃、被杀、正常结束）同样是权威换代——它带走整棵 CLI
+      // 进程树，包括那一代注册的 dev server。与代次围栏并进同一次落盘。
+      const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
       sessionStore.updateSession(ds.session);
+      if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
     }
     if (!transferRetirement) {
       try {
@@ -10229,6 +10250,11 @@ function reserveWorkerGeneration(ds: DaemonSession): number {
   ) + 1;
   ds.workerGeneration = workerGeneration;
   ds.session.workerGeneration = workerGeneration;
+  // P1-13：换代边界统一清 previewTarget。fork / refork / 切 CLI / adopt 全部经由这里
+  // 预留代次，所以这一处就是「上一代 CLI 起的 dev server 已经失去权威」的唯一判据。
+  // 并进同一次 updateSession，代次推进与预览清空要么一起落盘、要么一起回滚——否则
+  // 会出现「代次已经是新的、磁盘上还留着上一代端口」的中间态，重启后被当成有效路由。
+  const previousPreviewTarget = takeSessionPreviewTarget(ds.session);
   try {
     sessionStore.updateSession(ds.session);
   } catch (error) {
@@ -10236,8 +10262,11 @@ function reserveWorkerGeneration(ds: DaemonSession): number {
     else ds.workerGeneration = previousDaemonGeneration;
     if (previousSessionGeneration === undefined) delete ds.session.workerGeneration;
     else ds.session.workerGeneration = previousSessionGeneration;
+    // 只在原本有目标时写回：预留失败不该给一个从未注册过预览的会话凭空加上这个键。
+    if (previousPreviewTarget !== undefined) ds.session.previewTarget = previousPreviewTarget;
     throw error;
   }
+  if (previousPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
   // Reservation is the first durable proof that the previous generation has
   // lost authority. Clear its TUI slot before any environment check, adapter
   // creation, or fork can throw and strand a clicked card in "processing".

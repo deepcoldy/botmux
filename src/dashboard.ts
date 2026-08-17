@@ -58,8 +58,9 @@ import {
   projectSessionDetailForBrowser,
   projectSessionPreviewEventForBrowser,
   projectSessionPreviewsForBrowser,
-  resolveSessionPreviewFromRow,
+  resolveSessionPreviewForProxy,
 } from './dashboard/preview-contract.js';
+import { sessionPreviewTargetStillOwned } from './core/session-preview.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
@@ -529,19 +530,50 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+/**
+ * P1-13：一个会话的预览目标失效时的收口动作（本进程侧）。
+ *
+ * 「失效」= 目标没了或换了主人：worker 换代 / 切 CLI / 会话关闭 / 端口被别的进程接管。
+ * 这三件事必须一起做，少一件就留一扇后窗：
+ *   1. 断掉该会话已经建立的预览 SSE / 长响应 / WebSocket——它们握手时是合法的，此刻
+ *      仍在把一个**不再属于这个会话**的进程的内容送进浏览器；
+ *   2. 收回该会话上的交互租约（resume 出来的新一代不得继承旧的「交互模式」授权）；
+ *   3. 让持有会话的 daemon 清掉 previewTarget 并广播 `preview: null`——代理进程只有
+ *      procfs 的只读视角，改不了会话行。
+ */
+const previewInvalidationsInFlight = new Set<string>();
+function teardownSessionPreview(sessionId: string): void {
+  authSessionConnections.closeSessionStreams(sessionId);
+  previewInteraction.relockSession(sessionId);
+}
+function invalidateStalePreviewTarget(sessionId: string, ownerLarkAppId: string | undefined): void {
+  teardownSessionPreview(sessionId);
+  if (!ownerLarkAppId || previewInvalidationsInFlight.has(sessionId)) return;
+  // 每个会话同一时刻只发一次清理请求：刷新一次页面就是几十条子资源请求，逐条捅
+  // daemon 会把一次失效放大成一场风暴。拒绝本身已经生效，这里只是让状态收敛。
+  previewInvalidationsInFlight.add(sessionId);
+  void proxyToDaemon(ownerLarkAppId, `/api/sessions/${encodeURIComponent(sessionId)}/preview`, {
+    method: 'DELETE',
+  }).catch(() => { /* 清理是收敛动作；失败时本次拒绝依旧成立 */ })
+    .finally(() => previewInvalidationsInFlight.delete(sessionId));
+}
+
+/**
+ * 每一跳预览请求的判定入口（HTTP、WebSocket 升级、guard 页面共用同一条）。
+ *
+ * P1-12：归属复核只读 /proc/net/tcp{,6} 与 /proc/<pid>/stat（全体可读），所以即便
+ * 代理进程与 daemon 不是同一个用户也能在每次落地前重新核验。
+ */
 function resolveDashboardSessionPreview(sessionId: string): PreviewProxyResolution {
-  const row = aggregator.getSession(sessionId);
   const owner = aggregator.ownerOf(sessionId);
-  const resolution = resolveSessionPreviewFromRow({
-    row,
+  return resolveSessionPreviewForProxy({
+    row: aggregator.getSession(sessionId),
     sessionId,
     ownerLarkAppId: owner,
+    daemonOnline: !!owner && !!registry.getByAppId(owner),
+    isTargetOwned: target => sessionPreviewTargetStillOwned(target),
+    onStaleTarget: staleSessionId => invalidateStalePreviewTarget(staleSessionId, owner),
   });
-  if (!resolution.ok) return resolution;
-  if (!owner || !registry.getByAppId(owner)) {
-    return { ok: false, status: 503, error: 'daemon_offline' };
-  }
-  return resolution;
 }
 const sessionPreviewProxy = createSessionPreviewProxy({
   // Preview HTTP/WS never accepts ?t=. The user must first establish either
@@ -561,12 +593,34 @@ const sessionPreviewProxy = createSessionPreviewProxy({
   // that authorised them. Index each stream under its auth session so logout /
   // rotation / unbind tears it down immediately. The content path carries no
   // cookie, so its owner is the capability's own authSessionId.
+  // P1-13：同一条流再按 sessionId 建第二个索引。预览目标失效（换代 / 关闭 / 端口易主）
+  // 时身份仍然有效，只能靠这个索引定点断流。
   bindStream: (req, ctx, close) => {
     const authSessionId = ctx.contentCapability
       ? previewContentCapabilityAuthSession(ctx.contentCapability, ctx.sessionId)
       : dashboardRequestIdentity(req)?.authSessionId ?? null;
-    return authSessionId ? authSessionConnections.register(authSessionId, close) : null;
+    return authSessionId
+      ? authSessionConnections.register(authSessionId, close, ctx.sessionId)
+      : null;
   },
+});
+/**
+ * P1-13：daemon 侧生命周期事件 → 预览收口。
+ *
+ * daemon 在每个权威换代边界广播 `preview: null`（worker 换代 / suspend / exit /
+ * close），会话彻底结束时广播 `session.exited`。中央 Dashboard 订阅这些事件，把本地
+ * 还挂着的预览长连接断掉、交互租约收回——否则「服务端已经没有目标了，浏览器那条流
+ * 还在流」，而且 resume 之后旧的交互授权会直接落到新一代 CLI 上。
+ */
+aggregator.on(ev => {
+  if (ev.type === 'session.exited') {
+    teardownSessionPreview(ev.body.sessionId);
+    return;
+  }
+  if (ev.type !== 'session.update') return;
+  const patch = ev.body.patch as Record<string, unknown> | undefined;
+  if (!patch || !Object.prototype.hasOwnProperty.call(patch, 'previewTarget')) return;
+  teardownSessionPreview(ev.body.sessionId);
 });
 const previewGuardPage = createPreviewGuardPage({
   authenticated: req => dashboardRequestIdentity(req) !== null,

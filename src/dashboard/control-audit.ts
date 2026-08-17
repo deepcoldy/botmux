@@ -33,6 +33,8 @@ export type ControlAuditAction =
   | 'preview.lock'
   | 'preview.idle_relock'
   | 'preview.session_relock'
+  /** P1-13：预览目标本身失效（worker 换代 / 会话关闭 / 端口易主）导致的收回。 */
+  | 'preview.target_relock'
   | 'audit.dropped';
 
 export interface ControlAuditRecord {

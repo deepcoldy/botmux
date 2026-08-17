@@ -75,4 +75,29 @@ describe('web preview interaction state machine', () => {
     expect(manager.state(actor, 's2').mode).toBe('preview');
     expect(audit.records.filter(record => record.action === 'preview.session_relock')).toHaveLength(2);
   });
+
+  it('P1-13: a retired preview target relocks that session for every holder, and resume cannot inherit it', () => {
+    const audit = new MemoryAudit();
+    const manager = new PreviewInteractionManager({ audit, now: () => 1_000 });
+    const teammate: TerminalDashboardActor = {
+      userId: 'ou_teammate', authSessionId: 'auth-teammate', expiresAt: Number.MAX_SAFE_INTEGER,
+    };
+    manager.unlock(actor, 's1');
+    manager.unlock(teammate, 's1');
+    manager.unlock(actor, 's2');
+
+    // 会话 s1 的预览目标失效（worker 换代 / close→resume / 端口易主）。
+    expect(manager.relockSession('s1')).toBe(2);
+
+    // 解锁授权是对「那一代 worker 起的那个服务」给的，不跟着会话 id 顺延到下一代。
+    expect(manager.state(actor, 's1').mode).toBe('preview');
+    expect(manager.state(teammate, 's1').mode).toBe('preview');
+    // 别的会话上的授权一点不动。
+    expect(manager.state(actor, 's2').mode).toBe('interactive');
+    expect(audit.records.filter(record => record.action === 'preview.target_relock')).toHaveLength(2);
+
+    // resume 之后重新注册预览：必须重新显式解锁才回到交互模式。
+    expect(manager.state(actor, 's1').mode).toBe('preview');
+    expect(manager.unlock(actor, 's1').mode).toBe('interactive');
+  });
 });
