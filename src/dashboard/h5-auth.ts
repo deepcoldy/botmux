@@ -55,6 +55,12 @@ function tokenHash(token: string): string {
   return createHash('sha256').update('botmux-dashboard-h5-session-v1\0').update(token).digest('base64url');
 }
 
+/** Single-flight map key. Codes are one-time secrets — only digests may be
+ *  used as (short-lived) map keys, mirroring the session-token policy above. */
+function exchangeCodeKey(code: string): string {
+  return createHash('sha256').update('botmux-dashboard-h5-exchange-code-v1\0').update(code).digest('base64url');
+}
+
 function validTtl(ttlMs: number): boolean {
   return Number.isSafeInteger(ttlMs) && ttlMs >= 60_000 && ttlMs <= 24 * 60 * 60_000;
 }
@@ -295,10 +301,133 @@ export function createFeishuH5CodeExchanger(
   };
 }
 
+export const DASHBOARD_H5_EXCHANGE_WINDOW_MS = 60_000;
+export const DASHBOARD_H5_EXCHANGE_MAX_PER_IP_PER_WINDOW = 10;
+export const DASHBOARD_H5_EXCHANGE_MAX_CONCURRENT = 4;
+const EXCHANGE_BUSY_RETRY_MS = 1_000;
+const EXCHANGE_GATE_MAX_TRACKED_IPS = 4_096;
+
+/**
+ * Rate-limit bucket key for the public exchange endpoint: first
+ * `x-forwarded-for` hop when present (reverse-proxy deployments), otherwise
+ * the socket address. IPv4-mapped IPv6 prefixes are stripped to match the
+ * dashboard's other remote-address handling. The value is only ever an opaque
+ * bucket key — it grants nothing, so a spoofed header cannot elevate access,
+ * and the global in-flight cap still bounds spoofed-header spam.
+ */
+export function dashboardH5ClientIp(req: IncomingMessage): string {
+  const header = req.headers['x-forwarded-for'];
+  const raw = Array.isArray(header) ? header[0] : header;
+  const firstHop = (raw ?? '').split(',')[0].trim();
+  const candidate = firstHop || req.socket?.remoteAddress || '';
+  return candidate.replace(/^::ffff:/, '').slice(0, 100) || 'unknown';
+}
+
+export interface DashboardH5ExchangeGateOptions {
+  now?: () => number;
+  windowMs?: number;
+  maxPerIpPerWindow?: number;
+  maxConcurrent?: number;
+  pruneIntervalMs?: number;
+}
+
+export type H5ExchangeAdmission = { ok: true } | { ok: false; retryAfterMs: number };
+
+/**
+ * In-process brakes for the public, unauthenticated H5 exchange endpoint.
+ * One exchange can cost up to three open-platform requests, so three
+ * independent limits apply (LocateRateLimiter-style, zero dependencies):
+ *
+ *  - per-IP sliding window (`admit`) — only admitted hits consume slots, so
+ *    a refused burst cannot lock a NAT'd office out forever;
+ *  - single-flight per code plus a global in-flight cap (`share`) —
+ *    concurrent duplicates of one code join the same upstream flight, and
+ *    distinct codes beyond the cap are fast-rejected rather than queued so
+ *    spam cannot stack pending exchanges on the dashboard event loop;
+ *  - opportunistic pruning of idle IP buckets (`prune`) so the tracking map
+ *    cannot grow without bound. In-flight entries self-clean on settle (the
+ *    built-in exchanger always times out).
+ *
+ * The clock is injectable for tests.
+ */
+export class DashboardH5ExchangeGate {
+  private readonly hitsByIp = new Map<string, number[]>();
+  private readonly inFlightByKey = new Map<string, Promise<unknown>>();
+  private readonly now: () => number;
+  private readonly windowMs: number;
+  private readonly maxPerIpPerWindow: number;
+  private readonly maxConcurrent: number;
+  private readonly pruneIntervalMs: number;
+  private lastPruneAt: number;
+
+  constructor(opts: DashboardH5ExchangeGateOptions = {}) {
+    this.now = opts.now ?? Date.now;
+    this.windowMs = opts.windowMs ?? DASHBOARD_H5_EXCHANGE_WINDOW_MS;
+    this.maxPerIpPerWindow = opts.maxPerIpPerWindow ?? DASHBOARD_H5_EXCHANGE_MAX_PER_IP_PER_WINDOW;
+    this.maxConcurrent = opts.maxConcurrent ?? DASHBOARD_H5_EXCHANGE_MAX_CONCURRENT;
+    this.pruneIntervalMs = opts.pruneIntervalMs ?? this.windowMs;
+    this.lastPruneAt = this.now();
+  }
+
+  /** Sliding-window per-IP admission. Refusals carry an honest Retry-After. */
+  admit(ip: string): H5ExchangeAdmission {
+    const now = this.now();
+    if (now - this.lastPruneAt >= this.pruneIntervalMs || this.hitsByIp.size >= EXCHANGE_GATE_MAX_TRACKED_IPS) {
+      this.prune();
+    }
+    const cutoff = now - this.windowMs;
+    const hits = (this.hitsByIp.get(ip) ?? []).filter(at => at > cutoff);
+    if (hits.length >= this.maxPerIpPerWindow) {
+      this.hitsByIp.set(ip, hits);
+      return { ok: false, retryAfterMs: Math.max(1, hits[0] + this.windowMs - now) };
+    }
+    hits.push(now);
+    this.hitsByIp.set(ip, hits);
+    return { ok: true };
+  }
+
+  /**
+   * Single-flight + global concurrency. A key already in flight joins the
+   * existing promise (never re-hits the open platform, exempt from the cap);
+   * a new key beyond `maxConcurrent` is refused for a fast 429.
+   */
+  share<T>(key: string, start: () => Promise<T>):
+    | { ok: true; result: Promise<T> }
+    | { ok: false; retryAfterMs: number } {
+    const existing = this.inFlightByKey.get(key);
+    if (existing) return { ok: true, result: existing as Promise<T> };
+    if (this.inFlightByKey.size >= this.maxConcurrent) {
+      return { ok: false, retryAfterMs: EXCHANGE_BUSY_RETRY_MS };
+    }
+    const flight = start();
+    this.inFlightByKey.set(key, flight);
+    const settle = () => { this.inFlightByKey.delete(key); };
+    // then(settle, settle) — a .finally() chain would itself reject on
+    // failure and surface as an unhandled rejection.
+    flight.then(settle, settle);
+    return { ok: true, result: flight };
+  }
+
+  /** Drop IP buckets whose every hit has left the window. */
+  prune(): void {
+    const cutoff = this.now() - this.windowMs;
+    for (const [ip, hits] of this.hitsByIp) {
+      const live = hits.filter(at => at > cutoff);
+      if (live.length === 0) this.hitsByIp.delete(ip);
+      else if (live.length !== hits.length) this.hitsByIp.set(ip, live);
+    }
+    this.lastPruneAt = this.now();
+  }
+
+  trackedIpCount(): number { return this.hitsByIp.size; }
+  inFlightCount(): number { return this.inFlightByKey.size; }
+}
+
 export interface DashboardH5AuthControllerOptions {
   config: DashboardH5AuthConfig;
   sessions: DashboardSessionStore;
   exchanger?: FeishuH5CodeExchanger;
+  exchangeGate?: DashboardH5ExchangeGate;
   audit: ControlAuditSink;
 }
 
@@ -309,6 +438,11 @@ export interface DashboardH5AuthController {
   logoutPath: string;
   resolve(req: IncomingMessage): DashboardAuthIdentity | null;
   handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean>;
+}
+
+function rateLimited(res: ServerResponse, error: string, retryAfterMs: number): void {
+  const retryAfterSeconds = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  json(res, 429, { ok: false, error, retryAfterSeconds }, { 'retry-after': String(retryAfterSeconds) });
 }
 
 function json(res: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}): void {
@@ -381,6 +515,7 @@ retry.addEventListener('click',begin);begin();
 export function createDashboardH5AuthController(opts: DashboardH5AuthControllerOptions): DashboardH5AuthController {
   const { config, sessions, audit } = opts;
   const exchanger = opts.exchanger ?? createFeishuH5CodeExchanger(config);
+  const exchangeGate = opts.exchangeGate ?? new DashboardH5ExchangeGate();
   const allowed = new Set(config.allowedOpenIds);
   const entryPath = config.entryPath;
   const exchangePath = `${entryPath}/exchange`;
@@ -426,6 +561,14 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
         json(res, 415, { ok: false, error: 'unsupported_media_type' });
         return true;
       }
+      // Public endpoint, and each exchange can cost up to three open-platform
+      // requests: rate-limit per IP before even reading the body. The slot is
+      // consumed on attempt (invalid bodies included), like LocateRateLimiter.
+      const admission = exchangeGate.admit(dashboardH5ClientIp(req));
+      if (!admission.ok) {
+        rateLimited(res, 'rate_limited', admission.retryAfterMs);
+        return true;
+      }
       const code = await readCode(req);
       if (!code) {
         json(res, 400, { ok: false, error: 'invalid_authorization_code' });
@@ -433,7 +576,15 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       }
       let openId: string;
       try {
-        ({ openId } = await exchanger.exchange(code));
+        // Concurrent duplicates of one code share a single upstream flight;
+        // distinct codes beyond the global cap 429 immediately (never queue,
+        // so spam cannot stack pending exchanges on the event loop).
+        const flight = exchangeGate.share(exchangeCodeKey(code), () => exchanger.exchange(code));
+        if (!flight.ok) {
+          rateLimited(res, 'exchange_busy', flight.retryAfterMs);
+          return true;
+        }
+        ({ openId } = await flight.result);
       } catch {
         audit.append(controlAuditRecord('unknown', 'dashboard', 'auth.login_denied'));
         json(res, 502, { ok: false, error: 'feishu_exchange_failed' });

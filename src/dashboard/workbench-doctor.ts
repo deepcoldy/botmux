@@ -31,12 +31,215 @@ export const WORKBENCH_DOCTOR_FOOTER = '截图本页发给机器人即可';
 export const WORKBENCH_DOCTOR_STEP_TIMEOUT_MS = 8_000;
 
 /**
- * 整页 HTML。纯静态、无插值——页面上出现的每一个动态值都是访问者浏览器自己在运行
- * 时算出来的，服务端不往里塞任何东西，也就不存在把密钥渲染进页面的可能。
+ * WS 探针自带的握手超时，须不长于外层步骤预算：正常情况下由它先到点收尾（关
+ * socket、写一行超时），外层 8 秒只是兜底闸门。
+ */
+export const WORKBENCH_DOCTOR_WS_TIMEOUT_MS = 7_500;
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 页面与单测共用的诊断逻辑。
  *
- * 内联 JS 刻意写成不含反引号、不含 `${`、不含正则字面量的朴素 ES5 风格：前两者会
- * 和外层模板字符串打架，正则里的反斜杠则会被模板字符串吃掉一层（`\/` 变成 `/`，
- * 正则当场破相）。用 slice/split/trim 代替正则，问题从根上消失。
+ * 下面三个函数的**源码**会被 `Function.prototype.toString()` 原样内联进诊断页
+ * （见 workbenchDoctorHtml），单测则直接 import 同一份——测的就是页面里跑的那份
+ * 代码。因此它们必须遵守与内联脚本相同的约束：
+ *  - 不含反引号、不含 `${`、不含正则字面量（会和外层模板字符串打架）；
+ *  - 只用 var / function 的朴素写法，兼容老 iOS Safari；
+ *  - 函数名即页面里的调用名（构建是纯 tsc，不做改名压缩），不要重命名。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** `/api/sessions` 行里与「终端可探测」判定相关的字段子集。 */
+export interface DoctorSessionRow {
+  sessionId?: unknown;
+  id?: unknown;
+  status?: unknown;
+  cliId?: unknown;
+  webPort?: unknown;
+  proxyPort?: unknown;
+}
+
+/**
+ * 会话不可探测的原因；空串表示可探测。「可探测」= 终端真的走本机 worker：webPort
+ * 是 worker 终端页、proxyPort 是 dashboard 的 /s/ 反代，两个都在 view-link 链路
+ * 才通。riff 等外部后端的终端在沙箱侧，从这条链路探出来的失败不是故障，是误诊。
+ */
+export function doctorProbeableWhy(s: DoctorSessionRow | null | undefined): string {
+  if (!s || typeof s !== 'object') return '记录为空';
+  if (String(s.status || '') === 'closed') return '会话已关闭';
+  if (String(s.cliId || '') === 'riff') return 'riff 外部后端，终端不在本机 worker 上';
+  if (typeof s.webPort !== 'number' || !(s.webPort > 0)) return '缺本机终端端口 webPort';
+  if (typeof s.proxyPort !== 'number' || !(s.proxyPort > 0)) return '缺终端反代端口 proxyPort';
+  return '';
+}
+
+export interface DoctorSessionPick {
+  /**
+   * picked = 选中可探测会话；missing = ?session 点名的 id 不在列表；
+   * unprobeable = 点名的会话存在但探不了（reason 给原因）；
+   * none = 自动挑选时一个可探测会话都没有（reason 给统计），绝不拿第一个凑数。
+   */
+  kind: 'picked' | 'missing' | 'unprobeable' | 'none';
+  sessionId: string;
+  status: string;
+  reason: string;
+  /** picked 且 status 不是 active/working/idle：页面提示「退而用这个」。 */
+  fallback: boolean;
+}
+
+/**
+ * 从会话列表挑诊断对象。wanted 非空时只认点名的那个（存在性与可探测性都校验）；
+ * 自动挑选只在可探测会话里挑，优先 active/working/idle。
+ */
+export function pickDoctorSession(list: DoctorSessionRow[] | null | undefined, wanted: string): DoctorSessionPick {
+  var rows = list || [];
+  var res: DoctorSessionPick = { kind: 'none', sessionId: '', status: '', reason: '', fallback: false };
+  function idOf(s: DoctorSessionRow): string {
+    return String((s && (s.sessionId || s.id)) || '');
+  }
+  if (wanted) {
+    var hit: DoctorSessionRow | null = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (idOf(rows[i] || {}) === wanted) { hit = rows[i] || {}; break; }
+    }
+    if (!hit) {
+      res.kind = 'missing';
+      res.sessionId = wanted;
+      res.reason = '列表共 ' + rows.length + ' 个会话，没有一个叫这个 id';
+      return res;
+    }
+    res.sessionId = wanted;
+    res.status = String(hit.status || '?');
+    var whyWanted = doctorProbeableWhy(hit);
+    if (whyWanted) {
+      res.kind = 'unprobeable';
+      res.reason = whyWanted;
+      return res;
+    }
+    res.kind = 'picked';
+    return res;
+  }
+  var live: DoctorSessionRow | null = null;
+  var probeable: DoctorSessionRow | null = null;
+  var total = 0;
+  for (var j = 0; j < rows.length; j++) {
+    var s = rows[j] || {};
+    if (!idOf(s)) continue;
+    total++;
+    if (doctorProbeableWhy(s)) continue;
+    var st = String(s.status || '');
+    if (!live && (st === 'active' || st === 'working' || st === 'idle')) live = s;
+    if (!probeable) probeable = s;
+  }
+  var picked = live || probeable;
+  if (!picked) {
+    res.kind = 'none';
+    res.reason = '共 ' + total + ' 个会话，没有一个可探测的本机终端会话（riff 外部后端 / 缺 webPort、proxyPort / 已关闭）';
+    return res;
+  }
+  res.kind = 'picked';
+  res.sessionId = idOf(picked);
+  res.status = String(picked.status || '?');
+  res.fallback = !live;
+  return res;
+}
+
+/** runStep 每一步的闸门：外层判超时后 closed 置真并触发 cancel 钩子。 */
+export interface DoctorWsGate {
+  closed: boolean;
+  cancel: Array<() => void>;
+}
+
+/** probeWs 关心的 WebSocket 最小面；单测注入假实现，不起真服务。 */
+export interface DoctorWsLike {
+  onopen: (() => void) | null;
+  onerror: (() => void) | null;
+  onclose: ((ev?: { code?: unknown; reason?: unknown }) => void) | null;
+  close(): void;
+}
+
+/** probeWs 的全部外部依赖，页面喂真的，单测喂假的。 */
+export interface DoctorWsEnv {
+  /** WebSocket 工厂；宿主没有 WebSocket 时传 undefined，记一行后直接放行。 */
+  makeWs: ((url: string) => DoctorWsLike) | undefined;
+  line: (icon: string, label: string, value: string, note?: string) => void;
+  timeoutMs: number;
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (t: unknown) => void;
+  now: () => number;
+}
+
+/**
+ * WS 握手探针。三条硬规矩（对应上一版的泄漏与误诊）：
+ *  1. 自带 timeoutMs 兜底：到点自己收尾，不等外层 8 秒闸门；
+ *  2. 无论成败必 close socket——half-open socket 一直挂着就是 WS 泄漏；
+ *  3. 外层闸门（gate.closed）合上之后一行都不再写：迟到的握手结果只会串到后面
+ *     检查项下面造成误读。cancel 钩子由外层超时触发，负责关 socket 并放行 Promise。
+ */
+export function doctorProbeWs(
+  env: DoctorWsEnv,
+  label: string,
+  wsUrl: string,
+  shown: string,
+  gate: DoctorWsGate | null,
+): Promise<void> {
+  return new Promise(function (resolve) {
+    if (!env.makeWs) {
+      env.line('❌', label, '本浏览器没有 WebSocket', shown);
+      resolve();
+      return;
+    }
+    var settled = false;
+    var began = env.now();
+    var ws: DoctorWsLike | null = null;
+    var timer: unknown = null;
+    function shutdown(): void {
+      if (timer !== null) { env.clearTimeout(timer); timer = null; }
+      try { if (ws) ws.close(); } catch (e) { /* close 失败也不追究 */ }
+    }
+    function finish(icon: string, value: string): void {
+      if (settled) return;
+      settled = true;
+      shutdown();
+      if (!gate || !gate.closed) {
+        env.line(icon, label, value + '，耗时 ' + (env.now() - began) + 'ms', shown);
+      }
+      resolve();
+    }
+    if (gate) {
+      gate.cancel.push(function () {
+        if (settled) return;
+        settled = true;
+        shutdown();
+        resolve();
+      });
+    }
+    timer = env.setTimeout(function () {
+      finish('⚠️', '超时（' + Math.round(env.timeoutMs / 1000) + ' 秒无握手结果）');
+    }, env.timeoutMs);
+    try {
+      ws = env.makeWs(wsUrl);
+    } catch (e) {
+      var m = e && (e as { message?: unknown }).message ? String((e as { message?: unknown }).message) : String(e);
+      finish('❌', '构造失败 ' + m.slice(0, 120));
+      return;
+    }
+    ws.onopen = function () { finish('✅', 'open 握手成功'); };
+    ws.onerror = function () { finish('❌', 'error 握手失败（多半被网关或代理拦了）'); };
+    ws.onclose = function (ev) {
+      var code = ev && typeof ev.code === 'number' ? ev.code : '?';
+      var reason = String((ev && ev.reason) || '').slice(0, 60);
+      finish('❌', 'close code=' + code + (reason ? ' reason=' + reason : ''));
+    };
+  });
+}
+
+/**
+ * 整页 HTML。模板只内联**构建期常量与上面共享函数的源码**，不含任何请求期数据——
+ * 页面上出现的每一个动态值都是访问者浏览器自己在运行时算出来的，服务端不往里塞任
+ * 何东西，也就不存在把密钥渲染进页面的可能。
+ *
+ * 内联 JS（含被内联的共享函数）刻意写成不含反引号、不含 `${`、不含正则字面量的朴
+ * 素 ES5 风格：前两者会和外层模板字符串打架，正则里的反斜杠则会被模板字符串吃掉一
+ * 层（`\/` 变成 `/`，正则当场破相）。用 slice/split/trim 代替正则，问题从根上消失。
  */
 export function workbenchDoctorHtml(): string {
   return `<!doctype html>
@@ -75,9 +278,29 @@ button{display:block;margin:16px auto 0;padding:11px 22px;border:1px solid #2b41
 (function(){
 'use strict';
 var TIMEOUT = ${WORKBENCH_DOCTOR_STEP_TIMEOUT_MS};
+var WS_TIMEOUT = ${WORKBENCH_DOCTOR_WS_TIMEOUT_MS};
 var out = document.getElementById('out');
 var stat = document.getElementById('stat');
 var startedAt = Date.now();
+
+// ?session=<会话id>：允许点名要诊断的会话。只取这一个参数的值；查询串里的其余
+// 参数（可能携带凭证）既不读进变量也不上屏。
+function sessionParam(){
+  var raw = '';
+  try { raw = String(location.search || ''); } catch (e) { return ''; }
+  if (raw.charAt(0) === '?') raw = raw.slice(1);
+  var parts = raw.split('&');
+  for (var i = 0; i < parts.length; i++) {
+    var eq = parts[i].indexOf('=');
+    var key = (eq >= 0 ? parts[i].slice(0, eq) : parts[i]).trim();
+    if (key !== 'session') continue;
+    var val = eq >= 0 ? parts[i].slice(eq + 1) : '';
+    try { val = decodeURIComponent(val); } catch (e2) {}
+    return String(val).slice(0, 128).trim();
+  }
+  return '';
+}
+var WANTED_SESSION = sessionParam();
 
 // 全部走 textContent 落地：这一页不拼接任何 HTML 字符串，远端回来的内容永远只是文本。
 function line(icon, label, value, note){
@@ -112,6 +335,11 @@ function msg(e){
   var m = e && e.message ? e.message : String(e);
   return String(m).slice(0, 120);
 }
+
+// —— 与服务端 TS 同源的共享逻辑（构建期原样内联；单测 import 的是同一份源码）——
+${doctorProbeableWhy.toString()}
+${pickDoctorSession.toString()}
+${doctorProbeWs.toString()}
 
 // 每次请求都带上登录态：这一页要回答的正是「这台设备的 Cookie 到底带没带上」。
 function timedFetch(input, init){
@@ -164,37 +392,17 @@ function wsUrlOf(pathname, search){
   return proto + '//' + location.host + base + '/' + (search || '');
 }
 
-function probeWs(label, wsUrl, shown){
-  return new Promise(function(resolve){
-    if (typeof WebSocket === 'undefined') {
-      line('❌', label, '本浏览器没有 WebSocket', shown);
-      resolve();
-      return;
-    }
-    var settled = false;
-    var began = Date.now();
-    var ws = null;
-    function finish(icon, value){
-      if (settled) return;
-      settled = true;
-      line(icon, label, value + '，耗时 ' + (Date.now() - began) + 'ms', shown);
-      try { if (ws) ws.close(); } catch (e) {}
-      resolve();
-    }
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (e) {
-      finish('❌', '构造失败 ' + msg(e));
-      return;
-    }
-    ws.onopen = function(){ finish('✅', 'open 握手成功'); };
-    ws.onerror = function(){ finish('❌', 'error 握手失败（多半被网关或代理拦了）'); };
-    ws.onclose = function(ev){
-      var code = ev && typeof ev.code === 'number' ? ev.code : '?';
-      var reason = String((ev && ev.reason) || '').slice(0, 60);
-      finish('❌', 'close code=' + code + (reason ? ' reason=' + reason : ''));
-    };
-  });
+// 真正的探测逻辑在 doctorProbeWs（与服务端 TS、单测共用同一份源码）；这里只负责
+// 把浏览器真实的 WebSocket 与计时器喂进去。
+function probeWs(label, wsUrl, shown, gate){
+  return doctorProbeWs({
+    makeWs: typeof WebSocket === 'undefined' ? undefined : function(u){ return new WebSocket(u); },
+    line: line,
+    timeoutMs: WS_TIMEOUT,
+    setTimeout: function(fn, ms){ return setTimeout(fn, ms); },
+    clearTimeout: function(t){ clearTimeout(t); },
+    now: function(){ return Date.now(); }
+  }, label, wsUrl, shown, gate || null);
 }
 
 // ── 各项检查 ───────────────────────────────────────────────────────────────
@@ -208,6 +416,10 @@ function stepBasics(ctx){
   line('✅', '页面 origin', location.origin);
   var now = new Date();
   line('✅', '设备当前时间', now.toLocaleString(), 'UTC ' + now.toISOString());
+  // 点名了诊断对象就亮在页面最上面，截图第一眼就知道诊断的是谁。
+  if (WANTED_SESSION) {
+    line('✅', '诊断对象', WANTED_SESSION.slice(0, 48), '来自 ?session 查询参数：只诊断这个会话');
+  }
   ctx.ok = true;
 }
 
@@ -274,28 +486,28 @@ function stepViewLink(ctx){
     line('⚠️', 'view-link', '跳过', '上一步没拿到会话列表');
     return;
   }
-  var list = ctx.sessions || [];
-  var live = null;
-  var fallback = null;
-  for (var i = 0; i < list.length; i++) {
-    var s = list[i] || {};
-    var st = String(s.status || '');
-    var id = s.sessionId || s.id;
-    if (!id) continue;
-    if (!live && (st === 'active' || st === 'working' || st === 'idle')) live = s;
-    if (!fallback && st !== 'closed') fallback = s;
-  }
-  var picked = live || fallback;
-  if (!picked) {
-    line('⚠️', 'view-link', '跳过', '列表里没有可用（非 closed）会话');
+  // 只在「可探测」的本机 worker 会话里挑（或按 ?session 点名）。挑不到就明说，
+  // 绝不拿列表第一个凑数——拿 riff/无端口会话探出来的失败全是误诊。
+  var pick = pickDoctorSession(ctx.sessions || [], WANTED_SESSION);
+  if (pick.kind === 'missing') {
+    line('❌', '指定会话', WANTED_SESSION.slice(0, 48), '?session 指定的会话不存在：' + pick.reason + '。确认 id 后重试；终端各项跳过');
     return;
   }
-  if (!live) {
-    line('⚠️', '会话挑选', 'status=' + String(picked.status || '?'), '没有 active/working/idle，退而用这个');
+  if (pick.kind === 'unprobeable') {
+    line('⚠️', '指定会话', WANTED_SESSION.slice(0, 48), '该会话不可探测：' + pick.reason + '（status=' + pick.status + '）；终端各项跳过');
+    return;
   }
-  var sid = String(picked.sessionId || picked.id);
+  if (pick.kind === 'none') {
+    line('⚠️', '会话挑选', '没有可探测的会话', pick.reason + '。可在地址后加 ?session=<会话id> 指定；终端各项跳过');
+    return;
+  }
+  if (pick.fallback) {
+    line('⚠️', '会话挑选', 'status=' + pick.status, '没有 active/working/idle 的可探测会话，退而用这个');
+  }
+  var sid = pick.sessionId;
   ctx.sessionId = sid;
-  line('✅', '选中会话', sid.slice(0, 48), 'status=' + String(picked.status || '?'));
+  line('✅', '选中会话', sid.slice(0, 48),
+    (WANTED_SESSION ? '?session 指定' : '自动挑选：可探测（webPort/proxyPort 齐备）') + '，status=' + pick.status);
   return timedFetch('/api/sessions/' + encodeURIComponent(sid) + '/view-link', { method: 'GET' }).then(function(r){
     if (r.status !== 200) {
       line('❌', 'GET view-link', 'HTTP ' + r.status);
@@ -354,7 +566,7 @@ function stepWsViewToken(ctx){
   }
   return probeWs('WS 探测 A（viewToken 链路）',
     wsUrlOf(ctx.termPath, ctx.termSearch),
-    'ws ' + ctx.termPath + '/' + (ctx.termSearch ? '?viewToken 已隐藏' : ''));
+    'ws ' + ctx.termPath + '/' + (ctx.termSearch ? '?viewToken 已隐藏' : ''), ctx.gate);
 }
 
 function stepWsCookie(ctx){
@@ -364,7 +576,7 @@ function stepWsCookie(ctx){
   }
   // 不带任何查询参数：能不能连上，完全取决于这台设备升级 WebSocket 时带没带 Cookie。
   var path = '/s/' + encodeURIComponent(ctx.sessionId);
-  return probeWs('WS 探测 B（Cookie 链路）', wsUrlOf(path, ''), 'ws ' + path + '/（无查询参数）');
+  return probeWs('WS 探测 B（Cookie 链路）', wsUrlOf(path, ''), 'ws ' + path + '/（无查询参数）', ctx.gate);
 }
 
 var STEPS = [
@@ -378,7 +590,8 @@ var STEPS = [
 ];
 
 // 顺序跑。每项一个独立 8 秒闸门 + 独立 try/catch：任一项超时或抛错都只记一行，
-// 立刻走下一项，绝不让整页停在半路。
+// 立刻走下一项，绝不让整页停在半路。翻篇时合上本步的 gate 并触发 cancel 钩子——
+// probeWs 把「关 socket + 不再写行」注册在钩子里，旧 socket 的迟到回调从此写不进结果区。
 function runStep(i, ctx){
   if (i >= STEPS.length) {
     stat.textContent = '检测完成，共 ' + STEPS.length + ' 项，用时 '
@@ -389,10 +602,18 @@ function runStep(i, ctx){
   stat.textContent = '检测中… ' + (i + 1) + '/' + STEPS.length + '　' + step.name;
   var moved = false;
   var timer = null;
+  var gate = { closed: false, cancel: [] };
+  ctx.gate = gate;
+  function seal(){
+    gate.closed = true;
+    var fns = gate.cancel.splice(0);
+    for (var j = 0; j < fns.length; j++) { try { fns[j](); } catch (e) {} }
+  }
   function next(){
     if (moved) return;
     moved = true;
     if (timer) clearTimeout(timer);
+    seal();
     setTimeout(function(){ runStep(i + 1, ctx); }, 0);
   }
   timer = setTimeout(function(){

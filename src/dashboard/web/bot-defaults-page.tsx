@@ -3638,7 +3638,7 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
  *  - off：不打标签
  *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
  *  → 本行轮询到 authorized 后徽标变绿。 */
-function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
+export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
@@ -3674,19 +3674,26 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   }, [props.bot.larkAppId]);
 
   async function saveMode(next: string): Promise<void> {
+    // Capture the row's generation: a bot switch bumps it (see the effect
+    // above), and a slow response for the previous bot must not overwrite the
+    // new bot's row state — drop it silently instead.
+    const generation = lifecycle.current.generation;
     setModeBusy(true);
     setErr(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
         setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
       } else {
         setErr(responseErrorText(res));
       }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setModeBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setModeBusy(false);
     }
   }
 
@@ -3696,6 +3703,9 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     setErr(null);
     try {
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
+      // A bot switch while the POST was in flight must neither surface the old
+      // bot's error nor open the old bot's authorization page in a new tab.
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (!res.ok || !res.body.ok || !res.body.authUrl) {
         setErr(responseErrorText(res));
         return;
