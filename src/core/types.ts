@@ -17,6 +17,10 @@ import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
   messageId: string;      // Lark message_id for PATCHing
+  /** Stable visible destination of this card (`plain:oc_*`, `thread:om_*`, or
+   *  `quote:om_*`). Chat-scope sessions can move between multiple Lark topics;
+   *  cleanup must only withdraw predecessors from the same destination. */
+  replyTargetKey?: string;
   content: string;        // frozen text snapshot — kept so "导出文字" still works on historical cards
   title: string;          // turn title at freeze time
   /** Legacy boolean expand/collapse — kept for migrating old persisted cards. */
@@ -215,6 +219,10 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
+  /** Visible Lark destination of the live streaming card. Unlike
+   * currentReplyTarget this remains bound to the card after a newer turn is
+   * accepted, so parking cannot attribute the predecessor to the new topic. */
+  streamCardReplyTargetKey?: string;
   streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
   /** Monotonic in-memory generation for accepted user turns. Card POST
    * completions use it to avoid clearing a newer turn's pending state. */

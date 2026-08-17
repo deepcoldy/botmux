@@ -4357,6 +4357,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       ds.parkedStreamCardNonce = ds.streamCardNonce;
       ds.frozenCards.set(ds.streamCardNonce, {
         messageId: ds.streamCardId,
+        replyTargetKey: ds.streamCardReplyTargetKey,
         content: ds.lastScreenContent ?? '',
         title: prevTitle,
         displayMode: prevMode,

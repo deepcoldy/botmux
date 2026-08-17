@@ -25,7 +25,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
@@ -1281,6 +1281,11 @@ function logWorkerStderr(t: string, line: string): void {
 // the first POST returns a real message_id.
 export const CARD_POSTING_SENTINEL = '__posting__';
 
+function streamingCardReplyTargetKey(ds: DaemonSession, turnId?: string): string {
+  const replyContext = frozenReplyContextForTurn(ds, fallbackTurnId(ds, turnId));
+  return replyTargetKey(replyContext.target);
+}
+
 /**
  * Move the current streaming card into `frozenCards` without freezing it
  * cosmetically. The next successful card POST will sweep it via
@@ -1304,6 +1309,7 @@ export function parkStreamCard(ds: DaemonSession): void {
   if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
   ds.frozenCards.set(ds.streamCardNonce, {
     messageId: ds.streamCardId,
+    replyTargetKey: ds.streamCardReplyTargetKey,
     content: ds.lastScreenContent ?? '',
     title: ds.currentTurnTitle ?? '',
     displayMode: ds.displayMode ?? 'hidden',
@@ -1320,9 +1326,12 @@ export function parkStreamCard(ds: DaemonSession): void {
 }
 
 /**
- * Delete previously-frozen streaming cards from Lark and clear the cache.
+ * Delete previously-frozen streaming cards from the live card's visible Lark
+ * destination and clear those entries from the cache.
  * Called whenever a new streaming card becomes the active one — old turns'
- * cards just add visual clutter when scrolling thread history.
+ * cards just add visual clutter when scrolling that destination's history.
+ * A chat-scope session may answer in several Lark topics; cards from another
+ * topic remain frozen until a successor is posted in that same topic.
  *
  * Lazy-loads `frozenCards` from disk if the in-memory Map is missing
  * (post daemon-restart). Best-effort delete; failures (already withdrawn,
@@ -1340,9 +1349,15 @@ export function recallFrozenCards(ds: DaemonSession): void {
   const activeId = ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL
     ? ds.streamCardId
     : undefined;
+  const activeReplyTargetKey = ds.streamCardReplyTargetKey;
   const targets: string[] = [];
   for (const [nonce, fc] of [...ds.frozenCards.entries()]) {
     if (activeId && fc.messageId === activeId) continue;
+    // Legacy sessions have no destination key. Preserve the old sweep-all
+    // behavior only while the live card is also legacy. Once a new card has an
+    // exact destination, fail safe: never withdraw an unattributed card that
+    // may be visible in another topic.
+    if (activeReplyTargetKey && fc.replyTargetKey !== activeReplyTargetKey) continue;
     targets.push(fc.messageId);
     ds.frozenCards.delete(nonce);
   }
@@ -1385,6 +1400,7 @@ export async function postTurnStartingCard(
   const effectiveCliId = sessionCliId(ds, botCfg);
   const previousCardId = ds.streamCardId;
   const previousNonce = ds.streamCardNonce;
+  const previousReplyTargetKey = ds.streamCardReplyTargetKey;
   // A newer turn may have arrived while the previous turn's POST was still in
   // flight, so beginNewTurn could not park that sentinel. Park the now-live
   // predecessor here before replacing its identity.
@@ -1430,6 +1446,7 @@ export async function postTurnStartingCard(
     if (riffRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
     ds.streamCardId = previousCardId;
     ds.streamCardNonce = previousNonce;
+    ds.streamCardReplyTargetKey = previousReplyTargetKey;
     persistStreamCardState(ds);
     return true;
   };
@@ -1444,6 +1461,7 @@ export async function postTurnStartingCard(
       return false;
     }
     ds.streamCardId = messageId;
+    ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, turnId);
     ds.parkedStreamCardNonce = undefined;
     const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
     if (!superseded) {
@@ -1470,6 +1488,7 @@ export async function postTurnStartingCard(
     }
     ds.streamCardId = previousCardId;
     ds.streamCardNonce = previousNonce;
+    ds.streamCardReplyTargetKey = previousReplyTargetKey;
     persistStreamCardState(ds);
     logger.warn(`[${tag(ds)}] Failed to post starting card for turn ${turnId.substring(0, 12)}: ${err}`);
     if ((ds.streamCardTurnGeneration ?? 0) !== generation && ds.streamCardPendingTurnId) {
@@ -1514,6 +1533,7 @@ export async function postFreshStreamingCard(
   // together so a failed /card leaves no orphaned nonce/pending state).
   const prevCardId = ds.streamCardId;
   const prevNonce = ds.streamCardNonce;
+  const prevReplyTargetKey = ds.streamCardReplyTargetKey;
   const prevPending = ds.streamCardPending;
 
   ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -1540,7 +1560,9 @@ export async function postFreshStreamingCard(
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
-    ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, ds.currentReplyTarget?.turnId);
+    const turnId = ds.currentReplyTarget?.turnId;
+    ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, turnId);
+    ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, turnId);
     // This card is now the live one for the current turn. Clear the new-turn
     // pending flag so the next screen_update PATCHes it instead of POSTing a
     // duplicate (the gate above only suppresses cards when disabled+unforced;
@@ -1562,6 +1584,7 @@ export async function postFreshStreamingCard(
   } catch (err) {
     ds.streamCardId = prevCardId;
     ds.streamCardNonce = prevNonce;
+    ds.streamCardReplyTargetKey = prevReplyTargetKey;
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
@@ -7693,6 +7716,7 @@ function setupWorkerHandlers(
             break;
           }
           ds.streamCardId = postedCardId;
+          ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, msg.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
           // POSTing a second card. Without this, a re-fork that happens while
@@ -8105,6 +8129,7 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              ds.streamCardReplyTargetKey = streamingCardReplyTargetKey(ds, msg.turnId);
               const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
               if (!superseded) ds.streamCardPendingTurnId = undefined;
               ds.parkedStreamCardNonce = undefined;

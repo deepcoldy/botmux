@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { FrozenSessionReplyContext, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -86,6 +86,15 @@ export type SessionReplyTarget =
   | { mode: 'plain'; chatId: string }
   | { mode: 'thread'; rootMessageId: string }
   | { mode: 'quote'; rootMessageId: string };
+
+/** Stable key for one visible Lark destination. Keep the reply mode in the key:
+ * a quoted top-level reply and a reply inside that message's thread share the
+ * same message id but are different visible surfaces. */
+export function replyTargetKey(target: FrozenSessionReplyTarget): string {
+  return target.mode === 'plain'
+    ? `plain:${target.chatId}`
+    : `${target.mode}:${target.rootMessageId}`;
+}
 
 /** Freeze the visible Lark destination for one inbound turn before any
  * lifecycle mutation can replace or remove its session. `replyRootId` is
