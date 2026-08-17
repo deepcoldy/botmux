@@ -1040,6 +1040,12 @@ type VcMeetingRuntimeLeaseFence = VcMeetingAmbiguousReceiptRef & {
   expectedWorkerGeneration?: number;
   probeAttempts: number;
   timer?: ReturnType<typeof setTimeout>;
+  /** The live worker process observed when this fence was armed. The
+   *  producer-liveness gate needs it when findSession() no longer resolves the
+   *  ds (e.g. a collision loser's registry entry was deleted while its
+   *  process-only retirement is still in flight) — without it the gate
+   *  silently skipped exactly the orphaned-producer case it exists for. */
+  armedWorker?: DaemonSession['worker'];
 };
 
 type VcMeetingRuntimeLeaseRecoveryDeps = {
@@ -1117,8 +1123,15 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
 
     // Captured BEFORE teardown: retirement nulls ds.worker while the process
     // dies asynchronously; the producer-liveness gate below needs the real
-    // ChildProcess to prove the exit.
-    const workerBefore = ds?.worker && !ds.worker.killed ? ds.worker : null;
+    // ChildProcess to prove the exit. Falls back to the process observed at
+    // arm time when the registry no longer resolves the ds — a deleted
+    // registry entry is not proof the producer died (fourth-round review).
+    const armedAlive = fence.armedWorker
+      && !fence.armedWorker.killed
+      && fence.armedWorker.exitCode === null
+      && fence.armedWorker.signalCode === null
+      ? fence.armedWorker : null;
+    const workerBefore = (ds?.worker && !ds.worker.killed ? ds.worker : null) ?? armedAlive;
     if (ds) {
       try { deps.killWorker(ds); }
       catch (err) {
@@ -1290,6 +1303,10 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       teardownAndProbe(fence, !ds ? 'missing-session teardown' : 'workerless teardown');
       return;
     }
+    // Remember the live producer process itself: registry state can stop
+    // resolving this ds before the process has died, and the liveness gate in
+    // teardownAndProbe must keep seeing it.
+    fence.armedWorker = ds.worker;
     if ((ds.workerGeneration ?? 0) !== ref.workerGeneration) {
       deps.error(
         `[vc-delivery] runtime lease worker generation mismatch; escalating `
@@ -1354,6 +1371,12 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
     if (context.disposition === 'queued_removed') {
+      // No producer-exit proof required here, deliberately: `queued_removed`
+      // is an ACK from the EXACT expected worker generation saying it removed
+      // the queued delivery itself. The producer is alive, current and
+      // cooperating — the double-delivery risk this fence gates on is gone
+      // without anyone dying. Exit proof is demanded only on the teardown
+      // paths, where the producer's state is unknown or adversarial.
       clearFence(fence);
       return true;
     }

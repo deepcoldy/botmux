@@ -357,6 +357,37 @@ describe('operator revocation is the ONLY unproven exit (P1-3)', () => {
         expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
     });
 
+    it('defaultIsSessionActive is genuinely tri-state (round-4: the implementation itself)', async () => {
+        // Every revoke test injects isSessionActive, so a permissive rewrite of
+        // the default (`return false`) previously survived the suite. Pin the
+        // implementation: active row → true, closed row → false, absent row →
+        // false, and — the load-bearing leg — a CORRUPT session file yields
+        // `undefined` (evidence unavailable), never a silent "proven inactive".
+        const { defaultIsSessionActive } = await import('../src/core/mojo-containment-command.js');
+        const { config } = await import('../src/config.js');
+        const dataDir = freshDataDir();
+        const prevDataDir = config.session.dataDir;
+        config.session.dataDir = dataDir;
+        try {
+            writeFileSync(join(dataDir, 'sessions-app.json'), JSON.stringify({
+                's-active': { sessionId: 's-active', status: 'active' },
+                's-closed': { sessionId: 's-closed', status: 'closed' },
+            }));
+            expect(await defaultIsSessionActive('s-active')).toBe(true);
+            expect(await defaultIsSessionActive('s-closed')).toBe(false);
+            expect(await defaultIsSessionActive('s-absent')).toBe(false);
+
+            writeFileSync(join(dataDir, 'sessions-broken.json'), '{ not json');
+            // The corrupt file may be the very one hiding the row: unknown.
+            expect(await defaultIsSessionActive('s-maybe-hidden')).toBe(undefined);
+            // A row still FOUND in a readable file answers definitively even
+            // beside a corrupt sibling.
+            expect(await defaultIsSessionActive('s-active')).toBe(true);
+        } finally {
+            config.session.dataDir = prevDataDir;
+        }
+    });
+
     it('rejects a --handle whose value is another switch instead of eating --yes', async () => {
         const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
         const dataDir = freshDataDir();

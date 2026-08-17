@@ -436,7 +436,13 @@ export function buildSessionCard(
       });
     }
   }
-  if (showManageButtons && !adoptMode && effectiveCliId !== 'riff') {
+  // No restart button for ANY remote CLI: the riff worker refuses the IPC
+  // (dead button), and the mojo worker EXECUTES it — cancelling the remote
+  // session and cold-booting a context-less replacement. The riff-only literal
+  // rendered a live remote-destruction button on mojo cards (fourth-round
+  // review, gate 1); the click handler also guards, this keeps the surface
+  // honest.
+  if (showManageButtons && !adoptMode && !isRemoteCliId(effectiveCliId)) {
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },

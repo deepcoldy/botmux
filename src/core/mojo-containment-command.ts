@@ -62,7 +62,7 @@ const USAGE = `用法:
  * unavailable"), which does NOT block the revoke but IS surfaced to the
  * operator; only a definite `status === 'active'` blocks.
  */
-async function defaultIsSessionActive(sessionId: string): Promise<boolean | undefined> {
+export async function defaultIsSessionActive(sessionId: string): Promise<boolean | undefined> {
   try {
     const [{ config }, { readdirSync, readFileSync }, { join }] = await Promise.all([
       import('../config.js'),

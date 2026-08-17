@@ -82,7 +82,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -3334,6 +3334,7 @@ async function prepareLiveRemoteWorkerClose(
         : {}),
     };
   }
+  let takenOverRuntimeState: DaemonSession['remoteCloseState'];
   if (ds.remoteCloseState) {
     const runtimeUncertain = backendType === 'mojo'
       && ds.remoteCloseState.phase === 'uncertain';
@@ -3351,15 +3352,41 @@ async function prepareLiveRemoteWorkerClose(
     // and disk disagree about which attempt happened, and clearing on that
     // would launder an unknown state.
     const durableForTakeover = ds.session.mojoCloseJournal;
+    // Three legs, each covering a REAL production writer of this pair
+    // (fourth-round review named the two the exact-match version missed):
+    //   phase   — the runtime fence is `uncertain` for every non-irreversible
+    //             failed prepare, while the DURABLE phase differs by verdict:
+    //             `uncertain` for an uncertain one, `preparing` (with
+    //             recovery 'retryable') for a retryable-but-fenced one. Both
+    //             pairs describe the same failed attempt; matching only
+    //             uncertain/uncertain left retryable+fenced soft-deadlocked
+    //             with a durable row that itself promises a retry (gap A).
+    //   requestId — exact, always: both sides were written by that attempt.
+    //   lineage — equal, or the durable side is a superset (the worker may
+    //             have reported the pre-init lineage into the journal while
+    //             the runtime fence kept none, gap B). A CONFLICTING pair
+    //             still refuses: runtime and disk disagreeing about which
+    //             remote session was touched must never be laundered.
+    const durablePhaseMatches = durableForTakeover?.phase === 'uncertain'
+      || (durableForTakeover?.phase === 'preparing'
+        && durableForTakeover.recovery === 'retryable');
+    const runtimeTaskId = ds.remoteCloseState.taskId ?? undefined;
+    const durableTaskId = durableForTakeover?.taskId ?? undefined;
     const takeoverEligible = runtimeUncertain
-      && durableForTakeover?.phase === 'uncertain'
+      && durableForTakeover !== undefined
+      && durablePhaseMatches
       && durableForTakeover.requestId === ds.remoteCloseState.requestId
-      && (durableForTakeover.taskId ?? undefined) === (ds.remoteCloseState.taskId ?? undefined);
+      && (durableTaskId === runtimeTaskId || runtimeTaskId === undefined);
     if (takeoverEligible) {
       logger.warn(
-        `[${tag(ds)}] explicit close takes over uncertain Mojo journal `
+        `[${tag(ds)}] explicit close takes over ${durableForTakeover.phase} Mojo journal `
         + `(${ds.remoteCloseState.requestId}); re-running the cancel through the live worker`,
       );
+      // Cleared only in memory here; restored if the fresh attempt's durable
+      // write below fails, so the runtime fence (and everything keyed on it,
+      // e.g. the shutdown-detach explicit-close guard) never vanishes without
+      // a successor journal actually on disk.
+      takenOverRuntimeState = ds.remoteCloseState;
       ds.remoteCloseState = undefined;
     } else if (runtimeUncertain) {
       return {
@@ -3388,6 +3415,11 @@ async function prepareLiveRemoteWorkerClose(
       );
       ds.session.mojoCloseJournal = committed.mojoCloseJournal;
     } catch (err) {
+      // Reinstate a runtime fence the takeover cleared: without this, a failed
+      // durable write left the ds fence-less while disk still said uncertain,
+      // and guards keyed on ds.remoteCloseState (shutdown-detach's
+      // explicit-close check) silently lost their signal.
+      if (takenOverRuntimeState) ds.remoteCloseState = takenOverRuntimeState;
       logger.error(
         `[${tag(ds)}] Mojo close journal could not be persisted before cancellation: `
         + `${err instanceof Error ? err.message : String(err)}`,
@@ -5213,15 +5245,31 @@ async function closeUnregisteredCollisionLoser(
     return { ok: false, error: 'durable_close_failed' };
   }
 
-  // The registry entry is deleted right below, so the loser's worker MUST
-  // actually die here. killWorker refuses an unprepared live remote worker
-  // (P0-2) — correct for lineage, but on this path the refusal recreated the
-  // P0-new orphan: row closed, registry cleared, credential-carrying worker
-  // alive and unreachable. A remote loser is therefore retired process-only
-  // (no close IPC, no remote cancel — its lineage stays on the closed row for
-  // manual cleanup, mirroring the drain's isolation-over-deletion shape),
-  // while local losers keep killWorker so their backing session is destroyed.
+  // The registry entry is deleted right below, so the loser's worker must be
+  // put on a guaranteed path to death here. killWorker refuses an unprepared
+  // live remote worker (P0-2) — correct for lineage, but on this path the
+  // refusal recreated the P0-new orphan: row closed, registry cleared,
+  // credential-carrying worker alive and unreachable. A remote loser is
+  // therefore retired process-only: SIGTERM now, SIGKILL by backstop. To be
+  // precise about the claim (fourth-round review): this SIGNALS death and arms
+  // the escalation — it does not synchronously prove the exit. That is
+  // acceptable here because nothing downstream gates on this process being
+  // gone (unlike the VC fence, which separately demands exit proof before
+  // admitting replay); the registry delete below is safe either way.
+  //
+  // No remote cancel is issued: the lineage stays on the CLOSED row
+  // (riffParentTaskId) as the manual-cleanup handle, mirroring the drain's
+  // isolation-over-deletion shape — named in the log below so an operator can
+  // actually find it. Local losers keep killWorker so their backing session
+  // is destroyed.
   if (isRemoteBackendSession(loser)) {
+    if (loser.session.riffParentTaskId) {
+      logger.warn(
+        `[${tag(loser)}] collision loser owns remote lineage `
+        + `${loser.session.riffParentTaskId}; it is NOT cancelled and stays on the closed `
+        + 'row for manual cleanup',
+      );
+    }
     retireWorkerProcessOnly(loser, 'collision_loser');
   } else {
     killWorker(loser);
@@ -10406,22 +10454,23 @@ function setupWorkerHandlers(
           break;
         }
 
-        // Riff is a remote lineage-owning backend, not a local CLI process.
-        // The worker intentionally refuses restart because tearing it down can
-        // destroy or orphan the remote sandbox. Stop before crash-loop
-        // accounting and tell the user how to recover, rather than logging an
-        // "auto-restart" whose IPC is guaranteed to be a no-op.
-        if (isRiffBackendSession(ds)) {
+        // EVERY remote backend is a lineage-owning backend, not a local CLI
+        // process. Stop before crash-loop accounting: for riff the restart IPC
+        // is a guaranteed no-op, and for mojo it is WORSE than a no-op — the
+        // worker executes it, cancelling the remote session and cold-booting a
+        // context-less replacement, so treating a mojo backend exit as a local
+        // CLI crash silently destroyed remote context (fourth-round review).
+        if (isRemoteBackendSession(ds)) {
           const retirementPhase = remoteRetirementAdmissionPhase(ds);
           logger.warn(
-            `[${t}] Riff backend exited; automatic restart is unsupported`
+            `[${t}] Remote backend exited; automatic restart is unsupported`
             + (retirementPhase ? ` (${retirementPhase})` : ''),
           );
           // Explicit /close and daemon shutdown already own the user-visible
           // lifecycle. Only an unexpected backend exit needs recovery guidance.
           if (!retirementPhase && !suppressExitUi) {
             try {
-              await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', undefined);
+              await scopedReply(tr('cmd.restart.remote_unsupported', undefined, loc), 'text', undefined);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);

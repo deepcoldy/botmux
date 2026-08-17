@@ -5,6 +5,9 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
 const commandHandlerSource = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
 const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+const cardHandlerSource = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
+const cardBuilderSource = readFileSync(new URL('../src/im/lark/card-builder.ts', import.meta.url), 'utf8');
+const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
 describe('worker remote retirement protocol', () => {
   it('refuses Riff generation restart before the local restart helper can run', () => {
@@ -180,6 +183,49 @@ describe('worker remote retirement protocol', () => {
     expect(exitStart).toBeGreaterThanOrEqual(0);
     expect(exitHandler).toContain("phase: 'uncertain'");
     expect(exitHandler).not.toContain('ds.remoteCloseState = undefined');
+  });
+
+  it('leaves NO riff-only retirement guard anywhere: every generation-replacing entry point gates on isRemoteBackendSession', () => {
+    // Round-4 exhaustive close-out. Four rounds of review found riff-only
+    // guards one entry point at a time (/cd, then /restart+/repo, then the
+    // cards and the crash loop). This assertion inverts the process: outside
+    // the helper's own definition, `isRiffBackendSession(` may survive only in
+    // sites that are GENUINELY riff-specific (none today), so a new
+    // generation-replacing entry point copied from an old riff guard goes red
+    // here instead of waiting for a reviewer to name it.
+    for (const [name, source] of [
+      ['worker-pool', workerPoolSource],
+      ['command-handler', commandHandlerSource],
+      ['dashboard-ipc-server', dashboardIpcSource],
+      ['card-handler', cardHandlerSource],
+    ] as const) {
+      const uses = source.split('isRiffBackendSession(').length - 1;
+      expect(uses, `${name} still calls isRiffBackendSession`).toBe(0);
+    }
+    // The card RENDER side must agree with the click handler: no restart
+    // button for any remote CLI (a riff worker refuses the IPC; a mojo worker
+    // EXECUTES it and cancels the remote session).
+    expect(cardBuilderSource).toContain('!isRemoteCliId(effectiveCliId)');
+    expect(cardBuilderSource).not.toContain("effectiveCliId !== 'riff'");
+    // Card click + takeover guards on the generalized predicate.
+    expect(cardHandlerSource.split('isRemoteBackendSession(').length - 1).toBeGreaterThanOrEqual(3);
+    expect(commandHandlerSource).toContain('if (!isRemoteBackendSession(ds)) return false;'); // blockRiffTakeover body
+  });
+
+  it('wires the VC receiver teardown to the remote-aware retirement in production', () => {
+    // The fence-module tests inject their own killWorker, so reverting the
+    // PRODUCTION wiring kept them green (fourth-round review). Structural pin:
+    // ordering/wiring properties the injected harness cannot observe.
+    expect(daemonSource).toContain('killWorker: teardownVcReceiverWorker,');
+    // Both boot-recovery sites use the same split teardown.
+    expect(daemonSource.split('teardownVcReceiverWorker(ds)').length - 1).toBeGreaterThanOrEqual(2);
+    // The split itself: remote-frozen receivers go process-only, locals keep killWorker.
+    const body = daemonSource.slice(daemonSource.indexOf('function teardownVcReceiverWorker'));
+    const remoteBranch = body.indexOf('retireWorkerProcessOnly(ds');
+    const localBranch = body.indexOf('killWorker(ds)');
+    expect(body.indexOf('isRemoteBackendSession(ds)')).toBeGreaterThanOrEqual(0);
+    expect(remoteBranch).toBeGreaterThanOrEqual(0);
+    expect(localBranch).toBeGreaterThan(remoteBranch);
   });
 
   it('rejects REMOTE cwd and role switches before mutating persisted workingDir', () => {

@@ -98,7 +98,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { isRiffBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
@@ -450,14 +450,16 @@ export async function commitRepoSelection(
     return false;
   }
 
-  // A live Riff generation cannot use the generic close-and-refork branch.
-  // Riff teardown is a remote prepare/commit protocol; a failed cancellation
-  // followed by forkWorker would reach the double-fork kill and orphan the
-  // still-live remote task.  Require an explicit /close before any card,
-  // worktree, or manual-directory selection can replace this generation.
-  if (!ds.pendingRepo && isRiffBackendSession(ds)) {
-    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, locTarget));
-    logger.warn(`[${tag(ds)}] Repo switch refused: Riff session requires explicit close before replacement`);
+  // A live REMOTE generation (Riff or Mojo) cannot use the generic
+  // close-and-refork branch. Remote teardown is a prepare/commit protocol; a
+  // failed cancellation followed by forkWorker would reach the double-fork
+  // kill and orphan the still-live remote task. Require an explicit /close
+  // before any card, worktree, or manual-directory selection can replace this
+  // generation. (Fourth-round review: the riff-only predicate left the card
+  // entry point open for mojo.)
+  if (!ds.pendingRepo && isRemoteBackendSession(ds)) {
+    await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, locTarget));
+    logger.warn(`[${tag(ds)}] Repo switch refused: remote session requires explicit close before replacement`);
     return false;
   }
 
@@ -2340,12 +2342,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
-      // New Riff cards omit this button, but old/stale cards remain clickable.
-      // Surface the same explicit close-and-recreate guidance as /restart
-      // instead of forwarding an IPC the Riff worker must silently refuse.
-      if (isRiffBackendSession(ds)) {
-        logger.warn(`[${tag(ds)}] Rejected restart on Riff backend session`);
-        const unsupported = t('cmd.restart.riff_unsupported', undefined, locDs);
+      // New remote cards omit this button, but old/stale cards remain
+      // clickable. Surface the same explicit close-and-recreate guidance as
+      // /restart. This must cover EVERY remote backend: unlike riff (whose
+      // worker refuses restart), a mojo worker EXECUTES restart — its teardown
+      // cancels the remote session and cold-boots a context-less replacement —
+      // so a riff-only guard here was a real user entry point into a silent
+      // remote-session destruction (fourth-round review, gate 1).
+      if (isRemoteBackendSession(ds)) {
+        logger.warn(`[${tag(ds)}] Rejected restart on remote backend session`);
+        const unsupported = t('cmd.restart.remote_unsupported', undefined, locDs);
         await deliverEphemeralOrReply(
           ds,
           operatorOpenId,
@@ -3529,12 +3535,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
   }
 
-  // Reject a live Riff repo/worktree replacement before slug generation or
+  // Reject a live REMOTE repo/worktree replacement before slug generation or
   // any local/remote Git side effect. First-spawn pendingRepo selections stay
-  // recoverable when a synchronous fork failure has already stamped Riff.
-  if (!targetDs.pendingRepo && isRiffBackendSession(targetDs)) {
-    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, localeForBot(targetDs.larkAppId)));
-    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: Riff session requires explicit close before replacement`);
+  // recoverable when a synchronous fork failure has already stamped the
+  // remote backend.
+  if (!targetDs.pendingRepo && isRemoteBackendSession(targetDs)) {
+    await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, localeForBot(targetDs.larkAppId)));
+    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: remote session requires explicit close before replacement`);
     return;
   }
 

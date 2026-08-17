@@ -586,6 +586,90 @@ describe('mojo explicit close', () => {
     expect(after?.mojoQuarantinedLineage).toBeUndefined();
   });
 
+  it('takes over a RETRYABLE-but-fenced journal through the runtime fence (round-4 gap A)', async () => {
+    // A prepare that failed retryable+fenced writes durable phase 'preparing'
+    // (recovery retryable) while the runtime fence is 'uncertain' — the
+    // uncertain/uncertain exact match rejected this pair forever with
+    // retryable:false, even though the durable row itself promises a retry.
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-fenced', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-fenced', {
+      recovery: 'retryable',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+    fixture.ds.remoteCloseState = {
+      phase: 'uncertain',
+      requestId: 'req-fenced',
+      taskId: 'mojo-sid-123',
+    };
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed',
+      alreadyClosed: false,
+      known: true,
+    });
+    expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close_commit' }));
+    expect(fixture.ds.worker).toBeNull();
+  });
+
+  it('takes over when the durable journal carries a lineage the runtime fence lacks (round-4 gap B)', async () => {
+    // The worker can report the pre-init lineage into the JOURNAL while the
+    // runtime fence kept none — a durable superset, not a disagreement.
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-preinit', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-preinit', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+    fixture.ds.remoteCloseState = { phase: 'uncertain', requestId: 'req-preinit' };
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({ ok: true, outcome: 'closed' });
+    expect(fixture.ds.worker).toBeNull();
+  });
+
+  it('refuses when the two sides carry CONFLICTING lineages', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-conflict', 'mojo-sid-123');
+    sessionStore.markMojoCloseUnresolved(fixture.session.sessionId, 'req-conflict', {
+      recovery: 'uncertain',
+      taskId: 'mojo-sid-123',
+      admission: 'fenced',
+    });
+    fixture.ds.remoteCloseState = {
+      phase: 'uncertain',
+      requestId: 'req-conflict',
+      taskId: 'mojo-sid-OTHER',
+    };
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_close_reconciliation_required',
+    });
+    expect(fixture.worker.send).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the durable journal is a plain fresh prepare (phase leg)', async () => {
+    // A bare 'preparing' journal WITHOUT a recorded retryable verdict is a
+    // different attempt state, not a recorded failure inviting retry.
+    const fixture = createFixture({ liveWorker: true });
+    sessionStore.beginMojoCloseJournal(fixture.session.sessionId, 'req-bare', 'mojo-sid-123');
+    fixture.ds.remoteCloseState = {
+      phase: 'uncertain',
+      requestId: 'req-bare',
+      taskId: 'mojo-sid-123',
+    };
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_close_reconciliation_required',
+    });
+    expect(fixture.worker.send).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
+  });
+
   it('keeps refusing when the runtime uncertain fence does not match the durable journal', async () => {
     // The takeover requires runtime and disk to describe the SAME failed
     // attempt (phase + requestId + lineage). A mismatched pair means they

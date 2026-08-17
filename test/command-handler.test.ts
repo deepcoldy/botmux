@@ -2050,6 +2050,32 @@ describe('handleCommand', () => {
       );
     });
 
+    it('should reject Mojo restarts with the same remote guard (round-4 gate)', async () => {
+      // Unlike riff (whose worker refuses the IPC), a mojo worker EXECUTES
+      // restart — its teardown cancels the remote session and cold-boots a
+      // context-less replacement. The riff-only guard made /restart a real
+      // remote-destruction entry point for mojo.
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'mojo';
+      ds.session.backendType = 'mojo';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringMatching(/Mojo.*不支持重启.*\/close/),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('should send restart IPC when worker is alive', async () => {
       const workerSend = vi.fn();
       const ds = makeDaemonSession({
@@ -2609,6 +2635,37 @@ describe('handleCommand', () => {
       expect(ds.session).toBe(oldSession);
       expect(ds.workingDir).toBe('/remote/riff');
       expect(ds.session.riffParentTaskId).toBe('task-live');
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('/close');
+    });
+
+    it('refuses a repo switch over a live Mojo generation before teardown or refork (round-4 gate)', async () => {
+      const oldSession = makeSession({
+        cliId: 'mojo',
+        backendType: 'mojo',
+        riffParentTaskId: 'mojo-task-live',
+        workingDir: '/remote/mojo',
+      });
+      const ds = makeDaemonSession({
+        pendingRepo: false,
+        workingDir: '/remote/mojo',
+        worker: { killed: false } as any,
+        initConfig: { backendType: 'mojo' } as any,
+        session: oldSession,
+      });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(teardownAuthoritativePersistentBackingBeforeClose).not.toHaveBeenCalled();
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session).toBe(oldSession);
+      expect(ds.workingDir).toBe('/remote/mojo');
+      expect(ds.session.riffParentTaskId).toBe('mojo-task-live');
       expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('/close');
     });
 
