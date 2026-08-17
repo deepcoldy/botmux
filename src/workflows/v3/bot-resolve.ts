@@ -73,7 +73,6 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     cliId: bot.cliId,
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.model ? { model: bot.model } : {}),
-    ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.sandbox === true ? { sandbox: true } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),

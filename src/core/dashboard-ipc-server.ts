@@ -194,7 +194,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
@@ -3990,7 +3990,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   let nextTurnTimeoutMs: number | undefined;
   if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {
     const n = Number(body.turnTimeoutMs);
-    if (!Number.isInteger(n) || n <= 0) {
+    // Positive integer within the arm-able bound; reject anything else so an
+    // over-bound value can't wrap to ~1ms in the runner's setTimeout.
+    if (!Number.isInteger(n) || n <= 0 || n > MAX_TURN_TIMEOUT_MS) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_turn_timeout_ms' });
     }
     nextTurnTimeoutMs = n;

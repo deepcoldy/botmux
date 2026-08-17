@@ -66,6 +66,29 @@ export const LARK_REQUEST_TIMEOUT_MS = 15_000;
  * purpose does not apply to them. Give uploads a far looser ceiling. */
 export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
 
+/**
+ * Upper bound for a per-bot dsh runner turn timeout. Node's `setTimeout` delay
+ * is a 32-bit signed int of milliseconds; a larger value silently wraps to ~1ms
+ * and emits `TimeoutOverflowWarning`, so any timeout the runner will actually
+ * arm must fit here. Config parsing, the dashboard IPC, and the dashboard UI all
+ * validate against this single bound.
+ */
+export const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Normalize an untrusted `turnTimeoutMs` value: a positive integer within the
+ * arm-able bound is kept, anything else (≤0, non-integer, over the bound,
+ * non-number, absent) collapses to `undefined` (= use the runner default).
+ */
+export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value > 0
+    && value <= MAX_TURN_TIMEOUT_MS
+    ? value
+    : undefined;
+}
+
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
     ?.httpInstance?.defaults;
@@ -2852,11 +2875,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
-      // Positive integer only; ≤0 / non-int / absent → undefined (= runner default).
-      turnTimeoutMs: typeof entry.turnTimeoutMs === 'number'
-        && Number.isInteger(entry.turnTimeoutMs) && entry.turnTimeoutMs > 0
-        ? entry.turnTimeoutMs
-        : undefined,
+      // Positive integer within the arm-able bound only; anything else → undefined
+      // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
+      turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
       reasoningEffort: isCodexReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
         && codexModelSupportsReasoningEffort(

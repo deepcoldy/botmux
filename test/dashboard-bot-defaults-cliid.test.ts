@@ -271,6 +271,91 @@ describe('Codex-compatible runtime editor', () => {
     expect(root.findAllByProps({ 'data-input': 'agentTurnTimeout' })).toHaveLength(0);
   });
 
+  it('shows a legal non-whole-minute timeout and preserves it on a model-only save', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        // Daemon preserved the stored ms because the field was absent from the body.
+        json: async () => ({ ok: true, cliId: 'dsh', model: body.model, turnTimeoutMs: 90_001, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      // 90_001 ms is a legal positive integer but not a whole minute.
+      const { root } = renderDsh({ cliId: 'dsh', model: 'm0', turnTimeoutMs: 90_001 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      // Shown as exact decimal minutes (≈ 1.5000166667), never blanked.
+      expect(input.props.value).not.toBe('');
+      expect(Math.round(Number(input.props.value) * 60_000)).toBe(90_001);
+      // Edit only the model, then save. The untouched timeout must be omitted so
+      // the daemon preserves 90_001 instead of clearing it.
+      const modelInput = root.findByProps({ 'data-input': 'agentModel' });
+      act(() => modelInput.props.onChange({ currentTarget: { value: 'm1' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'dsh', model: 'm1', reasoningEffort: '' }]);
+      expect(Object.prototype.hasOwnProperty.call(requests[0], 'turnTimeoutMs')).toBe(false);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('blocks the save and shows an inline error on invalid turn timeout input', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      // 0 is not a clearable blank and not a positive timeout → must error, not clear.
+      act(() => input.props.onChange({ currentTarget: { value: '0' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      // No PUT happened; an inline error is shown.
+      expect(requests).toEqual([]);
+      expect(root.findAllByProps({ 'data-turn-timeout-error': '' }).length).toBeGreaterThan(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('blocks the save when the minutes value exceeds the arm-able millisecond bound', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      // 40000 min = 2.4e9 ms > 2_147_483_647 ms → invalid (would overflow setTimeout).
+      act(() => input.props.onChange({ currentTarget: { value: '40000' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([]);
+      expect(root.findAllByProps({ 'data-turn-timeout-error': '' }).length).toBeGreaterThan(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('shows a legacy path as read-only and omits cliRuntime on a model-only save', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];

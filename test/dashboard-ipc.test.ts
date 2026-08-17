@@ -2972,6 +2972,25 @@ describe('PUT /api/bot-agent', () => {
       expect(bad.status).toBe(400);
       expect(await bad.json()).toMatchObject({ error: 'invalid_turn_timeout_ms' });
 
+      // Reject values above the arm-able bound (would overflow Node setTimeout).
+      const over = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 2_147_483_648 }),
+      });
+      expect(over.status).toBe(400);
+      expect(await over.json()).toMatchObject({ error: 'invalid_turn_timeout_ms' });
+
+      // A legal non-whole-minute value is accepted and stored verbatim.
+      const oddMs = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 90_001 }),
+      });
+      expect(oddMs.status).toBe(200);
+      expect(await oddMs.json()).toMatchObject({ ok: true, turnTimeoutMs: 90_001 });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ turnTimeoutMs: 90_001 });
+
       // Set a valid timeout → stored on the dsh bot + echoed back.
       const set = await fetch(url, {
         method: 'PUT',

@@ -1362,8 +1362,12 @@ export function BotAgentSection(props: {
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
   // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty = use
-  // the runner default (10 min).
+  // the runner default (10 min). `touched` gates whether a save sends the field
+  // at all: an untouched field is omitted so the daemon preserves the exact
+  // stored ms (including legal non-whole-minute values) instead of clearing it.
   const [turnTimeoutMin, setTurnTimeoutMin] = useState(turnTimeoutMinFromMs(bot.turnTimeoutMs));
+  const [turnTimeoutTouched, setTurnTimeoutTouched] = useState(false);
+  const [turnTimeoutError, setTurnTimeoutError] = useState<string | null>(null);
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1379,6 +1383,8 @@ export function BotAgentSection(props: {
     setModel(typeof bot.model === 'string' ? bot.model : '');
     setReasoningEffort(bot.reasoningEffort ?? '');
     setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
+    setTurnTimeoutTouched(false);
+    setTurnTimeoutError(null);
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1473,16 +1479,32 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
+    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // so an illegal value surfaces an inline error instead of silently clearing
+    // the config. Untouched → omitted below so the daemon preserves the stored
+    // ms exactly (including legal non-whole-minute values).
+    let turnTimeoutField: number | '' | undefined;
+    if (cliKey === 'dsh' && turnTimeoutTouched) {
+      const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
+      if (parsed === 'invalid') {
+        const text = tr('botDefaults.agentTurnTimeoutInvalid');
+        setTurnTimeoutError(text);
+        setAgentStatus({ text: `✗ ${text}` });
+        return;
+      }
+      setTurnTimeoutError(null);
+      turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
+    }
     setAgentBusy(true);
     try {
       const body = {
         cliId: cliKey,
         model,
         reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
-        // dsh-only: send minutes→ms, or '' to clear (revert to runner default).
-        // Non-dsh selections omit the field entirely — the daemon drops any
-        // stored value for non-dsh CLIs regardless, so there's nothing to clear.
-        ...(cliKey === 'dsh' ? { turnTimeoutMs: turnTimeoutMsFromMinInput(turnTimeoutMin) } : {}),
+        // dsh-only: only send when the user actually edited the field. Omitting
+        // it makes the daemon preserve the current value; non-dsh selections
+        // never send it (the daemon drops any stored value for non-dsh CLIs).
+        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
@@ -1510,6 +1532,13 @@ export function BotAgentSection(props: {
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
+        // Re-sync the minutes input from the authoritative saved ms and clear
+        // the dirty flag so a subsequent unrelated save won't touch the field.
+        setTurnTimeoutMin(turnTimeoutMinFromMs(
+          typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
+        ));
+        setTurnTimeoutTouched(false);
+        setTurnTimeoutError(null);
         setRuntimeTouched(false);
         if (cliRuntime) {
           const probe = res.body.runtimeProbe;
@@ -1795,15 +1824,22 @@ export function BotAgentSection(props: {
             <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
             <input
               type="number"
-              min={1}
-              step={1}
-              inputMode="numeric"
+              min={0}
+              // Allow non-whole minutes so a legal non-60000-multiple ms value
+              // (e.g. 90001ms ≈ 1.50002min) can be shown and edited losslessly.
+              step="any"
+              inputMode="decimal"
               data-input="agentTurnTimeout"
               placeholder={tr('botDefaults.agentTurnTimeoutPlaceholder')}
               value={turnTimeoutMin}
               disabled={agentBusy}
-              onChange={event => setTurnTimeoutMin(event.currentTarget.value)}
+              onChange={event => {
+                setTurnTimeoutMin(event.currentTarget.value);
+                setTurnTimeoutTouched(true);
+                setTurnTimeoutError(null);
+              }}
             />
+            {turnTimeoutError ? <small className="hint-warn" data-turn-timeout-error="">{turnTimeoutError}</small> : null}
           </label>
         </div>
       )}
@@ -1872,29 +1908,46 @@ export function BotAgentSection(props: {
 }
 
 /**
+ * Node's setTimeout delay caps at a 32-bit signed int of ms; a larger value
+ * wraps to ~1ms. Kept in lockstep with `MAX_TURN_TIMEOUT_MS` in bot-registry
+ * (a browser bundle can't import that Node-side module); a unit test asserts the
+ * two stay equal so this copy can't silently drift.
+ */
+export const DASHBOARD_MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
  * Convert a stored dsh turn timeout (ms) into the minutes string shown in the
- * dashboard input. Non-positive / non-integer / absent → empty (runner default).
- * Sub-minute or non-whole-minute values fall back to empty rather than showing
- * a misleading rounded figure the operator did not type.
+ * input. Absent / non-positive / non-integer / over-bound → empty (the field
+ * then means "use the runner default"). A legal value that is not a whole
+ * number of minutes is shown as its exact decimal minutes so it round-trips
+ * losslessly instead of being hidden as empty.
  */
 function turnTimeoutMinFromMs(ms: unknown): string {
-  if (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0) return '';
-  if (ms % 60_000 !== 0) return '';
-  return String(ms / 60_000);
+  if (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return '';
+  const minutes = ms / 60_000;
+  // Trim any floating-point tail; the exact ms is recoverable via round() below.
+  return Number.isInteger(minutes) ? String(minutes) : String(Number(minutes.toFixed(10)));
 }
 
 /**
- * Parse the minutes input back into a value for the PUT body: a positive
- * integer number of minutes → ms; empty / invalid → '' (clear → runner
- * default). The daemon re-validates and rejects bad values, so this only needs
- * to distinguish "clear" from "set".
+ * Parse the minutes input for the PUT body. Returns:
+ *  - `''`        → cleared (empty input) → daemon reverts to the runner default,
+ *  - a number    → minutes → ms, a positive integer within the arm-able bound,
+ *  - `'invalid'` → the operator typed something that is not a clearable blank
+ *                  and not a representable positive timeout (0, negative, NaN,
+ *                  or a minutes value whose ms is non-integer / over-bound).
+ * Invalid input is surfaced inline instead of being coerced to a silent clear.
  */
-function turnTimeoutMsFromMinInput(minutes: string): number | '' {
+function parseTurnTimeoutMinInput(minutes: string): number | '' | 'invalid' {
   const trimmed = minutes.trim();
   if (!trimmed) return '';
-  const n = Number(trimmed);
-  if (!Number.isInteger(n) || n <= 0) return '';
-  return n * 60_000;
+  const asMinutes = Number(trimmed);
+  if (!Number.isFinite(asMinutes) || asMinutes <= 0) return 'invalid';
+  const ms = asMinutes * 60_000;
+  // Reject values that can't be stored as a whole positive ms within bounds.
+  const rounded = Math.round(ms);
+  if (Math.abs(ms - rounded) > 1e-6 || rounded <= 0 || rounded > DASHBOARD_MAX_TURN_TIMEOUT_MS) return 'invalid';
+  return rounded;
 }
 
 function skillInjectionResolved(bot: BotDefaultsRow): string {
