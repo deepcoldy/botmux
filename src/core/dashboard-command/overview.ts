@@ -95,9 +95,10 @@ export async function handleDashboardOverview(
     return;
   }
 
-  // 「打开工作台」按钮的链接带 Dashboard token。它只在这里拼——即 admin gate
-  // (handleDashboardCommand → ensureDashboardOwner) 已经放行之后，且卡片是私信
-  // 给发起人本人的。任何绕过 gate 的路径都不得渲染它。
+  // 「打开工作台」按钮的链接带 30 分钟短时兑换票据（P2-1，不再内嵌长期
+  // Dashboard token）。它只在这里 mint——即 admin gate（handleDashboardCommand →
+  // ensureDashboardOwner）已经放行之后，且卡片是私信给发起人本人的。任何绕过
+  // gate 的路径都不得渲染它。
   const workbench = (testDeps.resolveWorkbench ?? resolveWorkbenchButtonLinks)(larkAppId);
 
   const cardJson = buildOverviewCard(

@@ -733,6 +733,49 @@ describe('decideDashboardAuth — public surface', () => {
     });
     expect(d.kind).toBe('deny401');
   });
+
+  // ─── P2-1：/workbench-ticket/<ticket> 兑换端点 ─────────────────────────
+  // 飞书卡片的工作台入口改带短时票据；票据本身就是凭证，处理器自行验票，所以
+  // 这条 GET 必须在 token 门禁之外可达。其它方法与残缺路径保持 fail closed。
+  it('GET /workbench-ticket/<ticket> — 短时票据兑换端点 allow without any token', () => {
+    const d = decideDashboardAuth({
+      method: 'GET',
+      pathname: '/workbench-ticket/abc123_-XYZ',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  it('POST /workbench-ticket/<ticket> → deny401（仅豁免 GET，fail closed）', () => {
+    const d = decideDashboardAuth({
+      method: 'POST',
+      pathname: '/workbench-ticket/abc123_-XYZ',
+      hasTokenParam: false,
+      presentedToken: undefined,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
+  it('GET /workbench-ticket/（无票据段）与多级路径 → deny401', () => {
+    for (const pathname of ['/workbench-ticket/', '/workbench-ticket', '/workbench-ticket/a/b']) {
+      const d = decideDashboardAuth({
+        method: 'GET',
+        pathname,
+        hasTokenParam: false,
+        presentedToken: undefined,
+        activeToken: TOK,
+      });
+      expect(d.kind).toBe('deny401');
+    }
+  });
+
+  it('decideWorkbenchH5Auth also reaches the ticket redemption GET (falls through as public)', () => {
+    expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/workbench-ticket/abc123_-XYZ' }).kind)
+      .toBe('allow');
+  });
 });
 
 describe('decideDashboardAuth — protected surface', () => {

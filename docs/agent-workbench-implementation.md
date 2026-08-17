@@ -160,6 +160,7 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 ### 5.1 身份与秘密
 
 - App Secret、飞书 app/user access token、authorization code、Dashboard cookie、daemon HMAC、Terminal grant 和 preview target 不进入浏览器 DTO、URL hash、localStorage、SSE、审计或日志。
+- 长期 Dashboard 管理 token 不进持久化飞书卡片：`/dashboard` 卡片「打开工作台」按钮改带 30 分钟 TTL 的兑换票据（`/workbench-ticket/<ticket>`，构建卡片时现 mint、非一次性、到期即死）；dashboard 验票通过后按既有 `?t=` 流程同款种 legacy cookie 再 302 进工作台，无效/过期只回无凭据提示页。票据落盘（`~/.botmux/.workbench-tickets.json`，0600）只存 hash + 过期时间，重启不废刚发的卡；`?t=<长期 token>` 直链形态仅保留给 `botmux dashboard` 终端输出。
 - H5 allowlist 使用 open_id 精确匹配；空列表不是“允许所有人”。
 - control、preview interaction、preview proxy、H5 context 与 workbench capabilities 投影都不在 publicReadOnly allowlist。
 - Browser API adapter 对 response shape 做运行时校验；非法 mode、deadline、owned、securityNotice 或 H5 context 以 502 型客户端错误 fail closed。

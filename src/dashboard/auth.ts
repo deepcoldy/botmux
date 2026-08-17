@@ -328,6 +328,8 @@ export function buildSetCookie(token: string): string {
  *   - `GET/HEAD /`, `/assets/*`, root icons    — static SPA shell
  *   - `GET /api/workflows/*`                   — zero-I/O legacy retirement
  *                                                tombstone (HTTP 410).
+ *   - `GET /workbench-ticket/<ticket>`         — 短时票据兑换（票据即凭证，
+ *                                                处理器自行验票，P2-1）。
  *
  * Outside those always-public surfaces, the explicit `publicReadOnly`
  * allow-list controls tokenless observation. Mutations and private reads still
@@ -488,6 +490,13 @@ export function decideDashboardAuth(opts: {
       pathname.startsWith('/game/')
     );
 
+  // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换端点。URL 路径里的票据本身
+  // 就是凭证（30 分钟 TTL、落盘只存 hash，见 workbench-ticket.ts），处理器自行
+  // 验票，无效/过期只回一个无凭据提示页——所以这条 GET 必须放在 token 门禁之外，
+  // 与静态壳同级。仅豁免 GET（处理器也只接 GET），其它方法保持 fail closed。
+  const isTicketRedemption =
+    method === 'GET' && /^\/workbench-ticket\/[^/]+$/.test(pathname);
+
   // Public read-only mode opens ONLY the allow-listed "watch work" reads
   // (PUBLIC_READ_PATHS) — fail-closed: a path not on the list stays token-gated
   // even under publicReadOnly, so new endpoints don't silently become public.
@@ -498,7 +507,7 @@ export function decideDashboardAuth(opts: {
 
   const authed = !!presentedToken && presentedToken === activeToken;
 
-  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isPublicRead) {
+  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isPublicRead && !isTicketRedemption) {
     return { kind: 'deny401' };
   }
 

@@ -6,11 +6,20 @@
  * a fully-isolated handler suite covering refresh/goto/error paths.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SessionRow } from '../src/core/dashboard-rows.js';
+import { resolveWorkbenchButtonLinks } from '../src/core/workbench-link.js';
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
 import type { DashboardSettingsInput } from '../src/dashboard/settings-card-model.js';
+import {
+  resetWorkbenchTicketStoreForTests,
+  verifyWorkbenchTicket,
+} from '../src/dashboard/workbench-ticket.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import { appCenterAppLink } from '../src/im/lark/lark-hosts.js';
 import {
@@ -619,5 +628,79 @@ describe('handleOverviewCardAction', () => {
     // The handler still gets to create a client (admin gate passed), but it
     // should NOT make any HTTP request for an unknown action.
     expect(deps.requestSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─── P2-1：真实 resolver 端到端——长期 token 明文绝不进卡片 JSON ─────────────
+// 上面所有用例都注入假的 workbench 链接；这一组走**真实**的
+// resolveWorkbenchButtonLinks（真的读 .dashboard-port、真的 mint 票据落盘），
+// 钉死评审要修的那条不变量：持久化卡片里只有 30 分钟短时票据，`.dashboard-token`
+// 的内容（明文或 URL 编码形态）一个字节都不出现。
+describe('workbench link never embeds the persisted dashboard token (P2-1)', () => {
+  // 足够独特、绝不会偶然出现在 URL 结构里的 token 明文。
+  const LEAKY_TOKEN = 'LEAKY-LONG-LIVED-DASHBOARD-TOKEN-0123456789';
+  let homeDir: string;
+  let savedHome: string | undefined;
+
+  beforeEach(() => {
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-wblink-'));
+    const botmuxDir = join(homeDir, '.botmux');
+    mkdirSync(botmuxDir, { mode: 0o700 });
+    chmodSync(botmuxDir, 0o700); // mkdirSync 的 mode 会被 umask 削减，显式钉死
+    writeFileSync(join(botmuxDir, '.dashboard-port'), '7899');
+    writeFileSync(join(botmuxDir, '.dashboard-token'), LEAKY_TOKEN, { mode: 0o600 });
+    savedHome = process.env.HOME;
+    process.env.HOME = homeDir;
+    resetWorkbenchTicketStoreForTests();
+  });
+
+  afterEach(() => {
+    resetWorkbenchTicketStoreForTests();
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  it('resolveWorkbenchButtonLinks mints a redeemable /workbench-ticket/ URL, token-free', () => {
+    const links = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    expect(links).toBeDefined();
+
+    // webUrl 形态：<base>/workbench-ticket/<票据>，无查询串无 hash。
+    const web = new URL(links!.webUrl);
+    const m = web.pathname.match(/^\/workbench-ticket\/([A-Za-z0-9_-]{32,})$/);
+    expect(m).not.toBeNull();
+    expect(web.search).toBe('');
+    // 卡片里的票据必须真的可兑换（mint 已落盘）。
+    expect(verifyWorkbenchTicket(m![1])).toBe(true);
+
+    // 两端目标都不含长期 token（明文与 URL 编码形态）。
+    for (const target of [links!.webUrl, links!.appLink]) {
+      expect(target).not.toContain(LEAKY_TOKEN);
+      expect(target).not.toContain(encodeURIComponent(LEAKY_TOKEN));
+    }
+  });
+
+  it('the fully-rendered card JSON contains the ticket URL but zero token plaintext', () => {
+    const links = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    const json = buildOverviewCard(
+      { sessions: [], schedules: [], settings: makeSettings() },
+      { invokerOpenId: INVOKER, locale: 'zh', workbench: links },
+    );
+    expect(json).toContain('/workbench-ticket/');
+    expect(json).not.toContain(LEAKY_TOKEN);
+    expect(json).not.toContain(encodeURIComponent(LEAKY_TOKEN));
+    // 老形态 `?t=<token>` 整体退场：卡片 JSON 里不允许再出现 ?t=/%3Ft%3D 入口。
+    expect(json).not.toContain('?t=');
+    expect(json).not.toContain('%3Ft%3D');
+  });
+
+  it('every card build mints a FRESH ticket (refresh rotates the entry link)', () => {
+    const first = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    const second = resolveWorkbenchButtonLinks(LARK_APP_ID);
+    expect(first!.webUrl).not.toBe(second!.webUrl);
+    // 旧票不因新票作废（各自独立 TTL）。
+    const ticketOf = (u: string) => new URL(u).pathname.split('/workbench-ticket/')[1];
+    expect(verifyWorkbenchTicket(ticketOf(first!.webUrl))).toBe(true);
+    expect(verifyWorkbenchTicket(ticketOf(second!.webUrl))).toBe(true);
   });
 });

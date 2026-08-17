@@ -90,6 +90,7 @@ import {
 import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
 import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
+import { handleWorkbenchTicketRedemption } from './dashboard/workbench-ticket.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
   mintTerminalViewCapability,
@@ -3260,6 +3261,16 @@ const server = createServer(async (req, res) => {
         'location': decision.redirectTo,
       });
       res.end();
+      return;
+    }
+
+    // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie
+    // 流程——语义同款：验票通过就种同一个 legacy cookie，再 302 进工作台。票据由
+    // /dashboard 卡片构建时现 mint（TTL 30 分钟、可多端重复打开，落盘只存 hash，
+    // 见 dashboard/workbench-ticket.ts），长期管理 token 从此不再写进持久化卡片；
+    // 无效/过期回一个无凭据中文提示页。该 GET 在 decideDashboardAuth 里与静态壳
+    // 同级放行（票据本身就是凭证），其余方法不豁免。
+    if (handleWorkbenchTicketRedemption(req, res, url, { activeToken: () => activeToken })) {
       return;
     }
 

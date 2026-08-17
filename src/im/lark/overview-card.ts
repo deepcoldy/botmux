@@ -172,10 +172,12 @@ export interface BuildOverviewCardOpts {
   invokerOpenId: string;
   locale: Locale;
   /**
-   * 「打开工作台」按钮的目标。缺省（读不到 dashboard 端口/token）就不渲染按钮，
+   * 「打开工作台」按钮的目标。缺省（读不到 dashboard 端口等）就不渲染按钮，
    * 而不是渲染一个点了没反应的死链。链接怎么来的见 `core/workbench-link.ts`。
    *
-   * 注意：这条链接带 Dashboard token，等价于凭证。它只能出现在已经过了
+   * 注意（P2-1）：这条链接携带的是 30 分钟 TTL 的兑换票据（`/workbench-ticket/…`），
+   * **不再内嵌长期 Dashboard token**——卡片历史、转发、截图里的旧链接到期即废。
+   * 但票据在 TTL 内仍可兑换出管理 cookie，所以它依然只能出现在已经过了
    * `/dashboard` 管理员门禁的回复里——命令入口在 `dashboard-command/owner-gate.ts`
    * 拦，回调入口在下面 `handleOverviewCardAction` 的 invoker-lock +
    * `isDashboardAdmin` 拦。渲染它的地方不得放宽任何一层。
@@ -467,7 +469,8 @@ export async function handleOverviewCardAction(
 
   if (action === OVERVIEW_ACTION_REFRESH) {
     // 刷新必须重新带上工作台按钮，否则用户点一下「🔄 刷新」入口就消失了。
-    // 这里已经过了 invoker-lock + isDashboardAdmin 两道门，才允许拼带 token 的链接。
+    // 这里已经过了 invoker-lock + isDashboardAdmin 两道门，才允许现 mint 短时
+    // 票据拼入口链接（P2-1：链接带票据不带长期 token，刷新即换新票）。
     const workbench = (deps.resolveWorkbench ?? resolveWorkbenchButtonLinks)(larkAppId);
     return rebuildOverview(client, operatorOpenId, locale, workbench);
   }
