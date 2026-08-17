@@ -338,6 +338,10 @@ export interface DaemonSession {
     phase: 'preparing' | 'prepared' | 'abort_restored' | 'uncertain';
     requestId: string;
     taskId?: string;
+    /** LOCAL subtree residual carried by a `prepared` proof, so a retry after a
+     *  failed durable commit republishes the SAME residual close instead of
+     *  degrading it to a plain `closed` (see Session.mojoCloseJournal). */
+    localResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   };
   /** Graceful-shutdown transaction for the exact remote worker generation. */
   remoteShutdownState?: {

@@ -268,10 +268,10 @@ describe('A5: a workerless close must prove the local subtree', () => {
     try {
       const sessionId = 'sess-workerless-alive';
       recordContainmentHandle(liveWeakHandle(sessionId, child.pid, `nonce-${child.pid}`));
-      const outcome = proveWorkerlessLocalSubtree(sessionId);
-      expect(outcome).not.toBeNull();
-      expect(outcome?.kind).toBe('failed');
-      if (outcome?.kind === 'failed') expect(outcome.retryable).toBe(true);
+      const proof = proveWorkerlessLocalSubtree(sessionId);
+      expect(proof.unproven?.kind).toBe('failed');
+      if (proof.unproven?.kind === 'failed') expect(proof.unproven.retryable).toBe(true);
+      expect(proof.residual).toBeNull();
       expect(containmentHandles(sessionId)).toHaveLength(1);
     } finally {
       try { process.kill(child.pid, 'SIGKILL'); } catch { /* already gone */ }
@@ -285,20 +285,21 @@ describe('A5: a workerless close must prove the local subtree', () => {
   it.runIf(isLinux)('passes and discharges the handle when the local subtree is provably gone', () => {
     const sessionId = 'sess-workerless-gone';
     recordContainmentHandle(staleWeakHandle(sessionId, 999_004));
-    expect(proveWorkerlessLocalSubtree(sessionId)).toBeNull();
+    expect(proveWorkerlessLocalSubtree(sessionId)).toEqual({ unproven: null, residual: null });
     expect(containmentHandles(sessionId)).toEqual([]);
   });
 
   it('passes when the session never owned a local subtree', () => {
-    expect(proveWorkerlessLocalSubtree('sess-workerless-empty')).toBeNull();
+    expect(proveWorkerlessLocalSubtree('sess-workerless-empty'))
+      .toEqual({ unproven: null, residual: null });
   });
 
   it('refuses when the containment store is unreadable', () => {
     mkdirSync(dataDir, { recursive: true });
     writeFileSync(join(dataDir, STORE), 'corrupt');
-    const outcome = proveWorkerlessLocalSubtree('sess-workerless-corrupt');
-    expect(outcome?.kind).toBe('failed');
-    if (outcome?.kind === 'failed') expect(outcome.retryable).toBe(true);
+    const proof = proveWorkerlessLocalSubtree('sess-workerless-corrupt');
+    expect(proof.unproven?.kind).toBe('failed');
+    if (proof.unproven?.kind === 'failed') expect(proof.unproven.retryable).toBe(true);
   });
 
   it('lets a workerless close through when the only member left is a zombie', () => {
@@ -312,9 +313,13 @@ describe('A5: a workerless close must prove the local subtree', () => {
       kind: 'tree-identity', sessionId, generation: 0,
       rootPid: 5150, bootId: proc.bootId, startTime: 999, nonce: 'nonce-workerless-zombie',
     });
-    expect(proveWorkerlessLocalSubtree(sessionId, { procRoot: proc.path })).toBeNull();
     // Close allowed (a zombie executes nothing), handle retained: a weak handle
-    // never mints a boundary proof, so the blocker outlives the close.
+    // never mints a boundary proof, so the blocker outlives the close. The old
+    // contract returned a bare null here, which the caller read as "clean" and
+    // published a PLAIN closed row while the handle silently stayed — the close
+    // must instead carry the residual so it publishes closed_with_residual.
+    expect(proveWorkerlessLocalSubtree(sessionId, { procRoot: proc.path }))
+      .toEqual({ unproven: null, residual: 'local_subtree_boundary_unproven' });
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
@@ -328,8 +333,8 @@ describe('A5: a workerless close must prove the local subtree', () => {
       kind: 'tree-identity', sessionId, generation: 0,
       rootPid: 5150, bootId: proc.bootId, startTime: 999, nonce: 'nonce-workerless-mixed',
     });
-    const outcome = proveWorkerlessLocalSubtree(sessionId, { procRoot: proc.path });
-    expect(outcome?.kind).toBe('failed');
+    const proof = proveWorkerlessLocalSubtree(sessionId, { procRoot: proc.path });
+    expect(proof.unproven?.kind).toBe('failed');
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 
@@ -338,8 +343,8 @@ describe('A5: a workerless close must prove the local subtree', () => {
     // a proof we do not have. Point the scan at a /proc that does not exist.
     const sessionId = 'sess-workerless-unscannable';
     recordContainmentHandle(liveWeakHandle(sessionId, process.pid, 'nonce-unscannable'));
-    const outcome = proveWorkerlessLocalSubtree(sessionId, { procRoot: join(dataDir, 'no-proc') });
-    expect(outcome?.kind).toBe('failed');
+    const proof = proveWorkerlessLocalSubtree(sessionId, { procRoot: join(dataDir, 'no-proc') });
+    expect(proof.unproven?.kind).toBe('failed');
     expect(containmentHandles(sessionId)).toHaveLength(1);
   });
 });

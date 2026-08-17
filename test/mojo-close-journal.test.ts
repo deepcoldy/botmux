@@ -636,3 +636,38 @@ describe('a commit-only journal forbids further teardown', () => {
     })).toBe(false);
   });
 });
+
+describe('journal localResidual (round-6 P1)', () => {
+  it('validates the localResidual enum and rejects arbitrary strings', () => {
+    const base = { phase: 'prepared' as const, requestId: 'r', updatedAt: 'now' };
+    expect(sessionStore.isValidMojoCloseJournal({
+      ...base, localResidual: 'local_subtree_boundary_unproven',
+    })).toBe(true);
+    expect(sessionStore.isValidMojoCloseJournal({
+      ...base, localResidual: 'local_subtree_unprovable_on_platform',
+    })).toBe(true);
+    // Anything else is a forged/corrupted grade — the journal must refuse it
+    // rather than replay an unknown residual into the close outcome.
+    expect(sessionStore.isValidMojoCloseJournal({
+      ...base, localResidual: 'totally_fine_trust_me',
+    })).toBe(false);
+  });
+
+  it('a repeat prepare without a residual keeps the recorded one', () => {
+    sessionStore.init('app');
+    const session = sessionStore.createSession('oc_j', 'om_j', 'journal', 'group');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'task-1';
+    sessionStore.updateSession(session);
+    sessionStore.beginMojoCloseJournal(session.sessionId, 'req-1', 'task-1');
+    sessionStore.markMojoClosePrepared(
+      session.sessionId, 'req-1', 'task-1', 'local_subtree_boundary_unproven',
+    );
+    // The evidence grade of the original close does not improve by replaying it.
+    const replayed = sessionStore.markMojoClosePrepared(session.sessionId, 'req-1', 'task-1');
+    expect(replayed.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+  });
+});

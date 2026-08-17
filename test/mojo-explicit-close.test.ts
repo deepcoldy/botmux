@@ -88,6 +88,8 @@ function createFixture(options: {
   liveWorker?: boolean;
   closeOk?: boolean;
   resultTaskId?: string;
+  /** Local-subtree residual the worker reports on an otherwise successful close. */
+  closeResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   /** Omit the frozen identity so the lineage reads as quarantined. */
   legacyUnfrozen?: boolean;
   /** Restore-time quarantine PARKS the id here and clears the active slot. */
@@ -141,6 +143,7 @@ function createFixture(options: {
         taskId: options.resultTaskId ?? 'mojo-sid-123',
         ...((options.closeOk ?? true) ? {} : { error: 'mojo cancel HTTP 500' }),
         ...(options.closeRecovery ? { recovery: options.closeRecovery } : {}),
+        ...(options.closeResidual ? { residual: options.closeResidual } : {}),
       }));
     });
   }
@@ -1300,5 +1303,116 @@ describe('closeSessionForBackgroundCleanup', () => {
     expect(errored).toContain('close REFUSED');
     expect(errored).toContain('unit cleanup');
     expect(errored).toContain('mojo-sid-123');
+  });
+});
+
+describe('local residual survives durable retry, restart replay and the workerless path (round-6 P1)', () => {
+  it('durable-retry: a failed prepare commit republishes the SAME residual close', async () => {
+    // live worker reports ok + local residual; the first durable commit fails.
+    // The retry must publish closed_with_residual — before this fix
+    // remoteCloseState kept only {phase,requestId,taskId}, so the retry
+    // silently downgraded the close to a plain `closed`.
+    const fixture = createFixture({
+      liveWorker: true,
+      closeResidual: 'local_subtree_boundary_unproven',
+    });
+    const realPrepare = sessionStore.markMojoClosePrepared;
+    vi.spyOn(sessionStore, 'markMojoClosePrepared')
+      .mockImplementationOnce(() => { throw new Error('proof disk full'); })
+      .mockImplementation((...args) => realPrepare(...args));
+
+    expect(await closeSession(fixture.ds.session.sessionId, fixture.registry)).toMatchObject({
+      ok: false,
+      error: 'mojo_durable_close_failed',
+    });
+    expect(fixture.ds.remoteCloseState).toMatchObject({
+      phase: 'prepared',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+
+    expect(await closeSession(fixture.ds.session.sessionId, fixture.registry)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
+    // The replay handed the durable layer the residual it was replaying.
+    const prepareCalls = vi.mocked(sessionStore.markMojoClosePrepared).mock.calls;
+    expect(prepareCalls[prepareCalls.length - 1]![3]).toBe('local_subtree_boundary_unproven');
+  });
+
+  it('restart replay: a prepared journal carrying a residual still publishes it after daemon loss', async () => {
+    const fixture = createFixture({
+      liveWorker: true,
+      closeResidual: 'local_subtree_unprovable_on_platform',
+    });
+    const realClose = sessionStore.closeSession;
+    vi.spyOn(sessionStore, 'closeSession')
+      .mockImplementationOnce(() => { throw new Error('disk full'); })
+      .mockImplementation((...args) => realClose(...args));
+
+    expect((await closeSession(fixture.ds.session.sessionId, fixture.registry)).ok).toBe(false);
+    // The residual reached the DURABLE journal with the prepare proof.
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      localResidual: 'local_subtree_unprovable_on_platform',
+    });
+
+    // Lose every runtime-only proof and reload the row exactly as a new daemon.
+    setActiveSessionsRegistry(new Map());
+    sessionStore.init('app');
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_unprovable_on_platform' },
+    });
+  });
+
+  it('workerless: a weak-only local proof reaches the close as closed_with_residual', async () => {
+    // cancelMojoSessionById now carries the workerless local-subtree proof on the
+    // outcome; dropping it (the old `return null` contract in
+    // proveWorkerlessLocalSubtree) published a plain closed row while the
+    // containment handle silently stayed behind.
+    const fixture = createFixture();
+    cancelMojoMock.mockResolvedValue({
+      kind: 'cancelled',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'closed' });
+  });
+
+  it('workerless durable-retry: the residual survives a failed prepare commit too', async () => {
+    const fixture = createFixture();
+    cancelMojoMock.mockResolvedValue({
+      kind: 'cancelled',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+    const realPrepare = sessionStore.markMojoClosePrepared;
+    vi.spyOn(sessionStore, 'markMojoClosePrepared')
+      .mockImplementationOnce(() => { throw new Error('proof disk full'); })
+      .mockImplementation((...args) => realPrepare(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_durable_close_failed',
+    });
+    expect(fixture.ds.remoteCloseState).toMatchObject({
+      phase: 'prepared',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
+    // No second cancel: the retry republished the recorded proof.
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
   });
 });

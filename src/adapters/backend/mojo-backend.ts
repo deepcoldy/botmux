@@ -52,12 +52,16 @@ import {
     acquireContainmentHandle,
     containmentHandleKey,
     containmentHandles,
+    killPreparedBoundary,
+    prepareContainmentBoundary,
     proveContainmentQuiescent,
     recordContainmentHandle,
     releaseContainmentHandle,
+    strongHandleFromPreparedBoundary,
     containedProvenQuiescence,
     containmentQuiescence,
     type ContainmentReleaseDecision,
+    type PreparedContainmentBoundary,
     weakHandleRootStillOriginal,
 } from '../../core/mojo-containment.js';
 import type { ContainmentHandle, QuiescenceVerdict, WeakContainmentHandle } from '../../core/mojo-containment.js';
@@ -99,6 +103,7 @@ import type {
     MojoError,
     MojoCancelOutcome,
     MojoLineStyle,
+    MojoLocalCloseResidual,
     MojoStreamEvent,
 } from './mojo-types.js';
 import { MOJO_CLI_TIMEOUT_MS, MOJO_DESTROY_SETTLE_MS, MOJO_CHILD_TERMINATION_PROOF_MS } from './mojo-budgets.js';
@@ -135,6 +140,27 @@ const SESSION_BUSY_RE = /正在执行中|RUNNING）|already running/i;
 const RESUME_DEAD_RE =
     /会话.*(不存在|已过期|已结束|无效|未找到)|session.*(not\s*found|expired|invalid|does not exist)|not_found|invalid_session/i;
 const BUSY_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
+
+/**
+ * Pre-exec cgroup enrolment shim (P0: the spawn→enrolment window).
+ *
+ * Post-spawn migration cannot capture descendants the child forked before the
+ * parent's `cgroup.procs` write landed — cgroup v2 does not retroactively move
+ * an existing process's descendants — so the enrolment has to happen INSIDE the
+ * child, before any target code runs. `/bin/sh` writes its own pid into the
+ * prepared boundary and only then `exec`s the real launch, keeping the same
+ * pid. Between fork and the write the process executes just this shim, which
+ * forks nothing, so every descendant of the target is born enrolled.
+ *
+ * The `|| exit 97` is the handshake: an enrolment failure must NOT fall through
+ * to running a credentialed binary outside the boundary. Exit 97 is reserved —
+ * the parent maps it to a refused turn (see MOJO_ENROLL_FAILED_EXIT).
+ *
+ * Invoked as: sh -c SHIM <name> <cgroup.procs path> <bin> <args...>
+ * ($0 = name, $1 = procs path; after `shift`, "$@" = bin + args.)
+ */
+export const MOJO_CGROUP_ENROLL_SHIM = 'echo "$$" > "$1" || exit 97; shift; exec "$@"';
+export const MOJO_ENROLL_FAILED_EXIT = 97;
 
 /**
  * stdio is always `['ignore','pipe','pipe']` here (stdin MUST be closed — see
@@ -207,6 +233,20 @@ export class MojoBackend implements SessionBackend {
      * generation is distinguishable from the first one.
      */
     private readonly containmentGeneration: number;
+    /**
+     * The cgroup boundary prepared for the CURRENT turn, created before spawn so
+     * the child can enrol itself pre-exec (see MOJO_CGROUP_ENROLL_SHIM). Null on
+     * hosts without cgroup v2 delegation — those turns get a weak handle instead.
+     */
+    private preparedBoundary: PreparedContainmentBoundary | null = null;
+    /**
+     * Latched when a spawned turn's containment handle could NOT be persisted
+     * AND the started subtree could not be proven terminated afterwards. While
+     * set, every close/destroy proof is refused: there is a tree nothing durable
+     * describes, so publishing a closed row would drop the device-isolation
+     * blocker over a subtree we cannot enumerate.
+     */
+    private containmentUnrecorded = false;
     /**
      * Root pid of the most recent turn, kept AFTER `this.child` is cleared.
      *
@@ -604,6 +644,10 @@ export class MojoBackend implements SessionBackend {
     /** Overridable so a test can point the scan at a synthetic /proc. */
     protected get procRoot(): string { return '/proc'; }
 
+    /** Overridable so a test can point boundary preparation at a synthetic
+     *  cgroup root. `undefined` = the real /sys/fs/cgroup. */
+    protected get cgroupRoot(): string | undefined { return undefined; }
+
     /**
      * SIGTERM the whole turn SUBTREE, then gather the best evidence this host can
      * give that nothing in it survives (escalating to SIGKILL).
@@ -835,18 +879,84 @@ export class MojoBackend implements SessionBackend {
      * loses the tree, and a lost tree can never be proven quiescent afterwards.
      */
     private recordTurnContainment(rootPid: number): void {
-        // acquireContainmentHandle cannot return null: on a host with neither cgroup
-        // v2 nor a readable boot id it mints an `unprovable` handle instead, which is
-        // persisted, can never be released, and reports unsupported-platform. That is
-        // what makes the residual-close path safe — there is always something durable
-        // holding the device-isolation blocker, so there is no "nothing was recorded"
-        // case left to handle here.
+        // Strong path: the boundary was prepared before spawn and the child enrols
+        // itself pre-exec, so the handle can simply adopt the directory — no pid
+        // migration, hence no spawn→enrolment window (the P0 this replaced).
+        const prepared = this.preparedBoundary;
+        if (prepared) {
+            recordContainmentHandle(strongHandleFromPreparedBoundary(prepared));
+            // The handle owns the directory now; a later spawn failure must not
+            // kill a boundary that belongs to a recorded turn.
+            this.preparedBoundary = null;
+            return;
+        }
+        // acquireContainmentHandle cannot return null: on a host with neither a
+        // preparable cgroup boundary nor a readable boot id it mints an
+        // `unprovable` handle instead, which is persisted, can never be released,
+        // and reports unsupported-platform. That is what makes the residual-close
+        // path safe — there is always something durable holding the
+        // device-isolation blocker, so there is no "nothing was recorded" case
+        // left to handle here.
         recordContainmentHandle(acquireContainmentHandle({
             sessionId: this.sessionId,
             generation: this.containmentGeneration,
             rootPid,
             nonce: this.treeNonce,
         }));
+    }
+
+    /**
+     * Terminate a subtree whose containment handle could not be persisted.
+     *
+     * `containmentUnrecorded` is already latched by the caller. It is cleared
+     * only when the boundary is PROVEN empty (rmdir accepted by the kernel) —
+     * anything less keeps every close proof refused, because a tree nothing
+     * durable describes must not be closable.
+     */
+    private async containUnrecordedSpawn(
+        child: ChildProcessByStdio<null, Readable, Readable>,
+        cause: unknown,
+    ): Promise<void> {
+        logger.error(
+            `[mojo] containment handle could not be persisted for pid ${child.pid}; `
+            + `terminating the just-started subtree: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+        this.emitLine('❌ mojo 本轮启动失败：进程围栏无法登记，已终止刚启动的子进程。', 'err');
+        const prepared = this.preparedBoundary;
+        // Belt and braces alongside cgroup.kill: the direct child is its own
+        // group leader (detached:true), so the group signal reaches a pre-exec
+        // shim that has not enrolled yet.
+        if (typeof child.pid === 'number' && child.pid > 0) {
+            try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ }
+            try { child.kill('SIGKILL'); } catch { /* gone */ }
+        }
+        // Wait for the reap: a SIGKILLed member lingers in cgroup.procs as a
+        // zombie until its parent (us) collects it, and the rmdir proof below
+        // would spin against that zombie forever.
+        await new Promise<void>(resolve => {
+            if (child.exitCode !== null || child.signalCode !== null) return resolve();
+            const timer = setTimeout(resolve, 5_000);
+            timer.unref?.();
+            child.once('close', () => { clearTimeout(timer); resolve(); });
+        });
+        if (prepared) {
+            this.preparedBoundary = null;
+            if (killPreparedBoundary(prepared)) {
+                this.containmentUnrecorded = false;
+                return;
+            }
+            logger.error(
+                `[mojo] boundary ${prepared.cgroupPath} could not be proven empty after the record `
+                + 'failure; every close proof for this generation stays refused',
+            );
+            return;
+        }
+        // Weak path: no boundary to prove emptiness with. The latch stays set —
+        // the tree may have descendants only a recorded handle could enumerate.
+        logger.error(
+            '[mojo] unrecorded subtree was signalled but cannot be proven terminated '
+            + '(no strong boundary); every close proof for this generation stays refused',
+        );
     }
 
     /**
@@ -1088,6 +1198,21 @@ export class MojoBackend implements SessionBackend {
                 ok: false,
                 ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
                 error: 'shutdown_detach_in_progress',
+            };
+        }
+        if (this.containmentUnrecorded) {
+            // A spawned subtree exists that no durable handle describes (the record
+            // failed and termination could not be proven). Publishing ANY close
+            // verdict would drop the device-isolation blocker over a tree we cannot
+            // enumerate, so the close is refused outright.
+            this.closing = true;
+            this.admissionFenced = true;
+            return {
+                ok: false,
+                ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
+                error: 'containment_unrecorded_subtree',
+                recovery: 'retryable',
+                admission: 'fenced',
             };
         }
         // Gate FIRST so no new turn is accepted, then let the in-flight one settle
@@ -1491,7 +1616,28 @@ export class MojoBackend implements SessionBackend {
             this.streamedThisTurn = false;
             this.stdoutTail = '';
 
-            const child = spawnProcess(bin, args, {
+            // The strong boundary must exist BEFORE the child does, and the child
+            // must enter it BEFORE exec (see MOJO_CGROUP_ENROLL_SHIM): post-spawn
+            // migration leaves already-forked descendants outside the cgroup, which
+            // voids the entire strong proof. Null → weak handle fallback.
+            this.preparedBoundary = prepareContainmentBoundary(
+                {
+                    sessionId: this.sessionId,
+                    generation: this.containmentGeneration,
+                    nonce: this.treeNonce,
+                },
+                this.cgroupRoot !== undefined ? { cgroupRoot: this.cgroupRoot } : {},
+            );
+            const launchBin = this.preparedBoundary ? '/bin/sh' : bin;
+            const launchArgs = this.preparedBoundary
+                ? [
+                    '-c', MOJO_CGROUP_ENROLL_SHIM, 'mojo-cgroup-enroll',
+                    `${this.preparedBoundary.cgroupPath}/cgroup.procs`,
+                    bin, ...args,
+                ]
+                : args;
+
+            const child = spawnProcess(launchBin, launchArgs, {
                 cwd: this.resolveCwd(),
                 env: this.buildEnv(),
                 // stdin MUST be closed: mojo waits on socket-type stdin and an open
@@ -1530,7 +1676,18 @@ export class MojoBackend implements SessionBackend {
                 // Doing this at close time would be too late: a crash in between is
                 // exactly the window that loses the tree, and a lost tree is one the
                 // next generation can never prove quiescent.
-                this.recordTurnContainment(child.pid);
+                try {
+                    this.recordTurnContainment(child.pid);
+                } catch (err) {
+                    // A child is RUNNING and nothing durable describes it. Failing
+                    // only the turn would leave that subtree alive behind a blocker
+                    // nobody recorded — so terminate it now, and refuse every close
+                    // proof until termination is itself proven (the latch is set
+                    // FIRST so a concurrent /close cannot slip through the async
+                    // window below).
+                    this.containmentUnrecorded = true;
+                    void this.containUnrecordedSpawn(child, err);
+                }
             }
             let stderr = '';
 
@@ -1539,11 +1696,29 @@ export class MojoBackend implements SessionBackend {
 
             child.on('error', (err: Error) => {
                 this.child = null;
+                // Spawn failed: nothing ever ran, so nobody enrolled. Reap the
+                // prepared boundary (a recorded handle, if the record already
+                // happened, owns the directory instead and preparedBoundary is null).
+                const prepared = this.preparedBoundary;
+                if (prepared) {
+                    this.preparedBoundary = null;
+                    killPreparedBoundary(prepared);
+                }
                 reject(err);
             });
             child.on('close', (code: number | null) => {
                 this.child = null;
                 this.flushTail();
+                // The pre-exec shim's handshake: enrolment into the prepared cgroup
+                // failed, so it exited WITHOUT exec'ing mojo (nothing credentialed
+                // ran). Surfaced as its own failure so it cannot be mistaken for a
+                // mojo crash — silently falling through would retry into the same
+                // undelegated cgroup forever.
+                if (code === MOJO_ENROLL_FAILED_EXIT && !this.streamedThisTurn && !this.turnSettled) {
+                    this.emitLine('❌ mojo 启动失败：无法进入进程围栏（cgroup 入组被拒），本轮未执行。', 'err');
+                    this.settleTurn();
+                    return resolve(false);
+                }
                 // exit 2 == unknown model; stderr carries the authoritative list.
                 if (code === 2 && /未知模型|unknown model/i.test(stderr)) {
                     this.emitLine(`❌ 模型名无效。${stderr.trim()}`, 'err');
@@ -2024,37 +2199,59 @@ export async function cancelMojoSessionById(
     // without this check the daemon publishes the row `closed`, the row drops out of
     // the device-isolation inventory, and the blocker disappears while a credentialed
     // process is still executing.
-    const localUnproven = proveWorkerlessLocalSubtree(sessionId);
-    if (localUnproven) return localUnproven;
+    const local = proveWorkerlessLocalSubtree(sessionId);
+    if (local.unproven) return local.unproven;
+    // A weak-only local proof must survive every remote-gone outcome, or the
+    // caller publishes a plain `closed` row while the handle (and the blocker)
+    // silently stays behind — the exact laundering this type exists to prevent.
+    const carryResidual = (outcome: MojoCancelOutcome): MojoCancelOutcome =>
+        local.residual !== null && outcome.kind !== 'failed'
+            ? { ...outcome, localResidual: local.residual }
+            : outcome;
 
     try {
         await attempt();
-        return { kind: 'cancelled' };
+        return carryResidual({ kind: 'cancelled' });
     } catch {
         try {
             await attempt();
-            return { kind: 'cancelled' };
+            return carryResidual({ kind: 'cancelled' });
         } catch (err: unknown) {
             const outcome = classifyMojoCancelFailure(err);
             logger.warn(
                 `[mojo] orphan session cancel failed (session ${sessionId} may keep running remotely): ${String(err)}`,
             );
-            return outcome;
+            return carryResidual(outcome);
         }
     }
+}
+
+/** The workerless local-subtree proof, split into its two independent answers. */
+export interface WorkerlessLocalSubtreeProof {
+    /** Non-null → quiescence itself is unproven; the close must be REFUSED. */
+    unproven: MojoCancelOutcome | null;
+    /**
+     * Quiescence was proven, but at least one release decision kept its handle
+     * (weak evidence carries no boundary proof), so the close may proceed ONLY
+     * as `closed_with_residual`. Discarding this — the old contract returned
+     * bare null here — published a plain `closed` row while the handle and the
+     * device-isolation blocker silently stayed behind.
+     */
+    residual: MojoLocalCloseResidual | null;
 }
 
 /**
  * Prove (and discharge) the LOCAL subtree a dead worker may have left behind.
  *
- * Returns null when everything is proven gone, or when nothing was outstanding.
- * Any non-proof returns a `failed` outcome so the caller refuses the close and the
- * session's device-isolation blocker is retained.
+ * `unproven: null` means every outstanding handle was proven quiescent (or none
+ * existed). `residual` then reports whether any of those proofs was weak-only,
+ * in which case the handle stays in the store and the caller must surface a
+ * residual close instead of a plain one.
  */
 export function proveWorkerlessLocalSubtree(
     sessionId: string,
     opts: { procRoot?: string } = {},
-): MojoCancelOutcome | null {
+): WorkerlessLocalSubtreeProof {
     const procRoot = opts.procRoot ?? '/proc';
     const excludePids = [process.pid, process.ppid].filter(pid => typeof pid === 'number' && pid > 0);
     let outstanding: ContainmentHandle[];
@@ -2064,11 +2261,15 @@ export function proveWorkerlessLocalSubtree(
         // Unreadable store: we cannot know what is outstanding, so the close must not
         // succeed. Retryable, because a later read may well work.
         return {
-            kind: 'failed',
-            message: `cannot read containment store for ${sessionId}: ${String(err)}`,
-            retryable: true,
+            unproven: {
+                kind: 'failed',
+                message: `cannot read containment store for ${sessionId}: ${String(err)}`,
+                retryable: true,
+            },
+            residual: null,
         };
     }
+    let residual: MojoLocalCloseResidual | null = null;
 
     for (const handle of outstanding) {
         const verdict: QuiescenceVerdict = proveContainmentQuiescent(handle, {
@@ -2096,12 +2297,28 @@ export function proveWorkerlessLocalSubtree(
                 + 'refusing to report the session closed so its device-isolation blocker is retained',
             );
             return {
-                kind: 'failed',
-                message: `local subtree unproven: ${verdict.reason}`,
-                retryable: true,
+                unproven: {
+                    kind: 'failed',
+                    message: `local subtree unproven: ${verdict.reason}`,
+                    retryable: true,
+                },
+                residual: null,
             };
         }
-        releaseContainmentHandle(verdict);
+        const decision = releaseContainmentHandle(verdict);
+        if (decision.residual !== null) {
+            // Weak evidence: the handle (and the blocker) stays. The close may
+            // proceed, but only as a residual one — mirrors the live-worker
+            // teardown's `boundaryProven === false` branch so the two paths can
+            // never disagree about the same evidence grade.
+            logger.warn(
+                `[mojo] workerless close for ${sessionId}: local subtree `
+                + `${containmentHandleKey(handle)} scanned clean but the credential boundary is NOT `
+                + `proven (evidence ${decision.evidence}); the close will carry a residual marker `
+                + 'and the device-isolation blocker is retained',
+            );
+            residual = 'local_subtree_boundary_unproven';
+        }
     }
-    return null;
+    return { unproven: null, residual };
 }

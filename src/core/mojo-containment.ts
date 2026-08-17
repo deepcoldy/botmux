@@ -337,45 +337,135 @@ export interface AcquireContainmentInput {
 }
 
 /**
- * Mint the strongest handle this host can support for a turn subtree.
+ * A cgroup boundary created BEFORE the turn child is spawned.
  *
- * Returns null only when NEITHER kind can be minted (no cgroup v2 AND no boot
- * id, i.e. we cannot even describe the tree durably). A null return is itself a
- * fail-closed signal: the caller has spawned a credentialed child it will never
- * be able to prove quiescent, so it must keep the blocker for the session's
- * lifetime rather than proceed as if containment existed.
+ * The strong handle used to be minted post-spawn by migrating the root pid into
+ * a fresh cgroup. That left a spawn→enrolment window: cgroup v2 migration does
+ * not retroactively move a process's already-forked descendants
+ * (admin-guide/cgroup-v2: "Migration of a process doesn't affect already
+ * existing descendant processes"), so a descendant forked (and setsid'd) inside
+ * the window was outside the cgroup while `cgroup.procs` — the whole strong
+ * proof — read empty after the root exited. The proof went false-green and the
+ * device-isolation blocker was cleared with a credentialed escapee still alive.
+ *
+ * The boundary is therefore prepared first, and the child enrols ITSELF into it
+ * before exec'ing the target binary (see MOJO_CGROUP_ENROLL_SHIM in
+ * mojo-backend). Between fork and enrolment the process runs only our trusted
+ * shim, which forks nothing, so every descendant of the target binary is born
+ * inside the cgroup — that is the precondition the strong proof relies on.
+ */
+export interface PreparedContainmentBoundary {
+    sessionId: string;
+    generation: number;
+    cgroupPath: string;
+    nonce: string;
+}
+
+/**
+ * Create the cgroup directory for a turn about to be spawned.
+ *
+ * Returns null when the host cannot support a strong boundary (no cgroup v2, or
+ * the slice is not writable) — the caller falls back to the weak post-spawn
+ * handle, which never claims boundary proof.
+ */
+export function prepareContainmentBoundary(
+    input: { sessionId: string; generation: number; nonce: string },
+    opts: { cgroupRoot?: string } = {},
+): PreparedContainmentBoundary | null {
+    const cgroupRoot = opts.cgroupRoot ?? CGROUP_ROOT;
+    if (!cgroupV2Available({ cgroupRoot })) return null;
+    // A stable, collision-free name: two generations of the same session must
+    // not share a directory, or releasing one would release the other's proof.
+    const dir = join(
+        cgroupRoot,
+        CGROUP_SLICE,
+        `mojo-${sanitizeForPath(input.sessionId)}-g${input.generation}-${randomBytes(4).toString('hex')}`,
+    );
+    try {
+        mkdirSync(dir, { recursive: true });
+        // Enrolment is the CHILD's job (pre-exec), but it must be possible at
+        // all: an unwritable cgroup.procs would make every spawn die on the shim
+        // handshake. Probe writability now — an empty write is a no-op for the
+        // kernel — so an undelegated slice degrades to the weak handle here
+        // instead of failing every turn later.
+        writeFileSync(`${dir}/cgroup.procs`, '');
+        return { sessionId: input.sessionId, generation: input.generation, cgroupPath: dir, nonce: input.nonce };
+    } catch {
+        // Delegation not granted / read-only /sys — the caller falls back to the
+        // weak handle rather than pretending containment was established.
+        try { rmdirSync(dir); } catch { /* best-effort */ }
+        return null;
+    }
+}
+
+/** Mint the strong handle for a boundary the child has enrolled itself into. */
+export function strongHandleFromPreparedBoundary(prepared: PreparedContainmentBoundary): ContainmentHandle {
+    return {
+        kind: 'cgroup',
+        sessionId: prepared.sessionId,
+        generation: prepared.generation,
+        cgroupPath: prepared.cgroupPath,
+        nonce: prepared.nonce,
+    };
+}
+
+/**
+ * Kill every process currently enrolled in a prepared boundary (cgroup.kill),
+ * then remove the directory if that emptied it.
+ *
+ * For the caller who spawned a child through the enrolment shim and then FAILED
+ * to record the handle durably: the subtree must not be left running behind a
+ * blocker nobody recorded. Returns true only when the boundary is provably
+ * empty (or already gone) afterwards — false means the caller must keep its
+ * own fence up.
+ */
+export function killPreparedBoundary(prepared: PreparedContainmentBoundary): boolean {
+    // The ONLY accepted proof of emptiness is a successful rmdir: the kernel
+    // refuses to remove a cgroup with members, and once removed no late enroller
+    // can enter (its `cgroup.procs` write fails, so the shim exits without
+    // exec'ing). Reading `cgroup.procs` and seeing it empty is NOT enough — a
+    // shim mid-handshake could enrol between the read and the rmdir, and a
+    // freshly SIGKILLed member lingers as a listed zombie until reaped.
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            writeFileSync(`${prepared.cgroupPath}/cgroup.kill`, '1\n');
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+            // Unwritable kill knob (or a synthetic boundary in tests): fall
+            // through — the rmdir below is still the authoritative proof.
+        }
+        // On a synthetic (plain-directory) boundary the knob writes above CREATE
+        // files, which a plain rmdir refuses. Unlinking them is a no-op on real
+        // cgroupfs (EPERM, swallowed) and restores rmdir's meaning in tests.
+        for (const knob of ['cgroup.procs', 'cgroup.kill']) {
+            try { unlinkSync(`${prepared.cgroupPath}/${knob}`); } catch { /* cgroupfs refuses; fine */ }
+        }
+        try {
+            rmdirSync(prepared.cgroupPath);
+            return true;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+            // EBUSY / ENOTEMPTY: members still live (or racing in) — kill again.
+        }
+    }
+    return false;
+}
+
+/**
+ * Mint the strongest POST-SPAWN handle this host can describe a turn with.
+ *
+ * Deliberately NEVER a cgroup handle: migrating an already-running root into a
+ * cgroup does not capture descendants it forked before the write, so a strong
+ * handle minted here would claim a boundary that provably has a hole (the P0
+ * this module was rewritten for). Strong handles exist only via
+ * prepareContainmentBoundary + the pre-exec enrolment shim. This function is
+ * the fallback for hosts (or spawn paths) where that was not possible, and the
+ * handles it mints never carry boundary proof.
  */
 export function acquireContainmentHandle(
     input: AcquireContainmentInput,
     opts: { cgroupRoot?: string; procRoot?: string; platform?: string } = {},
 ): ContainmentHandle {
-    const cgroupRoot = opts.cgroupRoot ?? CGROUP_ROOT;
-    if (cgroupV2Available({ cgroupRoot })) {
-        // A stable, collision-free name: two generations of the same session must
-        // not share a directory, or releasing one would release the other's proof.
-        const dir = join(
-            cgroupRoot,
-            CGROUP_SLICE,
-            `mojo-${sanitizeForPath(input.sessionId)}-g${input.generation}-${randomBytes(4).toString('hex')}`,
-        );
-        try {
-            mkdirSync(dir, { recursive: true });
-            // Moving the root in migrates it AND every future descendant: cgroup
-            // membership is inherited across fork and is unaffected by setsid.
-            writeFileSync(`${dir}/cgroup.procs`, `${input.rootPid}\n`);
-            return {
-                kind: 'cgroup',
-                sessionId: input.sessionId,
-                generation: input.generation,
-                cgroupPath: dir,
-                nonce: input.nonce,
-            };
-        } catch {
-            // Delegation not granted / read-only /sys — fall through to the weak
-            // handle rather than pretending containment was established.
-            try { rmdirSync(dir); } catch { /* best-effort */ }
-        }
-    }
     const bootId = readBootId({ procRoot: opts.procRoot });
     const startTime = bootId === null
         ? null

@@ -326,6 +326,15 @@ export interface Session {
     taskId?: string;
     updatedAt: string;
     /**
+     * LOCAL subtree residual reported by the prepare that proved the remote side
+     * gone (see MojoLocalCloseResidual). Durable ON PURPOSE: the residual is part
+     * of the close outcome, and a prepared journal replayed after a daemon
+     * restart (or after a failed runtime commit) must still publish
+     * `closed_with_residual` — dropping it here is how the close came to lie
+     * with a plain `closed` while the containment handle stayed behind.
+     */
+    localResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+    /**
      * The EXACT verdict the worker returned for a failed prepare.
      *
      * Without it the journal collapsed two different states into one row: an

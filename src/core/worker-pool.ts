@@ -3335,6 +3335,9 @@ async function prepareLiveRemoteWorkerClose(
         ds.session.sessionId,
         ds.remoteCloseState.requestId,
         ds.remoteCloseState.taskId,
+        // The retry must republish the SAME proof, residual included — the
+        // original prepare saw the local evidence grade; this replay did not.
+        ds.remoteCloseState.localResidual,
       );
       ds.session.mojoCloseJournal = committed.mojoCloseJournal;
       ds.session.riffParentTaskId = committed.riffParentTaskId;
@@ -3353,6 +3356,9 @@ async function prepareLiveRemoteWorkerClose(
     return {
       ok: true,
       ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      ...(ds.remoteCloseState.localResidual
+        ? { residual: { reason: ds.remoteCloseState.localResidual } }
+        : {}),
     };
   }
   if (ds.remoteShutdownState) {
@@ -3523,18 +3529,25 @@ async function prepareLiveRemoteWorkerClose(
           ds.session.sessionId,
           requestId,
           taskId,
+          // Durable ON PURPOSE: the residual is part of the close outcome, and a
+          // daemon restart replaying this prepared journal must still publish
+          // `closed_with_residual` (only the worker saw the evidence grade).
+          result.residual,
         );
         ds.session.mojoCloseJournal = committed.mojoCloseJournal;
         ds.session.riffParentTaskId = committed.riffParentTaskId;
       } catch (err) {
         // Cancellation is irreversible. The runtime proof stays prepared and
         // admission remains fenced; a retry republishes that same proof without
-        // asking the worker to cancel twice. The durable `preparing` journal
-        // makes a daemon crash fail closed rather than resume this generation.
+        // asking the worker to cancel twice — residual included, or the retry
+        // would silently downgrade a residual close to a plain one. The durable
+        // `preparing` journal makes a daemon crash fail closed rather than
+        // resume this generation.
         ds.remoteCloseState = {
           phase: 'prepared',
           requestId,
           ...(taskId ? { taskId } : {}),
+          ...(result.residual ? { localResidual: result.residual } : {}),
         };
         logger.error(
           `[${tag(ds)}] Mojo close proof persistence failed after cancellation; `
@@ -3552,6 +3565,7 @@ async function prepareLiveRemoteWorkerClose(
         phase: 'prepared',
         requestId,
         ...(taskId ? { taskId } : {}),
+        ...(result.residual ? { localResidual: result.residual } : {}),
       };
       logger.info(`[${tag(ds)}] mojo worker close prepared and remote cancellation confirmed`);
       // The remote lineage is confirmed cancelled, but that says nothing about the
@@ -3987,12 +4001,19 @@ async function prepareMojoExplicitClose(
     // A prior daemon already received and durably recorded the irreversible
     // worker cancellation proof. Finish only the local status/lineage commit;
     // repeating the CLI cancel would turn an idempotent recovery into failure.
+    // A parked remote lineage outranks the journal's LOCAL residual in the one
+    // slot the response has (it names a live remote session); the local marker
+    // still surfaces whenever nothing is parked.
     return {
       ok: true,
       ...((durableClose.taskId ?? remoteId)
         ? { taskId: (durableClose.taskId ?? remoteId)! }
         : {}),
-      ...(parked ? { residual: parked } : {}),
+      ...(parked
+        ? { residual: parked }
+        : durableClose.localResidual
+          ? { residual: { reason: durableClose.localResidual } }
+          : {}),
     };
   }
   const matchingRuntimePreparedProof = durableClose?.phase === 'preparing'
@@ -4012,13 +4033,18 @@ async function prepareMojoExplicitClose(
         session.sessionId,
         ds.remoteCloseState!.requestId,
         ds.remoteCloseState!.taskId,
+        ds.remoteCloseState!.localResidual,
       );
       session.mojoCloseJournal = committed.mojoCloseJournal;
       session.riffParentTaskId = committed.riffParentTaskId;
       return {
         ok: true,
         ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
-        ...(parked ? { residual: parked } : {}),
+        ...(parked
+          ? { residual: parked }
+          : ds.remoteCloseState!.localResidual
+            ? { residual: { reason: ds.remoteCloseState!.localResidual } }
+            : {}),
       };
     } catch (err) {
       logger.error(
@@ -4254,11 +4280,16 @@ async function prepareMojoExplicitClose(
     );
     return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
   }
+  // The workerless local-subtree proof travels ON the outcome (see
+  // cancelMojoSessionById): a weak-only proof keeps its containment handle, and
+  // this close must say so — durably, so retries and restarts republish it.
+  const localResidual = outcome.kind !== 'failed' ? outcome.localResidual : undefined;
   try {
     const committed = sessionStore.markMojoClosePrepared(
       session.sessionId,
       requestId,
       remoteId,
+      localResidual,
     );
     session.mojoCloseJournal = committed.mojoCloseJournal;
     session.riffParentTaskId = committed.riffParentTaskId;
@@ -4266,7 +4297,12 @@ async function prepareMojoExplicitClose(
     // Cancellation is proven and cannot be rolled back. Keep the runtime proof
     // prepared so the same daemon can publish it on retry; after a crash the
     // durable `preparing` journal remains fenced for explicit reconciliation.
-    ds.remoteCloseState = { phase: 'prepared', requestId, taskId: remoteId };
+    ds.remoteCloseState = {
+      phase: 'prepared',
+      requestId,
+      taskId: remoteId,
+      ...(localResidual ? { localResidual } : {}),
+    };
     logger.error(
       `[${tag(ds)}] Workerless Mojo close proof persistence failed after cancellation: `
       + `${err instanceof Error ? err.message : String(err)}`,
@@ -4278,7 +4314,12 @@ async function prepareMojoExplicitClose(
       taskId: remoteId,
     };
   }
-  ds.remoteCloseState = { phase: 'prepared', requestId, taskId: remoteId };
+  ds.remoteCloseState = {
+    phase: 'prepared',
+    requestId,
+    taskId: remoteId,
+    ...(localResidual ? { localResidual } : {}),
+  };
   // Deliberately does NOT clear the runtime lineage here. sessionStore commonly
   // holds the very same Session object, so an early clear is visible to the durable
   // save — and if that save then fails, the rollback has already lost the id it
@@ -4290,7 +4331,16 @@ async function prepareMojoExplicitClose(
   // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
   // can carry both (restore parked the old id, the session then created a new one).
   // Reporting a plain success here would hide the parked remote session entirely.
-  return { ok: true, taskId: remoteId, ...(parked ? { residual: parked } : {}) };
+  // With nothing parked, the LOCAL residual takes the slot for the same reason.
+  return {
+    ok: true,
+    taskId: remoteId,
+    ...(parked
+      ? { residual: parked }
+      : localResidual
+        ? { residual: { reason: localResidual } }
+        : {}),
+  };
 }
 
 /**

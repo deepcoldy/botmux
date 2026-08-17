@@ -586,6 +586,9 @@ export function isValidMojoCloseJournal(
       && journal.admission !== 'restorable'
       && journal.admission !== 'fenced') return false;
   if (journal.commitOnly !== undefined && typeof journal.commitOnly !== 'boolean') return false;
+  if (journal.localResidual !== undefined
+      && journal.localResidual !== 'local_subtree_unprovable_on_platform'
+      && journal.localResidual !== 'local_subtree_boundary_unproven') return false;
   // A retryable verdict never proves an irreversible teardown, so it must not
   // arrive wearing the marker that suppresses further cancellation.
   if (journal.recovery === 'retryable' && journal.commitOnly === true) return false;
@@ -697,6 +700,7 @@ export function markMojoClosePrepared(
   sessionId: string,
   requestId: string,
   taskId?: string,
+  localResidual?: NonNullable<Session['mojoCloseJournal']>['localResidual'],
 ): Session {
   return mutateMojoCloseJournal(sessionId, (session) => {
     const existing = session.mojoCloseJournal;
@@ -715,10 +719,17 @@ export function markMojoClosePrepared(
       throw new Error(`Mojo close result lineage changed for ${sessionId}`);
     }
     if (provenTaskId) session.riffParentTaskId = provenTaskId;
+    // The residual is part of the PROOF being published: a replay of this
+    // prepared journal (runtime commit retry, or a daemon restart) must publish
+    // the same residual close it describes. A repeat prepare without one keeps
+    // the recorded residual — the evidence grade of the original close does not
+    // improve by being replayed.
+    const provenResidual = localResidual ?? existing?.localResidual;
     session.mojoCloseJournal = {
       phase: 'prepared',
       requestId,
       ...(provenTaskId ? { taskId: provenTaskId } : {}),
+      ...(provenResidual ? { localResidual: provenResidual } : {}),
       updatedAt: new Date().toISOString(),
     };
   });

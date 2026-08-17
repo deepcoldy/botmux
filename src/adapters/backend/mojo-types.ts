@@ -179,11 +179,21 @@ export const MOJO_CANONICAL_JWT_ENV_KEY = 'X_JWT_TOKEN';
  * calibrated against @byted/mojo, the classifier returns `failed` for everything
  * it cannot prove, which fails CLOSED (row stays open, retryable).
  */
+/**
+ * A LOCAL subtree the close proved quiescent by weak evidence only (or could not
+ * instrument at all), so its containment handle — and the device-isolation
+ * blocker — stays behind. Carried on remote-gone outcomes so the final close can
+ * publish `closed_with_residual` instead of lying with a plain `closed`.
+ */
+export type MojoLocalCloseResidual =
+    | 'local_subtree_unprovable_on_platform'
+    | 'local_subtree_boundary_unproven';
+
 export type MojoCancelOutcome =
     /** The cancel call succeeded. The remote session is gone. */
-    | { kind: 'cancelled' }
+    | { kind: 'cancelled'; localResidual?: MojoLocalCloseResidual }
     /** Proven already finished — carries the verified signal that proved it. */
-    | { kind: 'already_terminal'; evidence: string }
+    | { kind: 'already_terminal'; evidence: string; localResidual?: MojoLocalCloseResidual }
     /** Unknown or failed. `retryable: false` only for causes a retry cannot fix. */
     | { kind: 'failed'; code?: string; message: string; retryable: boolean };
 
