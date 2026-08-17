@@ -28,6 +28,7 @@ import {
   verifyPreviewContentCapability,
 } from '../src/dashboard/preview-content-capability.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
+import { resolvePreviewPortOwner } from '../src/core/preview-port-owner.js';
 import { isPreviewPort, probeSessionPreviewTarget } from '../src/core/session-preview.js';
 import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/control-audit.js';
 
@@ -168,15 +169,33 @@ const unreachablePort = await listen(reservation);
 await closeServer(reservation);
 const registeredAt = new Date(previewNow).toISOString();
 
+// P1-12 之后 SessionPreviewTarget 必须带端口持有证明，缺证明的目标会被
+// safeSessionPreviewTarget 归零、代理一律回 409。真实上游就监听在本进程里，所以
+// 这里走生产同一条 resolvePreviewPortOwner 求一份**真的**证明。
+// invalid-port / unreachable 两条用例考的是「端口非法」与「拨不通」，代理侧只做形状
+// 校验（归属复核在 dashboard.ts 的 resolver 里、不在代理里），因此复用同一份形状
+// 合法的证明，用例语义保持不变。
+const upstreamOwner = resolvePreviewPortOwner({
+  host: '127.0.0.1',
+  port: upstreamPort,
+  ownerPids: [process.pid],
+});
+assert.ok(
+  upstreamOwner.ok,
+  `could not prove ownership of the in-process preview upstream port (${(upstreamOwner as { reason?: string }).reason})`,
+);
+const owner = upstreamOwner.proof;
+const workerGeneration = 1;
+
 function resolvePreview(sessionId: string): PreviewProxyResolution {
   if (sessionId === 'browser-success') {
-    return { ok: true, target: { host: '127.0.0.1', port: upstreamPort, registeredAt } };
+    return { ok: true, target: { host: '127.0.0.1', port: upstreamPort, registeredAt, owner, workerGeneration } };
   }
   if (sessionId === 'invalid-port') {
-    return { ok: true, target: { host: '127.0.0.1', port: 70_000, registeredAt } };
+    return { ok: true, target: { host: '127.0.0.1', port: 70_000, registeredAt, owner, workerGeneration } };
   }
   if (sessionId === 'unreachable') {
-    return { ok: true, target: { host: '127.0.0.1', port: unreachablePort, registeredAt } };
+    return { ok: true, target: { host: '127.0.0.1', port: unreachablePort, registeredAt, owner, workerGeneration } };
   }
   if (sessionId === 'browser-failure') return { ok: false, status: 503, error: 'daemon_offline' };
   return { ok: false, status: 404, error: 'preview_not_registered' };
@@ -279,10 +298,18 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
     const port = Number(url.searchParams.get('port'));
     if (!isPreviewPort(port)) return json(res, 400, { ok: false, error: 'invalid_port' });
-    const target = await probeSessionPreviewTarget({ port, timeoutMs: 100, now: () => new Date(previewNow) });
-    return target
-      ? json(res, 200, { ok: true, preview: { path: '/preview/browser-success/', registeredAt: target.registeredAt } })
-      : json(res, 422, { ok: false, error: 'preview_unreachable' });
+    // P1-12：注册现在是「可达 + 归属」两件事，返回结构化结果而不是 target|undefined。
+    // 血缘根用本进程 pid——被注册的上游就监听在这个进程里。
+    const probe = await probeSessionPreviewTarget({
+      port,
+      timeoutMs: 100,
+      now: () => new Date(previewNow),
+      ownerPids: [process.pid],
+      workerGeneration,
+    });
+    return probe.ok
+      ? json(res, 200, { ok: true, preview: { path: '/preview/browser-success/', registeredAt: probe.target.registeredAt } })
+      : json(res, 422, { ok: false, error: probe.error });
   }
 
   if (previewGuard.handle(req, res, url)) return;

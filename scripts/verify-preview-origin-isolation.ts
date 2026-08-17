@@ -31,6 +31,7 @@ import type { Duplex } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Frame } from 'playwright';
 import { WebSocket, WebSocketServer } from 'ws';
+import { resolvePreviewPortOwner } from '../src/core/preview-port-owner.js';
 import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
 import { createDebugTerminalManager } from '../src/dashboard/debug-terminal.js';
 import { createPreviewGuardPage } from '../src/dashboard/preview-guard-page.js';
@@ -251,6 +252,24 @@ evilWss.on('connection', socket => {
 });
 const evilPort = await listen(evilUpstream);
 
+// P1-12 之后 SessionPreviewTarget 必须带「谁持有这个端口」的证明，缺证明的目标会被
+// safeSessionPreviewTarget 归零、代理直接回 409 invalid_preview_target。这里求一份
+// **真的** procfs 证明而不是编一个假的：恶意 dev server 就监听在本进程里，所以用本
+// 进程 pid 作血缘根，走的是生产同一条 resolvePreviewPortOwner。这样这条 P0 回归依旧
+// 跑在完整的硬化契约上——它要证的是「预览内容确实被代理进来了、而攻击链断死」，
+// 绝不能靠绕过归属校验来让自己变绿。
+const evilOwner = resolvePreviewPortOwner({
+  host: '127.0.0.1',
+  port: evilPort,
+  ownerPids: [process.pid],
+});
+assert.ok(
+  evilOwner.ok,
+  `harness could not prove ownership of its own dev-server port (${(evilOwner as { reason?: string }).reason})`
+  + ' — this P0 harness requires Linux procfs',
+);
+const evilTargetOwner = evilOwner.proof;
+
 // ── Dashboard 前门：真 guard shell + 真 preview proxy + 真 debug terminal ──────
 const debugTerminals = createDebugTerminalManager({
   getActiveToken: () => DASHBOARD_TOKEN,
@@ -264,7 +283,16 @@ function ownerCookiePresent(req: IncomingMessage): boolean {
 
 function resolvePreview(sessionId: string): PreviewProxyResolution {
   return sessionId === SESSION_ID
-    ? { ok: true, target: { host: '127.0.0.1', port: evilPort, registeredAt: new Date().toISOString() } }
+    ? {
+      ok: true,
+      target: {
+        host: '127.0.0.1',
+        port: evilPort,
+        registeredAt: new Date().toISOString(),
+        owner: evilTargetOwner,
+        workerGeneration: 1,
+      },
+    }
     : { ok: false, status: 404, error: 'preview_not_registered' };
 }
 
