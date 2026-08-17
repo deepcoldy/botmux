@@ -13,6 +13,11 @@ export const DASHBOARD_H5_CLIENT_TIMEOUT_MS = 8_000;
 const MAX_AUTH_BODY_BYTES = 4 * 1024;
 const DEFAULT_EXCHANGE_TIMEOUT_MS = 8_000;
 
+/** Upper bound for the configured reverse-proxy hop count. Deployments chain a
+ *  handful of proxies at most; a typo of `99` must not turn into "trust the
+ *  whole client-supplied chain". */
+export const DASHBOARD_H5_MAX_TRUSTED_PROXY_HOPS = 8;
+
 export interface DashboardH5AuthConfig {
   enabled: boolean;
   brand: Brand;
@@ -22,6 +27,14 @@ export interface DashboardH5AuthConfig {
   entryPath: string;
   sessionTtlMs: number;
   secureCookies: boolean;
+  /**
+   * How many reverse-proxy hops sit in front of this dashboard and may be
+   * trusted to have written `x-forwarded-for`. `0` (the default, and the only
+   * safe value for a directly-exposed dashboard) means the header is ignored
+   * outright and the socket peer address is the client. Required rather than
+   * optional so every construction site states its proxy posture.
+   */
+  trustedProxyHops: number;
 }
 
 export interface DashboardAuthIdentity {
@@ -219,6 +232,13 @@ export function resolveDashboardH5AuthConfig(env: NodeJS.ProcessEnv = process.en
   const rawTtl = Number(env.BOTMUX_DASHBOARD_FEISHU_H5_SESSION_TTL_MS);
   const sessionTtlMs = validTtl(rawTtl) ? rawTtl : DEFAULT_DASHBOARD_SESSION_TTL_MS;
   const publicUrl = env.BOTMUX_PUBLIC_URL?.trim() ?? '';
+  // Absent/blank/garbage all mean "no trusted proxy" — the value that makes
+  // `x-forwarded-for` unspoofable because it is not read at all.
+  const rawHops = Number(env.BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS);
+  const trustedProxyHops = Number.isSafeInteger(rawHops)
+    && rawHops > 0 && rawHops <= DASHBOARD_H5_MAX_TRUSTED_PROXY_HOPS
+    ? rawHops
+    : 0;
   return {
     enabled: (env.BOTMUX_DASHBOARD_FEISHU_H5_ENABLED ?? 'false').toLowerCase() === 'true',
     brand: env.BOTMUX_DASHBOARD_FEISHU_H5_BRAND === 'lark' ? 'lark' : 'feishu',
@@ -230,6 +250,7 @@ export function resolveDashboardH5AuthConfig(env: NodeJS.ProcessEnv = process.en
     sessionTtlMs,
     secureCookies: publicUrl.startsWith('https://')
       || (env.BOTMUX_DASHBOARD_FEISHU_H5_SECURE_COOKIE ?? '').toLowerCase() === 'true',
+    trustedProxyHops,
   };
 }
 
@@ -319,30 +340,72 @@ export function createFeishuH5CodeExchanger(
 export const DASHBOARD_H5_EXCHANGE_WINDOW_MS = 60_000;
 export const DASHBOARD_H5_EXCHANGE_MAX_PER_IP_PER_WINDOW = 10;
 export const DASHBOARD_H5_EXCHANGE_MAX_CONCURRENT = 4;
+/** Ceiling for the endpoint as a whole, across every source address. The
+ *  per-IP window alone bounds one client; this bounds the endpoint when the
+ *  attacker has many source addresses (or one trusted proxy in front of many
+ *  forged client addresses). */
+export const DASHBOARD_H5_EXCHANGE_MAX_GLOBAL_PER_WINDOW = 60;
+/** Hard cap on tracked per-IP buckets. Reaching it evicts the least recently
+ *  used bucket (O(1)); it never degrades into a per-request full-table scan. */
+export const DASHBOARD_H5_EXCHANGE_MAX_TRACKED_IPS = 4_096;
 const EXCHANGE_BUSY_RETRY_MS = 1_000;
-const EXCHANGE_GATE_MAX_TRACKED_IPS = 4_096;
+const EXCHANGE_GATE_MAX_SPENT_CODES = 4_096;
+
+function normalizeIpCandidate(value: string | undefined): string {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) return '';
+  // IPv4-mapped IPv6 prefixes are stripped to match the dashboard's other
+  // remote-address handling (dashboard.ts verifyCliRequest).
+  return trimmed.replace(/^::ffff:/i, '').slice(0, 100);
+}
 
 /**
- * Rate-limit bucket key for the public exchange endpoint: first
- * `x-forwarded-for` hop when present (reverse-proxy deployments), otherwise
- * the socket address. IPv4-mapped IPv6 prefixes are stripped to match the
- * dashboard's other remote-address handling. The value is only ever an opaque
- * bucket key — it grants nothing, so a spoofed header cannot elevate access,
- * and the global in-flight cap still bounds spoofed-header spam.
+ * Rate-limit bucket key for the public exchange endpoint, resolved under a
+ * TRUSTED-PROXY discipline (`proxy-addr` semantics, zero dependencies).
+ *
+ * `x-forwarded-for` is client-supplied text: anyone can send it, and each
+ * proxy only appends. Trusting the leftmost hop therefore hands an attacker an
+ * unlimited supply of distinct bucket keys — a per-IP limiter you can opt out
+ * of by typing a new IP, plus an attacker-driven tracking table.
+ *
+ * So the chain is read from the end WE control: `[socket peer, ...forwarded
+ * reversed]`, and `trustedProxyHops` says how many of those leading entries
+ * were written by infrastructure we trust. The first entry past them is the
+ * client. With the default `0` the header is never consulted at all; with `1`
+ * only the rightmost `x-forwarded-for` entry counts — the one the single
+ * trusted proxy wrote itself — so any value the client prepended sits beyond
+ * the trusted window and can never become a bucket key. A shorter-than-
+ * configured chain falls back to the furthest address actually present, which
+ * is at worst the direct peer.
+ *
+ * The value is only ever an opaque bucket key: it grants nothing.
  */
-export function dashboardH5ClientIp(req: IncomingMessage): string {
+export function dashboardH5ClientIp(req: IncomingMessage, trustedProxyHops = 0): string {
+  const socketAddress = normalizeIpCandidate(req.socket?.remoteAddress);
+  const hops = Number.isSafeInteger(trustedProxyHops)
+    ? Math.min(Math.max(trustedProxyHops, 0), DASHBOARD_H5_MAX_TRUSTED_PROXY_HOPS)
+    : 0;
+  if (hops === 0) return socketAddress || 'unknown';
   const header = req.headers['x-forwarded-for'];
-  const raw = Array.isArray(header) ? header[0] : header;
-  const firstHop = (raw ?? '').split(',')[0].trim();
-  const candidate = firstHop || req.socket?.remoteAddress || '';
-  return candidate.replace(/^::ffff:/, '').slice(0, 100) || 'unknown';
+  // Repeated headers are one logical list in wire order, so join before split.
+  const forwarded = (Array.isArray(header) ? header.join(',') : header ?? '')
+    .split(',')
+    .map(normalizeIpCandidate)
+    .filter(Boolean);
+  const chain = [socketAddress, ...forwarded.reverse()].filter(Boolean);
+  if (chain.length === 0) return 'unknown';
+  return chain[Math.min(hops, chain.length - 1)];
 }
 
 export interface DashboardH5ExchangeGateOptions {
   now?: () => number;
   windowMs?: number;
   maxPerIpPerWindow?: number;
+  maxGlobalPerWindow?: number;
   maxConcurrent?: number;
+  maxTrackedIps?: number;
+  maxSpentCodes?: number;
+  spentCodeTtlMs?: number;
   pruneIntervalMs?: number;
 }
 
@@ -350,55 +413,137 @@ export type H5ExchangeAdmission = { ok: true } | { ok: false; retryAfterMs: numb
 
 /**
  * In-process brakes for the public, unauthenticated H5 exchange endpoint.
- * One exchange can cost up to three open-platform requests, so three
+ * One exchange can cost up to three open-platform requests, so several
  * independent limits apply (LocateRateLimiter-style, zero dependencies):
  *
  *  - per-IP sliding window (`admit`) — only admitted hits consume slots, so
  *    a refused burst cannot lock a NAT'd office out forever;
+ *  - global sliding window (`admit`) — the same endpoint-wide ceiling in
+ *    requests-per-window, so "many source addresses" is not a way around the
+ *    per-IP budget. It is checked AFTER the per-IP budget and consumed only on
+ *    admission, so one noisy client can spend at most its own per-IP quota out
+ *    of the shared pool. Implemented as a fixed-size ring of admission
+ *    timestamps: exact sliding-window semantics with an honest Retry-After, in
+ *    O(1) per request and O(cap) memory;
+ *  - bounded IP tracking — the table never exceeds `maxTrackedIps`; a new
+ *    bucket past the cap evicts the least recently used one in O(1). Pruning
+ *    idle buckets (`prune`) is a memory tidy-up on a timer, NOT the bound, so
+ *    a saturated table can never turn into a full-table scan per request;
  *  - single-flight per code plus a global in-flight cap (`share`) —
  *    concurrent duplicates of one code join the same upstream flight, and
  *    distinct codes beyond the cap are fast-rejected rather than queued so
  *    spam cannot stack pending exchanges on the dashboard event loop;
- *  - opportunistic pruning of idle IP buckets (`prune`) so the tracking map
- *    cannot grow without bound. In-flight entries self-clean on settle (the
- *    built-in exchanger always times out).
+ *  - spent-code memory (`markSpent`/`isSpent`) — a code that already minted a
+ *    session is refused outright afterwards, so "one-time" holds for a
+ *    sequential replay too, not just for the concurrent window. Only the code
+ *    DIGEST is kept (never the code, never the session token), with a TTL and
+ *    its own bounded LRU.
  *
  * The clock is injectable for tests.
  */
 export class DashboardH5ExchangeGate {
+  /** Insertion-ordered ⇒ iteration starts at the least recently used bucket. */
   private readonly hitsByIp = new Map<string, number[]>();
   private readonly inFlightByKey = new Map<string, Promise<unknown>>();
+  /** code digest → expiry. Uniform TTL ⇒ insertion order is also expiry order. */
+  private readonly spentByKey = new Map<string, number>();
+  private readonly globalHits: number[];
+  private globalNext = 0;
+  private globalFilled = 0;
   private readonly now: () => number;
   private readonly windowMs: number;
   private readonly maxPerIpPerWindow: number;
+  private readonly maxTrackedIps: number;
+  private readonly maxSpentCodes: number;
+  private readonly spentCodeTtlMs: number;
   private readonly maxConcurrent: number;
   private readonly pruneIntervalMs: number;
   private lastPruneAt: number;
+  private sweeps = 0;
 
   constructor(opts: DashboardH5ExchangeGateOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.windowMs = opts.windowMs ?? DASHBOARD_H5_EXCHANGE_WINDOW_MS;
     this.maxPerIpPerWindow = opts.maxPerIpPerWindow ?? DASHBOARD_H5_EXCHANGE_MAX_PER_IP_PER_WINDOW;
     this.maxConcurrent = opts.maxConcurrent ?? DASHBOARD_H5_EXCHANGE_MAX_CONCURRENT;
+    this.maxTrackedIps = Math.max(1, opts.maxTrackedIps ?? DASHBOARD_H5_EXCHANGE_MAX_TRACKED_IPS);
+    this.maxSpentCodes = Math.max(1, opts.maxSpentCodes ?? EXCHANGE_GATE_MAX_SPENT_CODES);
+    this.spentCodeTtlMs = Math.max(1, opts.spentCodeTtlMs ?? this.windowMs);
+    const globalCap = Math.max(1, Math.min(opts.maxGlobalPerWindow ?? DASHBOARD_H5_EXCHANGE_MAX_GLOBAL_PER_WINDOW, 100_000));
+    this.globalHits = new Array<number>(globalCap).fill(0);
     this.pruneIntervalMs = opts.pruneIntervalMs ?? this.windowMs;
     this.lastPruneAt = this.now();
   }
 
-  /** Sliding-window per-IP admission. Refusals carry an honest Retry-After. */
+  /**
+   * Per-IP then endpoint-wide sliding-window admission. Refusals carry an
+   * honest Retry-After and consume nothing — neither budget, and (for an
+   * unknown IP) not a tracking-table slot either.
+   */
   admit(ip: string): H5ExchangeAdmission {
     const now = this.now();
-    if (now - this.lastPruneAt >= this.pruneIntervalMs || this.hitsByIp.size >= EXCHANGE_GATE_MAX_TRACKED_IPS) {
-      this.prune();
-    }
+    // Time-based only. The table's hard bound is the LRU eviction in
+    // `remember()`, so a saturated table never makes this a per-request scan.
+    if (now - this.lastPruneAt >= this.pruneIntervalMs) this.prune();
     const cutoff = now - this.windowMs;
-    const hits = (this.hitsByIp.get(ip) ?? []).filter(at => at > cutoff);
+    const known = this.hitsByIp.get(ip);
+    const hits = known ? known.filter(at => at > cutoff) : [];
     if (hits.length >= this.maxPerIpPerWindow) {
-      this.hitsByIp.set(ip, hits);
+      this.remember(ip, hits);
       return { ok: false, retryAfterMs: Math.max(1, hits[0] + this.windowMs - now) };
     }
+    const globalRetryAfterMs = this.globalRetryAfterMs(now);
+    if (globalRetryAfterMs !== null) {
+      // Keep an already-tracked bucket tidy, but never let a refused request
+      // from an unknown address create (and evict) a tracking entry.
+      if (known) this.remember(ip, hits);
+      return { ok: false, retryAfterMs: globalRetryAfterMs };
+    }
+    this.globalHits[this.globalNext] = now;
+    this.globalNext = (this.globalNext + 1) % this.globalHits.length;
+    if (this.globalFilled < this.globalHits.length) this.globalFilled += 1;
     hits.push(now);
-    this.hitsByIp.set(ip, hits);
+    this.remember(ip, hits);
     return { ok: true };
+  }
+
+  /** `null` when the endpoint-wide window still has room. */
+  private globalRetryAfterMs(now: number): number | null {
+    if (this.globalFilled < this.globalHits.length) return null;
+    const oldest = this.globalHits[this.globalNext];
+    const retryAfterMs = oldest + this.windowMs - now;
+    return retryAfterMs > 0 ? retryAfterMs : null;
+  }
+
+  /** Store a bucket at the young end of the LRU, evicting the oldest if the
+   *  table is full. Constant time: `delete` + `set` re-inserts, and at most one
+   *  entry is dropped per new key. */
+  private remember(ip: string, hits: number[]): void {
+    if (!this.hitsByIp.delete(ip) && this.hitsByIp.size >= this.maxTrackedIps) {
+      const oldest = this.hitsByIp.keys().next();
+      if (!oldest.done) this.hitsByIp.delete(oldest.value);
+    }
+    this.hitsByIp.set(ip, hits);
+  }
+
+  /** Remember that this code digest already minted a session. */
+  markSpent(key: string): void {
+    if (!this.spentByKey.delete(key) && this.spentByKey.size >= this.maxSpentCodes) {
+      const oldest = this.spentByKey.keys().next();
+      if (!oldest.done) this.spentByKey.delete(oldest.value);
+    }
+    this.spentByKey.set(key, this.now() + this.spentCodeTtlMs);
+  }
+
+  /** Whether this code digest already minted a session (within the TTL). */
+  isSpent(key: string): boolean {
+    const expiresAt = this.spentByKey.get(key);
+    if (expiresAt === undefined) return false;
+    if (this.now() >= expiresAt) {
+      this.spentByKey.delete(key);
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -423,19 +568,29 @@ export class DashboardH5ExchangeGate {
     return { ok: true, result: flight };
   }
 
-  /** Drop IP buckets whose every hit has left the window. */
+  /** Drop IP buckets and spent-code digests that have left their window. The
+   *  one full-table pass in this class — on a timer, never per request. */
   prune(): void {
-    const cutoff = this.now() - this.windowMs;
+    const now = this.now();
+    const cutoff = now - this.windowMs;
     for (const [ip, hits] of this.hitsByIp) {
       const live = hits.filter(at => at > cutoff);
       if (live.length === 0) this.hitsByIp.delete(ip);
       else if (live.length !== hits.length) this.hitsByIp.set(ip, live);
     }
-    this.lastPruneAt = this.now();
+    for (const [key, expiresAt] of this.spentByKey) {
+      if (now >= expiresAt) this.spentByKey.delete(key);
+    }
+    this.sweeps += 1;
+    this.lastPruneAt = now;
   }
 
   trackedIpCount(): number { return this.hitsByIp.size; }
   inFlightCount(): number { return this.inFlightByKey.size; }
+  spentCodeCount(): number { return this.spentByKey.size; }
+  /** Full-table sweeps performed so far. Diagnostic: this must stay flat as
+   *  request volume grows, otherwise admission has become O(table). */
+  sweepCount(): number { return this.sweeps; }
 }
 
 export interface DashboardH5AuthControllerOptions {
@@ -527,6 +682,14 @@ retry.addEventListener('click',begin);begin();
 })();</script></body></html>`;
 }
 
+/** Outcome of the ONE upstream exchange a given code is ever allowed to drive.
+ *  It carries the minted session, so concurrent replays of the code join the
+ *  same flight and receive this same cookie instead of each minting their own
+ *  independently-revocable session. */
+type H5ExchangeOutcome =
+  | { ok: true; openId: string; token: string; expiresAt: number }
+  | { ok: false; openId: string };
+
 export function createDashboardH5AuthController(opts: DashboardH5AuthControllerOptions): DashboardH5AuthController {
   const { config, sessions, audit } = opts;
   const exchanger = opts.exchanger ?? createFeishuH5CodeExchanger(config);
@@ -539,6 +702,33 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
   const resolve = (req: IncomingMessage) => sessions.resolveToken(
     parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE),
   );
+
+  /**
+   * The whole login decision for one code, run exactly once under the gate's
+   * single-flight: provider call, allowlist check, session creation and the
+   * audit record. Everything lives inside so that N concurrent replays produce
+   * ONE upstream call, ONE session and ONE audit line — not N of each.
+   */
+  const exchangeOnce = async (codeKey: string, code: string): Promise<H5ExchangeOutcome> => {
+    let openId: string;
+    try {
+      ({ openId } = await exchanger.exchange(code));
+    } catch (error) {
+      audit.append(controlAuditRecord('unknown', 'dashboard', 'auth.login_denied'));
+      throw error;
+    }
+    if (!allowed.has(openId)) {
+      audit.append(controlAuditRecord(openId, 'dashboard', 'auth.login_denied'));
+      return { ok: false, openId };
+    }
+    const created = sessions.create(openId);
+    // Burn the code the moment it becomes a session: a later, non-concurrent
+    // replay must not mint a second one even if the provider would answer
+    // again. Only the digest is retained — never the code, never the token.
+    exchangeGate.markSpent(codeKey);
+    audit.append(controlAuditRecord(openId, 'dashboard', 'auth.login'));
+    return { ok: true, openId, token: created.token, expiresAt: created.identity.expiresAt };
+  };
 
   const handle = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> => {
     const relevant = url.pathname === entryPath || url.pathname === exchangePath
@@ -579,7 +769,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       // Public endpoint, and each exchange can cost up to three open-platform
       // requests: rate-limit per IP before even reading the body. The slot is
       // consumed on attempt (invalid bodies included), like LocateRateLimiter.
-      const admission = exchangeGate.admit(dashboardH5ClientIp(req));
+      const admission = exchangeGate.admit(dashboardH5ClientIp(req, config.trustedProxyHops));
       if (!admission.ok) {
         rateLimited(res, 'rate_limited', admission.retryAfterMs);
         return true;
@@ -589,35 +779,41 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
         json(res, 400, { ok: false, error: 'invalid_authorization_code' });
         return true;
       }
-      let openId: string;
+      const codeKey = exchangeCodeKey(code);
+      // The spent check and the single-flight lookup must observe the same
+      // tick — no `await` between them. Otherwise a code whose flight settles
+      // in the gap would be seen as neither spent nor in flight, and the
+      // replay would open a second flight and mint a second session.
+      if (exchangeGate.isSpent(codeKey)) {
+        json(res, 409, { ok: false, error: 'authorization_code_already_used' });
+        return true;
+      }
+      // Concurrent duplicates of one code share a single upstream flight AND
+      // its single session; distinct codes beyond the global cap 429
+      // immediately (never queue, so spam cannot stack pending exchanges on
+      // the event loop).
+      const flight = exchangeGate.share(codeKey, () => exchangeOnce(codeKey, code));
+      if (!flight.ok) {
+        rateLimited(res, 'exchange_busy', flight.retryAfterMs);
+        return true;
+      }
+      let outcome: H5ExchangeOutcome;
       try {
-        // Concurrent duplicates of one code share a single upstream flight;
-        // distinct codes beyond the global cap 429 immediately (never queue,
-        // so spam cannot stack pending exchanges on the event loop).
-        const flight = exchangeGate.share(exchangeCodeKey(code), () => exchanger.exchange(code));
-        if (!flight.ok) {
-          rateLimited(res, 'exchange_busy', flight.retryAfterMs);
-          return true;
-        }
-        ({ openId } = await flight.result);
+        outcome = await flight.result;
       } catch {
-        audit.append(controlAuditRecord('unknown', 'dashboard', 'auth.login_denied'));
         json(res, 502, { ok: false, error: 'feishu_exchange_failed' });
         return true;
       }
-      if (!allowed.has(openId)) {
-        audit.append(controlAuditRecord(openId, 'dashboard', 'auth.login_denied'));
+      if (!outcome.ok) {
         json(res, 403, { ok: false, error: 'open_id_not_allowed' });
         return true;
       }
-      const created = sessions.create(openId);
-      audit.append(controlAuditRecord(openId, 'dashboard', 'auth.login'));
       json(res, 200, {
         ok: true,
-        user: { openId },
-        expiresAt: created.identity.expiresAt,
+        user: { openId: outcome.openId },
+        expiresAt: outcome.expiresAt,
         redirectTo: '/',
-      }, { 'set-cookie': dashboardSessionCookie(created.token, config.sessionTtlMs, config.secureCookies) });
+      }, { 'set-cookie': dashboardSessionCookie(outcome.token, config.sessionTtlMs, config.secureCookies) });
       return true;
     }
 

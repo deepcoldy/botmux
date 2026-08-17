@@ -211,7 +211,7 @@ describe('redactChildEnv()', () => {
 });
 
 describe('stripDashboardH5Env()', () => {
-  it('deletes the full 8-key family plus any future prefix knob in place, keys absent not undefined', () => {
+  it('deletes the whole named family plus any future prefix knob in place, keys absent not undefined', () => {
     // The daemon dotenv-loads ~/.botmux/.env wholesale, so at boot its env
     // holds the Dashboard's H5 APP_SECRET (a full Feishu app credential).
     // index-daemon.ts calls this right after dotenv: the daemon process itself

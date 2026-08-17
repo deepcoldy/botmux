@@ -142,7 +142,7 @@ describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () =>
     // The isolation red line: resolveDaemonEnv's output IS the ecosystem env
     // block (cli.ts ecosystemConfig), shared by the dashboard and every bot
     // daemon and written to ~/.botmux/ecosystem.config.json. Flood both
-    // sources with the complete 8-key family plus a future prefix knob; none
+    // sources with the complete named family plus a future prefix knob; none
     // may surface, for a shell-origin or a session-origin restart alike.
     const floodedEnv = {
       ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map(key => [key, 'secret-from-env'])),

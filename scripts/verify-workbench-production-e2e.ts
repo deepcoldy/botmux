@@ -202,6 +202,8 @@ const h5Config: DashboardH5AuthConfig = {
   entryPath: '/auth/feishu',
   sessionTtlMs: 60 * 60_000,
   secureCookies: false,
+  // Loopback harness, no proxy in front: x-forwarded-for is not trusted.
+  trustedProxyHops: 0,
 };
 const h5Sessions = new DashboardSessionStore({ ttlMs: h5Config.sessionTtlMs });
 const h5Auth = createDashboardH5AuthController({

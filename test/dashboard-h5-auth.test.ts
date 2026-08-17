@@ -6,10 +6,12 @@ import {
   DASHBOARD_H5_CLIENT_TIMEOUT_MS,
   DASHBOARD_H5_EXCHANGE_MAX_CONCURRENT,
   DASHBOARD_H5_EXCHANGE_MAX_PER_IP_PER_WINDOW,
+  DASHBOARD_H5_MAX_TRUSTED_PROXY_HOPS,
   DashboardH5ExchangeGate,
   dashboardH5ClientIp,
   DashboardSessionStore,
   DASHBOARD_SESSION_COOKIE,
+  resolveDashboardH5AuthConfig,
   safeDashboardH5ReturnTo,
   type DashboardH5AuthConfig,
   type FeishuH5CodeExchanger,
@@ -35,6 +37,7 @@ const config: DashboardH5AuthConfig = {
   entryPath: '/auth/feishu',
   sessionTtlMs: 60_000,
   secureCookies: false,
+  trustedProxyHops: 0,
 };
 
 class MemoryAudit implements ControlAuditSink {
@@ -52,21 +55,36 @@ afterEach(async () => {
 async function startController(
   openIdOrError: string | Error,
   nowRef = { value: 1_000 },
-  opts: { exchanger?: FeishuH5CodeExchanger; exchangeGate?: DashboardH5ExchangeGate } = {},
+  opts: {
+    exchanger?: FeishuH5CodeExchanger;
+    exchangeGate?: DashboardH5ExchangeGate;
+    config?: DashboardH5AuthConfig;
+  } = {},
 ): Promise<{
   base: string;
   audit: MemoryAudit;
   sessions: DashboardSessionStore;
   seen: { exchangePosts: number };
+  /** Every session token the store actually minted, in order. Its LENGTH is
+   *  the number of dashboard sessions created — the P1-2 contract is that one
+   *  one-time code can never grow it by more than 1. */
+  minted: string[];
 }> {
   const audit = new MemoryAudit();
+  const minted: string[] = [];
   const sessions = new DashboardSessionStore({
     ttlMs: config.sessionTtlMs,
     now: () => nowRef.value,
-    randomToken: () => 'A'.repeat(43),
+    // Distinct per call: a constant token would collapse N sessions into one
+    // map entry and hide exactly the bug these tests are about.
+    randomToken: () => {
+      const token = `sessiontoken${String(minted.length).padStart(3, '0')}${'A'.repeat(30)}`;
+      minted.push(token);
+      return token;
+    },
   });
   const controller = createDashboardH5AuthController({
-    config,
+    config: opts.config ?? config,
     sessions,
     audit,
     exchangeGate: opts.exchangeGate,
@@ -87,7 +105,7 @@ async function startController(
   });
   await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as { port: number }).port;
-  return { base: `http://127.0.0.1:${port}`, audit, sessions, seen };
+  return { base: `http://127.0.0.1:${port}`, audit, sessions, seen, minted };
 }
 
 function postExchange(base: string, code: string, headers: Record<string, string> = {}): Promise<Response> {
@@ -105,7 +123,7 @@ function cookiePair(setCookie: string): string {
 describe('Feishu H5 passwordless dashboard auth', () => {
   it('exchanges a code into a fixed-expiry HttpOnly session without returning or URL-embedding a token', async () => {
     const nowRef = { value: 10_000 };
-    const { base, audit } = await startController('ou_allowed', nowRef);
+    const { base, audit, minted } = await startController('ou_allowed', nowRef);
     const entry = await fetch(`${base}/auth/feishu`);
     expect(entry.status).toBe(200);
     const html = await entry.text();
@@ -132,7 +150,9 @@ describe('Feishu H5 passwordless dashboard auth', () => {
       redirectTo: '/',
     });
     expect(bodyText).not.toContain('one-time-code-do-not-log');
-    expect(bodyText).not.toContain('A'.repeat(43));
+    // The minted cookie value leaves through Set-Cookie only, never the body.
+    expect(minted).toHaveLength(1);
+    expect(bodyText).not.toContain(minted[0]);
     expect(response.url).not.toContain('code=');
     const setCookie = response.headers.get('set-cookie') ?? '';
     expect(setCookie).toContain(`${DASHBOARD_SESSION_COOKIE}=`);
@@ -282,42 +302,130 @@ describe('Feishu H5 passwordless dashboard auth', () => {
     expect(limited.headers.get('set-cookie')).toBeNull();
   });
 
-  it('buckets the rate limit by first x-forwarded-for hop, not by later proxy hops', async () => {
+  // P1-1：以前无条件相信 x-forwarded-for 的第一跳，等于把限流桶的钥匙交给攻击者
+  // ——换个伪造的头就是一个新桶，限流形同虚设，跟踪表还被撑大。默认不读这个头。
+  it('ignores x-forwarded-for with no trusted proxy configured: forged hops cannot escape the socket bucket', async () => {
     const { base } = await startController('ou_allowed', undefined, {
       exchangeGate: new DashboardH5ExchangeGate({ maxPerIpPerWindow: 1 }),
     });
-    expect((await postExchange(base, 'code-a', { 'x-forwarded-for': '203.0.113.7, 10.0.0.1' })).status).toBe(200);
-    const sameClient = await postExchange(base, 'code-b', { 'x-forwarded-for': '203.0.113.7, 10.9.9.9' });
-    expect(sameClient.status).toBe(429);
-    expect(sameClient.headers.get('retry-after')).toBeTruthy();
-    expect((await postExchange(base, 'code-c', { 'x-forwarded-for': '198.51.100.3' })).status).toBe(200);
-    // No header at all falls back to the socket address — its own bucket.
+    expect((await postExchange(base, 'code-a')).status).toBe(200);
+    const forgedHeaders = ['203.0.113.7', '198.51.100.3, 10.0.0.1', '9.9.9.9, 8.8.8.8, 7.7.7.7'];
+    for (const [index, forged] of forgedHeaders.entries()) {
+      const spoofed = await postExchange(base, `code-b${index}`, { 'x-forwarded-for': forged });
+      expect(spoofed.status, forged).toBe(429);
+      expect(spoofed.headers.get('retry-after'), forged).toBeTruthy();
+      expect(spoofed.headers.get('set-cookie'), forged).toBeNull();
+    }
+  });
+
+  it('with one trusted proxy hop, buckets by the address that proxy wrote — not by what the client prepended', async () => {
+    const { base } = await startController('ou_allowed', undefined, {
+      config: { ...config, trustedProxyHops: 1 },
+      exchangeGate: new DashboardH5ExchangeGate({ maxPerIpPerWindow: 1 }),
+    });
+    // 一层 nginx：客户端写什么都在左边，nginx 自己追加的对端地址在最右边。
+    expect((await postExchange(base, 'code-a', { 'x-forwarded-for': '203.0.113.7' })).status).toBe(200);
+    // 同一个真实客户端换着伪造左侧，仍然是同一个桶。
+    for (const [index, forged] of ['1.1.1.1, 203.0.113.7', '2.2.2.2, 3.3.3.3, 203.0.113.7'].entries()) {
+      const spoofed = await postExchange(base, `code-b${index}`, { 'x-forwarded-for': forged });
+      expect(spoofed.status, forged).toBe(429);
+    }
+    // 真正换了客户端（可信代理写的那一跳变了）才是新桶。
+    expect((await postExchange(base, 'code-c', { 'x-forwarded-for': '1.1.1.1, 198.51.100.3' })).status).toBe(200);
+    // 完全没有这个头就回落到直连地址，自成一桶。
     expect((await postExchange(base, 'code-d')).status).toBe(200);
   });
 
-  it('shares one upstream flight across concurrent duplicates of the same code', async () => {
+  it('429s the endpoint as a whole once the global window is spent, even below the per-IP budget', async () => {
+    const { base, minted } = await startController('ou_allowed', undefined, {
+      exchangeGate: new DashboardH5ExchangeGate({ maxPerIpPerWindow: 1_000, maxGlobalPerWindow: 2 }),
+    });
+    expect((await postExchange(base, 'global-code-1')).status).toBe(200);
+    expect((await postExchange(base, 'global-code-2')).status).toBe(200);
+    const limited = await postExchange(base, 'global-code-3');
+    expect(limited.status).toBe(429);
+    const retryAfter = Number(limited.headers.get('retry-after'));
+    expect(Number.isInteger(retryAfter) && retryAfter >= 1).toBe(true);
+    expect(await limited.json()).toEqual({ ok: false, error: 'rate_limited', retryAfterSeconds: retryAfter });
+    expect(limited.headers.get('set-cookie')).toBeNull();
+    // 拦在签发之前：全局闸吃掉的请求不会留下第三个会话。
+    expect(minted).toHaveLength(2);
+  });
+
+  // P1-2：共享 provider 结果还不够——每个 waiter 各自 sessions.create()，一张
+  // 一次性 code 就被放大成 N 个各自独立、各自要单独吊销的管理会话。新契约是
+  // 「一张 code 最多一个会话」，并发重放共享同一个会话。
+  it('mints exactly ONE dashboard session for a one-time code replayed concurrently', async () => {
     let release!: () => void;
     const blocked = new Promise<{ openId: string }>(resolve => {
       release = () => resolve({ openId: 'ou_allowed' });
     });
     const exchange = vi.fn(() => blocked);
-    const { base, seen } = await startController('ou_allowed', undefined, { exchanger: { exchange } });
-    const first = postExchange(base, 'duplicate-code');
-    const second = postExchange(base, 'duplicate-code');
+    const { base, seen, audit, minted } = await startController('ou_allowed', undefined, {
+      exchanger: { exchange },
+    });
+    const replays = [
+      postExchange(base, 'duplicate-code'),
+      postExchange(base, 'duplicate-code'),
+      postExchange(base, 'duplicate-code'),
+    ];
     await vi.waitFor(() => {
-      expect(seen.exchangePosts).toBe(2);
+      expect(seen.exchangePosts).toBe(3);
       expect(exchange).toHaveBeenCalledTimes(1);
     });
-    // Both requests are on the server; give the duplicate a beat to join the
-    // in-flight map before the shared exchange resolves.
+    // All three requests are on the server; give the duplicates a beat to join
+    // the in-flight map before the shared exchange resolves.
     await new Promise(resolve => setTimeout(resolve, 50));
     release();
-    const [r1, r2] = await Promise.all([first, second]);
-    expect(r1.status).toBe(200);
-    expect(r2.status).toBe(200);
+    const settled = await Promise.all(replays);
+    for (const response of settled) expect(response.status).toBe(200);
     expect(exchange).toHaveBeenCalledTimes(1);
-    expect(r1.headers.get('set-cookie')).toContain(`${DASHBOARD_SESSION_COOKIE}=`);
-    expect(r2.headers.get('set-cookie')).toContain(`${DASHBOARD_SESSION_COOKIE}=`);
+
+    const cookies = settled.map(response => cookiePair(response.headers.get('set-cookie') ?? ''));
+    expect(cookies[0]).toContain(`${DASHBOARD_SESSION_COOKIE}=`);
+    // 三个 200 拿到的是同一张 cookie，会话表也只多了一条，审计只记一次登录。
+    expect(new Set(cookies).size).toBe(1);
+    expect(minted).toHaveLength(1);
+    expect(audit.records.filter(record => record.action === 'auth.login')).toHaveLength(1);
+
+    // 同一个会话的硬证据：任一份 cookie 登出，另一份立刻失效。三个独立会话不会这样。
+    const logout = await fetch(`${base}/auth/feishu/logout`, {
+      method: 'POST', headers: { cookie: cookies[2] },
+    });
+    expect(logout.status).toBe(200);
+    const after = await fetch(`${base}/auth/feishu/session`, { headers: { cookie: cookies[0] } });
+    expect(after.status).toBe(401);
+  });
+
+  it('refuses a one-time code that already minted a session, without a second upstream call', async () => {
+    const exchange = vi.fn(async () => ({ openId: 'ou_allowed' }));
+    const { base, minted, audit } = await startController('ou_allowed', undefined, {
+      exchanger: { exchange },
+    });
+    expect((await postExchange(base, 'burn-after-reading')).status).toBe(200);
+    const replay = await postExchange(base, 'burn-after-reading');
+    expect(replay.status).toBe(409);
+    expect(await replay.json()).toEqual({ ok: false, error: 'authorization_code_already_used' });
+    expect(replay.headers.get('set-cookie')).toBeNull();
+    // 连开放平台都没再打一次，更没有第二个会话。
+    expect(exchange).toHaveBeenCalledTimes(1);
+    expect(minted).toHaveLength(1);
+    expect(audit.records.filter(record => record.action === 'auth.login')).toHaveLength(1);
+    // 只烧掉这一张 code，别的 code 照常。
+    expect((await postExchange(base, 'a-different-code')).status).toBe(200);
+    expect(minted).toHaveLength(2);
+  });
+
+  it('does not burn a code whose exchange failed: the client may retry the same one', async () => {
+    const exchange = vi.fn(async () => { throw new Error('provider_rejected'); });
+    const { base, minted } = await startController('ou_allowed', undefined, {
+      exchanger: { exchange },
+    });
+    expect((await postExchange(base, 'transient-failure-code')).status).toBe(502);
+    // 没签发会话 ⇒ 没烧掉 code：网络抖动不应该把用户锁在门外。
+    expect((await postExchange(base, 'transient-failure-code')).status).toBe(502);
+    expect(exchange).toHaveBeenCalledTimes(2);
+    expect(minted).toHaveLength(0);
   });
 
   it('fast-rejects distinct codes beyond the global in-flight cap and recovers after settle', async () => {
@@ -405,7 +513,9 @@ describe('DashboardH5ExchangeGate', () => {
 
   it('prunes idle IP buckets so the tracking map does not grow without bound', () => {
     let now = 0;
-    const gate = new DashboardH5ExchangeGate({ now: () => now, windowMs: 60_000, pruneIntervalMs: 60_000 });
+    const gate = new DashboardH5ExchangeGate({
+      now: () => now, windowMs: 60_000, pruneIntervalMs: 60_000, maxGlobalPerWindow: 10_000,
+    });
     for (let i = 0; i < 500; i++) gate.admit(`10.0.${Math.floor(i / 250)}.${i % 250}`);
     expect(gate.trackedIpCount()).toBe(500);
     now = 120_001;
@@ -415,19 +525,150 @@ describe('DashboardH5ExchangeGate', () => {
     gate.prune();
     expect(gate.trackedIpCount()).toBe(1);
   });
+
+  // P1-1：所谓 4096 上限以前只触发 prune、不拒绝也不淘汰，5000 个地址就是 5000 条。
+  it('hard-bounds the IP table at maxTrackedIps, evicting the least recently used bucket', () => {
+    let now = 0;
+    const ipOf = (i: number) => `10.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`;
+    const gate = new DashboardH5ExchangeGate({
+      now: () => now, windowMs: 60_000, maxPerIpPerWindow: 1,
+      maxGlobalPerWindow: 10_000, maxTrackedIps: 4_096,
+    });
+    for (let i = 0; i < 5_000; i++) expect(gate.admit(ipOf(i)), ipOf(i)).toEqual({ ok: true });
+    expect(gate.trackedIpCount()).toBe(4_096);
+    // 最早那个桶被淘汰了：它的额度重新可用（淘汰的代价是重置，不是把新客户端锁死）。
+    expect(gate.admit(ipOf(0))).toEqual({ ok: true });
+    // 最新的桶还在：额度照旧扣着，限流对活跃地址依然有效。
+    expect(gate.admit(ipOf(4_999)).ok).toBe(false);
+    expect(gate.trackedIpCount()).toBe(4_096);
+  });
+
+  it('keeps admission O(1) with a saturated table: the sweep is on a timer, not on size', () => {
+    let now = 0;
+    const gate = new DashboardH5ExchangeGate({
+      now: () => now, windowMs: 60_000, pruneIntervalMs: 60_000,
+      maxPerIpPerWindow: 1, maxGlobalPerWindow: 100_000, maxTrackedIps: 128,
+    });
+    for (let i = 0; i < 128; i++) gate.admit(`10.0.0.${i}`);
+    expect(gate.trackedIpCount()).toBe(128);
+    // 表满之后再来 2000 次：既没涨，也没有一次全表扫描。
+    for (let i = 0; i < 2_000; i++) gate.admit(`198.51.100.${i % 250}`);
+    expect(gate.trackedIpCount()).toBe(128);
+    expect(gate.sweepCount()).toBe(0);
+    // 到点才扫，一次；扫完过期桶清空，只剩这次新登记的。
+    now = 60_001;
+    expect(gate.admit('203.0.113.99')).toEqual({ ok: true });
+    expect(gate.sweepCount()).toBe(1);
+    expect(gate.trackedIpCount()).toBe(1);
+  });
+
+  it('caps the endpoint as a whole, so many source addresses cannot outrun the per-IP budget', () => {
+    let now = 0;
+    const gate = new DashboardH5ExchangeGate({
+      now: () => now, windowMs: 60_000, maxPerIpPerWindow: 10, maxGlobalPerWindow: 3,
+    });
+    expect(gate.admit('203.0.113.1')).toEqual({ ok: true });
+    now = 10_000;
+    expect(gate.admit('203.0.113.2')).toEqual({ ok: true });
+    now = 20_000;
+    expect(gate.admit('203.0.113.3')).toEqual({ ok: true });
+    now = 30_000;
+    // 第四个地址在自己的每 IP 额度之内，但端点整体的额度已经用完；Retry-After
+    // 指向最早那次全局命中离开窗口的时刻。
+    expect(gate.admit('203.0.113.4')).toEqual({ ok: false, retryAfterMs: 30_000 });
+    // 被拒的陌生地址连跟踪表都不进，攻击者撑不大这张表。
+    expect(gate.trackedIpCount()).toBe(3);
+    // 拒绝不消耗额度：最早那次命中一出窗口，配额就正好回来一格。
+    now = 60_001;
+    expect(gate.admit('203.0.113.4')).toEqual({ ok: true });
+    expect(gate.admit('203.0.113.5')).toEqual({ ok: false, retryAfterMs: 9_999 });
+  });
+
+  it('a per-IP refusal spends no global budget', () => {
+    let now = 0;
+    const gate = new DashboardH5ExchangeGate({
+      now: () => now, windowMs: 60_000, maxPerIpPerWindow: 1, maxGlobalPerWindow: 3,
+    });
+    expect(gate.admit('203.0.113.1')).toEqual({ ok: true });
+    for (let i = 0; i < 20; i++) expect(gate.admit('203.0.113.1').ok).toBe(false);
+    // 吵闹的客户端只花掉了自己的那一格：共享池里剩下的两格照常给别人用。
+    expect(gate.admit('203.0.113.2')).toEqual({ ok: true });
+    expect(gate.admit('203.0.113.3')).toEqual({ ok: true });
+    expect(gate.admit('203.0.113.4').ok).toBe(false);
+  });
+
+  it('remembers spent code digests with a TTL and its own bound', () => {
+    let now = 0;
+    const gate = new DashboardH5ExchangeGate({
+      now: () => now, windowMs: 60_000, spentCodeTtlMs: 60_000, maxSpentCodes: 2,
+    });
+    expect(gate.isSpent('digest-a')).toBe(false);
+    gate.markSpent('digest-a');
+    expect(gate.isSpent('digest-a')).toBe(true);
+    // 有界：第三个把最旧的挤出去，攻击者不能用无限 code 撑爆这张表。
+    gate.markSpent('digest-b');
+    gate.markSpent('digest-c');
+    expect(gate.spentCodeCount()).toBe(2);
+    expect(gate.isSpent('digest-a')).toBe(false);
+    expect(gate.isSpent('digest-c')).toBe(true);
+    // TTL 到点自然失效（code 本身早在开放平台侧过期了）。
+    now = 60_001;
+    expect(gate.isSpent('digest-c')).toBe(false);
+  });
 });
 
 describe('dashboardH5ClientIp', () => {
   const fakeReq = (headers: Record<string, string | string[]>, remoteAddress?: string): IncomingMessage =>
     ({ headers, socket: { remoteAddress } }) as unknown as IncomingMessage;
 
-  it('prefers the first x-forwarded-for hop and falls back to the socket address', () => {
-    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': '203.0.113.7, 10.0.0.1' }, '10.0.0.1'))).toBe('203.0.113.7');
-    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': ['198.51.100.3', '10.0.0.1'] }, '10.0.0.1'))).toBe('198.51.100.3');
+  it('ignores x-forwarded-for entirely without a trusted-proxy configuration', () => {
+    // 直连部署下这个头是纯客户端输入，读它就等于让攻击者自选限流桶。
+    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': '203.0.113.7, 10.0.0.1' }, '10.0.0.1'))).toBe('10.0.0.1');
+    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': ['198.51.100.3'] }, '10.0.0.1'), 0)).toBe('10.0.0.1');
     expect(dashboardH5ClientIp(fakeReq({}, '192.168.1.9'))).toBe('192.168.1.9');
-    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': '  ' }, '192.168.1.9'))).toBe('192.168.1.9');
     expect(dashboardH5ClientIp(fakeReq({}, '::ffff:192.168.1.9'))).toBe('192.168.1.9');
     expect(dashboardH5ClientIp(fakeReq({}))).toBe('unknown');
+  });
+
+  it('reads the client from the trusted end of the chain, so prepended hops never become bucket keys', () => {
+    const forged = { 'x-forwarded-for': '9.9.9.9, 8.8.8.8, 203.0.113.7' };
+    // 一层可信代理：只认它自己写下的那一跳（最右），客户端伪造的左侧全部无效。
+    expect(dashboardH5ClientIp(fakeReq(forged, '10.0.0.1'), 1)).toBe('203.0.113.7');
+    // 两层：再往左一跳，仍然在自家基础设施写的范围内。
+    expect(dashboardH5ClientIp(fakeReq(forged, '10.0.0.1'), 2)).toBe('8.8.8.8');
+    // 同名头出现多次是一条逻辑链，按线序拼接后再取。
+    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': ['9.9.9.9', '198.51.100.3'] }, '10.0.0.1'), 1))
+      .toBe('198.51.100.3');
+    // 链比配置短就回落到实际存在的最远一跳，最差也就是直连地址。
+    expect(dashboardH5ClientIp(fakeReq({}, '10.0.0.1'), 1)).toBe('10.0.0.1');
+    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': '  ' }, '10.0.0.1'), 1)).toBe('10.0.0.1');
+    // 转发跳同样做 IPv4-mapped 归一化。
+    expect(dashboardH5ClientIp(fakeReq({ 'x-forwarded-for': '::ffff:203.0.113.7' }, '10.0.0.1'), 1))
+      .toBe('203.0.113.7');
+    // 跳数非法/为负一律当成「没有可信代理」，绝不因为配置写错就去信客户端。
+    expect(dashboardH5ClientIp(fakeReq(forged, '10.0.0.1'), Number.NaN)).toBe('10.0.0.1');
+    expect(dashboardH5ClientIp(fakeReq(forged, '10.0.0.1'), -3)).toBe('10.0.0.1');
+    // 配置得比实际代理层数还多是运维错误，这里只保证有界：最多退到链条最左端。
+    expect(dashboardH5ClientIp(fakeReq(forged, '10.0.0.1'), 99)).toBe('9.9.9.9');
+  });
+});
+
+describe('resolveDashboardH5AuthConfig trusted proxy hops', () => {
+  const base = { BOTMUX_DASHBOARD_FEISHU_H5_ENABLED: 'true' };
+  it('defaults to zero and only accepts an in-range hop count', () => {
+    expect(resolveDashboardH5AuthConfig(base).trustedProxyHops).toBe(0);
+    expect(resolveDashboardH5AuthConfig({
+      ...base, BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS: '1',
+    }).trustedProxyHops).toBe(1);
+    expect(resolveDashboardH5AuthConfig({
+      ...base, BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS: String(DASHBOARD_H5_MAX_TRUSTED_PROXY_HOPS),
+    }).trustedProxyHops).toBe(DASHBOARD_H5_MAX_TRUSTED_PROXY_HOPS);
+    // 越界/垃圾值一律回落到「不信任何代理」这个安全侧，而不是就近取一个大数。
+    for (const raw of ['9', '-1', '1.5', 'yes', '']) {
+      expect(resolveDashboardH5AuthConfig({
+        ...base, BOTMUX_DASHBOARD_FEISHU_H5_TRUSTED_PROXY_HOPS: raw,
+      }).trustedProxyHops, raw).toBe(0);
+    }
   });
 });
 
