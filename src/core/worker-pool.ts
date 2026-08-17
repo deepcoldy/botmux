@@ -8705,6 +8705,9 @@ export function forkWorker(
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
     reasoningEffort: agentCfg.reasoningEffort,
+    // dsh runner turn timeout: read live from bot config so tuning bots.json
+    // takes effect on the next worker fork without recreating the session.
+    turnTimeoutMs: botCfg.turnTimeoutMs,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
@@ -12391,6 +12394,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliPathOverride: agentCfg.cliPathOverride,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: agentCfg.model,
+    turnTimeoutMs: botCfg.turnTimeoutMs,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Adopt is normally observe-only (prompt=''), driven later by 'message'

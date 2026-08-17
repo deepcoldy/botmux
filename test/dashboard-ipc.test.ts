@@ -2896,6 +2896,173 @@ describe('PUT /api/bot-substitute-mode', () => {
 });
 
 describe('PUT /api/bot-agent', () => {
+  it('updates cli selection and model through bots.json and live config', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const invalid = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'gpt-5.4', reasoningEffort: 'ultra' }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5', reasoningEffort: 'xhigh' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'kimi-k2.5',
+        reasoningEffort: 'xhigh',
+        selectionKey: 'ttadk-x-codex',
+      });
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored).toMatchObject({
+        cliId: 'codex',
+        wrapperCli: 'ttadk codex',
+        model: 'kimi-k2.5',
+        reasoningEffort: 'xhigh',
+      });
+
+      const sol = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }),
+      });
+      expect(sol.status).toBe(200);
+
+      // Simulate a stale in-memory snapshot while the locked bots.json entry
+      // already contains the newer ultra value. Validation must use the entry
+      // read inside rmwBotEntry, not this stale live config.
+      getBot(appId).config.reasoningEffort = 'xhigh';
+
+      const omittedEffort = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'gpt-5.4' }),
+      });
+      expect(omittedEffort.status).toBe(400);
+      expect(await omittedEffort.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists, validates and clears the dsh turn timeout through bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tt-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-tt-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'dsh',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-agent`;
+
+      // Reject non-positive / non-integer values.
+      const bad = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 0 }),
+      });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toMatchObject({ error: 'invalid_turn_timeout_ms' });
+
+      // Reject values above the arm-able bound (would overflow Node setTimeout).
+      const over = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 2_147_483_648 }),
+      });
+      expect(over.status).toBe(400);
+      expect(await over.json()).toMatchObject({ error: 'invalid_turn_timeout_ms' });
+
+      // A legal non-whole-minute value is accepted and stored verbatim.
+      const oddMs = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 90_001 }),
+      });
+      expect(oddMs.status).toBe(200);
+      expect(await oddMs.json()).toMatchObject({ ok: true, turnTimeoutMs: 90_001 });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ turnTimeoutMs: 90_001 });
+
+      // Set a valid timeout → stored on the dsh bot + echoed back.
+      const set = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 1_800_000 }),
+      });
+      expect(set.status).toBe(200);
+      expect(await set.json()).toMatchObject({ ok: true, cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ turnTimeoutMs: 1_800_000 });
+      expect(getBot(appId).config.turnTimeoutMs).toBe(1_800_000);
+
+      // Empty string clears it (revert to runner default).
+      const cleared = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: '' }),
+      });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, turnTimeoutMs: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].turnTimeoutMs).toBeUndefined();
+      expect(getBot(appId).config.turnTimeoutMs).toBeUndefined();
+
+      // Set it again, then switch away from dsh → non-dsh CLI drops the field.
+      await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 900_000 }),
+      });
+      const switched = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'claude-code', model: '' }),
+      });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ cliId: 'claude-code', turnTimeoutMs: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].turnTimeoutMs).toBeUndefined();
+      expect(getBot(appId).config.turnTimeoutMs).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
     const dataDir = join(dir, 'data');

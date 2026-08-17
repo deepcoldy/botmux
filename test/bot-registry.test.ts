@@ -1830,3 +1830,40 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
     expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
   });
 });
+
+describe('normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps positive integers within the arm-able bound and rejects everything else', () => {
+    expect(mod.normalizeTurnTimeoutMs(1_800_000)).toBe(1_800_000);
+    expect(mod.normalizeTurnTimeoutMs(90_001)).toBe(90_001); // legal non-whole-minute value
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS)).toBe(mod.MAX_TURN_TIMEOUT_MS);
+    // Rejected: non-positive, non-integer, over-bound, non-number, absent.
+    expect(mod.normalizeTurnTimeoutMs(0)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(-5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(1.5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS + 1)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs('1800000')).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(undefined)).toBeUndefined();
+  });
+
+  it('parseBotConfigsFromText drops an over-bound turnTimeoutMs', () => {
+    const [ok] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: 90_001 },
+    ]));
+    expect(ok.turnTimeoutMs).toBe(90_001);
+    const [over] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: mod.MAX_TURN_TIMEOUT_MS + 1 },
+    ]));
+    expect(over.turnTimeoutMs).toBeUndefined();
+  });
+
+  it('the dashboard UI mirror of the bound stays equal to the shared constant', async () => {
+    const { DASHBOARD_MAX_TURN_TIMEOUT_MS } = await import('../src/dashboard/web/bot-defaults-page.js');
+    expect(DASHBOARD_MAX_TURN_TIMEOUT_MS).toBe(mod.MAX_TURN_TIMEOUT_MS);
+  });
+});
