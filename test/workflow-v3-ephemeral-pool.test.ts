@@ -16,11 +16,25 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
 });
 
-afterEach(() => {
-  // maxRetries: async pool teardown (pty.log / attempt fence writes) can race
-  // the recursive delete's directory walk, surfacing as a spurious ENOTEMPTY
-  // on loaded CI runners. Node retries exactly this error class with backoff.
-  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+afterEach(async () => {
+  // The pool deliberately fire-and-forgets its diagnostic log writes
+  // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
+  // the attempt dir). A straggler landing after runNode resolves can RECREATE
+  // a directory the recursive delete just emptied, which rmSync's internal
+  // maxRetries never wins: they retry the same rmdir, they do not re-walk.
+  // An outer retry restarts the whole recursive walk from a fresh readdir, and
+  // the writers all finish within milliseconds, so a couple of spaced re-walks
+  // are deterministic where a single walk (however many inner retries) is not.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= 4 || (code !== 'ENOTEMPTY' && code !== 'EBUSY')) throw err;
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
 });
 
 describe('v3 ephemeral pool', () => {
