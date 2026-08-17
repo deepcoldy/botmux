@@ -957,6 +957,9 @@ export type WorkerToDaemon =
        * backend intentionally has no raw-terminal Web UI capability. */
       port: number;
       token: string;
+      /** PER-BOOT random read capability (P1-5): card links minted from it die
+       * with this worker generation, and the dashboard view-link API replaces
+       * it with a short-lived auth-bound grant instead of handing it out. */
       viewToken?: string;
       spawnCommand?: string;
       replyAlreadySent?: boolean;

@@ -2211,12 +2211,15 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 });
 
 /**
- * Read-only twin of write-link: the same capability URL the Feishu card's
- * 「打开 Web 终端」button already hands out (viewToken, never the write token).
- * The Workbench embeds this so its terminal pane works in containers that carry
- * no Dashboard cookie — a Feishu WebView being the motivating case. Knowing a
- * viewToken never grants terminal input, so this stays read-only by construction
- * rather than by UI convention.
+ * Read-only twin of write-link: the base capability URL the Feishu card's
+ * 「打开 Web 终端」button also hands out (viewToken, never the write token).
+ * The viewToken here is the worker's PER-BOOT card token — it dies with the
+ * worker generation and is deliberately not bound to any dashboard auth
+ * session. The central dashboard therefore REPLACES it with a short-lived
+ * signed read grant bound to the requesting identity before answering its own
+ * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
+ * browser directly. Knowing any view capability never grants terminal input,
+ * so the link stays read-only by construction rather than by UI convention.
  */
 ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });

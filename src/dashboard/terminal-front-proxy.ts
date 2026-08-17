@@ -6,7 +6,11 @@ import {
 } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
-import type { TerminalControlManager, TerminalDashboardActor } from './terminal-control.js';
+import type {
+  TerminalControlManager,
+  TerminalDashboardActor,
+  TerminalProxyGrant,
+} from './terminal-control.js';
 
 export const TERMINAL_CONTROL_HEADER = 'x-botmux-terminal-control';
 /** Covers daemon wake-up (up to 10s) plus a bounded worker handshake. Cleared
@@ -16,10 +20,16 @@ export const TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS = 30_000;
 export interface TerminalFrontProxyOptions {
   resolvePort(sessionId: string): number | undefined;
   resolveActor(req: IncomingMessage): TerminalDashboardActor | null;
-  /** Legacy owner pages may still open an explicitly minted token/viewToken
-   * link. H5 identities must never opt into this stable-capability path. */
-  allowLegacyQueryCapabilities?(actor: TerminalDashboardActor): boolean;
   control: TerminalControlManager;
+  /** P1-5: resolve which auth session a bound `?viewToken=` read capability
+   * belongs to (null for anything that is not a valid bound capability for
+   * this session). Lets the proxy refuse revoked capabilities and index the
+   * bridged socket for logout-time closing. */
+  viewCapabilityAuthSession?(sessionId: string, viewToken: string): string | null;
+  /** P1-5: liveness of the auth session behind a bound capability. `false`
+   * means logout/expiry already revoked it — the request is refused even
+   * though the worker's stateless check would still accept the signature. */
+  isAuthSessionLive?(authSessionId: string): boolean;
 }
 
 function safeDecodeSessionId(raw: string): string | undefined {
@@ -86,7 +96,10 @@ function plainError(res: ServerResponse, status: number, message: string): void 
 function socketError(socket: Duplex, status: number, message: string): void {
   if (socket.destroyed) return;
   const body = message;
-  const reason = status === 404 ? 'Not Found' : status === 409 ? 'Conflict' : 'Bad Gateway';
+  const reason = status === 403 ? 'Forbidden'
+    : status === 404 ? 'Not Found'
+    : status === 409 ? 'Conflict'
+    : 'Bad Gateway';
   socket.end([
     `HTTP/1.1 ${status} ${reason}`,
     'content-type: text/plain; charset=utf-8',
@@ -98,47 +111,84 @@ function socketError(socket: Duplex, status: number, message: string): void {
   ].join('\r\n'));
 }
 
+type PreparedTerminalRequest =
+  | { sessionId: string; port: number | undefined; revoked: true }
+  | {
+      sessionId: string;
+      port: number | undefined;
+      revoked: false;
+      actor: TerminalDashboardActor | null;
+      proxyGrant: TerminalProxyGrant | undefined;
+      /** Auth session whose read stream this bridge would carry — registered so
+       * logout/expiry of that authentication closes the socket immediately. */
+      readAuthSessionId: string | undefined;
+      headers: OutgoingHttpHeaders;
+    };
+
 export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
   handleHttp(req: IncomingMessage, res: ServerResponse, url: URL): boolean;
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean;
 } {
-  const prepare = (req: IncomingMessage, pathname: string) => {
-    const parsed = parseTerminalFrontPath(pathname);
+  const prepare = (req: IncomingMessage, url: URL): PreparedTerminalRequest | null => {
+    const parsed = parseTerminalFrontPath(url.pathname);
     if (!parsed) return null;
     const port = options.resolvePort(parsed.sessionId);
     const actor = options.resolveActor(req);
-    let hasLegacyQueryCapability = false;
-    if (actor && options.allowLegacyQueryCapabilities?.(actor)) {
-      try {
-        const requestUrl = new URL(req.url ?? '/', 'http://localhost');
-        hasLegacyQueryCapability = requestUrl.searchParams.has('token')
-          || requestUrl.searchParams.has('viewToken');
-      } catch {
-        // The outer path parser will reject malformed requests.
+    // An explicit `?token=` / `?viewToken=` query capability — no matter who
+    // carries it, platform/H5 actors included — is the SOLE authorization basis
+    // for the request (P1-6). No internal grant is injected next to it: a
+    // platform teammate/guest opening a correct write link used to receive a
+    // read grant that silently outranked the token at the worker, turning the
+    // explicitly issued 「操作链接」 read-only. Ambient Cookie / X-Botmux-Role
+    // headers are stripped for the same reason in the other direction: a wrong
+    // token must not become writable by borrowing the opener's owner ambient.
+    const hasExplicitQueryCapability = url.searchParams.has('token')
+      || url.searchParams.has('viewToken');
+    // P1-5: a bound view capability names the auth session it was minted for.
+    // Refuse it once that authentication ended (logout/expiry) — the worker's
+    // stateless signature/expiry check alone would still accept it.
+    let readAuthSessionId: string | undefined;
+    if (hasExplicitQueryCapability) {
+      const viewToken = url.searchParams.get('viewToken');
+      const boundAuthSession = viewToken
+        ? options.viewCapabilityAuthSession?.(parsed.sessionId, viewToken) ?? null
+        : null;
+      if (boundAuthSession) {
+        if (options.isAuthSessionLive?.(boundAuthSession) === false) {
+          return { ...parsed, port, revoked: true };
+        }
+        readAuthSessionId = boundAuthSession;
       }
     }
-    const proxyGrant = actor && !hasLegacyQueryCapability
+    const proxyGrant = actor && !hasExplicitQueryCapability
       ? options.control.grantForProxy(actor, parsed.sessionId)
       : undefined;
+    if (actor && proxyGrant?.scope === 'read') readAuthSessionId = actor.authSessionId;
     return {
       ...parsed,
       port,
+      revoked: false,
       actor,
       proxyGrant,
+      readAuthSessionId,
       headers: terminalForwardHeaders(req.headers, proxyGrant?.token, {
         // Validate the explicit capability at the worker, but do not also send
         // the legacy management cookie: a garbage `?token=` must not become a
         // writable request merely because its opener is the owner Dashboard.
-        stripBrowserCredentials: hasLegacyQueryCapability,
+        stripBrowserCredentials: hasExplicitQueryCapability,
       }),
     };
   };
 
   const handleHttp = (req: IncomingMessage, res: ServerResponse, url: URL): boolean => {
     if (!(url.pathname === '/s' || url.pathname.startsWith('/s/'))) return false;
-    const prepared = prepare(req, url.pathname);
+    const prepared = prepare(req, url);
     if (!prepared?.port) {
       plainError(res, 404, 'session terminal not available');
+      return true;
+    }
+    if (prepared.revoked) {
+      plainError(res, 403, 'view capability revoked');
       return true;
     }
     const upstream = requestLiteralLoopback({ host: '127.0.0.1', port: prepared.port }, {
@@ -174,9 +224,13 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       bridgedSocket?.destroy();
       if (!clientSocket.destroyed) clientSocket.destroy();
     });
-    const prepared = prepare(req, url.pathname);
+    const prepared = prepare(req, url);
     if (!prepared?.port) {
       socketError(clientSocket, 404, 'session terminal not available');
+      return true;
+    }
+    if (prepared.revoked) {
+      socketError(clientSocket, 403, 'view capability revoked');
       return true;
     }
 
@@ -219,6 +273,13 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         }
       }
 
+      // P1-5: index the read stream under its auth session (bound view
+      // capability or injected read grant) so logout/expiry closes it now
+      // rather than at the worker's grant-expiry timer.
+      const deregisterReadSocket = prepared.readAuthSessionId
+        ? options.control.registerReadSocket(prepared.readAuthSessionId, clientSocket)
+        : undefined;
+
       const lines = [`HTTP/1.1 ${upRes.statusCode ?? 101} ${upRes.statusMessage ?? 'Switching Protocols'}`];
       const raw = upRes.rawHeaders;
       for (let i = 0; i + 1 < raw.length; i += 2) lines.push(`${raw[i]}: ${raw[i + 1]}`);
@@ -229,9 +290,12 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
 
       let disconnected = false;
       const releaseOnDisconnect = () => {
-        if (disconnected || !prepared.actor || !leaseMarker) return;
+        if (disconnected) return;
         disconnected = true;
-        options.control.disconnect(prepared.actor, prepared.sessionId, leaseMarker);
+        deregisterReadSocket?.();
+        if (prepared.actor && leaseMarker) {
+          options.control.disconnect(prepared.actor, prepared.sessionId, leaseMarker);
+        }
       };
 
       upstreamSocket.pipe(clientSocket);

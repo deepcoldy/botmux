@@ -1061,6 +1061,21 @@ describe('Workbench H5 capability boundary', () => {
     expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/api/settings' }).kind).toBe('deny401');
   });
 
+  // ── P1-6 显式结论：H5 身份拿不到 write-link，且这不是判定顺序的偶然 ──────────
+  // H5 的写路径只有 /control/takeover 的短租约（可释放、可到期、可吊销）；
+  // 稳定 write token（操作链接）绝不发给 H5——那会绕开租约的全部收回机制，把
+  // 一个不可吊销的写能力送进浏览器可见的 JSON。view-link（只读、短时、绑定
+  // 登录）允许；write-link 拒绝。这里把两条并排钉死，防止未来任何 capability
+  // 扩表把 write-link 顺手带进来。
+  it('P1-6: an H5 identity may fetch the read view-link but NEVER the write-link', () => {
+    expect(workbenchH5Capability('GET', '/api/sessions/s1/view-link')).toBe('terminal.view');
+    expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/api/sessions/s1/view-link' }).kind).toBe('allow');
+    for (const method of ['GET', 'HEAD', 'POST'] as const) {
+      expect(workbenchH5Capability(method, '/api/sessions/s1/write-link'), method).toBeNull();
+      expect(decideWorkbenchH5Auth({ method, pathname: '/api/sessions/s1/write-link' }).kind, method).toBe('deny401');
+    }
+  });
+
   // The capability grant and the payload projection are decided in two different
   // modules; they drifted apart once already. `/api/sessions` + `/events` were
   // granted as `workbench.view` while dashboard.ts kept projecting them with the

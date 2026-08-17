@@ -363,9 +363,13 @@ export function workbenchH5Capability(method: string, pathname: string): Workben
     return 'workbench.view';
   }
 
-  // Read-only terminal capability URL. A viewToken cannot send input, so
-  // observing identities may fetch it; the writable twin (write-link) stays
-  // behind the local management cookie.
+  // Read-only terminal capability URL. A view capability cannot send input, so
+  // observing identities may fetch it; since P1-5 the returned URL carries a
+  // SHORT-LIVED read grant bound to this very auth session (revoked on
+  // logout/expiry), never a stable token. The writable twin (write-link) stays
+  // behind the local management cookie — H5 identities can never mint it (see
+  // the explicit dashboard-auth test): H5 write access exists only as the
+  // releasable/expiring /control/takeover lease.
   if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
     && /^\/api\/sessions\/[^/]+\/view-link$/.test(pathname)) {
     return 'terminal.view';

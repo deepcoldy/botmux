@@ -28,8 +28,14 @@ export interface WorkbenchApi {
   /** Capability URL for the read-only terminal (viewToken-bearing). The frame
    *  authenticates by this capability, so it also works where no Dashboard
    *  cookie exists — a Feishu WebView being the case that motivated it.
-   *  Returned rebased onto this page's origin — see `sameOriginViewLink`. */
-  getTerminalViewLink(sessionId: string, signal?: AbortSignal): Promise<string | null>;
+   *  Returned rebased onto this page's origin — see `sameOriginViewLink`.
+   *  The capability is short-lived and bound to this login (P1-5): `expiresAt`
+   *  is when the server stops honoring it, so callers should fetch a fresh
+   *  link shortly before then (null when the server did not say). */
+  getTerminalViewLink(
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<{ url: string; expiresAt: number | null } | null>;
   /** 让 bot 在会话原话题里发一条 @ 拥有者的定位标记。服务端对每个会话有 30s
    *  限流，超了返回 429 + `retry-after`（见 WorkbenchApiError.retryAfterSeconds）。 */
   locateSession(sessionId: string, signal?: AbortSignal): Promise<void>;
@@ -232,7 +238,13 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
           || parsed.username || parsed.password) {
           return null;
         }
-        return sameOriginViewLink(parsed);
+        // Malformed expiry degrades to "unknown" rather than rejecting the
+        // link: expiry-driven refresh is an optimization, not the gate.
+        const expiresAt = typeof body.expiresAt === 'number'
+          && Number.isSafeInteger(body.expiresAt) && body.expiresAt > 0
+          ? body.expiresAt
+          : null;
+        return { url: sameOriginViewLink(parsed), expiresAt };
       } catch {
         return null;
       }

@@ -186,6 +186,44 @@ describe('terminal server-side takeover lifecycle', () => {
     expect(audit.records.at(-1)).toEqual(expect.objectContaining({ action: 'terminal.disconnected' }));
   });
 
+  // ── P1-5: read-socket revocation index ────────────────────────────────────
+  // logout / auth-session expiry must close every READ stream the session
+  // opened — not only the write leases — and must never touch a different auth
+  // session's sockets.
+
+  it('logout closes exactly the ending auth session read sockets (write leases included)', () => {
+    const manager = new TerminalControlManager({ secret: SECRET, audit: new MemoryAudit(), ttlMs: 10_000, now: () => 1_000 });
+    const ending = actor('ou_viewer', 'auth-ending');
+    const surviving = actor('ou_other', 'auth-surviving');
+    const endingRead = { destroyed: false, destroy() { this.destroyed = true; } };
+    const endingRead2 = { destroyed: false, destroy() { this.destroyed = true; } };
+    const survivingRead = { destroyed: false, destroy() { this.destroyed = true; } };
+    manager.registerReadSocket(ending.authSessionId, endingRead);
+    manager.registerReadSocket(ending.authSessionId, endingRead2);
+    manager.registerReadSocket(surviving.authSessionId, survivingRead);
+    manager.takeover(ending, 's1');
+    const writable = { destroyed: false, destroy() { this.destroyed = true; } };
+    manager.registerWritableSocket(ending, 's1', writable);
+
+    expect(manager.releaseByAuthSession(ending.authSessionId)).toBe(1);
+    expect(endingRead.destroyed).toBe(true);
+    expect(endingRead2.destroyed).toBe(true);
+    expect(writable.destroyed).toBe(true);
+    // 不同 authSession 不串：另一个登录的只读流原样活着。
+    expect(survivingRead.destroyed).toBe(false);
+  });
+
+  it('a naturally closed read socket deregisters itself and is not re-destroyed on logout', () => {
+    const manager = new TerminalControlManager({ secret: SECRET, audit: new MemoryAudit(), ttlMs: 10_000, now: () => 1_000 });
+    let destroys = 0;
+    const socket = { destroyed: false, destroy() { this.destroyed = true; destroys += 1; } };
+    const deregister = manager.registerReadSocket('auth-1', socket);
+    deregister();
+    deregister(); // idempotent
+    expect(manager.releaseByAuthSession('auth-1')).toBe(0);
+    expect(destroys).toBe(0);
+  });
+
   it('never puts terminal content or a grant in the required audit tuple', () => {
     const record: ControlAuditRecord = {
       timestamp: '2026-08-11T12:00:00.000Z',

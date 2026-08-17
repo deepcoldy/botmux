@@ -132,6 +132,21 @@ export class DashboardSessionStore {
     return hash ? this.endHash(hash, reason) : false;
   }
 
+  /** Whether this auth session is still alive (present and unexpired). Used as
+   *  the revocation check for capabilities minted under the session (P1-5); a
+   *  due-but-unswept session is expired inline so the answer is authoritative. */
+  liveAuthSession(authSessionId: string): boolean {
+    const hash = this.hashesById.get(authSessionId);
+    if (!hash) return false;
+    const stored = this.sessionsByHash.get(hash);
+    if (!stored) return false;
+    if (this.now() >= stored.expiresAt) {
+      this.expireHash(hash);
+      return false;
+    }
+    return true;
+  }
+
   sweepExpired(): number {
     const before = this.sessionsByHash.size;
     for (const [hash, session] of this.sessionsByHash) {

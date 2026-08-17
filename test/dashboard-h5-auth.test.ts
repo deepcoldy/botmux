@@ -205,6 +205,29 @@ describe('Feishu H5 passwordless dashboard auth', () => {
     expect(await expired.json()).toEqual({ ok: false, error: 'authentication_required' });
   });
 
+  it('liveAuthSession answers the read-capability revocation check: logout and expiry both kill it', () => {
+    // P1-5：终端只读能力绑定 authSessionId，front-proxy 用这个判定拒绝已注销/
+    // 已过期登录还拿着未到期能力 URL 的重连。
+    const nowRef = { value: 1_000 };
+    const sessions = new DashboardSessionStore({ ttlMs: 60_000, now: () => nowRef.value });
+    const a = sessions.create('ou_viewer_a').identity;
+    const b = sessions.create('ou_viewer_b').identity;
+    expect(sessions.liveAuthSession(a.authSessionId)).toBe(true);
+    expect(sessions.liveAuthSession('never-existed')).toBe(false);
+
+    // 注销立即失效，且不串到另一个登录。
+    sessions.revokeAuthSession(a.authSessionId);
+    expect(sessions.liveAuthSession(a.authSessionId)).toBe(false);
+    expect(sessions.liveAuthSession(b.authSessionId)).toBe(true);
+
+    // 到点未清扫的会话也答「死」，顺手当场清掉（onEnd 照常触发）。
+    let ended = 0;
+    sessions.onEnd(() => { ended += 1; });
+    nowRef.value = 61_000;
+    expect(sessions.liveAuthSession(b.authSessionId)).toBe(false);
+    expect(ended).toBe(1);
+  });
+
   it('supports a fully mocked Feishu exchange and discards provider access tokens', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fakeFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

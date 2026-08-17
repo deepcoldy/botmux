@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -6,8 +7,17 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { deriveTerminalViewToken, deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
+import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
 import { issueTerminalControlGrant } from '../src/core/terminal-control-grant.js';
+
+/** The RETIRED stable view derivation (P1-5). Reproduced here so the tests can
+ *  prove a live worker rejects every historically issued stable view token. */
+function retiredStableViewToken(secret: string, sessionId: string): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-view-v1\0')
+    .update(sessionId)
+    .digest('base64url');
+}
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -138,10 +148,15 @@ setInterval(() => {}, 1_000);
     child.send(init);
     const ready = await waitForReady(child, logs);
 
-    expect(ready.viewToken).toBe(deriveTerminalViewToken(secret, sessionId));
-    // The operate/write link must also be the stable HMAC (not the random boot
+    // P1-5: the reported read capability is PER-BOOT random — deliberately no
+    // longer the stable secret-derived HMAC, which was irrevocable (logout,
+    // session expiry and worker restarts all left it valid forever).
+    expect(ready.viewToken).toBeTruthy();
+    expect(ready.viewToken).not.toBe(retiredStableViewToken(secret, sessionId));
+    // The operate/write link must still be the stable HMAC (not a random boot
     // token), so an already-issued 「操作链接」survives a worker restart that
-    // re-runs init → refreshTerminalWriteToken → ready.
+    // re-runs init → refreshTerminalWriteToken → ready (P1-6: write-capability
+    // semantics stay untouched).
     expect(ready.token).toBe(deriveTerminalWriteToken(secret, sessionId));
     const base = `http://127.0.0.1:${ready.port}`;
 
@@ -156,9 +171,51 @@ setInterval(() => {}, 1_000);
     // The browser must carry the view capability into its WS connection too.
     expect(viewHtml).toContain("base+'/'+location.search");
 
+    // Every historically issued stable view token fails closed on this worker.
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);
+
     const write = await fetch(`${base}/?token=${encodeURIComponent(ready.token)}`);
     expect(write.status).toBe(200);
     expect(await write.text()).toContain('var hasToken=true');
+
+    // P1-6: the explicit write capability has independent HIGHEST priority —
+    // an injected read-scope grant (what the central proxy hands teammate/guest
+    // viewers) must NOT downgrade a correct 「操作链接」 to read-only.
+    const injectedReadGrant = issueTerminalControlGrant(secret, {
+      scope: 'read', sessionId, userId: 'ou_platform_teammate', authSessionId: 'platform-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 10_000,
+    });
+    const writeDespiteReadGrant = await fetch(`${base}/?token=${encodeURIComponent(ready.token)}`, {
+      headers: { 'x-botmux-terminal-control': injectedReadGrant },
+    });
+    expect(writeDespiteReadGrant.status).toBe(200);
+    expect(await writeDespiteReadGrant.text()).toContain('var hasToken=true');
+    // A wrong write token with no other credential stays fully denied — it
+    // must never fall back to something weaker than the explicit capability.
+    expect((await fetch(`${base}/?token=wrong-token`)).status).toBe(403);
+
+    // P1-5: the dashboard-minted BOUND view capability (signed read grant in
+    // ?viewToken=) opens the terminal read-only…
+    const boundView = issueTerminalControlGrant(secret, {
+      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 60_000,
+    });
+    const boundResponse = await fetch(`${base}/?viewToken=${encodeURIComponent(boundView)}`);
+    expect(boundResponse.status).toBe(200);
+    expect(await boundResponse.text()).toContain('var hasToken=false');
+    // …an EXPIRED one is refused (expired reconnects with a kept URL die)…
+    const expiredBoundView = issueTerminalControlGrant(secret, {
+      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 20_000, expiresAt: Date.now() - 10_000,
+    });
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(expiredBoundView)}`)).status).toBe(403);
+    // …and a WRITE-scope grant may never travel in a URL: it neither writes
+    // nor even reads through the ?viewToken= channel (viewToken 永不升级).
+    const writeScopeInUrl = issueTerminalControlGrant(secret, {
+      scope: 'write', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 10_000,
+    });
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(writeScopeInUrl)}`)).status).toBe(403);
 
     const signedRead = issueTerminalControlGrant(secret, {
       scope: 'read', sessionId, userId: 'ou_h5_owner', authSessionId: 'h5-auth-1',
@@ -199,6 +256,28 @@ setInterval(() => {}, 1_000);
     await new Promise(resolvePromise => setTimeout(resolvePromise, 150));
     expect(readFileSync(inputLog, 'utf8')).toBe('');
     ws.close();
+
+    // P1-5: a READ socket authorized by a bound capability is closed at the
+    // capability's signed expiresAt — read streams no longer outlive their
+    // authentication even when the front proxy never tears them down.
+    const shortBoundView = issueTerminalControlGrant(secret, {
+      scope: 'read', sessionId, userId: 'ou_h5_viewer', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now(), expiresAt: Date.now() + 2_000,
+    });
+    const readWs = new WebSocket(`ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(shortBoundView)}`);
+    const readWsClosed = new Promise<{ code: number; reason: string }>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error('read WS was not closed at its expiry boundary')), 8_000);
+      readWs.once('close', (code, reason) => { clearTimeout(timer); resolvePromise({ code, reason: reason.toString() }); });
+      readWs.once('error', err => { clearTimeout(timer); rejectPromise(err); });
+    });
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error('bound-view WS open timeout')), 5_000);
+      readWs.once('open', () => { clearTimeout(timer); resolvePromise(); });
+      readWs.once('error', err => { clearTimeout(timer); rejectPromise(err); });
+    });
+    const readWsClose = await readWsClosed;
+    expect(readWsClose.code).toBe(4003);
+    expect(readWsClose.reason).toBe('view expired');
 
     // A valid short-lived Dashboard write grant is independently verified by
     // the worker. Accepted input is audited with identity/session/action and a
@@ -250,4 +329,87 @@ setInterval(() => {}, 1_000);
 
     child.send({ type: 'close' } satisfies DaemonToWorker);
   }, 25_000);
+
+  // P1-5 回归矩阵的收尾一格：worker 重启后，重启前发出的一切读 token（旧稳定
+  // HMAC、上一代 boot token）全部失效；而显式写能力（操作链接）跨重启存活不变。
+  it('a worker restart invalidates every prior read capability while the operate link survives', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-terminal-restart-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const secret = 'integration-restart-dashboard-secret';
+    const botmuxDir = join(root, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true });
+    writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
+    const fakeCli = join(root, 'fake-claude');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdin.setRawMode?.(true);
+process.stdin.resume();
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const sessionId = 'terminal-restart-session';
+    const init: DaemonToWorker = {
+      type: 'init',
+      sessionId,
+      chatId: 'oc_terminal_restart',
+      rootMessageId: 'om_terminal_restart',
+      workingDir: dataDir,
+      cliId: 'claude-code',
+      cliPathOverride: fakeCli,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_terminal_restart',
+      larkAppSecret: 'secret',
+    };
+    const spawnWorker = async (): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
+      const logs: string[] = [];
+      const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        cwd: resolve('.'),
+        env: {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: sessionId,
+          LARK_APP_ID: 'app_terminal_restart',
+          LARK_APP_SECRET: 'secret',
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      children.add(child);
+      child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+      child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+      child.send(init);
+      return { child, ready: await waitForReady(child, logs) };
+    };
+
+    const first = await spawnWorker();
+    const firstViewToken = first.ready.viewToken!;
+    expect(first.ready.token).toBe(deriveTerminalWriteToken(secret, sessionId));
+    const firstExit = new Promise<void>(resolvePromise => first.child.once('exit', () => resolvePromise()));
+    first.child.kill('SIGKILL');
+    await firstExit;
+
+    const second = await spawnWorker();
+    // 新一代 boot token 与上一代不同；写 token 稳定不变。
+    expect(second.ready.viewToken).toBeTruthy();
+    expect(second.ready.viewToken).not.toBe(firstViewToken);
+    expect(second.ready.token).toBe(first.ready.token);
+
+    const base = `http://127.0.0.1:${second.ready.port}`;
+    // 重启前的读能力（上一代 boot token、退役的稳定 HMAC）全部 403。
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(firstViewToken)}`)).status).toBe(403);
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);
+    // 本代 boot token 只读可用。
+    const freshView = await fetch(`${base}/?viewToken=${encodeURIComponent(second.ready.viewToken!)}`);
+    expect(freshView.status).toBe(200);
+    expect(await freshView.text()).toContain('var hasToken=false');
+    // 重启前发出的操作链接照常可写（写能力语义不动）。
+    const write = await fetch(`${base}/?token=${encodeURIComponent(first.ready.token)}`);
+    expect(write.status).toBe(200);
+    expect(await write.text()).toContain('var hasToken=true');
+
+    second.child.send({ type: 'close' } satisfies DaemonToWorker);
+  }, 45_000);
 });

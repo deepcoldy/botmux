@@ -113,15 +113,30 @@ describe('Agent Workbench API integration contract', () => {
     const api = createWorkbenchApi(async () => jsonResponse({
       ok: true,
       url: 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc',
+      expiresAt: 1_755_000_000_000,
     }));
 
     const link = await api.getTerminalViewLink('session-0');
-    expect(link).toBe('https://board.example/s/session-0?viewToken=view-cap-abc');
+    expect(link!.url).toBe('https://board.example/s/session-0?viewToken=view-cap-abc');
+    // 短时能力的到期时间原样透传，供面板在到期前主动换链。
+    expect(link!.expiresAt).toBe(1_755_000_000_000);
     // 端口/主机/协议全部换成当前页面的，路径与凭证一个字都不能动。
-    const parsed = new URL(link!);
+    const parsed = new URL(link!.url);
     expect(parsed.origin).toBe('https://board.example');
     expect(parsed.pathname).toBe('/s/session-0');
     expect(parsed.searchParams.get('viewToken')).toBe('view-cap-abc');
+  });
+
+  it('expiresAt 缺失或畸形时降级为 null，不整条拒掉链接', async () => {
+    setPageOrigin('https://board.example');
+    for (const expiresAt of [undefined, 'soon', -5, 1.5]) {
+      const api = createWorkbenchApi(async () => jsonResponse({
+        ok: true,
+        url: 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc',
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+      }));
+      await expect(api.getTerminalViewLink('session-0')).resolves.toMatchObject({ expiresAt: null });
+    }
   });
 
   it('同源改写发生在协议与凭证校验之后，非法链接照旧拒绝', async () => {
@@ -147,12 +162,12 @@ describe('Agent Workbench API integration contract', () => {
     // SSR / 注入 fetchImpl 的测试环境没有 window；改写是可达性优化，缺条件就别动。
     const upstream = 'http://10.37.228.130:8801/s/session-0?viewToken=view-cap-abc';
     const noWindow = createWorkbenchApi(async () => jsonResponse({ ok: true, url: upstream }));
-    await expect(noWindow.getTerminalViewLink('session-0')).resolves.toBe(upstream);
+    await expect(noWindow.getTerminalViewLink('session-0')).resolves.toEqual({ url: upstream, expiresAt: null });
 
     // 沙箱 iframe 的不透明 origin 是字符串 "null"，拼不出合法地址，同样回退。
     setPageOrigin('null');
     const opaqueOrigin = createWorkbenchApi(async () => jsonResponse({ ok: true, url: upstream }));
-    await expect(opaqueOrigin.getTerminalViewLink('session-0')).resolves.toBe(upstream);
+    await expect(opaqueOrigin.getTerminalViewLink('session-0')).resolves.toEqual({ url: upstream, expiresAt: null });
   });
 
   it('rejects semantically contradictory control and interaction states', async () => {

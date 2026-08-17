@@ -122,13 +122,15 @@ import {
 } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
-  deriveTerminalViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
-import { verifyTerminalControlGrant } from './core/terminal-control-grant.js';
+import {
+  looksLikeTerminalControlGrant,
+  verifyTerminalControlGrant,
+} from './core/terminal-control-grant.js';
 import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
@@ -1798,8 +1800,14 @@ const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
 // daemon restart re-forks every worker — a per-process random token would 403
 // every previously-issued operate link).
 let writeToken = randomBytes(16).toString('hex');
-// Standalone/test fallback. Production replaces this after init with a stable
-// per-session HMAC derived from the host-only dashboard secret.
+// Per-BOOT random read capability, reported to the daemon in `ready` and
+// embedded in Feishu card 「打开 Web 终端」 links. Deliberately NOT the stable
+// per-session HMAC any more (P1-5): a stable view token could never be revoked
+// — a viewer who fetched it once kept terminal read access forever, across
+// worker restarts included. Per-boot randomness bounds every card link to this
+// worker generation (restart ⇒ all previously issued view tokens die), and the
+// dashboard view-link API mints its own short-lived signed read grants instead
+// of ever handing this value out (see resolveTerminalAccessForReq).
 let viewToken = randomBytes(32).toString('base64url');
 
 // Active dashboard token, persisted by the dashboard process at this stable
@@ -1808,11 +1816,6 @@ let viewToken = randomBytes(32).toString('base64url');
 // proves a request traversed the platform's authenticated front door.
 const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
-
-function refreshTerminalViewToken(): void {
-  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
-  if (secret && sessionId) viewToken = deriveTerminalViewToken(secret, sessionId);
-}
 
 /** Re-derive the stable write (operate) token from the host-only dashboard
  *  secret so a restarted worker mints the SAME token — keeping already-issued
@@ -1845,16 +1848,57 @@ interface WorkerTerminalAccess extends TerminalAccessDecision {
 }
 
 function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerminalAccess {
-  const legacy = resolveTerminalAccessForRequest(
+  // P1-6 invariant: an explicit, matching write-link `?token=` is an
+  // independent capability with the HIGHEST priority. It wins outright — before
+  // the internal control-grant header is even looked at — so a central proxy
+  // that attaches a read-scope grant can never silently downgrade an explicitly
+  // issued 「操作链接」 to read-only for a viewer the platform authenticated as
+  // teammate/guest. (The front proxy additionally refrains from injecting a
+  // grant next to explicit query capabilities; this ordering makes the
+  // guarantee hold regardless of proxy behavior, not by accident of it.)
+  if (safeTerminalTokenEqual(url.searchParams.get('token'), writeToken)) {
+    return { hasRead: true, hasWrite: true, platformReadonly: false };
+  }
+  // `?viewToken=` read capability, two accepted forms (P1-5):
+  //   • this worker's per-boot random token (Feishu card links) — plain
+  //     equality; dies with the worker generation;
+  //   • a short-lived signed read grant minted by the dashboard view-link API —
+  //     verified statelessly (signature + expiry + session binding); the
+  //     WebSocket is additionally closed at the grant's expiresAt.
+  // The retired stable per-session HMAC matches neither form, so every
+  // previously issued stable view token fails closed on this worker.
+  const viewParam = url.searchParams.get('viewToken');
+  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken);
+  let viewGrantUser: string | undefined;
+  let viewGrantExpiresAt: number | undefined;
+  if (!viewTokenMatches && looksLikeTerminalControlGrant(viewParam) && sessionId) {
+    const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+    if (secret) {
+      const viewGrant = verifyTerminalControlGrant(secret, viewParam, sessionId);
+      // Only read scope may travel in a URL: the view-link API mints nothing
+      // else, and a leaked write-scope loopback grant must never double as a
+      // browser-shareable capability.
+      if (viewGrant.ok && viewGrant.claims.scope === 'read') {
+        viewTokenMatches = true;
+        viewGrantUser = viewGrant.claims.userId;
+        viewGrantExpiresAt = viewGrant.claims.expiresAt;
+      }
+    }
+  }
+  const legacy: WorkerTerminalAccess = resolveTerminalAccessForRequest(
     req.headers,
-    safeTerminalTokenEqual(url.searchParams.get('token'), writeToken),
-    safeTerminalTokenEqual(url.searchParams.get('viewToken'), viewToken),
+    false,
+    viewTokenMatches,
     () => readPlatformBinding() !== null,
     () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
   );
-  // Most terminal HTTP/WS requests use legacy view/write capabilities. Avoid a
-  // synchronous secret-file read on that hot path; only the central front
-  // proxy supplies this internal header.
+  if (viewGrantExpiresAt !== undefined && legacy.hasRead && !legacy.hasWrite) {
+    legacy.auditUser = viewGrantUser;
+    legacy.controlExpiresAt = viewGrantExpiresAt;
+  }
+  // Most terminal HTTP/WS requests use the query capabilities above. Avoid a
+  // second synchronous secret-file read on that hot path; only the central
+  // front proxy supplies this internal header.
   if (req.headers['x-botmux-terminal-control'] === undefined) return legacy;
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (!secret || !sessionId) return legacy;
@@ -14569,15 +14613,18 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
-      // A signed Dashboard lease is fixed-expiry. Even if the central proxy's
-      // socket invalidation is delayed or bypassed, the worker independently
-      // removes write authority and closes this connection at the signed
-      // boundary; a reconnect then resolves as read-only.
+      // A signed Dashboard grant is fixed-expiry — for READ scope as much as
+      // for write (P1-5). Even if the central proxy's socket invalidation is
+      // delayed or bypassed, the worker independently removes any granted
+      // authority and closes this connection at the signed boundary; a
+      // reconnect must then present a still-valid credential. Read-only
+      // sockets used to outlive their authentication here; now they cannot.
       let controlExpiryTimer: NodeJS.Timeout | undefined;
-      if (hasWrite && controlExpiresAt !== undefined) {
+      if (controlExpiresAt !== undefined) {
+        const expiredReason = hasWrite ? 'control expired' : 'view expired';
         controlExpiryTimer = setTimeout(() => {
           authedClients.delete(ws);
-          if (ws.readyState === WebSocket.OPEN) ws.close(4003, 'control expired');
+          if (ws.readyState === WebSocket.OPEN) ws.close(4003, expiredReason);
         }, Math.max(0, controlExpiresAt - Date.now()));
         controlExpiryTimer.unref();
       }
@@ -15973,7 +16020,8 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
-      refreshTerminalViewToken();
+      // The view token intentionally stays per-boot random (no refresh): a
+      // worker restart must invalidate every previously issued read link.
       refreshTerminalWriteToken();
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves

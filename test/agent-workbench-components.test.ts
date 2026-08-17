@@ -890,7 +890,10 @@ describe('终端面板：实时通道被拦时的降级提示', () => {
    *  地址握不上手），所以这里的 api 必须给得出这条链接，否则面板停在空态、连 iframe 都
    *  没有，覆盖层也就无从谈起。 */
   const VIEW_LINK = 'https://board.example/s/session-0?viewToken=view-cap-abc';
-  const touchApi: WorkbenchApi = { ...api, getTerminalViewLink: async () => VIEW_LINK };
+  const touchApi: WorkbenchApi = {
+    ...api,
+    getTerminalViewLink: async () => ({ url: VIEW_LINK, expiresAt: null }),
+  };
 
   /** 组件测试拿不到真 iframe 的 internals，所以把「读状态」当 prop 注进去。
    *  生产默认实现读的是同源 iframe 里的 #status 节点。 */
@@ -990,7 +993,10 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
     const viewLinkCalls: string[] = [];
     const paneApi: WorkbenchApi = {
       ...api,
-      getTerminalViewLink: async (sessionId: string) => { viewLinkCalls.push(sessionId); return VIEW_LINK; },
+      getTerminalViewLink: async (sessionId: string) => {
+        viewLinkCalls.push(sessionId);
+        return { url: VIEW_LINK, expiresAt: null };
+      },
       ...overrides,
     };
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -1051,6 +1057,33 @@ describe('终端面板：触屏改走 viewToken 链路', () => {
     expect(renderer.root.findAll(node => node.type === 'a').map(node => node.props.href))
       .not.toContain(COOKIE_TERMINAL_URL);
     act(() => renderer.unmount());
+  });
+
+  it('短时 viewToken 到期前主动换链：旧 iframe 顶到新链接就位再换 src', async () => {
+    // P1-5 后 view-link 是短时能力（服务端会在 expiresAt 关掉 WS 并拒绝重连）。
+    // 面板必须赶在到期前重取一条新链接，否则触屏终端会在 TTL 后死在黑屏重连循环里。
+    vi.useFakeTimers();
+    try {
+      setTouchEnvironment(true);
+      const mints: string[] = [];
+      const { renderer } = await renderTerminal({
+        getTerminalViewLink: async (sessionId: string) => {
+          mints.push(sessionId);
+          return { url: `${VIEW_LINK}-${mints.length}`, expiresAt: Date.now() + 120_000 };
+        },
+      });
+      expect(mints).toEqual(['session-0']);
+      expect(String(renderer.root.findByType('iframe').props.src)).toBe(`${VIEW_LINK}-1`);
+
+      // 到期前 30 秒（120s - 30s = 90s）自动重取；旧链接在新链接就位前不撤，
+      // iframe 始终在。
+      await act(async () => { await vi.advanceTimersByTimeAsync(90_500); });
+      expect(mints).toEqual(['session-0', 'session-0']);
+      expect(String(renderer.root.findByType('iframe').props.src)).toBe(`${VIEW_LINK}-2`);
+      act(() => renderer.unmount());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

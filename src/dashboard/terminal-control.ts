@@ -6,9 +6,16 @@ import {
   controlAuditRecord,
   type ControlAuditSink,
 } from './control-audit.js';
+import { TERMINAL_VIEW_CAPABILITY_TTL_MS } from './terminal-view-capability.js';
 
 export const DEFAULT_TERMINAL_CONTROL_TTL_MS = 5 * 60_000;
-const READ_GRANT_TTL_MS = 60_000;
+// One shared bound for every read capability (per-request proxy grants AND the
+// view-link URL capability). The worker closes read sockets at this signed
+// boundary (P1-5), so the value doubles as the periodic reconnect cadence for
+// long-watching read viewers — 60s would have made every read terminal blink
+// once a minute, while logout/expiry still closes sockets immediately through
+// the proxy-side index below.
+const READ_GRANT_TTL_MS = TERMINAL_VIEW_CAPABILITY_TTL_MS;
 
 export interface TerminalDashboardActor {
   userId: string;
@@ -76,6 +83,9 @@ function validControlTtl(value: number): boolean {
  */
 export class TerminalControlManager {
   private readonly leases = new Map<string, TerminalControlLease>();
+  /** P1-5 revocation index: read-only bridged sockets per auth session, so a
+   * logout/expiry can close every read stream that authentication opened. */
+  private readonly readSocketsByAuthSession = new Map<string, Set<TerminalControlSocket>>();
   private readonly secret: string;
   private readonly audit: ControlAuditSink;
   private readonly ttlMs: number;
@@ -264,12 +274,43 @@ export class TerminalControlManager {
     return true;
   }
 
+  /**
+   * Index a read-only bridged socket under the auth session that opened it.
+   * `releaseByAuthSession` (fired on logout/session expiry) then closes it
+   * immediately instead of waiting for the worker-side grant expiry timer.
+   * Returns a deregistration closure for the socket's own natural close.
+   */
+  registerReadSocket(authSessionId: string, socket: TerminalControlSocket): () => void {
+    let sockets = this.readSocketsByAuthSession.get(authSessionId);
+    if (!sockets) {
+      sockets = new Set();
+      this.readSocketsByAuthSession.set(authSessionId, sockets);
+    }
+    sockets.add(socket);
+    return () => {
+      const current = this.readSocketsByAuthSession.get(authSessionId);
+      if (!current) return;
+      current.delete(socket);
+      if (current.size === 0) this.readSocketsByAuthSession.delete(authSessionId);
+    };
+  }
+
   releaseByAuthSession(authSessionId: string): number {
     let released = 0;
     for (const [sessionId, lease] of [...this.leases]) {
       if (lease.authSessionId !== authSessionId) continue;
       this.invalidate(sessionId, lease, 'disconnect');
       released++;
+    }
+    // Read streams are not leases but must die with the authentication that
+    // opened them (P1-5). Only THIS auth session's sockets close — a different
+    // viewer's read stream on the same terminal is untouched.
+    const readSockets = this.readSocketsByAuthSession.get(authSessionId);
+    if (readSockets) {
+      this.readSocketsByAuthSession.delete(authSessionId);
+      for (const socket of readSockets) {
+        try { if (!socket.destroyed) socket.destroy(); } catch { /* already closed */ }
+      }
     }
     return released;
   }

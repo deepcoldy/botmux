@@ -158,7 +158,7 @@ export function TerminalPane(props: PaneCommonProps & {
   const [phase, setPhase] = useState<'loading' | 'ready' | 'busy' | 'error'>('loading');
   const [error, setError] = useState('');
   const [frameGeneration, setFrameGeneration] = useState(0);
-  const [viewLink, setViewLink] = useState<string | null>(null);
+  const [viewLink, setViewLink] = useState<{ sessionId: string; url: string; expiresAt: number | null } | null>(null);
   const [viewLinkPhase, setViewLinkPhase] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
   const [viewLinkAttempt, setViewLinkAttempt] = useState(0);
   const controlRef = useRef<TerminalControlState | null>(null);
@@ -186,19 +186,29 @@ export function TerminalPane(props: PaneCommonProps & {
     if (externalTerminalUrl || (props.authenticated && !touch)) return undefined;
     const controller = new AbortController();
     let retry: ReturnType<typeof setTimeout> | undefined;
-    setViewLink(null);
+    const sessionId = props.session.sessionId;
+    // 换会话才清掉手上的链接；同一会话的到期前换链（下面那个 effect 触发的重取）让旧
+    // iframe 一直顶到新链接就位再换 src，避免闪一下「正在获取…」空态。
+    setViewLink(previous => (previous?.sessionId === sessionId ? previous : null));
     setViewLinkPhase('loading');
-    void props.api.getTerminalViewLink(props.session.sessionId, controller.signal)
-      .then(url => {
+    void props.api.getTerminalViewLink(sessionId, controller.signal)
+      .then(link => {
         // Every failure — abort included — comes back as null rather than a
         // rejection, so this still runs after cleanup. Never schedule past it.
         if (controller.signal.aborted) return;
-        if (url) {
-          setViewLink(url);
+        if (link) {
+          setViewLink({ sessionId, url: link.url, expiresAt: link.expiresAt });
           setViewLinkPhase('ready');
           return;
         }
         setViewLinkPhase('failed');
+        // 手上的旧链接没过期就先继续用它顶着（后台重试换新）；已过期的链接 worker 端
+        // 已经关了 WS，留着只会是假活着的黑屏，撤下换诚实的失败态。
+        setViewLink(previous => (
+          previous?.sessionId === sessionId && previous.expiresAt !== null && previous.expiresAt <= Date.now()
+            ? null
+            : previous
+        ));
         // A missing link usually means the login lapsed or the worker has not
         // registered its terminal yet; both recover without the viewer acting.
         retry = setTimeout(() => setViewLinkAttempt(value => value + 1), 8_000);
@@ -209,6 +219,16 @@ export function TerminalPane(props: PaneCommonProps & {
     };
   }, [externalTerminalUrl, props.api, props.authenticated, props.session.sessionId, touch, viewLinkAttempt]);
 
+  // 短时 viewToken（P1-5）到期前主动换链：提前 30 秒重拉一条 view-link，成功后 iframe
+  // 换 src 平滑接续；真到期后 worker 会按签名边界关掉 WS，旧链接自己救不回来。至少
+  // 5 秒的下限防止服务端给出过近的到期时间时打转。
+  useEffect(() => {
+    if (viewLinkPhase !== 'ready' || viewLink?.expiresAt == null) return undefined;
+    const lead = viewLink.expiresAt - Date.now() - 30_000;
+    const timer = setTimeout(() => setViewLinkAttempt(value => value + 1), Math.max(5_000, lead));
+    return () => clearTimeout(timer);
+  }, [viewLink, viewLinkPhase]);
+
   // Bumping the attempt re-runs the effect above, which cancels any pending
   // auto-retry through its cleanup, so the button cannot stack timers.
   const retryViewLink = useCallback(() => {
@@ -218,9 +238,10 @@ export function TerminalPane(props: PaneCommonProps & {
 
   // 触屏没有裸回退：viewLink 还没到手就让空态顶着，绝不退回同源地址——那条路在 iOS 上
   // 必然是黑屏（WS 不带 Cookie，握手被 403），显示出来只会让人以为是终端坏了。
+  const viewLinkUrl = viewLink ? viewLink.url : null;
   const frameUrl = !externalTerminalUrl && touch
-    ? viewLink
-    : props.authenticated ? terminalUrl : viewLink;
+    ? viewLinkUrl
+    : props.authenticated ? terminalUrl : viewLinkUrl;
 
   const applyControl = useCallback((next: TerminalControlState, reloadOnDowngrade = true) => {
     const previous = controlRef.current;

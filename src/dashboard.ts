@@ -91,6 +91,11 @@ import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
 import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
+  mintTerminalViewCapability,
+  rewriteViewLinkCapability,
+  terminalViewCapabilityAuthSession,
+} from './dashboard/terminal-view-capability.js';
+import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
   isTtadkWrapper,
@@ -359,6 +364,38 @@ function legacyDashboardAuthSessionId(token: string): string {
     .digest('base64url');
 }
 
+/** Stable per-machine scope for platform-dashboard actors. Shared between
+ * identity resolution and the read-capability liveness check so the two can
+ * never drift apart on the authSessionId format. */
+function platformDashboardActorScope(machineId: string): string {
+  return createHmac('sha256', SECRET)
+    .update('botmux-platform-dashboard-actor-v1\0')
+    .update(machineId)
+    .digest('base64url');
+}
+
+/**
+ * P1-5 liveness for a bound terminal read capability: `false` means the auth
+ * session it was minted under is over (H5 logout/expiry, dashboard token
+ * rotation, platform unbind), so the front proxy refuses the capability even
+ * though its signature/expiry would still verify at the worker.
+ */
+function terminalAuthSessionLive(authSessionId: string): boolean {
+  if (dashboardSessions.liveAuthSession(authSessionId)) return true;
+  const activeToken = currentDashboardToken();
+  if (activeToken && authSessionId === legacyDashboardAuthSessionId(activeToken)) return true;
+  const binding = readPlatformBinding();
+  if (binding) {
+    const scope = platformDashboardActorScope(binding.machineId);
+    if (authSessionId === `${scope}:owner`
+      || authSessionId === `${scope}:teammate`
+      || authSessionId === `${scope}:guest`) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentity | null {
   const legacyCookie = parseCookie(req.headers.cookie);
   // The persisted file is the active-token authority (currentDashboardToken);
@@ -377,10 +414,7 @@ function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentit
       ? rawRole
       : undefined;
     if (platformRole && platformBinding) {
-      const machineScope = createHmac('sha256', SECRET)
-        .update('botmux-platform-dashboard-actor-v1\0')
-        .update(platformBinding.machineId)
-        .digest('base64url');
+      const machineScope = platformDashboardActorScope(platformBinding.machineId);
       return {
         kind: 'platform-dashboard',
         userId: `platform:${machineScope}:${platformRole}`,
@@ -409,6 +443,10 @@ function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentit
 }
 
 dashboardSessions.onEnd(identity => {
+  // Ends BOTH capabilities of the authentication (P1-5): write leases AND every
+  // read socket the auth session opened (bound view-link capabilities included,
+  // via the front proxy's read-socket index). New connections with a capability
+  // minted under this authSessionId are refused by terminalAuthSessionLive.
   terminalControl.releaseByAuthSession(identity.authSessionId);
   previewInteraction.relockAuthSession(identity.authSessionId);
 });
@@ -492,10 +530,13 @@ const previewGuardPage = createPreviewGuardPage({
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
   resolveActor: dashboardRequestIdentity,
-  allowLegacyQueryCapabilities: actor => (
-    (actor as DashboardRequestIdentity).kind === 'legacy-dashboard'
-  ),
   control: terminalControl,
+  // P1-5: bound `?viewToken=` capabilities are refused once the auth session
+  // they were minted under ended, and their bridged sockets are indexed so
+  // logout/expiry closes them immediately (see dashboardSessions.onEnd).
+  viewCapabilityAuthSession: (sessionId, viewToken) =>
+    terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+  isAuthSessionLive: terminalAuthSessionLive,
 });
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
@@ -4782,21 +4823,42 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Read-only web-terminal link (viewToken-bearing) — the same capability the
-    // Feishu card's 「打开 Web 终端」 button already publishes. The Workbench
-    // terminal pane uses it so the frame authenticates by capability instead of
-    // by Dashboard cookie, which a Feishu WebView does not carry. A viewToken can
-    // never send input, so this is safe for any identity allowed to observe the
-    // session; unauthenticated callers were already rejected by the auth decision
-    // above (this path is in no public allow-list).
+    // Read-only web-terminal link. The Workbench terminal pane uses it so the
+    // frame authenticates by capability instead of by Dashboard cookie, which
+    // a Feishu WebView's WebSocket does not carry. The daemon's URL still
+    // embeds the worker's per-boot card token, which is NOT bound to the
+    // requesting authentication — so it is REPLACED here (never passed
+    // through) with a short-lived signed read grant bound to sessionId +
+    // authSessionId + expiresAt (P1-5). The worker verifies it statelessly and
+    // closes the socket at expiry; the front proxy refuses it once this auth
+    // session ends. A view capability can never send input, so this stays safe
+    // for any identity allowed to observe the session; unauthenticated callers
+    // were already rejected by the auth decision above (no public allow-list).
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/view-link$/))) {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/view-link`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
+      if (upstream.status !== 200) {
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      let upstreamUrl: unknown;
+      try {
+        upstreamUrl = (JSON.parse(await upstream.text()) as { url?: unknown }).url;
+      } catch {
+        upstreamUrl = undefined;
+      }
+      const minted = requestIdentity
+        ? mintTerminalViewCapability(SECRET, sid, requestIdentity)
+        : null;
+      const rewritten = minted && typeof upstreamUrl === 'string'
+        ? rewriteViewLinkCapability(upstreamUrl, minted.token)
+        : null;
+      // Fail closed rather than fall back to the unbound upstream token.
+      if (!minted || !rewritten) return jsonRes(res, 502, { ok: false, error: 'view_link_unavailable' });
+      return jsonRes(res, 200, { ok: true, url: rewritten, expiresAt: minted.expiresAt });
     }
 
     // Browser-safe preview metadata. The literal loopback host/port remains in

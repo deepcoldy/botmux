@@ -71,6 +71,16 @@ export function issueTerminalControlGrant(
   return `${TOKEN_PREFIX}.${payload}.${signature(secret, payload).toString('base64url')}`;
 }
 
+/**
+ * Cheap shape probe: does this query/header value even claim to be a signed
+ * terminal grant?  Lets hot paths skip the synchronous secret-file read for
+ * ordinary random capability tokens (worker per-boot view token, write token)
+ * that can never verify anyway.
+ */
+export function looksLikeTerminalControlGrant(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.startsWith(`${TOKEN_PREFIX}.`);
+}
+
 export function verifyTerminalControlGrant(
   secret: string,
   token: string | string[] | undefined,
