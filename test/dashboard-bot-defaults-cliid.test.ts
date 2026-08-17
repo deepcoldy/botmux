@@ -307,6 +307,37 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('re-saves the displayed non-whole-minute value back to the exact stored ms', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 90_001 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      const shown = input.props.value; // e.g. "1.5000166667"
+      // Re-enter the exact displayed minutes (a touch) and save: rounding to the
+      // nearest ms must reproduce 90_001, not error on a ~2e-6 float mismatch.
+      act(() => input.props.onChange({ currentTarget: { value: shown } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
+      expect(root.findAllByProps({ 'data-turn-timeout-error': '' })).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('blocks the save and shows an inline error on invalid turn timeout input', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];

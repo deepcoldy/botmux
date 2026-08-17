@@ -36,6 +36,11 @@ import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+// Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
+// ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
+// runner re-validates its own argv so a hand-crafted invocation can't arm an
+// overflowing (effectively ~1ms) turn timeout. Mirrors MAX_TURN_TIMEOUT_MS.
+const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
@@ -129,7 +134,9 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--turn-timeout-ms' && val !== undefined) {
       const n = Number(val);
-      if (Number.isFinite(n) && n > 0) out.turnTimeoutMs = n;
+      // Accept only a positive integer within the arm-able bound; anything else
+      // (≤0, non-integer, over-bound) is ignored → falls back to the default.
+      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) out.turnTimeoutMs = n;
       i++;
     }
   }

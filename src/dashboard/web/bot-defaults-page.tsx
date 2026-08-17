@@ -1919,35 +1919,40 @@ export const DASHBOARD_MAX_TURN_TIMEOUT_MS = 2_147_483_647;
  * Convert a stored dsh turn timeout (ms) into the minutes string shown in the
  * input. Absent / non-positive / non-integer / over-bound → empty (the field
  * then means "use the runner default"). A legal value that is not a whole
- * number of minutes is shown as its exact decimal minutes so it round-trips
- * losslessly instead of being hidden as empty.
+ * number of minutes is shown as its decimal minutes (trimmed of any float
+ * tail) rather than hidden as empty; `parseTurnTimeoutMinInput` re-rounds it to
+ * the nearest whole ms, so the displayed value round-trips back to the same ms.
  */
 function turnTimeoutMinFromMs(ms: unknown): string {
   if (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return '';
   const minutes = ms / 60_000;
-  // Trim any floating-point tail; the exact ms is recoverable via round() below.
+  // Trim any floating-point tail; parseTurnTimeoutMinInput re-rounds to ms.
   return Number.isInteger(minutes) ? String(minutes) : String(Number(minutes.toFixed(10)));
 }
 
 /**
  * Parse the minutes input for the PUT body. Returns:
  *  - `''`        → cleared (empty input) → daemon reverts to the runner default,
- *  - a number    → minutes → ms, a positive integer within the arm-able bound,
+ *  - a number    → minutes → ms, rounded to the nearest whole ms, a positive
+ *                  integer within the arm-able bound,
  *  - `'invalid'` → the operator typed something that is not a clearable blank
  *                  and not a representable positive timeout (0, negative, NaN,
- *                  or a minutes value whose ms is non-integer / over-bound).
- * Invalid input is surfaced inline instead of being coerced to a silent clear.
+ *                  or a minutes value whose nearest ms is ≤0 / over-bound).
+ * Rounding to the nearest whole ms makes the value shown by
+ * `turnTimeoutMinFromMs` (a possibly-decimal minutes figure) round-trip back to
+ * the exact stored ms; invalid input is surfaced inline, never silently cleared.
  */
 function parseTurnTimeoutMinInput(minutes: string): number | '' | 'invalid' {
   const trimmed = minutes.trim();
   if (!trimmed) return '';
   const asMinutes = Number(trimmed);
   if (!Number.isFinite(asMinutes) || asMinutes <= 0) return 'invalid';
-  const ms = asMinutes * 60_000;
-  // Reject values that can't be stored as a whole positive ms within bounds.
-  const rounded = Math.round(ms);
-  if (Math.abs(ms - rounded) > 1e-6 || rounded <= 0 || rounded > DASHBOARD_MAX_TURN_TIMEOUT_MS) return 'invalid';
-  return rounded;
+  // Round to the nearest whole ms: the minutes field is a lossy display of a
+  // ms value, so snapping back to an integer ms is the safe, non-destructive
+  // interpretation (e.g. 1.5000166667 min → 90001 ms).
+  const ms = Math.round(asMinutes * 60_000);
+  if (ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return 'invalid';
+  return ms;
 }
 
 function skillInjectionResolved(bot: BotDefaultsRow): string {
