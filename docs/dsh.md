@@ -19,7 +19,7 @@
 
 ## 安装 dsh 运行时
 
-`dsh-runner.js` 随 botmux 构建分发，无需安装；需要安装的是 `dsh-jsonrpc-agent`，deepseek-harness 的单文件运行时：
+`dsh-runner.js` 随 botmux 构建分发，无需安装；需要安装的是 `dsh-jsonrpc-agent`，deepseek-harness 的单文件运行时（要求 Python >= 3.10）：
 
 ```bash
 pip install deepseek-harness-sdk   # 依赖 deepseek-harness-runtime-bin，提供 dsh-jsonrpc-agent
@@ -44,36 +44,57 @@ dsh 适配器**不读取 `~/.dsh` 全局配置**：botmux 的组合里没有挂�
 
 ### 注入方式
 
-- **per-bot env（推荐）**：`bots.json` 的 `env` 字段，或 dashboard 机器人配置页「运行时环境变量」。按会话注入，新会话生效，不影响其它机器人。沙箱模式下该变量可能不会传递，遇到时改用 daemon 环境。
-- **daemon 环境**：export 后重启 daemon。pm2 保留首次启动时捕获的环境，修改后需 `pm2 restart --update-env`（或 delete + start）才会更新。
+- **per-bot env（推荐）**：`bots.json` 的 `env` 字段，或 dashboard 机器人配置页「运行时环境变量」。按会话注入，新会话生效，不影响其它机器人。沙箱模式下同样生效：worker 把 `env` 作为 `injectEnv` 传给后端（PTY 并入子进程环境，tmux 通过 pane 内 `/usr/bin/env KEY=VAL` 注入），bwrap 不清理环境，key 会被一路继承。
+- **daemon 环境**：export 后重启 daemon 生效。用 `botmux restart`（在仓库 checkout 内也可用 `pnpm daemon:restart`）；不要直接用 `pm2 restart --update-env`，会绕过 botmux 的安全重启与会话恢复。
 
 ## 自定义组合（可选）
 
 runner 每次启动会把内置的默认组合覆写到 `~/.botmux/dsh/cordis.yml`，直接修改该文件无效。需要自定义时设置 `DSH_CORDIS_CONFIG=<绝对路径>`，runner 优先读取该文件。
 
-默认组合如下；需要改路由时复制一份，仅调整 `llm-deepseek` 段。以下为走 zen/go 网关的示例：
+内置默认组合如下（与 `src/dsh-runner.ts` 的 `VENDORED_CONFIG` 一致）：
 
 ```yaml
+# Vendored by botmux dsh-runner. Source: deepseek-harness python/sdk-runtime cordis.yml.
 - id: sdk-jsonrpc-server
   name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
 - id: agent-core
   name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    workspaceContext:
+      maxBytes: 65536
 - id: llm-deepseek
   name: '@deepseek-ai/dsh-llm-deepseek'
-  config:
-    apiKeyEnv: OPENCODE_GO_API_KEY
-    baseURL: https://opencode.ai/zen/go/v1
 - id: sessions
   name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
 - id: session-checkpoints
   name: '@deepseek-ai/dsh-session-checkpoint-policy'
 - id: subprocess
   name: '@deepseek-ai/dsh-subprocess-local'
 - id: bash
   name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
 - id: fs-local
   name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
 ```
+
+改路由时复制一份，只调整 `llm-deepseek` 段。例如走 zen/go 网关，把该段改为：
+
+```yaml
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    apiKeyEnv: OPENCODE_GO_API_KEY
+    baseURL: https://opencode.ai/zen/go/v1
+```
+
+其余段保持默认即可——尤其不要删掉 `sessions.config.root` 与 `bash` / `fs-local` 的 `config.cwd`，否则会话落盘位置会退回 workingDir 下的 `./.sessions`，与下文「会话目录」冲突。
+
+> 沙箱注意：`DSH_CORDIS_CONFIG` 指向的文件必须在文件沙箱可见范围内，否则沙箱内 `existsSync` 判空会**静默回退到内置组合**。最稳妥是放在 `~/.botmux/dsh/`（适配器已把该目录声明为 `authPaths`，例如 `~/.botmux/dsh/custom.yml`），或放在 workingDir 内。
 
 ## 会话与版本
 
@@ -87,7 +108,7 @@ runner 每次启动会把内置的默认组合覆写到 `~/.botmux/dsh/cordis.ym
 | dashboard 无 DeepSeek Harness 选项 | botmux 版本过旧，无 dsh 适配器。升级 botmux |
 | 报找不到 dsh-jsonrpc-agent | 运行时未安装或不在 PATH。安装 `deepseek-harness-sdk` 并将 `dsh-jsonrpc-agent` 加入 PATH（或配置 `pathOverride`） |
 | `no API key for provider route "deepseek-official"` | key 未进入进程环境（`~/.dsh/.credentials.yaml` 不生效）。通过 per-bot env 或 daemon 环境配置 key |
-| per-bot env 已配置仍报缺 key | 沙箱未传递该环境变量。改用 daemon 环境（export 后 `pm2 restart --update-env`） |
+| 自定义组合不生效（仍走默认路由 / 模型） | `DSH_CORDIS_CONFIG` 指向的文件在沙箱内不可见，`existsSync` 判空后静默回退内置组合。把文件放到 `~/.botmux/dsh/` 或 workingDir 内 |
 | `UNKNOWN_MODEL` 或 401 | model 不在该路由的模型列表，或 key 有误。核对 model 字段、key、baseURL |
 
-`GET /api/cli-options` 返回 `dsh: available: true/false`，可确认适配器是否可用。
+`GET /api/cli-options` 返回的 `options` 数组中，`id: "dsh"` 条目的 `available` 为 true/false，可确认适配器是否可用。
