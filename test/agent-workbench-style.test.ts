@@ -90,6 +90,36 @@ describe('Agent Workbench visual contract', () => {
     expect(block).toContain('.wb-session-group-caret');
   });
 
+  it('指尖目标按指针类型补齐，宽屏触屏（iPad）不再落空', () => {
+    // 44px 那套原先只写在 max-width: 620px 里，横屏 iPad 两头落空。这条钉住的是
+    // 「有一个不带宽度上限的 (hover: none) 段」，改回宽度断点就会断。
+    const touchBlocks = [...block.matchAll(/@media \(hover: none\)\s*\{/g)]
+      .map(match => {
+        // 手写一个括号配平扫描：媒体查询里还嵌着规则块，正则数不清层数。
+        let depth = 1;
+        let index = match.index! + match[0].length;
+        for (; index < block.length && depth > 0; index += 1) {
+          if (block[index] === '{') depth += 1;
+          else if (block[index] === '}') depth -= 1;
+        }
+        return block.slice(match.index! + match[0].length, index - 1);
+      });
+    expect(touchBlocks.length).toBeGreaterThanOrEqual(1);
+    const touchCss = touchBlocks.join('\n');
+
+    // 三类操作目标：列表行操作、面板/坞的动作按钮、收起后的会话栏。
+    for (const selector of ['.wb-session-row-action', '.wb-dock-action-grid a', '.wb-primary-action']) {
+      expect(touchCss, selector).toContain(selector);
+    }
+    const sizes = [...touchCss.matchAll(/(?:min-height|height|min-width|width|grid-template-columns):\s*(\d+)px/g)]
+      .map(match => Number(match[1]));
+    expect(sizes.length).toBeGreaterThanOrEqual(6);
+    expect(Math.min(...sizes)).toBeGreaterThanOrEqual(44);
+
+    // 行高是虚拟滚动的摆放依据，只能跟着宽度断点走：这一段碰它就会让列表滚过头。
+    expect(touchCss).not.toMatch(/\.wb-session-row\s*\{/);
+  });
+
   it('contains non-color state text and reduced-motion handling', () => {
     expect(block).toContain('.wb-mode-chip');
     expect(block).toContain('.wb-chat-contract');

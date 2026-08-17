@@ -259,6 +259,9 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 | workbench_failure — 控制接口 503 daemon_offline 报错并停在只读 | 通过 |
 | unauthorized — 未登录只读、不渲染接管按钮，preview 与 h5-context 均 401 | 通过 |
 | mobile_and_sidebar_layout — 390×844 下钻栈（无页内 tab 栏、无分屏）与 375×800 会话坞（minWidth 350、零 pane） | 通过 |
+| dock_touch_view_token — iPhone 13 真机 profile（hasTouch）下会话坞终端链接带 viewToken；把它拿到完全无 Cookie 的上下文里仍能打开终端，同上下文的裸 /s/&lt;id&gt; 401 | 通过 |
+| wide_touch_targets — 1194×834 触屏（iPad 横屏）下行操作 ≥44px，且触屏不渲染行内「接管」 | 通过 |
+| rail_collapsed_recovery — 预置「已收起」偏好后 1440/900/390 三档视口都能把列表叫回来并选到会话 | 通过 |
 | mobile_preview_interaction — 移动「网页」页蒙层、开启交互/立即锁定与 guard 同步 | 通过 |
 | preview_registration_and_proxy_boundaries — 注册、无效/未注册端口、不可达与代理边界不泄漏内部 target | 通过 |
 | preview_websocket — 同源 WebSocket 代理往返 | 通过 |

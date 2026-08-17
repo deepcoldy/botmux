@@ -28666,6 +28666,31 @@ body:has(.workbench-route-host) { min-width: 0; }
   .wb-session-row { height: 84px; }
 }
 
+/* P1-17：指尖目标按「指针类型」补齐，不再只按视口宽度。
+   44px 那套原先只写在 max-width: 620px 里，横屏 iPad（1024–1366px 且 hover: none）
+   于是两头落空，拿到的还是给鼠标做的 18–25px 目标：终端/接管、坞里的三个动作、
+   收起后的会话栏，手指都够不着。
+   这里刻意不动 .wb-session-row 的行高——虚拟滚动按 workbenchListItemHeight 摆放每
+   一行，行高只能跟着那份宽度契约走（54 / 84）。行操作是绝对定位的浮层，把按钮撑到
+   44px 不参与任何一行的摆放，所以两者不冲突。 */
+@media (hover: none) {
+  .wb-session-row-action { min-width: 44px; height: 44px; padding: 0 10px; font-size: 13px; }
+  .wb-pane-toolbar button,
+  .wb-pane-actions button,
+  .wb-pane-actions a,
+  .wb-dock-action-grid button,
+  .wb-dock-action-grid a,
+  .wb-dock-action-grid span,
+  .wb-primary-action { min-height: 44px; padding-inline: 10px; }
+  .wb-mobile-detail-seg button { min-height: 44px; }
+  /* 收起的会话栏是把列表叫回来的唯一入口（P1-18）：40px 的窄条在触屏上本来就难点，
+     栏宽和它所在的网格列要一起放宽，否则按钮撑不满、右边露一道缝。
+     终端关着的时候栏本来就铺满整页（.is-terminal-closed，那时它是唯一要画的东西），
+     那条更宽的规则不能被这里改窄——否则触屏反而只剩 44px 可点。 */
+  .wb-desktop-layout.is-rail-collapsed:not(.is-terminal-closed) { grid-template-columns: 44px minmax(0, 1fr); }
+  .wb-session-rail.is-collapsed { width: 44px; }
+}
+
 /* Mobile detail already shows the session name and its surface switcher, so the
    workspace's own header would repeat both and cost ~46px of the little height
    a phone terminal has. One bar, not two.

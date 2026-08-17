@@ -30,6 +30,8 @@ import {
   type WorkbenchApi,
 } from './agent-workbench-api.js';
 import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
+// 触屏鉴权契约只有一份实现，终端面板和会话坞共用（P1-17）。
+import { useTerminalViewLink, useTouchEnvironment } from './agent-workbench-touch.js';
 
 interface PaneCommonProps {
   session: WorkbenchSessionRow;
@@ -66,24 +68,6 @@ const FRAME_STATUS_POLL_MS = 1_000;
 /** 连续 8 拍（≈8 秒）都是 disconnected 才提示。终端页自己每 2 秒重连一次，正常网络下
  *  一两拍就连上了；8 秒还连不上，基本可以断定是这个浏览器环境拦掉了 ws://。 */
 const FRAME_STATUS_BLOCK_TICKS = 8;
-
-/** 整套探测只在触屏环境启用——ws:// 被系统拦截是 iOS（含飞书内嵌浏览器）的毛病，桌面
- *  和 Chromium 不受影响，没必要为它们付一个 1 秒轮询。写法沿用 session-list 的
- *  useTouchRowMetrics：matchMedia + change 订阅 + 卸载时退订。 */
-function useTouchEnvironment(): boolean {
-  const [touch, setTouch] = useState(false);
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.matchMedia) return undefined;
-    const query = window.matchMedia('(hover: none)');
-    const sync = () => setTouch(
-      (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0) || query.matches,
-    );
-    sync();
-    query.addEventListener?.('change', sync);
-    return () => query.removeEventListener?.('change', sync);
-  }, []);
-  return touch;
-}
 
 /** 盯着终端 iframe 内部的实时通道：iframe 明明加载出来了、里面却长时间连不上时，
  *  给外层一个 blocked 信号去盖提示层。iframe 本身不卸载，连上后提示自动撤掉。 */
@@ -164,9 +148,6 @@ export function TerminalPane(props: PaneCommonProps & {
   const [phase, setPhase] = useState<'loading' | 'ready' | 'busy' | 'error'>('loading');
   const [error, setError] = useState('');
   const [frameGeneration, setFrameGeneration] = useState(0);
-  const [viewLink, setViewLink] = useState<{ sessionId: string; url: string; expiresAt: number | null } | null>(null);
-  const [viewLinkPhase, setViewLinkPhase] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
-  const [viewLinkAttempt, setViewLinkAttempt] = useState(0);
   const controlRef = useRef<TerminalControlState | null>(null);
   const requestGeneration = useRef(0);
   const terminalUrl = workbenchTerminalHref(props.session, props.location);
@@ -188,59 +169,17 @@ export function TerminalPane(props: PaneCommonProps & {
   // 普通 HTTP fetch，Cookie 正常带得上，iOS 也拿得到。
   // 链接到手之前 iframe 故意留空：没有 Cookie 的裸同源地址只会渲染出 worker 的
   // "Forbidden" 纯文本，比一个诚实的等待态更糟。
-  useEffect(() => {
-    if (externalTerminalUrl || (props.authenticated && !touch)) return undefined;
-    const controller = new AbortController();
-    let retry: ReturnType<typeof setTimeout> | undefined;
-    const sessionId = props.session.sessionId;
-    // 换会话才清掉手上的链接；同一会话的到期前换链（下面那个 effect 触发的重取）让旧
-    // iframe 一直顶到新链接就位再换 src，避免闪一下「正在获取…」空态。
-    setViewLink(previous => (previous?.sessionId === sessionId ? previous : null));
-    setViewLinkPhase('loading');
-    void props.api.getTerminalViewLink(sessionId, controller.signal)
-      .then(link => {
-        // Every failure — abort included — comes back as null rather than a
-        // rejection, so this still runs after cleanup. Never schedule past it.
-        if (controller.signal.aborted) return;
-        if (link) {
-          setViewLink({ sessionId, url: link.url, expiresAt: link.expiresAt });
-          setViewLinkPhase('ready');
-          return;
-        }
-        setViewLinkPhase('failed');
-        // 手上的旧链接没过期就先继续用它顶着（后台重试换新）；已过期的链接 worker 端
-        // 已经关了 WS，留着只会是假活着的黑屏，撤下换诚实的失败态。
-        setViewLink(previous => (
-          previous?.sessionId === sessionId && previous.expiresAt !== null && previous.expiresAt <= Date.now()
-            ? null
-            : previous
-        ));
-        // A missing link usually means the login lapsed or the worker has not
-        // registered its terminal yet; both recover without the viewer acting.
-        retry = setTimeout(() => setViewLinkAttempt(value => value + 1), 8_000);
-      });
-    return () => {
-      controller.abort();
-      if (retry !== undefined) clearTimeout(retry);
-    };
-  }, [externalTerminalUrl, props.api, props.authenticated, props.session.sessionId, touch, viewLinkAttempt]);
-
-  // 短时 viewToken（P1-5）到期前主动换链：提前 30 秒重拉一条 view-link，成功后 iframe
-  // 换 src 平滑接续；真到期后 worker 会按签名边界关掉 WS，旧链接自己救不回来。至少
-  // 5 秒的下限防止服务端给出过近的到期时间时打转。
-  useEffect(() => {
-    if (viewLinkPhase !== 'ready' || viewLink?.expiresAt == null) return undefined;
-    const lead = viewLink.expiresAt - Date.now() - 30_000;
-    const timer = setTimeout(() => setViewLinkAttempt(value => value + 1), Math.max(5_000, lead));
-    return () => clearTimeout(timer);
-  }, [viewLink, viewLinkPhase]);
-
-  // Bumping the attempt re-runs the effect above, which cancels any pending
-  // auto-retry through its cleanup, so the button cannot stack timers.
-  const retryViewLink = useCallback(() => {
-    setViewLinkPhase('loading');
-    setViewLinkAttempt(value => value + 1);
-  }, []);
+  // 取链本身（重试、到期前换链、换会话清空）住在 agent-workbench-touch，会话坞用的是
+  // 同一个 hook——同一份触屏契约不能有第二种实现（P1-17）。
+  const {
+    link: viewLink,
+    phase: viewLinkPhase,
+    retry: retryViewLink,
+  } = useTerminalViewLink({
+    api: props.api,
+    sessionId: props.session.sessionId,
+    enabled: !externalTerminalUrl && (touch || !props.authenticated),
+  });
 
   // 触屏没有裸回退：viewLink 还没到手就让空态顶着，绝不退回同源地址——那条路在 iOS 上
   // 必然是黑屏（WS 不带 Cookie，握手被 403），显示出来只会让人以为是终端坏了。

@@ -102,7 +102,9 @@ describe('Agent Workbench route and surface integration', () => {
 
     const view = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8');
     expect(view).toContain('props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined');
-    expect(view).toContain('canControlTerminal={props.capabilities.canControl}');
+    // P1-17：能力位仍是第一道闸，触屏只读是叠在它上面的第二道（行为断言见
+    // agent-workbench-components.test.ts「触屏不给行内接管」）。
+    expect(view).toContain('canControlTerminal={props.capabilities.canControl && !touch}');
 
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('props.capabilities.canControl');

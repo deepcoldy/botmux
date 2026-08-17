@@ -42,6 +42,7 @@ import type { FeishuJsApi, WorkbenchH5Context } from './agent-workbench-chat.js'
 import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
 import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 import { WorkbenchSessionList } from './agent-workbench-session-list.js';
+import { useTouchEnvironment } from './agent-workbench-touch.js';
 import {
   TerminalPane,
   WebPane,
@@ -230,6 +231,8 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   ), [selectedHasPreview]);
 
   const layout = layoutEnvelope.layout;
+  // 触屏与否决定终端走哪条鉴权通道，进而决定「接管」这类写入口该不该渲染（P1-17）。
+  const touch = useTouchEnvironment();
   const responsive = deriveResponsiveWorkbenchLayout(viewportWidth, layout);
   const chatSplitActive = responsive.chatMode === 'native-split' && layout.chatRequested;
   const forcedRailCollapsed = responsive.railCollapsed;
@@ -454,11 +457,22 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     '--wb-rail-width': `${railWidth}px`,
   } as CSSProperties;
 
+  // P1-18：收起态和它的恢复入口必须同生共死。
+  // 折叠开关以前只在 full step（≥1280）渲染，可 620–1279 这两档照样沿用持久化的
+  // railCollapsed——在宽屏收起、再到中等视口重开页面，剩下的就只有一条点不动的窄条：
+  // 选不了会话，也没有任何办法把列表叫回来。开关改成整个桌面档位都给（收不收起本来
+  // 就是「用户在任何尺寸下自己的选择」，见 deriveResponsiveWorkbenchLayout 的注释），
+  // 收起态再从「有没有开关」推导：没有恢复入口就不许收起，这条死路在结构上就拼不出来。
+  const railToggle = responsive.mode === 'desktop'
+    ? () => updateLayout({ railCollapsed: !layout.railCollapsed })
+    : undefined;
+  const railCollapsed = Boolean(railToggle) && forcedRailCollapsed;
+
   const sessionList = (
     <WorkbenchSessionList
       sessions={props.sessions}
       selectedSessionId={selectedSessionId}
-      collapsed={responsive.mode === 'desktop' && forcedRailCollapsed}
+      collapsed={railCollapsed}
       locale={props.locale}
       now={now}
       online={props.online}
@@ -471,7 +485,10 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       // P1-4：定位是 POST /locate 的入口，只有 canLocate 的身份才渲染（H5/平台
       // 身份的 capability 表没有 /locate，点了只会 401）。不传即整体不渲染按钮。
       onLocate={props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined}
-      canControlTerminal={props.capabilities.canControl}
+      // P1-17：触屏一并不渲染行内「接管」。那边的终端挂的是 viewToken 只读通道，
+      // 接管到手也送不进输入（面板早就跳过 auto-takeover 了），行里还摆着这个按钮
+      // 只会让人反复点一个注定没反应的入口。
+      canControlTerminal={props.capabilities.canControl && !touch}
       onSelect={sessionId => {
         selectSession(sessionId);
         // Touch layouts drill in on tap; pointer layouts keep selection and
@@ -494,9 +511,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         toggleTerminal(sessionId, surface === 'terminal-control');
         setMobilePage('workspace');
       }}
-      onToggleCollapsed={responsive.mode === 'desktop' && responsive.step === 'full'
-        ? () => updateLayout({ railCollapsed: !layout.railCollapsed })
-        : undefined}
+      onToggleCollapsed={railToggle}
     />
   );
 
@@ -604,9 +619,9 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
           )}
         </div>
       ) : (
-        <div className={`wb-desktop-layout${forcedRailCollapsed ? ' is-rail-collapsed' : ''}${terminalSession ? '' : ' is-terminal-closed'}`}>
+        <div className={`wb-desktop-layout${railCollapsed ? ' is-rail-collapsed' : ''}${terminalSession ? '' : ' is-terminal-closed'}`}>
           {sessionList}
-          {!forcedRailCollapsed ? (
+          {!railCollapsed ? (
             <button
               type="button"
               className="wb-rail-separator"

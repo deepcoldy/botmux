@@ -1512,3 +1512,229 @@ describe('parseWorkbenchCapabilities 严格校验', () => {
     expect(Object.isFrozen(NO_WORKBENCH_CAPABILITIES)).toBe(true);
   });
 });
+
+describe('会话坞：终端链接的触屏契约（P1-17）', () => {
+  /** 两条链接都是同源的——api 层已把 view-link 改写到工作台 origin。区别只在鉴权方式：
+   *  带 viewToken 的走短时能力凭证，裸路径靠 Cookie。 */
+  const VIEW_LINK = 'https://board.example/s/session-0/?viewToken=view-cap-abc';
+  const COOKIE_TERMINAL_URL = 'https://board.example/s/session-0';
+  const LOCATION = { protocol: 'https:', origin: 'https://board.example', hostname: 'board.example' };
+  let previousWindow: unknown;
+
+  /** 触屏与否只由 useTouchEnvironment 的 matchMedia('(hover: none)') 读数决定。 */
+  function setTouchEnvironment(touch: boolean): void {
+    (globalThis as Record<string, unknown>).window = {
+      matchMedia: (query: string) => ({
+        matches: touch && query === '(hover: none)',
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    };
+  }
+
+  beforeEach(() => { previousWindow = (globalThis as Record<string, unknown>).window; });
+  afterEach(() => {
+    if (previousWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+    else (globalThis as Record<string, unknown>).window = previousWindow;
+  });
+
+  async function renderDock(options: {
+    authenticated?: boolean;
+    session?: Partial<WorkbenchSessionRow>;
+    viewLink?: WorkbenchApi['getTerminalViewLink'];
+  } = {}): Promise<{ renderer: TestRenderer.ReactTestRenderer; viewLinkCalls: string[] }> {
+    const viewLinkCalls: string[] = [];
+    const issue = options.viewLink ?? (async () => ({ url: VIEW_LINK, expiresAt: null }));
+    const dockApi: WorkbenchApi = {
+      ...api,
+      getTerminalViewLink: async (sessionId, signal) => {
+        viewLinkCalls.push(sessionId);
+        return issue(sessionId, signal);
+      },
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchDockView, {
+        sessions: [{ ...kindSession({}), webPort: 7681, proxyPort: 7682, ...options.session }],
+        online: true,
+        authenticated: options.authenticated ?? true,
+        initialSessionId: 'session-0',
+        api: dockApi,
+        sdk: null,
+        h5Context: null,
+        targetOrigin: 'https://board.example',
+        location: LOCATION,
+        onRouteChange: () => {},
+      }));
+    });
+    return { renderer, viewLinkCalls };
+  }
+
+  /** 坞里三个动作格子的可点链接。 */
+  function actionLinks(renderer: TestRenderer.ReactTestRenderer): ReactTestInstance[] {
+    return renderer.root.findAll(node => node.type === 'a' && textOf(node) === '终端链接');
+  }
+
+  it('触屏即使已登录也发 viewToken 链接，不发裸 Cookie 地址', async () => {
+    setTouchEnvironment(true);
+    const { renderer, viewLinkCalls } = await renderDock();
+
+    // iOS WebView 的 WebSocket 升级不带 Cookie：裸 /s/<id> 的页面能开，紧接着的握手
+    // 必然 403，终端停在空白。凭证必须在查询参数里。
+    expect(viewLinkCalls).toEqual(['session-0']);
+    const links = actionLinks(renderer);
+    expect(links).toHaveLength(1);
+    expect(links[0].props.href).toBe(VIEW_LINK);
+    expect(String(links[0].props.href)).toContain('viewToken=');
+    expect(links[0].props.href).not.toBe(COOKIE_TERMINAL_URL);
+    act(() => renderer.unmount());
+  });
+
+  it('桌面登录态照旧发同源地址，一次 view-link 都不问', async () => {
+    setTouchEnvironment(false);
+    const { renderer, viewLinkCalls } = await renderDock();
+
+    expect(viewLinkCalls).toEqual([]);
+    expect(actionLinks(renderer)[0].props.href).toBe(COOKIE_TERMINAL_URL);
+    act(() => renderer.unmount());
+  });
+
+  it('触屏拿不到 viewToken 链接时停在重试态，绝不回退到裸地址', async () => {
+    setTouchEnvironment(true);
+    const { renderer, viewLinkCalls } = await renderDock({ viewLink: async () => null });
+
+    expect(viewLinkCalls).toEqual(['session-0']);
+    // 一条 /s/ 链接都不许出现：宁可等，也不能给一条点开必定空白的地址。
+    expect(renderer.root.findAll(node =>
+      node.type === 'a' && String(node.props.href ?? '').includes('/s/'))).toHaveLength(0);
+    const retry = renderer.root.findAll(node => node.type === 'button' && textOf(node) === '终端重试');
+    expect(retry).toHaveLength(1);
+    await act(async () => { retry[0].props.onClick(); });
+    expect(viewLinkCalls).toEqual(['session-0', 'session-0']);
+    act(() => renderer.unmount());
+  });
+
+  it('未登录（飞书 WebView 无 Cookie）同样走 viewToken', async () => {
+    setTouchEnvironment(false);
+    const { renderer, viewLinkCalls } = await renderDock({ authenticated: false });
+
+    expect(viewLinkCalls).toEqual(['session-0']);
+    expect(actionLinks(renderer)[0].props.href).toBe(VIEW_LINK);
+    act(() => renderer.unmount());
+  });
+
+  it('触屏不给行内「接管」：那条通道只读，按钮点了也没反应', async () => {
+    const controlActions = (renderer: TestRenderer.ReactTestRenderer): ReactTestInstance[] =>
+      renderer.root.findAll(node =>
+        String(node.props.className ?? '').includes('wb-session-row-action is-terminal-control'));
+
+    async function renderView(): Promise<TestRenderer.ReactTestRenderer> {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
+          ...kindViewProps(kindSession({ webPort: 7681, proxyPort: 7682 })),
+          location: LOCATION,
+        }));
+      });
+      return renderer;
+    }
+
+    // 桌面：能力齐全 → 接管捷径照旧在（否则下面那条断言「全没了」也会假绿）。
+    setTouchEnvironment(false);
+    const desktop = await renderView();
+    expect(controlActions(desktop)).toHaveLength(1);
+    act(() => desktop.unmount());
+
+    // 触屏：终端挂的是 viewToken 只读通道，接管到手也送不进输入，入口整体不渲染。
+    setTouchEnvironment(true);
+    const touch = await renderView();
+    expect(controlActions(touch)).toHaveLength(0);
+    // 只读的「终端」入口必须还在，不能连看都看不了。
+    expect(touch.root.findAll(node =>
+      String(node.props.className ?? '').includes('wb-session-row-action is-terminal'))).toHaveLength(1);
+    act(() => touch.unmount());
+  });
+
+  it('外部 Riff 终端在触屏下保持原地址：能力凭证对别的 origin 无效', async () => {
+    setTouchEnvironment(true);
+    const { renderer, viewLinkCalls } = await renderDock({
+      session: { riffAccessUrl: 'https://riff.example/terminal/abc' },
+    });
+
+    expect(viewLinkCalls).toEqual([]);
+    expect(actionLinks(renderer)[0].props.href).toBe('https://riff.example/terminal/abc');
+    act(() => renderer.unmount());
+  });
+});
+
+describe('折叠会话栏：任何视口都有回来的路（P1-18）', () => {
+  function collapsedStorage(): MemoryStorage {
+    const storage = new MemoryStorage();
+    // 用户在宽屏收起过列表，这份偏好是窗口级的，重开页面照旧生效。
+    storage.setItem(RAIL_PREFS_KEY, JSON.stringify({ railWidth: 280, railCollapsed: true }));
+    return storage;
+  }
+
+  async function renderAt(viewportWidth: number, storage: WorkbenchStorage): Promise<TestRenderer.ReactTestRenderer> {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
+        ...railViewProps(storage),
+        viewportWidth,
+      }));
+    });
+    return renderer;
+  }
+
+  function expandButtons(renderer: TestRenderer.ReactTestRenderer): ReactTestInstance[] {
+    return renderer.root.findAll(node =>
+      node.type === 'button' && node.props['aria-label'] === '展开会话列表');
+  }
+
+  // 620–1279 这两档正是死路发生的地方：以前它们沿用持久化的 collapsed，却不渲染
+  // 折叠开关，页面只剩一条点不动的窄条。
+  for (const width of [900, 1180, 1440]) {
+    it(`${width}px 视口带着收起偏好打开，仍能展开并选到会话`, async () => {
+      const renderer = await renderAt(width, collapsedStorage());
+
+      // 收起态本身保留（那是用户的选择），但必须带着一个真按钮，而不是一块死掉的 div。
+      expect(renderer.root.findAllByProps({ className: 'wb-rail-expand' })
+        .filter(node => node.type === 'div')).toHaveLength(0);
+      const expand = expandButtons(renderer);
+      expect(expand).toHaveLength(1);
+      // 收起时列表整个不在 DOM 里，所以此刻一行都选不了——这正是死路的形状。
+      expect(renderer.root.findAll(node => node.props.role === 'option')).toHaveLength(0);
+
+      await act(async () => { expand[0].props.onClick(); });
+
+      const options = renderer.root.findAll(node => node.props.role === 'option');
+      expect(options.length).toBeGreaterThan(0);
+      await act(async () => {
+        options.find(option => String(option.props['aria-label']).includes('session 1'))!.props.onClick();
+      });
+      expect(renderer.root.findAll(node =>
+        String(node.props['aria-label']).includes('工作台 — Full title for session 1'))).toHaveLength(1);
+      act(() => renderer.unmount());
+    });
+  }
+
+  it('中等视口里收起/展开是同一个开关，来回都走得通', async () => {
+    const renderer = await renderAt(900, collapsedStorage());
+    await act(async () => { expandButtons(renderer)[0].props.onClick(); });
+
+    // 展开后收起按钮就位：中等视口不再是「只能进不能出」。
+    const collapse = renderer.root.findAll(node =>
+      node.type === 'button' && node.props['aria-label'] === '收起会话列表');
+    expect(collapse).toHaveLength(1);
+    await act(async () => { collapse[0].props.onClick(); });
+    expect(expandButtons(renderer)).toHaveLength(1);
+    act(() => renderer.unmount());
+  });
+
+  it('手机档（<620）不受收起偏好影响：列表就是首页', async () => {
+    const renderer = await renderAt(390, collapsedStorage());
+    expect(renderer.root.findAllByProps({ className: 'wb-rail-expand' })).toHaveLength(0);
+    expect(renderer.root.findAll(node => node.props.role === 'option').length).toBeGreaterThan(0);
+    act(() => renderer.unmount());
+  });
+});

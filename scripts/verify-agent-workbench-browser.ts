@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { constants } from 'node:fs';
-import { access, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
-import { chromium, type BrowserContext, type Page } from 'playwright';
+import { chromium, devices, type BrowserContext, type Page } from 'playwright';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   DASHBOARD_H5_CLIENT_TIMEOUT_MS,
@@ -28,6 +28,12 @@ import {
   verifyPreviewContentCapability,
 } from '../src/dashboard/preview-content-capability.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
+import {
+  centralViewLinkPath,
+  mintTerminalViewCapability,
+  terminalViewCapabilityAuthSession,
+  upstreamWorkerViewGeneration,
+} from '../src/dashboard/terminal-view-capability.js';
 import { resolvePreviewPortOwner } from '../src/core/preview-port-owner.js';
 import { isPreviewPort, probeSessionPreviewTarget } from '../src/core/session-preview.js';
 import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/control-audit.js';
@@ -35,6 +41,9 @@ import type { ControlAuditRecord, ControlAuditSink } from '../src/dashboard/cont
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const fixturePath = join(root, 'scripts', 'fixtures', 'agent-workbench-browser.tsx');
 const resultPath = join(root, 'docs', 'assets', 'agent-workbench-browser-results.json');
+/** 自验收截图落在仓库外：它们是每次跑出来的证据，不是需要版本化的资产。
+ *  用 BOTMUX_WORKBENCH_SHOT_DIR 可以指到别处。 */
+const shotDir = process.env.BOTMUX_WORKBENCH_SHOT_DIR?.trim() || join(tmpdir(), 'botmux-workbench-shots');
 const pageHtml = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Workbench browser harness</title><link rel="stylesheet" href="/style.css"><style>html,body,#root{width:100%;height:100%;margin:0;overflow:hidden}</style></head><body><div id="root"></div><script type="module" src="/fixture.js"></script></body></html>';
 const terminalHtml = '<!doctype html><html><body style="margin:0;background:#070a0e;color:#d8e2ed;font:13px monospace;padding:16px">LOCAL TERMINAL · READ/CONTROL CONTRACT</body></html>';
 const previewHtml = '<!doctype html><html><body style="margin:0;background:#101722;color:#d8e2ed;font:14px system-ui;padding:18px"><h1>Local preview target</h1><p id="preview-ready">HTTP and WebSocket preview harness is ready.</p></body></html>';
@@ -102,8 +111,17 @@ function requestActor(req: IncomingMessage, h5Identity: DashboardAuthIdentity | 
 
 const audit = new MemoryAudit();
 let previewNow = Date.now();
+const controlSecret = 'local-browser-control-secret-not-a-real-credential';
+/** Worker boot generation for the minted view capabilities. The real daemon
+ *  derives it from the worker's per-boot card token; the harness feeds the same
+ *  helper a synthetic upstream URL so the token shape is identical. */
+const viewGeneration = upstreamWorkerViewGeneration(
+  controlSecret,
+  'http://127.0.0.1:1/?viewToken=local-browser-boot-token',
+);
+if (!viewGeneration) throw new Error('unable to derive a worker view generation for the harness');
 const terminalControl = new TerminalControlManager({
-  secret: 'local-browser-control-secret-not-a-real-credential',
+  secret: controlSecret,
   audit,
   ttlMs: 60_000,
   now: () => previewNow,
@@ -257,6 +275,18 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     });
   }
 
+  // 短时 viewToken 只读能力（P1-5）。终端面板和会话坞的触屏路径都靠它：iOS WebView
+  // 发 WebSocket 升级时不带 Cookie，凭证必须能放进 URL 查询参数里。
+  const viewLinkMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/view-link$/);
+  if (req.method === 'GET' && viewLinkMatch) {
+    if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
+    const sessionId = decodeURIComponent(viewLinkMatch[1]);
+    const minted = mintTerminalViewCapability(controlSecret, sessionId, requestIdentity, viewGeneration, previewNow);
+    const link = minted ? centralViewLinkPath(sessionId, minted.token) : null;
+    if (!minted || !link) return json(res, 503, { ok: false, error: 'terminal_unavailable' });
+    return json(res, 200, { ok: true, url: link, expiresAt: minted.expiresAt });
+  }
+
   const controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
   if (controlMatch) {
     if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
@@ -316,9 +346,19 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
   if (await previewProxy.handleHttp(req, res, url)) return;
 
   if (url.pathname.startsWith('/s/')) {
-    if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
+    // 两条鉴权路，和真实前置代理同构：Cookie（桌面）或 ?viewToken=（触屏 / 无 Cookie
+    // 的 WebView）。后者是 P1-17 的关键——请求里连 Cookie 都没有也必须放行，否则手机
+    // 上点开终端就是一片 403 空白。
+    const sessionId = decodeURIComponent(url.pathname.slice('/s/'.length).replace(/\/+$/, ''));
+    const grantedAuthSession = terminalViewCapabilityAuthSession(
+      controlSecret,
+      sessionId,
+      url.searchParams.get('viewToken'),
+      previewNow,
+    );
+    if (!grantedAuthSession && !requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(terminalHtml);
+    res.end(grantedAuthSession ? terminalHtml.replace('READ/CONTROL CONTRACT', 'READ-ONLY VIEW CAPABILITY') : terminalHtml);
     return;
   }
 
@@ -361,6 +401,8 @@ const browser = await chromium.launch({
   headless: true,
   ...(browserPath ? { executablePath: browserPath } : {}),
 });
+
+await mkdir(shotDir, { recursive: true });
 
 type ScenarioResult = { ok: true; durationMs: number };
 const scenarioResults: Record<string, ScenarioResult> = {};
@@ -548,6 +590,112 @@ try {
     await sidebar.close();
   });
 
+  // P1-17：会话坞的终端链接在真触屏环境下必须是 viewToken 只读通道。
+  // 以前这里永远发裸的同源 /s/<id>，iOS WebView 的 WS 升级不带 Cookie，点开就是空白。
+  // 这条用真机 profile（hasTouch + isMobile）跑，不是只把 viewport 改窄。
+  await scenario('dock_touch_view_token', async () => {
+    const context = await browser.newContext({ ...devices['iPhone 13'] });
+    await context.addInitScript({ content: 'globalThis.__name = (target) => target;' });
+    await context.addCookies([{ name: 'dashboard', value: 'ok', url: base, httpOnly: true, sameSite: 'Lax' }]);
+    const page = await context.newPage();
+    await page.goto(`${base}/?surface=dock&scenario=success`);
+    await page.locator('.agent-workbench-dock').waitFor();
+    const environment = await page.evaluate(() => ({
+      hoverNone: matchMedia('(hover: none)').matches,
+      touchPoints: navigator.maxTouchPoints,
+    }));
+    assert.ok(
+      environment.hoverNone || environment.touchPoints > 0,
+      `iPhone profile must read as a touch environment: ${JSON.stringify(environment)}`,
+    );
+
+    const terminal = page.getByRole('link', { name: '终端链接' });
+    await terminal.waitFor();
+    const href = await terminal.getAttribute('href') ?? '';
+    assert.ok(href.includes('viewToken='), `dock terminal link must carry a viewToken: ${href}`);
+    assert.equal(new URL(href, base).origin, new URL(base).origin);
+    // 指尖目标（P1-17）：坞里的动作格子在触屏下至少 44px。
+    const box = await terminal.boundingBox();
+    assert.ok(box && box.height >= 44, `dock action target below 44px: ${JSON.stringify(box)}`);
+    await page.screenshot({ path: join(shotDir, 'dock-touch-iphone13.png') });
+
+    // 决定性的一步：把这条链接拿到一个**完全没有 Cookie**的上下文里打开——iOS WebView
+    // 发 WS 时正是这个处境。带 viewToken 的开得出来，裸 /s/<id> 只会 401。
+    const cookieless = await localContext({ width: 390, height: 844 });
+    const opened = await cookieless.newPage();
+    const granted = await opened.goto(new URL(href, base).toString());
+    assert.equal(granted?.status(), 200);
+    await opened.getByText('READ-ONLY VIEW CAPABILITY').waitFor();
+    await opened.screenshot({ path: join(shotDir, 'dock-touch-terminal-cookieless.png') });
+    const bare = await opened.goto(`${base}/s/browser-success`);
+    assert.equal(bare?.status(), 401);
+    await cookieless.close();
+    await context.close();
+  });
+
+  // 宽屏触屏（iPad 横屏）以前两头落空：44px 只写在 max-width: 620px 里。
+  await scenario('wide_touch_targets', async () => {
+    const context = await browser.newContext({
+      viewport: { width: 1194, height: 834 },
+      deviceScaleFactor: 2,
+      hasTouch: true,
+      isMobile: true,
+    });
+    await context.addInitScript({ content: 'globalThis.__name = (target) => target;' });
+    await context.addCookies([{ name: 'dashboard', value: 'ok', url: base, httpOnly: true, sameSite: 'Lax' }]);
+    const page = await context.newPage();
+    await page.goto(`${base}/?scenario=success`);
+    await page.locator('.wb-session-list').waitFor();
+    const metrics = await page.evaluate(() => {
+      const action = document.querySelector('.wb-session-row-action');
+      const style = action ? getComputedStyle(action) : null;
+      return {
+        hoverNone: matchMedia('(hover: none)').matches,
+        width: style ? Number.parseFloat(style.width) : 0,
+        height: style ? Number.parseFloat(style.height) : 0,
+      };
+    });
+    assert.ok(metrics.hoverNone, 'wide touch context must report (hover: none)');
+    assert.ok(metrics.width >= 44 && metrics.height >= 44, `row action below 44px: ${JSON.stringify(metrics)}`);
+    // 触屏下行内「接管」整体不渲染：那条通道只读（P1-17）。
+    assert.equal(await page.locator('.wb-session-row-action.is-terminal-control').count(), 0);
+    assert.ok(await page.locator('.wb-session-row-action.is-terminal').count() > 0);
+    await page.screenshot({ path: join(shotDir, 'wide-touch-ipad.png') });
+    await context.close();
+  });
+
+  // P1-18：带着「宽屏收起过列表」的持久化偏好，在三档视口都要能把列表叫回来并选到会话。
+  await scenario('rail_collapsed_recovery', async () => {
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 900, height: 800 }, { width: 390, height: 844 }]) {
+      const context = await authenticatedContext(viewport);
+      await context.addInitScript({
+        content: `try { localStorage.setItem('botmux.agent-workbench.rail.v1', JSON.stringify({ railWidth: 280, railCollapsed: true })); } catch {}`,
+      });
+      const page = await context.newPage();
+      await page.goto(`${base}/?scenario=success`);
+      await page.locator('.agent-workbench-page').waitFor();
+      if (viewport.width >= 620) {
+        // 收起态下列表整个不在 DOM 里——这正是死路的形状：一条点不动的窄条。
+        assert.equal(await page.getByRole('option').count(), 0, `${viewport.width}px: list must start collapsed`);
+        const expand = page.getByRole('button', { name: '展开会话列表' });
+        await expand.waitFor();
+        await page.screenshot({ path: join(shotDir, `rail-collapsed-${viewport.width}.png`) });
+        await expand.click();
+        await page.locator('.wb-session-list').waitFor();
+        await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+        await page.locator('.wb-workspace-title strong')
+          .filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
+      } else {
+        // 手机档是单列下钻，收起偏好本来就不该生效。
+        assert.equal(await page.locator('.wb-rail-expand').count(), 0);
+        await page.getByRole('option', { name: /Integrated Workbench browser scenario/ }).click();
+        await page.locator('.wb-mobile-detail').waitFor();
+      }
+      await page.screenshot({ path: join(shotDir, `rail-recovered-${viewport.width}.png`) });
+      await context.close();
+    }
+  });
+
   // 网页预览面板如今只在窄屏的「网页」页签下存在——桌面工作区只承载终端。
   // 交互解锁/回锁这条契约因此整体搬到移动视口来验。
   await scenario('mobile_preview_interaction', async () => {
@@ -672,7 +820,8 @@ try {
   const output = {
     ok: true,
     browser: browserPath ? 'local executable' : 'Playwright managed Chromium',
-    viewportCoverage: ['1440x900', '1280x800', '390x844', '375x800'],
+    viewportCoverage: ['1440x900', '1280x800', '1194x834 (touch)', '900x800', '390x844 (iPhone 13 profile)', '375x800'],
+    screenshots: shotDir,
     scenarios: scenarioResults,
   };
   await writeFile(resultPath, `${JSON.stringify(output, null, 2)}\n`);
