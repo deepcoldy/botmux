@@ -14614,19 +14614,37 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
     });
 
     wss.on('connection', (ws, req: IncomingMessage) => {
-      wsClients.add(ws);
-
-      // Read access was already checked before the WebSocket handshake. Resolve
-      // again here only to decide whether this client may write.
+      // P1-3 — the pre-handshake verdict is a SNAPSHOT, and this callback runs
+      // strictly after it: ws only completes the upgrade once verifyClient
+      // called back, and re-resolving access here re-reads `.dashboard-secret`
+      // synchronously. A capability whose expiry — or the worker generation it
+      // is pinned to, or the host secret it is signed under — turns over inside
+      // that window was authorized by the FIRST check and is already dead by
+      // this one. This callback used to recompute `access` but consume only
+      // `hasWrite`, so such a socket was registered in `wsClients`, seeded with
+      // the terminal scrollback, and — the second resolution carrying no
+      // controlExpiresAt — never given an expiry timer at all: an unbounded
+      // read-only stream outliving its own credential.
+      //
+      // FAIL CLOSED on the SECOND result instead. A socket that no longer
+      // resolves to read authority is closed before any registration, so it
+      // never joins a broadcast set and never receives the history seed; and
+      // the expiry timer below is armed from THIS resolution's expiresAt —
+      // never inherited from the handshake and never skipped.
       const url = parseWorkerRequestUrl(req);
       if (!url) {
         log(`Bad worker WS URL rejected: ${JSON.stringify(req.url ?? '')}`);
-        wsClients.delete(ws);
         ws.close(1008, 'Bad Request');
         return;
       }
       const access = resolveTerminalAccessForReq(req, url);
-      const { hasWrite, auditUser, controlExpiresAt } = access;
+      const { hasRead, hasWrite, auditUser, controlExpiresAt } = access;
+      if (!hasRead || (controlExpiresAt !== undefined && controlExpiresAt <= Date.now())) {
+        log('WS client refused at the connection re-check: capability no longer valid');
+        ws.close(4003, 'authorization expired');
+        return;
+      }
+      wsClients.add(ws);
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);

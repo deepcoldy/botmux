@@ -91,11 +91,12 @@ function waitForReady(child: ChildProcess, logs: string[]): Promise<Extract<Work
   });
 }
 
-function rawWsHandshake(port: number, path: string): Promise<string> {
+function rawWsHandshake(port: number, path: string, headers: Record<string, string> = {}): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
+    const extra = Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('');
     const socket = connect(port, '127.0.0.1', () => {
       socket.write(
-        `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n`
+        `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n${extra}`
         + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
         + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
       );
@@ -588,4 +589,191 @@ setInterval(() => {}, 1_000);
 
     second.child.send({ type: 'close' } satisfies DaemonToWorker);
   }, 45_000);
+
+  // ── P1-3：握手前放行 ≠ 登记那一刻仍然有效 ────────────────────────────────────
+  //
+  // verifyClient 和 connection 回调之间隔着一次真实的、同步的 `.dashboard-secret`
+  // 读：ws 先等 verifyClient 回调，再 completeUpgrade 写 101，再 emit('connection')，
+  // 而 connection 里重算 access 会把那个文件重新读一遍。能力的到期时刻正好落进这条缝
+  // 时，旧实现照样把 socket 登记进 wsClients、把终端 scrollback 直接喂过去，而第二次
+  // 解析已经拿不到 controlExpiresAt，于是这条只读连接连到期 timer 都没有——一条永不
+  // 过期的窥屏通道，中央前门再怎么撤销也够不着它。
+  //
+  // 这条缝的宽度就等于那次同步文件读：本地 SSD 上 ~0.1ms，$HOME 挂在慢盘/NFS 上就是
+  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。测试把 secret 文件用空白撑大来
+  // 复现慢 HOME 的时序：loadDashboardSecret 读完就 trim，secret 值一个字节没变，生产
+  // 代码一行没动，只是把这条本来就存在的缝拉宽到可稳定观测。
+  it('P1-3: a view capability that dies inside the WS handshake is refused at the connection re-check', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-ws-handshake-race-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const secret = 'integration-ws-handshake-race-secret';
+    const botmuxDir = join(root, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true });
+    writeFileSync(
+      join(botmuxDir, '.dashboard-secret'),
+      `${secret}${' '.repeat(32 * 1024 * 1024)}`,
+      { mode: 0o600 },
+    );
+
+    // 让 scrollback 非空。socket 一旦被登记，worker 会立刻把这段历史种子推过去，于是
+    // 「有没有被登记」在客户端侧是直接可观测的事实，不用去断言 worker 的内部集合。
+    const seedMarker = 'BOTMUX_SCROLLBACK_SEED_MARKER';
+    const fakeCli = join(root, 'fake-claude');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdout.write(${JSON.stringify(seedMarker)} + '\\r\\n');
+process.stdin.setRawMode?.(true);
+process.stdin.resume();
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const logs: string[] = [];
+    const sessionId = 'ws-handshake-race-session';
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_ws_race',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_ws_race',
+      rootMessageId: 'om_ws_race',
+      workingDir: dataDir,
+      cliId: 'claude-code',
+      cliPathOverride: fakeCli,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_ws_race',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    const ready = await waitForReady(child, logs);
+    const base = `http://127.0.0.1:${ready.port}`;
+    const boot = ready.viewToken!;
+
+    interface ViewSocketAttempt {
+      kind: 'refused' | 'closed' | 'alive';
+      code?: number;
+      reason?: string;
+      /** 服务端主动推过来的字节（历史种子就走这条路）。 */
+      received: string;
+    }
+
+    /** 走真实握手开一条 view WS，看它最终是被拒、被关，还是活过了自己的有效期。 */
+    const openViewSocket = (capability: string, waitMs: number): Promise<ViewSocketAttempt> => (
+      new Promise(resolveAttempt => {
+        const socket = new WebSocket(
+          `ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(capability)}`,
+          { headers: centralForwardHeaders(secret, capability) },
+        );
+        const chunks: string[] = [];
+        let opened = false;
+        let settled = false;
+        let deadline: NodeJS.Timeout | undefined;
+        const settle = (attempt: Omit<ViewSocketAttempt, 'received'>): void => {
+          if (settled) return;
+          settled = true;
+          if (deadline) clearTimeout(deadline);
+          socket.removeAllListeners();
+          try { socket.terminate(); } catch { /* already gone */ }
+          resolveAttempt({ ...attempt, received: chunks.join('') });
+        };
+        deadline = setTimeout(() => settle({ kind: opened ? 'alive' : 'refused' }), waitMs);
+        socket.on('message', data => chunks.push(data.toString()));
+        socket.on('open', () => { opened = true; });
+        socket.on('error', () => { if (!opened) settle({ kind: 'refused' }); });
+        socket.on('close', (code, reason) => settle(opened
+          ? { kind: 'closed', code, reason: reason.toString() }
+          : { kind: 'refused' }));
+      })
+    );
+
+    // 对照组，同时也是页缓存预热：一条两次校验都过的正常能力照常放行、照常拿到历史
+    // 种子，并且由第二次解析算出的 expiresAt timer 到点关掉（4003 / view expired）。
+    const liveTtlMs = 1_500;
+    const liveCapability = centralViewCapability(secret, sessionId, boot, {
+      issuedAt: Date.now(), expiresAt: Date.now() + liveTtlMs,
+    });
+    const liveStart = Date.now();
+    const live = await openViewSocket(liveCapability, liveTtlMs + 5_000);
+    expect(live.kind).toBe('closed');
+    expect(live.code).toBe(4003);
+    expect(live.reason).toBe('view expired');
+    expect(live.received).toContain(seedMarker);
+    expect(Date.now() - liveStart).toBeGreaterThanOrEqual(liveTtlMs - 300);
+
+    // 量一次 access 解析在这台机器上到底多贵——这个数值就是那条缝的宽度：
+    // 握手前那次校验发生在「一次解析之后」，connection 里那次发生在「两次解析之后」。
+    const probeCapability = centralViewCapability(secret, sessionId, boot, {
+      issuedAt: Date.now(), expiresAt: Date.now() + 60_000,
+    });
+    const probeStart = Date.now();
+    const probe = await fetch(`${base}/?viewToken=${encodeURIComponent(probeCapability)}`, {
+      headers: centralForwardHeaders(secret, probeCapability),
+    });
+    const oneResolveMs = Date.now() - probeStart;
+    expect(probe.status).toBe(200);
+    // 慢 HOME 复现必须真的生效，否则这条缝窄到根本量不出来，后面的扫描就成了空跑。
+    expect(oneResolveMs).toBeGreaterThan(20);
+
+    // 把到期时刻扫过 (第一次校验, 第二次校验] 这段区间。
+    const attempts: ViewSocketAttempt[] = [];
+    for (const factor of [1.15, 1.3, 1.45, 1.6, 1.75, 1.9, 1.45, 1.6]) {
+      const ttlMs = Math.max(2, Math.round(oneResolveMs * factor));
+      const capability = centralViewCapability(secret, sessionId, boot, {
+        issuedAt: Date.now(), expiresAt: Date.now() + ttlMs,
+      });
+      attempts.push(await openViewSocket(capability, ttlMs + 900));
+    }
+
+    // 1) 没有任何一条 socket 活过自己能力的有效期。旧实现里跨缝那条既没被拒也没有
+    //    timer，会一直活着——这一条就是本项的红线。
+    expect(attempts.filter(attempt => attempt.kind === 'alive')).toEqual([]);
+    // 2) 这一轮确实撞进了缝：至少有一条是被 connection 二次校验 fail closed 掉的，
+    //    而不是被握手前那次拦掉（refused）、也不是靠到期 timer 兜底（view expired）。
+    //    没撞进去就说明这个测试根本没测到东西，所以它必须响，不能默默变绿。
+    const refusedAtRecheck = attempts.filter(attempt => (
+      attempt.kind === 'closed' && attempt.reason === 'authorization expired'
+    ));
+    expect(refusedAtRecheck.length).toBeGreaterThan(0);
+    expect(refusedAtRecheck.every(attempt => attempt.code === 4003)).toBe(true);
+    // 3) 被二次校验拒掉的 socket 压根没进 wsClients，所以一个字节的终端历史都没拿到。
+    for (const attempt of refusedAtRecheck) expect(attempt.received).toBe('');
+
+    // worker 重启语义：钉在上一代 worker 上的能力连握手都过不去，压根到不了
+    // connection——二次校验是补上的那道闸，不是把前一道闸放松的借口。
+    const staleGeneration = centralViewCapability(secret, sessionId, boot, {
+      issuedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      generation: deriveWorkerViewGeneration(secret, 'previous-boot-view-token')!,
+    });
+    expect(await rawWsHandshake(
+      ready.port,
+      `/?viewToken=${encodeURIComponent(staleGeneration)}`,
+      centralForwardHeaders(secret, staleGeneration),
+    )).toContain('403 Forbidden');
+    // 同代、同会签的能力照常 101——上面那条 403 是 generation 造成的，不是会签或别的。
+    const currentGeneration = centralViewCapability(secret, sessionId, boot, {
+      issuedAt: Date.now(), expiresAt: Date.now() + 60_000,
+    });
+    expect(await rawWsHandshake(
+      ready.port,
+      `/?viewToken=${encodeURIComponent(currentGeneration)}`,
+      centralForwardHeaders(secret, currentGeneration),
+    )).toContain('101 Switching Protocols');
+
+    child.send({ type: 'close' } satisfies DaemonToWorker);
+  }, 90_000);
 });
