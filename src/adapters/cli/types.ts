@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput } from '../../types.js';
+import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -57,6 +57,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
 }

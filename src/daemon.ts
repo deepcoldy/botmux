@@ -110,13 +110,26 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { CliTurnPayload, Session, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
+import type { CliTurnPayload, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+
+function trustedCallerForTurn(
+  larkAppId: string,
+  senderOpenId?: string,
+  senderUnionId?: string,
+): TrustedCaller | undefined {
+  if (!senderOpenId && !senderUnionId) return undefined;
+  return {
+    ...(senderOpenId ? { requestUserOpenId: senderOpenId } : {}),
+    ...(senderUnionId ? { requestUserUnionId: senderUnionId } : {}),
+    requestLarkAppId: larkAppId,
+  };
+}
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import {
@@ -16478,12 +16491,13 @@ export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitte
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[], trustedCaller?: TrustedCaller): void {
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
+  if (trustedCaller) input.trustedCaller = trustedCaller;
   rememberLastCliInput(ds, userPrompt, input);
   const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
-  forkWorker(ds, input, turnId ? { turnId } : false);
+  forkWorker(ds, input, turnId ? { turnId, trustedCaller } : false);
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
   // still set. forkWorker materializes the exact opening as a tokened
@@ -17181,6 +17195,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
+  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId);
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
   // union_id 报成"自家 bot"，那个真人就会在全团队机器上被当队友 bot 放行（talk +
@@ -17808,7 +17823,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    forkReservedInitialSession(ds, availableBots, trustedCaller);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -17859,7 +17874,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    forkReservedInitialSession(ds, availableBots, trustedCaller);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -18555,6 +18570,7 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
+  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId);
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -19512,7 +19528,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
@@ -19551,7 +19567,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
     }
 
     return;
@@ -19646,7 +19662,10 @@ async function handleThreadReplyAdmitted(
     let accepted = false;
     try {
       accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
-        codexAppSteerable ? { codexAppSteerable: true } : {});
+        {
+          ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+        });
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
       // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
@@ -19736,6 +19755,7 @@ async function handleThreadReplyAdmitted(
         // the live-worker path (admission computed once at line ~18431; COPIED
         // here, never re-inferred). System/recovery openings keep it absent.
         if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
+        if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
         admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: currentFollowUp,
@@ -19771,6 +19791,9 @@ async function handleThreadReplyAdmitted(
             resume: ds.session.queuedActivationResume ?? ds.hasHistory,
             turnId: ds.session.queuedActivationTurnId,
             dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+            ...(ds.session.queuedActivationInput?.trustedCaller
+              ? { trustedCaller: ds.session.queuedActivationInput.trustedCaller }
+              : {}),
           },
         );
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
@@ -19795,6 +19818,7 @@ async function handleThreadReplyAdmitted(
           resume: ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,
           dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          ...(retainedQueuedActivation.trustedCaller ? { trustedCaller: retainedQueuedActivation.trustedCaller } : {}),
         });
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
@@ -19925,6 +19949,9 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
           wrappedInput.codexAppSteerable = true;
         }
+        if (threadTrustedCaller && !queuedHasDurableTail) {
+          wrappedInput.trustedCaller = threadTrustedCaller;
+        }
         reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
@@ -19932,6 +19959,7 @@ async function handleThreadReplyAdmitted(
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
+          ...(wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {}),
         });
       }
     } catch (e) {

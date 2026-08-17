@@ -217,6 +217,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // not); the host-side daily monitor reports newer versions to the owner.
         '-c',
         'check_for_update_on_startup=false',
+        '-c',
+        'mcp_servers.platform-ksher-agent-data-mcp.command="botmux"',
+        '-c',
+        'mcp_servers.platform-ksher-agent-data-mcp.args=["mcp-identity-proxy","data-agent"]',
       ];
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by

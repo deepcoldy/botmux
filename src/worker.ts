@@ -15,6 +15,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { clearTrustedTurnFile, trustedTurnFilePath, writeTrustedTurnFile } from './utils/trusted-turn-store.js';
 import { join, basename, dirname, delimiter } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -1862,6 +1863,23 @@ function ensureZellijAttachConfig(): string {
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let closeRequested = false;
+function trustedTurnFileForSession(): string | undefined {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
+  return trustedTurnFilePath(process.env.SESSION_DATA_DIR, sessionId);
+}
+function publishTrustedTurn(trustedCaller?: import('./types.js').TrustedCaller, turnId?: string): void {
+  const filePath = trustedTurnFileForSession();
+  if (!trustedCaller) {
+    clearTrustedTurnFile(filePath);
+    return;
+  }
+  if (!filePath) return;
+  try {
+    writeTrustedTurnFile(filePath, { sessionId, turnId, trustedCaller });
+  } catch (err: any) {
+    log(`Failed to publish trusted turn identity: ${err?.message ?? err}`);
+  }
+}
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
  *  持久化。仅有写权限的 dashboard 视图可见。 */
@@ -10131,6 +10149,7 @@ async function flushPending(): Promise<void> {
         currentBotmuxTurnId = item.turnId;
         currentBotmuxDispatchAttempt = item.dispatchAttempt;
         currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
+        publishTrustedTurn(item.trustedCaller, item.turnId);
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
         // this input is known not to have started and must not leave a latch
@@ -10321,7 +10340,11 @@ async function flushPending(): Promise<void> {
               adapterInputHandle(writeBackend),
               msg,
               item.codexAppInput!,
-              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
+              {
+                turnId: item.turnId,
+                ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+                ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+              },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -10335,7 +10358,11 @@ async function flushPending(): Promise<void> {
             () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
-              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
+              {
+                turnId: item.turnId,
+                ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+                ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+              },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -10654,6 +10681,7 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       if (shouldStopPendingBatch(item, pendingMessages[0])) break;
     }
   } finally {
@@ -10679,6 +10707,7 @@ function sendToPty(
     codexAppSteerable?: true;
     queuedActivationToken?: string;
     replyTurnId?: string;
+    trustedCaller?: import('./types.js').TrustedCaller;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
     /** At-most-once (idempotency lease): tag this keyed input so a CLI exit never
      *  replays it onto the auto-restarted CLI — excluded from BOTH the inflight
@@ -10696,6 +10725,7 @@ function sendToPty(
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
+    ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -12509,6 +12539,9 @@ async function spawnCli(
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.
   childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
+  const trustedFile = trustedTurnFileForSession();
+  if (trustedFile) childEnv.BOTMUX_TRUSTED_TURN_FILE = trustedFile;
+  else delete childEnv.BOTMUX_TRUSTED_TURN_FILE;
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
@@ -12929,6 +12962,15 @@ async function spawnCli(
         mcpRuntimeManifest,
         config.session.dataDir,
       ).map(canonical));
+    }
+    mandatoryDenyPaths.push(
+      canonical(join(userInfo().homedir, '.config', 'ksher-agent-data-mcp')),
+      canonical(join(userInfo().homedir, '.cache', 'ksher-agent-data-mcp')),
+      canonical(join(dataDir, 'trusted-turns')),
+    );
+    const currentTrustedTurnFile = trustedTurnFileForSession();
+    if (currentTrustedTurnFile) {
+      mandatoryReadOnlyPaths.push(canonical(currentTrustedTurnFile));
     }
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
@@ -15946,6 +15988,7 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
+      publishTrustedTurn(msg.trustedCaller, msg.turnId);
       refreshTerminalViewToken();
       refreshTerminalWriteToken();
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
@@ -16140,6 +16183,7 @@ process.on('message', async (raw: unknown) => {
                 : undefined),
             codexAppInput: entry.codexAppInput,
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
+            trustedCaller: msg.trustedCaller,
           }));
         let initialInputCommitted = false;
         if (shouldQueueInitialPrompt({
@@ -16167,6 +16211,7 @@ process.on('message', async (raw: unknown) => {
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+            trustedCaller: msg.trustedCaller,
             codexAppInput: msg.promptCodexAppInput,
             // Thread the root's steer authorization so ordered pre-final steer can
             // fold follow-ups into THIS turn (the runner's canSteer requires the
@@ -16335,6 +16380,7 @@ process.on('message', async (raw: unknown) => {
           codexAppDispatchId: msg.codexAppDispatchId,
           queuedActivationToken: msg.queuedActivationToken,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          trustedCaller: msg.trustedCaller,
           codexAppInput,
         };
         // process.on('message') does not serialize async listeners. Hold the
@@ -16364,6 +16410,7 @@ process.on('message', async (raw: unknown) => {
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          trustedCaller: msg.trustedCaller,
         });
         if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
         else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');

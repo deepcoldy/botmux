@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
@@ -15,6 +15,7 @@ export interface PendingCliInput {
   codexAppSteerable?: true;
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  trustedCaller?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
   /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
    *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and

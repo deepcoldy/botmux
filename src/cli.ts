@@ -99,6 +99,7 @@ import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorke
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
+import { runMetadataQuery, resolveMetadataQueryConfig } from './services/metadata-query.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -6939,6 +6940,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        --with-card-json 为每张卡片附原始结构化 JSON（消息均带 resources 附件 key）
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
+  metadata query "<sql>" [--json]
+                                       执行受控只读元数据查询；也兼容 --sql "<sql>"
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
@@ -10686,6 +10689,45 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
 }
 
+async function cmdMetadata(rest: string[]): Promise<void> {
+  const sub = (rest[0] ?? '').toLowerCase();
+  if (sub !== 'query') {
+    console.error('用法: botmux metadata query "<sql>" [--json]\n   或: botmux metadata query --sql "<sql>" [--json]');
+    process.exit(1);
+  }
+  const args = rest.slice(1);
+  const jsonOut = args.includes('--json');
+  const sqlFlagIdx = args.findIndex(arg => arg === '--sql' || arg.startsWith('--sql='));
+  let sql = '';
+  if (sqlFlagIdx >= 0) {
+    const sqlFlag = args[sqlFlagIdx];
+    sql = sqlFlag.startsWith('--sql=')
+      ? sqlFlag.slice('--sql='.length).trim()
+      : (args[sqlFlagIdx + 1] ?? '').trim();
+  } else {
+    sql = args.filter(arg => arg !== '--json').join(' ').trim();
+  }
+  if (!sql) {
+    console.error('缺少 SQL。用法: botmux metadata query "<sql>" [--json]\n   或: botmux metadata query --sql "<sql>" [--json]');
+    process.exit(1);
+  }
+
+  try {
+    const cfg = resolveMetadataQueryConfig();
+    const result = await runMetadataQuery(sql, cfg);
+    console.log(JSON.stringify({
+      success: true,
+      rowCount: result.rowCount,
+      rows: result.rows,
+      truncated: result.truncated,
+      ...(jsonOut ? { statistics: result.statistics } : {}),
+    }, null, jsonOut ? 2 : 0));
+  } catch (err: any) {
+    console.error(`metadata query failed: ${err?.message ?? String(err)}`);
+    process.exit(1);
+  }
+}
+
 /**
  * `botmux report` — delivery / progress report, then hand Review/progress/results
  * back to the stable recipient.
@@ -13319,6 +13361,29 @@ switch (command) {
     await runMcpGateway();
     break;
   }
+  case 'mcp-identity-proxy': {
+    const [target, sub] = process.argv.slice(3);
+    if (target !== 'data-agent') {
+      console.error('用法: botmux mcp-identity-proxy data-agent [diagnostics]');
+      process.exitCode = 2;
+      break;
+    }
+    const { getTrustedDataMcpProxyDiagnostics, runTrustedDataMcpProxy } = await import('./mcp/trusted-stdio-proxy.js');
+    if (sub === 'diagnostics' || sub === 'diagnose') {
+      console.log(JSON.stringify(getTrustedDataMcpProxyDiagnostics(), null, 2));
+      break;
+    }
+    if (sub) {
+      console.error('用法: botmux mcp-identity-proxy data-agent [diagnostics]');
+      process.exitCode = 2;
+      break;
+    }
+    await runTrustedDataMcpProxy();
+    break;
+  }
+  case 'metadata':
+    await cmdMetadata(process.argv.slice(3));
+    break;
   case 'hook': {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';

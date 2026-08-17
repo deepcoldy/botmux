@@ -270,6 +270,7 @@ import type {
   CodexAppTurnInput,
   FrozenSessionReplyTarget,
   DaemonToWorker,
+  TrustedCaller,
   WorkerToDaemon,
   Session,
   DisplayMode,
@@ -5703,6 +5704,7 @@ export function sendWorkerInput(
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
+    trustedCaller?: TrustedCaller;
   } = {},
 ): boolean {
   const riffRetirementPhase = riffRetirementAdmissionPhase(ds);
@@ -5773,6 +5775,7 @@ export function sendWorkerInput(
           // tail's frozen payload so promote/repark/restore COPY it verbatim
           // (admission computed once; never re-inferred downstream).
           ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
         },
         turnId: queuedTurnId,
         ...(opts.dispatchAttempt !== undefined
@@ -5832,6 +5835,7 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
@@ -5915,6 +5919,7 @@ export function promoteQueuedActivationTail(
     // queuedActivationInput so the ensuing fork/accept-ledger COPY (below) sees
     // it. Only `=== true`; a missing/false tail head stays forced-serial.
     ...(head.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+    ...(head.cliInput.trustedCaller ? { trustedCaller: head.cliInput.trustedCaller } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
 
@@ -5987,6 +5992,7 @@ export function promoteQueuedActivationTail(
       // ledger head steerable=true but the worker reservation false, so a
       // legitimate superseded settlement would be wrongly rejected.
       ...(exactInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+      ...(exactInput.trustedCaller ? { trustedCaller: exactInput.trustedCaller } : {}),
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
@@ -6051,6 +6057,7 @@ export function admitQueuedActivationTail(
       // (only `=== true`, never truthy). Dropping it here silently un-authorized
       // every queued/opening turn — the strip point that defeated the R4 fix.
       ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+      ...(entry.cliInput.trustedCaller ? { trustedCaller: entry.cliInput.trustedCaller } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -6095,6 +6102,7 @@ export type ForkResumeOrTurnId = boolean | string | {
    *  it on an auto-restarted CLI would violate at-most-once (codex #776 round-7
    *  finding #1). */
   atMostOnce?: boolean;
+  trustedCaller?: TrustedCaller;
 };
 
 /** Central quarantine decision for one fork boundary — the SINGLE authority that
@@ -6193,6 +6201,10 @@ export function forkWorker(
       const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.atMostOnce
         : undefined;
+      const gatedTrustedCaller = gatedPrompt.trustedCaller
+        ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+          ? resumeOrTurnId.trustedCaller
+          : undefined);
       sendWorkerInput(ds, promptInput, gatedTurnId, {
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
@@ -6208,6 +6220,7 @@ export function forkWorker(
         // terminalized the turn re-runs it. forkWorker's own init path sets this
         // from resumeOrTurnId.atMostOnce; the reroute must forward it identically.
         ...(gatedAtMostOnce ? { atMostOnce: true as const } : {}),
+        ...(gatedTrustedCaller ? { trustedCaller: gatedTrustedCaller } : {}),
       });
     } else {
       transferGate.needsWorker = true;
@@ -6280,6 +6293,10 @@ export function forkWorker(
   } else {
     resume = resumeOrTurnId;
   }
+  const initTrustedCaller = promptPayload.trustedCaller
+    ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+      ? resumeOrTurnId.trustedCaller
+      : undefined);
   if (ds.session.queuedActivationPending && ds.session.queuedActivationResume !== undefined) {
     resume = ds.session.queuedActivationResume;
   }
@@ -6308,6 +6325,7 @@ export function forkWorker(
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
           ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
+          ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
         },
         turnId,
         ...(initDispatchAttempt !== undefined
@@ -6328,6 +6346,7 @@ export function forkWorker(
       // opts too. The gate branch above already admits with the flag; this
       // sibling branch would otherwise silently downgrade true → false.
       ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
     });
     logger[routed ? 'info' : 'warn'](
       `[${tag(ds)}] ${routed ? 'Routed' : 'Failed to route'} double-fork prompt through existing durable owner`,
@@ -6927,6 +6946,7 @@ export function forkWorker(
     // worker tags the keyed init prompt no-replay (codex #776 round-7 #1).
     ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
+    ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'

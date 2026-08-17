@@ -87,6 +87,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
         undefined,
         context?.turnId,
         context?.codexAppSteerable,
+        context?.trustedCaller,
       );
     },
 
@@ -101,6 +102,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
         codexAppInput,
         context?.turnId,
         context?.codexAppSteerable,
+        context?.trustedCaller,
       );
     },
 
