@@ -1023,6 +1023,26 @@ describe('release re-checks emptiness BEFORE forgetting the tree (round-7 P1-1)'
         expect(hasUnprovenContainment('raced-sess', dataDir)).toBe(true);
     });
 
+    it('VETOES when rmdir refuses a non-zombie cgroup (member raced in after the recheck)', () => {
+        // The sub-ms TOCTOU (round-8 P2): the membership recheck read empty, but by
+        // the time rmdir runs a same-uid process has migrated in, so the kernel
+        // refuses to remove the now-non-empty cgroup. rmdir's refusal is the FINAL
+        // gate and must not be discarded. Modelled by a stray non-knob file that
+        // cgroupSubtreePids ignores (not a cgroup.procs, not a dir) but rmdir cannot
+        // remove — the same shape as "empty read, un-rmdir-able".
+        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-toctou-'));
+        const dir = mkdtempSync(join(tmpdir(), 'toctou-cgroup-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');   // membership recheck reads empty
+        writeFileSync(join(dir, 'intruder'), 'x');       // ...but rmdir will refuse
+        const handle: StrongContainmentHandle = {
+            kind: 'cgroup', sessionId: 'toctou-sess', generation: 1, cgroupPath: dir, nonce: 'n',
+        };
+        recordContainmentHandle(handle, dataDir);
+        const decision = releaseContainmentHandle({ proven: true, handle }, dataDir);
+        expect(decision.releaseAuthorised).toBe(false);
+        expect(hasUnprovenContainment('toctou-sess', dataDir)).toBe(true);
+    });
+
     it('RELEASES a zombie-only cgroup even when its directory cannot be removed', () => {
         // Zombie-only is genuinely quiescent (a zombie executes nothing) yet the
         // kernel refuses rmdir until the parent reaps it. That case must still

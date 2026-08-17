@@ -3245,9 +3245,11 @@ function SessionsPage(): React.JSX.Element {
     if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
     if (residualIds.length > 0) {
       // Fires even when nothing failed — otherwise an all-residual batch is
-      // entirely silent and the operator believes every remote session is gone.
-      alert(`⚠️ ${residualIds.length}/${ids.length} closed locally but their remote `
-        + `sessions were NOT cancelled (manual cleanup required): ${residualIds.join(', ')}`);
+      // entirely silent and the operator believes everything is gone. Kind-neutral
+      // (a batch can mix a surviving remote session and a local host subtree); each
+      // label already states which.
+      alert(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
+        + `requiring manual cleanup: ${residualIds.join(', ')}`);
     }
   }, [refresh, selected]);
 
@@ -3335,10 +3337,12 @@ function SessionsPage(): React.JSX.Element {
         .filter((item: any) => item?.ok && item?.residual)
         .map((item: any) => describeCloseResidual(item.residual));
       if (idleResiduals.length > 0) {
-        // "closed N, failed 0" would otherwise state that every remote session is
-        // gone, while some are still running with their injected credential.
-        alert(`⚠️ ${idleResiduals.length} session(s) closed locally but their remote `
-          + `sessions were NOT cancelled (manual cleanup required): ${idleResiduals.join(', ')}`);
+        // "closed N, failed 0" would otherwise state that everything is gone,
+        // while some rows left a residual (a remote session still running, or a
+        // local host subtree not proven terminated) needing manual cleanup.
+        // Kind-neutral: a batch can mix both, and each label already says which.
+        alert(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
+          + `requiring manual cleanup: ${idleResiduals.join(', ')}`);
       }
       refresh();
     } catch (e) {

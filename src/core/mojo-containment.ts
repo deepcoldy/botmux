@@ -1094,32 +1094,41 @@ export function releaseContainmentHandle(
         // The check keys off the kernel membership read, NOT rmdir success: the
         // knob-unlinking in rmdirCgroupTree is a test accommodation and must never
         // be what decides whether the tree is empty.
-        if (decision.evidence !== 'cgroup-zombie-only') {
+        const zombieOnly = decision.evidence === 'cgroup-zombie-only';
+        const vetoRelease = (reason: string, pids?: number[]): ContainmentReleaseDecision => {
+            logger.error(
+                `[mojo] session ${handle.sessionId}: release VETOED — ${reason} `
+                + `(${handle.cgroupPath}); keeping the handle and the device-isolation blocker`,
+            );
+            return {
+                boundaryProof: false,
+                releaseAuthorised: false,
+                evidence: decision.evidence,
+                residual: { deviceIsolation: true, pids, reason },
+                signalsStopped: true,
+            };
+        };
+        if (!zombieOnly) {
             const recheck = cgroupSubtreePids(handle.cgroupPath);
             const live = recheck.ok ? recheck.pids : [-1]; // unreadable → treat as populated
             if (live.length > 0) {
-                logger.error(
-                    `[mojo] session ${handle.sessionId}: release VETOED — cgroup ${handle.cgroupPath} `
-                    + `still has members (${recheck.ok ? live.join(',') : recheck.reason}); `
-                    + 'keeping the handle and the device-isolation blocker',
+                return vetoRelease(
+                    recheck.ok ? 'cgroup still has members (member raced back in)' : recheck.reason,
+                    recheck.ok ? live : undefined,
                 );
-                return {
-                    boundaryProof: false,
-                    releaseAuthorised: false,
-                    evidence: decision.evidence,
-                    residual: {
-                        deviceIsolation: true,
-                        pids: recheck.ok ? live : undefined,
-                        reason: 'cgroup not provably empty at release (member raced back in)',
-                    },
-                    signalsStopped: true,
-                };
             }
         }
-        // Empty (or zombie-only) is confirmed — reclaim the directory. rmdir is a
-        // last kernel-side check but no longer the gate; a failure here on the
-        // zombie-only path is expected and reported below.
-        rmdirCgroupTree(handle.cgroupPath);
+        // rmdir is the FINAL kernel-side gate, and its result is NOT discarded:
+        // between the membership recheck above and here is a sub-millisecond window
+        // in which a same-uid process could migrate in, after which the kernel
+        // refuses to remove the now-non-empty cgroup. For a non-zombie proof that
+        // refusal MEANS the tree is not empty → VETO rather than forget it. A
+        // zombie-only cgroup is expected to be un-rmdir-able until reaped, so its
+        // failure is tolerated (the handle is still released, dir reclaimed later).
+        const reclaimed = rmdirCgroupTree(handle.cgroupPath);
+        if (!reclaimed && !zombieOnly) {
+            return vetoRelease('cgroup could not be removed — a member raced in after the recheck');
+        }
     }
     const path = filePath(dataDir);
     mkdirSync(dirname(path), { recursive: true });

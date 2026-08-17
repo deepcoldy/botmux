@@ -392,13 +392,15 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
     return 'close_failed';
   }
   if (result.outcome === 'closed_with_residual') {
-    // A hot CLI/backend switch can hit an old mojo row carrying a parked lineage.
+    // A hot CLI/backend switch can hit an old mojo row carrying either a parked
+    // remote lineage OR a local host subtree that could not be proven terminated.
     // This path has no interactive surface, so the warning has to be loud in the
-    // log AND counted separately for whatever is showing the sweep total.
-    logger.warn(
-      `[${tag}] CLI mismatch close left an UNCANCELLED remote session `
-      + `(${result.residual.taskId}); manual cleanup required`,
-    );
+    // log AND counted separately for whatever is showing the sweep total. Kind-
+    // aware so a LOCAL residual is not logged as a phantom `(undefined)` remote id.
+    const r = result.residual;
+    logger.warn(r.taskId
+      ? `[${tag}] CLI mismatch close left an UNCANCELLED remote session (${r.taskId}); manual cleanup required`
+      : `[${tag}] CLI mismatch close left a local host subtree unproven (${r.reason}); manual cleanup required`);
     return 'closed_with_residual';
   }
   return 'closed';
