@@ -173,7 +173,10 @@ exit 0`);
 });
 
 describe('PROBE 2 — after generation replacement, the close must be honest about the old subtree', () => {
-    it('a REPLACEMENT backend terminates the inherited survivor before reporting success', async () => {
+    // Linux-only like PROBE 1: the fixture leaks a real setsid survivor and the
+    // wait conditions read the real /proc. The companion refusal case below stays
+    // cross-platform — its fake tree never leaves the mocked scan.
+    it.runIf(isLinux)('a REPLACEMENT backend terminates the inherited survivor before reporting success', async () => {
         // The originally reported hole. Generation 1 leaves a credentialed setsid
         // survivor. Generation 2 is a FRESH MojoBackend for the same session, so
         // `lastTurnPid` is null and nothing in memory reaches the old tree.
