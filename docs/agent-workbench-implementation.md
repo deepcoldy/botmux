@@ -236,14 +236,14 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 
 | 检查 | 结果 |
 |---|---|
-| pnpm build | 通过；domain audit、TypeScript、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：4543378f93d8（安全批 1 验收构建）。 |
+| pnpm build | 通过；domain audit、TypeScript、scripts 类型检查（`pnpm typecheck:scripts`，安全批 3 起接进构建链）、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：31f9b4146834（安全批 3 验收构建）。 |
 | pnpm exec tsc --noEmit / git diff --check | 通过。 |
 | Workbench 直接边界 | 16 files、262 tests 通过，覆盖 Workbench UI/模型/存储/路由、H5 auth、登录 UI、terminal control、preview 注册/代理与公开投影脱敏。 |
 | 纯模型 runner | 通过：320 sessions、22 virtual items；覆盖 rail-collapsed、focus、chat-jump、mobile-stack。 |
 | 组件 runner | 通过：21 component checks、14 rendered session options。 |
-| pnpm test 全量 unit project | 974 files / 15,882 tests 通过，1 file / 16 tests 按仓库既有条件跳过；0 failed（安全批 1 验收轮记录）。 |
+| pnpm test 全量 unit project | 978 files / 15,954 tests 通过，1 file / 16 tests 按仓库既有条件跳过（整文件跳过的是 `test/fs-policy-seatbelt.e2e.test.ts`，属 macOS seatbelt 专用）；0 failed（安全批 3 验收轮记录）。 |
 
-安全批 1 验收轮的全量命令为 `npx vitest run --project unit`（默认并行），全绿。此前轮次曾用 `pnpm test -- --maxWorkers=1 --no-file-parallelism` 串行执行：由于验证本身运行在活跃 Botmux workflow 内，进程发现类测试使用清空 BOTMUX 上下文的环境、私有 PID `/proc` 和独立 `TMUX_TMPDIR`，避免把外层同 UID worker 误当成 fixture；串行执行也消除了 `/proc` 瞬态并发噪声。两种跑法都属测试进程隔离，不会修改或重启 live daemon。
+安全批 1 至安全批 3 各验收轮的全量命令均为 `npx vitest run --project unit`（默认并行），全绿。安全批 3 轮次里 `test/workflow-v3-ephemeral-pool.test.ts`（22 例）与 `test/skill-doctor-command.test.ts`（3 例）都实测通过，与前两批结论一致。此前轮次曾用 `pnpm test -- --maxWorkers=1 --no-file-parallelism` 串行执行：由于验证本身运行在活跃 Botmux workflow 内，进程发现类测试使用清空 BOTMUX 上下文的环境、私有 PID `/proc` 和独立 `TMUX_TMPDIR`，避免把外层同 UID worker 误当成 fixture；串行执行也消除了 `/proc` 瞬态并发噪声。两种跑法都属测试进程隔离，不会修改或重启 live daemon。
 
 ### 8.2 本地真实浏览器场景（component harness）
 
