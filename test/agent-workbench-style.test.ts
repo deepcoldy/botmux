@@ -205,6 +205,70 @@ describe('Agent Workbench visual contract', () => {
     expect(block).toContain('@media (prefers-reduced-motion: reduce)');
   });
 
+  it('省略号截断的文字，行框装得下中文字形（上下沿不会被 overflow:hidden 削平）', () => {
+    // 第三次「裁切」反馈是**竖直方向**的：截断要 overflow:hidden，而 hidden 按盒子裁，
+    // 一行文字的内容盒高度就是 line-height。中文字形的墨迹顶满字体 em 盒——实测 12px
+    // 字号下 fontBoundingBox 上 11px + 下 3px = 14px，「查 / 看」的 actualBoundingBoxAscent
+    // 正好也是 11px。line-height 只有 1.3（15.6px）时半行距 0.8px，逐像素扫出来上沿净空
+    // 只剩 0.13px，em 盒更高的中文字体（PingFang SC ≈ 1.4em）直接变负 → 上沿横笔画被削平。
+    // 前两轮修的都是 padding-left（左缘），跟这条无关，所以一直没修到。
+    // 这里钉两件事，任一漂走都退回那个缺陷：
+    //   ① 截断元素必须有 padding-block —— 内边距撑的是**裁切框**，净空与字体度量脱钩；
+    //   ② 54px 行高预算算得通 —— 撑行框不能把虚拟滚动的行高契约挤爆。
+    const bare = block.replace(/\/\*[\s\S]*?\*\//g, '');
+    const ruleBody = (pattern: RegExp, need = 'padding-block') => (
+      [...bare.matchAll(pattern)].map(match => match[1]).find(body => body.includes(need)) ?? ''
+    );
+    const paddingBlock = (body: string) => Number.parseFloat(
+      /(?:^|;)\s*padding-block:\s*([\d.]+)px/.exec(body)?.[1] ?? 'NaN',
+    );
+
+    // 每一处单行省略号截断都要留出上下净空。名单就是逐像素体检扫出来的那批元素。
+    const truncating: Array<[string, RegExp]> = [
+      ['会话行标题', /\.wb-session-row\s+\.wb-session-title\s*\{([^{}]*)\}/g],
+      ['行 meta 的每一格', /\.wb-session-meta\s*>\s*span:not\(\.wb-session-kind\)\s*\{([^{}]*)\}/g],
+      ['行 meta 的时间戳', /\.wb-session-meta\s+time\s*\{([^{}]*)\}/g],
+      ['分组组头的组名', /\.wb-session-group-toggle\s*>\s*strong\s*\{([^{}]*)\}/g],
+      ['工作区头部会话名', /\.wb-workspace-title\s+strong\s*\{([^{}]*)\}/g],
+      ['工作区头部副行', /\.wb-workspace-title\s+small\s*\{([^{}]*)\}/g],
+      ['手机下钻页标题', /\.wb-mobile-detail-title\s*\{([^{}]*)\}/g],
+      ['坞里的选中会话', /\.wb-dock-selected\s+strong,\s*\n?\s*\.wb-dock-selected\s+span\s*\{([^{}]*)\}/g],
+    ];
+    for (const [name, pattern] of truncating) {
+      const body = ruleBody(pattern);
+      expect(body, `${name}要有一条声明 padding-block 的规则`).not.toBe('');
+      expect(paddingBlock(body), `${name}的上下内边距`).toBeGreaterThanOrEqual(1);
+    }
+
+    // 类型徽标（话题 / 群 / 单聊）反过来：它是 flex:none + 一两个字的固定文案，
+    // 永远没有要截断的内容，所以刻意被排除在 overflow:hidden 之外——开了 hidden
+    // 就是白架一把裁刀，16px 行框装 11px 中文，遇到 em 盒高的字体照样削平。
+    expect(bare, 'meta 行的截断规则必须把徽标排除掉')
+      .toMatch(/\.wb-session-meta\s*>\s*span:not\(\.wb-session-kind\)/);
+
+    // 标题行框：中文墨迹按 em 盒画，1.3 是装不下的，至少要 1.4 起步。
+    const titleBody = ruleBody(/\.wb-session-row\s+\.wb-session-title\s*\{([^{}]*)\}/g, 'line-height');
+    const titleLineHeight = Number.parseFloat(/line-height:\s*([\d.]+)/.exec(titleBody)?.[1] ?? 'NaN');
+    expect(titleLineHeight, '标题行框倍数').toBeGreaterThanOrEqual(1.4);
+
+    // 54px 预算复核：行高是虚拟滚动的硬契约，撑行框只能靠行内重新分配。
+    // 54 ≥ 上下内边距 + 标题盒 + 行内间距 + meta 行
+    const rowBody = [...bare.matchAll(/\.wb-session-row\s*\{([^{}]*)\}/g)]
+      .map(match => match[1]).find(body => /(?:^|;)\s*padding:/.test(body)) ?? '';
+    const rowPad = /(?:^|;)\s*padding:\s*([^;]+)/.exec(rowBody)?.[1].trim().split(/\s+/) ?? [];
+    const padTop = Number.parseFloat(rowPad[0]);
+    const padBottom = Number.parseFloat(rowPad[2]);
+    const copyBody = [...bare.matchAll(/\.wb-session-row\s+\.wb-session-copy\s*\{([^{}]*)\}/g)]
+      .map(match => match[1]).find(body => /gap:/.test(body)) ?? '';
+    const gap = Number.parseFloat(/gap:\s*([\d.]+)px/.exec(copyBody)?.[1] ?? '4');
+    const titleFontSize = 12;   // 会话栏基准字号，标题不另设 font-size
+    const titleBox = titleFontSize * titleLineHeight + 2 * paddingBlock(titleBody);
+    const metaBox = 18;         // meta 行由徽标定高：16px 行框 + 1px 亮环 ×2
+    const budget = padTop + padBottom + titleBox + gap + metaBox;
+    expect(budget, `行内竖直预算（${padTop}+${titleBox}+${gap}+${metaBox}+${padBottom}）必须装进 54px 行高`)
+      .toBeLessThanOrEqual(rowHeights(block)[0]);
+  });
+
   it('会话行的左右内边距把字形挡在高亮底板的圆角裁切区之外', () => {
     // 高亮底板是 .wb-session-row::before 那块圆角药丸，行本身始终透明。字形离底板
     // 左缘只有几像素时，圆角边界 + 选中态那条 2px accent 内影会直接压在字上，读起来

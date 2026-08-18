@@ -28106,8 +28106,11 @@ button.skills-issue-badge:hover {
      边界上，选中态那条 2px accent 内影更是从字形上横穿过去，读起来就是「行首被切掉
      一块」。规范的既有结论是「文字左内边距 ≥ 圆角半径」，这里把它补齐。
      右 14 同理留出弧线余量：meta 行的时间戳贴在右内边距上，它的字形底部落在底板下方
-     圆角的水平带里，8px 已经只剩 5.6px 净空，再窄就会啃到弧线。 */
-  padding: 6px 14px 6px 22px;
+     圆角的水平带里，8px 已经只剩 5.6px 净空，再窄就会啃到弧线。
+     上下 5（原 6）：省出来的 2px 给标题撑行框用，算式见下面
+     `.wb-session-row .wb-session-title`。行总高仍是 54px，虚拟滚动契约不受影响；
+     内容在行里是 align-items:center 居中的，少 1px 内边距不改变它的视觉位置。 */
+  padding: 5px 14px 5px 22px;
   /* 每行一条通栏横线原本一屏 18 条，还横穿圆角高亮底板，把药丸上下切平。整条删掉，
      行间关系交给留白节奏（项间留白 ÷ 项内行距 ≥ 2.5）+ 分组组头 + 选中底板。
      选中态的 accent 竖条也不再是 border-left（方头、和圆角底板中间夹 5px 缝），
@@ -28173,10 +28176,28 @@ button.skills-issue-badge:hover {
 .wb-session-copy-link:active,
 .wb-session-copy-link * { text-decoration: none; }
 .wb-session-copy-link:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
+/* ⚠️ 单行省略号截断 = overflow:hidden，而 hidden 是按**盒子**裁的，连字形一起裁。
+   一行文字的内容盒高度就是行框（line-height），字形却按字体自己的 em 盒画：实测
+   （Chromium + 中文回退字体）12px 字号下 fontBoundingBoxAscent 11px + Descent 3px
+   = 14px，而「查 / 看 / 后」这类汉字的 actualBoundingBoxAscent 就是 11px —— 墨迹
+   顶到 em 盒上沿，一格不剩。line-height 只有 1.3（15.6px）时半行距 (15.6−14)/2 =
+   0.8px，逐像素扫出来的净空更是只剩 0.13px：字形上沿的横笔画正压在裁切线上。
+   换成 em 盒更高的中文字体（PingFang SC ≈ 1.4em = 16.8px > 15.6px）半行距直接变负，
+   上沿被整齐削平 —— 线上反馈的「查看」被切就是这个。
+   所以本段所有截断文字统一两件事：① 行框放宽到 ≥ 1.4em；② 再各留 1px 上下内边距。
+   内边距是关键：它把**裁切框**（padding box）撑得比行框大，净空不再取决于字体度量，
+   换任何一套中文字体都还剩 ≥1px。改这些数之前先跑 glyphscan 逐像素体检。 */
 .wb-session-title { overflow: hidden; color: var(--wb-text); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .wb-session-meta { display: flex; justify-content: space-between; gap: 6px; min-width: 0; color: var(--text-3); font-size: 11px; }
-.wb-session-meta > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wb-session-meta time { flex: none; }
+/* meta 行每一格都是 flex 拉伸项，高度由行里最高的那个（徽标 18px）定；给它们加
+   1px 上下内边距只是把行框在**既有高度内**往里缩，meta 行总高不变，不吃预算。 */
+.wb-session-meta > span:not(.wb-session-kind) {
+  overflow: hidden;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-session-meta time { flex: none; padding-block: 1px; }
 .wb-session-reason { color: var(--wb-warning); }
 .wb-session-empty { position: absolute; inset: 60px 8px auto; color: var(--wb-faint); text-align: center; }
 
@@ -28237,8 +28258,24 @@ button.skills-issue-badge:hover {
 }
 .wb-workspace-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .wb-workspace-title > span:last-child { display: grid; min-width: 0; }
-.wb-workspace-title strong { overflow: hidden; max-width: 58vw; text-overflow: ellipsis; white-space: nowrap; }
-.wb-workspace-title small { overflow: hidden; color: var(--wb-muted); text-overflow: ellipsis; white-space: nowrap; }
+/* 工作区头部的会话名与副行：同样是单行省略号截断，同样按裁切框留净空。
+   副行 small 只有 10px 字号、行框 14px，是全段最挤的一处（实测上沿净空 0.44px），
+   所以除了 1px 内边距还把行框显式提到 1.5。头部高 46px，两行加起来 34.5px，够。 */
+.wb-workspace-title strong {
+  overflow: hidden;
+  max-width: 58vw;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-workspace-title small {
+  overflow: hidden;
+  padding-block: 1px;
+  color: var(--wb-muted);
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .wb-bot-mark {
   display: grid;
   place-items: center;
@@ -28319,7 +28356,8 @@ button.skills-issue-badge:hover {
   font-size: 11px;
   overflow: hidden;
 }
-.wb-chat-contract > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 单行截断同样留净空（理由见 .wb-session-title 那条长注释）。 */
+.wb-chat-contract > span:last-child { overflow: hidden; padding-block: 1px; text-overflow: ellipsis; white-space: nowrap; }
 .wb-chat-contract .is-open { color: var(--wb-success); }
 
 .wb-pane-region { min-width: 0; min-height: 0; padding: 5px; overflow: hidden; }
@@ -28532,7 +28570,8 @@ button.skills-issue-badge:hover {
 .wb-info-content dl { display: grid; margin: 0; border: 0; }
 .wb-info-content dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 0; border: 0; }
 .wb-info-content dt { color: var(--text-3); }
-.wb-info-content dd { margin: 0; overflow: hidden; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
+/* 单行截断同样留净空（理由见 .wb-session-title 那条长注释）。 */
+.wb-info-content dd { margin: 0; overflow: hidden; padding-block: 1px; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
 .wb-info-note { padding-left: 8px; border: 0; color: var(--text-3); }
 
 .wb-no-selection {
@@ -28585,8 +28624,15 @@ button.skills-issue-badge:hover {
 /* 保留线①（白名单第 1 类）：内容区 ↔ 固定操作条的功能性边界，满出血。 */
 .wb-dock-actions { display: grid; gap: 8px; padding: 12px; border: 0; border-top: 1px solid var(--border-keep); background: var(--bg-l1); }
 .wb-dock-selected { display: grid; min-width: 0; }
+/* 截断两行同样按裁切框留净空（理由见会话行标题那条）；这一格在 grid 的 auto 轨道
+   里，多出来的 2px 由轨道自己吸收，不碰 dock 的 40/220/24 三条固定轨。 */
 .wb-dock-selected strong,
-.wb-dock-selected span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-dock-selected span {
+  overflow: hidden;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .wb-dock-selected span { color: var(--wb-muted); }
 /* 页面唯一的主行动改实心：描边式的主按钮压不住下面三个次级按钮的重量之和。 */
 .wb-primary-action {
@@ -28788,10 +28834,21 @@ a.wb-session-row-action { text-decoration: none; }
    white-space: nowrap, and the -webkit-line-clamp:2 that used to sit here was
    inert anyway (clamping needs display:-webkit-box, which was never set), so the
    row has always painted one line. Keep it that way at 54px and let the full
-   name come from the element's own title= tooltip. line-height stays 1.3 (15.6px
-   at the rail's 12px base) — that number is part of the height budget above. */
+   name come from the element's own title= tooltip.
+   行框（第三次修，这次是**竖直方向**）：原来 line-height:1.3 = 15.6px，正好等于
+   标题的内容盒高度，而 overflow:hidden 就贴着这个盒子裁 —— 12px 中文字形的墨迹高
+   14px 且顶满 em 盒上沿，逐像素扫出来上沿净空只剩 0.13px，「查 / 看」的第一横被
+   削平。前两轮改的是 padding-left（左缘），跟这条完全无关，所以没修到。
+   现在 1.5（18px）+ 上下各 1px 内边距 → 裁切框 20px，字形上下各留 ≥3px（换 em 盒
+   1.4em 的中文字体也还有 1.6px）。
+   54px 的虚拟滚动契约没动，靠行内重新分配吸收：
+     54 = 5 上内边距 + 42 内容 + 5 下内边距 + 2 余量
+     内容 42 = 标题 20（18 行框 + 2 内边距）+ 4 间距 + meta 18
+   行的上下内边距从 6 收到 5（本条下面 .wb-session-row 的四值 padding），这 2px 就是
+   标题多出来的高度的来源；左右两个数一个没动，左缘那两轮修复原样保留。 */
 .wb-session-row .wb-session-title {
-  line-height: 1.3;
+  line-height: 1.5;
+  padding-block: 1px;
 }
 .wb-session-row .wb-session-meta {
   overflow: hidden;
@@ -28906,6 +28963,9 @@ body:has(.workbench-route-host) { min-width: 0; }
   flex: 1;
   min-width: 0;
   overflow: hidden;
+  /* 同会话行标题：截断靠 hidden，净空靠内边距。这条 bar 的高度由 44px 的返回按钮
+     定，标题多 2px 完全在里面，手机端行高不受影响。 */
+  padding-block: 1px;
   white-space: nowrap;
   text-overflow: ellipsis;
   color: var(--wb-text);
@@ -29039,6 +29099,13 @@ body:has(.workbench-route-host) { min-width: 0; }
   color: var(--text-3);
   font-size: 11px;
   line-height: 16px;
+  /* 徽标刻意**不**跟 meta 行其它格一起开 overflow:hidden（见上面那条 :not() 选择
+     器）。它是 flex:none + 一两个字的固定文案（话题 / 群 / 单聊），永远没有要截断
+     的内容，开了 hidden 等于白架一把裁刀 —— 16px 行框装 11px 中文，遇到 em 盒高的
+     中文字体半行距只剩 0.3px，「话」字上沿就被自己这圈框削平了。
+     不裁之后，它的字形只受 meta 行那层裁切管，而 1px 亮环天然把内容又让进 1px，
+     净空恒 ≥1px。nowrap 仍要保留：两个字的徽标不能折行。 */
+  white-space: nowrap;
 }
 /* meta 行是 space-between 的两栏（描述 | 时间）。插进徽标就变成三栏，自由空间
    会被均分到徽标和描述之间。让描述吃掉剩余空间，恢复「左对齐 + 时间靠右」。 */
@@ -29055,6 +29122,11 @@ body:has(.workbench-route-host) { min-width: 0; }
   width: 8px;
   height: 8px;
   flex: none;
+  /* 它也是 .wb-session-meta 的直接子 span，会吃到上面那条「截断文字留 1px 上下
+     内边距」的规则。这颗点是纯色块不是文字，尺寸只由 width/height 说了算：
+     全站 box-sizing:border-box 下 8×8 本来就不会变形，这里显式归零，免得哪天
+     谁把 border-box 撤了，圆点被撑成椭圆。 */
+  padding: 0;
   border-radius: 50%;
   background: var(--wb-accent);
 }
@@ -29113,7 +29185,10 @@ body:has(.workbench-route-host) { min-width: 0; }
   border-radius: 0;
   background: transparent;
   font-size: 11px;
-  line-height: 1.4;
+  /* 1.4 → 1.5：组头自己也是 overflow:hidden，11px 中文在 15.4px 行框里半行距归零，
+     组名上沿会被这层裁切削平。组头高 30px、上下内边距 5/3，内容区有 22px，
+     16.5px 的行框加组名那 2px 内边距（下一条）也才 18.5px，装得下。 */
+  line-height: 1.5;
   letter-spacing: .09em;
   text-align: left;
   white-space: nowrap;
@@ -29134,8 +29209,14 @@ body:has(.workbench-route-host) { min-width: 0; }
   transition: background-color .14s ease-out;
 }
 .wb-session-group-caret { text-align: center; }
-/* 长组名（会话名、仓库名都是自由文本）截断，别压到右边的计数上。 */
-.wb-session-group-toggle > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* 长组名（会话名、仓库名都是自由文本）截断，别压到右边的计数上。
+   自己开了 overflow:hidden 就要自己留净空，理由同标题那条。 */
+.wb-session-group-toggle > strong {
+  min-width: 0;
+  overflow: hidden;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+}
 /* hover：中性组提亮文字；语义色的两组只加底色，一 hover 就把红/绿洗成前景色会丢语义。 */
 .wb-session-group-toggle:hover { color: var(--wb-text); }
 .wb-session-group-toggle:hover::before { background: var(--bg-l3); }
