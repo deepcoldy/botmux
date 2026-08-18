@@ -105,5 +105,9 @@
     "node": ">=22"
   },
   "packageManager": "pnpm@9.5.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepcoldy/botmux.git"
+  },
   "license": "MIT"
 }

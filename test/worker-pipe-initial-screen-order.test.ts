@@ -37,7 +37,7 @@ describe('worker pipe initial screen ordering', () => {
       source.indexOf("case 'close':"),
       source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const localCloseIdx = closeCase.indexOf('// Local close destroys');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
     // The ACK is flushed (sendAndFlush), not fire-and-forget send(): a queued
     // send() is dropped when process.exit(0) wedges in node-pty's native exit

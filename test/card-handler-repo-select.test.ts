@@ -96,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
   CARD_POSTING_SENTINEL: '__posting__',
   };
@@ -331,6 +331,51 @@ describe('repo select card — plain switch', () => {
     expect(ds.workingDir).toBe('/remote/riff');
     expect(ds.session.riffParentTaskId).toBe('task-live');
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('/close');
+  });
+
+  it('does not create a replacement session when the old close left a residual', async () => {
+    // Picking a directory is not consent to leave a remote session running. The old
+    // row DID close (quarantined lineage cannot be cancelled safely), so this is not
+    // a failure — but the switch must stop and say so rather than silently spawning
+    // a replacement on top of an uncancelled remote session.
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('mojo-parked-9');
+    expect(said).toContain('未创建新会话');
+  });
+
+  it('a LOCAL-subtree residual on card repo switch points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('本机');
+    expect(said).toContain('未创建新会话');
+    expect(said).not.toContain('undefined');
+    expect(said).not.toMatch(/远端会话.*未.*取消/);
   });
 
   it('rejects a callback from any card id other than the currently published picker', async () => {
@@ -1084,7 +1129,7 @@ describe('repo select card — plain switch', () => {
     await Promise.resolve();
     expect(contenderEntered).toBe(false);
 
-    close.resolve({ ok: true, alreadyClosed: false });
+    close.resolve({ ok: true, outcome: 'closed', alreadyClosed: false });
     await switching;
     const ownerAfterSwitch = await contender;
     expect(contenderEntered).toBe(true);

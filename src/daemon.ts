@@ -1,7 +1,9 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -154,6 +156,8 @@ import {
   hasQueuedActivationAdmissionGate,
   sendWorkerSessionInput,
   killWorker,
+  retireWorkerProcessOnly,
+  retiringWorkersForSession,
   reapOrphanWorkers,
   scheduleCardPatch,
   setCurrentCliVersion,
@@ -161,6 +165,7 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
+  closeSessionForBackgroundCleanup,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
@@ -178,10 +183,13 @@ import {
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
+  migrateMojoSessionIdentities,
+  mojoLivePatchForSession,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
   cancelSessionReadyAck,
   waitForSessionReadyAck,
@@ -238,6 +246,10 @@ import {
 } from './core/session-manager.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
+  runIdempotencyFailClose,
+  runWithdrawAutoClose,
+} from './core/daemon-background-close.js';
+import {
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
   withBotTurnAdmission,
@@ -262,6 +274,7 @@ import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   getSessionPersistentBackendType,
+  isRemoteBackendSession,
   killPersistentBackendTarget,
   killPersistentSession,
   probePersistentBackendTarget,
@@ -403,16 +416,16 @@ import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocComment
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import {
-  abortRiffShutdownFleet,
-  canAbortVerifiedExitedRiffPreparation,
+  abortRemoteShutdownFleet,
+  canAbortVerifiedExitedRemotePreparation,
   collectUniqueDaemonShutdownSessions,
-  commitPreparedRiffShutdown,
-  isPreparedRiffSessionCurrent,
-  persistPreparedRiffShutdownFleet,
-  prepareRiffFleetForShutdown,
-  type FencedRiffShutdownParticipant,
-  type PreparedRiffShutdown,
-} from './core/riff-shutdown-detach.js';
+  commitPreparedRemoteShutdown,
+  isPreparedRemoteSessionCurrent,
+  persistPreparedRemoteShutdownFleet,
+  prepareRemoteFleetForShutdown,
+  type FencedRemoteShutdownParticipant,
+  type PreparedRemoteShutdown,
+} from './core/remote-shutdown-detach.js';
 import {
   BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS,
   DAEMON_SHUTDOWN_MAX_MS,
@@ -613,6 +626,9 @@ const activeSessions = new Map<string, DaemonSession>();
  *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
  *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
 let sessionsRestored = false;
+/** Once-per-daemon guard for the mojo containment boot reconciliation. The store
+ *  is bot-agnostic, so it must run once regardless of how many bots start. */
+let mojoContainmentReconciledThisBoot = false;
 const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
 const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
@@ -783,6 +799,23 @@ function vcMeetingPersistentBackendAvailable(backendType: PersistentBackendType)
   return ZmxBackend.isAvailable();
 }
 
+/**
+ * VC receiver teardown: this fence's job is to guarantee the local PRODUCER
+ * process is dead before hub replay is admitted. killWorker refuses an
+ * unprepared live remote worker (P0-2) — the fail-safe direction for lineage,
+ * but for THIS caller a silent refusal is fail-OPEN: the pane probes then read
+ * `missing` (mojo has no persistent pane) and the fence cleared while the
+ * producer kept running. Remote-frozen receivers are therefore retired
+ * process-only — no close IPC, no remote cancel, lineage and containment
+ * handles intact — with retireWorkerProcessOnly's SIGTERM→SIGKILL backstop
+ * guaranteeing death; local receivers keep killWorker so their backing
+ * session is torn down as before.
+ */
+function teardownVcReceiverWorker(ds: DaemonSession): void {
+  if (isRemoteBackendSession(ds)) retireWorkerProcessOnly(ds, 'vc_runtime_lease');
+  else killWorker(ds);
+}
+
 let testOnlyVcMeetingBootBackingMissing:
   | ((sessionId: string, destroy: boolean) => boolean)
   | undefined;
@@ -792,8 +825,12 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     return testOnlyVcMeetingBootBackingMissing(sessionId, destroy);
   }
   const ds = findActiveBySessionId(sessionId);
+  // Captured BEFORE teardown: retirement nulls ds.worker while the process
+  // dies asynchronously, and the producer-liveness check below needs the real
+  // ChildProcess to prove the exit.
+  const workerBefore = ds?.worker && !ds.worker.killed ? ds.worker : null;
   if (destroy && ds) {
-    try { killWorker(ds); }
+    try { teardownVcReceiverWorker(ds); }
     catch (err) {
       logger.warn(`[vc-delivery] boot recovery worker teardown failed session=${sessionId}: ${err}`);
     }
@@ -834,6 +871,18 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
         + `backend=${backendType} session=${sessionId}`,
       );
     }
+  }
+  // The worker PROCESS is itself the producer this recovery gates on; pane
+  // probes say nothing about it (mojo has no pane at all, so they always read
+  // `missing`). Clear only once the previously-live worker has actually
+  // exited — the retirement's SIGTERM→SIGKILL backstop makes a later reprobe
+  // see it gone.
+  if (workerBefore && workerBefore.exitCode === null && workerBefore.signalCode === null) {
+    allMissing = false;
+    logger.error(
+      `[vc-delivery] boot recovery worker process still live; receiver remains gated `
+      + `session=${sessionId}`,
+    );
   }
   return allMissing;
 }
@@ -876,9 +925,11 @@ function escalateVcMeetingBootRecovery(key: string, sessionId: string): void {
   vcMeetingReceiverRecoveryTimers.delete(key);
   vcMeetingReceiverRecoveryEscalating.add(key);
   const ds = findActiveBySessionId(sessionId);
-  if (ds) killWorker(ds);
-  // Wait past killWorker's 7s SIGKILL backstop, then direct-kill and probe the
-  // persisted exact backend. exists/unknown stays scoped-gated and reprobes.
+  if (ds) teardownVcReceiverWorker(ds);
+  // Wait past the retirement's SIGTERM→SIGKILL backstop window (killWorker for
+  // local receivers, retireWorkerProcessOnly for remote-frozen ones — a plain
+  // killWorker would REFUSE a live remote worker and arm nothing), then
+  // direct-kill and probe. exists/unknown stays scoped-gated and reprobes.
   scheduleVcMeetingBootRecoveryProbe(
     key,
     sessionId,
@@ -997,6 +1048,12 @@ type VcMeetingRuntimeLeaseFence = VcMeetingAmbiguousReceiptRef & {
   expectedWorkerGeneration?: number;
   probeAttempts: number;
   timer?: ReturnType<typeof setTimeout>;
+  /** The live worker process observed when this fence was armed. The
+   *  producer-liveness gate needs it when findSession() no longer resolves the
+   *  ds (e.g. a collision loser's registry entry was deleted while its
+   *  process-only retirement is still in flight) — without it the gate
+   *  silently skipped exactly the orphaned-producer case it exists for. */
+  armedWorker?: DaemonSession['worker'];
 };
 
 type VcMeetingRuntimeLeaseRecoveryDeps = {
@@ -1006,6 +1063,11 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
     message: Extract<DaemonToWorker, { type: 'expire_durable_turn' }>,
   ) => void;
   killWorker: (ds: DaemonSession) => void;
+  /** Worker processes still dying for this session id even though the registry
+   *  no longer resolves a ds (process-only retirements). The producer-liveness
+   *  gate must keep seeing them (fifth-round review, A1: a fence armed AFTER
+   *  the registry delete had no worker reference at all). */
+  resolveRetiringWorkers?: (sessionId: string) => readonly (DaemonSession['worker'])[];
   resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
   resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
@@ -1072,6 +1134,34 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
 
+    // Captured BEFORE teardown: retirement nulls ds.worker while the process
+    // dies asynchronously; the producer-liveness gate below needs the real
+    // ChildProcess to prove the exit. Falls back to the process observed at
+    // arm time when the registry no longer resolves the ds — a deleted
+    // registry entry is not proof the producer died (fourth-round review).
+    const armedAlive = fence.armedWorker
+      && !fence.armedWorker.killed
+      && fence.armedWorker.exitCode === null
+      && fence.armedWorker.signalCode === null
+      ? fence.armedWorker : null;
+    // Third source, for a fence armed AFTER the registry delete (the other
+    // half of the collision-loser timing): a process-only retirement is still
+    // dying for this session id, and neither ds nor arm-time capture ever saw
+    // it. Pin it onto the fence so later reprobes keep tracking the same
+    // process.
+    let retiringAlive: NonNullable<DaemonSession['worker']> | null = null;
+    if (!armedAlive && !(ds?.worker && !ds.worker.killed)) {
+      for (const w of deps.resolveRetiringWorkers?.(fence.receiverSessionId) ?? []) {
+        if (w && !w.killed && w.exitCode === null && w.signalCode === null) {
+          retiringAlive = w;
+          fence.armedWorker = w;
+          break;
+        }
+      }
+    }
+    const workerBefore = (ds?.worker && !ds.worker.killed ? ds.worker : null)
+      ?? armedAlive
+      ?? retiringAlive;
     if (ds) {
       try { deps.killWorker(ds); }
       catch (err) {
@@ -1120,6 +1210,19 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
           + `attempt=${fence.dispatchAttempt}`,
         );
       }
+    }
+    // The worker PROCESS is itself the producer this fence gates on; pane
+    // probes say nothing about it — mojo owns no pane, so they always read
+    // `missing`, which is exactly how a refused/incomplete teardown became
+    // fail-OPEN (third-round review, gate 3). Clear only once the previously
+    // live worker has actually EXITED; the retirement's SIGTERM→SIGKILL
+    // backstop guarantees a later reprobe sees it gone.
+    if (workerBefore && workerBefore.exitCode === null && workerBefore.signalCode === null) {
+      allMissing = false;
+      deps.error(
+        `[vc-delivery] runtime lease worker process still live; delivery remains gated `
+        + `session=${fence.receiverSessionId} attempt=${fence.dispatchAttempt}`,
+      );
     }
 
     // PTY has no surviving backing process once its worker has crossed the
@@ -1186,8 +1289,11 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         + `session=${fence.receiverSessionId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    // killWorker's live path has a 7s SIGKILL backstop. Only after that window
-    // do we directly kill + probe the deterministic owned pane.
+    // The teardown above arms a SIGTERM→SIGKILL backstop (killWorker's close
+    // path for local receivers; retireWorkerProcessOnly for remote-frozen
+    // ones — a plain killWorker would REFUSE a live remote worker and arm
+    // nothing, which is why the fence used to fail open for mojo). Only after
+    // that window do we directly kill + probe the deterministic owned pane.
     fence.timer = setTimeout(() => {
       if (!isCurrent(fence) || fence.phase !== 'escalating') return;
       teardownAndProbe(fence, 'timeout teardown');
@@ -1227,6 +1333,10 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       teardownAndProbe(fence, !ds ? 'missing-session teardown' : 'workerless teardown');
       return;
     }
+    // Remember the live producer process itself: registry state can stop
+    // resolving this ds before the process has died, and the liveness gate in
+    // teardownAndProbe must keep seeing it.
+    fence.armedWorker = ds.worker;
     if ((ds.workerGeneration ?? 0) !== ref.workerGeneration) {
       deps.error(
         `[vc-delivery] runtime lease worker generation mismatch; escalating `
@@ -1291,6 +1401,12 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
     if (context.disposition === 'queued_removed') {
+      // No producer-exit proof required here, deliberately: `queued_removed`
+      // is an ACK from the EXACT expected worker generation saying it removed
+      // the queued delivery itself. The producer is alive, current and
+      // cooperating — the double-delivery risk this fence gates on is gone
+      // without anyone dying. Exit proof is demanded only on the teardown
+      // paths, where the producer's state is unknown or adversarial.
       clearFence(fence);
       return true;
     }
@@ -1376,7 +1492,8 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
     if (!ds.worker || ds.worker.killed) throw new Error('receiver worker is not live');
     ds.worker.send(message);
   },
-  killWorker,
+  killWorker: teardownVcReceiverWorker,
+  resolveRetiringWorkers: retiringWorkersForSession,
   resolvePersistentScope(ds) {
     const backendType = getSessionPersistentBackendType(ds);
     if (backendType) return backendType;
@@ -2924,18 +3041,38 @@ function scheduleDeferredScheduleSettlement(
   // Exact transcript terminal needs only a short filesystem visibility grace.
   // Screen-only adapters use a longer confirmation and re-check that the same
   // turn is still idle before reclaiming the hidden session.
+  // Remote backends (riff / mojo) report their turn boundary over the network,
+  // so allow the same longer grace as the screen-only path instead of the 300ms
+  // local-filesystem one.
+  const remoteTerminal = ds.session.backendType === 'riff'
+    || ds.session.backendType === 'mojo';
   const delayMs = context.source === 'terminal'
-    ? (ds.session.backendType === 'riff' ? 1_500 : 300)
+    ? (remoteTerminal ? 1_500 : 300)
     : 1_500;
   const timer = setTimeout(() => {
     deferredScheduleSettleTimers.delete(sessionId);
     void settleDeferredScheduleRun(ds, context, {
       reconcile: reconcileDeferredTopicBinding,
-      closeSession: closeSessionHelper,
+      // Background path: no user surface, so a residual/refusal must at least be
+      // logged with its remote id instead of being discarded.
+      closeSession: (id: string) => closeSessionForBackgroundCleanup(
+        id,
+        'deferred-schedule settlement',
+      ),
     }).then((result) => {
       if (result.action === 'materialized') {
         logger.info(
           `[scheduler] Deferred topic materialized session=${sessionId.slice(0, 8)} root=${result.rootMessageId.slice(0, 12)}`,
+        );
+        return;
+      }
+      if (result.action === 'close_refused') {
+        // Must NOT print "Auto-closed": the row is still active and its remote
+        // session may still be running. Two contradictory log lines about the same
+        // session is exactly how a false success hides.
+        logger.error(
+          `[scheduler] Deferred run close REFUSED (${result.error ?? 'unknown'}); session stays `
+          + `ACTIVE session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
         );
         return;
       }
@@ -16611,14 +16748,14 @@ function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
 /** `/fast` is a passthrough keystroke to Codex's native tier toggle — it only
  *  reaches the executor on a real paste TUI. In RPC input mode the pane is a
  *  pure viewer (turns go over JSON-RPC, keystrokes never reach the app-server),
- *  and the Riff backend turns the text+Enter into two remote task writes. On
- *  those backends the toggle is a silent no-op (or worse), so fail closed:
+ *  and a remote backend (riff / mojo) turns the text+Enter into two independent
+ *  remote turns. On those backends the toggle is a silent no-op (or worse), so fail closed:
  *  reject with a clear message instead of pretending it worked. The read-only
  *  card badge is unaffected — it reflects whatever tier Codex actually runs. */
 function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   if (!ds) return false;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (backendType === 'riff') return true;
+  if (backendType === 'riff' || backendType === 'mojo') return true;
   return ds.initConfig?.codexRpcInput === true;
 }
 
@@ -16729,6 +16866,9 @@ function deliverPassthroughToExistingSession(
     sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
+      // Same reason as the worker-pool raw_input send: a passthrough is a real
+      // mojo turn, so it needs the live credential snapshot too.
+      ...(mojoLivePatchForSession(ds) ?? {}),
       turnId: turn.messageId,
     });
     turn.onDelivered?.();
@@ -18419,15 +18559,9 @@ export const __testOnly_handleBotAdded = handleBotAdded;
  *  than blocking the message.
  */
 function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
-  try {
-    const fp = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
-    if (existsSync(fp)) {
-      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
-      for (const [name, openId] of Object.entries(data)) {
-        if (openId === senderOpenId) return name;
-      }
-    }
-  } catch { /* fall through */ }
+  for (const [name, openId] of Object.entries(readPeerCrossRef(config.session.dataDir, larkAppId))) {
+    if (openId === senderOpenId) return name;
+  }
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
@@ -20719,6 +20853,18 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // Survive a fire-and-forget rejection instead of dying from it. Installed here
+  // rather than in index-daemon.ts on purpose: startDaemon has TWO entry points
+  // (index-daemon.ts and index-core-only.ts), so guarding the entry file would
+  // leave the other one unprotected. Idempotent, so an entry point may also call
+  // it earlier without harm.
+  //
+  // Node's default is to terminate the process, which is right for a worker (it
+  // owns one session) and wrong for the daemon (it owns every session): one
+  // missed `.catch` on one session's teardown would otherwise end every other
+  // live Lark session too. The rejection is logged loudly at error level — this
+  // is a backstop for the next missed `.catch`, not permission to omit them.
+  installDaemonRejectionGuard(logger);
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
   // a user-held tmux server can outlive every botmux pane and still leak stale
@@ -21135,8 +21281,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // status becomes `closed` → trigger-result resolves `failed` (soft terminal),
       // and resolveIdempotencyHit sees a not-live session on retry. This is the
       // observable fail-closed path the round-8 finding requires.
-      void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent; already terminal-intent */ });
-      logger.error(`[idempotency] fail-closed session ${ds.session.sessionId.slice(0, 8)} after exit-convergence write failure`);
+      void runIdempotencyFailClose(
+        ds.session.sessionId,
+        closeSessionForBackgroundCleanup,
+        logger,
+      );
     }
   };
   // Initialise worker pool with daemon callbacks
@@ -21156,9 +21305,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           logger.info(`[${sessionId.substring(0, 8)}] Withdraw auto-close deferred: Codex App FIFO became unsettled`);
           return false;
         }
-        await closeSessionHelper(sessionId);
-        logger.info(`[${sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
-        return true;
+        return runWithdrawAutoClose(
+          sessionId,
+          closeSessionForBackgroundCleanup,
+          logger,
+        );
       }).catch((err) => {
         logger.warn(
           `[${sessionId.substring(0, 8)}] Withdraw auto-close mutation failed; session retained: `
@@ -21294,6 +21445,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (err) {
     logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
     throw err instanceof Error ? err : new Error(String(err));
+  }
+  // Release durable mojo containment handles a REBOOT provably killed, BEFORE the
+  // device-isolation activation inventory ever synthesises a blocker from them —
+  // otherwise a post-reboot handle keeps blocking activation forever (round-11
+  // P1-1). Daemon-global and idempotent: guarded so it runs once no matter how
+  // many bots start; any store/proc read failure fails closed inside the helper.
+  if (!mojoContainmentReconciledThisBoot) {
+    mojoContainmentReconciledThisBoot = true;
+    try {
+      reconcileContainmentHandlesOnBoot();
+    } catch (err) {
+      logger.warn(`[mojo] containment boot reconciliation threw (blockers retained): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   // Seed dashboard IPC botName with the custom displayName (falling back to the
   // bot's config id); the friendly name from /bot/v3/info is wired into the
@@ -21688,6 +21852,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // reconnecting ask hook that raced the restore got retryable 503s until here.
   sessionsRestored = true;
 
+  // Freeze the control plane of restored mojo sessions NOW, not at their next
+  // worker fork. Restore completes before the dispatcher can deliver a message,
+  // so this closes the window where an operator edits the bot's endpoint/workspace
+  // between the restart and a session's next wake — which would otherwise let that
+  // session adopt the NEW control plane as its original identity.
+  migrateMojoSessionIdentities(activeSessions);
+
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup
   // (so root-linked clarifications can pair with them), but their flushes wait
@@ -22000,8 +22171,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     overloadTimer.unref?.();
   }
 
-  // Graceful shutdown. Riff owners first run a three-phase non-cancelling drain
-  // that durably ACKs every exact final task lineage as one fleet transaction.
+  // Graceful shutdown. Remote owners first run a three-phase non-cancelling
+  // drain that durably ACKs every exact final lineage as one fleet transaction.
   // No worker exits until every participant is prepared and fresh-verified.
   // Ordinary workers then receive SIGTERM / close IPC and the daemon waits up
   // to DAEMON_WORKER_EXIT_GRACE_MS for them to exit
@@ -22032,34 +22203,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       return;
     }
 
-    // Preflight Riff before stopping services/removing descriptors. A failed
+    // Preflight all remote backends before stopping services/removing descriptors. A failed
     // drain or persistence write aborts every successfully prepared peer, so a
     // refused shutdown returns to a live fleet instead of leaving an early
     // participant workerless.
-    const riffCandidates = initialShutdownFleet.sessions
-      .filter(ds => shutdownBackendDisposition(ds) === 'riff-drain-detach');
-    const riffPrepareResults = await prepareRiffFleetForShutdown(riffCandidates, {
+    const remoteCandidates = initialShutdownFleet.sessions
+      .filter(ds => shutdownBackendDisposition(ds) === 'remote-drain-detach');
+    const remotePrepareResults = await prepareRemoteFleetForShutdown(remoteCandidates, {
       deadlineMs: shutdownDeadlineMs,
     });
-    const riffPrepared = riffPrepareResults.filter(
-      (entry): entry is { ds: DaemonSession; result: PreparedRiffShutdown } => entry.result.ok,
+    const remotePrepared = remotePrepareResults.filter(
+      (entry): entry is { ds: DaemonSession; result: PreparedRemoteShutdown } => entry.result.ok,
     );
-    const riffFenced = riffPrepareResults.filter(
-      (entry): entry is { ds: DaemonSession; result: FencedRiffShutdownParticipant } =>
+    const remoteFenced = remotePrepareResults.filter(
+      (entry): entry is { ds: DaemonSession; result: FencedRemoteShutdownParticipant } =>
         entry.result.fence !== 'none',
     );
 
-    const abortRiffFleet = async (
+    const abortRemoteFleet = async (
       reason: string,
       retainFenced: ReadonlySet<DaemonSession> = new Set(),
     ): Promise<void> => {
       for (const ds of retainFenced) {
         logger.error(
-          `[${ds.session.sessionId.slice(0, 8)}] Riff shutdown participant remains fenced: `
+          `[${ds.session.sessionId.slice(0, 8)}] Remote shutdown participant remains fenced: `
           + 'durable/runtime ownership could not be reconciled safely',
         );
       }
-      const aborts = await abortRiffShutdownFleet(riffFenced
+      const aborts = await abortRemoteShutdownFleet(remoteFenced
         .filter(({ ds }) => !retainFenced.has(ds))
         .map(({ ds, result }) => ({ ds, result })), {
           deadlineMs: shutdownDeadlineMs,
@@ -22067,7 +22238,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       for (const { ds, result } of aborts) {
         if (result.ok) continue;
         logger.error(
-          `[${ds.session.sessionId.slice(0, 8)}] Riff shutdown rollback was not ACKed: `
+          `[${ds.session.sessionId.slice(0, 8)}] Remote shutdown rollback was not ACKed: `
           + `${result.error ?? 'unknown'}; admission remains fail-closed`,
         );
       }
@@ -22076,32 +22247,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.error(`Daemon remains online: ${reason}`);
     };
 
-    const riffPrepareFailures = riffPrepareResults.filter(entry => !entry.result.ok);
-    if (riffPrepareFailures.length > 0) {
-      for (const { ds, result } of riffPrepareFailures) {
+    const remotePrepareFailures = remotePrepareResults.filter(entry => !entry.result.ok);
+    if (remotePrepareFailures.length > 0) {
+      for (const { ds, result } of remotePrepareFailures) {
         if (result.ok) continue;
         logger.error(
           `[${ds.session.sessionId.slice(0, 8)}] Daemon shutdown prepare refused: `
           + `${result.error}${result.taskId ? ` (task ${result.taskId})` : ''}`,
         );
       }
-      await abortRiffFleet(
-        `${riffPrepareFailures.length} Riff owner(s) could not be safely drained`,
+      await abortRemoteFleet(
+        `${remotePrepareFailures.length} remote owner(s) could not be safely drained`,
       );
       return;
     }
 
-    const riffPersistence = persistPreparedRiffShutdownFleet(riffPrepared, {
+    const remotePersistence = persistPreparedRemoteShutdownFleet(remotePrepared, {
       deadlineMs: shutdownDeadlineMs,
     });
-    if (!riffPersistence.ok) {
-      const retainIds = new Set(riffPersistence.retainFencedSessionIds);
-      const retainFenced = new Set(riffPrepared
+    if (!remotePersistence.ok) {
+      const retainIds = new Set(remotePersistence.retainFencedSessionIds);
+      const retainFenced = new Set(remotePrepared
         .filter(({ ds }) => retainIds.has(ds.session.sessionId))
         .map(({ ds }) => ds));
-      logger.error(`Daemon shutdown lineage verification refused: ${riffPersistence.error}`);
-      await abortRiffFleet(
-        `${riffPersistence.sessionIds.length} Riff lineage row(s) could not be fresh-verified`,
+      logger.error(`Daemon shutdown lineage verification refused: ${remotePersistence.error}`);
+      await abortRemoteFleet(
+        `${remotePersistence.sessionIds.length} remote lineage row(s) could not be fresh-verified`,
         retainFenced,
       );
       return;
@@ -22112,28 +22283,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const currentShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
     if (!currentShutdownFleet.ok) {
       const ambiguousSessionId = currentShutdownFleet.sessionId;
-      await abortRiffFleet(
-        `Riff ownership became ambiguous after shutdown preflight: ${currentShutdownFleet.error}`,
-        new Set(riffPrepared
+      await abortRemoteFleet(
+        `Remote ownership became ambiguous after shutdown preflight: ${currentShutdownFleet.error}`,
+        new Set(remotePrepared
           .filter(({ ds }) => ds.session.sessionId === ambiguousSessionId)
           .map(({ ds }) => ds)),
       );
       return;
     }
-    const currentRiffOwners = currentShutdownFleet.sessions
-      .filter(ds => shutdownBackendDisposition(ds) === 'riff-drain-detach');
-    const riffPreparedOwners = new Set(riffPrepared.map(entry => entry.ds));
-    const riffGenerationMismatch = currentRiffOwners.some(ds => !riffPreparedOwners.has(ds))
-      || riffPrepared.some(({ ds, result }) =>
-        !currentRiffOwners.includes(ds) || !isPreparedRiffSessionCurrent(ds, result));
-    if (riffGenerationMismatch) {
-      const retainFenced = new Set(riffPrepared
+    const currentRemoteOwners = currentShutdownFleet.sessions
+      .filter(ds => shutdownBackendDisposition(ds) === 'remote-drain-detach');
+    const remotePreparedOwners = new Set(remotePrepared.map(entry => entry.ds));
+    const remoteGenerationMismatch = currentRemoteOwners.some(ds => !remotePreparedOwners.has(ds))
+      || remotePrepared.some(({ ds, result }) =>
+        !currentRemoteOwners.includes(ds) || !isPreparedRemoteSessionCurrent(ds, result));
+    if (remoteGenerationMismatch) {
+      const retainFenced = new Set(remotePrepared
         .filter(({ ds, result }) =>
-          (!currentRiffOwners.includes(ds) || !isPreparedRiffSessionCurrent(ds, result))
-          && !canAbortVerifiedExitedRiffPreparation(ds, result))
+          (!currentRemoteOwners.includes(ds) || !isPreparedRemoteSessionCurrent(ds, result))
+          && !canAbortVerifiedExitedRemotePreparation(ds, result))
         .map(({ ds }) => ds));
-      await abortRiffFleet(
-        'Riff ownership changed after shutdown preflight',
+      await abortRemoteFleet(
+        'Remote ownership changed after shutdown preflight',
         retainFenced,
       );
       return;
@@ -22141,12 +22312,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Validate-all above, then commit-all synchronously with no await or
     // callback boundary between peers.
-    const riffRetiredWorkers: ChildProcess[] = [];
-    for (const { ds, result } of riffPrepared) {
-      if (!commitPreparedRiffShutdown(ds, result)) {
-        throw new Error(`Riff shutdown commit invariant lost for ${ds.session.sessionId}`);
+    const remoteRetiredWorkers: ChildProcess[] = [];
+    for (const { ds, result } of remotePrepared) {
+      if (!commitPreparedRemoteShutdown(ds, result)) {
+        throw new Error(`Remote shutdown commit invariant lost for ${ds.session.sessionId}`);
       }
-      if (result.worker) riffRetiredWorkers.push(result.worker);
+      if (result.worker) remoteRetiredWorkers.push(result.worker);
     }
 
     scheduler.stopScheduler();
@@ -22222,7 +22393,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!e.alreadyExited && e.done) { workerExited.push(e.done); reapCandidates.push(w); }
       }
     };
-    for (const worker of riffRetiredWorkers) trackWorker(worker);
+    // Union of two renames: this branch generalised the collection
+    // riffRetiredWorkers -> remoteRetiredWorkers (it now carries mojo too), while
+    // master renamed the local helper trackWorkerExit -> trackWorker.
+    for (const worker of remoteRetiredWorkers) trackWorker(worker);
     for (const ds of currentShutdownFleet.sessions) {
       const w = ds.worker;
       if (!w) continue;
@@ -22237,8 +22411,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!w.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
         const disposition = shutdownBackendDisposition(ds);
-        if (disposition === 'riff-drain-detach') {
-          throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
+        if (disposition === 'remote-drain-detach') {
+          throw new Error(`undrained remote generation after atomic commit: ${ds.session.sessionId}`);
         }
         // Branch by the session's FROZEN backend (stamped on Session.backendType
         // at spawn), NOT the bot's live config — a dashboard backendType edit must

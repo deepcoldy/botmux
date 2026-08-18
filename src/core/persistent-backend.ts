@@ -12,6 +12,7 @@
  * import cycle with each other.
  */
 import { getBot } from '../bot-registry.js';
+import { isRemoteBackendId } from './remote-cli-ids.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
@@ -90,23 +91,50 @@ export function resolveSpawnBackendType(
 }
 
 /**
- * Enforce the `cliId === 'riff' ⇔ backendType === 'riff'` pairing invariant at
- * the ONE spawn chokepoint, so every config entry point (dashboard, `/config
+ * CLIs that are NOT local processes: they have an empty `resolvedBin` and their
+ * backend translates write() into remote API / headless-CLI calls. For each of
+ * these the cliId and the backendType share a name and must stay paired.
+ *
+ * Adding a remote CLI means adding it here — the alternative (another
+ * hardcoded `=== 'riff'` chain in every helper below) is exactly what made this
+ * generalization necessary.
+ */
+// The set itself now lives in the dependency-free core/remote-cli-ids leaf so
+// light consumers (e.g. the Lark card builder) can share it without pulling in
+// every PTY backend class through this module.
+
+/** True for a backend that runs the agent off-box (no local PTY to own). */
+export function isRemoteBackendType(type: BackendType): boolean {
+  return isRemoteBackendId(type);
+}
+
+export { isRemoteCliId } from './remote-cli-ids.js';
+
+/**
+ * Enforce the `cliId === <remote> ⇔ backendType === <remote>` pairing invariant
+ * at the ONE spawn chokepoint, so every config entry point (dashboard, `/config
  * set cli|backendType`, `botmux setup`, hand-edited bots.json) converges:
- *   - riff CLI on a local backend → force 'riff' (a pty/tmux spawn would fail
- *     on the empty resolvedBin);
- *   - non-riff CLI on the riff backend → fall back to the daemon default (the
- *     CLI's PTY chunked writes would otherwise fan out into riff tasks).
- * Manual pty/tmux/herdr/zellij overrides for non-riff CLIs pass through.
+ *   - a remote CLI on a local backend → force its own backend (a pty/tmux spawn
+ *     would fail on the empty resolvedBin);
+ *   - a non-remote CLI on a remote backend → fall back to the daemon default
+ *     (the CLI's PTY chunked writes would otherwise fan out into remote tasks).
+ * Manual pty/tmux/herdr/zellij overrides for local CLIs pass through.
+ *
+ * NOTE: kept under its historical name `reconcileRiffBackendType` on purpose —
+ * it is imported by name in several modules and renaming it would bloat this
+ * behaviour-preserving refactor into a cross-cutting rename.
  */
 export function reconcileRiffBackendType(
   cliId: string,
   resolved: BackendType,
   defaultType: BackendType,
 ): BackendType {
-  if (cliId === 'riff') return 'riff';
-  // defaultType 本身被误配成 riff 时兜底到确定可用的本地后端（pty 无外部依赖）。
-  if (resolved === 'riff') return defaultType !== 'riff' ? defaultType : 'pty';
+  // A remote CLI dictates its own backend (same name by construction).
+  if (isRemoteBackendId(cliId)) return cliId as BackendType;
+  // defaultType 本身被误配成远端后端时兜底到确定可用的本地后端（pty 无外部依赖）。
+  if (isRemoteBackendType(resolved)) {
+    return !isRemoteBackendType(defaultType) ? defaultType : 'pty';
+  }
   return resolved;
 }
 
@@ -134,6 +162,18 @@ export function isRiffBackendSession(ds: DaemonSession): boolean {
   return (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff';
 }
 
+/** Whether the live/persisted session is frozen onto ANY remote backend.
+ *  Same frozen-stamp rule as isRiffBackendSession. Used by the guards that
+ *  must reject BEFORE mutating persisted state (e.g. /cd repin): killWorker
+ *  refuses unprepared live retirement for every remote backend, so a caller
+ *  that mutates first and retires after would report success while the live
+ *  generation keeps running against the old state — the split-brain the riff
+ *  guard has always prevented, now needed for mojo too. */
+export function isRemoteBackendSession(ds: DaemonSession): boolean {
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  return frozen !== undefined && isRemoteBackendType(frozen);
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
@@ -143,11 +183,14 @@ export function isRiffBackendSession(ds: DaemonSession): boolean {
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'riff-drain-detach' | 'detach' | 'close' {
-  // Riff 不能落进普通 detach 的直接 SIGTERM：create/follow-up 最长 10s 才返回
-  // task id，而 worker SIGTERM 会立即 exit，丢掉唯一血缘。独立 disposition 迫使
-  // daemon 先走 drain → durable ACK → commit 协议；类型检查防止未来回归。
-  if (isRiffBackendSession(ds)) return 'riff-drain-detach';
+export function shutdownBackendDisposition(ds: DaemonSession): 'remote-drain-detach' | 'detach' | 'close' {
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  // Every remote backend must publish its exact final lineage before the local
+  // worker exits. Riff may wait for create/follow-up HTTP; Mojo may wait for the
+  // first `system/init`. Their backend-specific implementations stay behind the
+  // common prepare/abort/commit interface, while the daemon owns one atomic
+  // fleet transaction. Detach never cancels the remote session.
+  if (frozen && isRemoteBackendType(frozen)) return 'remote-drain-detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 

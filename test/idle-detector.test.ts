@@ -147,11 +147,6 @@ describe('IdleDetector: onBusy()', () => {
 
   it.each([
     {
-      name: 'Pi',
-      cli: createPiAdapter('/bin/pi'),
-      redraw: '\x1b[2JWorking... on it',
-    },
-    {
       name: 'Genius',
       cli: createGeniusAdapter('/bin/genius'),
       redraw: '\x1b[2JThe previous screen said esc to interrupt while it was running.',
@@ -171,6 +166,36 @@ describe('IdleDetector: onBusy()', () => {
     detector.fireIdle();
     detector.feed(redraw);
     expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
+  it('Pi opts in: Working... after idle flips busy so a false ready self-heals', () => {
+    // Pi's `Working...` is an ephemeral status line — never part of transcript
+    // history redraws — so the adapter explicitly sets idleToBusyPattern. A
+    // falsely published ready (e.g. a startup-window quiescence idle that
+    // slipped past the gates) is corrected as soon as the marker renders:
+    // the worker's onBusy pulls isPromptReady back to false and republishes
+    // working.
+    const cli = createPiAdapter('/bin/pi');
+    expect(cli.idleToBusyPattern?.source).toBe(cli.busyPattern?.source);
+
+    const detector = new IdleDetector(cli);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K plain redraw without the marker');
+    expect(cb).not.toHaveBeenCalled();
+    detector.feed('\x1b[2K● Working... (esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // Re-arms per idle cycle: a second marker in the same cycle stays quiet,
+    // the next idle re-arms the edge.
+    detector.feed('● Working... still');
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.fireIdle();
+    detector.feed('● Working...');
+    expect(cb).toHaveBeenCalledTimes(2);
     detector.dispose();
   });
 });

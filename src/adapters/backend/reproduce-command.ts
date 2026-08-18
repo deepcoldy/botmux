@@ -8,7 +8,7 @@
 //     交互 bash，PATH/HOME/NVM 等由其 rcfile 提供，与 wrapper 目标一致；这里只补
 //     botmux 注入的那批权威 env（buildBotmuxEnvAssignments）——正是它们平时靠
 //     wrapper 的 `/usr/bin/env KEY=VAL` 注入、裸 bash 不会有。
-//   - riff 后端没有本地 bin/args（远端执行），返回 null → 接口报 unavailable，
+//   - riff / mojo 后端没有本地 bin/args（远端执行），返回 null → 接口报 unavailable，
 //     绝不伪造一条本地命令误导排障。
 // 供 worker 在 ready 时算出、上报给 daemon 只驻内存（含凭证，绝不落盘）。
 
@@ -68,12 +68,12 @@ export interface ReproduceCommandInput {
   injectEnv?: Record<string, string>;
 }
 
-// 组装近似复现命令。riff（远端后端）返回 null。其余后端返回：
+// 组装近似复现命令。riff / mojo（远端后端）返回 null。其余后端返回：
 //   cd '<cwd>' && KEY='v' KEY2='v2' ... '<bin>' '<arg>' ...
 // env 前缀取 buildBotmuxEnvAssignments（BOTMUX_* / SESSION_DATA_DIR /
 // CLAUDE_CONFIG_DIR / CODEX_HOME / 代理 / per-bot 凭证），每个 VAL 做 bash 单引号转义。
 export function buildReproduceCommand(input: ReproduceCommandInput): string | null {
-  if (input.backendType === 'riff') return null;
+  if (input.backendType === 'riff' || input.backendType === 'mojo') return null;
   if (!input.bin) return null;
 
   const parts: string[] = [];

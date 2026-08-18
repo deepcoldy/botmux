@@ -29,6 +29,7 @@ import {
   nextAppVersion,
   OpenPlatformApiError,
   readStoredCookiesFromSessionFile,
+  safeErrorMessage,
   type OpenPlatformApiClient,
   type OpenPlatformClientResult,
   type StoredCookie,
@@ -78,7 +79,8 @@ function failureFromError(err: unknown, fallbackReason: OpenPlatformRenameFailur
     }
     return { reason: fallbackReason, message: err.message };
   }
-  return { reason: fallbackReason, message: err instanceof Error ? err.message : String(err) };
+  // 网络类错误（undici "fetch failed"）的真实原因在 cause 链里，safeErrorMessage 会带上。
+  return { reason: fallbackReason, message: safeErrorMessage(err) };
 }
 
 // ── 共用链路：改基础信息 + 镜像线上可见范围建版发布 ─────────────────────────

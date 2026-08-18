@@ -72,7 +72,7 @@ function knownBotNames(entries: BotMentionEntry[], selfAppId?: string): Set<stri
 }
 
 export function knownBotOpenIdsFromCrossRef(
-  crossRef: Record<string, string>,
+  crossRef: Readonly<Record<string, string>>,
   entries: BotMentionEntry[] = [],
   selfAppId?: string,
 ): Set<string> {

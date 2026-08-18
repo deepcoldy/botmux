@@ -53,7 +53,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommand(rawDshBin))];
     },
 
-    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model }) {
+    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs }) {
       // Pre-create the persistent dsh dir in the real HOME before the worker
       // enters the sandbox: the sandbox's keepExisting filter drops authPaths
       // that don't exist yet, and the runner can't create them from inside.
@@ -68,6 +68,10 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      // Per-bot turn timeout override; undefined → runner default (10 min).
+      pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
+        ? String(turnTimeoutMs)
+        : undefined);
       return args;
     },
 

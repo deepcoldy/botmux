@@ -574,6 +574,40 @@ describe('worker structured-turn status wiring', () => {
   });
 
 
+  it('scopes the argv turn-start evidence machinery and its flush side effect to Pi', () => {
+    // The transcript-evidence latch lives on the GENERIC codexBridgeIngest
+    // path, which also serves Grok (argv-baked + structured bridge +
+    // type-ahead). Its flush side effect must be Pi-gated, or Grok would gain
+    // a new startup-window write whose first ready is owned by the
+    // SessionStart busy arm instead.
+    const note = functionSlice('noteSpawnArgvTurnStartTranscriptEvidence', 'stopSpawnArgvTurnStartFailOpen');
+    const piGuard = note.indexOf('if (!structuredBridgeIsPi()) return;');
+    const latch = note.indexOf('spawnArgvTurnStartEvidenceSeen = true');
+    const flush = note.indexOf('flushQueuedInputAfterTurnStartEvidence()');
+    expect(piGuard).toBeGreaterThanOrEqual(0);
+    expect(latch).toBeGreaterThan(piGuard);
+    expect(flush).toBeGreaterThan(latch);
+
+    const gate = functionSlice('spawnArgvTurnStartGateHolds', 'noteSpawnArgvTurnStartTranscriptEvidence');
+    expect(gate).toContain('structuredBridgeIsPi()');
+
+    // markPromptReady branch boundary: the no-evidence gate must NOT re-kick
+    // (startup input protection — the TUI may not accept input yet); the
+    // lifecycle-block branch must re-kick (turn-start evidence exists there).
+    // functionSlice('markPromptReady', …) starts at markPromptReadyFromPty
+    // (prefix match) and also spans the helper definitions, so anchor on the
+    // literal markPromptReady body before locating the two gate branches.
+    const body = functionSlice('markPromptReady', 'persistCliSessionId');
+    const markStart = body.indexOf('function markPromptReady(): void');
+    expect(markStart).toBeGreaterThanOrEqual(0);
+    const evidenceGate = body.indexOf('if (spawnArgvTurnStartGateHolds()) {', markStart);
+    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock()) {', markStart);
+    expect(evidenceGate).toBeGreaterThanOrEqual(0);
+    expect(lifecycleGate).toBeGreaterThan(evidenceGate);
+    expect(body.slice(evidenceGate, lifecycleGate)).not.toContain('flushQueuedInputAfterTurnStartEvidence');
+    expect(body.slice(lifecycleGate)).toContain('flushQueuedInputAfterTurnStartEvidence()');
+  });
+
   it('carries the structured mark through adopt submit confirmation and exception cleanup', () => {
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');
     const handler = source.slice(source.indexOf("case 'message':"), source.indexOf("case 'raw_input':"));

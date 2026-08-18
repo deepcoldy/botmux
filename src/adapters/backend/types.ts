@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo';
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.
@@ -112,6 +112,13 @@ export interface SessionBackend {
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;
   /**
+   * Escape sequence re-asserting the pane's live input modes (mouse tracking,
+   * app cursor keys, …) on a fresh web-terminal client. Snapshot seeds carry
+   * screen cells but no DECSET state; backends that can query it (tmux) expose
+   * this so mouse-mode TUIs keep receiving clicks after a page (re)load.
+   */
+  capturePaneInputModes?(): string;
+  /**
    * Complete one authoritative screen refresh that starts after this call.
    * Snapshot-only backends use this as a completion fence before the worker
    * declares a turn idle, so a final burst cannot be lost to polling phase.
@@ -138,25 +145,30 @@ export interface SessionBackend {
   onAccessUrl?(cb: (url: string) => void): void;
   /**
    * Remote-task turn boundary — backends that execute discrete remote tasks
-   * (riff) invoke this when the current task finishes or fails. The worker
+   * (Riff/Mojo) invoke this when the current task finishes or fails. The worker
    * uses it to re-arm prompt-ready and flush queued follow-up messages: remote
    * backends have no PTY output, so the idle detector never fires for them and
    * nothing else would ever mark the session ready again after a write.
    * Optional — local backends never implement it.
    */
   onTaskDone?(cb: () => void): void;
-  /** Remote-task id updates (riff) — the worker forwards these to the daemon
+  /** Remote-session lineage updates — the worker forwards these to the daemon
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */
   onTaskId?(cb: (taskId: string | null) => void): void;
-  /** Async-capable teardown: Riff returns a confirmed cancellation result so
+  /** Async-capable teardown: remote backends return a confirmed cancellation result so
    * daemon-driven explicit close can fence late create/follow-up races before
    * publishing the durable closed row. Local backends remain synchronous. */
   destroySession?(): void | Promise<void | SessionDestroyResult>;
   /** Roll back a successful remote prepare when the daemon could not commit
    * the durable closed row. The backend must restore write admission without
-   * discarding the last task lineage. */
-  abortDestroySession?(): void | Promise<void>;
+   * discarding the last task lineage.
+   *
+   * Returns whether admission was ACTUALLY restored. A backend that is holding a
+   * latched fence (an unproven local subtree, an unnamed remote session) must
+   * refuse and say so: "the close was abandoned" is not evidence that the
+   * survivor died. Legacy backends return void, which means "restored". */
+  abortDestroySession?(): void | Promise<void> | SessionAbortDestroyResult | Promise<SessionAbortDestroyResult>;
   /** Finalize a successful prepare after the durable row is closed. */
   commitDestroySession?(): void;
   /** Graceful daemon shutdown for a remote-task backend. Fence only NEW
@@ -177,6 +189,83 @@ export interface SessionDestroyResult {
   /** Exact remote task that failed cancellation and must remain retryable. */
   taskId?: string;
   error?: string;
+  /**
+   * May a FAILED prepare restore write admission?
+   *
+   * A single boolean `ok` cannot answer this, and treating every failure as
+   * rollbackable is unsafe: once the remote session is cancelled, restoring
+   * admission produces a session that looks writable but can never continue.
+   *
+   *  - `retryable`     no irreversible side effect happened; admission may be
+   *                    restored and the same close retried.
+   *  - `uncertain`     an unknown side effect MAY have happened (for example a
+   *                    dispatched turn whose lineage never materialised, so a
+   *                    remote session may exist that we cannot name). Admission
+   *                    must stay fenced; the row stays active for a retry.
+   *  - `irreversible`  the remote side is already gone. Admission must never be
+   *                    restored.
+   *
+   * Absent means `retryable`, which is the historical behaviour.
+   */
+  recovery?: 'retryable' | 'uncertain' | 'irreversible';
+  /**
+   * May write admission be RESTORED after this failed prepare?
+   *
+   * This is a SEPARATE question from `recovery`, and collapsing the two is a
+   * fencing bug. `recovery` answers "may the close be retried / did anything
+   * irreversible happen?"; `admission` answers "is it safe to accept a new turn
+   * on this session again?". They genuinely disagree in at least one real state:
+   * a local child that could not be proven terminated leaves the close fully
+   * retryable (the irreversible remote cancel has NOT run) while a process that
+   * still holds the injected credential may be alive — so admitting a new write
+   * would layer a fresh turn on top of a live orphan.
+   *
+   *  - `restorable`  no live-side effect can be holding the session; the backend
+   *                  may re-open writes (abortDestroySession).
+   *  - `fenced`      a possibly-live local child or unnamed remote session may
+   *                  exist. Writes must stay refused even if the close itself is
+   *                  retried, and abortDestroySession must NOT re-open them.
+   *
+   * Absent is derived from `recovery` (retryable → restorable, uncertain /
+   * irreversible → fenced), which preserves the historical behaviour for every
+   * result that predates this field.
+   */
+  admission?: 'restorable' | 'fenced';
+  /**
+   * Set when the close SUCCEEDED but a local subtree could not be proven gone.
+   * Two distinct facts, deliberately kept distinguishable:
+   *
+   *  * `local_subtree_unprovable_on_platform` — this host cannot enumerate
+   *    processes at all (a non-Linux platform, where /proc does not exist), so no
+   *    retry can change the answer.
+   *  * `local_subtree_boundary_unproven` — enumeration DID run and found nothing
+   *    executing, but a clean scan is a diagnostic signal, not an unforgeable
+   *    boundary: a descendant that setsid'd and scrubbed its own environ is
+   *    invisible to it. This is the ordinary Linux weak-handle outcome.
+   *
+   * Neither is a failure. "The boundary is unproven" is a different fact from
+   * "the instrument says something may still be running": the latter is evidence
+   * of a possible credentialed survivor and must fence write admission, while
+   * these two would fence ordinary sessions forever with no possible recovery.
+   * The credential boundary is carried instead by the durable containment
+   * handle, which is retained (not released) in both cases, so the
+   * device-isolation blocker survives the close.
+   */
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+}
+
+/**
+ * Outcome of abortDestroySession().
+ *
+ * `admissionRestored: false` is NOT an error: the rollback was legitimately
+ * refused because the backend is still fencing writes. The daemon must persist
+ * that as "still fenced" instead of clearing its journal, or the durable state
+ * would claim admission was restored while write() keeps returning false.
+ */
+export interface SessionAbortDestroyResult {
+  admissionRestored: boolean;
+  /** Why admission is still fenced, for logs/journal. */
+  reason?: string;
 }
 
 export interface SessionShutdownDetachResult {

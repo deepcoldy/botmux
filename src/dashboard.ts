@@ -35,6 +35,7 @@ import {
 } from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
@@ -143,6 +144,7 @@ import {
   type DashboardUrls,
 } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
@@ -207,7 +209,7 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
@@ -1657,19 +1659,34 @@ function currentInstalledVersion(): string {
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
- * THEN open the SSE subscription. Order matters — hydrating after subscribe
- * would let snapshot data clobber events that arrived between subscribe and
- * the snapshot fetch.
+ * THEN open the SSE subscription.
+ *
+ * The subscription runs a snapshot barrier (subscribeDaemon's `onConnected`):
+ * after every stream establishment — the first included — and BEFORE any
+ * frame is read, we install a fresh authoritative snapshot while incoming
+ * frames stay queued in the stream; frames then apply on top in order. This
+ * gives two guarantees at once:
+ *
+ * 1. No reverse clobber: the barrier snapshot is installed before any frame
+ *    is applied, so a slow snapshot response can never overwrite state that
+ *    a faster SSE event already delivered (a naive post-subscribe hydrate
+ *    would).
+ * 2. No forward gap: events fired between step 1 below and the stream
+ *    handshake are picked up by the barrier snapshot, and events missed
+ *    during a drop are recovered by the barrier re-run on reconnect.
+ *
+ * The blocking hydrate in step 1 still matters: it populates the cache
+ * before the dashboard starts serving, and keeps a daemon's last-known
+ * state visible even if its SSE stream never connects.
  *
  * Idempotent: a second call for the same daemon while one is in flight is a
- * no-op; a call after attach finished re-hydrates (useful when a daemon
- * restarts and we want to refresh its slice of the cache).
+ * no-op; the subscription itself is installed once.
  */
 async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   if (attaching.has(d.larkAppId)) return;
   attaching.add(d.larkAppId);
   try {
-    // 1. Hydrate snapshot (blocking — completes before we wire SSE)
+    // 1. Blocking snapshot (see above)
     try {
       const [sRes, schRes] = await Promise.all([
         fetchDaemonIpc(d.ipcPort, '/api/sessions'),
@@ -1682,22 +1699,47 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ));
       aggregator.hydrateSessions(d.larkAppId, rows);
       for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
-      aggregator.hydrateSchedules(sch.schedules ?? []);
+      aggregator.hydrateSchedules(d.larkAppId, sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
     }
-    // 2. Open SSE subscription if not already (idempotent)
+    // 2. Open SSE subscription if not already (idempotent). The barrier
+    //    below runs inside subscribeDaemon, after the stream is established.
     if (!subs.has(d.larkAppId)) {
       subs.set(
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
+          // Snapshot barrier: install an authoritative snapshot before any
+          // frame is read. Frames arriving during this fetch stay queued in
+          // the stream and apply afterwards, so the snapshot can never
+          // clobber fresher SSE state; on reconnect it recovers missed
+          // events. The subscription signal is the generation arbitration:
+          // if aborted mid-flight (daemon offline, newer generation), the
+          // snapshot is discarded instead of clobbering the new generation.
+          signal => reconcileDaemon(d, signal),
         ),
       );
     }
   } finally {
     attaching.delete(d.larkAppId);
+  }
+}
+
+/**
+ * Reconcile one daemon's snapshot into the aggregator (subscribeDaemon
+ * barrier). Thin wrapper over reconcileDaemonSnapshot that also schedules
+ * presentation enrichment for the session rows.
+ */
+async function reconcileDaemon(
+  d: import('./dashboard/registry.js').DaemonInfo,
+  signal: AbortSignal,
+): Promise<void> {
+  const snapshot = await reconcileDaemonSnapshot(d, aggregator, signal);
+  if (!snapshot) return;
+  for (const row of snapshot.sessions) {
+    sessionPresentation.schedule(d.larkAppId, row);
   }
 }
 
@@ -2338,7 +2380,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2350,18 +2392,19 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       wrapperCli: b.wrapperCli,
       model: b.model,
       reasoningEffort: b.reasoningEffort,
+      turnTimeoutMs: b.turnTimeoutMs,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2370,6 +2413,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
   };
 }
 
@@ -2637,7 +2681,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
  */
 async function closeSessionsMatching(
   pred: (s: any) => boolean,
-): Promise<{ sessionId: string; ok: boolean; error?: string }[]> {
+): Promise<{ sessionId: string; ok: boolean; error?: string; residual?: ParsedCloseResidual }[]> {
   const matching = aggregator.getSessions().filter(s => s.status !== 'closed' && pred(s));
   return Promise.all(matching.map(async s => {
     try {
@@ -2649,9 +2693,11 @@ async function closeSessionsMatching(
       const text = await upstream.text();
       let body: any = null;
       try { body = JSON.parse(text); } catch { /* tolerate */ }
+      const residual = body?.ok ? parseCloseResidual(body) : undefined;
       return {
         sessionId: s.sessionId as string,
         ok: !!body?.ok,
+        ...(residual ? { residual } : {}),
         error: body?.ok ? undefined : (body?.error ?? `http_${upstream.status}`),
       };
     } catch (e: any) {
@@ -2789,8 +2835,9 @@ function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
   // Always scan all known CLI skill dirs, not just configured bots — users may
   // want to discover codex/trae/... skills even before creating a bot for them.
-  const allCliIds: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff', 'reasonix', 'dsh'];
-  for (const cliId of allCliIds) ids.add(cliId);
+  // Derived from the closed Record<CliId,…> in the registry — a hand-typed
+  // literal here silently omitted reasonix and mojo, hiding their skill dirs.
+  for (const cliId of ALL_CLI_IDS) ids.add(cliId);
   try {
     for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
   } catch {
@@ -3750,9 +3797,14 @@ const server = createServer(async (req, res) => {
           // else (incl. an unparseable/missing body) as a failure rather than a
           // silent success.
           const ok = upstream.ok && parsed?.ok === true;
+          // A residual is NOT a failure (the row closed) but must not be counted
+          // as a clean close either: an idle/workerless mojo row can carry a
+          // parked lineage, so this path really does produce them.
+          const residual = ok ? parseCloseResidual(parsed) : undefined;
           return {
             sessionId: s.sessionId,
             ok,
+            ...(residual ? { residual } : {}),
             error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
         } catch (e: any) {
@@ -4229,7 +4281,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, dashboardSkillsPayload());
     }
 
-    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+    // Batch skill removal. POST /api/skills/remove is the canonical route the
+    // dashboard UI calls: the payload (names[], force) must travel in the body,
+    // and DELETE bodies are dropped by the platform dashboard proxy (it assumes
+    // DELETE carries no body, forwards content-length but never pipes the bytes,
+    // so readJsonBody hangs until the outer gateway returns 504). DELETE
+    // /api/skills stays as an alias for direct/scripted callers.
+    if ((req.method === 'DELETE' && url.pathname === '/api/skills')
+      || (req.method === 'POST' && url.pathname === '/api/skills/remove')) {
       let parsed: unknown;
       try {
         parsed = await readJsonBody(req);
@@ -5530,6 +5589,7 @@ const server = createServer(async (req, res) => {
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
+            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
           }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));

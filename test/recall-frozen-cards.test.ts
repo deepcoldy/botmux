@@ -457,7 +457,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
-    ds.riffCloseState = { phase: 'preparing', requestId: 'close-before-post' };
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-before-post' };
     const sessionReply = vi.fn(async () => 'om_forbidden');
 
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
@@ -666,7 +666,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    ds.riffCloseState = { phase: 'preparing', requestId: 'close-1' };
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-1' };
     resolvePost('om_riff_orphan_card');
 
     await expect(post).resolves.toBe(false);
@@ -690,7 +690,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    ds.riffShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
+    ds.remoteShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
     resolvePost('om_riff_shutdown_orphan_card');
 
     await expect(post).resolves.toBe(false);
@@ -715,11 +715,11 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
 
     const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    ds.riffCloseState = { phase: 'preparing', requestId: 'close-abort' };
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-abort' };
     resolveFirst('om_aborted_close_orphan_card');
     await expect(firstPost).resolves.toBe(false);
 
-    ds.riffCloseState = undefined;
+    ds.remoteCloseState = undefined;
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
 
     expect(sessionReply).toHaveBeenCalledTimes(2);
@@ -916,6 +916,105 @@ describe('scheduleCardPatch withdrawn handling', () => {
 
     expect(ds.streamCardId).toBeUndefined();
     expect(persistStreamCardStateMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('scheduleCardPatch adjacent duplicate handling', () => {
+  it('drops an identical PATCH queued for the same card after the in-flight PATCH succeeds', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_SAME';
+
+    let resolvePatch!: () => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise<void>(resolve => { resolvePatch = resolve; }),
+    );
+
+    scheduleCardPatch(ds, '{"state":"same"}');
+    scheduleCardPatch(ds, '{"state":"same"}');
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardId).toBe('om_SAME');
+    expect(ds.pendingCardJson).toBe('{"state":"same"}');
+
+    resolvePatch();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardId).toBeUndefined();
+    expect(ds.pendingCardJson).toBeUndefined();
+    expect(ds.cardPatchInFlight).toBe(false);
+
+    // The optimization is adjacency-only: once the successful PATCH has
+    // settled, the same state scheduled later must still reach Lark.
+    scheduleCardPatch(ds, '{"state":"same"}');
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+
+  it('retries an identical queued PATCH when the in-flight PATCH fails', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_RETRY';
+
+    let rejectPatch!: (error: Error) => void;
+    let resolveRetry!: () => void;
+    updateMessageMock
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => { rejectPatch = reject; }),
+      )
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveRetry = resolve; }),
+      );
+
+    scheduleCardPatch(ds, '{"state":"retry"}');
+    scheduleCardPatch(ds, '{"state":"retry"}');
+
+    rejectPatch(new Error('temporary failure'));
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls[1]).toEqual([
+      APP_ID,
+      'om_RETRY',
+      '{"state":"retry"}',
+    ]);
+
+    resolveRetry();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+
+  it('does not deduplicate identical JSON queued for a different card', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_OLD';
+
+    let resolveOldPatch!: () => void;
+    let resolveNewPatch!: () => void;
+    updateMessageMock
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveOldPatch = resolve; }),
+      )
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveNewPatch = resolve; }),
+      );
+
+    scheduleCardPatch(ds, '{"state":"same-json"}');
+    ds.streamCardId = 'om_NEW';
+    scheduleCardPatch(ds, '{"state":"same-json"}');
+
+    resolveOldPatch();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls[1]).toEqual([
+      APP_ID,
+      'om_NEW',
+      '{"state":"same-json"}',
+    ]);
+
+    resolveNewPatch();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
   });
 });
 

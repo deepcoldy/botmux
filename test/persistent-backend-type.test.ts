@@ -174,7 +174,11 @@ describe('shutdownBackendDisposition (shutdown freeze-once)', () => {
   });
   it('routes a frozen Riff worker through drain + durable lineage ACK, never direct SIGTERM', () => {
     bot.backendType = 'pty';
-    expect(shutdownBackendDisposition(ds({ sessionBackend: 'riff' }))).toBe('riff-drain-detach');
+    expect(shutdownBackendDisposition(ds({ sessionBackend: 'riff' }))).toBe('remote-drain-detach');
+  });
+  it('routes a frozen Mojo worker through the same durable remote drain, never direct SIGTERM', () => {
+    bot.backendType = 'pty';
+    expect(shutdownBackendDisposition(ds({ sessionBackend: 'mojo' }))).toBe('remote-drain-detach');
   });
 });
 

@@ -44,6 +44,22 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
 }
 
 describe('cmdSend hook context wiring', () => {
+  it('strips trailing memory citations before relay and direct-send rendering', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nfunction currentBotIsApiOnly', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    expect(relaySend).toContain('content = stripTrailingOaiMemoryCitation(content);');
+    expect(relaySend.indexOf('content = stripTrailingOaiMemoryCitation(content);'))
+      .toBeLessThan(relaySend.indexOf('prepareCardMarkdown('));
+
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain('content = stripTrailingOaiMemoryCitation(content);');
+    expect(cmdSend.indexOf('content = stripTrailingOaiMemoryCitation(content);'))
+      .toBeLessThan(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'));
+  });
+
   it('delegates CLI session snapshot loading to the session-store gate (scope repair lives behind it)', () => {
     const loadSessionsStart = cliSource.indexOf('function loadSessions()');
     expect(loadSessionsStart).toBeGreaterThanOrEqual(0);

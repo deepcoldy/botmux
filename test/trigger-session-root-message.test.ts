@@ -96,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     map.set(key, ds);
     return true;
   },
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true })),
   getDaemonBootId: () => 'test-boot-id',
 }));
 

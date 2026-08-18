@@ -21,6 +21,7 @@ import {
   type CliOptionsState,
   type SubstituteTargetResolution,
 } from './bot-defaults.js';
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
@@ -287,6 +288,83 @@ export function BdTabGrid(props: { children: ReactNode; className?: string }) {
       {props.children}
     </div>
   );
+}
+
+/**
+ * Normalise an agent-switch close summary out of an (untrusted) JSON body.
+ *
+ * count and ids are read TOGETHER on purpose. Either one alone is evidence that a
+ * remote session survived, and trusting only one is how a malformed payload
+ * fails open:
+ *  - count>0 with missing/empty ids used to print no id at all;
+ *  - ids present with count 0/absent used to print "manual cleanup required" and
+ *    still show the green tick.
+ * So: any evidence at all ⇒ residual, and a declared residual with no usable id
+ * renders as `unknown` rather than vanishing.
+ */
+/** What a Riff-side agent persist reports back to its own visible status. */
+interface CliPersistOutcome {
+  ok: boolean;
+  /** True when a remote session survived (or the switch aborted). */
+  hadProblem: boolean;
+  note: string;
+}
+
+/**
+ * Did this response come AFTER the irreversible agent-switch closes?
+ *
+ * Detected by the presence of the close-summary fields, deliberately NOT by
+ * enumerating error codes. The enumeration was the bug: the server grew a fourth
+ * post-close exit (`reasoning_effort_not_supported_by_model`) that carries the
+ * same summary, but the client only recognised the two it knew, so the surviving
+ * remote task ids were silently dropped and an operator had no handle to clean
+ * them up. Any future post-close exit is now rendered without touching this file.
+ */
+function carriesAgentSwitchCloseSummary(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const record = body as Record<string, unknown>;
+  return 'closedMismatchedSessions' in record
+    || 'closedMismatchedFailed' in record
+    || 'closedMismatchedResidual' in record
+    || 'closedMismatchedResidualTaskIds' in record;
+}
+
+function parseAgentSwitchSummary(body: unknown): {
+  closed: number;
+  failed: number;
+  residual: number;
+  residualIds: string[];
+  hasResidual: boolean;
+} {
+  const record = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const num = (v: unknown): number =>
+    typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0;
+  const closed = num(record.closedMismatchedSessions);
+  const failed = num(record.closedMismatchedFailed);
+  const residualCount = num(record.closedMismatchedResidual);
+  const rawIds = record.closedMismatchedResidualTaskIds;
+  const ids = Array.isArray(rawIds)
+    ? rawIds.map(id => (typeof id === 'string' && id.trim() ? id : 'unknown'))
+    : [];
+  const hasResidual = residualCount > 0 || ids.length > 0;
+  // A declared residual with no usable id must still be visible.
+  const residualIds = hasResidual && ids.length === 0 ? ['unknown'] : ids;
+  return {
+    closed,
+    failed,
+    residual: Math.max(residualCount, residualIds.length),
+    residualIds,
+    hasResidual,
+  };
+}
+
+/** Render residual remote ids; empty only when there is genuinely no residual. */
+function residualIdText(
+  summary: { residualIds: string[] },
+  tr: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (summary.residualIds.length === 0) return '';
+  return tr('botDefaults.agentResidualIds', { ids: summary.residualIds.join(', ') });
 }
 
 function statusClass(status: StatusMessage, extra = ''): string {
@@ -844,9 +922,11 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'advanced'}
         >
           <BdTabGrid>
-            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
-                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' ? (
+            {/* 远端 CLI（riff/mojo）：backendType 与 CLI 选择 1:1 绑定 ——
+                reconcileRiffBackendType 在 spawn 层按 isRemoteBackendId(cliId)
+                无条件改写为同名后端，所以这里手动切 pty/tmux 只是一个会被
+                静默覆盖的假选择。隐藏该区块。 */}
+            {!isRemoteCliId(bot.cliId) ? (
               <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
@@ -1361,6 +1441,13 @@ export function BotAgentSection(props: {
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty = use
+  // the runner default (10 min). `touched` gates whether a save sends the field
+  // at all: an untouched field is omitted so the daemon preserves the exact
+  // stored ms (including legal non-whole-minute values) instead of clearing it.
+  const [turnTimeoutMin, setTurnTimeoutMin] = useState(turnTimeoutMinFromMs(bot.turnTimeoutMs));
+  const [turnTimeoutTouched, setTurnTimeoutTouched] = useState(false);
+  const [turnTimeoutError, setTurnTimeoutError] = useState<string | null>(null);
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1375,6 +1462,9 @@ export function BotAgentSection(props: {
     setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
+    setTurnTimeoutTouched(false);
+    setTurnTimeoutError(null);
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1384,6 +1474,7 @@ export function BotAgentSection(props: {
     bot.larkAppId,
     bot.model,
     bot.reasoningEffort,
+    bot.turnTimeoutMs,
     runtimeConfigKey,
     bot.wrapperCli,
     bot.skillInjection,
@@ -1468,25 +1559,64 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
+    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // so an illegal value surfaces an inline error instead of silently clearing
+    // the config. Untouched → omitted below so the daemon preserves the stored
+    // ms exactly (including legal non-whole-minute values).
+    let turnTimeoutField: number | '' | undefined;
+    if (cliKey === 'dsh' && turnTimeoutTouched) {
+      const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
+      if (parsed === 'invalid') {
+        const text = tr('botDefaults.agentTurnTimeoutInvalid');
+        setTurnTimeoutError(text);
+        setAgentStatus({ text: `✗ ${text}` });
+        return;
+      }
+      setTurnTimeoutError(null);
+      turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
+    }
     setAgentBusy(true);
     try {
       const body = {
         cliId: cliKey,
         model,
         reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        // dsh-only: only send when the user actually edited the field. Omitting
+        // it makes the daemon preserve the current value; non-dsh selections
+        // never send it (the daemon drops any stored value for non-dsh CLIs).
+        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
-        const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
-          ? res.body.closedMismatchedSessions as number
-          : 0;
-        const closedText = closedCount > 0
-          ? tr('botDefaults.agentClosedCount', { count: closedCount })
-          : '';
+        const summary = parseAgentSwitchSummary(res.body);
+        const closedCount = summary.closed;
+        const residualCount = summary.residual;
+        const failedCount = summary.failed;
+        // Localised, not hardcoded: this component is already tr()-driven, so a
+        // raw Chinese string would reach an English dashboard.
+        const notes = [
+          closedCount > 0 ? tr('botDefaults.agentClosedCount', { count: closedCount }) : '',
+          // Closed, but their remote sessions are still running.
+          residualCount > 0 ? tr('botDefaults.agentClosedResidual', { count: residualCount }) : '',
+          // Not closed at all — the rows are still active.
+          failedCount > 0 ? tr('botDefaults.agentCloseFailed', { count: failedCount }) : '',
+          // The ids are the ONLY handle for manual cleanup; a count alone is not
+          // actionable. Malformed/blank entries render as `unknown` rather than
+          // silently disappearing.
+          residualIdText(summary, tr),
+        ].filter(Boolean);
+        const closedText = notes.join(' · ');
+        // `hasResidual` (count OR ids), not the count alone — a payload carrying
+        // only ids must still lose the green tick.
+        const hadProblem = summary.hasResidual || failedCount > 0;
         setAgentStatus(res.body.availabilityWarning
           ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }
-          : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
+          : hadProblem
+            // Never the green tick when a session is still active or a remote
+            // session survived: that is what made this invisible.
+            ? { text: `⚠️ ${closedText}` }
+            : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime === undefined
@@ -1498,8 +1628,16 @@ export function BotAgentSection(props: {
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
+        // Re-sync the minutes input from the authoritative saved ms and clear
+        // the dirty flag so a subsequent unrelated save won't touch the field.
+        setTurnTimeoutMin(turnTimeoutMinFromMs(
+          typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
+        ));
+        setTurnTimeoutTouched(false);
+        setTurnTimeoutError(null);
         setRuntimeTouched(false);
         if (cliRuntime) {
           const probe = res.body.runtimeProbe;
@@ -1516,9 +1654,25 @@ export function BotAgentSection(props: {
           }
         }
       } else {
-        const detail = typeof res.body?.message === 'string' && res.body.message
-          ? res.body.message
-          : responseErrorText(res);
+        // The switch transaction refused: say what actually happened rather than
+        // surfacing a bare error code — the config is unchanged, some rows closed,
+        // and some remote sessions may need manual cleanup.
+        // ANY post-close exit, detected by the summary fields rather than a list of
+        // error codes — see carriesAgentSwitchCloseSummary. Some rows are closed
+        // and their remote ids are only ever reported here.
+        const aborted = carriesAgentSwitchCloseSummary(res.body);
+        const abortSummary = parseAgentSwitchSummary(res.body);
+        const detail = aborted
+          ? [
+            tr('botDefaults.agentSwitchAborted', {
+              closed: abortSummary.closed,
+              failed: abortSummary.failed,
+            }),
+            residualIdText(abortSummary, tr),
+          ].filter(Boolean).join(' · ')
+          : typeof res.body?.message === 'string' && res.body.message
+            ? res.body.message
+            : responseErrorText(res);
         const text = `✗ ${detail}`;
         setAgentStatus({ text });
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
@@ -1539,10 +1693,18 @@ export function BotAgentSection(props: {
    * reach PUT /agent — the bot would stay on its old CLI and backendType
    * would never auto-flip to riff. Returns false when persisting failed.
    */
-  async function persistRiffCliSelection(): Promise<boolean> {
-    if (bot.cliId === 'riff') return true; // already persisted
+  /**
+   * Riff's save reuses PUT /agent, so it inherits the SAME close transaction —
+   * including a residual (rows closed, remote still running) and an aborted
+   * switch. It must return that to the caller instead of a bare boolean:
+   * `setAgentStatus` is rendered in the `!isRiff` branch, so anything written
+   * there while Riff is selected is invisible.
+   */
+  async function persistRiffCliSelection(): Promise<CliPersistOutcome> {
+    if (bot.cliId === 'riff') return { ok: true, hadProblem: false, note: '' };
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
+      const summary = parseAgentSwitchSummary(res.body);
       if (res.ok && res.body.ok) {
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
@@ -1551,13 +1713,27 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
-        return true;
+        const note = [
+          summary.residual > 0 ? tr('botDefaults.agentClosedResidual', { count: summary.residual }) : '',
+          residualIdText(summary, tr),
+        ].filter(Boolean).join(' · ');
+        return { ok: true, hadProblem: summary.hasResidual, note };
       }
-      setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
-      return false;
+      // Aborted switch (close refused, or commit failed after closes ran): the
+      // config did NOT change and some remote sessions may need manual cleanup.
+      const aborted = carriesAgentSwitchCloseSummary(res.body);
+      const note = aborted
+        ? [
+          // Riff-specific wording: by this point the /riff write already
+          // succeeded, so "config unchanged" would be false here — only the
+          // Agent selection failed to switch.
+          tr('botDefaults.riffAgentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
+          residualIdText(summary, tr),
+        ].filter(Boolean).join(' · ')
+        : responseErrorText(res);
+      return { ok: false, hadProblem: true, note };
     } catch (e: any) {
-      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
-      return false;
+      return { ok: false, hadProblem: true, note: caughtErrorText(e) };
     }
   }
 
@@ -1583,6 +1759,8 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  // The dsh adapter is the only one that forwards a runner turn timeout.
+  const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
 
   useEffect(() => {
@@ -1777,6 +1955,31 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
+      {isDsh && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            <input
+              type="number"
+              min={0}
+              // Allow non-whole minutes so a legal non-60000-multiple ms value
+              // (e.g. 90001ms ≈ 1.50002min) can be shown and edited losslessly.
+              step="any"
+              inputMode="decimal"
+              data-input="agentTurnTimeout"
+              placeholder={tr('botDefaults.agentTurnTimeoutPlaceholder')}
+              value={turnTimeoutMin}
+              disabled={agentBusy}
+              onChange={event => {
+                setTurnTimeoutMin(event.currentTarget.value);
+                setTurnTimeoutTouched(true);
+                setTurnTimeoutError(null);
+              }}
+            />
+            {turnTimeoutError ? <small className="hint-warn" data-turn-timeout-error="">{turnTimeoutError}</small> : null}
+          </label>
+        </div>
+      )}
       {isCodexSelection && (
         <div className="bd-row">
           <div className="bd-field">
@@ -1839,6 +2042,54 @@ export function BotAgentSection(props: {
       )}
     </section>
   );
+}
+
+/**
+ * Node's setTimeout delay caps at a 32-bit signed int of ms; a larger value
+ * wraps to ~1ms. Kept in lockstep with `MAX_TURN_TIMEOUT_MS` in bot-registry
+ * (a browser bundle can't import that Node-side module); a unit test asserts the
+ * two stay equal so this copy can't silently drift.
+ */
+export const DASHBOARD_MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Convert a stored dsh turn timeout (ms) into the minutes string shown in the
+ * input. Absent / non-positive / non-integer / over-bound → empty (the field
+ * then means "use the runner default"). A legal value that is not a whole
+ * number of minutes is shown as its decimal minutes (trimmed of any float
+ * tail) rather than hidden as empty; `parseTurnTimeoutMinInput` re-rounds it to
+ * the nearest whole ms, so the displayed value round-trips back to the same ms.
+ */
+function turnTimeoutMinFromMs(ms: unknown): string {
+  if (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return '';
+  const minutes = ms / 60_000;
+  // Trim any floating-point tail; parseTurnTimeoutMinInput re-rounds to ms.
+  return Number.isInteger(minutes) ? String(minutes) : String(Number(minutes.toFixed(10)));
+}
+
+/**
+ * Parse the minutes input for the PUT body. Returns:
+ *  - `''`        → cleared (empty input) → daemon reverts to the runner default,
+ *  - a number    → minutes → ms, rounded to the nearest whole ms, a positive
+ *                  integer within the arm-able bound,
+ *  - `'invalid'` → the operator typed something that is not a clearable blank
+ *                  and not a representable positive timeout (0, negative, NaN,
+ *                  or a minutes value whose nearest ms is ≤0 / over-bound).
+ * Rounding to the nearest whole ms makes the value shown by
+ * `turnTimeoutMinFromMs` (a possibly-decimal minutes figure) round-trip back to
+ * the exact stored ms; invalid input is surfaced inline, never silently cleared.
+ */
+function parseTurnTimeoutMinInput(minutes: string): number | '' | 'invalid' {
+  const trimmed = minutes.trim();
+  if (!trimmed) return '';
+  const asMinutes = Number(trimmed);
+  if (!Number.isFinite(asMinutes) || asMinutes <= 0) return 'invalid';
+  // Round to the nearest whole ms: the minutes field is a lossy display of a
+  // ms value, so snapping back to an integer ms is the safe, non-destructive
+  // interpretation (e.g. 1.5000166667 min → 90001 ms).
+  const ms = Math.round(asMinutes * 60_000);
+  if (ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return 'invalid';
+  return ms;
 }
 
 function skillInjectionResolved(bot: BotDefaultsRow): string {
@@ -4105,7 +4356,7 @@ const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
 /** riff task-execute 的 sandboxCluster；缺省行为与服务端一致，回落 BOE。 */
 const RIFF_SANDBOX_CLUSTER_OPTIONS = ['boe', 'cn'] as const;
 
-function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
+function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<CliPersistOutcome> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
@@ -4155,8 +4406,16 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       if (res.ok && res.body.ok) {
         const next = typeof res.body.riff === 'string' && res.body.riff ? JSON.parse(res.body.riff) : null;
         props.patchBot(props.bot.larkAppId, { riff: next });
-        if (props.persistCliSelection && !(await props.persistCliSelection())) {
-          setStatus({ text: `✗ ${tr('botDefaults.riffCliPersistFailed')}` });
+        const persisted = await props.persistCliSelection?.();
+        if (persisted && !persisted.ok) {
+          // Show the transaction's own detail (Agent NOT switched + surviving
+          // remote ids) in THIS section's visible status, not the generic text.
+          setStatus({ text: `✗ ${persisted.note || tr('botDefaults.riffCliPersistFailed')}` });
+          return;
+        }
+        if (persisted?.hadProblem) {
+          // Saved, but a remote session survived — never the green tick.
+          setStatus({ text: `⚠️ ${persisted.note}` });
           return;
         }
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });

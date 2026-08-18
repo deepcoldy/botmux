@@ -51,11 +51,21 @@ const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
 
 /** Drivers whose transcript contract exposes every terminal edge needed for a
  *  strong started-turn status gate. Codex has final_answer plus explicit
- *  turn_aborted parsing. Other structured drivers still
- *  use the queue for attribution, but their interrupted/error shapes are not
- *  yet complete enough to let a started turn suppress screen-ready forever. */
+ *  turn_aborted parsing. Pi's drainPiTranscript closes a turn on
+ *  stop/length-without-toolcall and on the hard error/aborted edges (verified
+ *  against pi 0.84.2: `terminate:true` is still not persisted and the newer
+ *  pending/deferred StopReasons never reach the session JSONL), so a started
+ *  Pi turn may suppress the screen-ready heuristic. Accepted gap: a custom
+ *  tool returning `terminate:true` leaves a started turn with no on-disk
+ *  terminal — the card stays working until the NEXT user turn's transcript
+ *  user event HOL-drops the unclosed head (botmux ships no such tool; same
+ *  bounded-recovery shape Codex accepts for lost rollout finals). Other
+ *  structured drivers still use the queue for attribution, but their
+ *  interrupted/error shapes are not yet complete enough to let a started turn
+ *  suppress screen-ready forever. */
 export const STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS = [
   'codex',
+  'pi',
 ] as const satisfies readonly CliId[];
 
 const LIFECYCLE_BLOCKING_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS);

@@ -16,6 +16,16 @@ export interface PendingCliInput {
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /**
+   * mojo only: the credential snapshot that arrived WITH this turn.
+   *
+   * Carried on the queue item rather than applied at IPC-receive time because the
+   * two are not simultaneous — a turn can sit queued while later messages arrive.
+   * Applying on receipt made two queued credential turns collapse: queueing B then
+   * C executed as A → C → C instead of A → B → C, because both patches landed
+   * before either turn ran.
+   */
+  mojoLivePatch?: import('../adapters/backend/mojo-types.js').MojoLivePatch;
   /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
    *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
    *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). Set on
