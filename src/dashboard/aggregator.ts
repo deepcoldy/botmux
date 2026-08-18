@@ -60,9 +60,16 @@ export class Aggregator {
         if (cur) this.sessions.set(ev.body.sessionId, { ...cur, status: 'closed' });
         break;
       }
-      case 'schedule.created':
-        this.schedules.set((ev.body.schedule as Sched).id, ev.body.schedule as Sched);
+      case 'schedule.created': {
+        const schedule = ev.body.schedule as Sched & { larkAppId?: string };
+        // Tag ownerless rows with the reporting daemon so scoped reconcile
+        // (hydrateSchedules) can account for them.
+        this.schedules.set(schedule.id, {
+          ...schedule,
+          larkAppId: schedule.larkAppId ?? larkAppId,
+        });
         break;
+      }
       case 'schedule.updated': {
         const cur = this.schedules.get(ev.body.id);
         if (cur) this.schedules.set(ev.body.id, { ...cur, ...ev.body.patch });
@@ -84,8 +91,24 @@ export class Aggregator {
       this.sessions.set(r.sessionId, mergeSpawnedRow(this.sessions.get(r.sessionId), r, larkAppId));
     }
   }
-  hydrateSchedules(rows: Sched[]): void {
-    for (const r of rows) this.schedules.set(r.id, r);
+  /**
+   * Per-daemon reconcile for schedules. Upserts `rows` and REMOVES schedules
+   * owned by `larkAppId` that are absent from the snapshot: a
+   * `schedule.deleted` missed while the SSE stream was down would otherwise
+   * ghost forever, since upsert alone can't delete. Schedules owned by other
+   * daemons (and ownerless rows) are untouched. Rows missing `larkAppId`
+   * are tagged with the hydrating daemon, which is authoritative for them
+   * (they came from its /api/schedules).
+   */
+  hydrateSchedules(larkAppId: string, rows: Sched[]): void {
+    const incoming = new Set(rows.map(r => r.id));
+    for (const r of rows) {
+      const owner = (r as { larkAppId?: string }).larkAppId ?? larkAppId;
+      this.schedules.set(r.id, { ...r, larkAppId: owner });
+    }
+    for (const [id, cur] of this.schedules) {
+      if (cur.larkAppId === larkAppId && !incoming.has(id)) this.schedules.delete(id);
+    }
   }
 
   getSessions(): Row[] { return [...this.sessions.values()]; }
@@ -138,22 +161,31 @@ export class Aggregator {
  * function.
  *
  * `onConnected` fires after EVERY successful stream establishment — the first
- * connection included — BEFORE any frame is read. While it runs, incoming
- * frames stay queued in the stream; once it resolves, reading begins and the
- * queued frames are applied in order. The caller uses it to install an
- * authoritative snapshot (GET /api/sessions) that is therefore at least as
- * fresh as every frame applied afterwards: a slow snapshot response can
- * never clobber state that a faster SSE event already delivered (the reverse
- * race of a naive post-subscribe hydrate). The same barrier on reconnect
- * recovers events missed while the stream was down. If `onConnected` throws,
- * frames are still read (best-effort).
+ * connection included — BEFORE any frame is read, and receives the
+ * subscription's abort signal. While it runs, incoming frames stay queued in
+ * the stream; once it resolves, reading begins and the queued frames are
+ * applied in order. The caller uses it to install an authoritative snapshot
+ * (GET /api/sessions) that is therefore at least as fresh as every frame
+ * applied afterwards: a slow snapshot response can never clobber state that
+ * a faster SSE event already delivered (the reverse race of a naive
+ * post-subscribe hydrate). The same barrier on reconnect recovers events
+ * missed while the stream was down.
+ *
+ * The signal is also the generation arbitration: if this subscription is
+ * aborted (daemon offline, superseded by a newer generation) while the
+ * callback is in flight, the callback MUST discard its result instead of
+ * applying it — otherwise the stale generation's snapshot reverse-clobbers
+ * the newer one. The callback should fetch with
+ * `AbortSignal.any([signal, timeout])` and re-check `signal.aborted` before
+ * every aggregator mutation. If `onConnected` throws, frames are still read
+ * (best-effort).
  */
 export function subscribeDaemon(
   d: DaemonInfo,
   agg: Aggregator,
   onError: (e: Error) => void,
   fetchImpl: typeof fetch = fetch,
-  onConnected?: () => Promise<void> | void,
+  onConnected?: (signal: AbortSignal) => Promise<void> | void,
 ): () => void {
   const ctrl = new AbortController();
   const url = `http://127.0.0.1:${d.ipcPort}/api/events`;
@@ -183,9 +215,11 @@ export function subscribeDaemon(
         // before any frame is applied. Frames arriving during this call
         // remain queued in the stream and are applied afterwards, in order,
         // so the snapshot can never overwrite fresher SSE-delivered state.
+        // The subscription signal is passed through as the generation
+        // arbitration — the callback must not apply after abort.
         if (onConnected) {
           try {
-            await onConnected();
+            await onConnected(ctrl.signal);
           } catch (e) {
             onError(e instanceof Error ? e : new Error(String(e)));
           }

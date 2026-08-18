@@ -21,6 +21,7 @@ import {
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
@@ -1487,7 +1488,7 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ));
       aggregator.hydrateSessions(d.larkAppId, rows);
       for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
-      aggregator.hydrateSchedules(sch.schedules ?? []);
+      aggregator.hydrateSchedules(d.larkAppId, sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
     }
@@ -1503,8 +1504,10 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
           // frame is read. Frames arriving during this fetch stay queued in
           // the stream and apply afterwards, so the snapshot can never
           // clobber fresher SSE state; on reconnect it recovers missed
-          // events.
-          () => reconcileDaemon(d),
+          // events. The subscription signal is the generation arbitration:
+          // if aborted mid-flight (daemon offline, newer generation), the
+          // snapshot is discarded instead of clobbering the new generation.
+          signal => reconcileDaemon(d, signal),
         ),
       );
     }
@@ -1514,28 +1517,18 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
 }
 
 /**
- * Fetch one daemon's current session/schedule snapshot and merge it into the
- * aggregator. Runs as the subscribeDaemon barrier — before SSE frames are
- * read — on both initial attach and reconnect. Bounded by a timeout so a hung
- * daemon can't stall frame application indefinitely; on failure the live
- * stream remains the source of truth (best-effort).
+ * Reconcile one daemon's snapshot into the aggregator (subscribeDaemon
+ * barrier). Thin wrapper over reconcileDaemonSnapshot that also schedules
+ * presentation enrichment for the session rows.
  */
-async function reconcileDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
-  try {
-    const [sRes, schRes] = await Promise.all([
-      fetchDaemonIpc(d.ipcPort, '/api/sessions', { signal: AbortSignal.timeout(10_000) }),
-      fetchDaemonIpc(d.ipcPort, '/api/schedules', { signal: AbortSignal.timeout(10_000) }),
-    ]);
-    const s = await sRes.json() as { sessions: any[] };
-    const sch = await schRes.json() as { schedules: any[] };
-    const rows = (s.sessions ?? []).map((row) => (
-      d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
-    ));
-    aggregator.hydrateSessions(d.larkAppId, rows);
-    for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
-    aggregator.hydrateSchedules(sch.schedules ?? []);
-  } catch (e: any) {
-    logger.warn(`[dashboard] reconcile ${d.larkAppId}: ${e.message ?? e}`);
+async function reconcileDaemon(
+  d: import('./dashboard/registry.js').DaemonInfo,
+  signal: AbortSignal,
+): Promise<void> {
+  const snapshot = await reconcileDaemonSnapshot(d, aggregator, signal);
+  if (!snapshot) return;
+  for (const row of snapshot.sessions) {
+    sessionPresentation.schedule(d.larkAppId, row);
   }
 }
 
