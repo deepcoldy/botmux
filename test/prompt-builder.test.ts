@@ -315,8 +315,8 @@ describe('botmux routing prose XML boundaries', () => {
   });
 
   it.each([
-    ['zh', '&lt;对方 bot 的 open_id&gt;'],
-    ['en', '&lt;other-bot-open-id&gt;'],
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
   ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
     const prompt = buildBotmuxSystemPromptText({
       locale,

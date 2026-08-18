@@ -919,6 +919,105 @@ describe('scheduleCardPatch withdrawn handling', () => {
   });
 });
 
+describe('scheduleCardPatch adjacent duplicate handling', () => {
+  it('drops an identical PATCH queued for the same card after the in-flight PATCH succeeds', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_SAME';
+
+    let resolvePatch!: () => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise<void>(resolve => { resolvePatch = resolve; }),
+    );
+
+    scheduleCardPatch(ds, '{"state":"same"}');
+    scheduleCardPatch(ds, '{"state":"same"}');
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardId).toBe('om_SAME');
+    expect(ds.pendingCardJson).toBe('{"state":"same"}');
+
+    resolvePatch();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardId).toBeUndefined();
+    expect(ds.pendingCardJson).toBeUndefined();
+    expect(ds.cardPatchInFlight).toBe(false);
+
+    // The optimization is adjacency-only: once the successful PATCH has
+    // settled, the same state scheduled later must still reach Lark.
+    scheduleCardPatch(ds, '{"state":"same"}');
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+
+  it('retries an identical queued PATCH when the in-flight PATCH fails', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_RETRY';
+
+    let rejectPatch!: (error: Error) => void;
+    let resolveRetry!: () => void;
+    updateMessageMock
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => { rejectPatch = reject; }),
+      )
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveRetry = resolve; }),
+      );
+
+    scheduleCardPatch(ds, '{"state":"retry"}');
+    scheduleCardPatch(ds, '{"state":"retry"}');
+
+    rejectPatch(new Error('temporary failure'));
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls[1]).toEqual([
+      APP_ID,
+      'om_RETRY',
+      '{"state":"retry"}',
+    ]);
+
+    resolveRetry();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+
+  it('does not deduplicate identical JSON queued for a different card', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_OLD';
+
+    let resolveOldPatch!: () => void;
+    let resolveNewPatch!: () => void;
+    updateMessageMock
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveOldPatch = resolve; }),
+      )
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveNewPatch = resolve; }),
+      );
+
+    scheduleCardPatch(ds, '{"state":"same-json"}');
+    ds.streamCardId = 'om_NEW';
+    scheduleCardPatch(ds, '{"state":"same-json"}');
+
+    resolveOldPatch();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls[1]).toEqual([
+      APP_ID,
+      'om_NEW',
+      '{"state":"same-json"}',
+    ]);
+
+    resolveNewPatch();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+});
+
 // ─── Periodic usage refresh timer (PR #637 follow-up, codex review) ──────────
 //
 // The streaming card re-renders every USAGE_REFRESH_INTERVAL_MS while a turn is

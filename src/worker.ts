@@ -45,7 +45,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -1736,6 +1736,25 @@ let spawnArgvInitialPromptBusy = false;
  * arm above; quiescence argv adapters seed working then idle at first ready.
  */
 let spawnArgvNeedsWorkingSeed = false;
+/**
+ * Startup-window evidence for an argv-baked first prompt: true once the turn
+ * has VISIBLY started — busyPattern seen in the raw PTY stream since spawn, or
+ * a live structured-transcript user/final event ingested. Pi's TUI renders its
+ * input box seconds before it begins consuming the argv prompt (extension /
+ * model loading), and during that gap the screen shows no busy marker and the
+ * transcript has no user record — quiescence then reports a FALSE first idle
+ * ("not started yet", not "turn complete"). Until this latches,
+ * markPromptReady holds ready + re-arms instead of seeding working→idle.
+ */
+let spawnArgvTurnStartEvidenceSeen = false;
+/** Rolling ANSI-stripped PTY tail scanned for busyPattern while the argv
+ *  first-turn evidence gate is armed; dropped once evidence latches. */
+let spawnArgvTurnStartBusyScanTail = '';
+/** Fail-open deadline for the evidence gate: past this instant the gate stops
+ *  holding, so an argv prompt the CLI never consumed (e.g. dropped on a
+ *  restart) cannot park the card at 工作中 forever. */
+let spawnArgvTurnStartEvidenceDeadlineMs = 0;
+let spawnArgvTurnStartFailOpenTimer: ReturnType<typeof setTimeout> | null = null;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
@@ -4035,7 +4054,8 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
         ? 'worker.empty_final_failed_connection'
         : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
-  return partialText?.trim() ? `${partialText.trim()}\n\n${failure}` : failure;
+  const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
+  return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -6066,6 +6086,9 @@ function codexBridgeIngest(opts: {
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
+  // After ingest so the latch's delivery re-kick observes the started turn —
+  // the flush's own bridge mark must queue behind it, not ahead of it.
+  noteSpawnArgvTurnStartTranscriptEvidence(result.events);
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
   // Transcript-driven idle: a normal `assistant_final` or no-output
   // `turn_aborted` is Codex declaring end-of-turn, far more reliable than the screen-pattern heuristic
@@ -8555,12 +8578,12 @@ async function handleTrustedCodexAppMarker(
       log(`${cliName()} native turn ${nativeTurnId.substring(0, 12)} mapped to botmux turn ${turnId.substring(0, 12)}`);
     }
     let suppressDelivery = false;
-    // What actually reaches Lark: strip a trailing sentinel line so the literal
-    // token never posts. `finalContent` stays RAW above (the steer_superseded
-    // validator asserts finalContent==='' and must see the unstripped payload).
-    // If nothing remains after stripping, this was a pure-silence final → treat
-    // as suppressed so the daemon persists the FIFO advance without delivering.
-    const deliverableContent = stripTrailingBridgeSentinelLine(finalContent);
+    // What actually reaches Lark: strip internal memory attribution and a
+    // trailing sentinel line. `finalContent` stays RAW above (the
+    // steer_superseded validator asserts finalContent==='' and the fallback gate
+    // must see the unstripped payload). If nothing remains, this was metadata or
+    // a pure-silence final → persist the FIFO advance without delivering.
+    const deliverableContent = bridgePostText(finalContent, false);
     if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
       suppressDelivery = true;
     }
@@ -9025,6 +9048,25 @@ function onPtyData(data: string): void {
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
+  // Argv first-turn start evidence (Pi): latch the busy marker from the raw
+  // PTY stream. The viewport-based defer cannot see a marker that has not
+  // rendered yet, and a fast turn can paint and clear `Working...` between
+  // screen samples — the stream sees every byte exactly once.
+  if (
+    spawnArgvNeedsWorkingSeed
+    && !spawnArgvTurnStartEvidenceSeen
+    && structuredBridgeIsPi()
+    && cliAdapter?.busyPattern
+  ) {
+    spawnArgvTurnStartBusyScanTail = tailChars(
+      spawnArgvTurnStartBusyScanTail + stripAnsiForLog(data),
+      500,
+    );
+    if (cliAdapter.busyPattern.test(spawnArgvTurnStartBusyScanTail)) {
+      spawnArgvTurnStartEvidenceSeen = true;
+      spawnArgvTurnStartBusyScanTail = '';
+    }
+  }
   renderer?.write(data);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
@@ -9273,6 +9315,120 @@ function scheduleStructuredStartGraceRecheck(remainingMs: number): void {
   structuredStartGraceRecheckTimer.unref?.();
 }
 
+/** How long the argv first-turn evidence gate may hold ready with no start
+ *  evidence at all. Pi's startup gap (extension/model loading before it
+ *  consumes the argv prompt) is typically 3–9s; 90s covers slow hosts while
+ *  keeping a never-consumed argv prompt from parking the card at 工作中
+ *  forever. */
+const SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS = 90_000;
+
+/** True while markPromptReady must hold the argv-baked first prompt's ready:
+ *  no "turn started" evidence yet and the bounded grace has not expired.
+ *  Scoped to Pi — the only quiescence-argv adapter with BOTH evidence channels
+ *  (busyPattern + always-on structured transcript); Gemini/OpenCode/MTR keep
+ *  their historical first-idle behavior. Never applies to the Grok-class busy
+ *  arm, whose first ready is handled by spawnArgvInitialPromptBusy. */
+function spawnArgvTurnStartGateHolds(): boolean {
+  if (!spawnArgvNeedsWorkingSeed || spawnArgvInitialPromptBusy) return false;
+  if (!structuredBridgeIsPi()) return false;
+  if (spawnArgvTurnStartEvidenceSeen) return false;
+  return Date.now() < spawnArgvTurnStartEvidenceDeadlineMs;
+}
+
+/** Latch "the argv first turn actually began" from live structured-transcript
+ *  events. The latch must happen at INGEST time, not lazily at gate time: a
+ *  fast first turn can be started AND drained/emitted before markPromptReady
+ *  runs, leaving no started turn to observe in the queue. A user record is the
+ *  authoritative start signal; a final implies start too (covers a drain that
+ *  sees both lines at once).
+ *
+ *  The latch is also a DELIVERY DRIVER, not just a boolean: when evidence
+ *  lands later than the 15s first-prompt timeout, every markPromptReady-based
+ *  driver has already fired rejected and stopped (probe one-shot, timeout
+ *  short-circuit) and the 90s fail-open stands down on evidenceSeen — with a
+ *  silent PTY nothing else would ever deliver a startup-queued message. The
+ *  user record hitting disk is itself the proof the TUI accepts input, so
+ *  re-kick immediately. (The PTY busyPattern latch needs no re-kick: busy
+ *  output implies a later quiescence edge that re-drives markPromptReady.) */
+function noteSpawnArgvTurnStartTranscriptEvidence(events: readonly { kind: string }[]): void {
+  // The whole evidence mechanism is Pi-scoped (matching the onPtyData busy
+  // scan and spawnArgvTurnStartGateHolds); this generic ingest path also
+  // serves Grok — another argv-baked + structured-bridge + type-ahead CLI —
+  // so without this guard the flush side effect below would add a new
+  // startup-window write for Grok (whose first ready is owned by the
+  // SessionStart busy arm, not by this gate).
+  if (!structuredBridgeIsPi()) return;
+  if (spawnArgvTurnStartEvidenceSeen || !spawnArgvNeedsWorkingSeed) return;
+  if (!events.some(ev => ev.kind === 'user' || ev.kind === 'assistant_final')) return;
+  spawnArgvTurnStartEvidenceSeen = true;
+  spawnArgvTurnStartBusyScanTail = '';
+  if (!isPromptReady && pendingMessages.length > 0) {
+    log('Argv first-turn start evidence landed via transcript — releasing startup-queued input');
+    flushQueuedInputAfterTurnStartEvidence();
+  }
+}
+
+function stopSpawnArgvTurnStartFailOpen(): void {
+  if (!spawnArgvTurnStartFailOpenTimer) return;
+  clearTimeout(spawnArgvTurnStartFailOpenTimer);
+  spawnArgvTurnStartFailOpenTimer = null;
+}
+
+/** Turn-start evidence in hand ⇒ startup-queued input becomes deliverable.
+ *
+ *  Messages that arrive during startup (awaitingFirstPrompt) skip
+ *  handleMessage's type-ahead write (shouldWriteNow holds them, "no input box
+ *  yet") and historically relied on markPromptReady()'s tail flush for
+ *  delivery. When a Pi argv first turn never lands its terminal record
+ *  (terminate:true gap), every ready driver dies rejected: the structured
+ *  lifecycle block refuses quiescence idles, the queued-message busy probe
+ *  and the 15s first-prompt timeout both short-circuit through the same
+ *  rejected markPromptReady(), and the 90s fail-open stands down once
+ *  evidence is latched. Without an explicit re-kick the message sits in
+ *  pendingMessages forever (card pinned at 工作中, the next transcript user
+ *  event never appears, HOL-drop never fires).
+ *
+ *  Two call sites, one safety argument — input may only be re-kicked once the
+ *  TUI provably booted far enough to accept it:
+ *   1. markPromptReady()'s lifecycle-block rejection (a started turn /
+ *      confirmed submit exists);
+ *   2. the transcript-evidence latch in codexBridgeIngest (the user record
+ *      just hit disk — the ONLY driver left when evidence lands later than
+ *      every probe/timeout and the PTY stays silent).
+ *  The argv turn-start evidence gate must NOT re-kick — before any evidence
+ *  the TUI may still be loading extensions/models and a type-ahead paste
+ *  could be dropped or land in a half-drawn screen (flushPending() has no
+ *  awaitingFirstPrompt gate of its own; shouldWriteNow()'s hold is the only
+ *  startup input protection).
+ *
+ *  flushPending() still re-checks its own admission gates (type-ahead
+ *  allowance, durable HOL, injection serialization, restart fences,
+ *  ready-gate settle), so a non-type-ahead adapter keeps holding until a real
+ *  ready edge; this is a re-kick, never a bypass of those gates. */
+function flushQueuedInputAfterTurnStartEvidence(): void {
+  if (pendingMessages.length === 0) return;
+  flushPending();
+}
+
+/** Re-drive the held first idle if no start evidence ever appears. Without
+ *  this, a swallowed quiescence idle followed by a fully silent PTY (argv
+ *  prompt never consumed) would leave no later signal to re-check the gate.
+ *  The re-driven idle still passes deferPromptReadyWhileBusy, so a turn whose
+ *  evidence was merely missed keeps deferring on a busy viewport. */
+function scheduleSpawnArgvTurnStartFailOpen(): void {
+  if (spawnArgvTurnStartFailOpenTimer) return;
+  const backendAtSchedule = backend;
+  const cliGenerationAtSchedule = cliSpawnGeneration;
+  spawnArgvTurnStartFailOpenTimer = setTimeout(() => {
+    spawnArgvTurnStartFailOpenTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== cliGenerationAtSchedule) return;
+    if (isPromptReady || !spawnArgvNeedsWorkingSeed || spawnArgvTurnStartEvidenceSeen) return;
+    log('Argv-baked first prompt showed no start evidence within grace — failing open to quiescence idle');
+    idleDetector?.fireIdle();
+  }, Math.max(1, spawnArgvTurnStartEvidenceDeadlineMs - Date.now()));
+  spawnArgvTurnStartFailOpenTimer.unref?.();
+}
+
 function markPromptReady(): void {
   if (bareShellLaunchBlocked) {
     log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
@@ -9347,6 +9503,29 @@ function markPromptReady(): void {
     return;
   }
   if (freshnessAction === 'ignore') return;
+  // Argv-baked first prompt start gate (Pi): the TUI paints its input box
+  // seconds before the CLI begins consuming the argv prompt, and that startup
+  // window has no busyPattern on screen and no transcript user record —
+  // quiescence then produces a FALSE first idle ("not started yet", not "turn
+  // complete"). Letting it through would set isPromptReady for the whole turn
+  // and seed working→idle mid-turn (premature ✅ DONE + card flip to 等待输入).
+  // Hold ready and re-arm until the turn visibly starts; bounded fail-open via
+  // SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS restores the historical quiescence
+  // behavior if evidence never appears.
+  // Deliberately NO flush re-kick here (unlike the lifecycle block below):
+  // with zero turn-start evidence the TUI may still be booting, and a
+  // type-ahead paste could be dropped or land in a half-drawn screen —
+  // shouldWriteNow()'s awaitingFirstPrompt hold is the only startup input
+  // protection and flushPending() does not re-check it. Queued messages are
+  // delivered the moment evidence appears (the transcript latch re-kicks, a
+  // busy-marker latch implies a later quiescence edge) or by the 90s
+  // fail-open.
+  if (spawnArgvTurnStartGateHolds()) {
+    log('Argv-baked first prompt has not visibly started (no busy marker or transcript user event since spawn) — re-arming idle detector');
+    idleDetector?.reset();
+    scheduleSpawnArgvTurnStartFailOpen();
+    return;
+  }
   // Screen prompt/quiescence is only a UI heuristic. Structured transcript
   // bridges have the stronger lifecycle signal: a transcript-started turn
   // without assistant_final is still running even if the TUI redraw exposes a
@@ -9362,6 +9541,7 @@ function markPromptReady(): void {
     log('Ignoring prompt-ready heuristic while a structured turn is unfinished or submit verification/start is pending');
     idleDetector?.reset();
     if (remainingMs !== undefined) scheduleStructuredStartGraceRecheck(remainingMs);
+    flushQueuedInputAfterTurnStartEvidence();
     return;
   }
   structuredRejectedReadyEvidenceGeneration = undefined;
@@ -12372,6 +12552,14 @@ async function spawnCli(
     injectsReadyHook: cliAdapter.injectsReadyHook === true,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
+  // Fresh evidence window for the argv first-turn start gate (Pi): the new
+  // generation must not inherit a previous spawn's latch or fail-open timer.
+  stopSpawnArgvTurnStartFailOpen();
+  spawnArgvTurnStartEvidenceSeen = false;
+  spawnArgvTurnStartBusyScanTail = '';
+  spawnArgvTurnStartEvidenceDeadlineMs = spawnArgvNeedsWorkingSeed
+    ? Date.now() + SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS
+    : 0;
   if (deferInitialPrompt && preparedDeferredInput) {
     piInitialPromptAdditionalArgs = [...(preparedDeferredInput.additionalArgs ?? [])];
     piInitialPromptEnv = { ...(preparedDeferredInput.env ?? {}) };
@@ -14270,6 +14458,8 @@ function killCli(opts: {
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   stopStructuredStartGraceRecheck();
+  stopSpawnArgvTurnStartFailOpen();
+  spawnArgvTurnStartBusyScanTail = '';
   structuredRejectedReadyEvidenceGeneration = undefined;
   ptyOutputGeneration.reset();
   // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.

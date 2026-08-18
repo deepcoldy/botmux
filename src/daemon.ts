@@ -2,6 +2,7 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -18376,15 +18377,9 @@ export const __testOnly_handleBotAdded = handleBotAdded;
  *  than blocking the message.
  */
 function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
-  try {
-    const fp = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
-    if (existsSync(fp)) {
-      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
-      for (const [name, openId] of Object.entries(data)) {
-        if (openId === senderOpenId) return name;
-      }
-    }
-  } catch { /* fall through */ }
+  for (const [name, openId] of Object.entries(readPeerCrossRef(config.session.dataDir, larkAppId))) {
+    if (openId === senderOpenId) return name;
+  }
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {

@@ -71,6 +71,7 @@ import {
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
 import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
+import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -883,15 +884,9 @@ export function __resetChatStatsForTest(): void {
 /** Read the per-bot cross-reference: botName(lowercase) → openId as seen by larkAppId's app */
 export function readBotOpenIdCrossRef(dataDir: string, larkAppId: string): Map<string, string> {
   const map = new Map<string, string>();
-  try {
-    const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
-    if (existsSync(fp)) {
-      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
-      for (const [name, openId] of Object.entries(data)) {
-        map.set(name.toLowerCase(), openId);
-      }
-    }
-  } catch { /* ignore */ }
+  for (const [name, openId] of Object.entries(readPeerCrossRef(dataDir, larkAppId))) {
+    map.set(name.toLowerCase(), openId);
+  }
   return map;
 }
 
@@ -997,11 +992,7 @@ export function updateBotOpenIdCrossRef(
   if (knownBotNames.size === 0) return;
 
   // Read existing cross-reference
-  const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
-  let existing: Record<string, string> = {};
-  try {
-    if (existsSync(fp)) existing = JSON.parse(readFileSync(fp, 'utf-8'));
-  } catch { /* ignore */ }
+  const existing: Record<string, string> = { ...readPeerCrossRef(dataDir, larkAppId) };
 
   // Update with new mentions that match known bot names
   let changed = false;
@@ -1017,8 +1008,7 @@ export function updateBotOpenIdCrossRef(
 
   if (changed) {
     try {
-      if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-      atomicWriteFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
+      writePeerCrossRef(dataDir, larkAppId, existing);
       logger.debug(`Updated bot open_id cross-ref for ${larkAppId}: ${JSON.stringify(existing)}`);
     } catch (err) {
       logger.debug(`Failed to write bot open_id cross-ref: ${err}`);
