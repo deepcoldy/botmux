@@ -232,12 +232,72 @@ describe('Agent Workbench visual contract', () => {
     // 只内收 2.4px 左右，所以右侧要求比左侧宽松，但仍要留出可见净空。
     expect(right - boardSide, '右内边距距底板右缘').toBeGreaterThanOrEqual(6);
     // 组头的折叠箭头和行的状态标共用一条竖直基线，两者内边距必须一致。
-    const groupRule = [...bare.matchAll(/\.wb-session-group\s*\{([^{}]*)\}/g)]
-      .map(match => match[1]).find(body => /(?:^|;)\s*padding:/.test(body)) ?? '';
-    const groupPadding = /padding:\s*([^;]+)/.exec(groupRule)?.[1].trim().split(/\s+/) ?? [];
-    expect(groupPadding.length).toBe(4);
-    expect(Number.parseFloat(groupPadding[3]), '组头左内边距').toBe(left);
-    expect(Number.parseFloat(groupPadding[1]), '组头右内边距').toBe(right);
+    // ⚠️ 组头有两条规则：基础的 `.wb-session-group` 和更特异的
+    // `.wb-session-group.wb-session-group-toggle`（渲染时组头永远带后一个类，所以
+    // 生效的是它）。上一轮只改了基础那条，实际渲染的左内边距仍是 2px，箭头整个落在
+    // 底板外、离会话栏左缘 3.7px —— 线上第二次反馈的「箭头贴边被切」就是它。
+    // 两条都量，缺一条就退回那次漏改。
+    const groupPaddings = [
+      ['基础规则', /\.wb-session-group\s*\{([^{}]*)\}/g],
+      ['生效规则（.wb-session-group-toggle）', /\.wb-session-group\.wb-session-group-toggle\s*\{([^{}]*)\}/g],
+    ] as const;
+    for (const [name, pattern] of groupPaddings) {
+      const rule = [...bare.matchAll(pattern)]
+        .map(match => match[1]).find(body => /(?:^|;)\s*padding:/.test(body)) ?? '';
+      const groupPadding = /padding:\s*([^;]+)/.exec(rule)?.[1].trim().split(/\s+/) ?? [];
+      expect(groupPadding.length, `${name}的 padding 必须是四值写法`).toBe(4);
+      expect(Number.parseFloat(groupPadding[3]), `${name}的组头左内边距`).toBe(left);
+      expect(Number.parseFloat(groupPadding[1]), `${name}的组头右内边距`).toBe(right);
+    }
+    // 首列宽度也要一致：组头第一格放折叠箭头、行第一格放状态标，两格左缘同在
+    // 22px 上、宽度同为 14px，箭头才真的落在行状态标那一列里。
+    const columnsOf = (pattern: RegExp) => (
+      [...bare.matchAll(pattern)].map(match => match[1])
+        .find(body => /grid-template-columns:/.test(body)) ?? ''
+    );
+    const firstColumn = (body: string) => Number.parseFloat(
+      /grid-template-columns:\s*([^;]+)/.exec(body)?.[1].trim().split(/\s+/)[0] ?? '',
+    );
+    const rowColumns = firstColumn(columnsOf(/\.wb-session-row\s*\{([^{}]*)\}/g));
+    const groupColumns = firstColumn(columnsOf(/\.wb-session-group\.wb-session-group-toggle\s*\{([^{}]*)\}/g));
+    expect(rowColumns, '行的状态标列宽').toBe(14);
+    expect(groupColumns, '组头的折叠箭头列宽').toBe(rowColumns);
+  });
+
+  it('会话栏左缘只有一条首字形基线：栏头圆点 / 搜索图标 / 组头箭头 / 行状态标全部对齐', () => {
+    // 上一轮只修了会话行；栏头的 live 圆点停在 12px、搜索框的 ⌕ 停在 20px、组头箭头
+    // 停在 3.7px，一条竖线上挤着四个不同的起点，最左那个还压在会话栏边缘上。
+    // 这条把「首字形起点」当成一个常量来钉：谁都不许自己另起一条线。
+    const bare = block.replace(/\/\*[\s\S]*?\*\//g, '');
+    const paddingLeft = (body: string) => {
+      const parts = /(?:^|;)\s*padding:\s*([^;]+)/.exec(body)?.[1].trim().split(/\s+/) ?? [];
+      if (parts.length === 4) return Number.parseFloat(parts[3]);
+      if (parts.length === 2) return Number.parseFloat(parts[1]);
+      if (parts.length === 1) return Number.parseFloat(parts[0]);
+      return Number.NaN;
+    };
+    const ruleOf = (pattern: RegExp) => (
+      [...bare.matchAll(pattern)].map(match => match[1]).find(body => /(?:^|;)\s*padding:/.test(body)) ?? ''
+    );
+    const baseline = paddingLeft(ruleOf(/\.wb-session-row\s*\{([^{}]*)\}/g));
+    expect(baseline, '会话行的左内边距就是这条基线').toBe(22);
+
+    // 栏头没有圆角底板、不受裁切，但它的 live 圆点是同一列的首字形，落同一条线。
+    expect(paddingLeft(ruleOf(/\.wb-rail-heading\s*\{([^{}]*)\}/g)), '栏头左内边距').toBe(baseline);
+
+    // 搜索框是**有**圆角的填充块（--radius-md 10px）：⌕ 到框左缘的距离必须 ≥ 半径，
+    // 否则字形会啃到弧线；同时 margin 要与两块 ::before 底板的 8px 内缩线重合，
+    // 使 margin + padding 正好落在同一条基线上。
+    const searchRule = ruleOf(/\.wb-session-search\s*\{([^{}]*)\}/g);
+    const searchMargin = /(?:^|;)\s*margin:\s*([^;]+)/.exec(searchRule)?.[1].trim().split(/\s+/) ?? [];
+    expect(searchMargin.length, '搜索框 margin 用三值写法（上 左右 下）').toBe(3);
+    const searchSide = Number.parseFloat(searchMargin[1]);
+    const searchPad = paddingLeft(searchRule);
+    const boardRule = /\.wb-session-row::before\s*\{([^{}]*)\}/.exec(bare)?.[1] ?? '';
+    const boardSide = Number.parseFloat(/inset:\s*([^;]+)/.exec(boardRule)?.[1].trim().split(/\s+/)[1] ?? '');
+    expect(searchSide, '搜索框外边距与行底板同一条内缩线').toBe(boardSide);
+    expect(searchPad, '⌕ 距搜索框左缘必须 ≥ 圆角半径 --radius-md(10)').toBeGreaterThanOrEqual(10);
+    expect(searchSide + searchPad, '搜索图标落在同一条基线上').toBe(baseline);
   });
 
   it('终端外壳的底色跟随实际生效的渲染风格，不是皮肤令牌', () => {

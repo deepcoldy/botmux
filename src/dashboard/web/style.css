@@ -28007,7 +28007,10 @@ button.skills-issue-badge:hover {
      margin-left:auto 两套分配机制叠加，中间挂出约 90px 死空白。 */
   justify-content: flex-start;
   gap: 8px;
-  padding: 0 12px;
+  /* 左 22 与组头箭头、行状态标同一条线：栏头的 live 圆点原来在 12px，比列表里所有
+     首字形都往左突出 10px，会话栏左缘于是有 12 / 22 两条参差的线。栏头没有圆角底板、
+     不受裁切，但既然是同一列的首字形，就该落在同一条基线上。 */
+  padding: 0 12px 0 22px;
   border: 0;
 }
 
@@ -28039,8 +28042,11 @@ button.skills-issue-badge:hover {
   display: flex;
   align-items: center;
   gap: 5px;
-  margin: 6px 12px 4px;
-  padding: 0 8px;
+  /* 左缘对齐：外边距收到 8px，与会话行 / 组头两块 ::before 底板的 8px 内缩线重合
+     （列表左侧只留一条容器线）；内边距 14px 让 ⌕ 落在 22px 基线上，且 14 ≥ 圆角
+     半径 --radius-md(10)，字形永远咬不到填充块的弧线。 */
+  margin: 6px 8px 4px;
+  padding: 0 14px;
   border: 0;
   border-radius: var(--radius-md);
   color: var(--text-3);
@@ -28077,7 +28083,11 @@ button.skills-issue-badge:hover {
   align-items: center;
   gap: 4px;
   /* 组头的折叠箭头必须和它下面那些行的状态标共用一条竖直基线，所以左右内边距跟着
-     .wb-session-row 走（22 / 14），不再是自己的一份 9px。 */
+     .wb-session-row 走（22 / 14），不再是自己的一份 9px。
+     ⚠️ 组头**渲染时永远带 .wb-session-group-toggle**，真正生效的是下面那条
+     `.wb-session-group.wb-session-group-toggle`（特异性 0,2,0 压过这里的 0,1,0）。
+     改内边距必须两处一起改，只改这里等于什么都没改 —— 上一轮就是这么漏的，
+     agent-workbench-style.test.ts 现在按「两条规则的左右内边距必须相等」钉住。 */
   padding: 5px 14px 3px 22px;
   color: var(--text-3);
   font-size: 11px;
@@ -29089,10 +29099,16 @@ body:has(.workbench-route-host) { min-width: 0; }
 .wb-session-group.wb-session-group-toggle {
   width: 100%;
   min-height: 0;
-  /* 多一列放折叠箭头；icon / 标签 / 计数三格的相对排布不变，只是整体右移 8px，
-     箭头落在最左边——这是折叠列表的通行手势位置。 */
-  grid-template-columns: 11px 14px minmax(0, 1fr) auto;
-  padding: 5px 9px 3px 2px;
+  /* 左缘对齐（第二次修）：这条规则比 .wb-session-group 特异性高，组头**实际生效的**
+     内边距一直是这里的 `2px`，上一轮改在 .wb-session-group 上的 22px 从来没落到过
+     渲染上——组头下面那块 hover 底板（::before，inset 1px 8px、圆角 14）左缘在 8px，
+     折叠箭头却坐在 2px，整个字形落在底板**外面**、离会话栏左边缘只剩 3.7px，读起来
+     就是「箭头贴边被切」。
+     现在四列写成「箭头列 = 行的状态标列」：左内边距 22（= 底板左缘 8 + 圆角 14）后
+     箭头占 22–36，与 .wb-session-row 的状态标格逐像素重合；第二列 14px 的组图标落在
+     40，正好是行标题的起点。整条列表左侧只剩 22 / 40 两条线。 */
+  grid-template-columns: 14px 14px minmax(0, 1fr) auto;
+  padding: 5px 14px 3px 22px;
   border: 0;
   border-radius: 0;
   background: transparent;
