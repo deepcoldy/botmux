@@ -18,6 +18,15 @@ export { TERMINAL_VIEW_FORWARD_HEADER };
 /** Covers daemon wake-up (up to 10s) plus a bounded worker handshake. Cleared
  * as soon as response/upgrade headers arrive, so live streams stay unbounded. */
 export const TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS = 30_000;
+/**
+ * P1-2：upgrade 请求收到非 101 回应 = 一次拒绝，不是长连接。清掉唯一那道计时器
+ * 之后，一个不结束 body 的上游能把上游 socket 与浏览器 socket 一起挂死，没有任
+ * 何东西会回收它们。所以这条路保留总时限 + idle 时限（只有 idle 时限时，每 N 秒
+ * 滴一个字节就能永久续命），并给拒绝体加一个上限——预览那一跳早就有了。
+ */
+export const TERMINAL_UPGRADE_REJECTION_TIMEOUT_MS = 15_000;
+export const TERMINAL_UPGRADE_REJECTION_IDLE_TIMEOUT_MS = 10_000;
+export const MAX_TERMINAL_UPGRADE_REJECTION_BYTES = 64 * 1024;
 
 export interface TerminalFrontProxyOptions {
   resolvePort(sessionId: string): number | undefined;
@@ -225,6 +234,11 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     }, up => {
       upstream.setTimeout(0);
       res.writeHead(up.statusCode ?? 502, up.headers);
+      // P1-2：浏览器提前断开时把上游一起收掉。`up.pipe(res)` 在 dest 关闭时只做
+      // unpipe，不会 destroy source；headers 一到又把 30s 的前置超时拆掉了，于是
+      // 这条上游没有任何东西会回收——终端这一跳同样有长响应（日志/流式输出）。
+      // `ClientRequest.destroy()` 可重入；响应已自然写完的情况不必多此一举。
+      res.on('close', () => { if (!res.writableEnded) upstream.destroy(); });
       up.pipe(res);
     });
     upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
@@ -368,7 +382,30 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     });
     upstream.on('response', upRes => {
       responded = true;
-      upstream.setTimeout(0);
+      // P1-2：拒绝体必须在限期内读完，且有上限（见常量注释）。
+      let settled = false;
+      let totalTimer: ReturnType<typeof setTimeout> | undefined;
+      const disarm = (): void => {
+        settled = true;
+        if (totalTimer) clearTimeout(totalTimer);
+        totalTimer = undefined;
+      };
+      const abandon = (): void => {
+        if (settled) return;
+        disarm();
+        upRes.destroy();
+        upstream.destroy();
+        clientSocket.destroy();
+      };
+      upstream.setTimeout(TERMINAL_UPGRADE_REJECTION_IDLE_TIMEOUT_MS, abandon);
+      totalTimer = setTimeout(abandon, TERMINAL_UPGRADE_REJECTION_TIMEOUT_MS);
+      totalTimer.unref?.();
+      // 客户端先走时也要回收上游。升级请求的 socket 被 http server 摘掉 data 监听
+      // 后是暂停态，且 http server 建的 socket 是 allowHalfOpen——不 `resume()` 就
+      // 收不到 FIN，收到了也不会自动关。升级已被拒，客户端 FIN 即视为它走了。
+      clientSocket.on('close', abandon);
+      clientSocket.on('end', abandon);
+      clientSocket.resume();
       const lines = [`HTTP/1.1 ${upRes.statusCode ?? 502} ${upRes.statusMessage ?? 'Bad Gateway'}`, 'connection: close'];
       const raw = upRes.rawHeaders;
       for (let i = 0; i + 1 < raw.length; i += 2) {
@@ -378,9 +415,24 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       }
       lines.push('', '');
       clientSocket.write(lines.join('\r\n'));
-      upRes.on('data', chunk => clientSocket.write(chunk));
-      upRes.on('end', () => clientSocket.end());
-      upRes.on('error', () => clientSocket.destroy());
+      let bodyBytes = 0;
+      upRes.on('data', chunk => {
+        if (settled) return;
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bodyBytes += buffer.byteLength;
+        if (bodyBytes > MAX_TERMINAL_UPGRADE_REJECTION_BYTES) {
+          abandon();
+          return;
+        }
+        clientSocket.write(buffer);
+      });
+      upRes.on('end', () => {
+        if (settled) return;
+        disarm();
+        upstream.setTimeout(0);
+        clientSocket.end();
+      });
+      upRes.on('error', () => { disarm(); clientSocket.destroy(); });
     });
     upstream.on('error', () => {
       if (!responded) socketError(clientSocket, 502, 'terminal proxy error');

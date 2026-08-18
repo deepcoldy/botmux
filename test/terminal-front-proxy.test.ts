@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { DashboardSessionStore } from '../src/dashboard/h5-auth.js';
 import {
   issueTerminalControlGrant,
@@ -15,6 +15,7 @@ import {
   createTerminalFrontProxy,
   parseTerminalFrontPath,
   terminalForwardHeaders,
+  MAX_TERMINAL_UPGRADE_REJECTION_BYTES,
   TERMINAL_CONTROL_HEADER,
   TERMINAL_VIEW_FORWARD_HEADER,
 } from '../src/dashboard/terminal-front-proxy.js';
@@ -747,6 +748,175 @@ describe('central terminal front proxy boundary', () => {
     } finally {
       client?.socket.destroy();
       await close(front);
+      await close(worker.server);
+    }
+  });
+});
+
+// ─── P1-2：客户端先走 / 非 101 拒绝路径上的上游连接回收 ──────────────────────
+//
+// 与 preview 那一跳同形：`up.pipe(res)` 在 dest 关闭时只 unpipe、不 destroy source，
+// 而 headers 一到就把 30s 的前置超时拆掉了，于是浏览器一断开这条上游就永远挂着。
+// 非 101 那条路更薄——原本连 body 上限都没有，透传到底、无时限。
+describe('P1-2 终端代理在客户端断开与非 101 拒绝路径上回收上游连接', () => {
+  const clients = new Set<Socket>();
+  const upstreamSockets = new Set<Socket>();
+
+  afterEach(() => {
+    for (const socket of clients) socket.destroy();
+    clients.clear();
+    // 泄漏用例失败时上游 socket 还挂着，server.close() 会一直等——先强拆。
+    for (const socket of upstreamSockets) socket.destroy();
+    upstreamSockets.clear();
+  });
+
+  /** 上游 worker：普通 GET 回一条永不结束的流；upgrade 一律回非 101。 */
+  function reclaimUpstream(rejection: (socket: Duplex) => void): {
+    server: Server;
+    dialed: Promise<void>;
+    upstreamClosed: Promise<void>;
+    live: () => number;
+  } {
+    let markDialed!: () => void;
+    let markClosed!: () => void;
+    const dialed = new Promise<void>(resolve => { markDialed = resolve; });
+    const upstreamClosed = new Promise<void>(resolve => { markClosed = resolve; });
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-cache' });
+      res.write('terminal-stream-open\n');
+      markDialed();
+      // 故意不 end。
+    });
+    server.on('upgrade', (_req, socket) => {
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+      rejection(socket);
+      markDialed();
+    });
+    server.on('connection', socket => {
+      upstreamSockets.add(socket);
+      socket.on('close', () => { upstreamSockets.delete(socket); markClosed(); });
+    });
+    return { server, dialed, upstreamClosed, live: () => upstreamSockets.size };
+  }
+
+  function rawClient(port: number, request: string): {
+    socket: Socket;
+    raw: () => string;
+    closed: Promise<void>;
+    waitFor: (needle: string, label: string) => Promise<void>;
+  } {
+    const socket = connect(port, '127.0.0.1');
+    clients.add(socket);
+    let raw = '';
+    const waiters = new Set<{ needle: string; resolve: () => void }>();
+    socket.on('data', chunk => {
+      raw += chunk.toString();
+      for (const waiter of [...waiters]) {
+        if (!raw.includes(waiter.needle)) continue;
+        waiters.delete(waiter);
+        waiter.resolve();
+      }
+    });
+    socket.on('error', () => { /* 断开本身就是断言对象 */ });
+    const closed = new Promise<void>(resolve => socket.on('close', () => resolve()));
+    socket.write(request);
+    return {
+      socket,
+      raw: () => raw,
+      closed,
+      waitFor: (needle, label) => new Promise<void>((resolve, reject) => {
+        if (raw.includes(needle)) { resolve(); return; }
+        waiters.add({ needle, resolve });
+        setTimeout(() => reject(new Error(`${label}\n---received---\n${raw}`)), 4_000).unref();
+      }),
+    };
+  }
+
+  async function startFront(upstreamPort: number): Promise<{ server: Server; port: number }> {
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      resolveActor: () => null,
+      control: {} as never,
+    });
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://front');
+      if (!proxy.handleHttp(req, res, url)) { res.writeHead(404); res.end(); }
+    });
+    server.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    return { server, port: await listen(server) };
+  }
+
+  it('浏览器中途关掉终端长响应时，上游连接跟着销毁', async () => {
+    const worker = reclaimUpstream(socket => socket.destroy());
+    const upstreamPort = await listen(worker.server);
+    const front = await startFront(upstreamPort);
+    try {
+      const client = rawClient(front.port, 'GET /s/s1/ HTTP/1.1\r\nHost: front\r\n\r\n');
+      await client.waitFor('terminal-stream-open', '终端长响应首包没有透传');
+      expect(worker.live()).toBe(1);
+
+      client.socket.destroy();
+      await worker.upstreamClosed;
+      expect(worker.live()).toBe(0);
+    } finally {
+      await close(front.server);
+      await close(worker.server);
+    }
+  });
+
+  it('非 101 拒绝还没读完时浏览器断开，上游连接立刻回收', async () => {
+    // 200 + chunked 却一个 chunk 都不发：原本两条 socket 会一起挂死且无时限。
+    const worker = reclaimUpstream(socket => {
+      socket.write('HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n');
+    });
+    const upstreamPort = await listen(worker.server);
+    const front = await startFront(upstreamPort);
+    try {
+      const client = rawClient(
+        front.port,
+        'GET /s/s1/ HTTP/1.1\r\nHost: front\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+      );
+      await worker.dialed;
+      await client.waitFor('200 OK', '非 101 的状态行没有转达给浏览器');
+      expect(worker.live()).toBe(1);
+
+      // 干净 FIN（真实浏览器关页面的样子），不是 RST——这条路没有 'error' 兜底。
+      client.socket.end();
+      await worker.upstreamClosed;
+      expect(worker.live()).toBe(0);
+    } finally {
+      await close(front.server);
+      await close(worker.server);
+    }
+  });
+
+  it('非 101 拒绝体超过上限时截断并销毁两端，不再无界透传', async () => {
+    const chunk = 'x'.repeat(8 * 1024);
+    const worker = reclaimUpstream(socket => {
+      socket.write('HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n');
+      // 96KB > 64KB 上限，且永不 end。
+      for (let i = 0; i < 12; i++) socket.write(`${(8 * 1024).toString(16)}\r\n${chunk}\r\n`);
+    });
+    const upstreamPort = await listen(worker.server);
+    const front = await startFront(upstreamPort);
+    try {
+      const client = rawClient(
+        front.port,
+        'GET /s/s1/ HTTP/1.1\r\nHost: front\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+      );
+      await client.closed;
+      await worker.upstreamClosed;
+      expect(client.raw()).toContain('502 Bad Gateway');
+      // 上限之内就停手：不是「读完 96KB 再说」。
+      expect(client.raw().length).toBeLessThanOrEqual(MAX_TERMINAL_UPGRADE_REJECTION_BYTES + 1_024);
+      expect(worker.live()).toBe(0);
+    } finally {
+      await close(front.server);
       await close(worker.server);
     }
   });

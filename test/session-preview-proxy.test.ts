@@ -1,10 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   PREVIEW_SANDBOX_TOKENS,
+  PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS,
   createSessionPreviewProxy,
   previewRequestHeaders,
   type PreviewProxyResolution,
@@ -1029,5 +1030,225 @@ describe('P1-4 preview streams refuse to register under an auth session that die
     // 登记确实发生了：这条流照旧随认证结束一起断。
     expect(ctx.registry.closeAuthSession(COOKIE_AUTH_SESSION)).toBe(1);
     await reader.read().catch(() => { /* 断流即预期 */ });
+  });
+});
+
+// ─── P1-2：客户端先走 / 非 101 拒绝路径上的上游连接回收 ──────────────────────
+//
+// `bindStream` 返回的只是索引里的注销闭包（一次 `Set.delete`），而 `up.pipe(res)`
+// 在 dest 关闭时走的是 unpipe，**不会 destroy source**。所以在补这条防护之前，浏览
+// 器一关标签页这条上游就永远挂着：注销之后撤销扫描再也够不到它，而 headers 到达时
+// 又把 45s 的前置超时拆掉了，于是没有任何超时会回收这个 FD。预览页常见的 SSE / 长
+// 轮询每关一次页面漏一个，且没有任何并发配额兜底。
+//
+// 非 101 那条路更糟：代理攒完 body 才写回浏览器，上游只要不 end，两条 socket 一起
+// 挂死，而浏览器一个字节都收不到。
+describe('P1-2 preview 代理在客户端断开与非 101 拒绝路径上回收上游连接', () => {
+  let probeFront: Server | null = null;
+  let probeUpstream: Server | null = null;
+  const probeClients = new Set<Socket>();
+  const upstreamSockets = new Set<Socket>();
+
+  afterEach(async () => {
+    for (const socket of probeClients) socket.destroy();
+    probeClients.clear();
+    // 泄漏用例失败时上游 socket 还挂着，server.close() 会一直等——先强拆再关。
+    for (const socket of upstreamSockets) socket.destroy();
+    upstreamSockets.clear();
+    if (probeFront) await new Promise<void>(resolve => probeFront!.close(() => resolve()));
+    probeFront = null;
+    if (probeUpstream) await new Promise<void>(resolve => probeUpstream!.close(() => resolve()));
+    probeUpstream = null;
+  });
+
+  async function startReclaimProbe(): Promise<{
+    port: number;
+    registry: AuthSessionConnectionRegistry;
+    liveUpstream: () => number;
+    upstreamClosed: Promise<void>;
+    dialed: Promise<void>;
+  }> {
+    let markDialed!: () => void;
+    const dialed = new Promise<void>(resolve => { markDialed = resolve; });
+    let markUpstreamClosed!: () => void;
+    const upstreamClosed = new Promise<void>(resolve => { markUpstreamClosed = resolve; });
+    probeUpstream = createServer((req, res) => {
+      if (req.url?.startsWith('/short')) {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('short-preview-body');
+        markDialed();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write('event: hello\ndata: open\n\n');
+      markDialed();
+      // 故意不 end：这正是「握手后长期流」的形状。
+    });
+    // 非 101 拒绝：回 200 + chunked，然后一个 chunk 都不发、永不 end。
+    probeUpstream.on('upgrade', (_req, socket) => {
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+      socket.write('HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n');
+      markDialed();
+    });
+    probeUpstream.on('connection', socket => {
+      upstreamSockets.add(socket);
+      socket.on('close', () => { upstreamSockets.delete(socket); markUpstreamClosed(); });
+    });
+    await new Promise<void>(resolve => probeUpstream!.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (probeUpstream.address() as { port: number }).port;
+
+    const registry = new AuthSessionConnectionRegistry();
+    const manager = createSessionPreviewProxy({
+      authenticated: req => req.headers.cookie?.split(';').some(part => part.trim() === managementCookie()) === true,
+      resolve: () => okTarget(upstreamPort),
+      verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
+      bindStream: (_req, ctx, close) => registry.register('cookie-auth-session', close, ctx.sessionId),
+    });
+    probeFront = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      void manager.handleHttp(req, res, url).then(handled => {
+        if (!handled && !res.headersSent) { res.writeHead(404); res.end(); }
+      });
+    });
+    probeFront.on('upgrade', (req, socket, head) => {
+      if (!manager.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>(resolve => probeFront!.listen(0, '127.0.0.1', resolve));
+    return {
+      port: (probeFront.address() as { port: number }).port,
+      registry,
+      liveUpstream: () => upstreamSockets.size,
+      upstreamClosed,
+      dialed,
+    };
+  }
+
+  /** 裸客户端：拿到首包后由测试决定何时（以及怎样）断开。 */
+  function rawClient(port: number, request: string): {
+    socket: Socket;
+    raw: () => string;
+    waitFor: (needle: string, label: string) => Promise<void>;
+  } {
+    const socket = connect(port, '127.0.0.1');
+    probeClients.add(socket);
+    let raw = '';
+    const waiters = new Set<{ needle: string; resolve: () => void }>();
+    socket.on('data', chunk => {
+      raw += chunk.toString();
+      for (const waiter of [...waiters]) {
+        if (!raw.includes(waiter.needle)) continue;
+        waiters.delete(waiter);
+        waiter.resolve();
+      }
+    });
+    socket.on('error', () => { /* 断开本身就是断言对象 */ });
+    socket.write(request);
+    return {
+      socket,
+      raw: () => raw,
+      waitFor: (needle, label) => new Promise<void>((resolve, reject) => {
+        if (raw.includes(needle)) { resolve(); return; }
+        waiters.add({ needle, resolve });
+        setTimeout(() => reject(new Error(`${label}\n---received---\n${raw}`)), 4_000).unref();
+      }),
+    };
+  }
+
+  function previewGet(port: number, path: string): ReturnType<typeof rawClient> {
+    return rawClient(
+      port,
+      `GET ${path} HTTP/1.1\r\nHost: dashboard.test\r\nCookie: ${managementCookie()}\r\n\r\n`,
+    );
+  }
+
+  function previewUpgrade(port: number, path: string): ReturnType<typeof rawClient> {
+    return rawClient(
+      port,
+      `GET ${path} HTTP/1.1\r\nHost: dashboard.test\r\nOrigin: null\r\n`
+      + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+      + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+    );
+  }
+
+  async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+    const deadline = Date.now() + 4_000;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(label);
+      await new Promise<void>(resolve => { setTimeout(resolve, 10).unref(); });
+    }
+  }
+
+  it('浏览器中途关掉预览 SSE 时，上游连接跟着销毁而不是留下一个 FD', async () => {
+    const ctx = await startReclaimProbe();
+    const client = previewGet(ctx.port, '/preview/s1/stream');
+    await client.waitFor('event: hello', '预览 SSE 首包没有透传');
+    expect(ctx.liveUpstream()).toBe(1);
+    expect(ctx.registry.countSessionStreams('s1')).toBe(1);
+
+    // 浏览器关标签页。注销会发生，但在补防护之前没有任何东西会关掉上游。
+    client.socket.destroy();
+
+    await ctx.upstreamClosed;
+    expect(ctx.liveUpstream()).toBe(0);
+    // 注销照旧发生，两个索引都不留残留。
+    expect(ctx.registry.countSessionStreams('s1')).toBe(0);
+    expect(ctx.registry.count('cookie-auth-session')).toBe(0);
+  });
+
+  it('自然结束的短响应照常完整送达，也不会被误当成断开', async () => {
+    const ctx = await startReclaimProbe();
+    const client = previewGet(ctx.port, '/preview/s1/short');
+    await client.waitFor('short-preview-body', '短响应没有完整送达');
+    expect(client.raw()).toContain('200 OK');
+    await waitUntil(
+      () => ctx.registry.countSessionStreams('s1') === 0,
+      '短响应自然结束后索引仍有残留',
+    );
+  });
+
+  it('非 101 拒绝还没读完时浏览器断开，上游连接立刻回收', async () => {
+    const ctx = await startReclaimProbe();
+    const client = previewUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    await ctx.dialed;
+    // 上游回了 200 + chunked 却一个 chunk 都不发：代理攒完 body 才写回，所以浏览器
+    // 此刻一个字节都没有——挂死的不只是两条 socket，还有这个浏览器请求。
+    expect(client.raw()).toBe('');
+    expect(ctx.liveUpstream()).toBe(1);
+
+    // 干净 FIN（真实浏览器关页面的样子），不是 RST——这条路上没有 'error' 兜底。
+    client.socket.end();
+
+    await ctx.upstreamClosed;
+    expect(ctx.liveUpstream()).toBe(0);
+  });
+
+  it('非 101 拒绝体超过总时限还没读完时，上游与浏览器两端一起销毁', async () => {
+    // 计时器必须在代理武装它**之前**换成假的，所以整段都跑在假 setTimeout 下；
+    // socket I/O 走的是真事件循环，不受影响。
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const ctx = await startReclaimProbe();
+      const client = previewUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+      const clientClosed = new Promise<void>(resolve => client.socket.on('close', () => resolve()));
+      await ctx.dialed;
+
+      const upstreamGone = ctx.upstreamClosed.then(() => true as const);
+      // 反复推进：上游 200 还在路上时推进是无害的，武装之后第一次推进就会触发。
+      for (let attempt = 0; attempt < 100; attempt++) {
+        vi.advanceTimersByTime(PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS + 1_000);
+        const fired = await Promise.race([
+          upstreamGone,
+          new Promise<false>(resolve => { setImmediate(() => resolve(false)); }),
+        ]);
+        if (fired) break;
+      }
+      await upstreamGone;
+      await clientClosed;
+      expect(ctx.liveUpstream()).toBe(0);
+      expect(client.raw()).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

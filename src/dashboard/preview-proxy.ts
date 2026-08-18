@@ -23,6 +23,16 @@ import type { SessionPreviewResolution } from './preview-contract.js';
  * This bounds only the pre-header phase and is cleared once headers arrive. */
 export const PREVIEW_UPSTREAM_RESPONSE_TIMEOUT_MS = 45_000;
 const MAX_WEBSOCKET_REJECTION_BYTES = 64 * 1024;
+/**
+ * P1-2：一个 upgrade 请求收到非 101 回应时，那是一次**拒绝**，不是长连接。
+ *
+ * 代理把这段 body 攒完才写回浏览器（只有 `end` 才落笔），所以一个永不结束的
+ * 「拒绝」会同时钉死上游 socket 和浏览器 socket，而浏览器一个字节都收不到。
+ * 因此这条路必须两道时限都有：读完整段拒绝的**总时限**，以及静默多久算死的
+ * **idle 时限**——只有 idle 时限时，上游每 N 秒滴一个字节就能永久续命。
+ */
+export const PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS = 15_000;
+export const PREVIEW_UPGRADE_REJECTION_IDLE_TIMEOUT_MS = 10_000;
 
 /**
  * Sandbox flags forced onto every proxied preview document.
@@ -429,7 +439,18 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
         up.statusCode ?? 502,
         previewResponseHeaders(up.headers, target, parsed.basePath, opaqueRequest),
       );
-      if (bound) res.on('close', bound);
+      // P1-2：浏览器断开时除了注销，还要把上游一起收掉。`bound` 只是索引里的注销
+      // 闭包（一次 `Set.delete`），而 `up.pipe(res)` 在 dest 关闭时走的是 unpipe，
+      // **不会 destroy source**——两者都不关 socket。于是标签页一关，这条上游就永远
+      // 挂着：注销之后再没有任何撤销扫描能碰到它，也没有任何超时会回收它（headers
+      // 一到就把 45s 的前置超时拆掉了）。预览页常见的 SSE / 长轮询于是每关一次页面
+      // 漏一个 FD，且没有任何并发配额兜底。
+      res.on('close', () => {
+        bound?.();
+        // 正常收尾（响应已写完）时上游本就该自己结束，不必多此一举；只有客户端提前
+        // 断开才需要主动销毁。`ClientRequest.destroy()` 可重入，重复调用无副作用。
+        if (!res.writableEnded) upstream.destroy();
+      });
       up.pipe(res);
     });
     let failed = false;
@@ -525,20 +546,49 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
     });
     upstream.on('response', (upRes) => {
       responded = true;
-      upstream.setTimeout(0);
+      // P1-2：不要无条件 `setTimeout(0)`。这不是一条长响应，而是一段等着被读完的
+      // 拒绝说明；清掉唯一那道计时器后，一个不结束 body 的上游就能把两条 socket
+      // 一起挂死（浏览器还收不到任何字节，因为 body 只在 'end' 时才写回）。
+      let settled = false;
+      let totalTimer: ReturnType<typeof setTimeout> | undefined;
+      const disarm = (): void => {
+        settled = true;
+        if (totalTimer) clearTimeout(totalTimer);
+        totalTimer = undefined;
+      };
+      const abandon = (): void => {
+        if (settled) return;
+        disarm();
+        upRes.destroy();
+        upstream.destroy();
+        clientSocket.destroy();
+      };
+      upstream.setTimeout(PREVIEW_UPGRADE_REJECTION_IDLE_TIMEOUT_MS, abandon);
+      totalTimer = setTimeout(abandon, PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS);
+      totalTimer.unref?.();
+      // 客户端先走时同样要回收上游：这条路上没有 pipe，只有攒 body，没人替我们关。
+      // 升级请求的 socket 被 http server 摘掉 data 监听后是暂停态，且 http server
+      // 建的 socket 是 allowHalfOpen——不 `resume()` 就收不到 FIN，收到了也不会自动
+      // 关。升级已经被拒，客户端 FIN 就等于它走了，没有后半程要等。
+      clientSocket.on('close', abandon);
+      clientSocket.on('end', abandon);
+      clientSocket.resume();
       const bodyChunks: Buffer[] = [];
       let bodyBytes = 0;
       upRes.on('data', chunk => {
+        if (settled) return;
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         bodyBytes += buffer.byteLength;
         if (bodyBytes > MAX_WEBSOCKET_REJECTION_BYTES) {
-          upRes.destroy();
-          clientSocket.destroy();
+          abandon();
           return;
         }
         bodyChunks.push(buffer);
       });
       upRes.on('end', () => {
+        if (settled) return;
+        disarm();
+        upstream.setTimeout(0);
         const body = Buffer.concat(bodyChunks);
         const lines = [
           `HTTP/1.1 ${upRes.statusCode ?? 502} ${upRes.statusMessage ?? 'Bad Gateway'}`,
@@ -565,7 +615,7 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
         if (body.length) clientSocket.write(body);
         clientSocket.end();
       });
-      upRes.on('error', () => clientSocket.destroy());
+      upRes.on('error', () => { disarm(); clientSocket.destroy(); });
     });
     upstream.on('error', () => {
       if (!responded) socketError(clientSocket, 502, 'preview_unreachable');
