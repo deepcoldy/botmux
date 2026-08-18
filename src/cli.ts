@@ -231,6 +231,7 @@ import {
 import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
   bindRestartLeaseTo,
@@ -8045,6 +8046,7 @@ async function relaySend(
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
     ? prepareCardMarkdown(extractCardText(content), process.cwd(), 'filesystem')
     : undefined;
@@ -9126,6 +9128,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
+  // Keep memory attribution in the model's rollout, but never render the
+  // complete internal suffix into Lark or count it in send markers.
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
 
   const managedPayloadError = managedVcSendPayloadError({
@@ -9858,8 +9863,8 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   try {
     // A file-sandbox relay supplies a host-private copy normalized inside the
-    // sandbox namespace. Voice/doc-comment paths returned above and therefore
-    // continue using the untouched raw content.
+    // sandbox namespace. Voice/doc-comment paths returned above use the same
+    // already-sanitized outbound content, without card-markdown preparation.
     let text = extractCardText(content);
     const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
     if (preparedContentFile) {
@@ -10812,6 +10817,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
     console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');

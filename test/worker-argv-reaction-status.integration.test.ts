@@ -88,6 +88,19 @@ async function waitForPromptReady(
   throw new Error(`timed out waiting for prompt_ready: ${JSON.stringify(messages)}\n${logs.join('')}`);
 }
 
+/** A Pi transcript `message` record, shaped like SessionManager's JSONL. */
+function piTranscriptRecord(role: 'user' | 'assistant', text: string, stopReason?: string): string {
+  return JSON.stringify({
+    type: 'message',
+    timestamp: new Date().toISOString(),
+    message: {
+      role,
+      content: [{ type: 'text', text }],
+      ...(stopReason ? { stopReason } : {}),
+    },
+  }) + '\n';
+}
+
 describe('worker argv reaction status', () => {
   it('keeps an argv-baked Pi turn working until its viewport loses Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-busy-'));
@@ -95,10 +108,20 @@ describe('worker argv reaction status', () => {
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
 
+    // Real Pi writes a user record when it begins consuming the argv prompt
+    // and a terminal assistant record when the turn ends. With pi in the
+    // lifecycle-blocking allowlist a started turn without a terminal holds
+    // ready, so the fake must produce the realistic transcript shape.
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345678';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
     const fakePi = join(root, 'fake-pi');
     writeFileSync(fakePi, `#!/usr/bin/env node
 process.stdout.write('Working...\\n');
-setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone without transcript final\\n'), 4_500);
+setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone after transcript final\\n'), 4_500);
 setInterval(() => {}, 1_000);
 `);
     chmodSync(fakePi, 0o755);
@@ -130,6 +153,7 @@ setInterval(() => {}, 1_000);
       workingDir: dataDir,
       cliId: 'pi',
       cliPathOverride: fakePi,
+      cliSessionId,
       backendType: 'pty',
       prompt: 'hello from argv',
       larkAppId: 'app_test',
@@ -137,16 +161,32 @@ setInterval(() => {}, 1_000);
       turnId: 'om_turn',
     } satisfies DaemonToWorker);
 
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+
     const deadline = Date.now() + 3_500;
     while (Date.now() < deadline) {
       await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
     }
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
 
-    const updates = await waitForScreenUpdates(child, messages, 2, logs);
+    appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
+
+    await waitForScreenUpdates(
+      child,
+      messages,
+      1,
+      logs,
+      update => update.status === 'idle',
+      'idle screen update',
+    );
+    const updates = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
     expect(updates[0]?.status).toBe('working');
     expect(updates.at(-1)?.status).toBe('idle');
-  }, 15_000);
+  }, 20_000);
 
   it('defers a Pi transcript final that lands while the viewport still shows Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-external-busy-'));
@@ -212,6 +252,10 @@ setInterval(() => {}, 1_000);
     // The bridge must be attached before the terminal record lands, otherwise
     // the append below is never ingested and no external idle fires at all.
     await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // The turn's start: real Pi writes the user record when it begins
+    // consuming the argv prompt (required now that a started-without-terminal
+    // pi turn lifecycle-blocks ready).
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
     // Wait until the authoritative viewport provably shows Working... — the
     // first quiescence screen-idle deferral is that proof. Appending earlier
     // would race the fake's first write into the backend capture and the
@@ -222,15 +266,7 @@ setInterval(() => {}, 1_000);
     // regression covers. drainPiTranscript maps a stopReason:"stop" record
     // without tool calls to a terminal assistant_final, and codexBridgeIngest
     // fireIdle()s on it (source=external).
-    appendFileSync(transcriptPath, JSON.stringify({
-      type: 'message',
-      timestamp: new Date().toISOString(),
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'final answer' }],
-        stopReason: 'stop',
-      },
-    }) + '\n');
+    appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
 
     // The external idle MUST reach the busy-viewport guard (this log line is
     // the proof the transcript final was ingested and deferred — without it
@@ -267,6 +303,14 @@ setInterval(() => {}, 1_000);
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
 
+    // Realistic transcript shape (user at start, terminal at end) — a started
+    // pi turn without a terminal lifecycle-blocks ready.
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345679';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
     // Argv-baked first prompt (no flushPending). The fake stays running for the
     // whole first turn, then clears the screen so the turn settles idle. The
     // window must span at least a couple of SCREEN_UPDATE_INTERVAL_MS ticks so the
@@ -274,7 +318,7 @@ setInterval(() => {}, 1_000);
     const fakePi = join(root, 'fake-pi');
     writeFileSync(fakePi, `#!/usr/bin/env node
 process.stdout.write('Working...\\n');
-setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone without transcript final\\n'), 6_000);
+setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone after transcript final\\n'), 6_000);
 setInterval(() => {}, 1_000);
 `);
     chmodSync(fakePi, 0o755);
@@ -306,12 +350,16 @@ setInterval(() => {}, 1_000);
       workingDir: dataDir,
       cliId: 'pi',
       cliPathOverride: fakePi,
+      cliSessionId,
       backendType: 'pty',
       prompt: 'hello from argv',
       larkAppId: 'app_test',
       larkAppSecret: 'secret',
       turnId: 'om_turn',
     } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
 
     // The publisher must emit `working` WHILE the first turn is still running —
     // i.e. before prompt_ready. This log line is the proof it fired through the
@@ -329,6 +377,10 @@ setInterval(() => {}, 1_000);
     );
     expect(preReady.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+    // The turn's terminal: readiness follows once the fake clears Working...
+    // (external idle defers on the busy viewport, then the probe/quiescence
+    // finishes the turn).
+    appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
     // Dedup: the publisher sends `working` at most once per first turn even
     // though it runs every tick (lastSentStatus guard). Count the working
     // updates emitted before the first prompt_ready lands.
@@ -350,6 +402,384 @@ setInterval(() => {}, 1_000);
     );
     expect(updates.at(-1)?.status).toBe('idle');
   }, 25_000);
+
+  it('re-arms a startup-window false idle until the argv-baked Pi first turn visibly starts', async () => {
+    // Pi's TUI paints its input box seconds before the CLI begins consuming
+    // the argv prompt (extension/model loading). In that startup window the
+    // screen shows no Working... and the transcript has no user record, so a
+    // quiescence idle means "not started yet" — it must be re-armed (no
+    // prompt_ready, no working→idle seed) and the card must stay 工作中. Once
+    // the transcript user record lands, a mid-turn quiescence idle is
+    // suppressed by the structured lifecycle gate, and the transcript final
+    // then drives the real ready edge.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-startup-gap-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def01234567a';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    // The fake reproduces the gap: an idle-looking input box at spawn, total
+    // silence (NO Working...), then some mid-turn output so quiescence can
+    // fire again while the started turn is running.
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
+setTimeout(() => process.stdout.write('streaming tokens\\n'), 6_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-startup-gap',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-startup-gap',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    // The startup-window quiescence idle is re-armed by the evidence gate —
+    // this log is the proof it was caught (before the fix it flowed through
+    // markPromptReady and seeded a premature working→idle).
+    await waitForLog(child, logs, 'Argv-baked first prompt has not visibly started');
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+    expect(
+      messages.some(message => message.type === 'screen_update' && message.status === 'idle'),
+      JSON.stringify(messages),
+    ).toBe(false);
+
+    // Turn actually starts: real Pi writes the user record at that instant.
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+
+    // Mid-turn quiescence (the fake's 6s output going quiet) must now be
+    // suppressed by the structured lifecycle gate (started turn, no terminal).
+    await waitForLog(child, logs, 'Ignoring prompt-ready heuristic while a structured turn is unfinished');
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+
+    // Terminal record → external idle → real ready + working→idle seed.
+    appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
+    await waitForPromptReady(child, messages, logs);
+
+    // prompt_ready is sent before the seed's working→idle pair; wait for the
+    // seed's idle to land instead of counting raw updates.
+    await waitForScreenUpdates(
+      child,
+      messages,
+      1,
+      logs,
+      update => update.status === 'idle',
+      'idle screen update',
+    );
+    const updates = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
+    expect(updates.at(-1)?.status).toBe('idle');
+  }, 30_000);
+
+  it('delivers a message queued during startup even when every ready heuristic is lifecycle-blocked', async () => {
+    // The terminate-gap deadlock: the argv first turn is transcript-started
+    // but never gets a terminal record. A follow-up message arriving while
+    // awaitingFirstPrompt is still true skips handleMessage's type-ahead write
+    // and queues, relying on markPromptReady()'s tail flush — but the
+    // lifecycle gate rejects every ready heuristic (quiescence idle, the
+    // queued-message busy probe, the 15s first-prompt timeout all funnel into
+    // the same rejected markPromptReady()). Without the rejected-ready
+    // re-kick the message sits in pendingMessages forever and the card pins
+    // at 工作中. The re-kick must deliver it via Pi's type-ahead while the
+    // turn correctly stays non-ready.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-queued-deadlock-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def01234567b';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    // Input-box TUI, then permanent silence — the shape a custom-tool
+    // terminate leaves behind (screen back at the prompt, no terminal record).
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-queued-deadlock',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-queued-deadlock',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // Turn starts on disk but never terminates (terminate:true gap).
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+
+    // Follow-up arrives while awaitingFirstPrompt is still true → must queue.
+    child.send({
+      type: 'message',
+      content: 'second message please',
+      turnId: 'om_turn_2',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Queued message (');
+
+    // The rejected-ready re-kick must deliver the queued message through Pi's
+    // type-ahead path (driven by the quiescence idle / queued-message busy
+    // probe whose markPromptReady() the lifecycle gate rejects).
+    await waitForLog(child, logs, 'Writing to PTY (flush): "second message please');
+
+    // Delivery must not have required (or produced) a false ready edge: the
+    // started-without-terminal first turn keeps the session non-ready.
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+  }, 30_000);
+
+  it('holds a startup-queued message until turn-start evidence appears, then delivers via type-ahead', async () => {
+    // Startup input safety: before ANY turn-start evidence (no busy marker on
+    // the PTY stream, no transcript user record) the TUI may still be loading
+    // extensions/models, so a type-ahead paste could be dropped or land in a
+    // half-drawn screen. The evidence-gate rejection must therefore NOT
+    // re-kick flushPending() — the queued message stays queued through the
+    // gate's false-idle rejections. Once the transcript user record lands
+    // (evidence + started turn), the next lifecycle-rejected ready edge
+    // delivers it via Pi's type-ahead.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-startup-hold-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def01234567c';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    // Input box at spawn, then one later output burst so a quiescence edge can
+    // re-drive markPromptReady() after the user record lands.
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
+setTimeout(() => process.stdout.write('streaming tokens\\n'), 10_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-startup-hold',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-startup-hold',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // Follow-up during the no-evidence startup window → queues.
+    child.send({
+      type: 'message',
+      content: 'second message please',
+      turnId: 'om_turn_2',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Queued message (');
+
+    // The evidence gate rejects the startup false idle(s)...
+    await waitForLog(child, logs, 'Argv-baked first prompt has not visibly started');
+    // ...and must NOT deliver the queued message while there is still no
+    // turn-start evidence (this window also covers the queued-message busy
+    // probe's rejected markPromptReady()).
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 3_000));
+    expect(
+      logs.some(entry => entry.includes('Writing to PTY (flush)')),
+      logs.join(''),
+    ).toBe(false);
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+
+    // Turn-start evidence lands (started turn, still no terminal). The next
+    // rejected-ready edge (quiescence after the fake's 10s output, or the 15s
+    // first-prompt timeout probe) must deliver the queued message.
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+    await waitForLog(child, logs, 'Writing to PTY (flush): "second message please');
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+  }, 35_000);
+
+  it('delivers a startup-queued message when turn-start evidence lands after every probe and timeout died', async () => {
+    // The slow-evidence deadlock: the transcript user record lands only AFTER
+    // the 15s first-prompt timeout (whose probe fired a rejected
+    // markPromptReady() and stopped), with a permanently silent PTY (no
+    // quiescence edge will ever come) and the 90s fail-open standing down on
+    // evidenceSeen. The evidence latch itself must act as the delivery
+    // driver — without it the queued second message needs a third message or
+    // fresh PTY output to unlock.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-slow-evidence-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def01234567d';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    // Input box once, then permanent silence.
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-slow-evidence',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    const initSentAt = Date.now();
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-slow-evidence',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    child.send({
+      type: 'message',
+      content: 'second message please',
+      turnId: 'om_turn_2',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Queued message (');
+
+    // Outlive the 15s first-prompt timeout (its probe fires one rejected
+    // markPromptReady and stops). Everything that could deliver has now died.
+    while (Date.now() - initSentAt < 17_000) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 100));
+    }
+    expect(
+      logs.some(entry => entry.includes('Writing to PTY (flush)')),
+      logs.join(''),
+    ).toBe(false);
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+
+    // Evidence lands NOW — with a silent PTY the transcript latch is the only
+    // remaining driver and must release the queued message itself.
+    appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+    await waitForLog(child, logs, 'releasing startup-queued input');
+    await waitForLog(child, logs, 'Writing to PTY (flush): "second message please');
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+  }, 40_000);
 
   it('never lets an idle escape between the two working edges on a Grok-class first turn', async () => {
     // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt + injectsReadyHook +

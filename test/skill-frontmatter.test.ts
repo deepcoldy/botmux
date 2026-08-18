@@ -51,6 +51,41 @@ describe('skill frontmatter reader', () => {
     });
   });
 
+  describe('nested mapping keys (previously clobbered the top-level value)', () => {
+    it('ignores indented name/description inside metadata.input_schema (agentbuddy marketplace shape)', () => {
+      // Real shape from an internal agentbuddy marketplace skill: the
+      // frontmatter embeds a JSON-schema whose `name: { type: string }`
+      // property overwrote the skill name and failed install with
+      // `invalid_skill_name:{ type: string }`.
+      const text = [
+        '---',
+        'name: generating-midscene-e2e-tests',
+        'description: real description',
+        'metadata:',
+        '  input_schema:',
+        '    type: object',
+        '    properties:',
+        '      repo_dir:',
+        '        type: string',
+        '        description: "nested prop description"',
+        '      name: { type: string }',
+        '---',
+        '',
+        'body',
+      ].join('\n');
+      expect(readSkillFrontmatter(text)).toMatchObject({
+        name: 'generating-midscene-e2e-tests',
+        description: 'real description',
+      });
+    });
+
+    it('still reads top-level keys that appear after a nested block', () => {
+      const fm = readSkillFrontmatter('---\nname: x\nmetadata:\n  name: nested\nversion: 1.0.0\n---\n');
+      expect(fm.name).toBe('x');
+      expect(fm.version).toBe('1.0.0');
+    });
+  });
+
   describe('unchanged behaviour', () => {
     it('handles CRLF, quotes and tag arrays', () => {
       expect(readSkillFrontmatter('---\nname: x\ndescription: hi\r\n---\r\n').description).toBe('hi');

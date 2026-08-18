@@ -357,6 +357,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
+import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import type {
   CliTurnPayload,
   CodexAppDeliverySink,
@@ -1398,14 +1399,7 @@ export function sessionMojoConfig(
 
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
-  let crossRef: Record<string, string> = {};
-  const crossRefPath = join(dataDir, `bot-openids-${larkAppId}.json`);
-  if (existsSync(crossRefPath)) {
-    const parsed = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      crossRef = parsed as Record<string, string>;
-    }
-  }
+  const crossRef = readPeerCrossRef(dataDir, larkAppId);
 
   let botEntries: BotMentionEntry[] = [];
   const botInfoPath = join(dataDir, 'bots-info.json');
@@ -2239,7 +2233,11 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   ds.cardPatchInFlight = true;
+  let patchSucceeded = false;
   updateMessage(ds.larkAppId, cardId, json)
+    .then(() => {
+      patchSucceeded = true;
+    })
     .catch(err => {
       if (err instanceof MessageWithdrawnError) {
         // Only clear streamCardId when the withdrawn message is still the
@@ -2262,6 +2260,17 @@ function flushCardPatch(ds: DaemonSession): void {
     })
     .finally(() => {
       ds.cardPatchInFlight = false;
+      // A re-render can queue the exact same state while this PATCH is in
+      // flight. Drop only that adjacent duplicate after confirmed delivery.
+      // Failed PATCHes deliberately retain the queued item so it retries, and
+      // cardId participates in the comparison so a new turn's card is never
+      // mistaken for the card that just completed.
+      if (patchSucceeded
+        && ds.pendingCardId === cardId
+        && ds.pendingCardJson === json) {
+        ds.pendingCardJson = undefined;
+        ds.pendingCardId = undefined;
+      }
       if (ds.pendingCardJson) {
         flushCardPatch(ds);
       }

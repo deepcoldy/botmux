@@ -58,7 +58,20 @@ import { delay } from '../../utils/timing.js';
  *  idle probe and the reattach probe (`scheduleReattachIdleProbe`, gated on
  *  `busyPattern`), so a turn — and a reattached persistent pane with no new PTY
  *  output — is marked ready via the `Working...` marker exactly as before this
- *  change. `assistant_final` events additionally fire idle when they land. */
+ *  change. `assistant_final` events additionally fire idle when they land.
+ *  Three guards keep quiescence honest (the raw heuristic alone mis-fires):
+ *    1. Startup window: the TUI renders its input box seconds before the CLI
+ *       begins consuming an argv-baked first prompt (extension/model loading).
+ *       The worker holds the first ready until the turn has visibly started —
+ *       `Working...` seen on PTY, or the transcript's first user record
+ *       (worker `spawnArgvTurnStartEvidenceSeen` gate).
+ *    2. Mid-turn: pi is in STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS, so a
+ *       transcript-started turn without a terminal suppresses screen idle
+ *       (drainPiTranscript emits terminals for stop/length-no-toolcall and the
+ *       hard error/aborted edges — see pi-transcript.ts for the accepted
+ *       custom-tool `terminate:true` gap).
+ *    3. Post-idle: `idleToBusyPattern` flips a falsely published ready back to
+ *       working when `Working...` reappears. */
 export function createPiAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
@@ -112,6 +125,13 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     busyPattern: /Working\.\.\./,
+    // Self-heal for a falsely published ready (e.g. a startup-window quiescence
+    // idle slipping past the gates): if `Working...` renders AFTER an idle was
+    // reported, IdleDetector fires onBusy and the worker pulls isPromptReady
+    // back to false + republishes working. Safe as an idle→busy edge marker:
+    // Pi's `Working...` is an ephemeral status line, never part of transcript
+    // history redraws, so a completed turn cannot revive a closed card.
+    idleToBusyPattern: /Working\.\.\./,
     readyPattern: undefined,
     // Pi's native Message Queue parks/steers submit-while-busy input; the JSONL
     // transcript bridge (drainPiTranscript) + the `Working...` busy marker are
