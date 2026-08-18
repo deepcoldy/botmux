@@ -390,3 +390,89 @@ Workbench-only 身份按能力根本不请求 `/api/schedules`（`scheduleReques
 - 真实飞书/Lark 客户端最低版本与 requestAccess/requestAuthCode 支持矩阵。
 - 同源 Preview 只承载受信本机开发应用；若需求扩展到不可信应用，先设计独立 origin 和隔离容器。
 - 生产部署、真实凭据、开放平台发布与 live daemon 操作必须走独立变更审批，不属于本交付。
+
+## 11. 外观系统与视觉重构
+
+> 本节为 2026-08-18 追加，记录外观系统（四主题 + 跟随系统 + 终端双渲染）、常驻链接入口与视觉体系重构的实现要点与验收方式。原文 1–10 节结构不变。
+
+### 11.1 外观系统
+
+**状态模型**（`src/dashboard/web/agent-workbench-appearance.ts`）：
+
+- 一条 localStorage 记录 `botmux.agent-workbench.appearance.v1` 存三件事——`skin`（4 选 1）、`mode`（system/light/dark）、`termStyle`（reader/classic），永远一起读一起写。
+- 4 套配色：`ink`（墨黑）、`slate-blue`（蓝灰，默认）、`warm-graphite`（石墨）、`light-frost`（冷白）。浅色族只有 light-frost 一套，`mode` 落到 light 时恒用它。
+- 终端双渲染：`reader`（阅读，低饱和 + 行距 1.3，配色跟随当前 skin）与 `classic`（经典，Tokyo Night 原样 + 行距 1.0，默认）。
+- 旧偏好自动迁移：首版命名 `orca-ink` / `orca` 读到时静默换成 `ink` / `reader`，normalize 是唯一入口（load / save / 跨 tab storage 事件三路一致）。
+- 生效值写到文档根 `data-skin` / `data-theme`，CSS 侧靠属性选择器整体换档；工作台挂载期间接管这两个属性，卸载时把进来之前的值原样还回全站机制。
+- 跨 tab 同步靠 `storage` 事件；跟随系统靠 `matchMedia('(prefers-color-scheme: dark)')` 的 change；系统明暗变化时幂等盖回自己的解析结果，不额外重绘。
+
+**入口（三处同一状态源）**：
+
+- 桌面 / 会话坞：工作区头部 `⋯` 菜单 →「外观」（`WorkbenchAppearanceMenu`，下拉浮层）。
+- 移动端：会话列表页顶栏 `◐` 图标 → 底部 sheet（`WorkbenchAppearanceSheet`，同一块面板内容）。
+- 终端标题栏：「阅读｜经典」分段控件（`WorkbenchTermStyleSegment`），只切 termStyle。
+
+**终端 iframe 下发**：终端画布跑在跨文档的 `/s/<sessionId>` iframe 里，父页换 class 传不进去。父页通过 `postMessage`（type `botmux:wb-appearance`，targetOrigin 从 iframe URL 推导，绝不用 `*`）把 `{ termStyle, skin, theme }` 推给终端页；终端页只认父窗口发来的、12 个键齐全且每个都是十六进制色值的载荷，其余一律丢弃。
+
+**无障碍**：色板与分段控件为 radiogroup/radio + roving tabindex，方向键在组内移动；`⋯` 菜单有 haspopup/expanded，Esc 关闭并归还焦点。localStorage 不可用时只在当前页生效且不弹错，脏值与未知枚举逐字段回落默认。
+
+![外观面板（桌面）](assets/workbench-appearance-menu.png)
+
+![手机端外观面板（底部 sheet）](assets/workbench-appearance-sheet-mobile.png)
+
+### 11.2 四主题实测截图
+
+以下截图来自隔离实例的合成数据（无真实会话、用户或凭据），展示四套配色的实际效果：
+
+| 墨黑（ink） | 蓝灰（slate-blue，默认） |
+|---|---|
+| ![墨黑主题](assets/workbench-skin-ink.png) | ![蓝灰主题](assets/workbench-skin-slate-blue.png) |
+
+| 石墨（warm-graphite） | 冷白（light-frost） |
+|---|---|
+| ![石墨主题](assets/workbench-skin-warm-graphite.png) | ![冷白主题](assets/workbench-skin-light-frost.png) |
+
+### 11.3 终端双渲染
+
+「阅读」与「经典」的外框几何完全一致，切换只重绘画布 + 一次 `fit()`，不影响连接和接管状态。
+
+| 阅读（reader） | 经典（classic，默认） |
+|---|---|
+| ![阅读模式终端](assets/workbench-term-reader.png) | ![经典模式终端](assets/workbench-term-classic.png) |
+
+### 11.4 常驻链接入口
+
+**`/dashboard` 卡片**（`src/core/workbench-link.ts` + `src/im/lark/overview-card.ts`）：
+
+- 「打开工作台」按钮改为携带长期 Dashboard token 的常驻链接（产品决策反转，短票机制 `dashboard/workbench-ticket.ts` 原样保留但不再被卡片调用）。
+- PC 走 appCenter AppLink（`mode=appCenter`，可右键固定到侧边栏），移动端走裸 URL（手机客户端不识别 applink mode）。
+- 卡片正文不渲染明文链接行（曾短暂上过一版后撤下），只有按钮 + 一行小字提示（常驻不过期 + rotate 自救）。
+- token 读不到时 fail open 成无凭证裸链接，小字改说「需自行登录」。
+
+**工作台内 owner 自取**（`src/dashboard/standing-link.ts` + `WorkbenchStandingLinkPanel`）：
+
+- `GET /api/workbench/standing-link`：只有本机完整管理身份（legacy-dashboard cookie）可取，路由级 + 处理器级两层门禁；飞书 H5、平台 owner/teammate/guest、匿名一律 404。
+- 同源校验（`Sec-Fetch-Site` / `Origin`，Referer 兜底）、响应 `no-store`、每发一次落一条 `auth.standing_link_issued` 审计（审计写不进去就不发链接）。
+- 前端入口挂在 `⋯` 菜单（桌面）和 `◐` 底部 sheet（手机）的「常驻链接」面板，只对 `manageAuthed` 身份渲染。
+
+![常驻链接面板（桌面）](assets/workbench-standing-link-panel.png)
+
+![常驻链接面板（手机）](assets/workbench-standing-link-mobile.png)
+
+### 11.5 视觉体系重构
+
+- **分层配色**：四层底（L0 页面底 / L1 侧栏 / L2 卡片浮层 / L3 选中悬浮）+ 三档文字 + 语义色；历史 `--wb-*` 令牌全部映射到新令牌，换配色只改一处。
+- **圆角三档**：从 4/8/10/12 四档收成 6/10/14 三档 + 仅用于正圆的 full，读全站 `:root` 统一令牌。
+- **实线白名单**：分栏竖线、5px 实心分隔带、面板描边全删，分区改由底色差 + 透明握把带表达。
+- **终端原生全铺**：面板去描边、去圆角、去阴影，底色改终端画布色；标题栏贴 L1 满出血且无下沿线；8px 左安全边距由外壳 padding 给。
+- **手机字号自适应**（`e35a4d44`）：终端页 xterm fontSize 不再写死 14px，改为按容器宽度反推（目标 62 列，`width / (62 × 0.6)`，半档取整，只缩不放，硬边界 [9,15]），接在 resize / orientationchange / ResizeObserver 三个触发源上，250ms 防抖。桌面宽度 ≥ 约 521px 仍是 14px，存量渲染零变化。
+
+![手机端会话列表（字号自适应后）](assets/workbench-mobile-list.png)
+
+### 11.6 验收方式
+
+- 外观单测覆盖：normalize / migrate / select 规则、跨 tab storage 事件、系统明暗变化、localStorage 不可用降级。
+- 终端接缝集成测试：真实载荷跑终端页监听器，含冒充来源、错类型、脏色值、缺键的拒绝路径。
+- 契约测试：四套皮肤 15 个色值逐项锁死、圆角三档白名单。
+- 常驻链接：路由级 401/404、处理器级 404、跨站 403、审计失败 503、token 轮换后链接自然更新。
+- 浏览器实测：上述截图均来自隔离实例（合成会话数据，无真实敏感信息），覆盖桌面 / 手机、四主题、双渲染、外观面板、常驻链接面板。
