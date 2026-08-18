@@ -79,5 +79,10 @@
     "esbuild": "0.28.0",
     "typescript": "5.9.3"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepcoldy/botmux.git",
+    "directory": "packages/workflow-core"
+  },
   "license": "MIT"
 }

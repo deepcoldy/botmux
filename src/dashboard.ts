@@ -21,6 +21,7 @@ import {
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
@@ -1449,19 +1450,34 @@ function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
- * THEN open the SSE subscription. Order matters — hydrating after subscribe
- * would let snapshot data clobber events that arrived between subscribe and
- * the snapshot fetch.
+ * THEN open the SSE subscription.
+ *
+ * The subscription runs a snapshot barrier (subscribeDaemon's `onConnected`):
+ * after every stream establishment — the first included — and BEFORE any
+ * frame is read, we install a fresh authoritative snapshot while incoming
+ * frames stay queued in the stream; frames then apply on top in order. This
+ * gives two guarantees at once:
+ *
+ * 1. No reverse clobber: the barrier snapshot is installed before any frame
+ *    is applied, so a slow snapshot response can never overwrite state that
+ *    a faster SSE event already delivered (a naive post-subscribe hydrate
+ *    would).
+ * 2. No forward gap: events fired between step 1 below and the stream
+ *    handshake are picked up by the barrier snapshot, and events missed
+ *    during a drop are recovered by the barrier re-run on reconnect.
+ *
+ * The blocking hydrate in step 1 still matters: it populates the cache
+ * before the dashboard starts serving, and keeps a daemon's last-known
+ * state visible even if its SSE stream never connects.
  *
  * Idempotent: a second call for the same daemon while one is in flight is a
- * no-op; a call after attach finished re-hydrates (useful when a daemon
- * restarts and we want to refresh its slice of the cache).
+ * no-op; the subscription itself is installed once.
  */
 async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   if (attaching.has(d.larkAppId)) return;
   attaching.add(d.larkAppId);
   try {
-    // 1. Hydrate snapshot (blocking — completes before we wire SSE)
+    // 1. Blocking snapshot (see above)
     try {
       const [sRes, schRes] = await Promise.all([
         fetchDaemonIpc(d.ipcPort, '/api/sessions'),
@@ -1474,22 +1490,47 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ));
       aggregator.hydrateSessions(d.larkAppId, rows);
       for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
-      aggregator.hydrateSchedules(sch.schedules ?? []);
+      aggregator.hydrateSchedules(d.larkAppId, sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
     }
-    // 2. Open SSE subscription if not already (idempotent)
+    // 2. Open SSE subscription if not already (idempotent). The barrier
+    //    below runs inside subscribeDaemon, after the stream is established.
     if (!subs.has(d.larkAppId)) {
       subs.set(
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
+          // Snapshot barrier: install an authoritative snapshot before any
+          // frame is read. Frames arriving during this fetch stay queued in
+          // the stream and apply afterwards, so the snapshot can never
+          // clobber fresher SSE state; on reconnect it recovers missed
+          // events. The subscription signal is the generation arbitration:
+          // if aborted mid-flight (daemon offline, newer generation), the
+          // snapshot is discarded instead of clobbering the new generation.
+          signal => reconcileDaemon(d, signal),
         ),
       );
     }
   } finally {
     attaching.delete(d.larkAppId);
+  }
+}
+
+/**
+ * Reconcile one daemon's snapshot into the aggregator (subscribeDaemon
+ * barrier). Thin wrapper over reconcileDaemonSnapshot that also schedules
+ * presentation enrichment for the session rows.
+ */
+async function reconcileDaemon(
+  d: import('./dashboard/registry.js').DaemonInfo,
+  signal: AbortSignal,
+): Promise<void> {
+  const snapshot = await reconcileDaemonSnapshot(d, aggregator, signal);
+  if (!snapshot) return;
+  for (const row of snapshot.sessions) {
+    sessionPresentation.schedule(d.larkAppId, row);
   }
 }
 
