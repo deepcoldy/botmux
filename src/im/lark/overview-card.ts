@@ -229,20 +229,16 @@ export function buildOverviewCard(
       }],
     });
 
-    // 明文链接单独一行：按钮点得开但**复制不出来**，而这条链接的全部价值就在于
-    // 能被收藏进书签。用 plain_text 而非 lark_md —— token 是 base64url，含 `_`
-    // 和 `-`，走 lark_md 要么被 escapeLarkMd 转义成 `\_`（复制出来是坏链），要么
-    // 被当成斜体标记吃掉。plain_text 一字不改地原样呈现。
-    elements.push({
-      tag: 'div',
-      text: {
-        tag: 'plain_text',
-        content: opts.workbench.webUrl,
-      },
-    });
+    // 这里**故意不再多渲染一行明文链接**（曾短暂上过一版，产品试用后撤下）：
+    // 一整行 token 链接摊在卡片正文里太吵，且卡片是持久化载体（历史/转发/截图
+    // 都留着），明文摊开只会把常驻凭证的暴露面放得更大。入口只留按钮一个，
+    // token 只出现在按钮的 URL 里；owner 想拿到链接本体去收藏，走工作台
+    // `⋯` 菜单里的「常驻链接」自取面板（dashboard/web/agent-workbench-appearance-menu.tsx）
+    // 或终端 `botmux dashboard` 的第二行。别顺手把这行加回来。
 
-    // 小字：带凭证时说清「可收藏 + 怀疑泄漏怎么自救」，这是常驻链接风险交换里
-    // 用户那一侧的知情权；降级成无凭证链接时改说「需自行登录」，别吹不存在的能力。
+    // 小字：带凭证时说清「入口常驻不过期 + 怀疑泄漏怎么自救」，这是常驻链接风险
+    // 交换里用户那一侧的知情权；降级成无凭证链接时改说「需自行登录」，别吹不存在
+    // 的能力。注意小字里只放 rotate 命令，不放链接本体（见上）。
     elements.push({
       tag: 'note',
       elements: [{

@@ -68,8 +68,8 @@ export interface ResolvedWorkbenchUrl {
  * 端口同理取 dashboard 落盘的 `.dashboard-port`（端口探测可能落在 7891 之外）。
  *
  * 用 `/workbench?t=` 而不是 `/?t=…#/agent-workbench`：不带 `#` 的形态复制粘贴时
- * 不会被截断（见 dashboard-url.ts:workbenchEntryUrl），而这条链接现在就是给人
- * **复制收藏**的。
+ * 不会被截断（见 dashboard-url.ts:workbenchEntryUrl）——这条链接除了当按钮目标，
+ * 还会被 owner 从工作台「常驻链接」面板 / 终端 `botmux dashboard` 里复制去收藏。
  */
 export function resolveWorkbenchUrl(): ResolvedWorkbenchUrl | undefined {
   try {
@@ -104,8 +104,11 @@ export function resolveWorkbenchUrl(): ResolvedWorkbenchUrl | undefined {
 export interface WorkbenchButtonLinks {
   /** PC：appCenter AppLink（在飞书导航栏开标签页，可右键固定 → 真正的常驻入口）。 */
   appLink: string;
-  /** 移动端 + 卡片里明文可复制的那一行。手机客户端不识别 applink 的 `mode`，
-   *  直接给网页 URL；这也是用户收藏进书签的那条。 */
+  /** 移动端的按钮目标：手机客户端不识别 applink 的 `mode`，直接给网页 URL。
+   *  卡片里**不**再单独渲染一行明文链接（产品试用后撤下，见
+   *  `im/lark/overview-card.ts` 的「打开工作台」块），所以这条 URL 只出现在按钮
+   *  的 `multi_url` 里；owner 想拿链接本体收藏，走工作台 `⋯` 菜单的「常驻链接」
+   *  面板或终端 `botmux dashboard` 的输出。 */
   webUrl: string;
   /** 链接是否携带凭证。false 时卡片要注明「需在浏览器里登录」，别吹「常驻可收藏」。 */
   credentialed: boolean;

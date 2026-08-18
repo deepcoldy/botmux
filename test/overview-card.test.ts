@@ -242,6 +242,11 @@ describe('buildOverviewCard', () => {
   // The card is the ONLY zero-setup way into the Web Workbench from Feishu, so
   // the link shape is asserted end-to-end: applink prefix + fully-encoded target
   // carrying the `?t=` token on the `/workbench` standing entry.
+  //
+  // 入口形态：**只有按钮**。曾短暂在按钮下面多渲染一行明文链接（方便复制收藏），
+  // 产品试用后要求撤下——一整行 token 链接摊在正文里太吵，且卡片是持久化载体
+  // （历史/转发/截图都留着），明文摊开只会放大常驻凭证的暴露面。所以下面钉的
+  // 不变量是：token 只出现在按钮的 `multi_url` 里，卡片正文一个字节都没有。
   describe('open-workbench button', () => {
     const WORKBENCH_TARGET = 'http://10.0.0.7:7891/workbench?t=tok-abc';
     const WORKBENCH_APPLINK = appCenterAppLink(WORKBENCH_TARGET, 'feishu');
@@ -256,6 +261,23 @@ describe('buildOverviewCard', () => {
         .filter((e: any) => e.tag === 'action')
         .flatMap((e: any) => e.actions as any[])
         .filter((b: any) => b.text?.content === '打开工作台');
+    }
+
+    /**
+     * 卡片正文里所有可见文案（`div` / `note` 等非 action 元素的 content）。
+     * 用来钉「链接只在按钮的 multi_url 里，不摊在正文」这条不变量。
+     */
+    function bodyTexts(json: string): string[] {
+      const out: string[] = [];
+      const walk = (node: any): void => {
+        if (Array.isArray(node)) { node.forEach(walk); return; }
+        if (!node || typeof node !== 'object') return;
+        if (node.tag === 'action') return; // 按钮那块由 openWorkbenchButtons 单独断言
+        if (typeof node.content === 'string') out.push(node.content);
+        for (const value of Object.values(node)) walk(value);
+      };
+      walk(JSON.parse(json).elements);
+      return out;
     }
 
     it('renders exactly one 打开工作台 button whose PC target is the appCenter AppLink', () => {
@@ -289,31 +311,37 @@ describe('buildOverviewCard', () => {
       expect(target.searchParams.get('t')).toBe('tok-abc');
     });
 
-    // 常驻链接必须同时以**明文**出现，用户才能复制进书签；只有按钮的话，飞书里
-    // 长按按钮拿不到 URL。用 plain_text 而不是 lark_md：token 是 base64url，含
-    // `_` / `-`，走 lark_md 会被 escapeLarkMd 转义成 `\_`（复制出来是坏链）或被
-    // 当成斜体标记吃掉。
-    it('also renders the standing link as copyable plain text (not lark_md)', () => {
+    // 卡片正文里**不得**出现明文链接行（产品试用后撤下，见 describe 上方说明）。
+    // token 只跟着按钮的 multi_url 走：PC 是 applink 的 URL 编码形态，移动端是裸
+    // URL——四个字段各一份，卡片里出现的次数就到此为止。
+    it('never renders the standing link as a body row — the button is the only entry', () => {
       const json = buildOverviewCard(
         { sessions: [], schedules: [], settings: makeSettings() },
         withWorkbench,
       );
-      const parsed = JSON.parse(json);
-      const plainTexts = JSON.stringify(parsed).match(/"tag":"plain_text","content":"[^"]*"/g) ?? [];
-      const linkNode = plainTexts.find(s => s.includes('/workbench?t=tok-abc'));
-      expect(linkNode).toBeDefined();
-      // 明文一字不改地出现（没有反斜杠转义污染）。
-      expect(json).toContain(WORKBENCH_TARGET);
-      expect(json).not.toContain('workbench?t\\=');
+      for (const text of bodyTexts(json)) {
+        expect(text).not.toContain(WORKBENCH_TARGET);
+        expect(text).not.toContain('/workbench?t=');
+        expect(text).not.toContain('tok-abc');
+      }
+
+      const { multi_url: multiUrl } = openWorkbenchButtons(json)[0];
+      const carriers = [multiUrl.url, multiUrl.pc_url, multiUrl.android_url, multiUrl.ios_url];
+      for (const carrier of carriers) expect(carrier).toContain('tok-abc');
+      // 全卡片里 token 的出现次数 == 按钮上那几个 URL 字段，多一处就是正文漏了。
+      expect((json.match(/tok-abc/g) ?? []).length).toBe(carriers.length);
     });
 
-    it('carries the standing-link hint naming token rotation as the revocation lever', () => {
+    it('carries the standing-entry hint naming token rotation as the revocation lever', () => {
       const json = buildOverviewCard(
         { sessions: [], schedules: [], settings: makeSettings() },
         withWorkbench,
       );
-      expect(json).toContain('常驻链接');
+      expect(json).toContain('常驻入口');
       expect(json).toContain('轮换');
+      expect(json).toContain('botmux dashboard rotate');
+      // 小字只放自救命令，不放链接本体——正文零链接这条由上一个用例整体钉住。
+      expect(json).not.toContain('可收藏');
     });
 
     // 降级路径（fail open）：daemon 读不到 `.dashboard-token` 时照发卡片，只是
@@ -329,8 +357,14 @@ describe('buildOverviewCard', () => {
       );
       expect(openWorkbenchButtons(json).length).toBe(1);
       expect(json).toContain('需在浏览器里登录');
-      // 没凭证就别吹「常驻可收藏」——那句提示只属于真正带凭证的链接。
-      expect(json).not.toContain('可收藏');
+      // 降级态同样只有按钮：无凭证形态的那行明文链接一并撤下了。
+      for (const text of bodyTexts(json)) {
+        expect(text).not.toContain(bare);
+        expect(text).not.toContain('/#/agent-workbench');
+      }
+      // 没凭证就别吹「常驻不过期」——那句提示只属于真正带凭证的链接。
+      expect(json).not.toContain('常驻入口');
+      expect(json).not.toContain('rotate');
     });
 
     it('mobile falls back to the plain web URL (no appCenter container on phones)', () => {
@@ -704,6 +738,11 @@ describe('handleOverviewCardAction', () => {
 //
 // 所以下面断言的是新不变量：真实 resolveWorkbenchButtonLinks 拼出的链接**必须**
 // 携带落盘 token，且卡片 JSON 里**不再**出现 `/workbench-ticket/`。
+//
+// 补充（卡片形态收敛）：链接一度还在按钮下面多渲染一行明文，方便复制收藏；产品
+// 试用后要求撤下——卡片上只留按钮，token 只跟着按钮的 `multi_url` 走，正文里一个
+// 字节都没有。链接本体改由工作台 `⋯` 菜单的「常驻链接」面板 / 终端
+// `botmux dashboard` 自取。这不影响上面的凭证决策，只收窄了它在卡片里的暴露面。
 describe('workbench link embeds the standing dashboard token (product decision)', () => {
   // 足够独特、绝不会偶然出现在 URL 结构里的 token 明文。
   const LEAKY_TOKEN = 'LEAKY-LONG-LIVED-DASHBOARD-TOKEN-0123456789';
@@ -748,17 +787,31 @@ describe('workbench link embeds the standing dashboard token (product decision)'
     }
   });
 
-  it('the fully-rendered card JSON carries the standing token and no ticket path', () => {
+  it('the fully-rendered card JSON carries the standing token in the button only', () => {
     const links = resolveWorkbenchButtonLinks(LARK_APP_ID);
     const json = buildOverviewCard(
       { sessions: [], schedules: [], settings: makeSettings() },
       { invokerOpenId: INVOKER, locale: 'zh', workbench: links },
     );
-    // 反转后的核心断言：token 明文**就该**在卡片里（明文可复制那行 + applink 的
-    // URL 编码形态各一份）。
-    expect(json).toContain(LEAKY_TOKEN);
-    expect(json).toContain(encodeURIComponent(LEAKY_TOKEN));
-    expect(json).toContain('?t=');
+    const elements = (JSON.parse(json) as { elements: any[] }).elements;
+
+    // 反转后的核心断言：token **就该**进卡片——但只跟着按钮的 multi_url 走。
+    const button = elements
+      .filter(e => e.tag === 'action')
+      .flatMap(e => e.actions as any[])
+      .find(b => b.text?.content === '打开工作台');
+    expect(button).toBeDefined();
+    expect(button.multi_url.url).toContain(encodeURIComponent(links!.webUrl));
+    expect(button.multi_url.android_url).toBe(links!.webUrl);
+    expect(JSON.stringify(button)).toContain(LEAKY_TOKEN);
+
+    // 卡片正文（非按钮元素）一个字节的 token / 链接都没有：明文常驻链接那行在
+    // 产品试用后撤下了，正文只剩标题、小字提示和各分区摘要。
+    const body = JSON.stringify(elements.filter(e => e.tag !== 'action'));
+    expect(body).not.toContain(LEAKY_TOKEN);
+    expect(body).not.toContain('?t=');
+    expect(body).not.toContain('http://');
+
     // 短票残留清零。
     expect(json).not.toContain('/workbench-ticket/');
     expect(json).not.toContain('workbench-ticket');
