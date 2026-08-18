@@ -394,7 +394,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -18863,35 +18863,38 @@ async function handleThreadReplyAdmitted(
   // 回调 URL 已在上方 return，可用来中止）。答复权限 = canTalk，由
   // broker 在 submitCustomReply 内按注入的 canTalkChecker 判定：非授权人返回
   // 'unauthorized'，这里 fall through 到正常路由。卡片由 broker.onSettle 自动 PATCH。
-  // `!threadGrill`：grill goal 分支只改写 promptContent 后 fall-through（不 return），
-  // cmdContent 仍是字面量 `/workflow new <目标>`；若不排除，待回答 ask 会把它当答案吞掉，
-  // grill 永远不启动。grill 必须穿过拦截器走正常转发。
-  if (threadSenderOpenId && threadChatId && !threadGrill) {
-    const askReplyText = cmdContent.trim();
-    if (askReplyText) {
-      const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: threadChatId, anchor });
-      if (pendingAsk) {
-        const outcome = submitCustomReply({
-          askId: pendingAsk.askId,
-          by: threadSenderOpenId,
-          text: askReplyText,
-          // Actor context so the broker's talk check uses the same predicate as
-          // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
-          // (covers team-拉群 with no union_id), a platform teamMember human →
-          // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
-          // to the plain evaluateTalk(openId, chatType).
-          actor: {
-            botSender: isBotSenderType || isForeignBot,
-            senderUnionId: threadTeamTrustUnionId,
-            memberUnionId: threadSenderUnionId,
-          },
-        });
-        if (outcome === 'accepted') {
-          logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${threadSenderOpenId.substring(0, 12)}`);
-          return;
-        }
-        logger.info(`[${anchor.substring(0, 12)}] ask custom reply not accepted (${outcome}); falling through to normal routing`);
+  // 「哪些消息算纯文字答复」收口在 askCustomReplyCandidate（含带资源消息与 grill
+  // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
+  const askCandidate = askCustomReplyCandidate({
+    senderOpenId: threadSenderOpenId,
+    chatId: threadChatId,
+    cmdContent,
+    resourceCount: resources.length,
+    isWorkflowGrillTrigger: !!threadGrill,
+  });
+  if (askCandidate) {
+    const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    if (pendingAsk) {
+      const outcome = submitCustomReply({
+        askId: pendingAsk.askId,
+        by: askCandidate.senderOpenId,
+        text: askCandidate.text,
+        // Actor context so the broker's talk check uses the same predicate as
+        // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
+        // (covers team-拉群 with no union_id), a platform teamMember human →
+        // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
+        // to the plain evaluateTalk(openId, chatType).
+        actor: {
+          botSender: isBotSenderType || isForeignBot,
+          senderUnionId: threadTeamTrustUnionId,
+          memberUnionId: threadSenderUnionId,
+        },
+      });
+      if (outcome === 'accepted') {
+        logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${askCandidate.senderOpenId.substring(0, 12)}`);
+        return;
       }
+      logger.info(`[${anchor.substring(0, 12)}] ask custom reply not accepted (${outcome}); falling through to normal routing`);
     }
   }
 
