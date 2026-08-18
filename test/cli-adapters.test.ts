@@ -1917,11 +1917,13 @@ describe('buildResumeCommand', () => {
 });
 
 describe('native session rename capability', () => {
-  it('is declared only by the verified Codex and Claude Code adapters', () => {
+  it('is declared only by the verified Codex, Claude Code, and Grok adapters', () => {
     expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
       .toBe('/rename 新的标题');
     expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
+    expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
+      .toBe('/rename 新标题');
 
     expect(createCliAdapterSync('seed', '/bin/true').buildSessionRenameCommand).toBeUndefined();
     expect(createCodexAppAdapter('/bin/codex').buildSessionRenameCommand).toBeUndefined();
@@ -2030,7 +2032,51 @@ describe('grok buildArgs', () => {
   });
 
   it('surfaces curated model choices for setup', () => {
-    expect(adapter.modelChoices).toContain('grok-4.5');
+    expect(adapter.modelChoices).toEqual(['grok-4.6', 'grok-4.5']);
+  });
+
+  it('passes --reasoning-effort when configured', () => {
+    const args = adapter.buildArgs({
+      sessionId: sid,
+      resume: false,
+      model: 'grok-4.6',
+      reasoningEffort: 'high',
+    });
+    expect(args.slice(0, 8)).toEqual([
+      '--always-approve', '--no-plan',
+      '--model', 'grok-4.6',
+      '--reasoning-effort', 'high',
+      '--session-id', sid,
+    ]);
+  });
+
+  it('forks with --resume, --fork-session, and the child --session-id', () => {
+    const childId = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const args = adapter.buildArgs({
+      sessionId: childId,
+      resume: true,
+      resumeSessionId: sid,
+      forkSession: true,
+      reasoningEffort: 'medium',
+    });
+    expect(args.slice(0, 9)).toEqual([
+      '--always-approve', '--no-plan',
+      '--reasoning-effort', 'medium',
+      '--resume', sid,
+      '--fork-session',
+      '--session-id', childId,
+    ]);
+  });
+
+  it('does not fork a plain resume', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'child',
+      resume: true,
+      resumeSessionId: 'source',
+      forkSession: false,
+    });
+    expect(args.includes('--fork-session')).toBe(false);
+    expect(args.includes('--session-id')).toBe(false);
   });
 
   it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {

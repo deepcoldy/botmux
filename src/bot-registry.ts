@@ -25,7 +25,7 @@ import { isGrantDurationOption } from './services/grant-policy.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
-import { codexModelSupportsReasoningEffort, isCodexReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -2878,9 +2878,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Positive integer within the arm-able bound only; anything else → undefined
       // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
       turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
-      reasoningEffort: isCodexReasoningCliId(entryCliId)
+      reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
-        && codexModelSupportsReasoningEffort(
+        && cliModelSupportsReasoningEffort(
+          entryCliId,
           typeof entry.model === 'string' ? entry.model : undefined,
           entry.reasoningEffort,
         )

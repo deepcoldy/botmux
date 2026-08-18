@@ -21,8 +21,8 @@ import {
 import * as sessionStore from '../services/session-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import {
-  codexModelSupportsReasoningEffort,
-  isCodexReasoningCliId,
+  cliModelSupportsReasoningEffort,
+  isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -3980,7 +3980,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
   }
   const currentBotConfig = getBot(larkAppId).config;
-  const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+  const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
   // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
   // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
   // field is optional in the body, so distinguish absent (preserve) from
@@ -4096,7 +4096,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const nextReasoningEffort = supportsReasoningEffort
       ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
       : undefined;
-    if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
+    if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
       return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
     }
     entry.cliId = selected.cliId;
@@ -4149,7 +4149,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       return jsonRes(res, 400, {
         ok: false,
         error: r.result.error,
-        message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
+        message: `模型 ${model || '（Agent 默认模型）'} 不支持当前思考强度`,
       });
     }
 

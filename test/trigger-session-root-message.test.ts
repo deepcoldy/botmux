@@ -228,6 +228,20 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
   });
 
+  it('stamps per-turn model + reasoningEffort onto a grok session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'grok', workingDir: '/tmp' },
+      botName: 'Grok', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'grok-4.6', reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.session.model).toBe('grok-4.6');
+    expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
   it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },

@@ -29,7 +29,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './r
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
-import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -239,15 +239,17 @@ export function getDaemonStreamingCardUsageSnapshot(
     effectiveCliId,
     { fresh: opts?.fresh ?? false },
   );
-  // Model comes only from an explicitly-wired executor runtime (TRAE/Codex set
-  // ds.activeModel from their rollout settings) or the user-configured launch
-  // model — never snapshot.tokens.model. That field is the RAW transcript model
-  // and for relay-style CLIs is an internal routing code (e.g. `ark/relay-code`)
-  // that must not surface on a user card.
+  // Model normally comes from an explicitly-wired executor runtime (TRAE/Codex
+  // set ds.activeModel) or launch config. Grok's native snapshot is the one
+  // exception: its signals.json exposes a stable user-facing primaryModelId.
+  // We still never surface snapshot.tokens.model, which can be an internal
+  // routing code for Relay-family CLIs (e.g. `ark/relay-code`).
+  const grokModel = effectiveCliId === 'grok' ? snapshot.model?.trim() : undefined;
+  const grokReasoningEffort = effectiveCliId === 'grok' ? snapshot.reasoningEffort?.trim() : undefined;
   return {
     ...snapshot,
-    ...(runtimeModel ? { model: runtimeModel } : {}),
-    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
   };
 }
 
@@ -1072,7 +1074,7 @@ function sessionAgentConfig(
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
     ds.session.model = ds.session.model ?? botCfg.model;
-    ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)
+    ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
     ds.session.agentFrozen = true;
@@ -1106,7 +1108,7 @@ function sessionAgentConfig(
     if (repaired) sessionStore.updateSession(ds.session);
   }
   if (ds.session.reasoningEffort
-      && !codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)) {
+      && !cliModelSupportsReasoningEffort(ds.session.cliId, ds.session.model, ds.session.reasoningEffort)) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
   }
@@ -1357,6 +1359,60 @@ export function recallFrozenCards(ds: DaemonSession): void {
   logger.info(`[${tag(ds)}] Recalled ${targets.length} previous streaming card(s)`);
 }
 
+/** The first visible state for a newly accepted turn.
+ *
+ * `starting` is a process/session lifecycle state. A live Grok worker that
+ * accepts another turn is already past startup, so surface the turn as working
+ * immediately. The worker's structured lifecycle gate will later publish the
+ * authoritative terminal state from updates.jsonl.
+ */
+export function turnStartingCardStatus(ds: DaemonSession, effectiveCliId: CliId): 'limited' | 'working' | 'starting' {
+  if (ds.usageLimit) return 'limited';
+  if (effectiveCliId === 'grok' && workerHasInitialized(ds)) return 'working';
+  return 'starting';
+}
+
+/** Incremented for every worker status observation, including same-value edges.
+ * A screen update can land while the Feishu starting-card POST is in flight;
+ * the revision lets the POST completion distinguish that from the pre-turn
+ * cached idle state and immediately reconcile the newly-created card. */
+function bumpStreamCardStatusRevision(ds: DaemonSession): void {
+  ds.streamCardStatusRevision = (ds.streamCardStatusRevision ?? 0) + 1;
+}
+
+/** Re-render a just-created starting card when a newer worker status arrived
+ * during its POST. The turn id is forwarded to scheduleCardPatch so a late
+ * patch from turn N cannot overwrite turn N+1's card. */
+function reconcilePostedStartingCard(ds: DaemonSession, turnId: string, revisionAtPost: number): void {
+  if ((ds.streamCardStatusRevision ?? 0) === revisionAtPost) return;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId));
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: status === 'idle' }),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+  scheduleCardPatch(ds, cardJson, turnId);
+}
+
 /**
  * Post the current turn's starting card as soon as the daemon accepts the
  * inbound message. Terminal redraw is deliberately not part of this trigger:
@@ -1393,7 +1449,8 @@ export async function postTurnStartingCard(
   // predecessor here before replacing its identity.
   parkStreamCard(ds);
   const nonce = randomBytes(4).toString('hex');
-  const status = ds.usageLimit ? 'limited' : 'starting';
+  const status = turnStartingCardStatus(ds, effectiveCliId);
+  const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
@@ -1460,6 +1517,7 @@ export async function postTurnStartingCard(
     flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     syncUsageRefreshTimer(ds);
+    reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
     if (superseded && ds.streamCardPendingTurnId) {
       void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
@@ -4887,13 +4945,13 @@ export async function transferSession(
 
 /** Backends whose conversation state is a local, copyable transcript file and
  *  whose CLI exposes a native "fork/branch this session" primitive that botmux
- *  can drive at cold spawn (Claude family: `--fork-session`; Codex terminal:
+ *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex terminal:
  *  `codex fork <id>`). App-server backends (codex-app, or a codex CLI running in
  *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'codex',
+  'claude-code', 'seed', 'relay', 'codex', 'grok',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -7986,6 +8044,7 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        bumpStreamCardStatusRevision(ds);
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
         // `worker` + `lastScreenStatus`, which everything below still reads
@@ -8212,6 +8271,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already

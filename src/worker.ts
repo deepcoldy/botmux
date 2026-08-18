@@ -9517,7 +9517,12 @@ function markPromptReady(): void {
   // so a dropped Enter cannot create permanent false-busy.
   // Reject the heuristic and re-arm IdleDetector so the later transcript-final
   // fireIdle() can drive the real ready edge.
-  if (hasStructuredLifecycleBlock()) {
+  if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {
+    // Grok is lifecycle-blocking, but its FIRST ready is still a pre-execution
+    // SessionStart / idle-detector edge while the argv-baked prompt is running.
+    // The spawnArgvInitialPromptBusy arm below must publish working and consume
+    // itself on that first edge. After the arm is gone, later TUI redraws stay
+    // blocked until turn_completed so they cannot publish idle mid-turn.
     const remainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
     log('Ignoring prompt-ready heuristic while a structured turn is unfinished or submit verification/start is pending');

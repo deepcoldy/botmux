@@ -43,7 +43,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
-import { codexReasoningEffortsForModel } from '../../services/codex-reasoning-effort.js';
+import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -1500,7 +1500,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: (cliKey === 'grok' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -1622,9 +1622,13 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  const isReasoningSelection = isCodexSelection || cliKey === 'grok';
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
-  const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
+  const reasoningEffortOptions = useMemo(
+    () => reasoningEffortsForCliModel(cliKey === 'grok' ? 'grok' : isCodexSelection ? 'codex' : undefined, model),
+    [cliKey, isCodexSelection, model],
+  );
 
   useEffect(() => {
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
@@ -1843,7 +1847,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isCodexSelection && (
+      {isReasoningSelection && (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.agentReasoningEffortHelp')}>{tr('botDefaults.agentReasoningEffort')}</FieldTitle>
@@ -1853,7 +1857,16 @@ export function BotAgentSection(props: {
               value={reasoningEffort}
               disabled={agentBusy}
               options={[
-                { value: '', label: tr('botDefaults.agentReasoningEffortDefault') },
+                {
+                  value: '',
+                  label: tr(
+                    cliKey === 'grok'
+                      ? 'botDefaults.agentReasoningEffortDefaultGrok'
+                      : isCodexSelection
+                        ? 'botDefaults.agentReasoningEffortDefaultCodex'
+                        : 'botDefaults.agentReasoningEffortDefault',
+                  ),
+                },
                 ...reasoningEffortOptions.map(value => ({
                   value,
                   label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),

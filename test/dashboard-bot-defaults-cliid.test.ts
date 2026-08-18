@@ -185,6 +185,55 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows Grok reasoning effort and omits Codex-only max/ultra for grok-4.5', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'grok', model: 'grok-4.5', reasoningEffort: body.reasoningEffort, selectionKey: 'grok' }),
+      } as any;
+    });
+    try {
+      const grokCliState = {
+        options: [
+          { id: 'grok', label: 'Grok' },
+          { id: 'codex', label: 'Codex' },
+        ],
+        ttadkModelDefault: '',
+        ttadkModelSuggestions: [],
+      };
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_grok', cliId: 'grok', model: 'grok-4.5', reasoningEffort: 'high' },
+          sessionFallback: 'grok',
+          cliState: grokCliState,
+          patchBot: () => undefined,
+        }));
+      });
+      const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('high');
+      const options = picker.props.options as Array<{ value: string; label: string }>;
+      expect(options.map(option => option.value)).toEqual(['', 'low', 'medium', 'high']);
+      expect(options[0]?.label).toBe('跟随 Grok 默认值');
+      expect(options.map(option => option.value)).not.toContain('xhigh');
+      expect(options.map(option => option.value)).not.toContain('ultra');
+      act(() => picker.props.onChange('medium'));
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'grok', model: 'grok-4.5', reasoningEffort: 'medium' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   const dshCliState = {
     options: [
       { id: 'codex', label: 'Codex' },

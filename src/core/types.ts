@@ -216,6 +216,11 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
+  /** Incremented for every worker status observation, including same-value
+   *  edges. A screen update can land while the Feishu starting-card POST is
+   *  in flight; the revision lets the POST completion distinguish that from
+   *  the pre-turn cached idle state and immediately reconcile the new card. */
+  streamCardStatusRevision?: number;
   /** Monotonic in-memory generation for accepted user turns. Card POST
    * completions use it to avoid clearing a newer turn's pending state. */
   streamCardTurnGeneration?: number;

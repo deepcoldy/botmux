@@ -601,7 +601,7 @@ describe('worker structured-turn status wiring', () => {
     const markStart = body.indexOf('function markPromptReady(): void');
     expect(markStart).toBeGreaterThanOrEqual(0);
     const evidenceGate = body.indexOf('if (spawnArgvTurnStartGateHolds()) {', markStart);
-    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock()) {', markStart);
+    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {', markStart);
     expect(evidenceGate).toBeGreaterThanOrEqual(0);
     expect(lifecycleGate).toBeGreaterThan(evidenceGate);
     expect(body.slice(evidenceGate, lifecycleGate)).not.toContain('flushQueuedInputAfterTurnStartEvidence');
