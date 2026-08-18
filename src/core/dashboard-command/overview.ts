@@ -95,8 +95,9 @@ export async function handleDashboardOverview(
     return;
   }
 
-  // 「打开工作台」按钮的链接带 30 分钟短时兑换票据（P2-1，不再内嵌长期
-  // Dashboard token）。它只在这里 mint——即 admin gate（handleDashboardCommand →
+  // 「打开工作台」入口是一条带长期 Dashboard token 的**常驻链接**（产品决策见
+  // core/workbench-link.ts：自部署 owner 要能收藏，泄漏由 rotate 兜底）。正因为
+  // 它是常驻凭证，只在这里解析——即 admin gate（handleDashboardCommand →
   // ensureDashboardOwner）已经放行之后，且卡片是私信给发起人本人的。任何绕过
   // gate 的路径都不得渲染它。
   const workbench = (testDeps.resolveWorkbench ?? resolveWorkbenchButtonLinks)(larkAppId);

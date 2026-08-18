@@ -1181,7 +1181,14 @@ function DashboardShell(): React.JSX.Element {
         <div className="workbench-route-host" data-workbench-surface={workbenchSurface}>
           <main id="root" ref={setRouteRoot} />
         </div>
-        <AuthExpiredOverlay open={authExpiredOpen} onClose={closeAuthExpired} />
+        {/* 工作台是无边框壳（没有 topbar / 侧栏），登录态失效时这个浮层是它唯一
+            的自救出口——漏传 loginUrl 会让浮层退化成「访问链接已失效 / 知道了」
+            的死胡同，一键登录压根不渲染。与下面普通壳的传参保持一致。 */}
+        <AuthExpiredOverlay
+          open={authExpiredOpen}
+          loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+          onClose={closeAuthExpired}
+        />
       </>
     );
   }

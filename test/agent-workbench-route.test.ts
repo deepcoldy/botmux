@@ -29,6 +29,19 @@ describe('Agent Workbench route and surface integration', () => {
     expect(app).toContain('data-workbench-surface');
   });
 
+  // 工作台是无边框壳（没有 topbar/侧栏），登录态失效时 AuthExpiredOverlay 是它
+  // **唯一**的自救出口。普通壳一直传着 loginUrl，工作台壳漏传 → 浮层退化成
+  // 「访问链接已失效，知道了」的死胡同，一键登录按钮根本不渲染。两处必须一致。
+  it('passes loginUrl to AuthExpiredOverlay on the Workbench shell too', () => {
+    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
+    const overlayProps = app.match(/<AuthExpiredOverlay[\s\S]*?\/>/g) ?? [];
+    // 两个壳各一处：工作台壳 + 普通壳。
+    expect(overlayProps.length).toBe(2);
+    for (const usage of overlayProps) {
+      expect(usage).toContain('dashboardLoginHref(authLoginBaseUrl, location.hash)');
+    }
+  });
+
   it('allows login continuation only to Workbench routes', () => {
     expect(safeDashboardH5ReturnTo('/#/agent-workbench/s%2F1')).toBe('/#/agent-workbench/s%2F1');
     expect(safeDashboardH5ReturnTo('/#/agent-workbench-dock/s%2F1')).toBe('/#/agent-workbench-dock/s%2F1');

@@ -1114,6 +1114,15 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_groups': '📂 Groups',
   // Plain link button (appCenter AppLink) — not a `dash_overview_*` callback.
   'card.dashboard.overview.open_workbench': 'Open Workbench',
+  // The link carries the long-lived token and never expires (product decision —
+  // see core/workbench-link.ts). This note is the user's side of that trade: it
+  // says the link is bookmarkable AND how to revoke it if it ever leaks.
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 Standing link — bookmark it; if you suspect a leak, run <font color="grey">botmux dashboard rotate</font> to revoke it instantly',
+  // Degraded path: token unreadable, so the link carries no credential. Say so
+  // plainly instead of advertising a standing entry that isn't one.
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 Dashboard credential unavailable — sign in from the browser to use this link',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

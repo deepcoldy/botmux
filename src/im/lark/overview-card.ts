@@ -172,17 +172,19 @@ export interface BuildOverviewCardOpts {
   invokerOpenId: string;
   locale: Locale;
   /**
-   * 「打开工作台」按钮的目标。缺省（读不到 dashboard 端口等）就不渲染按钮，
+   * 「打开工作台」入口的目标。缺省（读不到 dashboard 端口等）就整块不渲染，
    * 而不是渲染一个点了没反应的死链。链接怎么来的见 `core/workbench-link.ts`。
    *
-   * 注意（P2-1）：这条链接携带的是 30 分钟 TTL 的兑换票据（`/workbench-ticket/…`），
-   * **不再内嵌长期 Dashboard token**——卡片历史、转发、截图里的旧链接到期即废。
-   * 但票据在 TTL 内仍可兑换出管理 cookie，所以它依然只能出现在已经过了
-   * `/dashboard` 管理员门禁的回复里——命令入口在 `dashboard-command/owner-gate.ts`
-   * 拦，回调入口在下面 `handleOverviewCardAction` 的 invoker-lock +
-   * `isDashboardAdmin` 拦。渲染它的地方不得放宽任何一层。
+   * ⚠️ 这条链接携带**长期 Dashboard token**，常驻不过期——这是产品 owner 拍板的
+   * 决策反转（此前是 30 分钟短票，见 workbench-link.ts 顶部「为什么链接里是长期
+   * token」）。自部署用户要的是一条能收藏的入口，泄漏风险由
+   * `botmux dashboard rotate` 兜底。
+   *
+   * 正因为它是常驻凭证，**发出前的门禁一层都不能放宽**：命令入口在
+   * `dashboard-command/owner-gate.ts` 拦，回调入口在下面 `handleOverviewCardAction`
+   * 的 invoker-lock + `isDashboardAdmin` 拦，卡片是私信给发起人本人。
    */
-  workbench?: { appLink: string; webUrl: string };
+  workbench?: { appLink: string; webUrl: string; credentialed: boolean };
 }
 
 export interface OverviewSnapshotInput {
@@ -205,7 +207,8 @@ export function buildOverviewCard(
   // ─── 打开工作台 ──────────────────────────────────────────────────────
   // 排在最前面：这是新用户从飞书进 Web 工作台的唯一入口，排到会话/群组后面就
   // 等于没有。纯链接按钮，没有 callback，所以不经过 handleOverviewCardAction。
-  // PC 用 appCenter AppLink（可右键固定成常驻标签页），移动端客户端没有这个容器，
+  // PC 用 appCenter AppLink（在飞书导航栏开标签页、可右键固定 → 常驻入口；
+  // `mode=window` 那种独立窗口关掉就没了，配不上「常驻」），移动端不识别 mode，
   // 直接给网页 URL。缺链接时整块不渲染，不留死按钮。
   if (opts.workbench) {
     elements.push({
@@ -223,6 +226,34 @@ export function buildOverviewCard(
           android_url: opts.workbench.webUrl,
           ios_url: opts.workbench.webUrl,
         },
+      }],
+    });
+
+    // 明文链接单独一行：按钮点得开但**复制不出来**，而这条链接的全部价值就在于
+    // 能被收藏进书签。用 plain_text 而非 lark_md —— token 是 base64url，含 `_`
+    // 和 `-`，走 lark_md 要么被 escapeLarkMd 转义成 `\_`（复制出来是坏链），要么
+    // 被当成斜体标记吃掉。plain_text 一字不改地原样呈现。
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        content: opts.workbench.webUrl,
+      },
+    });
+
+    // 小字：带凭证时说清「可收藏 + 怀疑泄漏怎么自救」，这是常驻链接风险交换里
+    // 用户那一侧的知情权；降级成无凭证链接时改说「需自行登录」，别吹不存在的能力。
+    elements.push({
+      tag: 'note',
+      elements: [{
+        tag: 'lark_md',
+        content: t(
+          opts.workbench.credentialed
+            ? 'card.dashboard.overview.workbench.standing_hint'
+            : 'card.dashboard.overview.workbench.login_required_hint',
+          undefined,
+          opts.locale,
+        ),
       }],
     });
     elements.push({ tag: 'hr' });
@@ -468,9 +499,10 @@ export async function handleOverviewCardAction(
   const nowMs = deps.nowMs ? deps.nowMs() : Date.now();
 
   if (action === OVERVIEW_ACTION_REFRESH) {
-    // 刷新必须重新带上工作台按钮，否则用户点一下「🔄 刷新」入口就消失了。
-    // 这里已经过了 invoker-lock + isDashboardAdmin 两道门，才允许现 mint 短时
-    // 票据拼入口链接（P2-1：链接带票据不带长期 token，刷新即换新票）。
+    // 刷新必须重新带上工作台入口，否则用户点一下「🔄 刷新」入口就消失了。
+    // 这里已经过了 invoker-lock + isDashboardAdmin 两道门，才允许解析出带长期
+    // token 的常驻链接（产品决策见 core/workbench-link.ts）。链接本身是稳定的，
+    // 刷新拿到的与首次投递逐字相同——收藏过的那条不会因为刷新而对不上。
     const workbench = (deps.resolveWorkbench ?? resolveWorkbenchButtonLinks)(larkAppId);
     return rebuildOverview(client, operatorOpenId, locale, workbench);
   }
