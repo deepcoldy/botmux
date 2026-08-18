@@ -148,6 +148,15 @@ export interface StrongContainmentHandle {
     cgroupPath: string;
     /** Env nonce injected into the tree, so a degraded scan can still corroborate. */
     nonce: string;
+    /**
+     * Boot id at mint time. A reboot provably kills the whole tree — including the
+     * same-UID sibling/parent migrant that cgroup emptiness cannot see — so a
+     * changed boot id is the ONE thing that lets a cgroup handle release (it is
+     * the same unforgeable fact a weak handle uses). Optional so a handle written
+     * by an older daemon (no bootId) still parses; such a legacy handle simply
+     * never gets the reboot proof and waits for an operator revoke.
+     */
+    bootId?: string;
 }
 
 export interface WeakContainmentHandle {
@@ -219,11 +228,16 @@ export type QuiescenceVerdict =
  * safety argument of this module, so it is carried in the data instead of being
  * re-derived by every caller:
  *
- *   - `cgroup-empty` / `cgroup-zombie-only`: kernel-owned membership state that a
- *     same-user child can neither forge, unlink nor escape -> boundary proof.
  *   - `boot-id-changed`: the recorded tree cannot have survived the reboot that
  *     changed the kernel boot id, and a same-user child cannot fake a boot id ->
- *     boundary proof.
+ *     THE boundary proof (the only one). Applies to a weak handle and, once its
+ *     bootId is stamped, to a cgroup handle too.
+ *   - `cgroup-empty` / `cgroup-zombie-only`: kernel membership shows the leaf
+ *     subtree empty. DIAGNOSTIC ONLY, NOT a boundary proof: mojo runs at the
+ *     daemon's UID and cgroup v2 lets a same-UID process migrate ITSELF out of
+ *     the leaf (to the parent slice or a sibling), invisible to the leaf-down
+ *     read. Good for stopping signals + killing (cgroup.kill), never for dropping
+ *     device isolation.
  *   - `scan-clean`: a /proc subtree scan came back empty. DIAGNOSTIC ONLY: a
  *     descendant that calls setsid(), scrubs its own environ and reparents to
  *     init evades enumeration entirely, so this can never authorise dropping
@@ -498,13 +512,21 @@ export function prepareContainmentBoundary(
 }
 
 /** Mint the strong handle for a boundary the child has enrolled itself into. */
-export function strongHandleFromPreparedBoundary(prepared: PreparedContainmentBoundary): ContainmentHandle {
+export function strongHandleFromPreparedBoundary(
+    prepared: PreparedContainmentBoundary,
+    opts: { procRoot?: string } = {},
+): ContainmentHandle {
+    const bootId = readBootId({ procRoot: opts.procRoot });
     return {
         kind: 'cgroup',
         sessionId: prepared.sessionId,
         generation: prepared.generation,
         cgroupPath: prepared.cgroupPath,
         nonce: prepared.nonce,
+        // Stamp the boot id so a later reboot can prove the tree gone (see the
+        // cgroup branch of proveContainmentQuiescent). Omitted only if /proc is
+        // unreadable, in which case the handle behaves like a legacy one.
+        ...(bootId !== null ? { bootId } : {}),
     };
 }
 
@@ -677,6 +699,20 @@ export function proveContainmentQuiescent(
     opts: ProveContainmentOpts = {},
 ): QuiescenceVerdict {
     if (handle.kind === 'cgroup') {
+        // A REBOOT is the one thing that provably kills the whole tree, including
+        // the same-UID sibling/parent migrant that cgroup emptiness cannot see.
+        // Check it FIRST: after a reboot the cgroup directory is gone, so the
+        // subtree read below would report `cgroup-empty` — which is NOT a boundary
+        // proof (round-8) and would leave the handle unreleasable forever. A
+        // changed boot id turns that into the real `boot-id-changed` proof, so a
+        // reboot actually clears a cgroup handle (round-9 P2-1). A handle minted
+        // before this field existed has no bootId and simply falls through.
+        if (handle.bootId) {
+            const currentBootId = readBootId({ procRoot: opts.procRoot });
+            if (currentBootId !== null && currentBootId !== handle.bootId) {
+                return { proven: true, handle, evidence: 'boot-id-changed' };
+            }
+        }
         // Read the WHOLE subtree, not just the leaf: a same-uid process can mkdir
         // a child cgroup and migrate into it, which a single-level read would miss
         // (it would see the leaf empty and call the tree gone).
@@ -823,6 +859,12 @@ function parseHandle(value: unknown, path: string, sessionId: string): Containme
     if (!common) return bad('a handle with missing common fields');
     if (h.kind === 'cgroup') {
         if (typeof h.cgroupPath !== 'string' || h.cgroupPath.length === 0) return bad('a cgroup handle with no path');
+        // bootId is OPTIONAL (legacy handles predate it), but if present it must be
+        // a non-empty string — a blank one would compare equal across reboots and
+        // resurrect the very pid/boot confusion the field exists to prevent.
+        if (h.bootId !== undefined && (typeof h.bootId !== 'string' || h.bootId.length === 0)) {
+            return bad('a cgroup handle with a malformed bootId');
+        }
         return h as unknown as StrongContainmentHandle;
     }
     if (h.kind === 'unprovable') {
@@ -1166,20 +1208,30 @@ export function revokeContainmentHandles(
             + 'of that turn is no longer tracked; its device-isolation blocker is gone.'
             + (opts.auditNote ? ` [${opts.auditNote}]` : ''),
         );
-        // Reclaim the cgroup directory the runtime no longer removes (a cgroup
-        // handle is never released by proof now). cgroup.kill first, so an operator
-        // who revokes a still-populated tree at least SIGKILLs it rather than
-        // leaving it running behind a now-cleared blocker.
-        if (handle.kind === 'cgroup') {
-            void killPreparedBoundary({
-                sessionId: handle.sessionId,
-                generation: handle.generation,
-                cgroupPath: handle.cgroupPath,
-                nonce: handle.nonce,
-            });
-        }
     }
+    // The caller (the operator CLI) is responsible for cgroup.kill + reclaiming the
+    // directory of any removed cgroup handle, and for LOGGING that kill's result —
+    // a cgroup handle is never released by proof now, so revoke is the only place
+    // its directory is reclaimed. Doing it here (fire-and-forget) would drop the
+    // blocker before a possibly-live tree was actually killed, invisibly; the CLI
+    // awaits it instead.
     return { removed, remaining };
+}
+
+/**
+ * Executing (non-zombie) pids anywhere in a cgroup handle's subtree, for the
+ * operator revoke safety gate. `unreadable` is the fail-closed signal — the gate
+ * must surface it rather than read "cannot enumerate" as "nobody there".
+ */
+export function cgroupHandleLiveMembers(
+    handle: StrongContainmentHandle,
+    opts: { procRoot?: string } = {},
+): { live: number[]; unreadable: boolean } {
+    const subtree = cgroupSubtreePids(handle.cgroupPath);
+    if (!subtree.ok) return { live: [], unreadable: true };
+    const live = subtree.pids.filter(pid => readProcLiveness(pid, opts) !== 'zombie'
+        && readProcLiveness(pid, opts) !== 'gone');
+    return { live, unreadable: false };
 }
 
 /**
@@ -1220,35 +1272,38 @@ export function inheritContainmentHandles(
  * Map a containment verdict onto ProcTree's `TurnQuiescence`.
  *
  * This function is the single place in the codebase allowed to mint
- * `{ kind: 'contained-proven', boundaryProof: true }`, and it only does so for a
- * STRONG (cgroup) handle. That split is the whole point of the two contracts
+ * `{ kind: 'contained-proven', boundaryProof: true }`, and it does so for exactly
+ * ONE evidence — `boot-id-changed`. That is the whole point of the contracts
  * meeting here:
  *
  *   - `quiescenceFromScan()` can never produce `boundaryProof: true`; a clean
  *     /proc scan is a diagnostic signal, because a descendant that both setsids
  *     AND scrubs its own environ evades enumeration entirely.
- *   - cgroup membership is kernel state that the same-user child cannot forge,
- *     unlink or escape, so an empty (or zombie-only) `cgroup.procs` is a real
- *     boundary proof.
+ *   - An empty (or zombie-only) `cgroup.procs` is ALSO only a diagnostic signal,
+ *     NOT a boundary proof: mojo runs at the daemon's UID and cgroup v2 lets a
+ *     same-UID process migrate itself out of the leaf, invisible to the leaf-down
+ *     read. cgroup emptiness is good for stopping signals and for killing
+ *     (cgroup.kill), never for dropping device isolation.
+ *   - `boot-id-changed` is the only unforgeable release: a reboot kills the whole
+ *     tree, migrant included. It applies to a weak handle and to a cgroup handle
+ *     once its bootId is stamped.
  *
- * A WEAK handle therefore maps to `diagnostic-clean` even when its verdict is
- * `proven: true`, and this module's own release rule now agrees with that
- * mapping instead of contradicting it: `containmentReleaseDecision` refuses to
- * authorise removal for `scan-clean`, so a weak handle is NOT released from the
- * durable store on a clean scan. The previous revision claimed callers gated the
- * blocker on `boundaryProof === true` while no caller did; the gate now lives
- * here, in `containmentReleaseDecision`, which is a real production consumer.
- * Only `boot-id-changed` lifts a weak handle to a boundary proof.
+ * So a STRONG (cgroup) proven-empty verdict maps to `diagnostic-clean`, exactly
+ * like a weak `scan-clean`, and `containmentReleaseDecision` refuses to authorise
+ * removal for either — the handle stays in the durable store and the blocker
+ * survives the close. The gate lives in `containmentReleaseDecision`, a real
+ * production consumer.
  */
 /**
  * The ONE place a `boundaryProof: true` TurnQuiescence is constructed.
  *
  * Round 4 claimed this property in a comment while three separate sites minted
  * the value, which is why the claim was rejected as unverifiable. It is now
- * structural: every caller goes through here, so
- * `git grep -n "boundaryProof: true" -- src/` returns this function and the type
- * definitions only. It is exported for the backend, which decides WHETHER a
- * proven boundary applies but must not decide what one looks like.
+ * structural: `boundaryProof: true` is minted here and in the release-decision
+ * gate (`containmentReleaseDecision`), and nowhere else — `git grep -n
+ * "boundaryProof: true" -- src/` returns those two sites plus type definitions.
+ * It is exported for the backend, which decides WHETHER a proven boundary applies
+ * but must not decide what one looks like.
  */
 export function containedProvenQuiescence(): TurnQuiescence {
     return { kind: 'contained-proven', boundaryProof: true };

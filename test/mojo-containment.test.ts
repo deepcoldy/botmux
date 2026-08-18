@@ -38,6 +38,7 @@ import {
     readProcStartTime,
     recordContainmentHandle,
     releaseContainmentHandle,
+    strongHandleFromPreparedBoundary,
     weakHandleRootStillOriginal,
     containmentQuiescence,
     sessionContainmentQuiescence,
@@ -294,6 +295,32 @@ describe('operator revocation is the ONLY unproven exit (P1-3)', () => {
         expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes', '--force'], deps)).toBe(0);
         expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
         expect(out.join('\n')).toMatch(/--force 越过存活证据/);
+    });
+
+    it('default-REJECTS revoking a cgroup handle whose cgroup still has a live member (round-9 P2-2)', async () => {
+        // A cgroup handle has no rootPid, so the tree-identity gate skipped it —
+        // revoke would drop the blocker while a credentialed process still ran in
+        // the cgroup, invisibly. The gate now reads cgroup membership directly.
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        const dir = mkdtempSync(join(tmpdir(), 'revoke-live-cg-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '5555\n');
+        const procRoot = fakeProc({ bootId: BOOT, pids: { 5555: 999 } }); // 5555 is RUNNING
+        recordContainmentHandle(
+            { kind: 'cgroup', sessionId: 'sess-1', generation: 1, cgroupPath: dir, nonce: 'n' }, dataDir,
+        );
+        const out: string[] = [];
+        const err: string[] = [];
+        const deps = {
+            dataDir, procRoot, isSessionActive: () => false,
+            stdout: (l: string) => out.push(l), stderr: (l: string) => err.push(l),
+        };
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], deps)).toBe(1);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+        expect(err.join('\n')).toMatch(/执行中的成员/);
+        // --force overrides, cgroup.kill + reclaims the directory.
+        expect(await runMojoContainmentCommand(['revoke', 'sess-1', '--yes', '--force'], deps)).toBe(0);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
     });
 
     it('default-REJECTS revoking while the session row is still active (P1-c)', async () => {
@@ -1053,5 +1080,59 @@ describe('a cgroup handle is NEVER released by proof (round-8 same-UID P0)', () 
         );
         expect(decision.releaseAuthorised).toBe(true);
         expect(hasUnprovenContainment('reboot-sess', dataDir)).toBe(false);
+    });
+});
+
+describe('a stamped bootId lets a REBOOT release a cgroup handle (round-9 P2-1)', () => {
+    const BOOT_A = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const BOOT_B = 'bbbbbbbb-5555-6666-7777-888888888888';
+    const cg = (dir: string, over: Partial<StrongContainmentHandle> = {}): StrongContainmentHandle => ({
+        kind: 'cgroup', sessionId: 'boot-sess', generation: 1, cgroupPath: dir, nonce: 'n', ...over,
+    });
+
+    it('same boot: an empty cgroup is STILL not released (blocker retained)', () => {
+        const dataDir = freshDataDir();
+        const dir = mkdtempSync(join(tmpdir(), 'cg-sameboot-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');
+        const handle = cg(dir, { bootId: BOOT_A });
+        recordContainmentHandle(handle, dataDir);
+        const verdict = proveContainmentQuiescent(handle, { procRoot: fakeProc({ bootId: BOOT_A }) });
+        expect(verdict.proven).toBe(true);
+        if (verdict.proven) expect(verdict.evidence).toBe('cgroup-empty');
+        expect(releaseContainmentHandle(verdict, dataDir).releaseAuthorised).toBe(false);
+        expect(hasUnprovenContainment('boot-sess', dataDir)).toBe(true);
+    });
+
+    it('changed boot: boot-id-changed proof RELEASES the cgroup handle', () => {
+        const dataDir = freshDataDir();
+        const dir = mkdtempSync(join(tmpdir(), 'cg-reboot2-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');
+        const handle = cg(dir, { bootId: BOOT_A });
+        recordContainmentHandle(handle, dataDir);
+        // Host now reports a DIFFERENT boot id — a reboot killed the whole tree.
+        const verdict = proveContainmentQuiescent(handle, { procRoot: fakeProc({ bootId: BOOT_B }) });
+        expect(verdict.proven).toBe(true);
+        if (verdict.proven) expect(verdict.evidence).toBe('boot-id-changed');
+        expect(releaseContainmentHandle(verdict, dataDir).releaseAuthorised).toBe(true);
+        expect(hasUnprovenContainment('boot-sess', dataDir)).toBe(false);
+    });
+
+    it('a legacy cgroup handle (no bootId) never gets the reboot proof', () => {
+        const dataDir = freshDataDir();
+        const dir = mkdtempSync(join(tmpdir(), 'cg-legacy-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');
+        const handle = cg(dir); // NO bootId
+        recordContainmentHandle(handle, dataDir);
+        const verdict = proveContainmentQuiescent(handle, { procRoot: fakeProc({ bootId: BOOT_B }) });
+        expect(verdict.proven).toBe(true);
+        if (verdict.proven) expect(verdict.evidence).toBe('cgroup-empty'); // NOT boot-id-changed
+        expect(releaseContainmentHandle(verdict, dataDir).releaseAuthorised).toBe(false);
+    });
+
+    it('strongHandleFromPreparedBoundary stamps the current boot id', () => {
+        const prepared = { sessionId: 's', generation: 1, cgroupPath: '/x', nonce: 'n' };
+        const handle = strongHandleFromPreparedBoundary(prepared, { procRoot: fakeProc({ bootId: BOOT_A }) });
+        expect(handle.kind).toBe('cgroup');
+        expect((handle as StrongContainmentHandle).bootId).toBe(BOOT_A);
     });
 });

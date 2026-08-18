@@ -1112,10 +1112,12 @@ export class MojoBackend implements SessionBackend {
             decisions.push(releaseContainmentHandle(verdict));
         }
         // A boundary proof is the only thing that may upgrade the verdict, and
-        // `boundaryProof` is the single field allowed to say so. It is true for a
-        // kernel-owned cgroup and for a weak handle whose recorded boot is gone;
-        // it is false for a merely clean scan, which therefore stays
-        // `diagnostic-clean` and keeps its residual.
+        // `boundaryProof` is the single field allowed to say so. It is true for
+        // exactly ONE evidence — a changed boot id (a reboot), for a weak handle
+        // OR a cgroup handle whose stamped bootId is gone. It is FALSE for a merely
+        // clean /proc scan AND for an empty cgroup (a same-UID process can migrate
+        // itself out of the leaf), both of which stay `diagnostic-clean` and keep
+        // their residual.
         if (decisions.length > 0 && decisions.every(d => d.boundaryProof)) {
             // Built by the containment module, which owns the only constructor of a
             // proven boundary; this layer decides WHETHER it applies, never what it

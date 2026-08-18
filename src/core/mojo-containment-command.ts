@@ -30,12 +30,15 @@
 import {
   MojoContainmentUnavailableError,
   containmentHandleKey,
+  cgroupHandleLiveMembers,
   containmentHandles,
   containmentSessionIds,
+  killPreparedBoundary,
   readBootId,
   revokeContainmentHandles,
   weakHandleRootStillOriginal,
   type ContainmentHandle,
+  type StrongContainmentHandle,
 } from './mojo-containment.js';
 
 const USAGE = `用法:
@@ -196,6 +199,20 @@ export async function runMojoContainmentCommand(
           liveBlockers.push(`${containmentHandleKey(h)}：记录的 root pid `
             + `${(h as { rootPid: number }).rootPid} 仍是原进程且存活`);
         }
+        // A cgroup handle has no rootPid, so the tree-identity check above skips
+        // it. Read its cgroup membership directly: revoking while a credentialed
+        // process still runs in the cgroup drops the blocker over a live tree.
+        if (h.kind === 'cgroup') {
+          const members = cgroupHandleLiveMembers(h as StrongContainmentHandle,
+            deps.procRoot ? { procRoot: deps.procRoot } : {});
+          if (members.unreadable) {
+            err(`⚠️ 无法读取 cgroup ${(h as StrongContainmentHandle).cgroupPath} 的成员：`
+              + '强 handle 的存活检测不可用，不作为拦截依据——撤销前请自行确认子树已消亡。');
+          } else if (members.live.length > 0) {
+            liveBlockers.push(`${containmentHandleKey(h)}：cgroup 内仍有执行中的成员 `
+              + `(${members.live.join(',')})`);
+          }
+        }
       }
       const active = await (deps.isSessionActive ?? defaultIsSessionActive)(sessionId);
       if (active === true) {
@@ -221,6 +238,22 @@ export async function runMojoContainmentCommand(
       if (removed.length === 0) {
         err(`session ${sessionId} 没有匹配的 containment handle，未做任何修改。`);
         return 1;
+      }
+      // cgroup.kill + reclaim the directory of every revoked cgroup handle — the
+      // runtime never removes it now (a cgroup handle is never released by proof).
+      // AWAITED and its result LOGGED, not fire-and-forget: an operator forcing
+      // past live evidence must at least SIGKILL the tree, and a failure to prove
+      // it empty must be visible rather than leaving a live tree behind a cleared
+      // blocker.
+      for (const h of removed) {
+        if (h.kind !== 'cgroup') continue;
+        const cg = h as StrongContainmentHandle;
+        const emptied = await killPreparedBoundary({
+          sessionId: cg.sessionId, generation: cg.generation,
+          cgroupPath: cg.cgroupPath, nonce: cg.nonce,
+        });
+        if (emptied) out(`已回收 cgroup ${cg.cgroupPath}（已 SIGKILL 并证实清空）`);
+        else err(`⚠️ cgroup ${cg.cgroupPath} 未能证实清空：可能仍有存活成员，blocker 已撤销，请人工核查该子树。`);
       }
       for (const h of removed) out(`已撤销: ${describeHandle(h)}`);
       if (liveBlockers.length > 0) {
