@@ -106,8 +106,12 @@ export async function maybeCreateDefaultWorktree(
   // auto-worktree is therefore the only barrier between the agent and the real
   // project; a silent fallback to baseDir on failure would be a sandbox escape.
   // BOTMUX_SANDBOX=1 forces the sandbox on regardless of the bot flag (testing).
+  // Legacy `readIsolation` is auto-migrated to `sandbox` at daemon startup, but
+  // the worker still honors it for an unmigrated read-only BOTS_CONFIG
+  // (sandboxRequested = sandbox || readIsolation || BOTMUX_SANDBOX) — match that
+  // union so fail-closed tracks the REAL sandbox state, not just the new flag.
   const failClosed = process.env.BOTMUX_SANDBOX === '1'
-    || (() => { try { return getBot(larkAppId).config.sandbox === true; } catch { return false; } })();
+    || (() => { try { const c = getBot(larkAppId).config; return c.sandbox === true || c.readIsolation === true; } catch { return false; } })();
   const notify = async (msg: string) => {
     if (!ctx.notify) return;
     try { await ctx.notify(msg); } catch { /* notices are best-effort — never fail a session start */ }

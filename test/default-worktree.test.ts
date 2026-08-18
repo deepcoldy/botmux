@@ -55,7 +55,7 @@ function makeRepo(name: string): string {
 async function loadWithBot(
   dir: string,
   autoWorktree: boolean,
-  agent: { cliId?: string; backendType?: string; sandbox?: boolean } = {},
+  agent: { cliId?: string; backendType?: string; sandbox?: boolean; readIsolation?: boolean } = {},
 ) {
   writeFileSync(configPath, JSON.stringify([{
     larkAppId: 'app_wt',
@@ -65,6 +65,7 @@ async function loadWithBot(
     defaultWorkingDir: dir,
     ...(autoWorktree ? { defaultWorkingDirAutoWorktree: true } : {}),
     ...(agent.sandbox ? { sandbox: true } : {}),
+    ...(agent.readIsolation ? { readIsolation: true } : {}),
   }], null, 2), 'utf-8');
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
@@ -186,6 +187,22 @@ describe('maybeCreateDefaultWorktree', () => {
     } finally {
       delete process.env.BOTMUX_SANDBOX;
     }
+  });
+
+  it('fail-closed: legacy readIsolation=true also refuses (worker treats it as sandbox-on)', async () => {
+    // The worker's sandboxRequested unions sandbox || readIsolation || BOTMUX_SANDBOX,
+    // so a legacy readIsolation bot IS sandboxed even when the new `sandbox` flag is
+    // absent (unmigrated read-only BOTS_CONFIG). fail-closed must track that union.
+    const plain = join(tempRoot, 'not-a-repo-riso');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, { readIsolation: true });
+    const notices: string[] = [];
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+
+    expect(notices).toHaveLength(0); // no fallback-to-real-dir notice
   });
 
   it('sandbox off: worktree creation failure still DEGRADES to base dir (no refusal)', async () => {
