@@ -3413,8 +3413,11 @@ async function revokeQuotaGrant(
   senderOpenId: string,
   ev: TalkEvaluation,
 ): Promise<void> {
+  // 会话群里的 chatGrant 是**继承**来的：授权记录挂在出生前那个私聊上（ev.grantChatId），
+  // 不在会话群自己身上。撤销必须落到来源 chat，否则删了个不存在的记录，硬上限失效。
+  const grantChatId = ev.grantChatId ?? chatId;
   const result = ev.reason === 'chatGrant'
-    ? await removeChatGrant(larkAppId, chatId, senderOpenId)
+    ? await removeChatGrant(larkAppId, grantChatId, senderOpenId)
     : ev.reason === 'globalGrant'
       ? await removeGlobalGrant(larkAppId, senderOpenId)
       : { ok: true as const, removed: false };

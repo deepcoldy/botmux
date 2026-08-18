@@ -16,10 +16,14 @@
  * 换成替身），额度用**真实 grant-store**（真扣真持久化），断言「扣费次数」与
  * 「任务是否落地（forkWorker）」始终一致。
  *
+ * 后半部分守的是出生**之后**那条缺口（复审 P1-4）：会话群不能靠出生时那条纯粹用来
+ * 承载 workingDir 的 oncall 绑定重新获得放行，必须沿用来源授权的额度键 / reason /
+ * 到期与撤销；以及绑定没落地时要回退，不留半残会话群。
+ *
  * Run:  pnpm vitest run test/session-group-birth-quota.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -126,18 +130,21 @@ vi.mock('../src/services/session-group-title.js', async () => {
 
 import { loadBotConfigs, registerBot, getBot } from '../src/bot-registry.js';
 import {
+  enforceMessageQuotaForCliInput,
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
 } from '../src/daemon.js';
-import { addChatGrant, chatQuotaKey } from '../src/services/grant-store.js';
-import { initSessionGroups, isSessionGroup } from '../src/services/session-groups-store.js';
-import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
+import { addChatGrant, chatQuotaKey, removeChatGrant } from '../src/services/grant-store.js';
+import { initSessionGroups, isSessionGroup, getSessionGroup } from '../src/services/session-groups-store.js';
+import { canTalk, evaluateTalk, grantCommandRestriction, type RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 const APP = 'sg_quota_app';
 const DM_CHAT = 'oc_dm_with_grantee';
 const BORN_GROUP = 'oc_born_session_group';
+const PLAIN_ONCALL = 'oc_plain_oncall_group';
 const OWNER = 'ou_owner';
 const GRANTEE = 'ou_chat_grantee';
+const OUTSIDER = 'ou_dragged_in_colleague';
 const BOT_NAME = '会话机器人';
 const QUOTA_LIMIT = 3;
 
@@ -201,6 +208,53 @@ function landedTurns(): any[] {
   return mocks.forkWorker.mock.calls;
 }
 
+/** 会话群**自己**那把额度键被扣了几次。修复后恒为 0：新群不该另起一份额度。 */
+function bornGroupUnits(): number {
+  return getBot(APP).config.quotaState?.[chatQuotaKey(BORN_GROUP, GRANTEE)]?.used ?? 0;
+}
+
+/**
+ * 补上「出生时为承载 workingDir 写下的 oncall 绑定」——本测试把 createGroupWithBots
+ * 换成了替身，真实的 bindOncall 不会跑，得手工补齐。旧实现正是靠这条纯粹为解目录
+ * 而写的绑定，把会话群变成了免授权、免额度的 oncall 群。
+ */
+function bindWorkingDirOncall(...chatIds: string[]): void {
+  const workingDir = join(mocks.dataDir, 'workdir');
+  getBot(APP).config.oncallChats = chatIds.map(chatId => ({ chatId, workingDir }));
+}
+
+/** 会话群里的第二条及以后消息走的就是这道闸（router 的 CLI 输入额度入口）。 */
+function inGroupMessage(messageId: string, openId: string = GRANTEE): Promise<boolean> {
+  return enforceMessageQuotaForCliInput(
+    APP, BORN_GROUP, openId, messageId, BORN_GROUP, undefined, undefined, 'group',
+  );
+}
+
+function createGroupResult(overrides: Record<string, unknown> = {}): any {
+  return {
+    ok: true,
+    chatId: BORN_GROUP,
+    creator: APP,
+    invalidBotIds: [],
+    invalidUserIds: [],
+    invalidOwnerUnionIds: [],
+    ownerTransferredTo: null,
+    transferError: null,
+    notifyMessageId: null,
+    notifyError: null,
+    shareLink: null,
+    shareLinkError: null,
+    // 出生必须拿到 workingDir 绑定（bot 配了 workingDir → birth 会请求绑定）。
+    // 绑定没落地时的回退是「绑定没落地必须回退」那组用例的被测对象。
+    oncallBindings: [{ larkAppId: APP, ok: true, created: true }],
+    roleProfileBootstrapMessageId: null,
+    roleProfileBootstrapError: null,
+    kickoffMessageId: null,
+    kickoffError: null,
+    ...overrides,
+  };
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
   mkdirSync(mocks.dataDir, { recursive: true });
@@ -217,6 +271,9 @@ beforeEach(async () => {
   delete bot.config.grantExpiryState;
   // 真实授权写入（磁盘 + 内存），带额度 → 有 quotaKey，扣费可观测。
   await addChatGrant(APP, DM_CHAT, GRANTEE, QUOTA_LIMIT);
+  // 会话群登记表是**落盘**的：不清掉，上一个用例出生的群会漏进下一个用例，
+  // 「没建成群」这类断言就会假绿。
+  rmSync(join(mocks.dataDir, `session-groups-${APP}.json`), { force: true });
   initSessionGroups(APP);
   activeSessions.clear();
   mocks.createdSessions.length = 0;
@@ -228,25 +285,7 @@ beforeEach(async () => {
   mocks.resolveSender.mockImplementation(async (_appId: string, openId?: string) => (
     openId ? { openId, type: 'user' as const } : undefined
   ));
-  mocks.createGroupWithBots.mockResolvedValue({
-    ok: true,
-    chatId: BORN_GROUP,
-    creator: APP,
-    invalidBotIds: [],
-    invalidUserIds: [],
-    invalidOwnerUnionIds: [],
-    ownerTransferredTo: null,
-    transferError: null,
-    notifyMessageId: null,
-    notifyError: null,
-    shareLink: null,
-    shareLinkError: null,
-    oncallBindings: [],
-    roleProfileBootstrapMessageId: null,
-    roleProfileBootstrapError: null,
-    kickoffMessageId: null,
-    kickoffError: null,
-  });
+  mocks.createGroupWithBots.mockResolvedValue(createGroupResult());
 });
 
 describe('会话群出生：扣费与任务落地必须一致', () => {
@@ -313,5 +352,132 @@ describe('会话群出生：斜杠命令判定必须先剥 @mention 前缀', () 
     expect(chargedUnits()).toBe(1);
     expect(landedTurns()).toHaveLength(1);
     expect(landedTurns()[0][0].chatId).toBe(BORN_GROUP);
+  });
+});
+
+/**
+ * 会话群必须**继承来源授权**，而不是靠出生时那条 oncall 绑定重新获得放行。
+ *
+ * 出生时为了承载 workingDir 会给新群写一条 oncall 绑定。oncall 腿排在 chatGrant /
+ * globalGrant 之前，且只看 chatId、不看发送者——于是一条私聊建群之后：
+ *   • 未配 messageQuota.defaultLimit → 新群里完全不限额；配了也是 chat:<新群>:<user>
+ *     这把**全新**的计数器，与私聊那把不共享 → 额度上限被放大成「N 个群 × 每群一份」；
+ *   • 群里任何被拉进来的人都直接过 canTalk；
+ *   • reason 从 chatGrant 变成 oncall → restrictGrantCommands 静默失效。
+ * 修法：会话群走专用腿（排在 oncall 之前），只放行群主，并沿用出生时持久化的原
+ * quotaKey / reason / 来源 chat；oncall 在会话群里退回只解析 workingDir。
+ */
+describe('会话群继承来源授权（堵 oncall 腿的额度与权限绕过）', () => {
+  it('出生后的第二条消息仍扣**来源私聊授权**那把额度，不在新群另起一份', async () => {
+    await handleNewTopic(dmEvent('帮我看下登录接口报 500', 'om_inherit_1'), dmCtx('om_inherit_1'));
+    expect(isSessionGroup(BORN_GROUP)).toBe(true);
+    expect(chargedUnits()).toBe(1);
+    bindWorkingDirOncall(BORN_GROUP);
+
+    await expect(inGroupMessage('om_inherit_2')).resolves.toBe(true);
+
+    // 计数器仍是私聊那把（+1）；新群没有独立额度记录。
+    expect(chargedUnits()).toBe(2);
+    expect(bornGroupUnits()).toBe(0);
+    expect(evaluateTalk(APP, BORN_GROUP, GRANTEE, undefined, undefined, 'group')).toMatchObject({
+      allowed: true,
+      reason: 'chatGrant',
+      quotaKey: chatQuotaKey(DM_CHAT, GRANTEE),
+      grantChatId: DM_CHAT,
+    });
+  });
+
+  it('额度真的会在会话群里用完，且撤销落在**来源私聊**的那条授权上', async () => {
+    await addChatGrant(APP, DM_CHAT, GRANTEE, 2);
+    await handleNewTopic(dmEvent('第一条', 'om_cap_1'), dmCtx('om_cap_1'));
+    bindWorkingDirOncall(BORN_GROUP);
+
+    // 第二条刚好用完，仍放行——扣的仍是私聊那把计数器。
+    await expect(inGroupMessage('om_cap_2')).resolves.toBe(true);
+    expect(chargedUnits()).toBe(2);
+    expect(bornGroupUnits()).toBe(0);
+
+    // 第三条被硬上限拦下（旧实现在这里是「不限」或「新群一份全新额度」）。
+    await expect(inGroupMessage('om_cap_3')).resolves.toBe(false);
+    // 自愈撤销必须落到来源私聊，而不是去删会话群上一条根本不存在的授权。
+    expect(getBot(APP).config.chatGrants?.[DM_CHAT] ?? []).not.toContain(GRANTEE);
+    expect(bornGroupUnits()).toBe(0);
+  });
+
+  it('非 owner 在会话群里不再被 oncall 腿放行（普通 oncall 群语义不变）', async () => {
+    await handleNewTopic(dmEvent('帮我看下这个报错', 'om_outsider'), dmCtx('om_outsider'));
+    bindWorkingDirOncall(BORN_GROUP, PLAIN_ONCALL);
+
+    expect(canTalk(APP, BORN_GROUP, GRANTEE, undefined, undefined, 'group')).toBe(true);
+    expect(canTalk(APP, BORN_GROUP, OUTSIDER, undefined, undefined, 'group')).toBe(false);
+    await expect(inGroupMessage('om_outsider_msg', OUTSIDER)).resolves.toBe(false);
+    // 反向锁：普通 oncall 群（不是会话群）一字未改，同一个陌生人照常放行。
+    expect(canTalk(APP, PLAIN_ONCALL, OUTSIDER, undefined, undefined, 'group')).toBe(true);
+  });
+
+  it('restrictGrantCommands 在会话群里照旧生效（reason 不再被洗成 oncall）', async () => {
+    getBot(APP).config.restrictGrantCommands = true;
+    await handleNewTopic(dmEvent('帮我跑一下测试', 'om_restrict'), dmCtx('om_restrict'));
+    bindWorkingDirOncall(BORN_GROUP);
+
+    expect(grantCommandRestriction(APP, DM_CHAT, GRANTEE)).toMatchObject({ blocked: true, reason: 'chatGrant' });
+    expect(grantCommandRestriction(APP, BORN_GROUP, GRANTEE)).toMatchObject({ blocked: true, reason: 'chatGrant' });
+    // 反向锁：授权用户（allowedUsers）不受这道闸约束。
+    expect(grantCommandRestriction(APP, BORN_GROUP, OWNER).blocked).toBe(false);
+  });
+
+  it('来源授权被撤销后，会话群里连群主也发不了言（撤销/到期跟着原授权走）', async () => {
+    await handleNewTopic(dmEvent('帮我看看', 'om_revoke'), dmCtx('om_revoke'));
+    bindWorkingDirOncall(BORN_GROUP);
+    expect(canTalk(APP, BORN_GROUP, GRANTEE, undefined, undefined, 'group')).toBe(true);
+
+    await removeChatGrant(APP, DM_CHAT, GRANTEE);
+
+    expect(canTalk(APP, BORN_GROUP, GRANTEE, undefined, undefined, 'group')).toBe(false);
+  });
+
+  it('provenance 落盘：daemon 重启后仍认得原授权', async () => {
+    await handleNewTopic(dmEvent('帮我看看', 'om_persist'), dmCtx('om_persist'));
+
+    initSessionGroups(APP); // 模拟重启：从磁盘重新加载
+
+    expect(getSessionGroup(BORN_GROUP)).toMatchObject({
+      ownerOpenId: GRANTEE,
+      originReason: 'chatGrant',
+      originQuotaKey: chatQuotaKey(DM_CHAT, GRANTEE),
+      originChatId: DM_CHAT,
+    });
+  });
+});
+
+/**
+ * 出生时那条 oncall 绑定承载的是 workingDir。绑定没落地 = 会话群解不出工作目录，
+ * 每一轮都会跑错地方；而 birth 过去**一眼都没看** result.oncallBindings。
+ * 回退语义与「用户没能被邀请进群」一致：解散半残的群、回落原私聊线程。
+ */
+describe('会话群出生：workingDir 绑定没落地必须回退', () => {
+  it('绑定失败 → 不登记会话群，任务回落原私聊（已扣的费不白扣）', async () => {
+    mocks.createGroupWithBots.mockResolvedValue(createGroupResult({
+      oncallBindings: [{ larkAppId: APP, ok: false, error: 'bots.json write failed' }],
+    }));
+
+    await handleNewTopic(dmEvent('帮我看下这个报错', 'om_bind_fail'), dmCtx('om_bind_fail'));
+
+    expect(mocks.createGroupWithBots).toHaveBeenCalledTimes(1);
+    expect(isSessionGroup(BORN_GROUP)).toBe(false);
+    // 「扣了费就不能丢任务」：回落到原私聊线程照常落地。
+    expect(chargedUnits()).toBe(1);
+    expect(landedTurns()).toHaveLength(1);
+    expect(landedTurns()[0][0].chatId).toBe(DM_CHAT);
+  });
+
+  it('绑定条目整个缺失（binding 根本没跑）同样回退', async () => {
+    mocks.createGroupWithBots.mockResolvedValue(createGroupResult({ oncallBindings: [] }));
+
+    await handleNewTopic(dmEvent('帮我看下这个报错', 'om_bind_missing'), dmCtx('om_bind_missing'));
+
+    expect(isSessionGroup(BORN_GROUP)).toBe(false);
+    expect(landedTurns()).toHaveLength(1);
+    expect(landedTurns()[0][0].chatId).toBe(DM_CHAT);
   });
 });

@@ -97,6 +97,35 @@ describe('session-groups-store', () => {
     expect(getSessionGroup('oc_a')!.titleRetryAt).toBeUndefined();
   });
 
+  it('persists the birth authorization provenance (origin quota key / reason / chat)', () => {
+    // 会话群的额度与权限身份来自「出生时那条授权」，不是新群自己。这三个字段就是
+    // dispatcher 后续每条消息据以沿用原计数器/原 reason/原到期的依据，必须活过重启。
+    registerSessionGroup('oc_born', {
+      ownerOpenId: 'ou_grantee',
+      lastSessionId: '',
+      originReason: 'chatGrant',
+      originQuotaKey: 'chat:oc_dm:ou_grantee',
+      originChatId: 'oc_dm',
+    });
+    initSessionGroups('cli_testapp'); // simulate restart: reload from disk
+    expect(getSessionGroup('oc_born')).toMatchObject({
+      ownerOpenId: 'ou_grantee',
+      originReason: 'chatGrant',
+      originQuotaKey: 'chat:oc_dm:ou_grantee',
+      originChatId: 'oc_dm',
+    });
+  });
+
+  it('keeps legacy entries readable: provenance is optional (pre-upgrade groups)', () => {
+    registerSessionGroup('oc_legacy', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    initSessionGroups('cli_testapp');
+    const entry = getSessionGroup('oc_legacy')!;
+    expect(entry.ownerOpenId).toBe('ou_owner');
+    expect(entry.originReason).toBeUndefined();
+    expect(entry.originQuotaKey).toBeUndefined();
+    expect(entry.originChatId).toBeUndefined();
+  });
+
   it('is per-appId: another app does not see the entries', () => {
     registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
     initSessionGroups('cli_otherapp');

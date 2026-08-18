@@ -12,9 +12,16 @@
  * written at creation, session spawn, streaming card) behaves exactly like a
  * normal solo-group chat-scope session.
  *
+ * The oncall binding written at creation carries ONLY the working dir: the
+ * group's talk/quota identity comes from the authorization provenance recorded
+ * in the registry (origin* fields), which the dispatcher replays for every
+ * later message. See evaluateSessionGroupTalk in im/lark/event-dispatcher.
+ *
  * Returns null to fall through to the legacy thread behavior:
  *   - the message is a slash command (never birth a group for /help, /login …)
  *   - group creation failed (a DM notice explains the fallback)
+ *   - the requested working-dir binding did not commit (the group would spawn
+ *     its sessions in the wrong directory)
  */
 import { getBot } from '../bot-registry.js';
 import { createGroupWithBots } from '../services/group-creator.js';
@@ -25,7 +32,7 @@ import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
 import { sendMessage, replyMessage } from '../im/lark/client.js';
-import { extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
+import { evaluateTalk, extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
 import { stripLeadingMentions } from '../im/lark/message-parser.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
@@ -102,6 +109,15 @@ export async function maybeBirthSessionGroup(
   const placeholder = buildPlaceholderName(text, prefix, locale);
   const workingDir = sg.workingDir?.trim() || botCfg.defaultWorkingDir?.trim() || botCfg.workingDir?.trim() || undefined;
 
+  // Provenance snapshot, taken in the DM context BEFORE the new chat exists:
+  // WHICH authorization is paying for this group. The dispatcher replays it for
+  // every later message in the group (same quota counter, same reason, same
+  // expiry/revocation) instead of re-judging against a brand-new chat id that
+  // no grant has ever seen — see evaluateSessionGroupTalk. This is the same
+  // verdict the caller's pre-birth quota charge was made on (chatType is 'p2p'
+  // by construction here, which the p2pOpen leg needs).
+  const originEv = evaluateTalk(larkAppId, dmChatId, senderOpenId, undefined, undefined, ctx.chatType);
+
   try {
     const result = await createGroupWithBots({
       creatorLarkAppId: larkAppId,
@@ -127,7 +143,29 @@ export async function maybeBirthSessionGroup(
       throw new Error(`user invite rejected (${senderOpenId.substring(0, 12)}…)`);
     }
 
-    registerSessionGroup(newChatId, { ownerOpenId: senderOpenId, lastSessionId: '' });
+    // A requested oncall binding that did NOT commit leaves the group unable to
+    // resolve its working dir — every turn would spawn in the wrong place. The
+    // binding result was previously never inspected, so this failed silently.
+    // Treat it like the rejected-invite case: disband and fall back to the
+    // legacy DM thread rather than hand the user a half-working group.
+    if (workingDir && !result.oncallBindings.some(b => b.larkAppId === larkAppId && b.ok)) {
+      const detail = result.oncallBindings.find(b => b.larkAppId === larkAppId)?.error ?? 'not attempted';
+      await deleteChat(larkAppId, newChatId)
+        .then(r => { if (!r.ok) logger.warn(`[session-group] orphan chat ${newChatId.substring(0, 12)} disband failed: ${r.error}`); })
+        .catch(err => logger.warn(`[session-group] orphan chat disband threw: ${err}`));
+      await unbindOncall(larkAppId, newChatId)
+        .catch(err => logger.warn(`[session-group] orphan oncall unbind threw: ${err}`));
+      throw new Error(`working-dir binding failed (${detail})`);
+    }
+
+    registerSessionGroup(newChatId, {
+      ownerOpenId: senderOpenId,
+      lastSessionId: '',
+      // Persisted provenance — the group's talk/quota identity for its whole life.
+      originReason: originEv.reason,
+      originQuotaKey: originEv.quotaKey,
+      originChatId: dmChatId,
+    });
 
     // Intro message: quote the user's DM text so the group is self-explaining.
     // Its message_id becomes the turn's IN-GROUP anchor (ctx.messageId below):
@@ -176,7 +214,7 @@ export async function maybeBirthSessionGroup(
     logger.info(
       `[session-group] born chat=${newChatId.substring(0, 12)} for dm=${dmChatId.substring(0, 12)} ` +
       `msg=${messageId.substring(0, 12)} intro=${introMessageId?.substring(0, 12) ?? '-'} ` +
-      `name="${placeholder}" workingDir=${workingDir ?? '-'}`,
+      `name="${placeholder}" workingDir=${workingDir ?? '-'} origin=${originEv.reason}`,
     );
 
     return {

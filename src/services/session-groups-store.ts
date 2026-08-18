@@ -14,6 +14,9 @@
  *      session group whose session was /close'd resumes that session instead
  *      of spawning a fresh one (的话题内续聊同款体验).
  *   3. ownerOpenId                 — the DM user the group was born for.
+ *   4. origin* provenance          — WHICH authorization birthed the group, so
+ *      the dispatcher can keep charging that same quota/expiry instead of
+ *      minting a fresh per-group allowance (see the origin* fields below).
  *
  * File layout mirrors session-store / chat-first-seen-store: one file per bot
  * at `${config.session.dataDir}/session-groups-${appId}.json`, written
@@ -35,6 +38,29 @@ export interface SessionGroupEntry {
   createdAt: number;
   /** Epoch ms of the last observed activity (birth, resume, new session). */
   lastActiveAt: number;
+  /**
+   * Provenance of the authorization that birthed this group — the DM-side
+   * `evaluateTalk` verdict, captured at birth.
+   *
+   * A session group is minted for ONE user off ONE authorization, so every
+   * later message in it must keep charging that SAME authorization instead of
+   * being re-judged against the brand-new chat id (which no chatGrant, no
+   * quota counter and no expiry has ever seen). Without this, the auto-written
+   * oncall binding — created only to carry the working dir — became the group's
+   * talk source: unlimited when no `messageQuota.defaultLimit` is configured,
+   * a FRESH per-group allowance when one is, and `restrictGrantCommands`
+   * silently defeated because the reason was no longer `chatGrant`/`globalGrant`.
+   *
+   * Typed as a plain string (not `TalkReason`) on purpose: importing the type
+   * from `im/lark/event-dispatcher` would close an import cycle, since the
+   * dispatcher reads this registry.
+   */
+  originReason?: string;
+  /** quotaKey of that authorization; absent = the source carried no quota. */
+  originQuotaKey?: string;
+  /** Chat the source authorization lives on (the DM). Revoke / expiry cleanup
+   *  must target it — the session group itself holds no grant record. */
+  originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
   /** Failed scheduling rounds (each round contains the service's bounded
@@ -100,6 +126,9 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     lastSessionId: entry.lastSessionId,
     createdAt: entry.createdAt ?? now,
     lastActiveAt: now,
+    originReason: entry.originReason,
+    originQuotaKey: entry.originQuotaKey,
+    originChatId: entry.originChatId,
     titled: entry.titled,
     titleAttempts: entry.titleAttempts,
     titleRetryAt: entry.titleRetryAt,
