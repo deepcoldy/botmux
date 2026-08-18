@@ -143,9 +143,18 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
   }),
 }));
 
-vi.mock('../src/services/default-worktree.js', () => ({
-  maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
-}));
+vi.mock('../src/services/default-worktree.js', () => {
+  class AutoWorktreeFailClosedError extends Error {
+    constructor(public readonly reason: string) {
+      super(reason);
+      this.name = 'AutoWorktreeFailClosedError';
+    }
+  }
+  return {
+    maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
+    AutoWorktreeFailClosedError,
+  };
+});
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
@@ -162,7 +171,7 @@ import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '.
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
-import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
+import { maybeCreateDefaultWorktree, AutoWorktreeFailClosedError } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
@@ -1229,6 +1238,43 @@ describe('repo select card — worktree open', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.workingDir).toBeUndefined();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
+  it('runAutoWorktreeCommit fail-closes when the sandbox is on and the worktree cannot be created', async () => {
+    // The file sandbox binds workingDir read-write to the real host dir, so a
+    // fallback to the real default dir on a worktree failure would be a sandbox
+    // escape. The session must be REFUSED (closed), not degraded to the real dir.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(
+      new AutoWorktreeFailClosedError('默认目录不是 git 仓库（或暂时无法确认）'),
+    );
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+
+    // No spawn in the real default dir.
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    // The never-started pending session was closed and removed from the map.
+    expect(ds.pendingRepo).toBe(false);
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBeUndefined();
+    expect(closeSession).toHaveBeenCalledWith('uuid-old');
+    // The user got a fail-closed notice naming the dir and the reason — not a
+    // "fell back to the default dir" notice.
+    expect(notify).toHaveBeenCalledTimes(1);
+    const notice = notify.mock.calls[0]![0] as string;
+    expect(notice).toContain('文件沙盒已开启');
+    expect(notice).toContain('/repos/alpha');
+    expect(notice).not.toContain('已回退');
     expect(ds.worktreeCreating).toBe(false);
   });
 

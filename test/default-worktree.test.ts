@@ -7,6 +7,10 @@
  *   - git precheck: a non-git default dir falls back WITHOUT a premature
  *     "creating…" notice (the double-notice bug the review flagged)
  *   - notify ordering on the happy path (creating → created)
+ *   - fail-closed: when the file sandbox is on, a non-git dir or a worktree
+ *     creation failure REFUSES (AutoWorktreeFailClosedError) instead of
+ *     degrading to the real default dir (which would be a sandbox escape —
+ *     the sandbox binds workingDir read-write to the host)
  *
  * Run: pnpm vitest run test/default-worktree.test.ts
  */
@@ -51,7 +55,7 @@ function makeRepo(name: string): string {
 async function loadWithBot(
   dir: string,
   autoWorktree: boolean,
-  agent: { cliId?: string; backendType?: string } = {},
+  agent: { cliId?: string; backendType?: string; sandbox?: boolean } = {},
 ) {
   writeFileSync(configPath, JSON.stringify([{
     larkAppId: 'app_wt',
@@ -60,6 +64,7 @@ async function loadWithBot(
     ...(agent.backendType ? { backendType: agent.backendType } : {}),
     defaultWorkingDir: dir,
     ...(autoWorktree ? { defaultWorkingDirAutoWorktree: true } : {}),
+    ...(agent.sandbox ? { sandbox: true } : {}),
   }], null, 2), 'utf-8');
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
@@ -132,6 +137,70 @@ describe('maybeCreateDefaultWorktree', () => {
 
     expect(r.dir).toBe(plain);          // degrades to the base dir, session still starts
     expect(notices).toHaveLength(1);    // ONLY the fallback — no misleading "creating…" first
+  });
+
+  it('fail-closed: sandbox on + non-git default dir REFUSES (throws, no fallback to the real dir)', async () => {
+    const plain = join(tempRoot, 'not-a-repo-sbx');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, { sandbox: true });
+    const notices: string[] = [];
+
+    // The sandbox binds workingDir read-write to the real host dir (DIRECT mode),
+    // so a fallback to baseDir would be a sandbox escape — the spawn is refused.
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+
+    // No fallback notice from the service — the caller (runAutoWorktreeCommit)
+    // surfaces the refusal + recovery hint and closes the pending session.
+    expect(notices).toHaveLength(0);
+  });
+
+  it('fail-closed: sandbox on + worktree creation failure REFUSES (throws, only the creating notice)', async () => {
+    // An empty git repo (init, no commits) passes isGitWorkTree but make
+    // createRepoWorktree throw ("fatal: not a valid object name: 'HEAD'").
+    const empty = join(tempRoot, 'empty-repo');
+    mkdirSync(empty);
+    execFileSync('git', ['init', '-b', 'master'], { cwd: empty, stdio: 'ignore' });
+    const { mod } = await loadWithBot(empty, true, { sandbox: true });
+    const notices: string[] = [];
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', empty, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+
+    // Only the "creating…" heads-up went out; NO fallback-to-real-dir notice.
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('worktree');
+  });
+
+  it('fail-closed: BOTMUX_SANDBOX=1 env also refuses even without the bot config flag', async () => {
+    const plain = join(tempRoot, 'not-a-repo-env');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true); // sandbox config flag OFF
+    process.env.BOTMUX_SANDBOX = '1';
+    try {
+      await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+        isBotDefaultDir: true, locale: 'zh',
+      })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+  });
+
+  it('sandbox off: worktree creation failure still DEGRADES to base dir (no refusal)', async () => {
+    const empty = join(tempRoot, 'empty-repo-nosbx');
+    mkdirSync(empty);
+    execFileSync('git', ['init', '-b', 'master'], { cwd: empty, stdio: 'ignore' });
+    const { mod } = await loadWithBot(empty, true); // sandbox off
+    const notices: string[] = [];
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', empty, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    });
+
+    expect(r.dir).toBe(empty); // degraded to the base dir — session still starts
+    expect(notices.some(n => n.includes('回退'))).toBe(true); // fallback notice posted
   });
 
   it('no-ops (no notice, dir unchanged) when the dir did not come from the bot default', async () => {

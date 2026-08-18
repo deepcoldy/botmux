@@ -342,6 +342,7 @@ export const messages: Record<string, string> = {
   'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',
   'worktree.auto_created': '🌿 Auto-created an isolated worktree for this session: `{path}`\nBranch `{branch}`, based on `{base}`. Your default directory is untouched.',
   'worktree.auto_fallback': '⚠️ Could not create a worktree in the default directory `{dir}` ({error}); fell back to starting the session directly in the default directory.',
+  'worktree.auto_fail_closed': '⛔ File sandbox is enabled, but an isolated worktree could not be created in the default directory `{dir}` ({error}). To keep the agent\'s writes out of the real directory, this session was not started. Configure the default directory as a git repository and start again, or use /repo to pick a working directory manually.',
   'worktree.err_not_git': 'default directory is not a git repository (or could not be confirmed)',
   'cmd.skip.opened': '▶️ Session started (working dir: {cwd})',
   'cmd.status.running': 'running',
