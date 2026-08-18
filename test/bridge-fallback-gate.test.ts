@@ -71,6 +71,35 @@ describe('stripTrailingOaiMemoryCitation', () => {
     const unclosed = '<oai-mem-citation>\n<citation_entries>x</citation_entries>\n<rollout_ids>';
     expect(stripTrailingOaiMemoryCitation(unclosed)).toBe(unclosed);
   });
+
+  it('stops each section at its first closing tag', () => {
+    const extraCitationText = [
+      '<oai-mem-citation>',
+      '<citation_entries>first</citation_entries>',
+      'visible text after the first closing tag',
+      '<citation_entries>second</citation_entries>',
+      '<rollout_ids>019c1234</rollout_ids>',
+      '</oai-mem-citation>',
+    ].join('\n');
+    expect(stripTrailingOaiMemoryCitation(extraCitationText)).toBe(extraCitationText);
+
+    const extraRolloutText = [
+      '<oai-mem-citation>',
+      '<citation_entries>entry</citation_entries>',
+      '<rollout_ids>first</rollout_ids>',
+      'visible text after the first closing tag',
+      '<rollout_ids>second</rollout_ids>',
+      '</oai-mem-citation>',
+    ].join('\n');
+    expect(stripTrailingOaiMemoryCitation(extraRolloutText)).toBe(extraRolloutText);
+  });
+
+  it('handles a large malformed suffix without combinatorial backtracking', () => {
+    const repeatedCandidates = '</citation_entries><citation_entries>x'.repeat(25_000);
+    const malformed = `<oai-mem-citation><citation_entries>${repeatedCandidates}`
+      + '<rollout_ids>missing final envelope';
+    expect(stripTrailingOaiMemoryCitation(malformed)).toBe(malformed);
+  });
 });
 
 describe('stripTrailingBridgeSentinelLine', () => {

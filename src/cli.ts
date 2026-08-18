@@ -10774,6 +10774,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
     console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');

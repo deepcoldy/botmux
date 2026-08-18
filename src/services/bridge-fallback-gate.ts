@@ -65,7 +65,7 @@ export const BRIDGE_NOTHING_TO_SEND_SENTINEL = 'BOTMUX_NOTHING_TO_SEND';
 export const BRIDGE_NO_REPLY_SENTINEL_LEGACY = 'BOTMUX_NO_REPLY';
 
 const OAI_MEMORY_CITATION_OPEN = '<oai-mem-citation>';
-const OAI_MEMORY_CITATION_SUFFIX = /^<oai-mem-citation>\s*<citation_entries>[\s\S]*?<\/citation_entries>\s*<rollout_ids>[\s\S]*?<\/rollout_ids>\s*<\/oai-mem-citation>\s*$/;
+const OAI_MEMORY_CITATION_SUFFIX = /^<oai-mem-citation>\s*<citation_entries>(?:(?!<\/citation_entries>)[\s\S])*?<\/citation_entries>\s*<rollout_ids>(?:(?!<\/rollout_ids>)[\s\S])*?<\/rollout_ids>\s*<\/oai-mem-citation>\s*$/;
 
 /** Remove TraeX/Codex's internal memory-attribution envelope when it is a
  * complete suffix of an outbound answer. The rollout keeps the block in its
