@@ -23,7 +23,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({ config: { env: {} } }),
 }));
 
-import { recordContainmentHandle, type WeakContainmentHandle } from '../src/core/mojo-containment.js';
+import { readBootId, recordContainmentHandle, type WeakContainmentHandle } from '../src/core/mojo-containment.js';
 import {
   appendResidualContainmentSessions,
   buildDeviceIsolationInventory,
@@ -35,13 +35,21 @@ import {
 let dir: string;
 let previousDataDir: string | undefined;
 
+// Handles must be minted from the CURRENT boot: the boot reconciliation runs
+// before the first inventory build and RELEASES handles whose recorded boot id
+// provably predates this boot (that is its whole point), so a made-up bootId
+// never reaches the classifier on Linux any more. On hosts with no readable
+// boot id (Darwin) the reconcile fails closed and the fallback is retained —
+// the fixture blocks on every platform either way.
+const fixtureBootId = readBootId() ?? 'boot-fixture';
+
 function weakHandle(sessionId: string): WeakContainmentHandle {
   return {
     kind: 'tree-identity',
     sessionId,
     generation: 1,
     rootPid: 4242,
-    bootId: 'boot-abc',
+    bootId: fixtureBootId,
     startTime: 999,
     nonce: 'nonce-1',
   };
