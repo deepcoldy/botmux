@@ -33,6 +33,12 @@ export interface TrustedTurnInspection {
   hasLarkAppId: boolean;
 }
 
+export interface TrustedTurnReadResolution {
+  trustedCaller?: TrustedCaller;
+  inspection: TrustedTurnInspection;
+  attempts: TrustedTurnInspection[];
+}
+
 const DEFAULT_TTL_MS = 15 * 60 * 1000;
 
 export function trustedTurnFilePath(dataDir: string, sessionId: string): string {
@@ -73,6 +79,12 @@ export function trustedTurnFilePathResolutionFromEnv(
   if (env.BOTMUX_TRUSTED_TURN_FILE) {
     return { filePath: env.BOTMUX_TRUSTED_TURN_FILE, source: 'explicit_env' };
   }
+  return derivedTrustedTurnFilePathResolutionFromEnv(env);
+}
+
+function derivedTrustedTurnFilePathResolutionFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): TrustedTurnFileResolution {
   if (!env.BOTMUX_SESSION_ID) return { source: 'unresolved' };
   const source = env.SESSION_DATA_DIR ? 'session_data_dir' : 'data_dir_fallback';
   return {
@@ -144,12 +156,11 @@ export function readTrustedTurnFile(
   return record.trustedCaller;
 }
 
-export function inspectTrustedTurnFromEnv(
-  env: NodeJS.ProcessEnv = process.env,
+function inspectTrustedTurnResolution(
+  resolution: TrustedTurnFileResolution,
+  expectedSessionId?: string,
   nowMs = Date.now(),
 ): TrustedTurnInspection {
-  const resolution = trustedTurnFilePathResolutionFromEnv(env);
-  const expectedSessionId = env.BOTMUX_SESSION_ID;
   const base = {
     filePath: resolution.filePath,
     source: resolution.source,
@@ -191,4 +202,50 @@ export function inspectTrustedTurnFromEnv(
     return { ...inspected, reason: 'missing_union_id' };
   }
   return { ...inspected, valid: true };
+}
+
+function trustedTurnResolutionAttemptsFromEnv(env: NodeJS.ProcessEnv = process.env): TrustedTurnFileResolution[] {
+  const attempts: TrustedTurnFileResolution[] = [];
+  if (env.BOTMUX_TRUSTED_TURN_FILE) {
+    attempts.push({ filePath: env.BOTMUX_TRUSTED_TURN_FILE, source: 'explicit_env' });
+  }
+
+  const derived = derivedTrustedTurnFilePathResolutionFromEnv(env);
+  const alreadyAttempted = attempts.some(attempt => (
+    attempt.filePath && derived.filePath && attempt.filePath === derived.filePath
+  ));
+  if (!alreadyAttempted) attempts.push(derived);
+  return attempts;
+}
+
+export function inspectTrustedTurnFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  nowMs = Date.now(),
+): TrustedTurnInspection {
+  return inspectTrustedTurnResolution(
+    trustedTurnFilePathResolutionFromEnv(env),
+    env.BOTMUX_SESSION_ID,
+    nowMs,
+  );
+}
+
+export function resolveTrustedTurnFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  nowMs = Date.now(),
+): TrustedTurnReadResolution {
+  const attempts = trustedTurnResolutionAttemptsFromEnv(env)
+    .map(resolution => inspectTrustedTurnResolution(resolution, env.BOTMUX_SESSION_ID, nowMs));
+  const selected = attempts.find(attempt => attempt.valid);
+  const inspection = selected ?? attempts[0] ?? inspectTrustedTurnResolution({ source: 'unresolved' }, env.BOTMUX_SESSION_ID, nowMs);
+  const trustedCaller = selected?.filePath
+    ? readTrustedTurnFile(selected.filePath, env.BOTMUX_SESSION_ID, nowMs)
+    : undefined;
+  return { trustedCaller, inspection, attempts };
+}
+
+export function readTrustedTurnFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  nowMs = Date.now(),
+): TrustedCaller | undefined {
+  return resolveTrustedTurnFromEnv(env, nowMs).trustedCaller;
 }

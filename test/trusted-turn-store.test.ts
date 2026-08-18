@@ -7,6 +7,7 @@ import {
   clearTrustedTurnFile,
   inspectTrustedTurnFromEnv,
   readTrustedTurnFile,
+  resolveTrustedTurnFromEnv,
   resolveBotmuxDataDirForTrustedTurn,
   trustedTurnFilePath,
   trustedTurnFilePathFromEnv,
@@ -115,6 +116,112 @@ describe('trusted-turn-store', () => {
     });
   });
 
+  it('falls back from a stale explicit env file to the current session file', () => {
+    const dataDir = tempDir();
+    const explicitFile = join(dataDir, 'trusted-turns', 'stale.json');
+    const derivedFile = trustedTurnFilePath(dataDir, 'sess-1');
+    writeTrustedTurnFile(derivedFile, {
+      sessionId: 'sess-1',
+      turnId: 'turn-1',
+      trustedCaller: {
+        requestUserOpenId: 'ou_current',
+        requestUserUnionId: 'on_current',
+        requestLarkAppId: 'cli_app',
+      },
+    }, 1000, 5000);
+
+    const resolution = resolveTrustedTurnFromEnv({
+      BOTMUX_TRUSTED_TURN_FILE: explicitFile,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_SESSION_ID: 'sess-1',
+    }, 2000);
+
+    expect(resolution.trustedCaller).toEqual({
+      requestUserOpenId: 'ou_current',
+      requestUserUnionId: 'on_current',
+      requestLarkAppId: 'cli_app',
+    });
+    expect(resolution.inspection).toMatchObject({
+      filePath: derivedFile,
+      source: 'session_data_dir',
+      valid: true,
+      hasUnionId: true,
+    });
+    expect(resolution.attempts).toMatchObject([
+      {
+        filePath: explicitFile,
+        source: 'explicit_env',
+        valid: false,
+        reason: 'file_missing',
+      },
+      {
+        filePath: derivedFile,
+        source: 'session_data_dir',
+        valid: true,
+      },
+    ]);
+  });
+
+  it('keeps a valid explicit env file ahead of the derived session file', () => {
+    const dataDir = tempDir();
+    const explicitFile = join(dataDir, 'trusted-turns', 'explicit.json');
+    const derivedFile = trustedTurnFilePath(dataDir, 'sess-1');
+    writeTrustedTurnFile(explicitFile, {
+      sessionId: 'sess-1',
+      trustedCaller: { requestUserUnionId: 'on_explicit' },
+    }, 1000, 5000);
+    writeTrustedTurnFile(derivedFile, {
+      sessionId: 'sess-1',
+      trustedCaller: { requestUserUnionId: 'on_derived' },
+    }, 1000, 5000);
+
+    const resolution = resolveTrustedTurnFromEnv({
+      BOTMUX_TRUSTED_TURN_FILE: explicitFile,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_SESSION_ID: 'sess-1',
+    }, 2000);
+
+    expect(resolution.trustedCaller).toEqual({ requestUserUnionId: 'on_explicit' });
+    expect(resolution.inspection).toMatchObject({
+      filePath: explicitFile,
+      source: 'explicit_env',
+      valid: true,
+    });
+  });
+
+  it('falls back when the explicit env file belongs to a different session', () => {
+    const dataDir = tempDir();
+    const explicitFile = join(dataDir, 'trusted-turns', 'other.json');
+    const derivedFile = trustedTurnFilePath(dataDir, 'sess-1');
+    writeTrustedTurnFile(explicitFile, {
+      sessionId: 'other-session',
+      trustedCaller: { requestUserUnionId: 'on_other' },
+    }, 1000, 5000);
+    writeTrustedTurnFile(derivedFile, {
+      sessionId: 'sess-1',
+      trustedCaller: { requestUserUnionId: 'on_current' },
+    }, 1000, 5000);
+
+    const resolution = resolveTrustedTurnFromEnv({
+      BOTMUX_TRUSTED_TURN_FILE: explicitFile,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_SESSION_ID: 'sess-1',
+    }, 2000);
+
+    expect(resolution.trustedCaller).toEqual({ requestUserUnionId: 'on_current' });
+    expect(resolution.attempts[0]).toMatchObject({
+      filePath: explicitFile,
+      source: 'explicit_env',
+      valid: false,
+      reason: 'session_mismatch',
+    });
+    expect(resolution.inspection).toMatchObject({
+      filePath: derivedFile,
+      source: 'session_data_dir',
+      valid: true,
+    });
+  });
+
   it('reports missing trusted turn file as blocked diagnostics', () => {
     const dataDir = tempDir();
 
@@ -167,5 +274,48 @@ describe('trusted-turn-store', () => {
     });
     expect(JSON.stringify(diagnostics)).not.toContain('on_user');
     expect(JSON.stringify(diagnostics)).not.toContain('ou_user');
+  });
+
+  it('exposes redacted diagnostics for trusted-turn fallback attempts', () => {
+    const dataDir = tempDir();
+    const explicitFile = join(dataDir, 'trusted-turns', 'stale.json');
+    const derivedFile = trustedTurnFilePath(dataDir, 'sess-1');
+    writeTrustedTurnFile(derivedFile, {
+      sessionId: 'sess-1',
+      trustedCaller: {
+        requestUserOpenId: 'ou_current',
+        requestUserUnionId: 'on_current',
+      },
+    }, Date.now(), 5000);
+
+    const diagnostics = getTrustedDataMcpProxyDiagnostics({
+      BOTMUX_TRUSTED_TURN_FILE: explicitFile,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_SESSION_ID: 'sess-1',
+    });
+
+    expect(diagnostics).toMatchObject({
+      status: 'ok',
+      trustedTurn: {
+        filePath: derivedFile,
+        source: 'session_data_dir',
+        valid: true,
+      },
+      trustedTurnAttempts: [
+        {
+          filePath: explicitFile,
+          source: 'explicit_env',
+          valid: false,
+          reason: 'file_missing',
+        },
+        {
+          filePath: derivedFile,
+          source: 'session_data_dir',
+          valid: true,
+        },
+      ],
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain('on_current');
+    expect(JSON.stringify(diagnostics)).not.toContain('ou_current');
   });
 });

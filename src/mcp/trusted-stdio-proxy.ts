@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Buffer } from 'node:buffer';
-import { inspectTrustedTurnFromEnv, readTrustedTurnFile, trustedTurnFilePathFromEnv } from '../utils/trusted-turn-store.js';
+import { resolveTrustedTurnFromEnv } from '../utils/trusted-turn-store.js';
 import { TRUSTED_IDENTITY_FIELDS, mergeTrustedIdentityArgs, redactTrustedIdentityFields } from '../utils/trusted-mcp.js';
 
 type JsonObject = Record<string, unknown>;
@@ -19,14 +19,16 @@ const DATA_AGENT_UPSTREAM = {
 };
 
 export function getTrustedDataMcpProxyDiagnostics(env: NodeJS.ProcessEnv = process.env): JsonObject {
-  const trustedTurn = inspectTrustedTurnFromEnv(env);
+  const trustedTurnResolution = resolveTrustedTurnFromEnv(env);
+  const trustedTurn = trustedTurnResolution.inspection;
   return {
-    status: trustedTurn.valid ? 'ok' : 'blocked',
+    status: trustedTurnResolution.trustedCaller ? 'ok' : 'blocked',
     target: 'data-agent',
     injectTools: Array.from(DATA_AGENT_TOOL_NAMES),
     hiddenSchemaFields: Array.from(TRUSTED_IDENTITY_FIELDS),
     agentVisibleArguments: ['sql', 'datasource'],
     trustedTurn,
+    trustedTurnAttempts: trustedTurnResolution.attempts,
     stdio: {
       clientReadProtocols: ['jsonl', 'content-length'],
       upstreamReadProtocols: ['jsonl', 'content-length'],
@@ -131,10 +133,6 @@ function redactToolSchemas(message: JsonObject): JsonObject {
   };
 }
 
-function trustedTurnFileFromEnv(): string | undefined {
-  return trustedTurnFilePathFromEnv(process.env);
-}
-
 function missingTrustedIdentityResponse(id: unknown): JsonObject {
   return {
     jsonrpc: '2.0',
@@ -151,10 +149,7 @@ function injectTrustedIdentity(message: JsonObject): { ok: true; message: JsonOb
   const name = (message.params as JsonObject).name;
   if (typeof name !== 'string' || !DATA_AGENT_TOOL_NAMES.has(name)) return { ok: true, message };
 
-  const trustedFile = trustedTurnFileFromEnv();
-  const trustedCaller = trustedFile
-    ? readTrustedTurnFile(trustedFile, process.env.BOTMUX_SESSION_ID)
-    : undefined;
+  const trustedCaller = resolveTrustedTurnFromEnv(process.env).trustedCaller;
   const merged = mergeTrustedIdentityArgs((message.params as JsonObject).arguments, trustedCaller);
   if (!merged.ok) return { ok: false, response: missingTrustedIdentityResponse(message.id) };
 
