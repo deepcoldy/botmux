@@ -240,7 +240,7 @@ chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，c
 |---|---|
 | pnpm build | 通过；domain audit、TypeScript、scripts 类型检查（`pnpm typecheck:scripts`，安全批 3 起接进构建链）、runtime build id、Dashboard bundle、dist audit 全绿。最终 build id：da7294e3fa31（安全批 4 验收构建）。 |
 | pnpm exec tsc --noEmit / git diff --check | 通过。 |
-| Workbench 直接边界 | 16 files、262 tests 通过，覆盖 Workbench UI/模型/存储/路由、H5 auth、登录 UI、terminal control、preview 注册/代理与公开投影脱敏。 |
+| Workbench 直接边界 | 覆盖 Workbench UI/模型/存储/路由、H5 auth、登录 UI、terminal control、preview 注册/代理与公开投影脱敏（具体用例数以下方「全量 unit project」为准，此处不再单列一份无法复算的文件/用例计数）。 |
 | 纯模型 runner | 通过：320 sessions、22 virtual items；覆盖 rail-collapsed、focus、chat-jump、mobile-stack。 |
 | 组件 runner | 通过：21 component checks、14 rendered session options。 |
 | pnpm test 全量 unit project | 979 files / 15,987 tests 通过，1 file / 16 tests 按仓库既有条件跳过（整文件跳过的是 `test/fs-policy-seatbelt.e2e.test.ts`，属 macOS seatbelt 专用；其余 10 条散落在 dashboard-ipc、tmux-backend-env、zmx-backend-helpers、resource-monitor-darwin 四个文件里按平台条件跳过）；0 failed（安全批 4 验收轮记录）。 |
