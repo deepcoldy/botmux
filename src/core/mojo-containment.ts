@@ -1293,11 +1293,13 @@ export function revokeContainmentHandles(
         );
     }
     // The caller (the operator CLI) is responsible for cgroup.kill + reclaiming the
-    // directory of any removed cgroup handle, and for LOGGING that kill's result —
-    // a cgroup handle is never released by proof now, so revoke is the only place
-    // its directory is reclaimed. Doing it here (fire-and-forget) would drop the
-    // blocker before a possibly-live tree was actually killed, invisibly; the CLI
-    // awaits it instead.
+    // directory of any removed cgroup handle, and for LOGGING that kill's result.
+    // A cgroup handle IS released by proof — but only on `boot-id-changed`, i.e. a
+    // reboot, which already wiped cgroupfs, so there is nothing to reclaim on that
+    // path. Revoke is therefore the only place a cgroup handle is dropped while its
+    // directory may still exist (a same-boot operator override), so it is where the
+    // reclaim lives. Doing it here fire-and-forget would drop the blocker before a
+    // possibly-live tree was actually killed, invisibly; the CLI awaits it instead.
     return { removed, remaining };
 }
 
