@@ -2047,6 +2047,16 @@ describe('grok buildArgs', () => {
     expect(args[args.indexOf('--resume') + 1]).toBe(sid);
   });
 
+  it('starts fresh when resume=true but no sessionId is available (never --continue)', () => {
+    // Defense-in-depth: sessionId is normally the non-empty botmux UUID, but
+    // if it is ever missing, --continue would resume the globally most recent
+    // grok session — shared across botmux sessions of this bot — and leak a
+    // sibling session's context. Start fresh instead.
+    const args = adapter.buildArgs({ sessionId: '', resume: true });
+    expect(args).not.toContain('--continue');
+    expect(args).not.toContain('--resume');
+  });
+
   it('carves out GROK_HOME (directory-level: SQLite under sessions/) and resolves skills/hooks under it', () => {
     expect(adapter.authPaths).toEqual([GROK_TEST_HOME]);
     expect(adapter.skillsDir).toBe(join(GROK_TEST_HOME, 'skills'));

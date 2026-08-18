@@ -35,6 +35,12 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
       // leaking into a private chat. Losing this session's context is the
       // lesser evil; matches reasonix/antigravity, which reject `--continue`
       // for the same "most recent is racy" reason.
+      //
+      // 已知回退：Kimi 适配器目前没有任何 cliSessionId 捕获机制（无 bridge、
+      // 无 observation、无 output capture），「缺 id」是常态而非边角。移除
+      // `--continue` 后，Kimi 会话在每次 worker 重启（崩溃 / idle 回收 /
+      // 部署）后都新起干净会话，丧失跨重启恢复能力——`--continue` 曾是唯一的
+      // 跨重启恢复路径。后续需补 session id 捕获才能恢复精确 resume。
       return args;
     },
 

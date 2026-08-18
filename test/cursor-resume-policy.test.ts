@@ -49,17 +49,21 @@ describe('cursor resume policy', () => {
     })).toBe(false);
   });
 
-  it('blocks --continue resumes from observing and persisting Cursor global latest chat', () => {
+  it('resume without a cliSessionId observes and persists (adapter starts fresh, no --continue)', () => {
+    // The adapter no longer falls back to --continue (a cross-session leak
+    // hazard), so resume=true without a cliSessionId is effectively a FRESH
+    // launch. Observing captures the new chat id that would otherwise stay
+    // uncaptured — the old policy blocked it for the --continue era.
     expect(shouldObserveCursorChatId({
       cliId: 'cursor',
       effectiveResume: true,
       effectiveCliSessionId: undefined,
-    })).toBe(false);
+    })).toBe(true);
     expect(shouldPersistObservedCursorChatId({
       effectiveResume: true,
       effectiveCliSessionId: undefined,
-      observedChatId: 'global-latest-chat',
-    })).toBe(false);
+      observedChatId: 'freshly-minted-chat',
+    })).toBe(true);
   });
 
   it('does not observe non-Cursor sessions', () => {
