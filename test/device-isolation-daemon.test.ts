@@ -697,27 +697,3 @@ describe('device-isolation daemon transaction', () => {
     })).body.error).toBe('inventory_changed');
   });
 });
-
-describe('containment boot reconciliation runs once, before the inventory (round-11 P1-1)', () => {
-  afterEach(() => { resetDeviceIsolationDaemonForTest(); });
-
-  it('calls reconcileContainmentOnBoot exactly once across repeated inventory builds', () => {
-    let calls = 0;
-    setDeviceIsolationDaemonDependenciesForTest({
-      listSessions: () => [],
-      reconcileContainmentOnBoot: () => { calls++; },
-    });
-    buildDeviceIsolationInventory();
-    buildDeviceIsolationInventory();
-    buildDeviceIsolationInventory();
-    expect(calls).toBe(1); // once per boot, guarded — not per request
-  });
-
-  it('a throwing reconciliation is swallowed and the inventory still builds (fail-closed: blockers retained)', () => {
-    setDeviceIsolationDaemonDependenciesForTest({
-      listSessions: () => [],
-      reconcileContainmentOnBoot: () => { throw new Error('store unreadable'); },
-    });
-    expect(() => buildDeviceIsolationInventory()).not.toThrow();
-  });
-});

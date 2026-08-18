@@ -189,6 +189,7 @@ import {
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
   cancelSessionReadyAck,
   waitForSessionReadyAck,
@@ -625,6 +626,9 @@ const activeSessions = new Map<string, DaemonSession>();
  *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
  *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
 let sessionsRestored = false;
+/** Once-per-daemon guard for the mojo containment boot reconciliation. The store
+ *  is bot-agnostic, so it must run once regardless of how many bots start. */
+let mojoContainmentReconciledThisBoot = false;
 const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
 const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
@@ -21383,6 +21387,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (err) {
     logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
     throw err instanceof Error ? err : new Error(String(err));
+  }
+  // Release durable mojo containment handles a REBOOT provably killed, BEFORE the
+  // device-isolation activation inventory ever synthesises a blocker from them —
+  // otherwise a post-reboot handle keeps blocking activation forever (round-11
+  // P1-1). Daemon-global and idempotent: guarded so it runs once no matter how
+  // many bots start; any store/proc read failure fails closed inside the helper.
+  if (!mojoContainmentReconciledThisBoot) {
+    mojoContainmentReconciledThisBoot = true;
+    try {
+      reconcileContainmentHandlesOnBoot();
+    } catch (err) {
+      logger.warn(`[mojo] containment boot reconciliation threw (blockers retained): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   // Seed dashboard IPC botName with the custom displayName (falling back to the
   // bot's config id); the friendly name from /bot/v3/info is wired into the
