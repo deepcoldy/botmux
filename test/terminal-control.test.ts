@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import {
   issueTerminalControlGrant,
@@ -16,6 +16,7 @@ import {
   TerminalControlManager,
   type TerminalDashboardActor,
 } from '../src/dashboard/terminal-control.js';
+import { logger } from '../src/utils/logger.js';
 
 const SECRET = 'host-only-dashboard-secret-for-tests';
 
@@ -467,6 +468,86 @@ describe('P1-11 same-origin behind a reverse proxy / platform tunnel', () => {
       'x-forwarded-host': 'm-abc.platform.example',
       origin: 'https://m-victim.platform.example',
     })).toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+  });
+});
+
+// 端口归一化：`new URL('https://dash.example').host` 会被 URL 规范剥成
+// `dash.example`，而 `Host` 头是反代原样写进来的字符串，常见配置会写成
+// `dash.example:443`。两边不对称归一化，自建反代的控制请求与终端 WS 就会被自己
+// 的门禁全判成跨站——页面能开、只读能看，一操作就 403、终端连不上。
+describe('P1-11 origin matching normalizes ports on both sides', () => {
+  beforeEach(() => { vi.spyOn(logger, 'warn').mockImplementation(() => undefined); });
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  it('accepts an explicit default port on either side (proxy_set_header Host $host:$server_port)', () => {
+    // https + :443
+    expect(controlRequestOriginState({
+      host: 'dash.example:443', origin: 'https://dash.example', 'sec-fetch-site': 'same-origin',
+    })).toBe('same-origin');
+    expect(managementUpgradeOrigin({ host: 'dash.example:443', origin: 'https://dash.example' }))
+      .toEqual({ ok: true });
+    // http + :80
+    expect(controlRequestOriginState({ host: 'dash.example:80', origin: 'http://dash.example' }))
+      .toBe('same-origin');
+    // Origin 侧写显式端口、Host 侧不写，方向反过来也要认。
+    expect(controlRequestOriginState({ host: 'dash.example', origin: 'https://dash.example:443' }))
+      .toBe('same-origin');
+  });
+
+  it('accepts nginx 开箱默认：Host 被改写成上游回环地址，X-Forwarded-Host 带 :443', () => {
+    expect(controlRequestOriginState({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'dash.example:443',
+      origin: 'https://dash.example',
+    })).toBe('same-origin');
+    expect(managementUpgradeOrigin({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'dash.example:443',
+      origin: 'https://dash.example',
+    })).toEqual({ ok: true });
+  });
+
+  it('accepts the operator-declared BOTMUX_PUBLIC_URL when every proxy header lost the port', () => {
+    // 对外走非默认端口 + `proxy_set_header Host $host;`（$host 不含端口）：两个
+    // 请求头都推不出 :8443，只有运维显式声明的对外基址能救。
+    const stripped = { host: 'box.example', origin: 'https://box.example:8443' } as const;
+    expect(controlRequestOriginState({ ...stripped })).toBe('foreign');
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://box.example:8443');
+    expect(controlRequestOriginState({ ...stripped })).toBe('same-origin');
+    expect(managementUpgradeOrigin({ ...stripped })).toEqual({ ok: true });
+    // 它只为自己那一个 authority 背书，别的站点照旧拒。
+    expect(controlRequestOriginState({ host: 'box.example', origin: 'https://evil.example:8443' }))
+      .toBe('foreign');
+  });
+
+  it('keeps refusing真跨站与同域别的端口', () => {
+    expect(controlRequestOriginState({ host: 'dash.example:443', origin: 'https://evil.example' }))
+      .toBe('foreign');
+    // 本地开发机上另一个 localhost 服务：端口不同就是不同源，不能因为归一化被放行。
+    expect(controlRequestOriginState({ host: '127.0.0.1:8787', origin: 'http://127.0.0.1:9999' }))
+      .toBe('foreign');
+    // 候选不带端口时也不能通配放行非默认端口的 Origin。
+    expect(controlRequestOriginState({ host: '127.0.0.1', origin: 'http://127.0.0.1:9999' }))
+      .toBe('foreign');
+    expect(managementUpgradeOrigin({ host: 'dash.example:443', origin: 'https://evil.example' }))
+      .toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+  });
+
+  it('logs the origin and every candidate authority behind the 403 (运维唯一的线索)', () => {
+    const warn = vi.mocked(logger.warn);
+    expect(managementUpgradeOrigin({
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'dash.example',
+      origin: 'https://box.example:8443',
+    })).toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+    const logged = warn.mock.calls.map(call => String(call[0])).join('\n');
+    expect(logged).toContain('https://box.example:8443');
+    expect(logged).toContain('127.0.0.1:8787');
+    expect(logged).toContain('dash.example');
+    // 请求方可控字符串不能把换行带进日志。
+    warn.mockClear();
+    controlRequestOriginState({ host: 'dash.example', origin: 'https://evil.example' });
+    expect(String(vi.mocked(logger.warn).mock.calls[0]?.[0] ?? '')).not.toContain('\n');
   });
 });
 

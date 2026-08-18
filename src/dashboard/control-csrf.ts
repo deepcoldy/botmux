@@ -13,8 +13,9 @@
  *
  * 因此控制类请求要同时满足两道：
  *  1. **同源证明**：`Sec-Fetch-Site: same-origin`，或 `Origin` 与本请求 Host
- *     精确相等。两个信号都没有 → fail closed（浏览器发起的写请求必然带其中之
- *     一；跨站 form 会带一个对不上的 `Origin`，沙箱/不透明来源会带 `null`）。
+ *     同源（两边归一化成 hostname + 有效端口后相等）。两个信号都没有 → fail
+ *     closed（浏览器发起的写请求必然带其中之一；跨站 form 会带一个对不上的
+ *     `Origin`，沙箱/不透明来源会带 `null`）。
  *  2. **一次性 CSRF 票据**：页面加载时现签、绑定当前认证会话、随认证结束一起
  *     作废，提交时放在 `X-Botmux-Csrf` 头里。`<form>` 无法设置自定义头，所以
  *     即使第 1 道被某个浏览器的 Fetch-Metadata 实现绕过，无 body 的表单攻击也
@@ -28,6 +29,7 @@
  * 的路径内凭据校验，**不能**用本函数误杀——调用方必须在 preview 分支之后再调。
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { logger } from '../utils/logger.js';
 
 /** 提交控制类请求时携带 CSRF 票据的头名。`<form>` 设不了自定义头，这是关键。 */
 export const CONTROL_CSRF_HEADER = 'x-botmux-csrf';
@@ -55,11 +57,70 @@ function headerValue(value: string | string[] | undefined): string | undefined {
   return value;
 }
 
+/** 归一化后的 authority：hostname + 端口。端口为空串表示「没有显式端口」。 */
+interface NormalizedAuthority {
+  hostname: string;
+  port: string;
+}
+
 /**
- * `Origin` 是否与本请求自己的 authority 精确同源。只比 host（含端口），不比
- * scheme：中心化平台在 TLS 终止后把明文转给本进程，浏览器发的是 `https://…`
- * 而本地看到的是明文连接，比 scheme 会把正常访问全判成跨站。host 相等已经足以
- * 区分兄弟子域与其它端口——那正是本条要防的。
+ * 候选 authority（`Host` / `X-Forwarded-Host` / `BOTMUX_PUBLIC_URL`）拆成
+ * hostname + port。借 `http://` 解析，IPv6 字面量、大小写、尾随点都交给 URL
+ * 规范处理，与 Origin 侧用的是同一套归一化。
+ *
+ * 副作用：显式的 `:80` 会被 URL 当成 http 默认端口抹掉，退化成「无端口」。无端
+ * 口只与跑在协议默认端口上的 Origin 相等（见 {@link authorityMatchesOrigin}），
+ * 所以「同域别的端口」这条要防的路依旧堵着。
+ */
+function normalizeAuthority(value: string): NormalizedAuthority | undefined {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || trimmed.length > 256) return undefined;
+  let url: URL;
+  try { url = new URL(`http://${trimmed}`); } catch { return undefined; }
+  // 只接受纯 authority：带路径/凭据/查询的 Host 头是畸形输入，不是候选。
+  if (!url.hostname || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    return undefined;
+  }
+  return { hostname: url.hostname, port: url.port };
+}
+
+/** Origin 侧：隐含的默认端口显式化（https→443 / http→80），这样两边比的是同一
+ *  种形式——`https://dash.example` 与 `Host: dash.example:443` 是同一个门。 */
+function normalizeOrigin(origin: string | undefined): (NormalizedAuthority & { explicitPort: boolean }) | undefined {
+  if (!origin || origin === 'null') return undefined;
+  let parsed: URL;
+  try { parsed = new URL(origin); } catch { return undefined; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+  return {
+    hostname: parsed.hostname.toLowerCase(),
+    port: parsed.port || (parsed.protocol === 'https:' ? '443' : '80'),
+    explicitPort: parsed.port !== '',
+  };
+}
+
+function authorityMatchesOrigin(
+  candidate: NormalizedAuthority,
+  origin: NormalizedAuthority & { explicitPort: boolean },
+): boolean {
+  if (candidate.hostname !== origin.hostname) return false;
+  // 候选不带端口（`proxy_set_header Host $host;`、平台隧道）：本进程无从得知反
+  // 代前面是 80 还是 443，只能认「Origin 也跑在协议默认端口上」。通配放行会把
+  // 「同域其它端口」这条攻击面重新打开。对外走非默认端口的部署，靠运维显式声明
+  // 的 `BOTMUX_PUBLIC_URL` 候选覆盖。
+  if (!candidate.port) return !origin.explicitPort;
+  return candidate.port === origin.port;
+}
+
+/**
+ * `Origin` 是否与本请求自己的 authority 同源。两边都归一化成 hostname + 有效端
+ * 口后比较，不比 scheme：中心化平台在 TLS 终止后把明文转给本进程，浏览器发的是
+ * `https://…` 而本地看到的是明文连接，比 scheme 会把正常访问全判成跨站。
+ * hostname + 端口相等已经足以区分兄弟子域与其它端口——那正是本条要防的。
+ *
+ * 端口必须两边对称归一化：`new URL('https://dash.example').host` 会被 URL 规范
+ * 剥成 `dash.example`，而 `Host` 头是原始字符串，反代常写成 `dash.example:443`。
+ * 早先直接比字符串，于是 `proxy_set_header Host $host:$server_port;` 这类广为流
+ * 传的配置会把自己人的控制请求全判成跨站。
  *
  * `host` 可以给多个候选：反代/平台隧道下 `Host` 可能已被改写成回环地址，浏览器
  * 真正看到的域名在 `X-Forwarded-Host` 里。这不削弱防线——浏览器不允许页面设置
@@ -70,24 +131,72 @@ export function originMatchesHost(
   origin: string | undefined,
   host: string | undefined | ReadonlyArray<string | undefined>,
 ): boolean {
-  if (!origin || origin === 'null') return false;
-  let parsed: URL;
-  try { parsed = new URL(origin); } catch { return false; }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const parsed = normalizeOrigin(origin);
+  if (!parsed) return false;
   const candidates = Array.isArray(host) ? host : [host as string | undefined];
-  const originHost = parsed.host.toLowerCase();
-  return candidates.some(candidate =>
-    typeof candidate === 'string' && candidate.trim().toLowerCase() === originHost);
+  return candidates.some(candidate => {
+    if (typeof candidate !== 'string') return false;
+    const normalized = normalizeAuthority(candidate);
+    return normalized ? authorityMatchesOrigin(normalized, parsed) : false;
+  });
 }
 
-/** 本请求可能的自身 authority：直连是 `Host`，反代/平台隧道下还有转发头。 */
+let publicAuthorityCache: { raw: string; authority: string | undefined } | undefined;
+
+/**
+ * 运维显式声明的对外基址（`BOTMUX_PUBLIC_URL`）也算一个候选 authority。
+ * 自建反代下 `Host` 与 `X-Forwarded-Host` 可能双双不可信——被改写成上游回环地
+ * 址，或被 `$host` 剥掉了非默认端口——这条是唯一由本机配置而来、跨站页面无从
+ * 影响的「浏览器实际访问的 authority」，纳入候选不削弱防线。
+ */
+function publicUrlAuthority(): string | undefined {
+  const raw = process.env.BOTMUX_PUBLIC_URL?.trim() ?? '';
+  if (publicAuthorityCache?.raw === raw) return publicAuthorityCache.authority;
+  let authority: string | undefined;
+  if (raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === 'http:' || url.protocol === 'https:') authority = url.host || undefined;
+    } catch { authority = undefined; }
+  }
+  publicAuthorityCache = { raw, authority };
+  return authority;
+}
+
+/** 本请求可能的自身 authority：直连是 `Host`，反代/平台隧道下还有转发头，外加
+ *  运维显式声明的对外基址。 */
 function requestAuthorities(headers: ControlRequestHeadersLike): Array<string | undefined> {
   const forwarded = headerValue(headers['x-forwarded-host']);
   return [
     headerValue(headers.host),
     // 逗号分隔时第一个才是最初的客户端所见 host。
     forwarded ? forwarded.split(',')[0] : undefined,
+    publicUrlAuthority(),
   ];
+}
+
+/** 日志安全：Origin/Host 都是请求方可控字符串，掐长度并去掉控制字符再落盘。 */
+function logSafeValue(value: string): string {
+  let out = '';
+  for (const ch of value.slice(0, 128)) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code >= 0x20 && code !== 0x7f) out += ch;
+  }
+  return out;
+}
+
+/**
+ * 判成跨站时留一行线索。这条 403 是硬失败：前端无降级、doctor 也报不出原因，
+ * 服务端再零日志，运维只能看到「终端连不上、一点接管就 403」。把 Origin 与全部
+ * 候选 authority 打出来，反代配错（Host 被改写 / 端口被剥掉）一眼可辨。
+ */
+function warnForeignOrigin(kind: string, origin: string, headers: ControlRequestHeadersLike): void {
+  const authorities = requestAuthorities(headers)
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+    .map(logSafeValue);
+  logger.warn(`[dashboard-csrf] ${kind} 判为跨站并拒绝：origin=${logSafeValue(origin)}`
+    + ` 候选 authority=[${authorities.join(', ')}]`
+    + '（反代请原样透传 host:port，或用 BOTMUX_PUBLIC_URL 声明对外基址）');
 }
 
 /**
@@ -98,7 +207,10 @@ function requestAuthorities(headers: ControlRequestHeadersLike): Array<string | 
 export function controlRequestOriginState(headers: ControlRequestHeadersLike): ControlRequestOriginState {
   const site = headerValue(headers['sec-fetch-site']);
   const origin = headerValue(headers.origin);
-  if (origin !== undefined && !originMatchesHost(origin, requestAuthorities(headers))) return 'foreign';
+  if (origin !== undefined && !originMatchesHost(origin, requestAuthorities(headers))) {
+    warnForeignOrigin('控制类请求', origin, headers);
+    return 'foreign';
+  }
   if (site !== undefined && site !== 'same-origin') return 'foreign';
   if (origin === undefined && site === undefined) return 'unknown';
   return 'same-origin';
@@ -113,9 +225,11 @@ export function managementUpgradeOrigin(headers: ControlRequestHeadersLike):
   { ok: true } | { ok: false; error: 'upgrade_origin_forbidden' } {
   const origin = headerValue(headers.origin);
   if (origin === undefined) return { ok: true };
-  return originMatchesHost(origin, requestAuthorities(headers))
-    ? { ok: true }
-    : { ok: false, error: 'upgrade_origin_forbidden' };
+  if (originMatchesHost(origin, requestAuthorities(headers))) return { ok: true };
+  // WS 握手被拒最难查：浏览器拿不到 403 的状态码与响应体，页面只会显示「连不
+  // 上」，workbench-doctor 的探测同样说不出原因。日志是唯一的线索。
+  warnForeignOrigin('WebSocket 升级', origin, headers);
+  return { ok: false, error: 'upgrade_origin_forbidden' };
 }
 
 function csrfTokenHash(token: string): string {
