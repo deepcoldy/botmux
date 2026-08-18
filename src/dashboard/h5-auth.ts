@@ -4,8 +4,10 @@ import type { Brand } from '../im/lark/lark-hosts.js';
 import { larkHosts } from '../im/lark/lark-hosts.js';
 import {
   controlAuditRecord,
+  type ControlAuditAction,
   type ControlAuditSink,
 } from './control-audit.js';
+import { logger } from '../utils/logger.js';
 
 export const DASHBOARD_SESSION_COOKIE = 'botmux_dashboard_session';
 export const DEFAULT_DASHBOARD_SESSION_TTL_MS = 30 * 60_000;
@@ -695,6 +697,25 @@ type H5ExchangeOutcome =
   | { ok: true; openId: string; token: string; expiresAt: number }
   | { ok: false; openId: string };
 
+/**
+ * 本地环节（审计落盘、会话创建）失败的标记，与「飞书上游换取 open_id 失败」
+ * 严格区分：两者的排查方向完全相反——上游失败要去查飞书应用配置与网络，本地
+ * 失败是磁盘满 / 审计路径不可写。把两者都报成 `feishu_exchange_failed`，会让
+ * 一块写满的磁盘看起来像飞书应用配错了。
+ */
+class DashboardH5LocalFailure extends Error {
+  constructor(readonly stage: string, readonly reason: unknown) {
+    super(`dashboard h5 local failure at ${stage}`);
+    this.name = 'DashboardH5LocalFailure';
+  }
+}
+
+/** 只进本机 daemon 日志的错因摘要——绝不进 HTTP 响应体（错误串可能带审计文件
+ *  路径 / errno，那是运维信息，不是给客户端看的）。 */
+function describeFailure(reason: unknown): string {
+  return reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
+}
+
 export function createDashboardH5AuthController(opts: DashboardH5AuthControllerOptions): DashboardH5AuthController {
   const { config, sessions, audit } = opts;
   const exchanger = opts.exchanger ?? createFeishuH5CodeExchanger(config);
@@ -708,6 +729,22 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
     parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE),
   );
 
+  /** 落日志前抹掉 appSecret：错因只进本机 daemon 日志，但上游客户端的错误串万一
+   *  带上凭据，也不能就这么写进日志文件。 */
+  const describeForLog = (reason: unknown): string => {
+    const text = describeFailure(reason);
+    return config.appSecret ? text.split(config.appSecret).join('***') : text;
+  };
+
+  /** 审计写不进去 = fail closed，但要让调用方认得出这是本地故障而非上游故障。 */
+  const auditOrFail = (userId: string, action: ControlAuditAction): void => {
+    try {
+      audit.append(controlAuditRecord(userId, 'dashboard', action));
+    } catch (error) {
+      throw new DashboardH5LocalFailure(`audit ${action}`, error);
+    }
+  };
+
   /**
    * The whole login decision for one code, run exactly once under the gate's
    * single-flight: provider call, allowlist check, session creation and the
@@ -719,19 +756,36 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
     try {
       ({ openId } = await exchanger.exchange(code));
     } catch (error) {
-      audit.append(controlAuditRecord('unknown', 'dashboard', 'auth.login_denied'));
+      // 上游的错因优先：审计再写不进去也不能把它盖掉，否则日志里只剩本地错误、
+      // 看不出飞书那边到底怎么了。这条路径本来就要抛，没有任何状态要 fail closed。
+      try {
+        audit.append(controlAuditRecord('unknown', 'dashboard', 'auth.login_denied'));
+      } catch (auditError) {
+        logger.error(`[dashboard-h5] auth.login_denied 审计写入失败：${describeForLog(auditError)}`);
+      }
       throw error;
     }
     if (!allowed.has(openId)) {
-      audit.append(controlAuditRecord(openId, 'dashboard', 'auth.login_denied'));
+      auditOrFail(openId, 'auth.login_denied');
       return { ok: false, openId };
     }
-    const created = sessions.create(openId);
+    // 审计先行，与 terminal-control 的 takeover 同一套 fail-closed 顺序：durable
+    // 审计写不进去就一条不可逆状态都不落。反过来（先建 session、先烧 code、再写
+    // 审计）一旦写失败，会留下浏览器永远拿不到的孤儿 session，还白白烧掉这个一
+    // 次性 code，让用户连重试都换不回登录。
+    // openId 已过 allowlist（配置侧按 validOpenId 过滤），create 只会因非法
+    // openId/token 抛错，此处不会在审计落地后再失败。
+    auditOrFail(openId, 'auth.login');
+    let created: { token: string; identity: DashboardAuthIdentity };
+    try {
+      created = sessions.create(openId);
+    } catch (error) {
+      throw new DashboardH5LocalFailure('session create', error);
+    }
     // Burn the code the moment it becomes a session: a later, non-concurrent
     // replay must not mint a second one even if the provider would answer
     // again. Only the digest is retained — never the code, never the token.
     exchangeGate.markSpent(codeKey);
-    audit.append(controlAuditRecord(openId, 'dashboard', 'auth.login'));
     return { ok: true, openId, token: created.token, expiresAt: created.identity.expiresAt };
   };
 
@@ -805,7 +859,16 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       let outcome: H5ExchangeOutcome;
       try {
         outcome = await flight.result;
-      } catch {
+      } catch (error) {
+        // 错因分流：本地故障（审计不可写 / 建会话失败）报 503，飞书上游故障才
+        // 报 502。原始错因只落 daemon 日志——曾经这里是裸 catch，磁盘写满会让
+        // 全量登录静默失败并谎称是飞书的问题，日志里一条线索都没有。
+        if (error instanceof DashboardH5LocalFailure) {
+          logger.error(`[dashboard-h5] 登录本地失败（${error.stage}）：${describeForLog(error.reason)}`);
+          json(res, 503, { ok: false, error: 'login_unavailable' });
+          return true;
+        }
+        logger.warn(`[dashboard-h5] 飞书换取 open_id 失败：${describeForLog(error)}`);
         json(res, 502, { ok: false, error: 'feishu_exchange_failed' });
         return true;
       }
@@ -839,8 +902,15 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
         return true;
       }
       const token = parseNamedCookie(req.headers.cookie, DASHBOARD_SESSION_COOKIE);
+      // 撤销在前（登出的安全动作已经完成、不可撤回），审计写失败不能再把清
+      // Cookie 的成功响应吞掉：否则浏览器留着一枚已死的 cookie，页面还以为自己
+      // 没登出。审计失败单独落日志，运维照样看得见。
       sessions.revokeToken(token);
-      audit.append(controlAuditRecord(identity.userId, 'dashboard', 'auth.logout'));
+      try {
+        audit.append(controlAuditRecord(identity.userId, 'dashboard', 'auth.logout'));
+      } catch (error) {
+        logger.error(`[dashboard-h5] auth.logout 审计写入失败（会话已撤销）：${describeForLog(error)}`);
+      }
       json(res, 200, { ok: true }, { 'set-cookie': clearDashboardSessionCookie(config.secureCookies) });
       return true;
     }

@@ -27,6 +27,7 @@ import {
 } from '../src/dashboard/preview-content-capability.js';
 import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
 import { parseNamedCookie } from '../src/dashboard/h5-auth.js';
+import { logger } from '../src/utils/logger.js';
 
 const config: DashboardH5AuthConfig = {
   enabled: true,
@@ -45,6 +46,21 @@ class MemoryAudit implements ControlAuditSink {
   append(record: ControlAuditRecord): void { this.records.push(record); }
 }
 
+/** 审计写不进去（磁盘满 / 审计路径不可写）的模拟。生产环境注入的是同步的
+ *  `FileControlAuditSink`，`append()` 失败会原样抛出、没有任何吞咽层，所以这
+ *  条失败路径必须被测到。`broken` 可翻回 false，模拟运维把磁盘清干净。 */
+class BrokenAudit implements ControlAuditSink {
+  attempts: ControlAuditRecord[] = [];
+  broken = true;
+  constructor(private readonly failOn: (record: ControlAuditRecord) => boolean = () => true) {}
+  append(record: ControlAuditRecord): void {
+    this.attempts.push(record);
+    if (this.broken && this.failOn(record)) {
+      throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    }
+  }
+}
+
 let server: Server | null = null;
 
 afterEach(async () => {
@@ -59,6 +75,9 @@ async function startController(
     exchanger?: FeishuH5CodeExchanger;
     exchangeGate?: DashboardH5ExchangeGate;
     config?: DashboardH5AuthConfig;
+    /** 注入别的 sink（如 {@link BrokenAudit}）时，返回的 `audit` 就是空的，
+     *  断言请用调用方自己持有的那个实例。 */
+    audit?: ControlAuditSink;
   } = {},
 ): Promise<{
   base: string;
@@ -86,7 +105,7 @@ async function startController(
   const controller = createDashboardH5AuthController({
     config: opts.config ?? config,
     sessions,
-    audit,
+    audit: opts.audit ?? audit,
     exchangeGate: opts.exchangeGate,
     exchanger: opts.exchanger ?? {
       exchange: vi.fn(async () => {
@@ -452,6 +471,70 @@ describe('Feishu H5 passwordless dashboard auth', () => {
     for (const settled of await Promise.all(inFlight)) expect(settled.status).toBe(200);
     // Slots freed on settle: the same total budget now admits a fresh code.
     expect((await postExchange(base, 'after-drain-code')).status).toBe(200);
+  });
+});
+
+// P1-5：审计是 fail-closed 的一环（与 terminal-control 的 takeover 同一套顺序），
+// 但「写不进去」不能变成半提交——登录不能留下浏览器永远拿不到的孤儿会话、也不能
+// 白烧掉一次性 code；登出的撤销已经完成，清 Cookie 的成功响应就必须发出去。
+describe('P1-5 audit write failures never half-commit a login or a logout', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('mints no orphan session and burns no code when the login audit cannot be written', async () => {
+    const errors = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const audit = new BrokenAudit();
+    const { base, minted } = await startController('ou_allowed', { value: 10_000 }, { audit });
+
+    const failed = await postExchange(base, 'disk-is-full-code');
+    expect(failed.status).toBe(503);
+    // 本地故障不再冒充飞书上游故障：磁盘满不该让运维去查飞书应用配置。
+    expect(await failed.json()).toEqual({ ok: false, error: 'login_unavailable' });
+    expect(failed.headers.get('set-cookie')).toBeNull();
+    // 审计确实先于会话创建被尝试，且一枚 token 都没签发出去 → 没有孤儿会话。
+    expect(audit.attempts.map(record => record.action)).toEqual(['auth.login']);
+    expect(minted).toHaveLength(0);
+    // 原始错因落进 daemon 日志（这里原来是裸 catch，运维一条线索都拿不到）。
+    expect(errors.mock.calls.map(call => String(call[0])).join('\n')).toContain('ENOSPC');
+
+    // code 也没被烧掉：磁盘清干净后，同一个 code 还能换回登录，而不是 409。
+    audit.broken = false;
+    const retry = await postExchange(base, 'disk-is-full-code');
+    expect(retry.status).toBe(200);
+    expect(retry.headers.get('set-cookie')).toContain(`${DASHBOARD_SESSION_COOKIE}=`);
+    expect(minted).toHaveLength(1);
+  });
+
+  it('still clears the cookie and answers 200 when the logout audit cannot be written', async () => {
+    const errors = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const audit = new BrokenAudit(record => record.action === 'auth.logout');
+    const { base } = await startController('ou_allowed', { value: 10_000 }, { audit });
+    const login = await postExchange(base, 'logout-audit-code');
+    expect(login.status).toBe(200);
+    const cookie = cookiePair(login.headers.get('set-cookie') ?? '');
+
+    const logout = await fetch(`${base}/auth/feishu/logout`, { method: 'POST', headers: { cookie } });
+    expect(logout.status).toBe(200);
+    expect(await logout.json()).toEqual({ ok: true });
+    // 撤销已经不可撤回，清 Cookie 的响应就不能被审计失败吞掉，否则浏览器揣着一
+    // 枚已死的 cookie，页面还以为自己没登出。
+    expect(logout.headers.get('set-cookie')).toContain('Max-Age=0');
+    // 会话是真撤销了，不只是清了 cookie。
+    const after = await fetch(`${base}/auth/feishu/session`, { headers: { cookie } });
+    expect(after.status).toBe(401);
+    expect(errors.mock.calls.map(call => String(call[0])).join('\n')).toContain('auth.logout');
+  });
+
+  it('logs the real upstream cause behind a 502 without putting it or the app secret in the response', async () => {
+    const warns = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const { base } = await startController(new Error(`provider_rejected ${config.appSecret}`));
+    const response = await postExchange(base, 'upstream-broken-code');
+    const text = await response.text();
+    expect(response.status).toBe(502);
+    expect(JSON.parse(text)).toEqual({ ok: false, error: 'feishu_exchange_failed' });
+    expect(text).not.toContain(config.appSecret);
+    const logged = warns.mock.calls.map(call => String(call[0])).join('\n');
+    expect(logged).toContain('provider_rejected');   // 运维终于看得到真实错因
+    expect(logged).not.toContain(config.appSecret);  // 但凭据不落日志
   });
 });
 
