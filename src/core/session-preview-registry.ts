@@ -28,10 +28,23 @@ import { logger } from '../utils/logger.js';
  * 摘掉内存里的 previewTarget，返回被摘掉的旧值（本来就没有则返回 undefined）。
  * 不落盘、不广播：调用方要把它并进自己的原子 `updateSession`，并在 save 失败时用
  * 返回值回滚。
+ *
+ * P1-3：`expectedRegisteredAt` 是可选的 revision 门槛——「作废我判定失效的那一次注册」，
+ * 而不是「清空此刻的值」。判定失效与清理落地之间隔着一次跨进程往返，这中间会话完全
+ * 可以合法地重注册一个新目标；无条件清空会把它一并抹掉，agent 刚拿到的
+ * 「✓ Web 预览已注册」立刻变成空。`registeredAt` 是 ISO 串，天然就是这次注册的
+ * revision。不传时保持原来的无条件语义（换代 / 关闭 / suspend 这些权威边界本来就
+ * 该清掉「当前那个」，无论它是哪一次注册）。
  */
-export function takeSessionPreviewTarget(session: Session): Session['previewTarget'] {
+export function takeSessionPreviewTarget(
+  session: Session,
+  expectedRegisteredAt?: string,
+): Session['previewTarget'] {
   const previous = session.previewTarget;
   if (previous === undefined) return undefined;
+  if (expectedRegisteredAt !== undefined && previous.registeredAt !== expectedRegisteredAt) {
+    return undefined;
+  }
   session.previewTarget = undefined;
   return previous;
 }
@@ -54,9 +67,17 @@ export function publishSessionPreviewCleared(sessionId: string): void {
  * 落盘失败**不**回滚内存：此刻内存里的会话已经不再持有那个目标（这正是我们要的
  * fail-closed 方向），而下一次成功的 save 会让磁盘收敛。广播照发，Dashboard 立刻
  * 停止把用户导向一个已经不属于本会话的端口。
+ *
+ * P1-3：`expectedRegisteredAt` 见 `takeSessionPreviewTarget`。revision 不匹配时整条
+ * 是 no-op（不写盘、不广播、返回 false），幂等语义不变——「本来就没有」与「已经不是
+ * 那一个了」对调用方是同一件事：这次清理没有需要做的事。
  */
-export function clearSessionPreviewTarget(session: Session, why: string): boolean {
-  if (takeSessionPreviewTarget(session) === undefined) return false;
+export function clearSessionPreviewTarget(
+  session: Session,
+  why: string,
+  expectedRegisteredAt?: string,
+): boolean {
+  if (takeSessionPreviewTarget(session, expectedRegisteredAt) === undefined) return false;
   try {
     sessionStore.updateSession(session);
   } catch (err) {

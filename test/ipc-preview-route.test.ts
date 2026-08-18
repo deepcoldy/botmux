@@ -275,6 +275,57 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     }
   });
 
+  // ─── P1-3：同代次内的并发注册不得互相覆盖 ─────────────────────────────────
+  //
+  // 这条路由没有 per-session 串行化，`readJsonBody` 与 `probeSessionPreviewTarget`
+  // 两处 await 都是真实让出点。原来的 CAS 只锚了会话对象 / 状态 / 代次 / worker /
+  // 鉴权，**没有 previewTarget 自己**，于是谁先 settle 谁先写、后 settle 的无条件覆盖
+  // ——胜负由 probe 耗时决定，不是由请求先后决定（单 host 超时 750ms，不带 host 时
+  // 127.0.0.1 与 ::1 串行试，「A 慢一秒、B 快一毫秒」是常规而非极端）。
+  it('P1-3: 慢请求不再覆盖 await 期间落地的新注册', async () => {
+    const port = await reachablePort();
+    const ds = activeSession();
+    const winner = {
+      host: '127.0.0.1', port: 4000, registeredAt: '2026-08-11T12:00:09.000Z',
+      owner: { pid: 4242, procStart: '918273', inode: '556677' }, workerGeneration: 5,
+    };
+    let lookups = 0;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(() => {
+      lookups++;
+      // 第一次查询 = handler 捕获锚点，紧接着进入 probe 的 await。那个窗口里另一条
+      // 并发注册（同代次、同样合法）先落地了。
+      if (lookups === 1) queueMicrotask(() => { ds.session.previewTarget = winner; });
+      return ds;
+    });
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+
+    const res = await postPreview(ds.session.sessionId, { port });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'preview_target_changed' });
+    // 先落地的那个原封不动，也没有第二条 preview 广播出去。
+    expect(ds.session.previewTarget).toBe(winner);
+    expect(update).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('P1-3: 没有并发写入时，覆盖旧目标照常成功', async () => {
+    const port = await reachablePort();
+    const ds = activeSession();
+    ds.session.previewTarget = {
+      host: '127.0.0.1', port: 1111, registeredAt: '2026-08-10T00:00:00.000Z',
+      owner: { pid: 4242, procStart: '918273', inode: '556677' }, workerGeneration: 5,
+    };
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+
+    const res = await postPreview(ds.session.sessionId, { port });
+
+    expect(res.status).toBe(200);
+    expect(ds.session.previewTarget).toMatchObject({ port });
+  });
+
   it('restores in-memory state when durable persistence fails', async () => {
     const port = await reachablePort();
     const previous = {
@@ -327,6 +378,97 @@ describe('DELETE /api/sessions/:sessionId/preview', () => {
       type: 'session.update',
       body: { sessionId: 's-preview', patch: { previewTarget: null } },
     });
+  });
+});
+
+// ─── P1-3：在途 DELETE 不得误删这段窗口里刚注册的新目标 ──────────────────────
+//
+// 判定失效发生在代理进程，DELETE 落地在 daemon 进程，中间隔着一次跨进程往返。那段
+// 窗口里会话完全可以合法地重注册一个新目标；无条件清空会把它一起抹掉，agent 刚拿到
+// 的「✓ Web 预览已注册」立刻失效。
+describe('DELETE /api/sessions/:sessionId/preview 带 expected revision', () => {
+  const stale = {
+    host: '127.0.0.1', port: 4173, registeredAt: '2026-08-11T12:00:00.000Z',
+    owner: { pid: 4242, procStart: '918273', inode: '556677' }, workerGeneration: 5,
+  };
+  const fresh = {
+    host: '127.0.0.1', port: 5173, registeredAt: '2026-08-11T12:00:07.000Z',
+    owner: { pid: 4243, procStart: '918274', inode: '556678' }, workerGeneration: 5,
+  };
+
+  async function deletePreview(sessionId: string, expectedRegisteredAt?: string): Promise<Response> {
+    const handle = await ensureIpc();
+    const base = `/api/sessions/${encodeURIComponent(sessionId)}/preview`;
+    const path = expectedRegisteredAt === undefined
+      ? base
+      : `${base}?expectedRegisteredAt=${encodeURIComponent(expectedRegisteredAt)}`;
+    return fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'DELETE',
+      headers: daemonIpcAuthHeaders({
+        secret: HOST_SECRET, port: handle.port, method: 'DELETE', path,
+      }),
+    });
+  }
+
+  it('revision 不匹配时是彻底的 no-op：不清、不写盘、不广播，且幂等回 200', async () => {
+    const ds = activeSession();
+    ds.session.previewTarget = fresh;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+
+    // 代理判定失效的是 stale，可 DELETE 飞到时会话已经重注册成 fresh。
+    const res = await deletePreview(ds.session.sessionId, stale.registeredAt);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: false });
+    expect(ds.session.previewTarget).toBe(fresh);
+    expect(update).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('revision 匹配时照常清掉并广播 preview: null', async () => {
+    const ds = activeSession();
+    ds.session.previewTarget = { ...stale };
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+
+    const res = await deletePreview(ds.session.sessionId, stale.registeredAt);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: true });
+    expect(ds.session.previewTarget).toBeUndefined();
+    expect(update).toHaveBeenCalledWith(ds.session);
+    expect(publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: { sessionId: ds.session.sessionId, patch: { previewTarget: null } },
+    });
+  });
+
+  it('不带 expected 时保持原来的无条件语义（换代/关闭等权威边界仍可一键清空）', async () => {
+    const ds = activeSession();
+    ds.session.previewTarget = { ...fresh };
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+
+    const res = await deletePreview(ds.session.sessionId);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: true });
+    expect(ds.session.previewTarget).toBeUndefined();
+  });
+
+  it('本来就没有目标时依旧幂等回 cleared:false', async () => {
+    const ds = activeSession();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+
+    const res = await deletePreview(ds.session.sessionId, stale.registeredAt);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: false });
+    expect(update).not.toHaveBeenCalled();
   });
 });
 

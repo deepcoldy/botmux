@@ -6084,6 +6084,9 @@ async function cmdPreview(rest: string[]): Promise<void> {
     console.error('✗ 当前会话后端（远端 sandbox）的 Web 服务不在本机，Dashboard 预览不支持');
   } else if (error === 'preview_generation_changed') {
     console.error('✗ 注册期间会话已换代或已关闭；请在新一轮里重新注册');
+  } else if (error === 'preview_target_changed') {
+    // P1-3：并发注册（例如同时注册两个端口）时，后到的一方不再无声覆盖先落地的那个。
+    console.error('✗ 注册期间本会话的预览目标已被另一次注册改写；同一时刻只能有一个预览目标，请确认后重试');
   } else if (error === 'remote_host_forbidden') {
     console.error('✗ 只允许注册本机 loopback 服务');
   } else if (error === 'origin_unproven' || error === 'managed_action_required') {

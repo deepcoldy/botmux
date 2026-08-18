@@ -152,7 +152,9 @@ export function resolveSessionPreviewForProxy(input: {
   ownerLarkAppId: string | undefined;
   daemonOnline: boolean;
   isTargetOwned: (target: SessionPreviewTarget) => boolean;
-  onStaleTarget?: (sessionId: string) => void;
+  /** P1-3：把判定失效的**那一个** target 一起交出去，收口方据此只作废这一次注册
+   *  （见 `takeSessionPreviewTarget` 的 `expectedRegisteredAt`）。 */
+  onStaleTarget?: (sessionId: string, staleTarget: SessionPreviewTarget) => void;
 }): SessionPreviewResolution | { ok: false; status: 503; error: 'daemon_offline' } {
   const resolution = resolveSessionPreviewFromRow({
     row: input.row,
@@ -164,7 +166,7 @@ export function resolveSessionPreviewForProxy(input: {
     return { ok: false, status: 503, error: 'daemon_offline' };
   }
   if (!input.isTargetOwned(resolution.target)) {
-    input.onStaleTarget?.(input.sessionId);
+    input.onStaleTarget?.(input.sessionId, resolution.target);
     return { ok: false, status: 409, error: 'preview_target_stale' };
   }
   return resolution;

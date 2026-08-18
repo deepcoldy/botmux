@@ -16,7 +16,7 @@ describe('central dashboard preview wiring', () => {
   it('re-checks listener ownership on every hop and tears the session down when it changes', () => {
     expect(dashboardSource).toContain('resolveSessionPreviewForProxy({');
     expect(dashboardSource).toContain('isTargetOwned: target => sessionPreviewTargetStillOwned(target)');
-    expect(dashboardSource).toContain('onStaleTarget: staleSessionId => invalidateStalePreviewTarget(staleSessionId, owner)');
+    expect(dashboardSource).toContain('invalidateStalePreviewTarget(staleSessionId, owner, staleTarget)');
     expect(dashboardSource).toContain('authSessionConnections.closeSessionStreams(sessionId)');
     expect(dashboardSource).toContain('previewInteraction.relockSession(sessionId)');
     expect(dashboardSource).toContain('authSessionConnections.register(authSessionId, close, ctx.sessionId)');
@@ -30,6 +30,12 @@ describe('central dashboard preview wiring', () => {
     expect(dashboardSource).toContain('previewTeardownForDaemonEvent(ev, lastSeenPreviewFingerprints)');
     // 收口只走这一条判据：不能再有绕过指纹记忆的无条件 teardown 分支。
     expect(dashboardSource).not.toContain('teardownSessionPreview(ev.body.sessionId)');
+  });
+
+  // P1-3：失效清理是「作废我判定失效的那一个」，不是「清空当前值」——在途 DELETE 不
+  // 得误删这段窗口里刚注册的新目标。行为证据在 ipc-preview-route 套件里。
+  it('names the stale registration in the invalidation DELETE instead of clearing unconditionally', () => {
+    expect(dashboardSource).toContain('?expectedRegisteredAt=${encodeURIComponent(staleTarget.registeredAt)}');
   });
 
   it('projects internal targets out of both REST snapshots and SSE events', () => {

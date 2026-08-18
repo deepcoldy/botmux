@@ -64,6 +64,7 @@ import {
 import {
   sameSessionPreviewTarget,
   sessionPreviewTargetStillOwned,
+  type SessionPreviewTarget,
 } from './core/session-preview.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
@@ -554,15 +555,22 @@ function teardownSessionPreview(sessionId: string): void {
   authSessionConnections.closeSessionStreams(sessionId);
   previewInteraction.relockSession(sessionId);
 }
-function invalidateStalePreviewTarget(sessionId: string, ownerLarkAppId: string | undefined): void {
+function invalidateStalePreviewTarget(
+  sessionId: string,
+  ownerLarkAppId: string | undefined,
+  staleTarget: SessionPreviewTarget,
+): void {
   teardownSessionPreview(sessionId);
   if (!ownerLarkAppId || previewInvalidationsInFlight.has(sessionId)) return;
   // 每个会话同一时刻只发一次清理请求：刷新一次页面就是几十条子资源请求，逐条捅
   // daemon 会把一次失效放大成一场风暴。拒绝本身已经生效，这里只是让状态收敛。
   previewInvalidationsInFlight.add(sessionId);
-  void proxyToDaemon(ownerLarkAppId, `/api/sessions/${encodeURIComponent(sessionId)}/preview`, {
-    method: 'DELETE',
-  }).catch(() => { /* 清理是收敛动作；失败时本次拒绝依旧成立 */ })
+  // P1-3：指名要作废的是判定失效的**那一次注册**。这条 DELETE 跨进程飞过去的途中，
+  // 会话完全可以合法地重注册一个新目标；不带 revision 的清空会把它一起抹掉。
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/preview`
+    + `?expectedRegisteredAt=${encodeURIComponent(staleTarget.registeredAt)}`;
+  void proxyToDaemon(ownerLarkAppId, path, { method: 'DELETE' })
+    .catch(() => { /* 清理是收敛动作；失败时本次拒绝依旧成立 */ })
     .finally(() => previewInvalidationsInFlight.delete(sessionId));
 }
 
@@ -580,7 +588,8 @@ function resolveDashboardSessionPreview(sessionId: string): PreviewProxyResoluti
     ownerLarkAppId: owner,
     daemonOnline: !!owner && !!registry.getByAppId(owner),
     isTargetOwned: target => sessionPreviewTargetStillOwned(target),
-    onStaleTarget: staleSessionId => invalidateStalePreviewTarget(staleSessionId, owner),
+    onStaleTarget: (staleSessionId, staleTarget) =>
+      invalidateStalePreviewTarget(staleSessionId, owner, staleTarget),
   });
 }
 const sessionPreviewProxy = createSessionPreviewProxy({

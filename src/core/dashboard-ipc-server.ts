@@ -1430,6 +1430,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) =>
   // 上一代 CLI 的注册会被写进新一代（甚至已关闭）的会话里。
   const generationAtEntry = previewWorkerGeneration(ds);
   const workerAtEntry = ds.worker;
+  // P1-3：previewTarget 自己也得进 CAS 锚点。上面那四件只覆盖「跨代次/跨生命周期」，
+  // **同代次内的并发注册**不在它们的射程里：这条路由没有 per-session 串行化，agent
+  // 完全可以 `botmux preview 3000 & botmux preview 4000 &`，或者在 stale 清理在途时
+  // 重注册。而谁先落地由 probe 耗时决定，不是由请求先后决定——单 host 超时 750ms，
+  // 不带 host 时 127.0.0.1 与 ::1 串行试，「A 慢一秒、B 快一毫秒」是常规而非极端。
+  // 没有这一条，后 settle 的旧请求会无条件盖掉先落地的新值，两条 CLI 都打印
+  // 「✓ Web 预览已注册」，实际生效的却是哪一个不确定。
+  const previewAtEntry = ds.session.previewTarget;
   const probe = await probeSessionPreviewTarget({
     port: body.port,
     ...(isPreviewLoopbackHost(body.host) ? { host: body.host } : {}),
@@ -1463,6 +1471,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) =>
   ) {
     return jsonRes(res, 409, { ok: false, error: 'preview_generation_changed' });
   }
+  // 引用比较即「我 await 期间有没有别人写过这个字段」：注册整体替换对象，清理写
+  // undefined，两者都会改变引用。
+  if (ds.session.previewTarget !== previewAtEntry) {
+    return jsonRes(res, 409, { ok: false, error: 'preview_target_changed' });
+  }
 
   const previous = ds.session.previewTarget;
   ds.session.previewTarget = target;
@@ -1488,6 +1501,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) =>
  * 由中央 Dashboard 在**代理落地前**发现归属已变（端口换了进程持有）时调用：代理侧
  * 只有本机 procfs 的只读视角，改不了会话行，必须由持有会话的 daemon 来清字段 + 落盘
  * + 广播 `preview: null`。仅 trusted host / HMAC 可用；幂等——本来就没有目标时回 200。
+ *
+ * P1-3：`?expectedRegisteredAt=` 指名要作废的是哪一次注册。判定失效发生在代理进程，
+ * 这条 DELETE 落地在 daemon 进程，中间隔着一次跨进程往返；那段窗口里会话完全可以合法
+ * 地重注册一个新目标，无条件清空会把它一起抹掉（fail-closed 方向没错，但 agent 刚拿到
+ * 的「✓ 已注册」会莫名其妙失效）。revision 不匹配时整条 no-op，回 `cleared: false`，
+ * 幂等语义不变。不带参数时保持原来的无条件语义。
  */
 ipcRoute('DELETE', '/api/sessions/:sessionId/preview', (req, res, params) => {
   if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) {
@@ -1495,7 +1514,13 @@ ipcRoute('DELETE', '/api/sessions/:sessionId/preview', (req, res, params) => {
   }
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  const cleared = clearSessionPreviewTarget(ds.session, 'listener ownership changed');
+  const expectedRegisteredAt = new URL(req.url ?? '/', 'http://localhost')
+    .searchParams.get('expectedRegisteredAt') ?? undefined;
+  const cleared = clearSessionPreviewTarget(
+    ds.session,
+    'listener ownership changed',
+    expectedRegisteredAt,
+  );
   return jsonRes(res, 200, { ok: true, cleared });
 });
 
