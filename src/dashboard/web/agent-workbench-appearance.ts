@@ -21,9 +21,10 @@ import {
 } from './preferences.js';
 import type { WorkbenchStorage } from './agent-workbench-storage.js';
 
-export type WorkbenchSkinId = 'orca-ink' | 'slate-blue' | 'warm-graphite' | 'light-frost';
-/** 终端画布的渲染取向：`orca` 跟随工作台配色，`classic` 保持终端本色（现状渲染）。 */
-export type WorkbenchTermStyle = 'orca' | 'classic';
+export type WorkbenchSkinId = 'ink' | 'slate-blue' | 'warm-graphite' | 'light-frost';
+/** 终端画布的渲染取向：`reader` 低饱和大行距、跟随工作台配色，`classic` 保持终端本色
+ *  （现状渲染）。首版这两个值叫 `orca` / `orca-ink`，见下面的 LEGACY_* 迁移表。 */
+export type WorkbenchTermStyle = 'reader' | 'classic';
 
 export interface WorkbenchAppearance {
   skin: WorkbenchSkinId;
@@ -34,13 +35,33 @@ export interface WorkbenchAppearance {
 export const WORKBENCH_APPEARANCE_STORAGE_KEY = 'botmux.agent-workbench.appearance.v1';
 
 export const WORKBENCH_SKIN_IDS: readonly WorkbenchSkinId[] = [
-  'orca-ink',
+  'ink',
   'slate-blue',
   'warm-graphite',
   'light-frost',
 ];
 
-export const WORKBENCH_TERM_STYLES: readonly WorkbenchTermStyle[] = ['orca', 'classic'];
+export const WORKBENCH_TERM_STYLES: readonly WorkbenchTermStyle[] = ['reader', 'classic'];
+
+/**
+ * 首版命名 → 现命名。存量浏览器的 localStorage 里还写着 `termStyle: 'orca'` /
+ * `skin: 'orca-ink'`，读到时静默换成新值即可 —— 用户选的是「那一套外观」，不是那个
+ * 名字，弹提示或回落默认都等于无故把人家的选择清掉。写回去的是新值（save 前必过
+ * normalize），所以每台机器只迁一次。
+ */
+const LEGACY_SKIN_IDS: Readonly<Record<string, WorkbenchSkinId>> = { 'orca-ink': 'ink' };
+const LEGACY_TERM_STYLES: Readonly<Record<string, WorkbenchTermStyle>> = { orca: 'reader' };
+
+/** 认新值，也认旧值；都不认返回 null。类型守卫本身保持严格，只认新值。 */
+export function migrateWorkbenchSkin(value: unknown): WorkbenchSkinId | null {
+  if (isWorkbenchSkin(value)) return value;
+  return typeof value === 'string' ? LEGACY_SKIN_IDS[value] ?? null : null;
+}
+
+export function migrateWorkbenchTermStyle(value: unknown): WorkbenchTermStyle | null {
+  if (isWorkbenchTermStyle(value)) return value;
+  return typeof value === 'string' ? LEGACY_TERM_STYLES[value] ?? null : null;
+}
 
 /** 浅色族唯一的一套：`mode` 落到 light 时恒用它，不占色板的「深色代表」名额。 */
 export const WORKBENCH_LIGHT_SKIN: WorkbenchSkinId = 'light-frost';
@@ -54,7 +75,7 @@ export function isWorkbenchSkin(value: unknown): value is WorkbenchSkinId {
 }
 
 export function isWorkbenchTermStyle(value: unknown): value is WorkbenchTermStyle {
-  return value === 'orca' || value === 'classic';
+  return value === 'reader' || value === 'classic';
 }
 
 /** 皮肤所属明暗族。`light-frost` 是浅色，其余三套都是深色。 */
@@ -71,7 +92,10 @@ export function defaultWorkbenchAppearance(inheritedMode: ThemeMode = 'dark'): W
 }
 
 /** 未知 skin / mode / termStyle 一律逐字段回落默认，绝不整份丢弃、更不抛错——
- *  手改过 localStorage 或旧版本残留只该丢掉那一个字段，不该让工作台白屏。 */
+ *  手改过 localStorage 或旧版本残留只该丢掉那一个字段，不该让工作台白屏。
+ *  首版命名（`orca` / `orca-ink`）在这里被认成新值，不算「未知」。
+ *  这是**唯一**的入口：loadWorkbenchAppearance、saveWorkbenchAppearance 与跨 tab 的
+ *  storage 事件全部经过它，所以三条路径的迁移行为天然一致。 */
 export function normalizeWorkbenchAppearance(
   value: unknown,
   inheritedMode: ThemeMode = 'dark',
@@ -80,9 +104,9 @@ export function normalizeWorkbenchAppearance(
   if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
   const input = value as Partial<Record<keyof WorkbenchAppearance, unknown>>;
   return {
-    skin: isWorkbenchSkin(input.skin) ? input.skin : fallback.skin,
+    skin: migrateWorkbenchSkin(input.skin) ?? fallback.skin,
     mode: normalizeThemeMode(input.mode) ?? fallback.mode,
-    termStyle: isWorkbenchTermStyle(input.termStyle) ? input.termStyle : fallback.termStyle,
+    termStyle: migrateWorkbenchTermStyle(input.termStyle) ?? fallback.termStyle,
   };
 }
 
@@ -156,7 +180,7 @@ export function selectWorkbenchTermStyle(
 
 /** 终端容器 class：几何（行距 / 内边距）差异全部由样式侧的这两个类承担。 */
 export function workbenchTermContainerClass(termStyle: WorkbenchTermStyle): string {
-  return termStyle === 'orca' ? 'wb-term-orca' : 'wb-term-classic';
+  return termStyle === 'reader' ? 'wb-term-reader' : 'wb-term-classic';
 }
 
 // ── 色板缩影 ────────────────────────────────────────────────────────────────
@@ -169,7 +193,7 @@ export interface WorkbenchSkinPreview {
 }
 
 export const WORKBENCH_SKIN_PREVIEWS: Record<WorkbenchSkinId, WorkbenchSkinPreview> = {
-  'orca-ink': { bg: '#212121', raise: '#3C3C3C', accent: '#FF8B63' },
+  ink: { bg: '#212121', raise: '#3C3C3C', accent: '#FF8B63' },
   'slate-blue': { bg: '#19212C', raise: '#333F4E', accent: '#6FCBF7' },
   'warm-graphite': { bg: '#24211A', raise: '#443E34', accent: '#F2A33C' },
   'light-frost': { bg: '#F3F6F9', raise: '#C9D7E8', accent: '#0B5F8F' },
@@ -212,13 +236,13 @@ export const WORKBENCH_CLASSIC_TERM_THEME: WorkbenchTermTheme = {
 };
 
 /**
- * `orca` = 低饱和 muted 版：直接映射该套配色的 token（--term-bg / --text-1 /
- * --text-3 / --accent / --ok / --warn / --err），所以终端和工作台是同一套色。
+ * `reader`（「阅读」）= 低饱和 muted 版：直接映射该套配色的 token（--term-bg /
+ * --text-1 / --text-3 / --accent / --ok / --warn / --err），所以终端和工作台是同一套色。
  * `light-frost` 的终端画布仍是深色（彩色 ANSI 放浅底上不可读，业界通行做法），
  * 所以它这一行用的是规范里为它单列的那组亮色终端令牌。
  */
-export const WORKBENCH_ORCA_TERM_THEMES: Record<WorkbenchSkinId, WorkbenchTermTheme> = {
-  'orca-ink': {
+export const WORKBENCH_READER_TERM_THEMES: Record<WorkbenchSkinId, WorkbenchTermTheme> = {
+  ink: {
     background: '#030303',
     foreground: '#EDEDED',
     cursor: '#FF8B63',
@@ -280,21 +304,21 @@ export function workbenchTermTheme(
   termStyle: WorkbenchTermStyle,
   skin: WorkbenchSkinId,
 ): WorkbenchTermTheme {
-  return termStyle === 'orca' ? WORKBENCH_ORCA_TERM_THEMES[skin] : WORKBENCH_CLASSIC_TERM_THEME;
+  return termStyle === 'reader' ? WORKBENCH_READER_TERM_THEMES[skin] : WORKBENCH_CLASSIC_TERM_THEME;
 }
 
 /**
  * xterm 的 `lineHeight`。这是**唯一**的出处：终端页那段监听器（src/worker.ts 的模板
  * 字符串，没法 import）必须照抄同样的数字，接缝测试按这张表比对它的字面量；
- * `.wb-term-classic / .wb-term-orca` 的 `--term-line-height` 同样按这张表对齐。
+ * `.wb-term-classic / .wb-term-reader` 的 `--term-line-height` 同样按这张表对齐。
  *
- * Orca 从 1.55 降到 1.3：1.55 下单元格高 ≈24.5px，CLI 的底部 chrome（提示 + 输入框 +
+ * 阅读风从 1.55 降到 1.3：1.55 下单元格高 ≈24.5px，CLI 的底部 chrome（提示 + 输入框 +
  * 状态条，固定占 8 个终端行）就要吃掉约 196px —— 900 高的窗口里四分之一屏全是 chrome。
  * 1.3 仍比经典的 1.0 松三成，正文呼吸感在，chrome 收回约 16%、可视行数多出两成。
  * `classic` 恒为 1 = xterm 默认，「经典 = 原样」的一部分。
  */
 export const WORKBENCH_TERM_LINE_HEIGHTS: Record<WorkbenchTermStyle, number> = {
-  orca: 1.3,
+  reader: 1.3,
   classic: 1,
 };
 
@@ -309,7 +333,7 @@ export const WORKBENCH_TERM_CANVAS_BG_VAR = '--term-canvas-bg';
  * 终端面板外壳的底色 —— 跟着**实际生效的终端渲染风格**走，而不是跟着皮肤令牌走。
  *
  * 外壳（`.wb-pane-frame-shell`）给字形留了 8px 安全边距，这圈底色原本刷的是皮肤的
- * `--term-bg`。Orca 时两者本来就同色（`WORKBENCH_ORCA_TERM_THEMES[skin].background`
+ * `--term-bg`。阅读风时两者本来就同色（`WORKBENCH_READER_TERM_THEMES[skin].background`
  * 逐套等于该皮肤的 `--term-bg`），可经典渲染的 xterm 底色是它自己的 Tokyo Night
  * `#1a1b26`，和 `--term-bg`（如 slate-blue 的 `#030407`）差一大截，画布外就露出一圈
  * 更黑的边框 —— 用户看到的「经典终端黑色边框」就是它。
@@ -420,7 +444,7 @@ export function restoreWorkbenchRootAttributes(
 // ── 单一状态源 ──────────────────────────────────────────────────────────────
 /**
  * 外观只有一个状态源：桌面 `⋯ → 外观`、移动列表页 `◐`、终端标题栏的
- * 「Orca｜经典」分段控件全部读写这一个 store，任一处改动另外两处立刻跟着变。
+ * 「阅读｜经典」分段控件全部读写这一个 store，任一处改动另外两处立刻跟着变。
  * 跨 tab 同步靠 `storage` 事件；跟随系统靠 `matchMedia` 的 change。
  */
 export interface WorkbenchAppearanceSnapshot {

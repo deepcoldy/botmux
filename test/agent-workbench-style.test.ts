@@ -23,7 +23,7 @@ function rowHeights(css: string): number[] {
  *            + 三档文字 + 四个语义色 + 保留线 + on-accent + 终端画布 + 计数徽章。 */
 const SKIN_TOKENS: Record<string, Record<string, string>> = {
   // 完全中性的灰阶外壳，彩色预算只服务状态与身份。
-  'orca-ink': {
+  'ink': {
     '--bg-l0': '#181818', '--bg-l1': '#212121', '--bg-l2': '#2b2b2b', '--bg-l3': '#3c3c3c',
     '--text-1': '#ededed', '--text-2': '#b8b8b8', '--text-3': '#a6a6a6',
     '--accent': '#ff8b63', '--ok': '#3ed598', '--warn': '#efc260', '--err': '#ff8c8f',
@@ -323,8 +323,8 @@ describe('Agent Workbench visual contract', () => {
       expect(value, `.wb-term-${style} 的 --term-line-height`).toBeDefined();
       expect(Number(value), `.wb-term-${style} 的 --term-line-height`).toBe(expected);
     }
-    // Orca 明显比经典松（正文呼吸感），但不至于把底部 chrome 撑到占屏。
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.orca).toBeGreaterThan(WORKBENCH_TERM_LINE_HEIGHTS.classic * 1.2);
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.orca).toBeLessThanOrEqual(1.35);
+    // 阅读风明显比经典松（正文呼吸感），但不至于把底部 chrome 撑到占屏。
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBeGreaterThan(WORKBENCH_TERM_LINE_HEIGHTS.classic * 1.2);
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBeLessThanOrEqual(1.35);
   });
 });

@@ -5,7 +5,7 @@ import type { WorkbenchApi } from '../../src/dashboard/web/agent-workbench-api.j
 import type { WorkbenchSessionRow } from '../../src/dashboard/web/agent-workbench-model.js';
 
 const NOW = Date.UTC(2026, 7, 11, 20, 42, 0);
-const SESSION_ID = 'orca-release-review';
+const SESSION_ID = 'demo-release-review';
 const serverPort = Number(window.location.port);
 
 const sessions: WorkbenchSessionRow[] = Array.from({ length: 320 }, (_, index) => {
@@ -16,7 +16,7 @@ const sessions: WorkbenchSessionRow[] = Array.from({ length: 320 }, (_, index) =
     title: index === 0
       ? 'Ship Agent Workbench — contract and accessibility review'
       : (index % 4 === 0 ? 'Review preview interaction lease and safe relock' : 'Agent task ' + String(index + 1) + ' — implementation stream'),
-    botName: index % 3 === 0 ? 'Orca Builder' : (index % 3 === 1 ? 'Contract Reviewer' : 'Release Scout'),
+    botName: index % 3 === 0 ? 'Release Builder' : (index % 3 === 1 ? 'Contract Reviewer' : 'Release Scout'),
     cliId: index % 4 === 0 ? 'codex' : (index % 4 === 1 ? 'claude' : (index % 4 === 2 ? 'gemini' : 'cursor')),
     repoName: index % 2 === 0 ? 'botmux' : 'platform-shell',
     workingDir: index % 2 === 0 ? '/workspace/botmux' : '/workspace/platform-shell',

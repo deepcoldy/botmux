@@ -27650,7 +27650,7 @@ button.skills-issue-badge:hover {
 .feedback-more { margin-top: 12px; }
 @media (max-width: 1100px) { .feedback-kpis { grid-template-columns: repeat(3, 1fr); } .feedback-deliveries > div { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .feedback-kpis, .feedback-grid { grid-template-columns: 1fr; } }
-/* Agent Workbench — Orca-flavoured terminal surface: no gradients, no decorative
+/* Agent Workbench — reader-flavoured terminal surface: no gradients, no decorative
    rules, and independent from the Dashboard card/aurora vocabulary.
    段内三条硬约束，改之前先读：
    ① 实线只给白名单五类（内容区↔固定工具条的功能性边界、chip 的 1px 亮环、脱离
@@ -27732,7 +27732,7 @@ button.skills-issue-badge:hover {
   /* 触控目标下限：桌面 28px，(hover: none) 下整体提到 44px。尺寸只写一次，
      媒体查询只改这个令牌的值，避免同一个高度被四处规则反复重定义。 */
   --touch-target: 28px;
-  /* 终端渲染风格的三个可继承变量，由 .wb-term-classic / .wb-term-orca 覆盖；
+  /* 终端渲染风格的三个可继承变量，由 .wb-term-classic / .wb-term-reader 覆盖；
      挂在任意祖先上都生效（继承），iframe 内的取值由 TS 侧读这里再 postMessage 下发。
      默认取 classic（现状渲染）。 */
   --term-pad: 4px 8px 8px 8px;
@@ -27774,8 +27774,8 @@ button.skills-issue-badge:hover {
    皮肤只重定义上面那组工作台令牌，不动全站任何变量，也不写 data-theme —— 明暗仲裁
    仍归 ui.ts 的 applyTheme 管，工作台再插一手必打架。
    放在浅色块之后：两者特异性相同，显式选中的皮肤要赢过「浅色族」的兜底。 */
-:root[data-skin="orca-ink"] .agent-workbench-page,
-:root[data-skin="orca-ink"] .agent-workbench-dock {
+:root[data-skin="ink"] .agent-workbench-page,
+:root[data-skin="ink"] .agent-workbench-dock {
   /* 完全中性的灰阶外壳，彩色预算只服务状态与身份。L1↔L3 只有 1.46：L3 被 --text-3
      的 AA 4.53 顶死，抬不动，四套里只有这套付这个代价。 */
   --bg-l0: #181818;
@@ -28440,7 +28440,7 @@ button.skills-issue-badge:hover {
 /* 终端渲染风格：两套容器 class 只负责几何（行距 / 内边距 / 字号），配色由 TS 侧的
    两套 xterm theme 预设承担。class 挂在工作台根或终端面板上都行 —— 下面三个变量是
    可继承的，落到 .wb-pane-frame-shell 和 iframe 下发通道上都读得到。
-   classic = 现状渲染（存量零变化），orca = 规范里更松的行距与更大的呼吸。
+   classic = 现状渲染（存量零变化），reader（「阅读」）= 规范里更松的行距与更大的呼吸。
    两套都保留 8px 左安全边距，这条不因风格而失效。
    ⚠️ --term-line-height 是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts）
    的 CSS 侧副本：真正落到 xterm 上的是终端页那行 term.options.lineHeight，这里只做
@@ -28450,7 +28450,7 @@ button.skills-issue-badge:hover {
   --term-line-height: 1;
   --term-font-size: 12px;
 }
-.wb-term-orca {
+.wb-term-reader {
   --term-pad: 6px 8px 8px 8px;
   --term-line-height: 1.3;
   --term-font-size: 12px;
@@ -29229,7 +29229,7 @@ body:has(.workbench-route-host) { min-width: 0; }
 .wb-action-group .is-danger { color: var(--accent); font-weight: 600; }
 .wb-action-group .is-danger:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 
-/* 分段控件（Orca / 经典、跟随系统 / 浅色 / 深色）：容器 24px 高，按自身高度取档 → sm。
+/* 分段控件（阅读 / 经典、跟随系统 / 浅色 / 深色）：容器 24px 高，按自身高度取档 → sm。
    选中段 = 字色 + 600 字重 + 2px accent 内底线，不引入第五档灰做 thumb。
    只有 2 项、或容器高 < 40px 的组一律不画组内分线（白名单第 6 类第 ③④ 条）。 */
 .wb-seg,

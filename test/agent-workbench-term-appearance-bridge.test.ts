@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   WORKBENCH_CLASSIC_TERM_THEME,
-  WORKBENCH_ORCA_TERM_THEMES,
+  WORKBENCH_READER_TERM_THEMES,
   WORKBENCH_SKIN_IDS,
   WORKBENCH_TERM_LINE_HEIGHTS,
   WORKBENCH_TERM_STYLES,
@@ -13,7 +13,7 @@ import {
 /** 终端画布住在跨文档的 `/s/<sessionId>` iframe 里（src/worker.ts 的内联页面），
  *  父页换 class / 换 CSS 变量都传不进去，配色只能靠 postMessage 递过来。
  *  这一整条链路横跨两个文档、两份源码，任何一侧单方面改都会静默半截：
- *  父页发了、子页不认 → 切了 Orca 终端不变色；子页认的键多了一个 → 整条丢弃。
+ *  父页发了、子页不认 → 切了阅读风终端不变色；子页认的键多了一个 → 整条丢弃。
  *  所以这里把子页那段监听器原样抠出来跑，喂父页真实构造的载荷，两侧一起验。 */
 function extractTerminalPageListener(): string {
   const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
@@ -115,8 +115,8 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
         // 这里刻意用父页真正发出去的那个构造函数，而不是手搓一个等价对象：
         // 接缝要验的就是「父页实际发的东西子页认不认」。
         page.fire(workbenchTermAppearanceMessage(termStyle, skin));
-        const expected = termStyle === 'orca'
-          ? WORKBENCH_ORCA_TERM_THEMES[skin]
+        const expected = termStyle === 'reader'
+          ? WORKBENCH_READER_TERM_THEMES[skin]
           : WORKBENCH_CLASSIC_TERM_THEME;
         expect(page.term.options.theme, `${skin}/${termStyle}`).toEqual({ ...expected });
         // 行距变了可视行数就变，必须复算一次。
@@ -125,19 +125,19 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
     }
   });
 
-  it('Orca 走大行距 1.3，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
+  it('阅读风走大行距 1.3，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
     // 1.3 而不是最初的 1.55：1.55 下单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome
     // （提示 + 输入框 + 状态条）要吃掉约 196px，一屏四分之一全是 chrome。1.3 仍比经典
     // 的 1.0 松三成，正文呼吸感还在，chrome 收回约 16%。
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.orca).toBe(1.3);
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBe(1.3);
     expect(WORKBENCH_TERM_LINE_HEIGHTS.classic).toBe(1);
 
-    const orca = bootTerminalPage();
-    orca.fire(workbenchTermAppearanceMessage('orca', 'orca-ink'));
-    expect(orca.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.orca);
+    const reader = bootTerminalPage();
+    reader.fire(workbenchTermAppearanceMessage('reader', 'ink'));
+    expect(reader.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.reader);
 
     const classic = bootTerminalPage();
-    classic.fire(workbenchTermAppearanceMessage('classic', 'orca-ink'));
+    classic.fire(workbenchTermAppearanceMessage('classic', 'ink'));
     expect(classic.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.classic);
   });
 
@@ -146,13 +146,13 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
     // 上一条已经用真实监听器验过行为；这一条再把源码里那行三元钉死，任何一侧单方面
     // 改数字（比如只改了 CSS 的 --term-line-height）都会在这里断掉。
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const found = /term\.options\.lineHeight=_d\.termStyle==='orca'\?([\d.]+):([\d.]+);/.exec(source);
+    const found = /term\.options\.lineHeight=_d\.termStyle==='reader'\?([\d.]+):([\d.]+);/.exec(source);
     expect(found, 'worker.ts 里找不到行距那行三元').not.toBeNull();
-    expect(Number(found?.[1])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.orca);
+    expect(Number(found?.[1])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.reader);
     expect(Number(found?.[2])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.classic);
   });
 
-  it('经典风的色值与终端页里写死的那份逐色相同 —— 没开 Orca 的用户零变化', () => {
+  it('经典风的色值与终端页里写死的那份逐色相同 —— 没开阅读风的用户零变化', () => {
     // 「经典 = 原本 Botmux 预览的真实终端渲染原样」。终端页 new Terminal() 里那份
     // 字面量是既有渲染的唯一事实来源；父页的 classic 预设只要漂一个色，
     // 存量用户一进工作台就会看到终端换色 —— 而这恰恰是 classic 承诺不会发生的事。
@@ -170,7 +170,7 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
   });
 
   it('只认父窗口发来的合法载荷：冒充来源、错类型、脏色值一律丢弃', () => {
-    const good = workbenchTermAppearanceMessage('orca', 'warm-graphite');
+    const good = workbenchTermAppearanceMessage('reader', 'warm-graphite');
 
     // ① 别的窗口冒充（同源的兄弟 iframe、被嵌进来的第三方页面都可能发消息）
     const spoofed = bootTerminalPage();

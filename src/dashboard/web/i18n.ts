@@ -2344,7 +2344,7 @@ const zh = {
   'workbench.appearance.close': '关闭',
   'workbench.appearance.themeGroup': '主题',
   'workbench.appearance.modeLabel': '明暗模式',
-  'workbench.appearance.skin.orcaInk': '墨黑',
+  'workbench.appearance.skin.ink': '墨黑',
   'workbench.appearance.skin.slateBlue': '蓝灰',
   'workbench.appearance.skin.warmGraphite': '石墨',
   'workbench.appearance.skin.lightFrost': '冷白',
@@ -2353,9 +2353,9 @@ const zh = {
   'workbench.appearance.mode.dark': '深色',
   'workbench.appearance.termGroup': '终端渲染',
   'workbench.appearance.termStyleLabel': '终端渲染风格',
-  'workbench.appearance.term.orca': 'Orca',
+  'workbench.appearance.term.reader': '阅读',
   'workbench.appearance.term.classic': '经典',
-  'workbench.appearance.termNote': 'Orca：终端跟随工作台配色 · 经典：终端保持本色',
+  'workbench.appearance.termNote': '阅读：低饱和大行距，久看不累 · 经典：原汁原味终端渲染',
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
@@ -4697,7 +4697,7 @@ const en: Record<keyof typeof zh, string> = {
   'workbench.appearance.close': 'Close',
   'workbench.appearance.themeGroup': 'Theme',
   'workbench.appearance.modeLabel': 'Light or dark',
-  'workbench.appearance.skin.orcaInk': 'Ink',
+  'workbench.appearance.skin.ink': 'Ink',
   'workbench.appearance.skin.slateBlue': 'Slate',
   'workbench.appearance.skin.warmGraphite': 'Graphite',
   'workbench.appearance.skin.lightFrost': 'Frost',
@@ -4706,9 +4706,9 @@ const en: Record<keyof typeof zh, string> = {
   'workbench.appearance.mode.dark': 'Dark',
   'workbench.appearance.termGroup': 'Terminal',
   'workbench.appearance.termStyleLabel': 'Terminal rendering style',
-  'workbench.appearance.term.orca': 'Orca',
+  'workbench.appearance.term.reader': 'Reader',
   'workbench.appearance.term.classic': 'Classic',
-  'workbench.appearance.termNote': 'Orca: the terminal follows the workbench palette · Classic: the terminal keeps its own colours',
+  'workbench.appearance.termNote': 'Reader: muted colours and roomy line spacing for long sessions · Classic: the terminal rendered exactly as it comes',
 };
 
 const dictionaries: Record<DashboardLocale, DashboardMessages> = { zh, en };

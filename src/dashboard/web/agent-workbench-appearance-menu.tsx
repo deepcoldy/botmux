@@ -27,7 +27,7 @@ import {
 } from './agent-workbench-appearance.js';
 
 const SKIN_LABEL_KEY: Record<WorkbenchSkinId, string> = {
-  'orca-ink': 'workbench.appearance.skin.orcaInk',
+  ink: 'workbench.appearance.skin.ink',
   'slate-blue': 'workbench.appearance.skin.slateBlue',
   'warm-graphite': 'workbench.appearance.skin.warmGraphite',
   'light-frost': 'workbench.appearance.skin.lightFrost',
@@ -40,7 +40,7 @@ const MODE_OPTIONS: ReadonlyArray<{ value: ThemeMode; labelKey: string }> = [
 ];
 
 const TERM_OPTIONS: ReadonlyArray<{ value: WorkbenchTermStyle; labelKey: string }> = [
-  { value: 'orca', labelKey: 'workbench.appearance.term.orca' },
+  { value: 'reader', labelKey: 'workbench.appearance.term.reader' },
   { value: 'classic', labelKey: 'workbench.appearance.term.classic' },
 ];
 
@@ -98,7 +98,7 @@ function radioGroupKeyDown(event: ReactKeyboardEvent<HTMLElement>): void {
   else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') moveRadioFocus(event, -1);
 }
 
-/** 「Orca｜经典」分段控件。终端标题栏右侧和外观面板里用的是同一个组件、同一状态源。 */
+/** 「阅读｜经典」分段控件。终端标题栏右侧和外观面板里用的是同一个组件、同一状态源。 */
 export function WorkbenchTermStyleSegment(props: { termStyle: WorkbenchTermStyle }): JSX.Element {
   return (
     <span

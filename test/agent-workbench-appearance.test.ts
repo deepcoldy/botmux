@@ -4,11 +4,15 @@ import {
   DEFAULT_WORKBENCH_SKIN,
   DEFAULT_WORKBENCH_TERM_STYLE,
   WORKBENCH_CLASSIC_TERM_THEME,
-  WORKBENCH_ORCA_TERM_THEMES,
+  WORKBENCH_READER_TERM_THEMES,
   WORKBENCH_SKIN_IDS,
   WorkbenchAppearanceStore,
   defaultWorkbenchAppearance,
+  isWorkbenchSkin,
+  isWorkbenchTermStyle,
   loadWorkbenchAppearance,
+  migrateWorkbenchSkin,
+  migrateWorkbenchTermStyle,
   normalizeWorkbenchAppearance,
   postWorkbenchTermAppearance,
   resolveWorkbenchSkin,
@@ -58,7 +62,7 @@ describe('工作台外观：默认值与持久化', () => {
 
   it('三个字段共用一条记录，写回的 JSON 不多不少', () => {
     const storage = new MemoryStorage();
-    const appearance: WorkbenchAppearance = { skin: 'warm-graphite', mode: 'light', termStyle: 'orca' };
+    const appearance: WorkbenchAppearance = { skin: 'warm-graphite', mode: 'light', termStyle: 'reader' };
     expect(saveWorkbenchAppearance(storage, appearance)).toBe(true);
     const raw = storage.values.get(APPEARANCE_KEY)!;
     expect(Object.keys(JSON.parse(raw)).sort()).toEqual(['mode', 'skin', 'termStyle']);
@@ -69,9 +73,9 @@ describe('工作台外观：默认值与持久化', () => {
     expect(normalizeWorkbenchAppearance({ skin: 'neon', mode: 'sunset', termStyle: 'ascii' }, 'light'))
       .toEqual({ skin: 'slate-blue', mode: 'light', termStyle: 'classic' });
     // 只有一个字段坏掉时，另外两个照旧留着。
-    expect(normalizeWorkbenchAppearance({ skin: 'orca-ink', mode: 'dark', termStyle: 42 }, 'system'))
-      .toEqual({ skin: 'orca-ink', mode: 'dark', termStyle: 'classic' });
-    for (const junk of [null, undefined, 'orca-ink', 7, ['orca-ink']]) {
+    expect(normalizeWorkbenchAppearance({ skin: 'ink', mode: 'dark', termStyle: 42 }, 'system'))
+      .toEqual({ skin: 'ink', mode: 'dark', termStyle: 'classic' });
+    for (const junk of [null, undefined, 'ink', 7, ['ink']]) {
       expect(normalizeWorkbenchAppearance(junk, 'dark')).toEqual(defaultWorkbenchAppearance('dark'));
     }
   });
@@ -90,13 +94,48 @@ describe('工作台外观：默认值与持久化', () => {
     expect(saveWorkbenchAppearance(hostile, defaultWorkbenchAppearance())).toBe(false);
     expect(saveWorkbenchAppearance(null, defaultWorkbenchAppearance())).toBe(false);
   });
+
+  it('存量偏好里的首版命名（orca / orca-ink）静默迁移到新值，不回落默认', () => {
+    // 改名前发出去的版本已经把 `termStyle:'orca'` / `skin:'orca-ink'` 写进了用户的
+    // localStorage。这两个值现在不是合法值了，但用户选的是「那一套外观」而不是那个
+    // 名字 —— 当成脏值回落默认，等于无故把人家的选择清空一次。
+    expect(normalizeWorkbenchAppearance({ skin: 'orca-ink', mode: 'dark', termStyle: 'orca' }, 'system'))
+      .toEqual({ skin: 'ink', mode: 'dark', termStyle: 'reader' });
+    // 单字段旧值也认：两张迁移表各管各的。
+    expect(normalizeWorkbenchAppearance({ skin: 'orca-ink', mode: 'light', termStyle: 'classic' }, 'dark'))
+      .toEqual({ skin: 'ink', mode: 'light', termStyle: 'classic' });
+    expect(normalizeWorkbenchAppearance({ skin: 'slate-blue', mode: 'dark', termStyle: 'orca' }, 'dark'))
+      .toEqual({ skin: 'slate-blue', mode: 'dark', termStyle: 'reader' });
+    // 迁移只认这两个历史值，别的仍旧是脏值。
+    expect(normalizeWorkbenchAppearance({ skin: 'orca', mode: 'dark', termStyle: 'orca-ink' }, 'dark'))
+      .toEqual(defaultWorkbenchAppearance('dark'));
+    // 类型守卫保持严格：旧值不是合法值，只是「可迁移」。
+    expect(isWorkbenchSkin('orca-ink')).toBe(false);
+    expect(isWorkbenchTermStyle('orca')).toBe(false);
+    expect(migrateWorkbenchSkin('orca-ink')).toBe('ink');
+    expect(migrateWorkbenchTermStyle('orca')).toBe('reader');
+    expect(migrateWorkbenchSkin('nope')).toBeNull();
+    expect(migrateWorkbenchTermStyle(42)).toBeNull();
+  });
+
+  it('迁移经 load/save 落盘一次，之后本地存的就是新值', () => {
+    const storage = new MemoryStorage();
+    storage.values.set(APPEARANCE_KEY, JSON.stringify({ skin: 'orca-ink', mode: 'dark', termStyle: 'orca' }));
+    const loaded = loadWorkbenchAppearance(storage, 'dark');
+    expect(loaded).toEqual({ skin: 'ink', mode: 'dark', termStyle: 'reader' });
+    // 下一次写回（用户改任何一项都会走 save）把旧值从磁盘上抹掉，只迁一次。
+    saveWorkbenchAppearance(storage, loaded);
+    expect(JSON.parse(storage.values.get(APPEARANCE_KEY)!))
+      .toEqual({ skin: 'ink', mode: 'dark', termStyle: 'reader' });
+    expect(storage.values.get(APPEARANCE_KEY)).not.toContain('orca');
+  });
 });
 
 describe('工作台外观：明暗族与色板规则', () => {
   it('light-frost 属浅色族，其余三套属深色族', () => {
-    expect(WORKBENCH_SKIN_IDS).toEqual(['orca-ink', 'slate-blue', 'warm-graphite', 'light-frost']);
+    expect(WORKBENCH_SKIN_IDS).toEqual(['ink', 'slate-blue', 'warm-graphite', 'light-frost']);
     expect(workbenchSkinFamily('light-frost')).toBe('light');
-    for (const skin of ['orca-ink', 'slate-blue', 'warm-graphite'] as const) {
+    for (const skin of ['ink', 'slate-blue', 'warm-graphite'] as const) {
       expect(workbenchSkinFamily(skin)).toBe('dark');
     }
   });
@@ -110,15 +149,15 @@ describe('工作台外观：明暗族与色板规则', () => {
     expect(resolveWorkbenchSkin({ ...warm, mode: 'system' }, true)).toBe('warm-graphite');
     expect(resolveWorkbenchSkin({ ...warm, mode: 'system' }, false)).toBe('light-frost');
     // 存量脏值把浅色那套留在 skin 上时，深色族回落默认而不是渲染成浅色。
-    expect(resolveWorkbenchSkin({ skin: 'light-frost', mode: 'dark', termStyle: 'orca' }, false)).toBe('slate-blue');
+    expect(resolveWorkbenchSkin({ skin: 'light-frost', mode: 'dark', termStyle: 'reader' }, false)).toBe('slate-blue');
   });
 
   it('跟随系统下点浅色 = 我要一直浅色；深色代表原样留着', () => {
-    const base: WorkbenchAppearance = { skin: 'orca-ink', mode: 'system', termStyle: 'classic' };
+    const base: WorkbenchAppearance = { skin: 'ink', mode: 'system', termStyle: 'classic' };
     const light = selectWorkbenchSkin(base, 'light-frost');
-    expect(light).toEqual({ skin: 'orca-ink', mode: 'light', termStyle: 'classic' });
+    expect(light).toEqual({ skin: 'ink', mode: 'light', termStyle: 'classic' });
     // 再切回深色，用户上次选的那套还在。
-    expect(resolveWorkbenchSkin(selectWorkbenchMode(light, 'dark'), false)).toBe('orca-ink');
+    expect(resolveWorkbenchSkin(selectWorkbenchMode(light, 'dark'), false)).toBe('ink');
   });
 
   it('跟随系统下点深色只换代表色；浅色下点深色顺带切到深色', () => {
@@ -126,16 +165,16 @@ describe('工作台外观：明暗族与色板规则', () => {
     expect(selectWorkbenchSkin(system, 'warm-graphite')).toEqual({
       skin: 'warm-graphite', mode: 'system', termStyle: 'classic',
     });
-    const light: WorkbenchAppearance = { skin: 'slate-blue', mode: 'light', termStyle: 'orca' };
-    expect(selectWorkbenchSkin(light, 'orca-ink')).toEqual({
-      skin: 'orca-ink', mode: 'dark', termStyle: 'orca',
+    const light: WorkbenchAppearance = { skin: 'slate-blue', mode: 'light', termStyle: 'reader' };
+    expect(selectWorkbenchSkin(light, 'ink')).toEqual({
+      skin: 'ink', mode: 'dark', termStyle: 'reader',
     });
   });
 
   it('选中已生效的项时返回同一份引用，不触发多余的写和重绘', () => {
-    const current: WorkbenchAppearance = { skin: 'slate-blue', mode: 'light', termStyle: 'orca' };
+    const current: WorkbenchAppearance = { skin: 'slate-blue', mode: 'light', termStyle: 'reader' };
     expect(selectWorkbenchMode(current, 'light')).toBe(current);
-    expect(selectWorkbenchTermStyle(current, 'orca')).toBe(current);
+    expect(selectWorkbenchTermStyle(current, 'reader')).toBe(current);
     expect(selectWorkbenchSkin(current, 'light-frost')).toBe(current);
     expect(selectWorkbenchTermStyle(current, 'classic')).toEqual({ ...current, termStyle: 'classic' });
   });
@@ -143,10 +182,10 @@ describe('工作台外观：明暗族与色板规则', () => {
 
 describe('工作台外观：终端双风格', () => {
   it('两套容器 class 与两套 xterm theme 一一对应', () => {
-    expect(workbenchTermContainerClass('orca')).toBe('wb-term-orca');
+    expect(workbenchTermContainerClass('reader')).toBe('wb-term-reader');
     expect(workbenchTermContainerClass('classic')).toBe('wb-term-classic');
     expect(workbenchTermTheme('classic', 'warm-graphite')).toBe(WORKBENCH_CLASSIC_TERM_THEME);
-    expect(workbenchTermTheme('orca', 'warm-graphite')).toBe(WORKBENCH_ORCA_TERM_THEMES['warm-graphite']);
+    expect(workbenchTermTheme('reader', 'warm-graphite')).toBe(WORKBENCH_READER_TERM_THEMES['warm-graphite']);
   });
 
   it('classic = 终端页现有配色原样（存量零变化）', () => {
@@ -159,16 +198,16 @@ describe('工作台外观：终端双风格', () => {
     }
   });
 
-  it('orca 每套配色都给全 theme，且背景就是该套的终端画布色', () => {
+  it('阅读风每套配色都给全 theme，且背景就是该套的终端画布色', () => {
     const termBg: Record<string, string> = {
-      'orca-ink': '#030303',
+      'ink': '#030303',
       'slate-blue': '#030407',
       'warm-graphite': '#040402',
       // 浅色那套的终端画布仍是深色：彩色 ANSI 放浅底上不可读。
       'light-frost': '#16202B',
     };
     for (const skin of WORKBENCH_SKIN_IDS) {
-      const theme = WORKBENCH_ORCA_TERM_THEMES[skin];
+      const theme = WORKBENCH_READER_TERM_THEMES[skin];
       expect(theme.background).toBe(termBg[skin]);
       expect(Object.keys(theme).sort()).toEqual(Object.keys(WORKBENCH_CLASSIC_TERM_THEME).sort());
       for (const value of Object.values(theme)) expect(value).toMatch(/^#[0-9a-fA-F]{6}$/);
@@ -178,21 +217,21 @@ describe('工作台外观：终端双风格', () => {
   it('下发给终端 iframe 时按 iframe 自己的 origin 定向，推不出来就放弃', () => {
     const sent: Array<{ data: unknown; origin: string }> = [];
     const frame = { contentWindow: { postMessage: (data: unknown, origin: string) => { sent.push({ data, origin }); } } };
-    expect(postWorkbenchTermAppearance(frame, '/s/abc', 'orca', 'orca-ink', 'https://board.example/x')).toBe(true);
+    expect(postWorkbenchTermAppearance(frame, '/s/abc', 'reader', 'ink', 'https://board.example/x')).toBe(true);
     expect(sent[0].origin).toBe('https://board.example');
     expect(sent[0].data).toMatchObject({
       type: 'botmux:wb-appearance',
-      termStyle: 'orca',
-      skin: 'orca-ink',
-      theme: WORKBENCH_ORCA_TERM_THEMES['orca-ink'],
+      termStyle: 'reader',
+      skin: 'ink',
+      theme: WORKBENCH_READER_TERM_THEMES['ink'],
     });
     // 触屏的 viewToken 链接可能落在别的 host/port 上，origin 跟着链接走。
     expect(postWorkbenchTermAppearance(frame, 'http://box.local:8931/s/abc', 'classic', 'slate-blue')).toBe(true);
     expect(sent[1].origin).toBe('http://box.local:8931');
     // 解不出 origin（相对地址 + 没有基准页）时不发，绝不退化成 `*` 广播。
-    expect(postWorkbenchTermAppearance(frame, '/s/abc', 'orca', 'orca-ink')).toBe(false);
-    expect(postWorkbenchTermAppearance(frame, null, 'orca', 'orca-ink', 'https://board.example')).toBe(false);
-    expect(postWorkbenchTermAppearance({ contentWindow: null }, '/s/abc', 'orca', 'orca-ink', 'https://board.example')).toBe(false);
+    expect(postWorkbenchTermAppearance(frame, '/s/abc', 'reader', 'ink')).toBe(false);
+    expect(postWorkbenchTermAppearance(frame, null, 'reader', 'ink', 'https://board.example')).toBe(false);
+    expect(postWorkbenchTermAppearance({ contentWindow: null }, '/s/abc', 'reader', 'ink', 'https://board.example')).toBe(false);
     expect(sent).toHaveLength(2);
   });
 });
@@ -308,20 +347,38 @@ describe('工作台外观 store：落到文档根 / 跨 tab / 跟随系统', () 
     const h = harness({ storage, inheritedMode: 'dark' });
     const unmount = h.store.mount();
 
-    h.pushStorage(APPEARANCE_KEY, JSON.stringify({ skin: 'orca-ink', mode: 'dark', termStyle: 'orca' }));
-    expect(h.store.getSnapshot().appearance).toEqual({ skin: 'orca-ink', mode: 'dark', termStyle: 'orca' });
-    expect(h.root.dataset.skin).toBe('orca-ink');
+    h.pushStorage(APPEARANCE_KEY, JSON.stringify({ skin: 'ink', mode: 'dark', termStyle: 'reader' }));
+    expect(h.store.getSnapshot().appearance).toEqual({ skin: 'ink', mode: 'dark', termStyle: 'reader' });
+    expect(h.root.dataset.skin).toBe('ink');
 
     h.pushStorage('botmux.agent-workbench.rail.v1', '{"railWidth":420}');
-    expect(h.store.getSnapshot().appearance.skin).toBe('orca-ink');
+    expect(h.store.getSnapshot().appearance.skin).toBe('ink');
 
     h.pushStorage(APPEARANCE_KEY, '{not json');
     expect(h.store.getSnapshot().appearance).toEqual(defaultWorkbenchAppearance('dark'));
 
     // key=null 是「整份 localStorage 被清空」，回去重读一遍即可（读回默认）。
-    storage.values.set(APPEARANCE_KEY, JSON.stringify({ skin: 'warm-graphite', mode: 'dark', termStyle: 'orca' }));
+    storage.values.set(APPEARANCE_KEY, JSON.stringify({ skin: 'warm-graphite', mode: 'dark', termStyle: 'reader' }));
     h.pushStorage(null, null);
     expect(h.store.getSnapshot().appearance.skin).toBe('warm-graphite');
+    unmount();
+  });
+
+  it('跨 tab 同步路径同样迁移首版命名：旧 tab 写的旧值不会把这一页打回默认', () => {
+    // 改名期间两个 tab 可能一新一旧：旧 tab 保存时写的还是 orca / orca-ink。
+    // storage 事件这条路和 load 走同一条 normalize，所以迁移行为必须一致。
+    const storage = new MemoryStorage();
+    const h = harness({ storage, inheritedMode: 'dark' });
+    const unmount = h.store.mount();
+
+    h.pushStorage(APPEARANCE_KEY, JSON.stringify({ skin: 'orca-ink', mode: 'dark', termStyle: 'orca' }));
+    expect(h.store.getSnapshot().appearance).toEqual({ skin: 'ink', mode: 'dark', termStyle: 'reader' });
+    expect(h.root.dataset.skin).toBe('ink');
+
+    // key=null（整份被清空）会回去重读 storage，那条路也要认旧值。
+    storage.values.set(APPEARANCE_KEY, JSON.stringify({ skin: 'orca-ink', mode: 'dark', termStyle: 'orca' }));
+    h.pushStorage(null, null);
+    expect(h.store.getSnapshot().appearance).toEqual({ skin: 'ink', mode: 'dark', termStyle: 'reader' });
     unmount();
   });
 
@@ -347,8 +404,8 @@ describe('工作台外观 store：落到文档根 / 跨 tab / 跟随系统', () 
     unmount();
   });
 
-  it('终端外壳底色跟随实际渲染风格：Orca=皮肤 --term-bg，经典=经典预设的真实底色', () => {
-    // 外壳（.wb-pane-frame-shell）那圈安全边距原本刷皮肤令牌 --term-bg。Orca 下两者
+  it('终端外壳底色跟随实际渲染风格：阅读风=皮肤 --term-bg，经典=经典预设的真实底色', () => {
+    // 外壳（.wb-pane-frame-shell）那圈安全边距原本刷皮肤令牌 --term-bg。阅读风下两者
     // 本来同色，可经典渲染的 xterm 底是它自己的 #1a1b26，于是画布外露出一圈更黑的
     // 边框 —— 线上反馈的「经典终端黑色边框」。这个函数把外壳底色接到**同一份**
     // theme 上（也就是同一次 postMessage 下发给 iframe 的那份），不存在第二份字面量。
@@ -357,23 +414,23 @@ describe('工作台外观 store：落到文档根 / 跨 tab / 跟随系统', () 
       // 经典：恒等于终端页那份 Tokyo Night 底色，与皮肤无关。
       expect(workbenchTermCanvasStyle('classic', skin)['--term-canvas-bg'], skin)
         .toBe(WORKBENCH_CLASSIC_TERM_THEME.background);
-      // Orca：等于该皮肤的 xterm 底色，而它按设计规范就等于这套皮肤的 --term-bg 令牌。
-      const orcaBg = workbenchTermCanvasStyle('orca', skin)['--term-canvas-bg'];
-      expect(orcaBg, skin).toBe(WORKBENCH_ORCA_TERM_THEMES[skin].background);
+      // 阅读风：等于该皮肤的 xterm 底色，而它按设计规范就等于这套皮肤的 --term-bg 令牌。
+      const readerBg = workbenchTermCanvasStyle('reader', skin)['--term-canvas-bg'];
+      expect(readerBg, skin).toBe(WORKBENCH_READER_TERM_THEMES[skin].background);
       const anchor = `:root[data-skin="${skin}"] .agent-workbench-dock`;
       const body = css.slice(css.indexOf(anchor), css.indexOf('}', css.indexOf(anchor)));
-      expect(body.toLowerCase(), `${skin} 的 --term-bg`).toContain(`--term-bg: ${orcaBg.toLowerCase()};`);
+      expect(body.toLowerCase(), `${skin} 的 --term-bg`).toContain(`--term-bg: ${readerBg.toLowerCase()};`);
     }
     // 两套风格必须真的不同色，否则这次修复什么也没修。
     expect(workbenchTermCanvasStyle('classic', 'slate-blue')['--term-canvas-bg'])
-      .not.toBe(workbenchTermCanvasStyle('orca', 'slate-blue')['--term-canvas-bg']);
+      .not.toBe(workbenchTermCanvasStyle('reader', 'slate-blue')['--term-canvas-bg']);
   });
 
   it('没有 localStorage / 没有文档根也照常工作，只是不落盘', () => {
     const h = harness({ storage: null, root: fakeRoot() });
     const unmount = h.store.mount();
-    h.store.set(selectWorkbenchTermStyle(h.store.getSnapshot().appearance, 'orca'));
-    expect(h.store.getSnapshot().appearance.termStyle).toBe('orca');
+    h.store.set(selectWorkbenchTermStyle(h.store.getSnapshot().appearance, 'reader'));
+    expect(h.store.getSnapshot().appearance.termStyle).toBe('reader');
     unmount();
     expect(h.root.dataset.skin).toBeUndefined();
   });

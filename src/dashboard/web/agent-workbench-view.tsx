@@ -587,7 +587,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       ref={rootRef}
       className="agent-workbench-page"
       data-surface="appCenter"
-      // 终端容器自己带 wb-term-orca / wb-term-classic；根上再挂一份，是给它的祖先
+      // 终端容器自己带 wb-term-reader / wb-term-classic；根上再挂一份，是给它的祖先
       // （面板外留白、移动端下钻容器）留的选择器钩子，省掉一层 :has()。
       data-term-style={appearanceTermStyle}
       data-responsive-step={responsive.step}

@@ -343,7 +343,7 @@ export function TerminalPane(props: PaneCommonProps & {
           </span>
           {expires ? <span className="wb-lease-time">{`${expires}到期`}</span> : null}
         </div>
-        {/* 「Orca｜经典」就近可切；与右边那组终端操作隔开、不共板——它们不是同一组操作。 */}
+        {/* 「阅读｜经典」就近可切；与右边那组终端操作隔开、不共板——它们不是同一组操作。 */}
         <WorkbenchTermStyleSegment termStyle={appearance.termStyle} />
         <div className="wb-pane-actions">
           {frameUrl ? <a href={frameUrl} target="_blank" rel="noopener noreferrer">新标签页打开</a> : null}
