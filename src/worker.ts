@@ -5248,9 +5248,9 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 
 function codexBridgeFallbackActive(): boolean {
   // Transcript-backed CLIs whose final output can be harvested when the
-  // model forgets to call `botmux send`. Cursor is adopt-only — see
+  // model forgets to call `botmux send` — see
   // services/structured-bridge-clis.ts (single source of the allowlist).
-  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
+  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId);
 }
 
 /** Only drivers with a complete normal-final + interrupted-terminal contract
@@ -5668,8 +5668,14 @@ function cursorLateAttachMode(path: string): CursorAttachMode {
       // be ingested from byte 0 rather than swallowed as history.
       if (Number.isFinite(birthtimeMs) && birthtimeMs >= start - 5_000) return 'fresh-empty';
     } catch { /* fall back to history-safe baseline */ }
+    return 'baseline-existing';
   }
-  return 'baseline-existing';
+  // Non-adopt (botmux-spawned): a FRESH spawn's chatId is a brand-new UUID,
+  // so its JSONL can only contain THIS session's lines — always ingest from
+  // byte 0, even when the file appears (with the first turn already inside)
+  // before the poller attaches. A RESUME spawn's JSONL carries the prior
+  // run's history and must be baselined behind the tail.
+  return lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty';
 }
 
 /** Attach the Cursor adopt bridge. Cursor's JSONL has no per-event
@@ -9712,6 +9718,11 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       }
       persistCliSessionId(chatId);
       log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
+      // The chatId also names the agent-transcript JSONL — hand it to the
+      // structured bridge so a `botmux send`-less turn can be harvested.
+      // Safe when already attached (first-attach-wins) and when the JSONL
+      // doesn't exist yet (arms the 1s late-attach poller).
+      codexBridgeNotifyCliSessionId(chatId);
       return;
     }
     attempts++;
@@ -13941,6 +13952,24 @@ async function spawnCli(
       codexBridgePendingSessionId = sid;
       codexBridgeStartTimer();
     } else {
+      codexBridgeStartTimer();
+    }
+  } else if (cfg.cliId === 'cursor') {
+    // Cursor's chatId (= cliSessionId) is only discoverable from the CLI's
+    // open store.db fd, so a FRESH spawn has no id yet at this point —
+    // observeCursorCliSessionId's pid poll surfaces it and
+    // codexBridgeNotifyCliSessionId completes the attach. A RESUME spawn
+    // knows the chatId up front and can resolve the JSONL immediately (it
+    // persists from the prior run). Attach modes: resume → baseline behind
+    // the existing tail (history must not replay); fresh → ingest from byte
+    // 0 (the JSONL is chatId-scoped, so it can only hold this session).
+    const path = effectiveCliSessionId
+      ? resolveFileBridgePath('cursor', { sessionId: effectiveCliSessionId })
+      : undefined;
+    if (path) {
+      cursorBridgeAttach(path, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+    } else {
+      if (effectiveCliSessionId) codexBridgePendingSessionId = effectiveCliSessionId;
       codexBridgeStartTimer();
     }
   }

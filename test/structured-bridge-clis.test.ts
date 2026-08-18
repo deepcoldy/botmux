@@ -36,11 +36,12 @@ describe('structured-bridge-clis', () => {
     }
   });
 
-  it('fallback treats cursor as adopt-only', () => {
-    expect(isStructuredBridgeFallbackActive('cursor')).toBe(false);
-    expect(isStructuredBridgeFallbackActive('cursor', true)).toBe(true);
+  it('fallback is always-on for cursor (spawned sessions harvest send-less finals too)', () => {
+    expect(isStructuredBridgeFallbackActive('cursor')).toBe(true);
     expect(isStructuredBridgeFallbackActive('grok')).toBe(true);
     expect(isStructuredBridgeFallbackActive('hermes')).toBe(true);
+    expect(isStructuredBridgeFallbackActive('claude-code')).toBe(false);
+    expect(isStructuredBridgeFallbackActive(undefined)).toBe(false);
   });
 
   it('adopt idle/input allowlists match historical worker behaviour', () => {
