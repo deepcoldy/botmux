@@ -158,14 +158,27 @@ async function runWorker(opts: {
     } as DaemonToWorker;
     child.send(init);
 
+    // Wait until the dump PARSES, not merely exists: the fake binary's
+    // writeFileSync creates the file at open() and fills it afterwards, so an
+    // existence poll can land between the two on a loaded runner and read an
+    // empty/partial file ("Unexpected end of JSON input").
+    let invocation: Invocation | undefined;
     await waitFor(
-      () => existsSync(dump),
+      () => {
+        if (!existsSync(dump)) return false;
+        try {
+          invocation = JSON.parse(readFileSync(dump, 'utf-8')) as Invocation;
+          return true;
+        } catch {
+          return false; // created but not fully written yet
+        }
+      },
       opts.timeoutMs ?? 20_000,
-      () => `mojo was never invoked\n${logs.join('')}`,
+      () => `mojo was never invoked (or its dump never became parseable)\n${logs.join('')}`,
     );
     return {
       bin,
-      invocation: JSON.parse(readFileSync(dump, 'utf-8')) as Invocation,
+      invocation: invocation!,
       logs: logs.join(''),
       messages,
       elapsedMs: Date.now() - startedAt,
