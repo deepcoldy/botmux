@@ -467,8 +467,9 @@ export function buildReplyCardFooter(opts: {
   } else if (parts.length > 1) {
     signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
-    // usage-only / recipient-only (brand disabled) — still marked for parsing.
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+    // The v2 structural element id is the signature for a one-part footer.
+    // Keep the visible text completely clean: no dangling dot and no link.
+    signedContent = parts[0];
   }
   const content = `<font color='grey'>${signedContent}</font>`;
   return {

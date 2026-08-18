@@ -1294,16 +1294,13 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
 
   const tag = el.tag;
 
-  // The public element id alone is not ownership proof: third-party cards may
-  // collide with it. New botmux footers carry the id plus the exact reserved
-  // marker; unexpected large text stays visible rather than being stripped.
-  const elementText = el.text?.content ?? el.content;
+  // One-part footers (recipient-only / usage-only, brand off) have no visible
+  // `·` marker — the v2 element id is the signature. Multi-part footers still
+  // carry the marker as a separator, but stripping does not require it.
   if (
     el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && tag === 'markdown'
     && (el.text_size === undefined || el.text_size === 'notation_small_v2')
-    && typeof elementText === 'string'
-    && hasExactMarkerMarkdown(elementText)
   ) {
     return;
   }
