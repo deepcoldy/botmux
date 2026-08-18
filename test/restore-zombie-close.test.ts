@@ -75,6 +75,33 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 // Map the test passes into restoreActiveSessions — production's closeSession
 // evicts from activeSessionsRegistry, which IS that Map.
 const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
+/**
+ * The DURABLE bot identity, independently controllable from the in-memory `bot`.
+ *
+ * That split is the whole point: a close must be justified by what is on disk, not
+ * by this process's mirror, and only a fixture that can make them disagree can
+ * prove it.
+ */
+const disk = vi.hoisted(() => ({
+  /** undefined ⇒ no persisted config at all (live config is then the authority). */
+  rows: undefined as any[] | undefined,
+  unreadable: false,
+}));
+
+vi.mock('../src/services/config-store.js', () => ({
+  requireConfigPath: vi.fn(() => {
+    if (!disk.rows && !disk.unreadable) throw new Error('Bot config path unknown');
+    return '/tmp/fixture-bots.json';
+  }),
+  readRawConfig: vi.fn(async () => {
+    if (disk.unreadable) throw new Error('EACCES');
+    return disk.rows ?? [];
+  }),
+  findEntryIndex: vi.fn((rows: any[], id: string) => rows.findIndex(r => r?.larkAppId === id)),
+  rmwBotEntry: vi.fn(),
+  writeRawConfigAtomic: vi.fn(),
+}));
+
 const transferState = vi.hoisted(() => ({
   active: new WeakSet<object>(),
   callbacks: new WeakMap<object, Set<() => void>>(),
@@ -289,6 +316,8 @@ beforeEach(() => {
   zmxSnapshot.unhealthySessions = [];
   herdrProbe.result = 'exists';
   bot.cliId = 'claude-code';
+  disk.rows = undefined;
+  disk.unreadable = false;
   bot.cliRuntime = undefined;
   bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
@@ -886,6 +915,99 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
   beforeEach(() => {
     wp.registry = new Map<string, DaemonSession>();
+  });
+
+  // The DURABLE config has the final word on every irreversible close.
+  //
+  // getBot().config is a per-process mirror: another daemon committing to
+  // bots.json does not update it. Every entry point into this sweep — including
+  // the deferred ones (a transfer settling, a Codex App ledger draining) — runs an
+  // unbounded time after the decision to retry was made, so the mirror can be
+  // arbitrarily stale by then. Judging a close by it destroys sessions the
+  // persisted config endorses, and nothing downstream can undo that.
+  it('does NOT close when the persisted config exists but cannot be READ', async () => {
+    // "Exists but unreadable" is untrustworthy. That is different from having no
+    // persisted config at all, where the live config legitimately IS the authority
+    // — treating both the same way would disable mismatch convergence outright.
+    const s1 = makeActivePersistentSession('om_auth_unreadable');
+    s1.cliId = 'codex';
+    sessionStore.updateSession(s1);
+    registerDs(s1);
+    disk.unreadable = true;
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
+    expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+  });
+
+  it('does NOT close a session the PERSISTED config still endorses', async () => {
+    // The live mirror says claude-code (so the codex session looks stale), but disk
+    // says codex — another process committed it. The session is correct under the
+    // durable authority and must survive.
+    const s1 = makeActivePersistentSession('om_auth_endorsed');
+    s1.cliId = 'codex';
+    sessionStore.updateSession(s1);
+    registerDs(s1);
+    disk.rows = [{ larkAppId: 'app_test', cliId: 'codex' }];
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
+    expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+  });
+
+  it('DOES close when the persisted config agrees the session is stale', async () => {
+    // The guard must not disable the feature it protects.
+    const s1 = makeActivePersistentSession('om_auth_stale');
+    s1.cliId = 'codex';
+    sessionStore.updateSession(s1);
+    registerDs(s1);
+    disk.rows = [{ larkAppId: 'app_test', cliId: 'claude-code' }];
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s1.sessionId);
+  });
+
+  it('skips the close when the bot row is GONE from the persisted config', async () => {
+    const s1 = makeActivePersistentSession('om_auth_rowgone');
+    s1.cliId = 'codex';
+    sessionStore.updateSession(s1);
+    registerDs(s1);
+    disk.rows = [{ larkAppId: 'someone-else', cliId: 'traex' }];
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
+    expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+  });
+
+  it('a DEFERRED retry re-reads disk, so a commit during the wait cannot mis-close', async () => {
+    // The retry runs after the transfer gate settles. Showing the authority had not
+    // diverged when the retry was ARMED proves nothing about when it RUNS.
+    const relaying = makeActivePersistentSession('om_auth_deferred');
+    relaying.cliId = 'codex';
+    sessionStore.updateSession(relaying);
+    const ds = registerDs(relaying);
+    transferState.active.add(ds);
+    disk.rows = [{ larkAppId: 'app_test', cliId: 'claude-code' }];
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(relaying.sessionId);
+
+    // While the transfer settles, another process commits codex back — the session
+    // is frozen on codex, so disk now endorses it. The live mirror is untouched,
+    // because that write happened in a different process.
+    disk.rows = [{ larkAppId: 'app_test', cliId: 'codex' }];
+
+    const callbacks = [...(transferState.callbacks.get(ds) ?? [])];
+    expect(callbacks, 'a deferred retry must have been armed').toHaveLength(1);
+    transferState.active.delete(ds);
+    for (const callback of callbacks) callback();
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(
+      closeSession,
+      'the deferred retry must re-read disk, not inherit the stale live mirror',
+    ).not.toHaveBeenCalledWith(relaying.sessionId);
+    expect(sessionStore.getSession(relaying.sessionId)!.status).toBe('active');
   });
 
   it('closes mismatched sessions of this bot, keeps matching ones', async () => {
