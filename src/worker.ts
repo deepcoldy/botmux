@@ -12539,9 +12539,11 @@ async function spawnCli(
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.
   childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
-  const trustedFile = trustedTurnFileForSession();
-  if (trustedFile) childEnv.BOTMUX_TRUSTED_TURN_FILE = trustedFile;
-  else delete childEnv.BOTMUX_TRUSTED_TURN_FILE;
+  // Do not freeze a per-turn trusted identity file into long-lived CLI env.
+  // The Data MCP proxy derives the current file from BOTMUX_SESSION_ID +
+  // SESSION_DATA_DIR, which avoids stale BOTMUX_TRUSTED_TURN_FILE values after
+  // session resume or worker reuse.
+  delete childEnv.BOTMUX_TRUSTED_TURN_FILE;
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
