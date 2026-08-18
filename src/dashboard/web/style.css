@@ -29223,13 +29223,19 @@ body:has(.workbench-route-host) { min-width: 0; }
 /* 「跟随系统」比另外两段长，给模式分段一个更宽的下限，三段仍然等宽。 */
 .wb-appearance-mode-seg > .wb-seg-item { min-width: 56px; }
 
-/* 触屏左滑露出的操作组：一块 156×56 的板，不是三块。
+/* 触屏露出的操作组：一块 156×56 的板，不是三块。
    156 = 3 × 52，每个动作 52 × 56，宽高都超过 44px 的指尖下限；56 = 行卡底板高
    （60px 行高减去上下各 2px inset），与行卡等高。
    组的右缘与行卡的 8px 内缩落在同一条线上：贴屏边会让滑出的这一行比其余每一行都
-   多探出 8px，静态图上一眼看得出跑偏。 */
+   多探出 8px，静态图上一眼看得出跑偏。
+   选择器只写 `.wb-session-row-actions`：行操作那个 <span> 从来只有这一个类，
+   原来写的 `.wb-session-row-actions.wb-action-group` 一次都没匹配上，整段是死的。
+   也不能反过来去 TSX 上补 `wb-action-group` —— 那个类在本文件里排得更后、特异性
+   相同，会把桌面浮层的 1px 描边和投影一并抹掉（浮层归白名单第 3 类，必须有边有影）。
+   `overflow` 与子项的 `border-radius: 0` 本来由 `.wb-action-group` 提供，这里就地
+   补上：组的圆角由容器裁，子项四角同值，才读得成一个对象。 */
 @media (hover: none) {
-  .wb-session-row-actions.wb-action-group {
+  .wb-session-row-actions {
     right: 8px;
     gap: 0;
     width: 156px;
@@ -29239,13 +29245,16 @@ body:has(.workbench-route-host) { min-width: 0; }
     border-radius: var(--radius-lg);
     background: var(--bg-l2);
     box-shadow: none;
+    overflow: hidden;
   }
-  .wb-session-row-actions.wb-action-group > * {
+  .agent-workbench-page .wb-session-row-actions > *,
+  .agent-workbench-dock .wb-session-row-actions > * {
     flex: 1;
     width: 52px;
     min-width: 52px;
     height: 56px;
     padding: 0;
+    border-radius: 0;
     font-size: 12px;
   }
 }
