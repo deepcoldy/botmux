@@ -134,21 +134,29 @@ export class Aggregator {
 
 /**
  * Subscribe to one daemon's SSE stream and feed events into the aggregator.
- * Auto-reconnects on error with 1s backoff. Returns an abort function.
+ * Auto-reconnects on error OR clean EOF with 1s backoff. Returns an abort
+ * function.
  *
- * `onReconnect` fires after the stream is re-established following a drop,
- * so the caller can re-hydrate and recover events missed while disconnected.
+ * `onConnected` fires after EVERY successful stream establishment — the first
+ * connection included — BEFORE any frame is read. While it runs, incoming
+ * frames stay queued in the stream; once it resolves, reading begins and the
+ * queued frames are applied in order. The caller uses it to install an
+ * authoritative snapshot (GET /api/sessions) that is therefore at least as
+ * fresh as every frame applied afterwards: a slow snapshot response can
+ * never clobber state that a faster SSE event already delivered (the reverse
+ * race of a naive post-subscribe hydrate). The same barrier on reconnect
+ * recovers events missed while the stream was down. If `onConnected` throws,
+ * frames are still read (best-effort).
  */
 export function subscribeDaemon(
   d: DaemonInfo,
   agg: Aggregator,
   onError: (e: Error) => void,
   fetchImpl: typeof fetch = fetch,
-  onReconnect?: () => void,
+  onConnected?: () => Promise<void> | void,
 ): () => void {
   const ctrl = new AbortController();
   const url = `http://127.0.0.1:${d.ipcPort}/api/events`;
-  let hadFailure = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Clear the reconnect backoff immediately on abort so the loop exits
@@ -157,22 +165,45 @@ export function subscribeDaemon(
     if (reconnectTimer) clearTimeout(reconnectTimer);
   }, { once: true });
 
+  const applyFrame = (evt: string, body: unknown): void => {
+    if (evt === 'session.spawned' && d.botAvatarUrl && (body as { session?: unknown })?.session) {
+      const session = (body as { session: Record<string, unknown> }).session;
+      (body as { session: unknown }).session = { ...session, botAvatarUrl: d.botAvatarUrl };
+    }
+    agg.applyEvent(d.larkAppId, { type: evt, body } as any);
+  };
+
   (async () => {
     while (!ctrl.signal.aborted) {
       try {
         const res = await fetchImpl(url, { signal: ctrl.signal });
         if (!res.ok || !res.body) throw new Error(`bad status ${res.status}`);
-        if (hadFailure) {
-          hadFailure = false;
-          onReconnect?.();
+
+        // Snapshot barrier: install the caller's authoritative snapshot
+        // before any frame is applied. Frames arriving during this call
+        // remain queued in the stream and are applied afterwards, in order,
+        // so the snapshot can never overwrite fresher SSE-delivered state.
+        if (onConnected) {
+          try {
+            await onConnected();
+          } catch (e) {
+            onError(e instanceof Error ? e : new Error(String(e)));
+          }
         }
+        if (ctrl.signal.aborted) break;
+
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
         let evt = '';
         for (;;) {
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) {
+            // Clean EOF of an established stream means the daemon went away.
+            // Treat it as a disconnect: fall through to the backoff +
+            // barrier re-run path instead of silently tight-looping.
+            throw new Error('sse stream ended (clean EOF)');
+          }
           buf += dec.decode(value, { stream: true });
           let nl: number;
           while ((nl = buf.indexOf('\n')) >= 0) {
@@ -182,11 +213,7 @@ export function subscribeDaemon(
             else if (line.startsWith('data:') && evt) {
               const data = line.slice(5).trim();
               try {
-                const body = JSON.parse(data);
-                if (evt === 'session.spawned' && d.botAvatarUrl && body?.session) {
-                  body.session = { ...body.session, botAvatarUrl: d.botAvatarUrl };
-                }
-                agg.applyEvent(d.larkAppId, { type: evt, body } as any);
+                applyFrame(evt, JSON.parse(data));
               } catch {
                 // Skip malformed frame
               }
@@ -195,10 +222,8 @@ export function subscribeDaemon(
           }
         }
       } catch (e) {
-        if (!ctrl.signal.aborted) {
-          onError(e as Error);
-          hadFailure = true;
-        }
+        if (ctrl.signal.aborted) break;
+        onError(e as Error);
         await new Promise(r => { reconnectTimer = setTimeout(r, 1_000); });
         reconnectTimer = undefined;
       }

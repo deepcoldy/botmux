@@ -1447,26 +1447,34 @@ function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
- * THEN open the SSE subscription. Order matters — hydrating after subscribe
- * would let snapshot data clobber events that arrived between subscribe and
- * the snapshot fetch.
+ * THEN open the SSE subscription.
  *
- * However, hydrate-then-subscribe leaves a race window: events that fire
- * between the snapshot fetch and the SSE handshake are missed entirely. To
- * close it, a second lightweight hydration runs after the subscription is
- * established. Its snapshot is newer than the first, so it picks up every
- * missed event; any event arriving after the subscription is delivered via
- * SSE and is at least as new as the second snapshot.
+ * The subscription runs a snapshot barrier (subscribeDaemon's `onConnected`):
+ * after every stream establishment — the first included — and BEFORE any
+ * frame is read, we install a fresh authoritative snapshot while incoming
+ * frames stay queued in the stream; frames then apply on top in order. This
+ * gives two guarantees at once:
+ *
+ * 1. No reverse clobber: the barrier snapshot is installed before any frame
+ *    is applied, so a slow snapshot response can never overwrite state that
+ *    a faster SSE event already delivered (a naive post-subscribe hydrate
+ *    would).
+ * 2. No forward gap: events fired between step 1 below and the stream
+ *    handshake are picked up by the barrier snapshot, and events missed
+ *    during a drop are recovered by the barrier re-run on reconnect.
+ *
+ * The blocking hydrate in step 1 still matters: it populates the cache
+ * before the dashboard starts serving, and keeps a daemon's last-known
+ * state visible even if its SSE stream never connects.
  *
  * Idempotent: a second call for the same daemon while one is in flight is a
- * no-op; a call after attach finished re-hydrates (useful when a daemon
- * restarts and we want to refresh its slice of the cache).
+ * no-op; the subscription itself is installed once.
  */
 async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   if (attaching.has(d.larkAppId)) return;
   attaching.add(d.larkAppId);
   try {
-    // 1. Hydrate snapshot (blocking — completes before we wire SSE)
+    // 1. Blocking snapshot (see above)
     try {
       const [sRes, schRes] = await Promise.all([
         fetchDaemonIpc(d.ipcPort, '/api/sessions'),
@@ -1483,46 +1491,51 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
     }
-    // 2. Open SSE subscription if not already (idempotent)
+    // 2. Open SSE subscription if not already (idempotent). The barrier
+    //    below runs inside subscribeDaemon, after the stream is established.
     if (!subs.has(d.larkAppId)) {
       subs.set(
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
-          // On SSE reconnect, re-hydrate to recover events missed while the
-          // stream was down.
-          () => { void rehydrateDaemon(d); },
+          // Snapshot barrier: install an authoritative snapshot before any
+          // frame is read. Frames arriving during this fetch stay queued in
+          // the stream and apply afterwards, so the snapshot can never
+          // clobber fresher SSE state; on reconnect it recovers missed
+          // events.
+          () => reconcileDaemon(d),
         ),
       );
     }
-    // 3. Re-hydrate to close the hydrate→subscribe race window. Events that
-    //    fired between step 1 and step 2 were not delivered over SSE; this
-    //    second snapshot is fetched *after* the subscription, so it reflects
-    //    those events. SSE events arriving after step 2 are applied on top
-    //    and are at least as fresh as this snapshot.
-    await rehydrateDaemon(d);
   } finally {
     attaching.delete(d.larkAppId);
   }
 }
 
 /**
- * Fetch the current session snapshot from one daemon and merge it into the
- * aggregator. Used both for the post-subscribe race-window close and for
- * SSE reconnect recovery.
+ * Fetch one daemon's current session/schedule snapshot and merge it into the
+ * aggregator. Runs as the subscribeDaemon barrier — before SSE frames are
+ * read — on both initial attach and reconnect. Bounded by a timeout so a hung
+ * daemon can't stall frame application indefinitely; on failure the live
+ * stream remains the source of truth (best-effort).
  */
-async function rehydrateDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
+async function reconcileDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   try {
-    const sRes = await fetchDaemonIpc(d.ipcPort, '/api/sessions');
+    const [sRes, schRes] = await Promise.all([
+      fetchDaemonIpc(d.ipcPort, '/api/sessions', { signal: AbortSignal.timeout(10_000) }),
+      fetchDaemonIpc(d.ipcPort, '/api/schedules', { signal: AbortSignal.timeout(10_000) }),
+    ]);
     const s = await sRes.json() as { sessions: any[] };
+    const sch = await schRes.json() as { schedules: any[] };
     const rows = (s.sessions ?? []).map((row) => (
       d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
     ));
     aggregator.hydrateSessions(d.larkAppId, rows);
     for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
+    aggregator.hydrateSchedules(sch.schedules ?? []);
   } catch (e: any) {
-    logger.warn(`[dashboard] re-hydrate ${d.larkAppId}: ${e.message ?? e}`);
+    logger.warn(`[dashboard] reconcile ${d.larkAppId}: ${e.message ?? e}`);
   }
 }
 

@@ -130,7 +130,7 @@ describe('Aggregator cache merge', () => {
   });
 });
 
-describe('subscribeDaemon reconnect', () => {
+describe('subscribeDaemon barrier & reconnect', () => {
   const daemon = { larkAppId: 'appA', ipcPort: 19999, botName: 'A' } as any;
 
   /** A never-ending SSE stream (prevents tight reconnect loops in tests). */
@@ -148,21 +148,95 @@ describe('subscribeDaemon reconnect', () => {
     });
   }
 
-  it('does not fire onReconnect on the first successful connection', async () => {
-    let reconnects = 0;
+  /** An SSE stream that enqueues `frames` once, then ends with a clean EOF. */
+  function eofSSE(frames: string[]): Response {
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const f of frames) controller.enqueue(enc.encode(f));
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  }
+
+  it('runs the barrier on the first connection before any frame is applied', async () => {
+    const agg = new Aggregator();
+    let barrierResolved = false;
     const abort = subscribeDaemon(
-      daemon, new Aggregator(),
+      daemon, agg,
       () => {},
-      () => Promise.resolve(neverEndingSSE()),
-      () => { reconnects++; },
+      () => Promise.resolve(eofSSE([
+        'event: session.spawned\ndata: {"session":{"sessionId":"s1","status":"idle"}}\n\n',
+      ])),
+      async () => {
+        await new Promise(r => setTimeout(r, 100));
+        barrierResolved = true;
+      },
+    );
+    // The frame is queued in the stream while the barrier runs; not applied yet.
+    await new Promise(r => setTimeout(r, 50));
+    expect(barrierResolved).toBe(false);
+    expect(agg.getSessions()).toHaveLength(0);
+    // After the barrier resolves, the queued frame is applied.
+    await new Promise(r => setTimeout(r, 100));
+    expect(barrierResolved).toBe(true);
+    expect(agg.getSessions()).toHaveLength(1);
+    expect(agg.getSession('s1')?.status).toBe('idle');
+    abort();
+  });
+
+  it('a slow barrier snapshot cannot clobber a queued SSE frame', async () => {
+    // Repro of the reverse race: an event delivered over SSE at ~50ms used to
+    // be overwritten by a slow snapshot response finishing at ~144ms. With the
+    // barrier, the snapshot is installed BEFORE any frame is read, so the
+    // queued frame always applies on top and wins.
+    const agg = new Aggregator();
+    const abort = subscribeDaemon(
+      daemon, agg,
+      () => {},
+      () => Promise.resolve(eofSSE([
+        'event: session.exited\ndata: {"sessionId":"s1"}\n\n',
+      ])),
+      async () => {
+        await new Promise(r => setTimeout(r, 150));
+        agg.hydrateSessions('appA', [{ sessionId: 's1', larkAppId: 'appA', status: 'idle' } as any]);
+      },
+    );
+    await new Promise(r => setTimeout(r, 300));
+    expect(agg.getSession('s1')?.status).toBe('closed');
+    abort();
+  });
+
+  it('keeps reading frames when the barrier throws', async () => {
+    const agg = new Aggregator();
+    const errors: Error[] = [];
+    const abort = subscribeDaemon(
+      daemon, agg,
+      e => errors.push(e),
+      () => Promise.resolve(new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'event: session.spawned\ndata: {"session":{"sessionId":"s1"}}\n\n',
+          ));
+          // Hold open so the only error observed is the barrier's.
+        },
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } })),
+      async () => { throw new Error('snapshot fetch failed'); },
     );
     await new Promise(r => setTimeout(r, 100));
     abort();
-    expect(reconnects).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toBe('snapshot fetch failed');
+    // The live stream still populated the aggregator (best-effort).
+    expect(agg.getSessions()).toHaveLength(1);
   });
 
-  it('fires onReconnect after a fetch failure and successful retry', async () => {
-    let reconnects = 0;
+  it('skips the barrier on a failed fetch and runs it on the successful retry', async () => {
+    let barriers = 0;
     let call = 0;
     const abort = subscribeDaemon(
       daemon, new Aggregator(),
@@ -172,11 +246,36 @@ describe('subscribeDaemon reconnect', () => {
         if (call === 1) return Promise.reject(new Error('connection refused'));
         return Promise.resolve(neverEndingSSE());
       },
-      () => { reconnects++; },
+      () => { barriers++; },
     );
-    // Wait for: initial fail → 1s backoff → reconnect → onReconnect
+    // Wait for: initial fail → 1s backoff → reconnect → barrier
     await new Promise(r => setTimeout(r, 1_500));
     abort();
-    expect(reconnects).toBe(1);
+    expect(barriers).toBe(1);
+  });
+
+  it('treats clean EOF as a disconnect: backs off and re-runs the barrier', async () => {
+    const times: number[] = [];
+    let call = 0;
+    const abort = subscribeDaemon(
+      daemon, new Aggregator(),
+      () => {},
+      () => {
+        call++;
+        if (call === 1) {
+          // Established stream that ends immediately with a clean EOF.
+          return Promise.resolve(eofSSE(['event: ping\ndata: {}\n\n']));
+        }
+        return Promise.resolve(neverEndingSSE());
+      },
+      () => { times.push(Date.now()); },
+    );
+    // Wait for: first connect → clean EOF → 1s backoff → reconnect → barrier
+    await new Promise(r => setTimeout(r, 1_500));
+    abort();
+    expect(times).toHaveLength(2);
+    // The backoff actually elapsed (without it, a tight loop would run
+    // dozens of iterations in this window).
+    expect(times[1] - times[0]).toBeGreaterThanOrEqual(900);
   });
 });
