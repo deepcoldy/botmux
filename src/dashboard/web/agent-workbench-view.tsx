@@ -39,6 +39,11 @@ import {
   type WorkbenchStorage,
 } from './agent-workbench-storage.js';
 import type { FeishuJsApi, WorkbenchH5Context } from './agent-workbench-chat.js';
+import {
+  WorkbenchAppearanceMenu,
+  WorkbenchAppearanceSheet,
+  useWorkbenchAppearanceRoot,
+} from './agent-workbench-appearance-menu.js';
 import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
 import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 import { WorkbenchSessionList } from './agent-workbench-session-list.js';
@@ -231,6 +236,9 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   ), [selectedHasPreview]);
 
   const layout = layoutEnvelope.layout;
+  // 外观（配色 / 明暗 / 终端渲染）挂载期间落到文档根上，离开工作台原样还回全站机制。
+  const appearanceTermStyle = useWorkbenchAppearanceRoot().appearance.termStyle;
+  const [appearanceSheetOpen, setAppearanceSheetOpen] = useState(false);
   // 触屏与否决定终端走哪条鉴权通道，进而决定「接管」这类写入口该不该渲染（P1-17）。
   const touch = useTouchEnvironment();
   const responsive = deriveResponsiveWorkbenchLayout(viewportWidth, layout);
@@ -489,6 +497,8 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       // 接管到手也送不进输入（面板早就跳过 auto-takeover 了），行里还摆着这个按钮
       // 只会让人反复点一个注定没反应的入口。
       canControlTerminal={props.capabilities.canControl && !touch}
+      // 手机上列表页就是首屏，外观入口在它的顶栏（桌面走工作区头部的 ⋯ 菜单）。
+      onOpenAppearance={responsive.mode === 'mobile' ? () => setAppearanceSheetOpen(true) : undefined}
       onSelect={sessionId => {
         selectSession(sessionId);
         // Touch layouts drill in on tap; pointer layouts keep selection and
@@ -534,6 +544,8 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
               onClick={() => setTerminal(null)}
             >关闭终端 ✕</button>
           ) : null}
+          {/* 手机上不重复给入口：列表页顶栏的 ◐ 已经直达同一块面板（底部 sheet）。 */}
+          {responsive.mode !== 'mobile' ? <WorkbenchAppearanceMenu /> : null}
         </div>
       </header>
       <div className="wb-pane-stack">
@@ -575,6 +587,9 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       ref={rootRef}
       className="agent-workbench-page"
       data-surface="appCenter"
+      // 终端容器自己带 wb-term-orca / wb-term-classic；根上再挂一份，是给它的祖先
+      // （面板外留白、移动端下钻容器）留的选择器钩子，省掉一层 :has()。
+      data-term-style={appearanceTermStyle}
       data-responsive-step={responsive.step}
       data-demo={props.demo ? 'true' : undefined}
       style={rootStyle}
@@ -617,6 +632,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
                   : workspace}
             </div>
           )}
+          <WorkbenchAppearanceSheet open={appearanceSheetOpen} onClose={() => setAppearanceSheetOpen(false)} />
         </div>
       ) : (
         <div className={`wb-desktop-layout${railCollapsed ? ' is-rail-collapsed' : ''}${terminalSession ? '' : ' is-terminal-closed'}`}>

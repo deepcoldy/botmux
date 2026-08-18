@@ -32,6 +32,14 @@ import {
 import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 // 触屏鉴权契约只有一份实现，终端面板和会话坞共用（P1-17）。
 import { useTerminalViewLink, useTouchEnvironment } from './agent-workbench-touch.js';
+import {
+  postWorkbenchTermAppearance,
+  workbenchTermContainerClass,
+} from './agent-workbench-appearance.js';
+import {
+  WorkbenchTermStyleSegment,
+  useWorkbenchAppearance,
+} from './agent-workbench-appearance-menu.js';
 
 interface PaneCommonProps {
   session: WorkbenchSessionRow;
@@ -118,6 +126,14 @@ function useTerminalFrameWatch(params: {
 
   const onFrameLoad = useCallback(() => setLoadedFrameKey(frameKey), [frameKey]);
   return { blocked: enabled && blocked, onFrameLoad: enabled ? onFrameLoad : undefined };
+}
+
+function browserHref(): string | undefined {
+  try {
+    return typeof window === 'undefined' ? undefined : window.location?.href;
+  } catch {
+    return undefined;
+  }
 }
 
 function apiErrorText(error: unknown): string {
@@ -286,6 +302,21 @@ export function TerminalPane(props: PaneCommonProps & {
     read: () => readFrameStatus(frameRef.current),
   });
 
+  // 终端渲染风格：容器 class 管几何（行距 / 内边距），xterm 的配色住在跨文档的
+  // 终端页里，父页换 class 它收不到 —— 必须把 theme 推过去，否则会出现「工作台
+  // 换了配色、终端还是旧色」的半截状态。切换和重挂 iframe 时各推一次。
+  const { appearance, skin } = useWorkbenchAppearance();
+  const pushTermAppearance = useCallback(() => {
+    // 相对地址要靠当前页 href 才解得出 origin；测试环境的假 window 没有 location，
+    // 解不出来时 postWorkbenchTermAppearance 自己放弃这次下发（绝不用 `*` 广播）。
+    postWorkbenchTermAppearance(frameRef.current, frameUrl, appearance.termStyle, skin, browserHref());
+  }, [appearance.termStyle, frameUrl, skin]);
+  useEffect(() => { pushTermAppearance(); }, [pushTermAppearance]);
+  const onFrameLoad = useCallback(() => {
+    frameWatch.onFrameLoad?.();
+    pushTermAppearance();
+  }, [frameWatch, pushTermAppearance]);
+
   // 触屏挂的是 viewToken 只读通道：控制权接口哪怕报「已接管」或平台所有者（fixed），这块
   // iframe 也送不进输入，徽标必须跟着说只读，否则和下面那行反馈自相矛盾。
   const controlled = !touch && control?.mode === 'controlled' && control.owned;
@@ -295,7 +326,10 @@ export function TerminalPane(props: PaneCommonProps & {
     : null;
 
   return (
-    <section className="wb-pane wb-terminal-pane" aria-label="终端面板">
+    <section
+      className={`wb-pane wb-terminal-pane ${workbenchTermContainerClass(appearance.termStyle)}`}
+      aria-label="终端面板"
+    >
       <header className="wb-pane-titlebar">
         <div className="wb-pane-identity">
           <span className="wb-pane-glyph" aria-hidden="true">›_</span>
@@ -305,6 +339,8 @@ export function TerminalPane(props: PaneCommonProps & {
           </span>
           {expires ? <span className="wb-lease-time">{`${expires}到期`}</span> : null}
         </div>
+        {/* 「Orca｜经典」就近可切；与右边那组终端操作隔开、不共板——它们不是同一组操作。 */}
+        <WorkbenchTermStyleSegment termStyle={appearance.termStyle} />
         <div className="wb-pane-actions">
           {frameUrl ? <a href={frameUrl} target="_blank" rel="noopener noreferrer">新标签页打开</a> : null}
           {/* 触屏不给接管按钮：那边挂的是 viewToken 只读通道，接管到手也送不进输入，
@@ -351,7 +387,7 @@ export function TerminalPane(props: PaneCommonProps & {
               title={`终端 — ${workbenchSessionTitle(props.session)}`}
               allow="clipboard-read; clipboard-write"
               referrerPolicy="no-referrer"
-              onLoad={frameWatch.onFrameLoad}
+              onLoad={onFrameLoad}
             />
             {/* iframe 加载得出来、里面的实时通道却始终连不上（iOS 会拦掉 http 页里的
                 ws://）。这时终端区域只会是一片黑，与其让人对着黑屏猜，不如直说，并给一条

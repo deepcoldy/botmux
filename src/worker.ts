@@ -15106,6 +15106,40 @@ try{
   try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
 }
 fit.fit();
+// 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
+// iframe 里，父页换 class / 换 CSS 变量都传不进来，配色只能靠 postMessage 递过来。
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+// 安全边界：这个页面会被跨 origin 嵌入，因此只认 window.parent 发来的、结构完全
+// 对得上的消息，且每个颜色都必须是 #rgb / #rrggbb 十六进制字面量；少一个键、多一个
+// 非法值，整条消息丢弃（宁可保持现状，也不要把半套主题刷到画布上）。
+var _WB_THEME_KEYS=['background','foreground','cursor','selectionBackground',
+  'black','red','green','yellow','blue','magenta','cyan','white'];
+function _wbSanitizeTheme(raw){
+  if(!raw||typeof raw!=='object')return null;
+  var out={};
+  for(var _i=0;_i<_WB_THEME_KEYS.length;_i++){
+    var _k=_WB_THEME_KEYS[_i],_v=raw[_k];
+    if(typeof _v!=='string'||!/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(_v))return null;
+    out[_k]=_v;
+  }
+  return out;
+}
+window.addEventListener('message',function(_ev){
+  if(_ev.source===window||_ev.source!==window.parent)return;
+  var _d=_ev.data;
+  if(!_d||_d.type!=='botmux:wb-appearance')return;
+  var _theme=_wbSanitizeTheme(_d.theme);
+  if(!_theme)return;
+  try{
+    term.options.theme=_theme;
+    // Orca 是大行距（≈1.55）；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
+    // 经典那套色值与上面写死的字面量逐色相同，所以没开 Orca 的用户零变化。
+    term.options.lineHeight=_d.termStyle==='orca'?1.55:1;
+    // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
+    fit.fit();
+  }catch(_e){}
+});
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
 // zellij frame (or relay history seed) can therefore finish after the browser
 // has initialised the viewport scrollbar, leaving that viewport at scrollTop=0

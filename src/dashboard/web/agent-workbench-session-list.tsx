@@ -30,6 +30,7 @@ import {
   type WorkbenchStorage,
 } from './agent-workbench-storage.js';
 import { buildChatAppLink } from './agent-workbench-chat.js';
+import { t } from './ui.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
@@ -165,6 +166,9 @@ export interface WorkbenchSessionListProps {
   /** 「看过了」的回执：行内那些不改变选中态的操作（打开飞书聊天、定位）也该
    *  清掉未读，但它们不能顺手把选中态挪过去（移动端选中会直接钻进工作区）。 */
   onSeen?(sessionId: string): void;
+  /** 手机上列表页就是首屏：顶栏单列一枚 ◐ 直达「外观」面板。桌面不传——那边的
+   *  入口在工作区头部的 ⋯ 菜单里，同一个状态源。 */
+  onOpenAppearance?(): void;
 }
 
 function useViewportHeight(ref: React.RefObject<HTMLElement | null>): number {
@@ -425,6 +429,16 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
           </select>
+        ) : null}
+        {props.onOpenAppearance ? (
+          <button
+            type="button"
+            className="wb-appearance-btn"
+            aria-haspopup="dialog"
+            aria-label={t('workbench.appearance.title')}
+            title={t('workbench.appearance.title')}
+            onClick={props.onOpenAppearance}
+          >◐</button>
         ) : null}
         {props.onToggleCollapsed ? (
           <button type="button" aria-label="收起会话列表" title="收起会话列表" onClick={props.onToggleCollapsed}>«</button>

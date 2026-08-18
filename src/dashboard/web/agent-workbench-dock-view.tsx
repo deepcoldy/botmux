@@ -17,6 +17,10 @@ import {
   type WorkbenchH5Context,
 } from './agent-workbench-chat.js';
 import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
+import {
+  WorkbenchAppearanceMenu,
+  useWorkbenchAppearanceRoot,
+} from './agent-workbench-appearance-menu.js';
 import { WorkbenchSessionList } from './agent-workbench-session-list.js';
 // 终端面板用的同一份触屏契约（P1-17）：坞里的终端链接不能自己另发一条裸 Cookie 地址。
 import { useTerminalViewLink, useTouchEnvironment } from './agent-workbench-touch.js';
@@ -43,6 +47,8 @@ function firstSessionId(sessions: readonly WorkbenchSessionRow[]): string | null
 
 export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.Element {
   const api = useMemo(() => props.api ?? createWorkbenchApi(), [props.api]);
+  // 坞和完整工作台是同一份外观：挂载期间落到文档根，离开时还回全站机制。
+  useWorkbenchAppearanceRoot();
   const [selectedId, setSelectedId] = useState(props.initialSessionId ?? firstSessionId(props.sessions));
   const [h5, setH5] = useState<WorkbenchH5Context | null>(props.h5Context ?? null);
   const selected = props.sessions.find(session => session.sessionId === selectedId) ?? null;
@@ -97,6 +103,8 @@ export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.
       <header className="wb-dock-header">
         <div><span aria-hidden="true">◖</span><strong>会话坞</strong></div>
         <span className={props.online ? 'is-online' : 'is-offline'}>{props.online ? '● 在线' : '○ 离线'}</span>
+        {/* 精简形态头部放不下单列图标，外观仍走 ⋯ 菜单——和完整工作台同一个状态源。 */}
+        <WorkbenchAppearanceMenu />
       </header>
       <WorkbenchSessionList
         sessions={props.sessions}

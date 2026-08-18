@@ -2338,6 +2338,24 @@ const zh = {
   'workflow.v3.cancelAlreadyTerminal': '运行已先一步进入终态，未再提交取消。',
   'workflow.v3.cancelAuthRequired': '需要 Dashboard 写权限：请在终端运行 `botmux dashboard` 获取当前登录链接后重试。',
   'workflow.v3.cancelFailed': '取消失败：{error}',
+  // ─── 工作台「外观」（配色 / 明暗 / 终端渲染，同一状态源三处入口）─────────────
+  'workbench.appearance.title': '外观',
+  'workbench.appearance.more': '更多',
+  'workbench.appearance.close': '关闭',
+  'workbench.appearance.themeGroup': '主题',
+  'workbench.appearance.modeLabel': '明暗模式',
+  'workbench.appearance.skin.orcaInk': '墨黑',
+  'workbench.appearance.skin.slateBlue': '蓝灰',
+  'workbench.appearance.skin.warmGraphite': '石墨',
+  'workbench.appearance.skin.lightFrost': '冷白',
+  'workbench.appearance.mode.system': '跟随系统',
+  'workbench.appearance.mode.light': '浅色',
+  'workbench.appearance.mode.dark': '深色',
+  'workbench.appearance.termGroup': '终端渲染',
+  'workbench.appearance.termStyleLabel': '终端渲染风格',
+  'workbench.appearance.term.orca': 'Orca',
+  'workbench.appearance.term.classic': '经典',
+  'workbench.appearance.termNote': 'Orca：终端跟随工作台配色 · 经典：终端保持本色',
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
@@ -4674,6 +4692,23 @@ const en: Record<keyof typeof zh, string> = {
   'workflow.v3.cancelAlreadyTerminal': 'The run reached a terminal state first; no cancel was submitted.',
   'workflow.v3.cancelAuthRequired': 'Dashboard write access is required. Run `botmux dashboard` in a terminal, open its current login link, then retry.',
   'workflow.v3.cancelFailed': 'Cancel failed: {error}',
+  'workbench.appearance.title': 'Appearance',
+  'workbench.appearance.more': 'More',
+  'workbench.appearance.close': 'Close',
+  'workbench.appearance.themeGroup': 'Theme',
+  'workbench.appearance.modeLabel': 'Light or dark',
+  'workbench.appearance.skin.orcaInk': 'Ink',
+  'workbench.appearance.skin.slateBlue': 'Slate',
+  'workbench.appearance.skin.warmGraphite': 'Graphite',
+  'workbench.appearance.skin.lightFrost': 'Frost',
+  'workbench.appearance.mode.system': 'System',
+  'workbench.appearance.mode.light': 'Light',
+  'workbench.appearance.mode.dark': 'Dark',
+  'workbench.appearance.termGroup': 'Terminal',
+  'workbench.appearance.termStyleLabel': 'Terminal rendering style',
+  'workbench.appearance.term.orca': 'Orca',
+  'workbench.appearance.term.classic': 'Classic',
+  'workbench.appearance.termNote': 'Orca: the terminal follows the workbench palette · Classic: the terminal keeps its own colours',
 };
 
 const dictionaries: Record<DashboardLocale, DashboardMessages> = { zh, en };
