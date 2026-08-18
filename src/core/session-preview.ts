@@ -90,6 +90,35 @@ export function safeSessionPreviewTarget(value: unknown): SessionPreviewTarget |
 }
 
 /**
+ * P1-1：一次注册的指纹。空串表示「这个会话此刻没有合法的预览目标」。
+ *
+ * host:port 不足以当身份：端口被回收后重注册、worker 换代后在同一端口重注册，都会
+ * 产生同一个 host:port，但那是另一次注册、另一个进程。registeredAt（ISO 串，天然可
+ * 当 revision）、workerGeneration、以及 owner 三元证明合起来才唯一确定「哪一次」。
+ */
+export function sessionPreviewFingerprint(previewTarget: unknown): string {
+  const target = safeSessionPreviewTarget(previewTarget);
+  if (!target) return '';
+  return [
+    target.host,
+    target.port,
+    target.registeredAt,
+    target.workerGeneration,
+    target.owner.pid,
+    target.owner.procStart,
+    target.owner.inode,
+  ].join('|');
+}
+
+/** P1-1：两个 target 是不是同一次注册（见 `sessionPreviewFingerprint`）。 */
+export function sameSessionPreviewTarget(
+  a: SessionPreviewTarget,
+  b: SessionPreviewTarget,
+): boolean {
+  return sessionPreviewFingerprint(a) === sessionPreviewFingerprint(b);
+}
+
+/**
  * P1-12：目标是否仍由注册时那个进程持有。probe 之后与**每次代理落地之前**都要过
  * 这一关；`changed`/`unverifiable` 一律按失效处理（返回 false），调用方负责清 target
  * 并广播 `preview: null`。

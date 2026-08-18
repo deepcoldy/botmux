@@ -22,6 +22,16 @@ describe('central dashboard preview wiring', () => {
     expect(dashboardSource).toContain('authSessionConnections.register(authSessionId, close, ctx.sessionId)');
   });
 
+  // P1-1：行为证据在 session-preview（指纹与事件收口判据）与 session-preview-proxy
+  // （握手期换靶必须拒）两个套件里；这里只钉「中央 Dashboard 真的把这两件事接上了」。
+  it('re-checks the dialed target before registering a stream and converges SSE replays by fingerprint', () => {
+    expect(dashboardSource).toContain('const current = resolveDashboardSessionPreview(ctx.sessionId);');
+    expect(dashboardSource).toContain('if (!current.ok || !sameSessionPreviewTarget(current.target, ctx.target)) return false;');
+    expect(dashboardSource).toContain('previewTeardownForDaemonEvent(ev, lastSeenPreviewFingerprints)');
+    // 收口只走这一条判据：不能再有绕过指纹记忆的无条件 teardown 分支。
+    expect(dashboardSource).not.toContain('teardownSessionPreview(ev.body.sessionId)');
+  });
+
   it('projects internal targets out of both REST snapshots and SSE events', () => {
     expect(dashboardSource).toContain('projectSessionPreviewsForBrowser(sessions)');
     expect(dashboardSource).toContain('projectSessionPreviewEventForBrowser(ev.type, ev.body)');

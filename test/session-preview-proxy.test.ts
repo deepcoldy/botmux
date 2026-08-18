@@ -10,7 +10,11 @@ import {
   previewRequestHeaders,
   type PreviewProxyResolution,
 } from '../src/dashboard/preview-proxy.js';
-import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
+import {
+  PREVIEW_CONTENT_SEGMENT,
+  sameSessionPreviewTarget,
+  type SessionPreviewTarget,
+} from '../src/core/session-preview.js';
 import { AuthSessionConnectionRegistry } from '../src/dashboard/auth-session-connections.js';
 import { managementUpgradeOrigin } from '../src/dashboard/control-csrf.js';
 
@@ -1250,5 +1254,198 @@ describe('P1-2 preview 代理在客户端断开与非 101 拒绝路径上回收�
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ─── P1-1：拨号 → upstream 101/headers 之间的**换靶**竞态 ────────────────────
+//
+// 授权与目标解析都发生在拨号之前，dev server 的握手最长可以拖 45 秒。这段窗口里
+// worker 换代 / 切 CLI / 端口易主 / 目标被清空，daemon 会广播出来、dashboard 会
+// teardown——但 teardown 扫的是索引，而这条流此刻还没进索引，一条都关不到。等上游握完
+// 手，旧的 bindStream 只查身份（身份没变，依然合法），于是它拿到 200/101 并被**重新
+// 登记**，继续把一个已经不属于这个会话的进程的内容送进浏览器。
+//
+// 所以 bindStream 拿到拨号时用的 target，登记前把目标重解一遍比指纹：不是同一次注册
+// 就返回 false，由现成分支销毁上游、不写 200/101、不登记。
+describe('P1-1 preview 流在握手完成前复核 target 指纹', () => {
+  const COOKIE_AUTH_SESSION = 'cookie-auth-session';
+  const LEAKED_PREVIEW = 'preview-bytes-from-retired-target';
+  const rawClients = new Set<Socket>();
+
+  afterEach(() => {
+    for (const socket of rawClients) socket.destroy();
+    rawClients.clear();
+  });
+
+  async function startSwappablePreview(): Promise<{
+    port: number;
+    registry: AuthSessionConnectionRegistry;
+    dialed: Promise<void>;
+    swapTarget: (next: SessionPreviewTarget | null) => void;
+    reregisterSameTarget: () => void;
+    completeUpgrade: (payload?: string) => void;
+    completeResponse: (payload?: string) => void;
+  }> {
+    let markDialed!: () => void;
+    const dialed = new Promise<void>(resolve => { markDialed = resolve; });
+    let pausedSocket: Duplex | undefined;
+    let pausedResponse: ServerResponse | undefined;
+    upstream = createServer((_req, res) => { pausedResponse = res; markDialed(); });
+    upstream.on('upgrade', (_req, socket) => {
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+      pausedSocket = socket;
+      markDialed();
+    });
+    await new Promise<void>(resolve => upstream!.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    let current: SessionPreviewTarget | null = {
+      host: '127.0.0.1', port: upstreamPort, registeredAt: TARGET_TIME,
+      owner: { ...TARGET_OWNER }, workerGeneration: 7,
+    };
+    const registry = new AuthSessionConnectionRegistry();
+    const manager = createSessionPreviewProxy({
+      authenticated: req => req.headers.cookie?.split(';').some(part => part.trim() === managementCookie()) === true,
+      resolve: () => (current
+        ? { ok: true, target: current }
+        : { ok: false, status: 404, error: 'preview_not_registered' }),
+      verifyContentCapability: (capability, sessionId) => capability === CAPABILITY && sessionId === 's1',
+      // dashboard.ts 的同款接线：身份复核之外，再把目标重解一遍与拨号时那个比指纹。
+      bindStream: (_req, ctx, close) => {
+        if (!current || !sameSessionPreviewTarget(current, ctx.target)) return false;
+        return registry.register(COOKIE_AUTH_SESSION, close, ctx.sessionId);
+      },
+    });
+    front = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://dashboard.test');
+      void manager.handleHttp(req, res, url).then(handled => {
+        if (!handled && !res.headersSent) { res.writeHead(404); res.end(); }
+      });
+    });
+    front.on('upgrade', (req, socket, head) => {
+      if (!manager.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    await new Promise<void>(resolve => front!.listen(0, '127.0.0.1', resolve));
+    return {
+      port: (front.address() as { port: number }).port,
+      registry,
+      dialed,
+      swapTarget: next => { current = next; },
+      // 换代后在**同一个端口**重注册：host:port 一模一样，但那是另一次注册。
+      reregisterSameTarget: () => {
+        current = {
+          host: '127.0.0.1', port: upstreamPort, registeredAt: '2026-08-11T12:00:05.000Z',
+          owner: { ...TARGET_OWNER, pid: TARGET_OWNER.pid + 1 }, workerGeneration: 8,
+        };
+      },
+      completeUpgrade: (payload = '') => {
+        pausedSocket?.write(
+          'HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n'
+          + payload,
+        );
+      },
+      completeResponse: (payload = '') => {
+        pausedResponse?.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        pausedResponse?.write(payload);
+      },
+    };
+  }
+
+  function rawUpgrade(port: number, path: string): {
+    raw: () => string;
+    closed: Promise<void>;
+    waitFor: (needle: string, label: string) => Promise<void>;
+  } {
+    const socket = connect(port, '127.0.0.1');
+    rawClients.add(socket);
+    let raw = '';
+    const waiters = new Set<{ needle: string; resolve: () => void }>();
+    socket.on('data', chunk => {
+      raw += chunk.toString();
+      for (const waiter of [...waiters]) {
+        if (!raw.includes(waiter.needle)) continue;
+        waiters.delete(waiter);
+        waiter.resolve();
+      }
+    });
+    socket.on('error', () => { /* 断开本身就是断言对象 */ });
+    const closed = new Promise<void>(resolve => socket.on('close', () => resolve()));
+    socket.write(
+      `GET ${path} HTTP/1.1\r\nHost: dashboard.test\r\nOrigin: null\r\n`
+      + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+      + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+    );
+    return {
+      raw: () => raw,
+      closed,
+      waitFor: (needle, label) => new Promise<void>((resolve, reject) => {
+        if (raw.includes(needle)) { resolve(); return; }
+        waiters.add({ needle, resolve });
+        setTimeout(() => reject(new Error(`${label}\n---received---\n${raw}`)), 4_000).unref();
+      }),
+    };
+  }
+
+  it('握手期间换代后在同一端口重注册：旧升级请求拿不到 101，也不会被重新登记', async () => {
+    const ctx = await startSwappablePreview();
+    const client = rawUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    await ctx.dialed;
+
+    // 换靶就发生在这一刻。索引里空无一物——teardown 一条都关不到。
+    ctx.reregisterSameTarget();
+    expect(ctx.registry.closeSessionStreams('s1')).toBe(0);
+
+    ctx.completeUpgrade(LEAKED_PREVIEW);
+    await client.waitFor('403', '换靶后的旧升级请求没有被拒');
+    await client.closed;
+    expect(client.raw()).not.toContain('101');
+    expect(client.raw()).not.toContain(LEAKED_PREVIEW);
+    expect(ctx.registry.countSessionStreams('s1')).toBe(0);
+    expect(ctx.registry.count(COOKIE_AUTH_SESSION)).toBe(0);
+  });
+
+  it('握手期间目标被清空：旧升级请求同样拒绝', async () => {
+    const ctx = await startSwappablePreview();
+    const client = rawUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    await ctx.dialed;
+    ctx.swapTarget(null);
+    ctx.completeUpgrade(LEAKED_PREVIEW);
+    await client.waitFor('403', '目标清空后的旧升级请求没有被拒');
+    await client.closed;
+    expect(client.raw()).not.toContain('101');
+    expect(client.raw()).not.toContain(LEAKED_PREVIEW);
+    expect(ctx.registry.countSessionStreams('s1')).toBe(0);
+  });
+
+  it('握手期间换代：在途的 HTTP 预览响应拿不到 200，也不会被重新登记', async () => {
+    const ctx = await startSwappablePreview();
+    const pending = fetch(`http://127.0.0.1:${ctx.port}/preview/s1/stream`, {
+      headers: { cookie: managementCookie() },
+    });
+    await ctx.dialed;
+    ctx.reregisterSameTarget();
+    ctx.completeResponse(`event: hello\ndata: ${LEAKED_PREVIEW}\n\n`);
+
+    const response = await pending;
+    expect(response.status).toBe(403);
+    const body = await response.text();
+    expect(body).not.toContain(LEAKED_PREVIEW);
+    expect(JSON.parse(body)).toEqual({ ok: false, error: 'authentication_revoked' });
+    expect(ctx.registry.countSessionStreams('s1')).toBe(0);
+  });
+
+  it('目标没变时照常放行，并且依旧随身份/目标失效一起断', async () => {
+    const ctx = await startSwappablePreview();
+    const client = rawUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    await ctx.dialed;
+    ctx.completeUpgrade('preview-frame-bytes');
+    await client.waitFor('101', '没换靶的预览升级请求被误拒');
+    await client.waitFor('preview-frame-bytes', '桥接建立后预览字节没有透传');
+    expect(ctx.registry.countSessionStreams('s1')).toBe(1);
+
+    const closed = client.closed;
+    expect(ctx.registry.closeSessionStreams('s1')).toBe(1);
+    await closed;
   });
 });

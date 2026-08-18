@@ -6,11 +6,14 @@ import {
   isPreviewPort,
   probeSessionPreviewTarget,
   safeSessionPreviewTarget,
+  sameSessionPreviewTarget,
   sessionPreviewDescriptor,
+  sessionPreviewFingerprint,
   sessionPreviewPath,
 } from '../src/core/session-preview.js';
 import {
   previewDescriptorFromRow,
+  previewTeardownForDaemonEvent,
   projectSessionPreviewEventForBrowser,
   projectSessionPreviewForBrowser,
   projectSessionDetailForBrowser,
@@ -352,5 +355,99 @@ describe('session preview ownership resolution', () => {
       },
       sessionId: 's1', ownerLarkAppId: 'app-a',
     })).toMatchObject({ ok: false, status: 409, error: 'invalid_preview_target' });
+  });
+});
+
+// ─── P1-1：换靶复核与 SSE 重放收敛 ───────────────────────────────────────────
+//
+// 代理的授权与目标解析都发生在**拨号之前**，而 dev server 的握手最长可以拖 45 秒。
+// 这段窗口里换代 / 切 CLI / 端口易主换来的新目标，旧流握完手照样能拿到 200/101，还会
+// 被重新登记进索引（换靶那一刻的 teardown 扫的是索引，扫不到一条还没入索引的流）。
+// 复核靠的是「这是不是同一次注册」——host:port 不够，端口回收后重注册会给出同一个
+// host:port，但那是另一个进程。
+describe('P1-1 preview target 指纹与 daemon 事件收口', () => {
+  const target = {
+    host: '127.0.0.1',
+    port: 3000,
+    registeredAt: '2026-08-11T12:00:00.000Z',
+    owner: { pid: 4242, procStart: '918273', inode: '556677' },
+    workerGeneration: 3,
+  } as const;
+
+  function withTarget(patch: Record<string, unknown>): Record<string, unknown> {
+    return { ...target, owner: { ...target.owner }, ...patch };
+  }
+
+  it('只有同一次注册才算同一个 target', () => {
+    expect(sameSessionPreviewTarget(target, withTarget({}) as never)).toBe(true);
+    // host:port 一样但换了一次注册的每一种形态，都必须判为不同。
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ['换端口', { port: 4000 }],
+      ['重注册（registeredAt 变）', { registeredAt: '2026-08-11T12:00:01.000Z' }],
+      ['worker 换代', { workerGeneration: 4 }],
+      ['端口易主（pid 变）', { owner: { ...target.owner, pid: 4243 } }],
+      ['pid 复用（procStart 变）', { owner: { ...target.owner, procStart: '918274' } }],
+      ['监听 socket 换了（inode 变）', { owner: { ...target.owner, inode: '556678' } }],
+    ];
+    for (const [label, patch] of variants) {
+      expect(sameSessionPreviewTarget(target, withTarget(patch) as never), label).toBe(false);
+    }
+  });
+
+  it('非法/缺失的 target 指纹归零，绝不与任何一次真实注册相等', () => {
+    expect(sessionPreviewFingerprint(undefined)).toBe('');
+    expect(sessionPreviewFingerprint(null)).toBe('');
+    expect(sessionPreviewFingerprint({ host: '169.254.169.254', port: 80 })).toBe('');
+    expect(sessionPreviewFingerprint(target)).not.toBe('');
+  });
+
+  it('SSE 重连重放同一份 target 时不收口，指纹变了才收口', () => {
+    const seen = new Map<string, string>();
+    const spawned = (previewTarget: unknown): { type: string; body: unknown } =>
+      ({ type: 'session.spawned', body: { session: { sessionId: 's1', previewTarget } } });
+
+    // 第一次见到（dashboard 启动 / 会话新建）不算换靶。
+    expect(previewTeardownForDaemonEvent(spawned(target), seen)).toBeUndefined();
+    // daemon 的 /api/events 每次被连上都重放全部会话——重放不得误杀预览长连接。
+    expect(previewTeardownForDaemonEvent(spawned(target), seen)).toBeUndefined();
+    expect(previewTeardownForDaemonEvent(spawned(withTarget({})), seen)).toBeUndefined();
+
+    // daemon 重启期间广播的 preview:null 丢了，重连后只以 spawned 形式补齐：要收口。
+    expect(previewTeardownForDaemonEvent(spawned(undefined), seen)).toBe('s1');
+    // 收口后记忆同步更新，同一份重放不会反复收口。
+    expect(previewTeardownForDaemonEvent(spawned(undefined), seen)).toBeUndefined();
+    // 换代后在新端口重注册：再收口一次。
+    expect(previewTeardownForDaemonEvent(spawned(withTarget({ port: 4000 })), seen)).toBe('s1');
+  });
+
+  it('previewTarget 补丁与会话结束照旧收口，无关事件一律不动', () => {
+    const seen = new Map<string, string>();
+    seen.set('s1', sessionPreviewFingerprint(target));
+
+    expect(previewTeardownForDaemonEvent(
+      { type: 'session.update', body: { sessionId: 's1', patch: { status: 'idle' } } },
+      seen,
+    )).toBeUndefined();
+    expect(previewTeardownForDaemonEvent(
+      { type: 'schedule.updated', body: { id: 'x', patch: { previewTarget: null } } },
+      seen,
+    )).toBeUndefined();
+
+    expect(previewTeardownForDaemonEvent(
+      { type: 'session.update', body: { sessionId: 's1', patch: { previewTarget: null } } },
+      seen,
+    )).toBe('s1');
+    // 补丁处理完就把记忆刷成新值，紧随其后的 SSE 重放不会再收口一次。
+    expect(seen.get('s1')).toBe('');
+    expect(previewTeardownForDaemonEvent(
+      { type: 'session.spawned', body: { session: { sessionId: 's1' } } },
+      seen,
+    )).toBeUndefined();
+
+    expect(previewTeardownForDaemonEvent(
+      { type: 'session.exited', body: { sessionId: 's1' } },
+      seen,
+    )).toBe('s1');
+    expect(seen.has('s1')).toBe(false);
   });
 });

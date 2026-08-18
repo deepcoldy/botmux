@@ -55,12 +55,16 @@ import {
 } from './dashboard/preview-content-capability.js';
 import {
   previewDescriptorFromRow,
+  previewTeardownForDaemonEvent,
   projectSessionDetailForBrowser,
   projectSessionPreviewEventForBrowser,
   projectSessionPreviewsForBrowser,
   resolveSessionPreviewForProxy,
 } from './dashboard/preview-contract.js';
-import { sessionPreviewTargetStillOwned } from './core/session-preview.js';
+import {
+  sameSessionPreviewTarget,
+  sessionPreviewTargetStillOwned,
+} from './core/session-preview.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
@@ -603,11 +607,18 @@ const sessionPreviewProxy = createSessionPreviewProxy({
   // server 的握手最长可以拖 45 秒；这段窗口里的登出/到期/rotate/解绑扫描不到一条
   // 还没入索引的流。所以登记前把身份重新解一遍并复核存活：解不出身份（cookie 那条
   // 路的会话已经没了）或已不存活，一律 fail closed，由代理销毁上游、不回 101/200。
+  // P1-1：同一段窗口里换靶也要 fail closed。身份没变、目标却已经换代 / 切 CLI /
+  // 端口易主时，旧流握完手照样能拿到 200/101，还会被**重新登记**进索引——换靶那一刻
+  // 的 teardown 扫的是索引，扫不到一条还没入索引的流。所以登记前把目标重解一遍
+  // （`resolveDashboardSessionPreview` 内含每跳的 owner 复核）并与拨号时那个比指纹：
+  // 不是同一次注册就不登记、不回 101/200，由代理销毁上游。
   bindStream: (req, ctx, close) => {
     const authSessionId = ctx.contentCapability
       ? previewContentCapabilityAuthSession(ctx.contentCapability, ctx.sessionId)
       : dashboardRequestIdentity(req)?.authSessionId ?? null;
     if (!authSessionId || !terminalAuthSessionLive(authSessionId)) return false;
+    const current = resolveDashboardSessionPreview(ctx.sessionId);
+    if (!current.ok || !sameSessionPreviewTarget(current.target, ctx.target)) return false;
     return authSessionConnections.register(authSessionId, close, ctx.sessionId);
   },
 });
@@ -618,16 +629,16 @@ const sessionPreviewProxy = createSessionPreviewProxy({
  * close），会话彻底结束时广播 `session.exited`。中央 Dashboard 订阅这些事件，把本地
  * 还挂着的预览长连接断掉、交互租约收回——否则「服务端已经没有目标了，浏览器那条流
  * 还在流」，而且 resume 之后旧的交互授权会直接落到新一代 CLI 上。
+ *
+ * P1-1：`session.spawned` 也要认。daemon 重启期间广播的 `preview: null` 是丢的（事件
+ * 总线没有 replay buffer），重连之后只以 spawned 重放形式补齐。判据与记忆都在
+ * `previewTeardownForDaemonEvent` 里——只有目标指纹**确实变了**才收口，否则每次 SSE
+ * 重连都会误杀全部预览长连接。
  */
+const lastSeenPreviewFingerprints = new Map<string, string>();
 aggregator.on(ev => {
-  if (ev.type === 'session.exited') {
-    teardownSessionPreview(ev.body.sessionId);
-    return;
-  }
-  if (ev.type !== 'session.update') return;
-  const patch = ev.body.patch as Record<string, unknown> | undefined;
-  if (!patch || !Object.prototype.hasOwnProperty.call(patch, 'previewTarget')) return;
-  teardownSessionPreview(ev.body.sessionId);
+  const sessionId = previewTeardownForDaemonEvent(ev, lastSeenPreviewFingerprints);
+  if (sessionId) teardownSessionPreview(sessionId);
 });
 const previewGuardPage = createPreviewGuardPage({
   authenticated: req => dashboardRequestIdentity(req) !== null,

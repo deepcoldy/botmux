@@ -3,6 +3,7 @@ import {
   previewBackendSupported,
   safeSessionPreviewTarget,
   sessionPreviewDescriptor,
+  sessionPreviewFingerprint,
   type SessionPreviewDescriptor,
   type SessionPreviewTarget,
 } from '../core/session-preview.js';
@@ -175,4 +176,58 @@ export function previewDescriptorFromRow(row: unknown): SessionPreviewDescriptor
   if (typeof source.sessionId !== 'string') return undefined;
   if (!previewBackendSupported(source.backendType)) return undefined;
   return sessionPreviewDescriptor(source.sessionId, source.previewTarget);
+}
+
+/**
+ * P1-1：daemon 生命周期事件 → 「这个会话的预览长连接要不要收口」。
+ *
+ * 原来只认两件事：`session.exited`，以及带 `previewTarget` 的 `session.update`。
+ * 漏掉的是 `session.spawned`——daemon 的 `/api/events` **每次**被连上都会把全部会话
+ * 重放成 spawned（SSE attach 的确定性重放），而 daemon 重启期间广播的
+ * `preview: null` 是丢的（事件总线没有 replay buffer），重连之后只以 spawned 形式
+ * 补齐。于是「目标已经没了，浏览器那条流还在流」这一支完全不在收口范围内。
+ *
+ * 但 spawned 不能无条件收口：aggregator 在通知监听器**之前**就把整行覆盖掉了，
+ * 每次 SSE 重连都会重放全部会话，无条件 teardown 等于每次重连误杀全部预览长连接。
+ * 所以 dashboard 侧自记一份「上次见过的目标指纹」，只有指纹**确实变了**才收口；
+ * 第一次见到某个会话不算变（那是重放/新建，不是换靶）。
+ *
+ * `lastSeenFingerprints` 由调用方持有并在此原地更新——收口判据和记忆必须是同一个
+ * 动作，分开写迟早会漏更新一条分支。
+ */
+export function previewTeardownForDaemonEvent(
+  event: { type: string; body: unknown },
+  lastSeenFingerprints: Map<string, string>,
+): string | undefined {
+  const body = event.body && typeof event.body === 'object' && !Array.isArray(event.body)
+    ? event.body as Record<string, unknown>
+    : {};
+  if (event.type === 'session.exited') {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+    if (!sessionId) return undefined;
+    lastSeenFingerprints.delete(sessionId);
+    return sessionId;
+  }
+  if (event.type === 'session.spawned') {
+    const row = body.session && typeof body.session === 'object' && !Array.isArray(body.session)
+      ? body.session as Record<string, unknown>
+      : undefined;
+    const sessionId = typeof row?.sessionId === 'string' ? row.sessionId : undefined;
+    if (!sessionId) return undefined;
+    const fingerprint = sessionPreviewFingerprint(row?.previewTarget);
+    const previous = lastSeenFingerprints.get(sessionId);
+    lastSeenFingerprints.set(sessionId, fingerprint);
+    return previous !== undefined && previous !== fingerprint ? sessionId : undefined;
+  }
+  if (event.type !== 'session.update') return undefined;
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const patch = body.patch && typeof body.patch === 'object' && !Array.isArray(body.patch)
+    ? body.patch as Record<string, unknown>
+    : undefined;
+  if (!sessionId || !patch || !Object.prototype.hasOwnProperty.call(patch, 'previewTarget')) {
+    return undefined;
+  }
+  // 记忆同步更新，否则下一次 SSE 重放会把「已经处理过的这次变更」再当成一次变更。
+  lastSeenFingerprints.set(sessionId, sessionPreviewFingerprint(patch.previewTarget));
+  return sessionId;
 }

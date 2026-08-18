@@ -93,10 +93,19 @@ export interface SessionPreviewProxyOptions {
    * 把一条活流挂到已经死掉的认证会话名下——从此再没有任何撤销能碰到它。本钩子因此
    * 是「登记点」也是「最后一次判定点」：调用方在这里重查存活，代理按 false 销毁
    * 上游、不登记、不回 101/200。
+   *
+   * P1-1：`context.target` 是**拨号那一刻**用的目标。同一段 45 秒窗口里换代 / 切
+   * CLI / 端口易主换来的新目标，旧流握完手照样能拿到 200/101，还会被重新登记进索引
+   * （换靶时的 teardown 扫的是索引，扫不到一条还没入索引的流）。所以调用方在这里
+   * 除了复核身份，还要把目标重解一遍与它比对——不是同一次注册就返回 false。
    */
   bindStream?: (
     req: IncomingMessage,
-    context: { sessionId: string; contentCapability: string | null },
+    context: {
+      sessionId: string;
+      contentCapability: string | null;
+      target: SessionPreviewTarget;
+    },
     close: () => void,
   ) => (() => void) | null | false;
 }
@@ -427,7 +436,7 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       // 动作；拨号期间被撤销的流在这里被拒，浏览器一个字节的预览内容都拿不到。
       const bound = options.bindStream?.(
         req,
-        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
+        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability, target },
         () => { upstream.destroy(); res.destroy(); },
       );
       if (bound === false) {
@@ -513,7 +522,7 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       // 的 socket，先回 101 再补登记就等于把它挂到一个已死的认证会话上。
       const bound = options.bindStream?.(
         req,
-        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability },
+        { sessionId: parsed.sessionId, contentCapability: parsed.contentCapability, target },
         () => { upstreamSocket.destroy(); clientSocket.destroy(); },
       );
       if (bound === false) {
