@@ -90,6 +90,16 @@ function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return '';
+}
+
 function pickNum(obj: any, keys: readonly string[]): number {
   if (!obj || typeof obj !== 'object') return 0;
   for (const key of keys) {
@@ -390,13 +400,18 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
  *  per-turn provider total (input includes cached input); companion
  *  signals.json supplies the live context gauge and user-facing model id. */
 function foldGrokLine(agg: TokenUsageAggregate, entry: any): void {
-  const meta = entry?.params?._meta ?? entry?.params?.update?._meta;
-  const contextTokens = num(meta?.totalTokens);
+  // Grok writes two sibling `_meta` objects. `params._meta` is almost always
+  // present (eventId / totalTokens) and must not shadow `update._meta.modelId`
+  // on `user_message_chunk` — that is the first-turn user-facing model before
+  // signals.json exists.
+  const paramsMeta = entry?.params?._meta;
+  const updateMeta = entry?.params?.update?._meta;
+  const contextTokens = num(paramsMeta?.totalTokens) || num(updateMeta?.totalTokens);
   if (contextTokens > 0) {
     agg.latestContextUsage = { usedTokens: contextTokens };
   }
-  const eventModel = meta?.modelId;
-  if (typeof eventModel === 'string' && eventModel) agg.model = eventModel;
+  const eventModel = firstNonEmptyString(updateMeta?.modelId, paramsMeta?.modelId);
+  if (eventModel) agg.model = eventModel;
   const update = entry?.params?.update;
   if (update?.sessionUpdate !== 'turn_completed') return;
   const u = update.usage;
@@ -1214,6 +1229,16 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
       ? summary.reasoning_effort.trim()
       : '';
     if (reasoningEffort) agg.reasoningEffort = reasoningEffort;
+    // signals.json is rewritten at turn end. A first-turn working card only
+    // has summary.current_model_id until then — use it when fold/signals
+    // did not already supply a model.
+    const summaryModel = typeof summary?.current_model_id === 'string'
+      ? summary.current_model_id.trim()
+      : '';
+    if (summaryModel && !agg.model) {
+      agg.model = summaryModel;
+      if (result) result = { ...result, model: summaryModel };
+    }
   } catch {
     // summary.json is also created lazily; reasoning effort is optional.
   }
