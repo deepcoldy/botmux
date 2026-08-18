@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  cursorBaselineOffset,
   drainCursorTranscript,
   cursorChatIdFromStoreDbPath,
   findCursorTranscriptByChatId,
@@ -247,5 +248,107 @@ describe('drainCursorTranscript', () => {
     const r2 = drainCursorTranscript(path, r1.newOffset);
     expect(r2.events).toEqual([]);
     expect(r2.newOffset).toBe(r1.newOffset);
+  });
+
+  const turnEnded = { type: 'turn_ended', status: 'success' };
+
+  it('never advances the offset past a trailing turn_ended status footer', () => {
+    const messages = line(userMsg('first')) + line(assistantFinal('reply'));
+    writeFileSync(path, messages + line(turnEnded));
+    const r = drainCursorTranscript(path, 0);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(r.newOffset).toBe(Buffer.byteLength(messages, 'utf8'));
+    // Re-drain from the held-back offset: the footer re-parses to zero events
+    // and the offset stays put — no duplicates, no progress.
+    const again = drainCursorTranscript(path, r.newOffset);
+    expect(again.events).toEqual([]);
+    expect(again.newOffset).toBe(r.newOffset);
+  });
+
+  it('holds the offset before a footer left at EOF without a trailing newline', () => {
+    const messages = line(userMsg('first')) + line(assistantFinal('reply'));
+    writeFileSync(path, messages + JSON.stringify(turnEnded));
+    const r = drainCursorTranscript(path, 0);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(r.newOffset).toBe(Buffer.byteLength(messages, 'utf8'));
+    expect(r.pendingTail).toBe('');
+  });
+
+  it('survives cursor\'s footer-truncating rewrite between turns (live regression)', () => {
+    // Turn 1 at rest: messages + turn_ended footer. Cursor's NEXT turn
+    // truncates the footer and writes the new user/assistant lines starting
+    // at the footer's old byte position, re-appending the footer at EOF.
+    // A drain that had consumed the footer would commit an offset INSIDE the
+    // next turn's user line and permanently miss its user event — observed
+    // live on cursor-agent 2026.08.11 (spawned session, turn 2 ghosted).
+    const turn1 = line(userMsg('turn one prompt')) + line(assistantFinal('turn one answer'));
+    writeFileSync(path, turn1 + line(turnEnded));
+    const r1 = drainCursorTranscript(path, 0);
+    expect(r1.events).toHaveLength(2);
+
+    const turn2 = line(userMsg('turn two prompt')) + line(assistantFinal('turn two answer'));
+    writeFileSync(path, turn1 + turn2 + line(turnEnded));
+    const r2 = drainCursorTranscript(path, r1.newOffset);
+    expect(r2.events.map(e => ({ kind: e.kind, text: e.text }))).toEqual([
+      { kind: 'user', text: 'turn two prompt' },
+      { kind: 'assistant_final', text: 'turn two answer' },
+    ]);
+  });
+
+  it('rewinds through a run of consecutive trailing status lines', () => {
+    const messages = line(userMsg('first')) + line(assistantFinal('reply'));
+    writeFileSync(path, messages + line(turnEnded) + line({ type: 'other_status' }));
+    const r = drainCursorTranscript(path, 0);
+    expect(r.newOffset).toBe(Buffer.byteLength(messages, 'utf8'));
+  });
+
+  it('a status line followed by message lines is consumed normally', () => {
+    writeFileSync(path,
+      line(turnEnded) + line(userMsg('after footer')) + line(assistantFinal('answer')));
+    const r = drainCursorTranscript(path, 0);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(r.newOffset).toBe(statSync(path).size);
+  });
+});
+
+describe('cursorBaselineOffset', () => {
+  const turnEnded = { type: 'turn_ended', status: 'success' };
+
+  it('returns undefined for a missing file', () => {
+    expect(cursorBaselineOffset(join(dir, 'nope.jsonl'))).toBeUndefined();
+  });
+
+  it('baselines to file size when the transcript ends with a message line', () => {
+    writeFileSync(path, line(userMsg('first')) + line(assistantFinal('reply')));
+    expect(cursorBaselineOffset(path)).toBe(statSync(path).size);
+  });
+
+  it('rewinds before a trailing turn_ended footer (with and without newline)', () => {
+    const messages = line(userMsg('first')) + line(assistantFinal('reply'));
+    writeFileSync(path, messages + line(turnEnded));
+    expect(cursorBaselineOffset(path)).toBe(Buffer.byteLength(messages, 'utf8'));
+    writeFileSync(path, messages + JSON.stringify(turnEnded));
+    expect(cursorBaselineOffset(path)).toBe(Buffer.byteLength(messages, 'utf8'));
+  });
+
+  it('skips a partial message tail like a plain size baseline (old in-flight output)', () => {
+    writeFileSync(path, line(userMsg('first')) + '{"role":"assistant","message":{"content"');
+    expect(cursorBaselineOffset(path)).toBe(statSync(path).size);
+  });
+
+  it('resume flow: baseline then footer-truncating rewrite still yields the next turn', () => {
+    const turn1 = line(userMsg('old prompt')) + line(assistantFinal('old answer'));
+    writeFileSync(path, turn1 + line(turnEnded));
+    const baseline = cursorBaselineOffset(path)!;
+    // History stays behind the baseline...
+    expect(drainCursorTranscript(path, baseline).events).toEqual([]);
+    // ...and the next turn's rewrite from the footer position is fully seen.
+    const turn2 = line(userMsg('new prompt')) + line(assistantFinal('new answer'));
+    writeFileSync(path, turn1 + turn2 + line(turnEnded));
+    const r = drainCursorTranscript(path, baseline);
+    expect(r.events.map(e => ({ kind: e.kind, text: e.text }))).toEqual([
+      { kind: 'user', text: 'new prompt' },
+      { kind: 'assistant_final', text: 'new answer' },
+    ]);
   });
 });

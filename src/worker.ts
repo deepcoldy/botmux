@@ -171,7 +171,7 @@ import {
   isStructuredBridgeFallbackActive,
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
-import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { cursorBaselineOffset, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -5383,6 +5383,18 @@ function codexBridgeStartTimer(): void {
           }
         }
         codexBridgeIngest();
+        // Cursor's mirror can flush THIS turn's user line as late as the end
+        // of the first assistant step (a tool-less reply flushes the whole
+        // turn at once, at the end). While the CLI is visibly busy the head's
+        // bounded attribution lease must not lapse waiting for that flush —
+        // refresh it each tick; the 20s countdown then effectively starts
+        // when the CLI goes idle, preserving the wedge protection for a
+        // swallowed Enter. Non-adopt only: adopt keeps its historical timing
+        // (an expired adopt mark degrades to local-turn synthesis, still
+        // visible in Lark).
+        if (!isPromptReady && !lastInitConfig?.adoptMode) {
+          codexBridgeQueue.refreshUnstartedHeadAttributionLease();
+        }
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -5694,6 +5706,20 @@ function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-exi
     }
   }
   codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode);
+  if (mode === 'baseline-existing') {
+    // A transcript at rest ends with cursor's `turn_ended` status footer, and
+    // the next turn REWRITES from that footer's byte position. A plain size
+    // baseline would sit PAST it, so the next user line would start behind the
+    // committed offset and never be ingested (turn never starts, fallback
+    // ghosts). Rewind the baseline to the footer's start; the footer re-parses
+    // to zero events so nothing duplicates.
+    const rewound = cursorBaselineOffset(path);
+    if (rewound !== undefined && rewound < codexBridgeOffset) {
+      log(`Cursor bridge baseline rewound before trailing status footer: ${codexBridgeOffset} → ${rewound}`);
+      codexBridgeOffset = rewound;
+      codexBridgePendingTail = '';
+    }
+  }
 }
 
 /** Drop the current file-backed bridge attachment (watcher + path cursor).

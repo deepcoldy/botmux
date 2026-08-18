@@ -238,9 +238,29 @@ function eventFromLine(path: string, lineStart: number, obj: any, timestampMs: n
   return undefined;
 }
 
+/** True for a parsed JSONL object that is NOT a conversation message —
+ *  cursor-agent's status/footer lines like `{"type":"turn_ended",
+ *  "status":"success"}`. These are NOT append-only: cursor appends one at EOF
+ *  when a turn ends, then the NEXT turn's flush truncates it away and writes
+ *  the new user/assistant lines starting at the footer's old byte position
+ *  (footer re-appended at the new EOF). */
+function isStatusFooterObject(obj: any): boolean {
+  return (obj?.role ?? obj?.message?.role) === undefined;
+}
+
 /** Increment-read the transcript from `fromOffset`. Mirrors the byte-offset
  *  contract of codex-transcript.drainCodexRollout so the worker can reuse the
- *  same fs.watch / poll wakeup machinery and the shared CodexBridgeQueue. */
+ *  same fs.watch / poll wakeup machinery and the shared CodexBridgeQueue.
+ *
+ *  Footer invariant: `newOffset` NEVER advances past a trailing run of parsed
+ *  status/footer objects (see isStatusFooterObject). Consuming the footer
+ *  would strand the offset at the old EOF — the next turn REWRITES from the
+ *  footer's start, so the new user line would begin BEHIND the committed
+ *  offset and the drain would only ever see a mid-line fragment of it (the
+ *  turn then never fingerprint-matches and the send-less fallback ghosts,
+ *  observed live on cursor-agent 2026.08.11). Leaving the offset at the
+ *  footer's start costs a ~40-byte re-read per poll and re-parses to zero
+ *  events, so no duplicates can result. */
 export function drainCursorTranscript(path: string, fromOffset: number): CursorDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: fromOffset, pendingTail: '' };
   let size: number;
@@ -249,7 +269,9 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
   // Cursor's mirror can briefly disappear / shrink while it rewrites. Do not
   // reset to 0 here: replaying the full history pollutes attribution state and
   // can wedge a live turn behind old events. Wait for the mirror to grow past
-  // the last consumed byte instead.
+  // the last consumed byte instead. (The footer rewind above keeps the
+  // committed offset at the truncation point, so the equal-size no-op window
+  // during a footer-truncate is expected and harmless.)
   if (size < start) return { events: [], newOffset: fromOffset, pendingTail: '' };
   if (size === start) return { events: [], newOffset: start, pendingTail: '' };
 
@@ -264,8 +286,12 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
   let newOffset = start + Buffer.byteLength(completeText, 'utf8');
 
   const events: CodexBridgeEvent[] = [];
+  // Byte start of the current TRAILING run of parsed status/footer lines.
+  // Reset by any message line or unparseable fragment; blank lines don't
+  // break the run. When set after the scan, newOffset rewinds to it.
+  let trailingFooterStart: number | undefined;
   // Track byte offset within the file so synthetic uuids are stable across
-  // re-drains (the transcript is append-only).
+  // re-drains (message lines are append-only; only the footer moves).
   let cursor = start;
   for (const line of completeText.split('\n')) {
     if (line.length === 0) {
@@ -276,7 +302,15 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
     const lineStart = cursor;
     cursor += lineByteLen;
     let obj: any;
-    try { obj = JSON.parse(line); } catch { continue; }
+    try { obj = JSON.parse(line); } catch {
+      trailingFooterStart = undefined;
+      continue;
+    }
+    if (isStatusFooterObject(obj)) {
+      trailingFooterStart ??= lineStart;
+      continue;
+    }
+    trailingFooterStart = undefined;
     // No per-event timestamp in Cursor's JSONL — stamp with the drain
     // wall-clock. Combined with byte-offset baselining at attach, this keeps
     // the CodexBridgeQueue freshness gates happy without a real timestamp.
@@ -287,18 +321,91 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
 
   // Cursor frequently leaves the final JSON object at EOF without a trailing
   // newline until the next turn mutates the mirror. If the tail is already a
-  // complete JSON object, consume it now; otherwise keep it pending.
+  // complete JSON object, consume it now (message) or hold the offset before
+  // it (status footer); otherwise keep it pending.
   if (pendingTail.length > 0) {
     try {
       const lineStart = newOffset;
       const obj = JSON.parse(pendingTail);
-      const ev = eventFromLine(path, lineStart, obj, Date.now());
-      if (ev) events.push(ev);
-      newOffset = size;
+      if (isStatusFooterObject(obj)) {
+        trailingFooterStart ??= lineStart;
+      } else {
+        trailingFooterStart = undefined;
+        const ev = eventFromLine(path, lineStart, obj, Date.now());
+        if (ev) events.push(ev);
+        newOffset = size;
+      }
       pendingTail = '';
     } catch {
       // Still being written.
     }
   }
+  if (trailingFooterStart !== undefined) {
+    newOffset = trailingFooterStart;
+    pendingTail = '';
+  }
   return { events, newOffset, pendingTail };
+}
+
+const BASELINE_FOOTER_PROBE_BYTES = 64 * 1024;
+
+/** Baseline offset for attaching to an EXISTING cursor transcript (resume /
+ *  restart re-attach): the byte frontier future drains should start from.
+ *  Like a plain size baseline this leaves all history (and any partial tail —
+ *  old in-flight output) behind the offset, but REWINDS before a trailing run
+ *  of status/footer lines so the next turn's footer-truncating rewrite (see
+ *  drainCursorTranscript) starts exactly at the committed offset instead of
+ *  behind it. Returns undefined when the file is missing/unreadable so the
+ *  caller can keep its existing degrade path. */
+export function cursorBaselineOffset(path: string): number | undefined {
+  let size: number;
+  try {
+    if (!existsSync(path)) return undefined;
+    size = statSync(path).size;
+  } catch { return undefined; }
+  if (size === 0) return 0;
+
+  const len = Math.min(size, BASELINE_FOOTER_PROBE_BYTES);
+  const probeStart = size - len;
+  const buf = Buffer.alloc(len);
+  let read = 0;
+  try {
+    const fd = openSync(path, 'r');
+    try { read = readSync(fd, buf, 0, len, probeStart); } finally { closeSync(fd); }
+  } catch { return undefined; }
+  const probe = buf.subarray(0, read).toString('utf8');
+
+  // Walk the probe's line layout forward, tracking the same trailing-footer
+  // run the drain uses. The first probe segment may be a mid-line fragment
+  // (probe boundary), which safely resets the run via its parse failure.
+  const lastNl = probe.lastIndexOf('\n');
+  const completeText = lastNl >= 0 ? probe.slice(0, lastNl + 1) : '';
+  const tail = lastNl >= 0 ? probe.slice(lastNl + 1) : probe;
+  let trailingFooterStart: number | undefined;
+  let cursor = probeStart;
+  for (const line of completeText.split('\n')) {
+    if (line.length === 0) { cursor += 1; continue; }
+    const lineStart = cursor;
+    cursor += Buffer.byteLength(line, 'utf8') + 1;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch {
+      trailingFooterStart = undefined;
+      continue;
+    }
+    if (isStatusFooterObject(obj)) trailingFooterStart ??= lineStart;
+    else trailingFooterStart = undefined;
+  }
+  if (tail.length > 0) {
+    // A parseable status-footer tail joins the run; a message tail (old
+    // in-flight output) or a still-being-written fragment is skipped like the
+    // plain size baseline does. Tail start is derived from completeText's byte
+    // length, NOT the loop cursor — the split's trailing empty segment would
+    // otherwise inflate the cursor by one.
+    const tailStart = probeStart + Buffer.byteLength(completeText, 'utf8');
+    try {
+      if (isStatusFooterObject(JSON.parse(tail))) trailingFooterStart ??= tailStart;
+      else trailingFooterStart = undefined;
+    } catch { trailingFooterStart = undefined; }
+  }
+  return trailingFooterStart ?? size;
 }
