@@ -17,6 +17,7 @@ import {
   selectWorkbenchSkin,
   selectWorkbenchTermStyle,
   workbenchSkinFamily,
+  workbenchTermCanvasStyle,
   workbenchTermContainerClass,
   workbenchTermTheme,
   type WorkbenchAppearance,
@@ -344,6 +345,28 @@ describe('工作台外观 store：落到文档根 / 跨 tab / 跟随系统', () 
     expect(h.store.getSnapshot()).toBe(stable);
     expect(notified).toBe(0);
     unmount();
+  });
+
+  it('终端外壳底色跟随实际渲染风格：Orca=皮肤 --term-bg，经典=经典预设的真实底色', () => {
+    // 外壳（.wb-pane-frame-shell）那圈安全边距原本刷皮肤令牌 --term-bg。Orca 下两者
+    // 本来同色，可经典渲染的 xterm 底是它自己的 #1a1b26，于是画布外露出一圈更黑的
+    // 边框 —— 线上反馈的「经典终端黑色边框」。这个函数把外壳底色接到**同一份**
+    // theme 上（也就是同一次 postMessage 下发给 iframe 的那份），不存在第二份字面量。
+    const css = readFileSync('src/dashboard/web/style.css', 'utf8');
+    for (const skin of WORKBENCH_SKIN_IDS) {
+      // 经典：恒等于终端页那份 Tokyo Night 底色，与皮肤无关。
+      expect(workbenchTermCanvasStyle('classic', skin)['--term-canvas-bg'], skin)
+        .toBe(WORKBENCH_CLASSIC_TERM_THEME.background);
+      // Orca：等于该皮肤的 xterm 底色，而它按设计规范就等于这套皮肤的 --term-bg 令牌。
+      const orcaBg = workbenchTermCanvasStyle('orca', skin)['--term-canvas-bg'];
+      expect(orcaBg, skin).toBe(WORKBENCH_ORCA_TERM_THEMES[skin].background);
+      const anchor = `:root[data-skin="${skin}"] .agent-workbench-dock`;
+      const body = css.slice(css.indexOf(anchor), css.indexOf('}', css.indexOf(anchor)));
+      expect(body.toLowerCase(), `${skin} 的 --term-bg`).toContain(`--term-bg: ${orcaBg.toLowerCase()};`);
+    }
+    // 两套风格必须真的不同色，否则这次修复什么也没修。
+    expect(workbenchTermCanvasStyle('classic', 'slate-blue')['--term-canvas-bg'])
+      .not.toBe(workbenchTermCanvasStyle('orca', 'slate-blue')['--term-canvas-bg']);
   });
 
   it('没有 localStorage / 没有文档根也照常工作，只是不落盘', () => {

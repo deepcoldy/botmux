@@ -15175,9 +15175,13 @@ window.addEventListener('message',function(_ev){
   if(!_theme)return;
   try{
     term.options.theme=_theme;
-    // Orca 是大行距（≈1.55）；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
+    // Orca 是大行距 1.3；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
     // 经典那套色值与上面写死的字面量逐色相同，所以没开 Orca 的用户零变化。
-    term.options.lineHeight=_d.termStyle==='orca'?1.55:1;
+    // 这两个数字的唯一出处是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts），
+    // 接缝测试按那张表比对这一行的字面量：改一处必须两处一起改。
+    // 曾经是 1.55，单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome（提示 + 输入框 +
+    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走。
+    term.options.lineHeight=_d.termStyle==='orca'?1.3:1;
     // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
     fit.fit();
   }catch(_e){}

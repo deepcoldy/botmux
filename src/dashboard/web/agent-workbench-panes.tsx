@@ -34,6 +34,7 @@ import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 import { useTerminalViewLink, useTouchEnvironment } from './agent-workbench-touch.js';
 import {
   postWorkbenchTermAppearance,
+  workbenchTermCanvasStyle,
   workbenchTermContainerClass,
 } from './agent-workbench-appearance.js';
 import {
@@ -328,6 +329,9 @@ export function TerminalPane(props: PaneCommonProps & {
   return (
     <section
       className={`wb-pane wb-terminal-pane ${workbenchTermContainerClass(appearance.termStyle)}`}
+      // 外壳那圈安全边距的底色 = 这一刻真正渲染出来的 xterm 底色（同一个
+      // workbenchTermTheme 也在往 iframe 里推），经典渲染下才不会露出一圈更黑的边。
+      style={workbenchTermCanvasStyle(appearance.termStyle, skin) as CSSProperties}
       aria-label="终端面板"
     >
       <header className="wb-pane-titlebar">

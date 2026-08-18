@@ -5,6 +5,7 @@ import {
   workbenchListItemHeight,
   type WorkbenchListItem,
 } from '../src/dashboard/web/agent-workbench-model.js';
+import { WORKBENCH_TERM_LINE_HEIGHTS } from '../src/dashboard/web/agent-workbench-appearance.js';
 
 /** 每一条给 `.wb-session-row` 定死高度的规则，按出现顺序。
  *  只认整条 `height` 声明：`min-height` 不是虚拟滚动摆放行的依据。 */
@@ -202,5 +203,68 @@ describe('Agent Workbench visual contract', () => {
     expect(block).toContain('.wb-mode-chip');
     expect(block).toContain('.wb-chat-contract');
     expect(block).toContain('@media (prefers-reduced-motion: reduce)');
+  });
+
+  it('会话行的左右内边距把字形挡在高亮底板的圆角裁切区之外', () => {
+    // 高亮底板是 .wb-session-row::before 那块圆角药丸，行本身始终透明。字形离底板
+    // 左缘只有几像素时，圆角边界 + 选中态那条 2px accent 内影会直接压在字上，读起来
+    // 就是「行首被切掉一块」——这正是线上反馈的那个缺陷。规范的既有结论是
+    // 「文字左内边距 ≥ 圆角半径」，这条把它变成不会再漂走的硬约束。
+    // `.wb-session-row {` 在段里出现好几次（虚拟滚动的定位、行高、断点覆盖），
+    // 要的是声明了 padding 的那一条；注释先剥掉，免得说明文字里的数字被当成声明。
+    const bare = block.replace(/\/\*[\s\S]*?\*\//g, '');
+    const rowRule = [...bare.matchAll(/\.wb-session-row\s*\{([^{}]*)\}/g)]
+      .map(match => match[1]).find(body => /(?:^|;)\s*padding:/.test(body)) ?? '';
+    const padding = /(?:^|;)\s*padding:\s*([^;]+)/.exec(rowRule)?.[1].trim().split(/\s+/) ?? [];
+    expect(padding.length, '行的 padding 必须是四值写法（上 右 下 左）').toBe(4);
+    const [, right, , left] = padding.map(value => Number.parseFloat(value));
+
+    const boardRule = /\.wb-session-row::before\s*\{([^{}]*)\}/.exec(bare)?.[1] ?? '';
+    const inset = /inset:\s*([^;]+)/.exec(boardRule)?.[1].trim().split(/\s+/) ?? [];
+    expect(inset.length, '底板的 inset 必须是两值写法（纵 横）').toBe(2);
+    const boardSide = Number.parseFloat(inset[1]);
+    // 底板圆角取 --radius-lg；半径的数字由上面「圆角收成三档」那条钉死。
+    expect(boardRule).toContain('border-radius: var(--radius-lg)');
+    const radius = 14;
+
+    expect(left - boardSide, '左内边距距底板左缘').toBeGreaterThanOrEqual(radius);
+    // 右边挂的是 meta 行的时间戳，字形底部落在底板下方圆角的水平带里，弧线在那个高度
+    // 只内收 2.4px 左右，所以右侧要求比左侧宽松，但仍要留出可见净空。
+    expect(right - boardSide, '右内边距距底板右缘').toBeGreaterThanOrEqual(6);
+    // 组头的折叠箭头和行的状态标共用一条竖直基线，两者内边距必须一致。
+    const groupRule = [...bare.matchAll(/\.wb-session-group\s*\{([^{}]*)\}/g)]
+      .map(match => match[1]).find(body => /(?:^|;)\s*padding:/.test(body)) ?? '';
+    const groupPadding = /padding:\s*([^;]+)/.exec(groupRule)?.[1].trim().split(/\s+/) ?? [];
+    expect(groupPadding.length).toBe(4);
+    expect(Number.parseFloat(groupPadding[3]), '组头左内边距').toBe(left);
+    expect(Number.parseFloat(groupPadding[1]), '组头右内边距').toBe(right);
+  });
+
+  it('终端外壳的底色跟随实际生效的渲染风格，不是皮肤令牌', () => {
+    // 经典渲染的 xterm 底色是它自己的 Tokyo Night #1a1b26，皮肤的 --term-bg 是
+    // #030407 一类；外壳那圈 8px 安全边距刷 --term-bg 就会在画布外露出一道更黑的框。
+    // 现在外壳读 --term-canvas-bg —— 由 workbenchTermCanvasStyle() 写成内联变量，
+    // 取值就是同一次下发给终端 iframe 的那份 theme.background，两边不可能不同色。
+    for (const selector of ['.wb-pane', '.wb-pane-frame-shell', '.wb-pane-frame']) {
+      const rule = new RegExp(`\\${selector}\\s*\\{([^{}]*)\\}`).exec(block)?.[1] ?? '';
+      expect(rule, selector).toMatch(/background:\s*var\(--term-canvas-bg,\s*var\(--term-bg\)\)/);
+    }
+    // 变量没设上时回落 --term-bg：网页预览面板走的就是这条，改动前后完全一致。
+    expect(block).not.toMatch(/\.wb-pane-frame-shell\s*\{[^{}]*background:\s*var\(--term-bg\)\s*;/);
+  });
+
+  it('两套渲染风格的 --term-line-height 与 TS 侧的唯一出处一致', () => {
+    // 真正落到 xterm 上的是终端页那行 term.options.lineHeight（bridge 测试钉住），
+    // CSS 这两个变量只做声明与查阅——但声明错了就会误导下一个改这里的人，
+    // 曾经 classic 写着 1.4、实际跑的是 1，就是这么漂出来的。
+    for (const [style, expected] of Object.entries(WORKBENCH_TERM_LINE_HEIGHTS)) {
+      const rule = new RegExp(`\\.wb-term-${style}\\s*\\{([^{}]*)\\}`).exec(block)?.[1] ?? '';
+      const value = /--term-line-height:\s*([\d.]+)/.exec(rule)?.[1];
+      expect(value, `.wb-term-${style} 的 --term-line-height`).toBeDefined();
+      expect(Number(value), `.wb-term-${style} 的 --term-line-height`).toBe(expected);
+    }
+    // Orca 明显比经典松（正文呼吸感），但不至于把底部 chrome 撑到占屏。
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.orca).toBeGreaterThan(WORKBENCH_TERM_LINE_HEIGHTS.classic * 1.2);
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.orca).toBeLessThanOrEqual(1.35);
   });
 });

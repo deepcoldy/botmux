@@ -27736,7 +27736,7 @@ button.skills-issue-badge:hover {
      挂在任意祖先上都生效（继承），iframe 内的取值由 TS 侧读这里再 postMessage 下发。
      默认取 classic（现状渲染）。 */
   --term-pad: 4px 8px 8px 8px;
-  --term-line-height: 1.4;
+  --term-line-height: 1;
   --term-font-size: 12px;
   color: var(--text-1);
   background: var(--bg-l0);
@@ -28076,7 +28076,9 @@ button.skills-issue-badge:hover {
   grid-template-columns: 14px 1fr auto;
   align-items: center;
   gap: 4px;
-  padding: 5px 9px 3px;
+  /* 组头的折叠箭头必须和它下面那些行的状态标共用一条竖直基线，所以左右内边距跟着
+     .wb-session-row 走（22 / 14），不再是自己的一份 9px。 */
+  padding: 5px 14px 3px 22px;
   color: var(--text-3);
   font-size: 11px;
   letter-spacing: .09em;
@@ -28089,7 +28091,13 @@ button.skills-issue-badge:hover {
   grid-template-columns: 14px minmax(0, 1fr);
   align-items: center;
   gap: 4px;
-  padding: 6px 8px;
+  /* 左内边距 22 = 高亮底板左缘（::before 的 inset 左 8）+ 圆角半径（--radius-lg 14）。
+     原来是 8px，正好等于底板左缘 —— 状态标那一格距底板左缘 0px，字形直接压在圆角
+     边界上，选中态那条 2px accent 内影更是从字形上横穿过去，读起来就是「行首被切掉
+     一块」。规范的既有结论是「文字左内边距 ≥ 圆角半径」，这里把它补齐。
+     右 14 同理留出弧线余量：meta 行的时间戳贴在右内边距上，它的字形底部落在底板下方
+     圆角的水平带里，8px 已经只剩 5.6px 净空，再窄就会啃到弧线。 */
+  padding: 6px 14px 6px 22px;
   /* 每行一条通栏横线原本一屏 18 条，还横穿圆角高亮底板，把药丸上下切平。整条删掉，
      行间关系交给留白节奏（项间留白 ÷ 项内行距 ≥ 2.5）+ 分组组头 + 选中底板。
      选中态的 accent 竖条也不再是 border-left（方头、和圆角底板中间夹 5px 缝），
@@ -28318,7 +28326,8 @@ button.skills-issue-badge:hover {
   grid-template-rows: 34px auto minmax(0, 1fr);
   border: 0;
   border-radius: 0;
-  background: var(--term-bg);
+  /* 与外壳同一个变量：面板骨架露出来的那几像素也不能是第二种黑。 */
+  background: var(--term-canvas-bg, var(--term-bg));
   box-shadow: none;
   overflow: hidden;
 }
@@ -28390,7 +28399,12 @@ button.skills-issue-badge:hover {
 /* 没有反馈文案时整行让位：grid 的第二轨是 auto，display:none 之后它收成 0。 */
 .wb-pane-feedback:empty { display: none; }
 /* 终端画布。三件事：
-   ① 底色改读 --term-bg，不再硬编码一个既不属于工作台、也不属于终端页的第三种黑；
+   ① 底色读 --term-canvas-bg：那是**这一刻真正渲染出来的 xterm 底色**，由 TS 侧的
+      workbenchTermCanvasStyle() 把 workbenchTermTheme() 的 background 写成内联变量
+      （同一份 theme 也在往终端 iframe 里推，所以外壳和画布永远同源同色）。
+      只读 --term-bg 的老写法在经典渲染下必然露边：经典 xterm 的底是它自己的
+      #1a1b26，皮肤令牌是 #030407 一类，画布外那圈安全边距就成了一道更黑的框。
+      变量没设上时回落 --term-bg，与改动前完全一致（网页预览面板走的就是这条）。
    ② 左安全边距 8px 由这层的 padding 给 —— 外壳和 iframe 同底色，视觉上就是终端本色
       铺满，但第 0 列字形不会贴在会话栏色块的交界上被抗锯齿吃掉半个。这条与是否有
       圆角要内切无关：没有圆角要躲，不等于可以归零；
@@ -28402,10 +28416,10 @@ button.skills-issue-badge:hover {
   position: relative;
   min-height: 0;
   padding: var(--term-pad);
-  background: var(--term-bg);
+  background: var(--term-canvas-bg, var(--term-bg));
   overflow: hidden;
 }
-.wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: var(--term-bg); }
+.wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: var(--term-canvas-bg, var(--term-bg)); }
 
 /* 网页预览面板复用同一套 .wb-pane 骨架，但它装的是普通网页不是终端：底色回到 L2，
    也不需要为字形留安全边距。 */
@@ -28417,15 +28431,18 @@ button.skills-issue-badge:hover {
    两套 xterm theme 预设承担。class 挂在工作台根或终端面板上都行 —— 下面三个变量是
    可继承的，落到 .wb-pane-frame-shell 和 iframe 下发通道上都读得到。
    classic = 现状渲染（存量零变化），orca = 规范里更松的行距与更大的呼吸。
-   两套都保留 8px 左安全边距，这条不因风格而失效。 */
+   两套都保留 8px 左安全边距，这条不因风格而失效。
+   ⚠️ --term-line-height 是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts）
+   的 CSS 侧副本：真正落到 xterm 上的是终端页那行 term.options.lineHeight，这里只做
+   声明与查阅。两处必须一字不差，agent-workbench-style.test.ts 按那张表比对。 */
 .wb-term-classic {
   --term-pad: 4px 8px 8px 8px;
-  --term-line-height: 1.4;
+  --term-line-height: 1;
   --term-font-size: 12px;
 }
 .wb-term-orca {
   --term-pad: 6px 8px 8px 8px;
-  --term-line-height: 1.55;
+  --term-line-height: 1.3;
   --term-font-size: 12px;
 }
 .wb-pane-empty {
@@ -28973,7 +28990,8 @@ body:has(.workbench-route-host) { min-width: 0; }
 .wb-session-row-actions {
   position: absolute;
   top: 50%;
-  right: 8px;
+  /* 和行的右内边距对齐：浮层自己带边和阴影，压在底板圆角上会看出两层圆弧不同心。 */
+  right: 14px;
   z-index: 2;
   display: flex;
   gap: 4px;

@@ -5,6 +5,7 @@ import {
   WORKBENCH_CLASSIC_TERM_THEME,
   WORKBENCH_ORCA_TERM_THEMES,
   WORKBENCH_SKIN_IDS,
+  WORKBENCH_TERM_LINE_HEIGHTS,
   WORKBENCH_TERM_STYLES,
   workbenchTermAppearanceMessage,
 } from '../src/dashboard/web/agent-workbench-appearance.js';
@@ -124,14 +125,31 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
     }
   });
 
-  it('Orca 走大行距 1.55，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
+  it('Orca 走大行距 1.3，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
+    // 1.3 而不是最初的 1.55：1.55 下单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome
+    // （提示 + 输入框 + 状态条）要吃掉约 196px，一屏四分之一全是 chrome。1.3 仍比经典
+    // 的 1.0 松三成，正文呼吸感还在，chrome 收回约 16%。
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.orca).toBe(1.3);
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.classic).toBe(1);
+
     const orca = bootTerminalPage();
     orca.fire(workbenchTermAppearanceMessage('orca', 'orca-ink'));
-    expect(orca.term.options.lineHeight).toBe(1.55);
+    expect(orca.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.orca);
 
     const classic = bootTerminalPage();
     classic.fire(workbenchTermAppearanceMessage('classic', 'orca-ink'));
-    expect(classic.term.options.lineHeight).toBe(1);
+    expect(classic.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.classic);
+  });
+
+  it('终端页那行行距字面量与 WORKBENCH_TERM_LINE_HEIGHTS 同源（改一处必须两处一起改）', () => {
+    // 终端页住在 worker.ts 的模板字符串里、没法 import，所以行距只能是抄过去的字面量。
+    // 上一条已经用真实监听器验过行为；这一条再把源码里那行三元钉死，任何一侧单方面
+    // 改数字（比如只改了 CSS 的 --term-line-height）都会在这里断掉。
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const found = /term\.options\.lineHeight=_d\.termStyle==='orca'\?([\d.]+):([\d.]+);/.exec(source);
+    expect(found, 'worker.ts 里找不到行距那行三元').not.toBeNull();
+    expect(Number(found?.[1])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.orca);
+    expect(Number(found?.[2])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.classic);
   });
 
   it('经典风的色值与终端页里写死的那份逐色相同 —— 没开 Orca 的用户零变化', () => {

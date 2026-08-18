@@ -283,6 +283,47 @@ export function workbenchTermTheme(
   return termStyle === 'orca' ? WORKBENCH_ORCA_TERM_THEMES[skin] : WORKBENCH_CLASSIC_TERM_THEME;
 }
 
+/**
+ * xterm 的 `lineHeight`。这是**唯一**的出处：终端页那段监听器（src/worker.ts 的模板
+ * 字符串，没法 import）必须照抄同样的数字，接缝测试按这张表比对它的字面量；
+ * `.wb-term-classic / .wb-term-orca` 的 `--term-line-height` 同样按这张表对齐。
+ *
+ * Orca 从 1.55 降到 1.3：1.55 下单元格高 ≈24.5px，CLI 的底部 chrome（提示 + 输入框 +
+ * 状态条，固定占 8 个终端行）就要吃掉约 196px —— 900 高的窗口里四分之一屏全是 chrome。
+ * 1.3 仍比经典的 1.0 松三成，正文呼吸感在，chrome 收回约 16%、可视行数多出两成。
+ * `classic` 恒为 1 = xterm 默认，「经典 = 原样」的一部分。
+ */
+export const WORKBENCH_TERM_LINE_HEIGHTS: Record<WorkbenchTermStyle, number> = {
+  orca: 1.3,
+  classic: 1,
+};
+
+export function workbenchTermLineHeight(termStyle: WorkbenchTermStyle): number {
+  return WORKBENCH_TERM_LINE_HEIGHTS[termStyle] ?? WORKBENCH_TERM_LINE_HEIGHTS.classic;
+}
+
+/** 终端外壳（安全边距那圈）要刷的底色变量名。见 `workbenchTermCanvasStyle`。 */
+export const WORKBENCH_TERM_CANVAS_BG_VAR = '--term-canvas-bg';
+
+/**
+ * 终端面板外壳的底色 —— 跟着**实际生效的终端渲染风格**走，而不是跟着皮肤令牌走。
+ *
+ * 外壳（`.wb-pane-frame-shell`）给字形留了 8px 安全边距，这圈底色原本刷的是皮肤的
+ * `--term-bg`。Orca 时两者本来就同色（`WORKBENCH_ORCA_TERM_THEMES[skin].background`
+ * 逐套等于该皮肤的 `--term-bg`），可经典渲染的 xterm 底色是它自己的 Tokyo Night
+ * `#1a1b26`，和 `--term-bg`（如 slate-blue 的 `#030407`）差一大截，画布外就露出一圈
+ * 更黑的边框 —— 用户看到的「经典终端黑色边框」就是它。
+ *
+ * 取值直接来自 `workbenchTermTheme()`，也就是同一次下发给终端 iframe 的那份 theme：
+ * 外壳和画布永远同源同色，不存在第二份字面量。
+ */
+export function workbenchTermCanvasStyle(
+  termStyle: WorkbenchTermStyle,
+  skin: WorkbenchSkinId,
+): Record<string, string> {
+  return { [WORKBENCH_TERM_CANVAS_BG_VAR]: workbenchTermTheme(termStyle, skin).background };
+}
+
 /** 父页 → 终端 iframe 的一次外观下发。终端页只认这一个消息类型。 */
 export const WORKBENCH_TERM_APPEARANCE_MESSAGE = 'botmux:wb-appearance';
 
