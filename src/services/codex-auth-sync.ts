@@ -72,10 +72,10 @@ export function provisionCodexAuth(options: ProvisionCodexAuthOptions): string {
     } catch (error) {
       throw new Error(`unsafe per-bot Codex auth file: ${(error as Error).message}`);
     }
-    options.log(`[read-isolation] Codex auth policy=isolated path=${authDst} credential=${present ? 'present' : 'missing'}`);
+    options.log(`[codex-auth] policy=isolated path=${authDst} credential=${present ? 'present' : 'missing'}`);
     if (!present) {
       options.log(
-        `[read-isolation] WARN Codex auth policy=isolated has no credential at ${authDst}; `
+        `[codex-auth] WARN policy=isolated has no credential at ${authDst}; `
         + `run CODEX_HOME=${codexHome} codex login --with-api-key before starting this bot`,
       );
     }
@@ -85,7 +85,7 @@ export function provisionCodexAuth(options: ProvisionCodexAuthOptions): string {
   const globalCodexHome = options.globalCodexHome ?? join(homedir(), '.codex');
   const authSrc = join(globalCodexHome, 'auth.json');
   const sourcePresent = existsSync(authSrc);
-  options.log(`[read-isolation] Codex auth policy=shared source=${authSrc} destination=${authDst} credential=${sourcePresent ? 'present' : 'missing'}`);
+  options.log(`[codex-auth] policy=shared source=${authSrc} destination=${authDst} credential=${sourcePresent ? 'present' : 'missing'}`);
   if (!sourcePresent) return codexHome;
 
   const raw = readFileSync(authSrc, 'utf8');

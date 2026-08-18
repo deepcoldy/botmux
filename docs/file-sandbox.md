@@ -15,9 +15,7 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
 
 ## Codex 的 per-bot 登录态
 
-沙箱开启且 Codex adapter 支持 CLI 数据重定向时，botmux 会把 `CODEX_HOME`
-指向 `<BOTMUX_HOME>/bots/<larkAppId>/codex`。`codexAuthSync` 控制这个目录里的
-`auth.json` 如何获得凭证：
+`codexAuthSync` 控制 Codex 使用全局登录态还是该 bot 的独立登录态：
 
 ```json
 {
@@ -27,9 +25,11 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
 }
 ```
 
-- 缺省或 `shared`：保持旧版行为，每次冷启动都用全局 `~/.codex/auth.json`
-  刷新 per-bot 副本。全局重新登录后，下次冷启动自动同步。
-- `isolated`：从不读取或复制全局 auth。首次启动前在该 bot 的私有 home 中执行
+- 缺省或 `shared`：保持旧版行为。非沙箱直接使用全局 `~/.codex`；沙箱把
+  `CODEX_HOME` 指向 per-bot 目录，并在每次冷启动用全局 `~/.codex/auth.json`
+  刷新其中的 auth 副本。全局重新登录后，下次冷启动自动同步。
+- `isolated`：无论是否启用沙箱，都把 `CODEX_HOME` 指向
+  `<BOTMUX_HOME>/bots/<larkAppId>/codex`，且从不读取或复制全局 auth。首次启动前执行
   `CODEX_HOME=<BOTMUX_HOME>/bots/<larkAppId>/codex codex login --with-api-key`。
   缺少凭证时 worker 只记录路径、策略和明确登录指引，不记录 key/token/auth 内容。
 
@@ -37,9 +37,9 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
 私有 `auth.json` 在 daemon 重启、会话休眠/恢复和其它冷启动中保持不变。凭证文件
 始终为 `0600`，符号链接或逃出 BOT_HOME 的 Codex 目录会被拒绝。
 
-注意：`sandbox: false` 时 botmux 不重定向 `CODEX_HOME`，Codex 按自身默认使用
-全局 `~/.codex` 和全局登录态；仅设置 `codexAuthSync: "isolated"` 并不能为非沙箱
-会话创建独立 auth 文件。
+注意：`sandbox: false` 只表示不启用 OS 文件访问隔离。缺省的 `shared` 仍使用
+全局 `~/.codex`；显式设置 `codexAuthSync: "isolated"` 则仍会使用独立
+`CODEX_HOME`，但不会阻止该 CLI 读取其它宿主文件。
 
 `bots.json` 的 per-bot `env` 在 Linux bwrap 中会随该 pane 的进程环境传入 CLI
 （PTY 与 tmux 均覆盖），不会写进共享 tmux server 环境。它可以为自定义 provider

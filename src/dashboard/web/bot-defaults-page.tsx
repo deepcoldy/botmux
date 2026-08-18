@@ -816,6 +816,9 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {bot.cliId === 'codex' ? (
+              <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             {bot.cliId !== 'riff' && bot.sandbox === true ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
@@ -2137,39 +2140,14 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
   );
 }
 
-function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
-  const [enabled, setEnabled] = useState(bot.sandbox === true);
-  const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
   const [authMode, setAuthMode] = useState<'shared' | 'isolated'>(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared');
   const [authBusy, setAuthBusy] = useState(false);
   const [authStatus, setAuthStatus] = useState<StatusMessage>(null);
 
-  useEffect(() => setEnabled(bot.sandbox === true), [bot.sandbox]);
   useEffect(() => setAuthMode(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared'), [bot.codexAuthSync]);
-
-  async function toggle(next: boolean): Promise<void> {
-    setEnabled(next);
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox`, { enabled: next });
-      if (res.ok && res.body.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.sandboxSaved')}`, ok: true });
-        patchBot(bot.larkAppId, { sandbox: res.body.sandbox === true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-        setEnabled(!next);
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-      setEnabled(!next);
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function saveAuthMode(next: 'shared' | 'isolated'): Promise<void> {
     const previous = authMode;
@@ -2193,6 +2171,59 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAuth')}</h3>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.codexAuthSyncLabel')}</span>
+          <select
+            data-input="codexAuthSync"
+            value={authMode}
+            disabled={authBusy}
+            onChange={event => void saveAuthMode(event.currentTarget.value as 'shared' | 'isolated')}
+          >
+            <option value="shared">{tr('botDefaults.codexAuthSyncShared')}</option>
+            <option value="isolated">{tr('botDefaults.codexAuthSyncIsolated')}</option>
+          </select>
+        </label>
+        <small>{tr('botDefaults.codexAuthSyncHelp')}</small>
+        <StatusSpan status={authStatus} attr={{ 'data-codex-auth-sync-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [enabled, setEnabled] = useState(bot.sandbox === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setEnabled(bot.sandbox === true), [bot.sandbox]);
+
+  async function toggle(next: boolean): Promise<void> {
+    setEnabled(next);
+    setStatus(null);
+    setBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox`, { enabled: next });
+      if (res.ok && res.body.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.sandboxSaved')}`, ok: true });
+        patchBot(bot.larkAppId, { sandbox: res.body.sandbox === true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        setEnabled(!next);
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+      setEnabled(!next);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // The unified fs-policy always provides deny-by-default file read/write
   // isolation. This capability line is narrower: whether the CLI's global data
   // root can additionally be redirected into this bot's private BOT_HOME
@@ -2213,24 +2244,6 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
         {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
       </p>
-      {bot.cliId === 'codex' ? (
-        <div className="bd-row">
-          <label>
-            <span>{tr('botDefaults.codexAuthSyncLabel')}</span>
-            <select
-              data-input="codexAuthSync"
-              value={authMode}
-              disabled={authBusy}
-              onChange={event => void saveAuthMode(event.currentTarget.value as 'shared' | 'isolated')}
-            >
-              <option value="shared">{tr('botDefaults.codexAuthSyncShared')}</option>
-              <option value="isolated">{tr('botDefaults.codexAuthSyncIsolated')}</option>
-            </select>
-          </label>
-          <small>{tr('botDefaults.codexAuthSyncHelp')}</small>
-          <StatusSpan status={authStatus} attr={{ 'data-codex-auth-sync-status': '' }} />
-        </div>
-      ) : null}
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
       </div>

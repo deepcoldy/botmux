@@ -16,7 +16,7 @@ describe('codexAuthSync daemon → worker cold-spawn wiring', () => {
     expect(init).toContain("codexAuthSync: botCfg.codexAuthSync ?? 'shared'");
   });
 
-  it('provisions auth only inside the sandbox/read-isolation redirect branch', () => {
+  it('provisions auth inside the per-bot home redirect branch', () => {
     const gate = worker.indexOf('if (willRedirectCliData) {');
     const provision = worker.indexOf('provisionIsolatedBotHome(', gate);
     const nextLifecycle = worker.indexOf('// Predict reattach vs fresh', gate);
@@ -24,6 +24,8 @@ describe('codexAuthSync daemon → worker cold-spawn wiring', () => {
     expect(provision).toBeGreaterThan(gate);
     expect(provision).toBeLessThan(nextLifecycle);
     expect(worker.slice(provision, nextLifecycle)).toContain("cfg.codexAuthSync ?? 'shared'");
+    expect(worker).toContain('forcePerBotHome: isolatedCodexHomeRequested');
+    expect(worker).toContain('readIsolation: sandboxRequested && willRedirectCliData');
   });
 
   it('passes per-bot env at backend spawn after sandbox wrapping is selected', () => {

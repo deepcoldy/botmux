@@ -80,14 +80,18 @@ export function botHomePath(botmuxHome: string, appId: string): string {
   return `${botmuxHome.replace(/\/+$/, '')}/bots/${assertSafeAppId(appId)}`;
 }
 
-/** Whether a worker can redirect CLI data into BOT_HOME for this session. */
+/** Whether a worker can redirect CLI data into BOT_HOME for this session.
+ * A forced per-bot home (currently Codex `codexAuthSync=isolated`) is separate
+ * from the OS sandbox: it changes CLI state ownership without implying file
+ * read/write confinement. */
 export function shouldRedirectCliData(input: {
   sandboxRequested: boolean;
+  forcePerBotHome?: boolean;
   supportsReadIsolation: boolean;
   wrapperCli?: string;
   sessionDataDir?: string;
 }): boolean {
-  return input.sandboxRequested
+  return (input.sandboxRequested || input.forcePerBotHome === true)
     && input.supportsReadIsolation
     && !input.wrapperCli
     && !!input.sessionDataDir;

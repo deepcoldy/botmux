@@ -4513,7 +4513,7 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
 });
 
-// Codex credential sync policy for sandbox-redirected per-bot CODEX_HOME.
+// Codex credential policy: shared global login or an independent per-bot CODEX_HOME.
 ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { codexAuthSync?: unknown };

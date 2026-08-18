@@ -31,9 +31,14 @@ describe('CLI data redirect gate', () => {
     expect(shouldRedirectCliData({ ...base, sandboxRequested: false })).toBe(false);
   });
 
+  it('redirects an explicitly isolated Codex home even when sandbox=false', () => {
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: false, forcePerBotHome: true })).toBe(true);
+  });
+
   it('does not promise per-bot auth through unsupported adapters or wrappers', () => {
     expect(shouldRedirectCliData({ ...base, sandboxRequested: true, supportsReadIsolation: false })).toBe(false);
     expect(shouldRedirectCliData({ ...base, sandboxRequested: true, wrapperCli: 'gateway codex' })).toBe(false);
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: false, forcePerBotHome: true, wrapperCli: 'gateway codex' })).toBe(false);
   });
 });
 

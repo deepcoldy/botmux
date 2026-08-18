@@ -1307,10 +1307,9 @@ export interface BotConfig {
    */
   codexRpcInput?: boolean;
   /**
-   * Codex credential policy when sandbox/read isolation redirects CODEX_HOME
-   * into this bot's BOT_HOME. Missing/`shared` preserves the historical global
-   * auth refresh; `isolated` never reads or copies global auth. Unsandboxed
-   * sessions keep Codex's native global-home/login behavior.
+   * Codex credential policy. Missing/`shared` preserves the historical global
+   * auth refresh; `isolated` always redirects Codex into this bot's private
+   * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
   /**
