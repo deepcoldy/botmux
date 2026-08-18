@@ -278,7 +278,7 @@ Store 快照或终端代理跑通的证据**——后者见 8.2.1。结果 JSON 
 | terminal_disconnect_returns_readonly — 写 WebSocket 断开后回只读 | 通过 |
 | preview_idle_timeout_relocks — 15 分钟 idle 到点回锁并落审计 | 通过 |
 
-P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-preview-origin-isolation.ts`（真 Chromium + 真 debug-terminal，会真的 spawn /bin/bash）：恶意预览页依次尝试读 parent DOM、带 cookie 调 /api/sessions、POST /api/debug-terminal 后连 /debug-terminal/&lt;id&gt;/ws、并把战利品外传给外部收集器；断言全部失败，同时断言预览自身的相对脚本、相对 fetch 与自身 WebSocket 仍然工作。机器可读结果见 assets/preview-origin-isolation-results.json。
+P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-preview-origin-isolation.ts`（真 Chromium + 真 debug-terminal，会真的 spawn /bin/bash）：恶意预览页依次尝试读 parent DOM、带 cookie 调 /api/sessions、POST /api/debug-terminal 后连 /debug-terminal/&lt;id&gt;/ws，最后把战利品外传给外部收集器。前三类取数全部失败（parent DOM / cookie / localStorage 抛 SecurityError，两个管理接口抛 TypeError，debug WebSocket 升级零次被接受，且另有一条断言证明它确实尝试过、不是空断言）。最后这步外传要单独说清楚，**沙箱不封出网**：恶意页对外部收集器的 POST 真的拿到 200 并送出 448 字节，脚本反而要求这次外传成功发生（否则视为攻击页压根没试）；真正被断言的是这份载荷里不含任何受保护值（Dashboard token、会话清单标记、RCE 标记、已知 debug 终端 id）——通道在，战利品为空。同时断言预览自身的相对脚本、相对 fetch 与自身 WebSocket 仍然工作。机器可读结果见 assets/preview-origin-isolation-results.json；其中 `assertions.exfiltrationEmpty` 说的正是「载荷里没有受保护值」，与同一份 JSON 里的 `exfiltratedBytes: 448`、`attack.exfiltration: "sent:200"` 并不矛盾。
 
 guard 蒙层的时序与能力渲染另有 `scripts/verify-preview-guard-race.ts`（真 Chromium + 真 guard 壳 + 真交互状态机 + 真角色门禁）：① 一份在点击「返回预览模式」**之前**就已经落到浏览器手里的 activity 响应，在锁定之后才被交给壳，蒙层必须保持锁定（这类响应 AbortController 已经拦不住，只能靠请求代号丢弃）；② 不做任何注入的原生路径上，服务端挂住的 activity 被客户端 abort，放行后同样掀不开蒙层；③ 只读身份（platform teammate）的壳里没有解锁/锁定按钮、蒙层锁定、预览内容照常可见，同时直接 POST unlock 仍是 403。截图 assets/preview-guard-race-unlocked.png、assets/preview-guard-race-locked.png、assets/preview-guard-readonly.png，机器可读结果见 assets/preview-guard-race-results.json。
 
@@ -309,8 +309,14 @@ assets/workbench-production-e2e-h5-sessions.png、-dock-touch.png、-cookieless-
 -guard-locked.png、-guard-unlocked.png。
 
 P1-14 另有一份专项对照 `scripts/verify-workbench-schedules-degradation.ts`（同样是生产
-bundle）：Workbench-only 与 legacy owner 两组身份跑同一条启动路径，证明排程 401 只让
-排程区块降级、不动会话快照。结果见 assets/workbench-schedules-degradation-results.json。
+bundle）：Workbench-only 与 legacy owner 两组身份跑同一条启动路径。它证明的是**能力门**——
+Workbench-only 身份按能力根本不请求 `/api/schedules`（`scheduleRequests: 0`），会话列表
+照常渲染 2 行真实数据、概览排程区块整块隐藏而不是画空面板、窄门禁 401（实际发生在
+`/api/settings`）没有误弹登录蒙层；对照组 legacy owner 请求 4 次、排程面板与排程行照常
+渲染。至于「`/api/schedules` 真回 401 HTML 时会话快照不受影响」这一条，浏览器脚本里没有
+演练过（那一跳压根没发生），由单测 `test/dashboard-store-bootstrap.test.ts` 用真 401 HTML
+响应覆盖。结果见 assets/workbench-schedules-degradation-results.json（该文件的 `subject`
+沿用了旧口径 “tolerates a schedules 401”，实际覆盖范围以本段为准）。
 
 ### 8.3 截图
 
