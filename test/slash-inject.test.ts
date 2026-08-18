@@ -38,3 +38,16 @@ describe('bots.json tuiSlashAllow 解析', () => {
     expect(cfgs[0].tuiSlashAllow).toBeUndefined();
   });
 });
+
+describe('bots.json codexAuthSync 解析', () => {
+  const base = { larkAppId: 'cli_codex', larkAppSecret: 's', cliId: 'codex' };
+
+  it('缺省和未知值都保持升级兼容的 shared 行为', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([base]))[0].codexAuthSync).toBe('shared');
+    expect(parseBotConfigsFromText(JSON.stringify([{ ...base, codexAuthSync: 'typo' }]))[0].codexAuthSync).toBe('shared');
+  });
+
+  it('保留显式 isolated 策略', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([{ ...base, codexAuthSync: 'isolated' }]))[0].codexAuthSync).toBe('isolated');
+  });
+});

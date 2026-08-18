@@ -816,6 +816,9 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {bot.cliId === 'codex' ? (
+              <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             {bot.cliId !== 'riff' && bot.sandbox === true ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
@@ -2134,6 +2137,60 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
         <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
       </div>
     </div>
+  );
+}
+
+function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [authMode, setAuthMode] = useState<'shared' | 'isolated'>(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authStatus, setAuthStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => setAuthMode(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared'), [bot.codexAuthSync]);
+
+  async function saveAuthMode(next: 'shared' | 'isolated'): Promise<void> {
+    const previous = authMode;
+    setAuthMode(next);
+    setAuthStatus(null);
+    setAuthBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/codex-auth-sync`, { codexAuthSync: next });
+      if (res.ok && res.body.ok) {
+        patchBot(bot.larkAppId, { codexAuthSync: next });
+        setAuthStatus({ text: `✓ ${tr('botDefaults.codexAuthSyncSaved')}`, ok: true });
+      } else {
+        setAuthMode(previous);
+        setAuthStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setAuthMode(previous);
+      setAuthStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAuth')}</h3>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.codexAuthSyncLabel')}</span>
+          <select
+            data-input="codexAuthSync"
+            value={authMode}
+            disabled={authBusy}
+            onChange={event => void saveAuthMode(event.currentTarget.value as 'shared' | 'isolated')}
+          >
+            <option value="shared">{tr('botDefaults.codexAuthSyncShared')}</option>
+            <option value="isolated">{tr('botDefaults.codexAuthSyncIsolated')}</option>
+          </select>
+        </label>
+        <small>{tr('botDefaults.codexAuthSyncHelp')}</small>
+        <StatusSpan status={authStatus} attr={{ 'data-codex-auth-sync-status': '' }} />
+      </div>
+    </section>
   );
 }
 

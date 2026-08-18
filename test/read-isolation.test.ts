@@ -17,7 +17,30 @@ import {
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
+  shouldRedirectCliData,
 } from '../src/adapters/cli/read-isolation.js';
+
+describe('CLI data redirect gate', () => {
+  const base = { supportsReadIsolation: true, sessionDataDir: '/srv/botmux/data' };
+
+  it('redirects sandboxed supported CLIs into BOT_HOME', () => {
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: true })).toBe(true);
+  });
+
+  it('keeps sandbox=false on the CLI native global home/login state', () => {
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: false })).toBe(false);
+  });
+
+  it('redirects an explicitly isolated Codex home even when sandbox=false', () => {
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: false, forcePerBotHome: true })).toBe(true);
+  });
+
+  it('does not promise per-bot auth through unsupported adapters or wrappers', () => {
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: true, supportsReadIsolation: false })).toBe(false);
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: true, wrapperCli: 'gateway codex' })).toBe(false);
+    expect(shouldRedirectCliData({ ...base, sandboxRequested: false, forcePerBotHome: true, wrapperCli: 'gateway codex' })).toBe(false);
+  });
+});
 
 const G1 = '11'.repeat(32);
 const POLICY1 = isolationPanePolicyDigest({

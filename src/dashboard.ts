@@ -5158,6 +5158,23 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/codex-auth-sync — per-bot Codex credential policy.
+    let mBotCodexAuthSync: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCodexAuthSync = url.pathname.match(/^\/api\/bots\/([^/]+)\/codex-auth-sync$/))) {
+      const appId = decodeURIComponent(mBotCodexAuthSync[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-codex-auth-sync`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
     // `{ riff: string }` (raw JSON text; '' = clear).
     let mBotRiff: RegExpMatchArray | null;

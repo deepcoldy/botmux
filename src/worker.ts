@@ -30,6 +30,7 @@ import {
   isolatedPaneReattachSafe,
   sendCredFilePath,
   botHomePath,
+  shouldRedirectCliData,
   buildCliExecutableReadCarveOuts,
   isolationPaneMarkerContent,
   isolationPanePolicyDigest,
@@ -362,6 +363,7 @@ import {
   projectRuntimeScreenStatus,
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
+import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-auth-sync.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -1540,6 +1542,7 @@ function provisionIsolatedBotHome(
   isClaude: boolean,
   cliId: string,
   hookInstall: HookInstallConfig | undefined,
+  codexAuthSync: CodexAuthSyncMode,
   log: (m: string) => void,
 ): void {
   try {
@@ -1581,12 +1584,7 @@ function provisionIsolatedBotHome(
       // other projects' data), then trust this bot's cwd. Merge-safe on resume.
       seedAndTrustClaudeState(join(cdir, '.claude.json'), workingDir, log);
     } else {
-      const cdir = join(botHome, 'codex');
-      mkdirSync(cdir, { recursive: true });
-      // auth.json: keep synced to the shared account's copy on EVERY spawn (a re-login
-      // elsewhere rotates the refresh token, which would strand a stale per-bot copy).
-      const authSrc = join(homedir(), '.codex', 'auth.json');
-      if (existsSync(authSrc)) writeCredIfChanged(join(cdir, 'auth.json'), readFileSync(authSrc, 'utf-8'));
+      const cdir = provisionCodexAuth({ botHome, mode: codexAuthSync, log });
       // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
       const cfgDst = join(cdir, 'config.toml');
       const cfgSrc = join(homedir(), '.codex', 'config.toml');
@@ -11783,18 +11781,33 @@ async function spawnCli(
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
-  // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it keep
-  // their CLI data (transcripts/memory/auth) in their own BOT_HOME via
+  // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it, plus
+  // Codex bots explicitly requesting isolated auth, keep their CLI data
+  // (transcripts/memory/auth) in their own BOT_HOME via
   // CLAUDE_CONFIG_DIR/CODEX_HOME — under deny-by-default the global ~/.claude|
   // ~/.codex are simply not exposed. Best-effort: a non-supporting adapter
   // keeps its REAL data dirs instead, which the policy exposes readWrite (the
   // sandbox itself still applies). Decided EARLY so every JSONL/bridge/resume
   // path below already targets the right dir. wrapperCli strips spawn args, so
   // the redirect (and its env) can't be guaranteed there → not redirected.
-  const willRedirectCliData = sandboxRequested
-    && cliAdapter.supportsReadIsolation === true
-    && !cfg.wrapperCli
-    && !!process.env.SESSION_DATA_DIR;
+  const isolatedCodexHomeRequested = cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
+  const willRedirectCliData = shouldRedirectCliData({
+    sandboxRequested,
+    forcePerBotHome: isolatedCodexHomeRequested,
+    supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
+    wrapperCli: cfg.wrapperCli,
+    sessionDataDir: process.env.SESSION_DATA_DIR,
+  });
+  if (isolatedCodexHomeRequested && !willRedirectCliData) {
+    const reason = cfg.wrapperCli
+      ? 'wrapperCli cannot guarantee CODEX_HOME propagation'
+      : cliAdapter.supportsReadIsolation !== true
+        ? 'the selected Codex runtime does not support per-bot home redirection'
+        : 'SESSION_DATA_DIR is unavailable';
+    throw new Error(
+      `[codex-auth] refusing to start isolated Codex bot ${cfg.larkAppId}: ${reason}`,
+    );
+  }
   // Bump the CLI-lifetime nonce: any stuck-warning card posted by a previous
   // backend instance (within this same worker) must not inject keys into the
   // new one. The worker echoes this nonce in stuck_warning and re-checks it on
@@ -11823,7 +11836,15 @@ async function spawnCli(
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
-    provisionIsolatedBotHome(isolationBotHome, cfg.workingDir, isClaudeFam, cfg.cliId, cliAdapter.hookInstall, log);
+    provisionIsolatedBotHome(
+      isolationBotHome,
+      cfg.workingDir,
+      isClaudeFam,
+      cfg.cliId,
+      cliAdapter.hookInstall,
+      cfg.codexAuthSync ?? 'shared',
+      log,
+    );
     if (isClaudeFam && effectiveReadyHookInstall) {
       effectiveReadyHookInstall = {
         ...effectiveReadyHookInstall,
@@ -12402,7 +12423,9 @@ async function spawnCli(
     // The adapter further ANDs this with !disableCliBypass. Read live per spawn.
     bypassHookTrust: config.bypassCodexHookTrust,
     skillPluginDir: cfg.skillPluginDir,
-    readIsolation: willRedirectCliData,
+    // Per-bot CODEX_HOME can be enabled without the OS sandbox. Only the latter
+    // needs Codex's read-isolation shell-env behavior.
+    readIsolation: sandboxRequested && willRedirectCliData,
     // Hybrid Codex RPC input: when engageCodexRpc (which runs BEFORE this spawn)
     // bound the pane to a botmux-owned app-server thread, these make codex.ts emit
     // `codex --remote <ws> resume <thread>` (a pure viewer — no bypass flags) instead
