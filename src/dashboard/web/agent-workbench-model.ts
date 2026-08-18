@@ -603,10 +603,10 @@ export function flattenWorkbenchGroups(
  *  Touch layouts use taller rows for 44px targets, so the measurement is passed
  *  in rather than assumed.
  *  桌面 54px 与 style.css 的 `.wb-session-row { height: 54px }` 一一对应；触屏
- *  84px 对应 620px 断点里的那条。改一处必须同时改另一处。 */
+ *  60px 对应 620px 断点里的那条。改一处必须同时改另一处。 */
 export function workbenchListItemHeight(item: WorkbenchListItem, touch = false): number {
   if (item.kind === 'header') return 30;
-  return touch ? 84 : 54;
+  return touch ? 60 : 54;
 }
 
 export function computeVirtualWindow(

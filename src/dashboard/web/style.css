@@ -28914,7 +28914,7 @@ body:has(.workbench-route-host) { min-width: 0; }
    （agent-workbench-model.ts）一字不差，对不上列表就会滚过自己的末尾。 */
 @media (max-width: 620px) {
   .wb-session-row-action { height: 44px; padding: 0 10px; font-size: 13px; }
-  .wb-session-row { height: 84px; }
+  .wb-session-row { height: 60px; }
   .wb-session-row .wb-session-copy { gap: 4px; }
 }
 
@@ -29222,6 +29222,33 @@ body:has(.workbench-route-host) { min-width: 0; }
 }
 /* 「跟随系统」比另外两段长，给模式分段一个更宽的下限，三段仍然等宽。 */
 .wb-appearance-mode-seg > .wb-seg-item { min-width: 56px; }
+
+/* 触屏左滑露出的操作组：一块 156×56 的板，不是三块。
+   156 = 3 × 52，每个动作 52 × 56，宽高都超过 44px 的指尖下限；56 = 行卡底板高
+   （60px 行高减去上下各 2px inset），与行卡等高。
+   组的右缘与行卡的 8px 内缩落在同一条线上：贴屏边会让滑出的这一行比其余每一行都
+   多探出 8px，静态图上一眼看得出跑偏。 */
+@media (hover: none) {
+  .wb-session-row-actions.wb-action-group {
+    right: 8px;
+    gap: 0;
+    width: 156px;
+    height: 56px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-lg);
+    background: var(--bg-l2);
+    box-shadow: none;
+  }
+  .wb-session-row-actions.wb-action-group > * {
+    flex: 1;
+    width: 52px;
+    min-width: 52px;
+    height: 56px;
+    padding: 0;
+    font-size: 12px;
+  }
+}
 
 /* ⋯ 菜单：`⋯` 是单按钮，不套容器底板 —— 给一个按钮加一个盒子只是多一块噪声。
    下拉浮层走白名单第 3 类（1px --border-keep + --shadow-pop）；里面的菜单项走形态

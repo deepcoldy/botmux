@@ -451,14 +451,16 @@ describe('Agent Workbench 行高契约', () => {
     label: '进行中', isNeedsYou: false, session: session(1),
   };
 
-  it('桌面行高 54px、触屏 84px，组头两边都是 30px', () => {
+  it('桌面行高 54px、触屏 60px，组头两边都是 30px', () => {
     // 54 必须和 style.css 的 `.wb-session-row { height: 54px }` 一字不差：
     // 虚拟滚动按这个数摆放每一行，对不上列表就会滚过自己的末尾。
     expect(workbenchListItemHeight(row)).toBe(54);
     expect(workbenchListItemHeight(row, false)).toBe(54);
-    // 触屏那条（620px 断点里的 min-height: 84px）不受桌面收窄影响，
-    // 44px 的点击目标是无障碍底线，不能跟着桌面一起变矮。
-    expect(workbenchListItemHeight(row, true)).toBe(84);
+    // 触屏那条是 620px 断点里的 `.wb-session-row { height: 60px }`。
+    // 84 → 60 是视觉重构的一部分：行内不再堆两行 meta，行高跟着收窄。
+    // 44px 的指尖目标不再靠行高兜底，改由行内操作按钮自己的 --touch-target 保证，
+    // 所以这里能收窄而不破无障碍底线（见 style.css 的 @media (hover: none) 段）。
+    expect(workbenchListItemHeight(row, true)).toBe(60);
     // 组头不分触屏桌面。
     expect(workbenchListItemHeight(header)).toBe(30);
     expect(workbenchListItemHeight(header, true)).toBe(30);
@@ -467,7 +469,7 @@ describe('Agent Workbench 行高契约', () => {
   it('虚拟滚动的总高按同一份行高算，触屏更高所以窗口里装得更少', () => {
     const items = [header, ...Array.from({ length: 10 }, () => row)];
     expect(computeVirtualWindow(items, 0, 640).totalHeight).toBe(30 + 10 * 54);
-    expect(computeVirtualWindow(items, 0, 640, 240, true).totalHeight).toBe(30 + 10 * 84);
+    expect(computeVirtualWindow(items, 0, 640, 240, true).totalHeight).toBe(30 + 10 * 60);
     expect(computeVirtualWindow(items, 0, 200, 0, true).end)
       .toBeLessThan(computeVirtualWindow(items, 0, 200, 0, false).end);
   });

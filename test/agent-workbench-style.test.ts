@@ -151,8 +151,9 @@ describe('Agent Workbench visual contract', () => {
     // 对不上列表就会滚过自己的末尾（62→54 那次改动正是从这里开始出问题的）。
     expect(heights[0]).toBe(54);
     expect(heights[0]).toBe(workbenchListItemHeight(row));
-    // 触屏行不跟着桌面一起收窄：44px 的点击目标是无障碍底线。
-    expect(heights.at(-1)).toBe(84);
+    // 触屏行 84 → 60：行内不再堆两行 meta，行高跟着收窄。44px 的指尖目标不再靠
+    // 行高兜底，改由行内操作按钮自己的 --touch-target 保证（下面那条用例钉住）。
+    expect(heights.at(-1)).toBe(60);
     expect(heights.at(-1)).toBe(workbenchListItemHeight(row, true));
     // 组头两边都是 30px，CSS 里靠 padding + line-height 撑出来，这里只钉住估算侧。
     expect(workbenchListItemHeight({ ...row, kind: 'header', count: 1, collapsed: false })).toBe(30);
