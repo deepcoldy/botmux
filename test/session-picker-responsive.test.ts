@@ -82,7 +82,12 @@ function makeTerminal(cols: number, modern = false): InstanceType<typeof Termina
   return terminal;
 }
 
-function makeFixture(multiBot: boolean, titleFor?: (index: number) => string, adoptTmuxTarget?: string): { root: string; dataDir: string } {
+function makeFixture(
+  multiBot: boolean,
+  titleFor?: (index: number) => string,
+  adoptTmuxTarget?: string,
+  dormantTmux = false,
+): { root: string; dataDir: string } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-picker-responsive-'));
   tempDirs.push(root);
   const dataDir = join(root, 'data');
@@ -125,17 +130,31 @@ function makeFixture(multiBot: boolean, titleFor?: (index: number) => string, ad
       originalCliPid: process.pid,
     };
   }
+  if (dormantTmux) {
+    const selectedId = `48000000-1111-2222-3333-444444444444`;
+    const selected = sessions[selectedId] as Record<string, unknown>;
+    selected.backendType = 'tmux';
+    delete selected.pid;
+    selected.lastCliInput = 'resume this conversation';
+  }
   writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(sessions));
   return { root, dataDir };
 }
 
-async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string, modern = false, adoptTmuxTarget?: string): Promise<{
+async function spawnPicker(
+  cols: number,
+  multiBot: boolean,
+  titleFor?: (index: number) => string,
+  modern = false,
+  adoptTmuxTarget?: string,
+  dormantTmux = false,
+): Promise<{
   child: pty.IPty;
   terminal: InstanceType<typeof Terminal>;
   renderCount: () => number;
   waitForRender: (minimum: number) => Promise<void>;
 }> {
-  const fixture = makeFixture(multiBot, titleFor, adoptTmuxTarget);
+  const fixture = makeFixture(multiBot, titleFor, adoptTmuxTarget, dormantTmux);
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: fixture.root,
@@ -336,6 +355,14 @@ describe('session picker real terminal responsiveness', () => {
     // The visible (printable) part of the payload still shows — only the control
     // bytes were stripped, so the label is not silently dropped.
     expect(screen.lines.some(line => line.includes('evil') && line.includes('injected'))).toBe(true);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('offers recovery when the selected managed tmux backend is missing', async () => {
+    const picker = await spawnPicker(120, false, undefined, false, undefined, true);
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines.some(line => line.includes('tmux: bmx-48000000') && line.includes('Enter 恢复并连接'))).toBe(true);
+    expect(screen.lines.some(line => line.includes('⏎ 恢复'))).toBe(true);
     await closePicker(picker.child, picker.terminal);
   });
 });
