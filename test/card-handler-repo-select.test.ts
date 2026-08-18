@@ -1278,6 +1278,46 @@ describe('repo select card — worktree open', () => {
     expect(ds.worktreeCreating).toBe(false);
   });
 
+  it('runAutoWorktreeCommit fail-closed does NOT close a session whose pendingRepo was consumed mid-build (takeover)', async () => {
+    // Same mid-build takeover window as the success-path bail test, but with a
+    // FAIL-CLOSED rejection: a notifier adoption consumes pendingRepo and starts
+    // its own live session while the (slow, failing) worktree build runs. The
+    // late refusal must NOT closeSession / publishClosedSessionPatch the freshly
+    // adopted session — that would kill a live session the user just started.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    const d = deferred<never>();
+    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(
+      d.promise.then(() => { throw new AutoWorktreeFailClosedError('git fetch failed'); }) as any,
+    );
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(true));
+
+    // Simulate the takeover consuming pendingRepo and owning the session.
+    ds.pendingRepo = false;
+    d.resolve(undefined as never);
+    await run;
+
+    // The adopted session is untouched: not closed, still in the map, no
+    // refusal notice (the adopted session IS running — "session refused" would
+    // be a lie), no fork/kill from this path.
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBe(ds);
+    expect(notify).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
   it('double click starts ONE background creation and commits once', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);

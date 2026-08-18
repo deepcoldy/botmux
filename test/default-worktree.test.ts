@@ -220,6 +220,28 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices.some(n => n.includes('回退'))).toBe(true); // fallback notice posted
   });
 
+  it('fail-closed does NOT apply to the riff remote backend: sandbox on still DEGRADES', async () => {
+    // The worker's sandboxRequested excludes riff (`!riffRemoteBackend` —
+    // localSandboxApplies): riff has no local CLI process, the agent runs in
+    // riff's own remote sandbox and its writes never touch the real local dir.
+    // fail-closed must track that REAL sandbox state — refusing a riff session
+    // on a worktree failure would brick a supported config (sandbox + riff) for
+    // a local-escape rationale that does not exist there.
+    const plain = join(tempRoot, 'not-a-repo-riff');
+    mkdirSync(plain);
+    // cliId 'riff' forces the riff backend through reconcileRiffBackendType.
+    const { mod } = await loadWithBot(plain, true, { cliId: 'riff', sandbox: true });
+    const notices: string[] = [];
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    });
+
+    expect(r.dir).toBe(plain); // degraded to the base dir — riff session still starts
+    expect(notices.some(n => n.includes('回退'))).toBe(true); // fallback notice posted
+    expect(notices.some(n => n.includes('沙盒已开启'))).toBe(false); // no fail-closed refusal
+  });
+
   it('no-ops (no notice, dir unchanged) when the dir did not come from the bot default', async () => {
     const repo = makeRepo('proj');
     const { mod } = await loadWithBot(repo, true);

@@ -15,7 +15,10 @@
  * UNLESS the file sandbox is enabled, in which case the failure is fail-closed
  * (see {@link AutoWorktreeFailClosedError}): falling back to the real default dir
  * would let the agent's writes land in the real project, defeating the isolation
- * the sandbox promises.
+ * the sandbox promises. The riff REMOTE backend is exempt: it has no local CLI
+ * process (the agent runs in riff's own remote sandbox), so the local-escape
+ * rationale does not apply and it keeps degrading — matching the worker's
+ * `sandboxRequested = !riffRemoteBackend && …`.
  *
  * ALL user-facing notices are posted from here via the caller-supplied `notify`
  * callback (best-effort — a failed send never propagates), so the three spawn
@@ -36,7 +39,10 @@ import type { Locale } from '../i18n/types.js';
 import { logger } from '../utils/logger.js';
 
 /**
- * Raised when auto-worktree cannot be created AND the file sandbox is enabled.
+ * Raised when auto-worktree cannot be created AND the file sandbox is enabled
+ * on a LOCAL backend. The riff remote backend is exempt (no local CLI process
+ * — the agent's writes land in riff's own remote sandbox, never the real local
+ * dir), matching the worker's `sandboxRequested = !riffRemoteBackend && …`.
  *
  * The file sandbox (bwrap/Seatbelt DIRECT mode) binds `workingDir` read-write
  * to the REAL host directory — the auto-worktree is the only thing keeping a
@@ -86,11 +92,11 @@ export function botAutoWorktreeEnabled(larkAppId: string): boolean {
 /**
  * Given a resolved spawn dir, create a fresh linked worktree off it when the bot
  * opts in AND `isBotDefaultDir` is true. Otherwise returns `baseDir` unchanged.
- * Never throws on a non-git dir / git failure UNLESS the file sandbox is on —
- * see {@link AutoWorktreeFailClosedError}: with the sandbox enabled, a fallback
- * to the real default dir would let the agent's writes land in the real project
- * (the sandbox binds workingDir read-write to the host), so the spawn is
- * refused instead of degrading.
+ * Never throws on a non-git dir / git failure UNLESS the file sandbox is on
+ * (local backend only — riff is exempt, see below): with the sandbox enabled,
+ * a fallback to the real default dir would let the agent's writes land in the
+ * real project (the sandbox binds workingDir read-write to the host), so the
+ * spawn is refused instead of degrading.
  */
 export async function maybeCreateDefaultWorktree(
   larkAppId: string,
@@ -110,8 +116,21 @@ export async function maybeCreateDefaultWorktree(
   // the worker still honors it for an unmigrated read-only BOTS_CONFIG
   // (sandboxRequested = sandbox || readIsolation || BOTMUX_SANDBOX) — match that
   // union so fail-closed tracks the REAL sandbox state, not just the new flag.
+  // The worker's sandboxRequested ALSO excludes the riff remote backend
+  // (`!riffRemoteBackend` — localSandboxApplies): riff has no local CLI process,
+  // the agent runs in riff's own remote sandbox and its writes never touch the
+  // real local dir, so the escape rationale does not apply and the old graceful
+  // fallback must keep working for riff bots.
   const failClosed = process.env.BOTMUX_SANDBOX === '1'
-    || (() => { try { const c = getBot(larkAppId).config; return c.sandbox === true || c.readIsolation === true; } catch { return false; } })();
+    || (() => {
+      try {
+        const c = getBot(larkAppId).config;
+        if (c.sandbox !== true && c.readIsolation !== true) return false;
+        return resolvePairedSpawnBackendType(
+          c.cliId, undefined, c.backendType, config.daemon.backendType,
+        ) !== 'riff';
+      } catch { return false; }
+    })();
   const notify = async (msg: string) => {
     if (!ctx.notify) return;
     try { await ctx.notify(msg); } catch { /* notices are best-effort — never fail a session start */ }

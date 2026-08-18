@@ -913,6 +913,15 @@ export async function runAutoWorktreeCommit(deps: {
       // land in the real project (the sandbox binds workingDir read-write to
       // the host — a sandbox escape), so the session is refused, not degraded.
       // Close the never-started pending session and tell the user how to fix.
+      //
+      // Same mid-build takeover guard as the success path below: a notifier
+      // adoption (etc.) can consume pendingRepo WHILE the up-to-30s build runs
+      // and start its own live session. Closing here would kill that freshly
+      // adopted session, so bail without touching it.
+      if (!ds.pendingRepo) {
+        logger.info(`[${tag(ds)}] auto-worktree fail-closed ignored — pendingRepo already consumed (session taken over): ${e.reason}`);
+        return;
+      }
       logger.warn(`[${tag(ds)}] auto-worktree fail-closed (sandbox on, session refused): ${e.reason}`);
       try {
         await notify(t('worktree.auto_fail_closed', { dir: baseDir, error: e.reason }, localeForBot(larkAppId)));
