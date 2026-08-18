@@ -48,6 +48,7 @@ import {
   type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
+import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import {
@@ -4886,10 +4887,12 @@ export async function closeSessionForBackgroundCleanup(
     return result;
   }
   if (result.outcome === 'closed_with_residual') {
+    // Kind-aware: a LOCAL-subtree residual has no taskId, so the old wording
+    // logged "remote session undefined was NOT cancelled" and pointed cleanup at
+    // a nonexistent remote session instead of the host process (round-11 P1-2).
     logger.warn(
-      `[${tagId}] ${context}: closed locally, but remote session `
-      + `${result.residual.taskId} was NOT cancelled (${result.residual.reason}); `
-      + 'manual cleanup required',
+      `[${tagId}] ${context}: closed locally — ${closeResidualClause(result.residual)} `
+      + `(${result.residual.reason})`,
     );
   }
   return result;

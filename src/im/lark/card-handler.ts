@@ -5,6 +5,7 @@
  */
 import { execSync } from 'node:child_process';
 import { basename as pathBasename, dirname, join } from 'node:path';
+import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
@@ -791,9 +792,13 @@ export async function commitRepoSelection(
       } else if (switched.error === 'close_residual') {
         await sessionReply(
           rootId,
-          '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
-          + `需要人工清理：\`${switched.residual.taskId}\`。\n`
-          + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
+          closeResidualIsLocal(switched.residual)
+            ? '⚠️ 原会话已在本地关闭、远端会话已取消，但**本机可能残留带凭证的子进程未确认终止**'
+              + `（${describeCloseResidual(switched.residual)}），请人工核查该主机进程。\n`
+              + '**未创建新会话** —— 请先确认该子进程已终止，再重新切换仓库。'
+            : '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+              + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+              + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
         );
       } else if (switched.error === 'close_refused') {
         // Without this the user taps the card and gets nothing back, while the old
@@ -2537,12 +2542,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         };
       }
       if (closed.status === 'closed_with_residual') {
-        // Closed locally, but a remote session was deliberately left running.
+        // Closed locally, with a residual. A LOCAL-subtree residual has no taskId,
+        // so the old wording rendered "远端会话 undefined 未被取消" and pointed the
+        // operator at a nonexistent remote session (round-11 P1-2).
         return {
           toast: {
             type: 'warning',
-            content: `会话已在本地关闭，但远端会话 ${closed.residual.taskId} 未被取消`
-              + '（控制面无法验证），需要人工清理。',
+            content: closeResidualIsLocal(closed.residual)
+              ? `会话已在本地关闭、远端会话已取消，但本机可能残留带凭证子进程未确认终止`
+                + `（${describeCloseResidual(closed.residual)}），请人工核查该主机进程。`
+              : `会话已在本地关闭，但远端会话 ${closed.residual.taskId} 未被取消`
+                + '（控制面无法验证），需要人工清理。',
           },
         };
       }

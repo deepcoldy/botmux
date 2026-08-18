@@ -357,6 +357,27 @@ describe('repo select card — plain switch', () => {
     expect(said).toContain('未创建新会话');
   });
 
+  it('a LOCAL-subtree residual on card repo switch points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+    const ds = makeDs({ pendingRepo: false, workingDir: '/repos/alpha', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    const said = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(said).toContain('本机');
+    expect(said).toContain('未创建新会话');
+    expect(said).not.toContain('undefined');
+    expect(said).not.toMatch(/远端会话.*未.*取消/);
+  });
+
   it('rejects a callback from any card id other than the currently published picker', async () => {
     const ds = makeDs({
       pendingRepo: true,

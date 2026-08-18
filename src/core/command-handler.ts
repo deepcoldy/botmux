@@ -8,6 +8,7 @@ import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
+import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -1401,16 +1402,23 @@ export async function handleCommand(
             break;
           }
           if (closed.status === 'closed_with_residual') {
+            const isLocal = closeResidualIsLocal(closed.residual);
             logger.warn(
-              `[${logTag}] session closed locally but remote lineage ${closed.residual.taskId} `
-              + `was NOT cancelled (${closed.residual.reason}); manual cleanup required`,
+              `[${logTag}] session closed locally with residual (${closed.residual.reason}); `
+              + `${isLocal ? 'local host subtree unproven' : `remote lineage ${closed.residual.taskId} NOT cancelled`}; `
+              + 'manual cleanup required',
             );
             await sessionReply(
               rootId,
-              '✅ 会话已在本地关闭。\n'
-              + `⚠️ 但远端会话 \`${closed.residual.taskId}\` **未被取消** —— 它的控制面无法验证`
-              + '（quarantined），盲目取消可能打到别的租户，因此保留下来。**需要人工清理**，'
-              + '否则它会继续占用云端沙箱并持有已注入的凭据。',
+              isLocal
+                ? '✅ 会话已在本地关闭，远端会话已取消。\n'
+                  + '⚠️ 但**本机可能残留带凭证的子进程未确认终止**'
+                  + `（${describeCloseResidual(closed.residual)}）——**请人工核查该主机进程**。`
+                  + 'device-isolation 会保留隔离直到主机重启或 `botmux mojo-containment revoke`。'
+                : '✅ 会话已在本地关闭。\n'
+                  + `⚠️ 但远端会话 \`${closed.residual.taskId}\` **未被取消** —— 它的控制面无法验证`
+                  + '（quarantined），盲目取消可能打到别的租户，因此保留下来。**需要人工清理**，'
+                  + '否则它会继续占用云端沙箱并持有已注入的凭据。',
             );
             break;
           }
@@ -1966,12 +1974,18 @@ export async function handleCommand(
                   '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
                 );
               } else if (switched.error === 'close_residual') {
-                logger.warn(`[${logTag}] Repo switch stopped: old session closed with an uncancelled remote lineage`);
+                const isLocal = closeResidualIsLocal(switched.residual);
+                logger.warn(`[${logTag}] Repo switch stopped: old session closed with `
+                  + `${isLocal ? 'an unproven local host subtree' : 'an uncancelled remote lineage'}`);
                 await sessionReply(
                   rootId,
-                  '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
-                  + `需要人工清理：\`${switched.residual.taskId}\`。\n`
-                  + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
+                  isLocal
+                    ? '⚠️ 原会话已在本地关闭、远端会话已取消，但**本机可能残留带凭证的子进程未确认终止**'
+                      + `（${describeCloseResidual(switched.residual)}），请人工核查该主机进程。\n`
+                      + '**未创建新会话** —— 请先确认该子进程已终止，再重新切换仓库。'
+                    : '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+                      + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+                      + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
                 );
               } else if (switched.error === 'close_refused') {
                 // Silence here would be the worst outcome: the old session is

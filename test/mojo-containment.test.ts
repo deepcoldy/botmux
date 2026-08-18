@@ -38,6 +38,7 @@ import {
     readProcStartTime,
     recordContainmentHandle,
     releaseContainmentHandle,
+    reconcileContainmentHandlesOnBoot,
     strongHandleFromPreparedBoundary,
     weakHandleRootStillOriginal,
     containmentQuiescence,
@@ -1134,5 +1135,57 @@ describe('a stamped bootId lets a REBOOT release a cgroup handle (round-9 P2-1)'
         const handle = strongHandleFromPreparedBoundary(prepared, { procRoot: fakeProc({ bootId: BOOT_A }) });
         expect(handle.kind).toBe('cgroup');
         expect((handle as StrongContainmentHandle).bootId).toBe(BOOT_A);
+    });
+});
+
+describe('boot reconciliation consumes the bootId proof (round-11 P1-1)', () => {
+    const BOOT_A = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const BOOT_B = 'bbbbbbbb-5555-6666-7777-888888888888';
+    const cg = (dir: string, over: Partial<StrongContainmentHandle> = {}): StrongContainmentHandle => ({
+        kind: 'cgroup', sessionId: 'br-sess', generation: 1, cgroupPath: dir, nonce: 'n', ...over,
+    });
+    const emptyDir = (): string => {
+        const dir = mkdtempSync(join(tmpdir(), 'br-cg-'));
+        writeFileSync(join(dir, 'cgroup.procs'), '');
+        return dir;
+    };
+
+    it('RELEASES an old-boot cgroup handle (reboot proved the tree gone)', () => {
+        const dataDir = freshDataDir();
+        recordContainmentHandle(cg(emptyDir(), { bootId: BOOT_A }), dataDir);
+        const r = reconcileContainmentHandlesOnBoot({ dataDir, procRoot: fakeProc({ bootId: BOOT_B }) });
+        expect(r).toMatchObject({ released: 1, storeUnreadable: false });
+        expect(hasUnprovenContainment('br-sess', dataDir)).toBe(false);
+    });
+
+    it('RETAINS a same-boot cgroup handle', () => {
+        const dataDir = freshDataDir();
+        recordContainmentHandle(cg(emptyDir(), { bootId: BOOT_A }), dataDir);
+        const r = reconcileContainmentHandlesOnBoot({ dataDir, procRoot: fakeProc({ bootId: BOOT_A }) });
+        expect(r.released).toBe(0);
+        expect(hasUnprovenContainment('br-sess', dataDir)).toBe(true);
+    });
+
+    it('RETAINS a legacy cgroup handle with no bootId, even across a boot change', () => {
+        const dataDir = freshDataDir();
+        recordContainmentHandle(cg(emptyDir()), dataDir); // no bootId
+        const r = reconcileContainmentHandlesOnBoot({ dataDir, procRoot: fakeProc({ bootId: BOOT_B }) });
+        expect(r.released).toBe(0);
+        expect(hasUnprovenContainment('br-sess', dataDir)).toBe(true);
+    });
+
+    it('RELEASES an old-boot WEAK handle too (same reboot proof)', () => {
+        const dataDir = freshDataDir();
+        recordContainmentHandle({ ...weak({ bootId: BOOT_A }), sessionId: 'br-weak' }, dataDir);
+        const r = reconcileContainmentHandlesOnBoot({ dataDir, procRoot: fakeProc({ bootId: BOOT_B }) });
+        expect(r.released).toBe(1);
+        expect(hasUnprovenContainment('br-weak', dataDir)).toBe(false);
+    });
+
+    it('FAILS CLOSED on an unreadable store — releases nothing', () => {
+        const dataDir = freshDataDir();
+        writeFileSync(join(dataDir, 'mojo-containment-handles.json'), '{ not json');
+        const r = reconcileContainmentHandlesOnBoot({ dataDir, procRoot: fakeProc({ bootId: BOOT_B }) });
+        expect(r).toMatchObject({ released: 0, storeUnreadable: true });
     });
 });

@@ -1288,6 +1288,23 @@ describe('closeSessionForBackgroundCleanup', () => {
     expect(warned).toContain('unit cleanup');
   });
 
+  it('a LOCAL-subtree residual logs the host subtree, not a phantom remote id (round-11 P1-2)', async () => {
+    const fixture = createFixture();
+    const { logger } = await import('../src/utils/logger.js');
+    cancelMojoMock.mockResolvedValue({ kind: 'cancelled', localResidual: 'local_subtree_boundary_unproven' });
+
+    const result = await closeSessionForBackgroundCleanup(fixture.session.sessionId, 'unit cleanup');
+
+    expect(result).toMatchObject({
+      ok: true, outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
+    const warned = vi.mocked(logger.warn).mock.calls.map(c => String(c[0])).join('\n');
+    expect(warned).toContain('本地');            // names the host subtree
+    expect(warned).not.toContain('undefined');
+    expect(warned).not.toMatch(/远端会话.*未.*取消|remote session .*undefined/);
+  });
+
   it('logs an error when a background close is refused', async () => {
     cancelMojoMock.mockResolvedValue({ kind: 'failed', message: 'HTTP 500', retryable: true });
     const fixture = createFixture();

@@ -16,7 +16,7 @@ import type {
 import { deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
 import { getBot } from '../bot-registry.js';
 import { quarantinedLauncherEnvKeys, quarantinedSessionIds } from './mojo-launcher-env-quarantine.js';
-import { containmentSessionIds, hasUnprovenContainment } from './mojo-containment.js';
+import { containmentSessionIds, hasUnprovenContainment, reconcileContainmentHandlesOnBoot } from './mojo-containment.js';
 import { config } from '../config.js';
 import { isMojoFullyRemote } from '../adapters/backend/sandbox.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
@@ -184,6 +184,9 @@ export interface DeviceIsolationDaemonDependencies {
   readMarker: () => string | null;
   sleep: (ms: number) => Promise<void>;
   dataDir: () => string;
+  /** Release durable containment handles a REBOOT provably killed, before the
+   *  inventory synthesises blockers from them. Run once per daemon boot. */
+  reconcileContainmentOnBoot: () => void;
 }
 
 export type DeviceIsolationDaemonResult = {
@@ -626,7 +629,11 @@ const defaultDependencies: DeviceIsolationDaemonDependencies = {
   ),
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   dataDir: () => config.session.dataDir,
+  reconcileContainmentOnBoot: () => { reconcileContainmentHandlesOnBoot(); },
 };
+
+/** Guards the once-per-boot containment reconciliation (reset for tests). */
+let containmentReconciledThisBoot = false;
 
 let dependencies: DeviceIsolationDaemonDependencies = defaultDependencies;
 
@@ -836,6 +843,18 @@ function generationFor(entries: readonly DeviceIsolationInventoryEntry[]): strin
 }
 
 export function buildDeviceIsolationInventory(): DeviceIsolationInventory {
+  // BEFORE synthesising blockers from durable handles: release any a reboot
+  // provably killed. Once per boot — a boot id does not change within a process,
+  // so a single pass is exactly right, and it must run before the first inventory
+  // or a post-reboot handle would keep blocking activation forever (round-11 P1-1).
+  if (!containmentReconciledThisBoot) {
+    containmentReconciledThisBoot = true;
+    try {
+      dependencies.reconcileContainmentOnBoot();
+    } catch (err) {
+      logger.warn(`[device-isolation] containment boot reconciliation failed (blockers retained): ${String(err)}`);
+    }
+  }
   const entries = dependencies.listSessions()
     .map(classifySession)
     .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
@@ -1235,6 +1254,7 @@ export function resetDeviceIsolationDaemonForTest(): void {
   transaction = null;
   daemonIdentity = null;
   dependencies = defaultDependencies;
+  containmentReconciledThisBoot = false;
 }
 
 export function logDeviceIsolationActivationError(error: unknown): void {

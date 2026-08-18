@@ -649,6 +649,31 @@ describe('Card integration: full event flow', () => {
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
+    it('a LOCAL-subtree residual close toast points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast?.type).toBe('warning');
+      expect(result?.toast?.content).toContain('本机');
+      expect(result?.toast?.content).not.toContain('undefined');
+      expect(result?.toast?.content).not.toMatch(/远端会话.*未.*取消/);
+    });
+
     it('close refusal reports the remote id and does not send a closed card', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();

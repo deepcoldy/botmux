@@ -117,13 +117,14 @@ function cgroupSubtreePids(dir: string): { ok: true; pids: number[] } | { ok: fa
  * The cgroup the daemon itself lives in (from /proc/self/cgroup), used as the
  * PARENT of per-session boundaries.
  *
- * Building boundaries at the hierarchy root makes their parent root-owned only
- * when the daemon is root. Nesting under the daemon's own delegated cgroup means
- * a non-root delegated daemon's boundaries have a parent it does not own, so a
- * same-uid child cannot migrate UP and out of the delegated subtree (cgroup v2
- * migration needs write access to the common ancestor). Falls back to the flat
- * `botmux.slice` at the root when /proc/self/cgroup is unreadable or names the
- * root — the caller's `mkdir` still degrades to a weak handle if neither works.
+ * Nesting under the daemon's own cgroup keeps the per-session boundaries tidy
+ * and co-located with the daemon. It does NOT make the cgroup a security
+ * boundary: within a single delegation domain a same-UID process can still
+ * migrate itself between cgroups (up to a writable ancestor, or into a sibling),
+ * which is exactly why cgroup emptiness is no longer a release proof (see
+ * containmentReleaseDecision). Falls back to the flat `botmux.slice` at the root
+ * when /proc/self/cgroup is unreadable or names the root — the caller's `mkdir`
+ * still degrades to a weak handle if neither works.
  */
 function resolveSliceParent(cgroupRoot: string, procRoot = '/proc'): string {
     try {
@@ -1016,6 +1017,81 @@ export function containmentSessionIds(dataDir?: string): string[] {
  */
 export function hasUnprovenContainment(sessionId: string, dataDir?: string): boolean {
     return containmentHandles(sessionId, dataDir).length > 0;
+}
+
+/**
+ * Release every durable handle a REBOOT has provably killed, and report what
+ * stayed. Run once per daemon boot, BEFORE the device-isolation activation
+ * inventory is built.
+ *
+ * Why this exists (round-11 P1-1): `proveContainmentQuiescent` gained a
+ * boot-id-changed branch for cgroup handles, but its only production callers are
+ * live-worker teardown and workerless close — NEITHER runs for a session that is
+ * already `closed_with_residual` and exists only as a durable handle. So after a
+ * host reboot (which truly kills the whole tree, migrant included) that handle
+ * lingered forever and device isolation kept synthesising an `activation_blocked`
+ * from it — the new bootId proof had no consumer. This is that consumer: it
+ * enumerates the store and RELEASES only handles whose verdict is
+ * `boot-id-changed`. A same-boot handle, a legacy handle with no bootId, an
+ * unprovable handle, or a still-live cgroup are all RETAINED.
+ *
+ * Fail-CLOSED throughout: an unreadable store, an unreadable /proc, or a handle
+ * whose proof throws leaves that handle in place. Releasing on a "cannot tell"
+ * is exactly the unblock this whole module refuses.
+ */
+export function reconcileContainmentHandlesOnBoot(
+    opts: { procRoot?: string; dataDir?: string } = {},
+): { released: number; retained: number; storeUnreadable: boolean } {
+    let ids: string[];
+    try {
+        ids = containmentSessionIds(opts.dataDir);
+    } catch (err) {
+        logger.error(
+            `[mojo] boot reconciliation skipped: containment store unreadable (${String(err)}); `
+            + 'every blocker is retained (fail-closed)',
+        );
+        return { released: 0, retained: 0, storeUnreadable: true };
+    }
+    let released = 0;
+    let retained = 0;
+    for (const sessionId of ids) {
+        let handles: ContainmentHandle[];
+        try {
+            handles = containmentHandles(sessionId, opts.dataDir);
+        } catch {
+            retained++;
+            continue;
+        }
+        for (const handle of handles) {
+            let verdict: QuiescenceVerdict;
+            try {
+                // No scan callback: we only ever act on `boot-id-changed`, which is
+                // decided from the stamped boot id alone. A weak scan-clean or a
+                // cgroup-empty verdict is deliberately NOT released here.
+                verdict = proveContainmentQuiescent(handle, opts.procRoot ? { procRoot: opts.procRoot } : {});
+            } catch {
+                retained++;
+                continue;
+            }
+            if (verdict.proven && verdict.evidence === 'boot-id-changed') {
+                try {
+                    releaseContainmentHandle(verdict, opts.dataDir);
+                    released++;
+                } catch {
+                    retained++;
+                }
+            } else {
+                retained++;
+            }
+        }
+    }
+    if (released > 0) {
+        logger.info(
+            `[mojo] boot reconciliation: released ${released} containment handle(s) a reboot proved gone, `
+            + `retained ${retained}`,
+        );
+    }
+    return { released, retained, storeUnreadable: false };
 }
 
 /**
