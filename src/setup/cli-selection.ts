@@ -271,6 +271,7 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
     value.startsWith('shell_environment_policy.set.BOTMUX_')
     || value === 'check_for_update_on_startup=false'
+    || value.startsWith('mcp_servers.platform-ksher-agent-data-mcp.')
   );
 }
 

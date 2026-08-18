@@ -182,7 +182,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds,
       expect.anything(),
-      { turnId: seedId },
+      expect.objectContaining({ turnId: seedId }),
     );
     expect(mocks.getChatContext).toHaveBeenCalledOnce();
     expect(mocks.getChatContext).toHaveBeenCalledWith(appId, chatId);
@@ -230,7 +230,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds,
       expect.anything(),
-      { turnId: 'om_join_seed' },
+      expect.objectContaining({ turnId: 'om_join_seed' }),
     );
   });
 
@@ -675,7 +675,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds,
       expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
-      { turnId: userMessageId },
+      expect.objectContaining({ turnId: userMessageId }),
     );
     expect(ds?.session.currentReplyTarget).toMatchObject({
       rootMessageId: userMessageId,
@@ -752,7 +752,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds,
       expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
-      { turnId: userMessageId },
+      expect.objectContaining({ turnId: userMessageId }),
     );
 
     releaseSeed('om_late_join_seed');

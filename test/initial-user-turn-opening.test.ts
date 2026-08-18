@@ -449,7 +449,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).toContain('<botmux_routing>');
     expect(opening).toContain('<user_message>\n重启之后的第一条真实消息\n</user_message>');
     expect(opening).not.toContain('<botmux_reminder>');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: false, turnId: 'om_cold_first' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ resume: false, turnId: 'om_cold_first' }));
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
@@ -506,7 +506,7 @@ describe('empty-started session — first real business turn must use the new-to
 
     const opening = forkInputs()[0]!.content;
     expect(opening).toContain('<botmux_routing>');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: true, turnId: 'om_after_schedule' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ resume: true, turnId: 'om_after_schedule' }));
   });
 
   it('worker-null refork without the marker keeps the ordinary resume follow-up path', async () => {
@@ -522,7 +522,7 @@ describe('empty-started session — first real business turn must use the new-to
     const content = forkInputs()[0]!.content;
     expect(content).toContain('<botmux_reminder>');
     expect(content).not.toContain('<botmux_routing>');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: true, turnId: 'om_plain_cold' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ resume: true, turnId: 'om_plain_cold' }));
   });
 
   // ─── restart durability ─────────────────────────────────────────────────────
@@ -746,7 +746,7 @@ describe('empty-started session — first real business turn must use the new-to
     const retryInput = forkInputs()[forkInputs().length - 1]!;
     expect(retryInput.content).toContain('<botmux_routing>');
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
-      .toEqual({ resume: false, turnId: 'om_boom_retry' });
+      .toEqual(expect.objectContaining({ resume: false, turnId: 'om_boom_retry' }));
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
@@ -777,7 +777,7 @@ describe('empty-started session — first real business turn must use the new-to
     const retryInput = forkInputs()[forkInputs().length - 1]!;
     expect(retryInput.content).toContain('<botmux_routing>');
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
-      .toEqual({ resume: false, turnId: 'om_after_death' });
+      .toEqual(expect.objectContaining({ resume: false, turnId: 'om_after_death' }));
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 });

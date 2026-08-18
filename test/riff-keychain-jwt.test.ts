@@ -198,7 +198,7 @@ describe('readBytecloudKeychainJwt — token extraction', () => {
     writeKeychain(join('.config', 'kaboo-cli'), {
       access_token: 'a', bytecloud_jwt: 'JWT-KABOO', refresh_token: 'r',
     });
-    expect(readBytecloudKeychainJwt(home, bare)).toBe('JWT-KABOO');
+    expect(readBytecloudKeychainJwt(home, bare, Date.now(), 'linux')).toBe('JWT-KABOO');
   });
 
   it('reads bytecloud_jwt from bytedcli data dir (the Mac-verified layout)', () => {
@@ -301,14 +301,14 @@ describe('readBytecloudKeychainJwt — expiry-aware selection (stale must not sh
   it('falls back to an opaque token when no parseable-live token exists', () => {
     // only an opaque token present → use it (better than nothing; we cannot judge its exp).
     writeKeychain(join('.config', 'kaboo-cli'), { bytecloud_jwt: 'opaque-only' });
-    expect(readBytecloudKeychainJwt(home, bare, nowMs)).toBe('opaque-only');
+    expect(readBytecloudKeychainJwt(home, bare, nowMs, 'linux')).toBe('opaque-only');
   });
 
   it('prefers a parseable-live token over an opaque one even when the opaque is listed later', () => {
     const live = makeJwt(NOW + 3600);
     writeKeychain(join('.config', 'kaboo-cli'), { bytecloud_jwt: live });
     writeKeychain(join('.local', 'share', 'bytedcli', 'data'), { bytecloud_jwt: 'opaque-later' });
-    expect(readBytecloudKeychainJwt(home, bare, nowMs)).toBe(live);
+    expect(readBytecloudKeychainJwt(home, bare, nowMs, 'linux')).toBe(live);
   });
 
   it('a non-3-segment fake token (2 or 4 segments) must NOT shadow a real JWT via a decodable exp', () => {

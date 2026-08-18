@@ -108,6 +108,7 @@ export interface SetCodexAppThreadNameOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  initializeTimeoutMs?: number;
   signal?: AbortSignal;
   detached?: boolean;
   waitForExistingPreview?: boolean;
@@ -675,7 +676,7 @@ export async function listCodexAppThreads(opts: ListCodexAppThreadsOptions = {})
   const cwd = opts.cwd ?? process.cwd();
   const client = new CodexAppServerProbe(codexBin, cwd);
   try {
-    await client.initialize(timeoutMs);
+    await client.initialize(opts.initializeTimeoutMs ?? timeoutMs);
     const result = await client.withTimeout(client.request('thread/list', {
       limit: opts.limit ?? 30,
       sortKey: 'updated_at',
