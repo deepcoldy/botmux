@@ -93,6 +93,7 @@ const api: WorkbenchApi = {
   },
   async getTerminalViewLink() { return null; },
   async locateSession() {},
+  async getStandingLink() { return null; },
 };
 
 document.documentElement.dataset.theme = 'dark';

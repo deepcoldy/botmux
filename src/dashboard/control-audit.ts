@@ -22,6 +22,10 @@ export type ControlAuditAction =
   | 'auth.login'
   | 'auth.login_denied'
   | 'auth.logout'
+  /** owner 在工作台里自取了一次常驻链接（`GET /api/workbench/standing-link`）。
+   *  记的是「谁、什么时候取的」；链接与 token 本身绝不进这条记录——那正是这套
+   *  审计词汇表刻意保持狭窄的原因。 */
+  | 'auth.standing_link_issued'
   | 'terminal.takeover'
   | 'terminal.takeover_reused'
   | 'terminal.release'

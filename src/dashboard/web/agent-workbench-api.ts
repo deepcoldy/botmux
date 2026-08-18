@@ -41,6 +41,12 @@ export interface WorkbenchApi {
   /** 让 bot 在会话原话题里发一条 @ 拥有者的定位标记。服务端对每个会话有 30s
    *  限流，超了返回 429 + `retry-after`（见 WorkbenchApiError.retryAfterSeconds）。 */
   locateSession(sessionId: string, signal?: AbortSignal): Promise<void>;
+  /** owner 自取的**常驻**工作台入口（`<base>/workbench?t=<当前活跃 token>`），
+   *  用来收藏进浏览器书签。只有本机完整管理身份取得到；其它身份服务端 401/404，
+   *  这里一律回落 null——「取不到」就是「没有这个入口」，绝不半开。
+   *  与 view-link 那条短时能力 URL 不同，这里返回的是长期凭证，所以调用方只在
+   *  用户显式点开弹层时才请求，不做预取。 */
+  getStandingLink(signal?: AbortSignal): Promise<{ url: string } | null>;
 }
 
 export class WorkbenchApiError extends Error {
@@ -251,6 +257,25 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
           : null;
         return { url: sameOriginViewLink(body.url), expiresAt };
       } catch {
+        return null;
+      }
+    },
+    async getStandingLink(signal) {
+      try {
+        const body = responseObject(
+          await jsonRequest<unknown>(fetchImpl, '/api/workbench/standing-link', { signal }),
+          'invalid_standing_link_response',
+        );
+        // 这条 URL 会被放进输入框交给用户复制粘贴，所以只接受**绝对的 http(s)**
+        // 地址：`javascript:` 之类的伪协议、超长串一律当没有拿到。服务端本就只
+        // 会给 `<base>/workbench?t=…`，形状不对说明链路被人动过手脚。
+        if (typeof body.url !== 'string' || !body.url || body.url.length > 2_048) return null;
+        const parsed = new URL(body.url);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        return { url: body.url };
+      } catch {
+        // 401 / 403 / 404（无权身份）与 503（还没有活跃 token）走同一条回落：
+        // 前端只知道「没有这个入口」，不区分原因。
         return null;
       }
     },

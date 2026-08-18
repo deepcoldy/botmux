@@ -21,6 +21,9 @@ function AgentWorkbenchRoutePage(): JSX.Element {
       // P1-4：操作入口（定位/接管/交互）各看服务端投影的对应布尔，不再由
       // workbenchAuthed 一个布尔包办。
       capabilities={ui.workbenchCapabilities}
+      // 「常驻链接」是管理面能力，只认本机完整管理身份（loadAuthState 从
+      // /api/settings 的 authed 写入；H5/平台身份在那里就被置 false）。
+      manageAuthed={ui.authed}
       initialSessionId={route?.surface === 'main' ? route.sessionId : null}
       locale="zh-CN"
       now={now}

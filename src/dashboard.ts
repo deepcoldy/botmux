@@ -115,6 +115,7 @@ import {
   revokeWorkbenchTicketsOutsideGeneration,
   workbenchTicketGeneration,
 } from './dashboard/workbench-ticket.js';
+import { handleWorkbenchStandingLink } from './dashboard/standing-link.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
   centralViewLinkPath,
@@ -138,6 +139,7 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
   buildPlatformDashboardLoginUrl,
+  workbenchEntryUrl,
   type DashboardUrls,
 } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -3383,6 +3385,21 @@ const server = createServer(async (req, res) => {
         ok: true,
         capabilities: projectWorkbenchOperationCapabilities(requestIdentity),
       });
+    }
+
+    // owner 在工作台内自取常驻链接（`<base>/workbench?t=<当前活跃 token>`）。
+    // 只有本机完整管理身份能取：上面的门禁已经把 workbench-only / 平台角色 /
+    // 匿名 deny401，处理器再自己判一次 kind === 'legacy-dashboard'（两层独立，
+    // 见 dashboard/standing-link.ts 顶注）。同源校验 + no-store + 每次落一条
+    // `auth.standing_link_issued` 审计；token 现读落盘的活跃值，所以
+    // `dashboard rotate` 之后这里自然发新链接。
+    if (handleWorkbenchStandingLink(req, res, url, {
+      identity: requestIdentity,
+      activeToken: () => activeToken,
+      standingLinkUrl: token => workbenchEntryUrl(dashboardUrlsFor(token).url),
+      audit: dashboardControlAudit,
+    })) {
+      return;
     }
 
     // Server-authoritative terminal control lease. The API returns only mode

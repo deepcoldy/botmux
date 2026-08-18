@@ -63,6 +63,12 @@ export interface AgentWorkbenchViewProps {
    *  canControl（终端接管）、canInteract（Preview 解锁）。必填——调用方必须显式
    *  给出投影值（页面从 ui.workbenchCapabilities 取，缺省已是全 false）。 */
   capabilities: WorkbenchCapabilities;
+  /** 本机**完整管理身份**（`/api/settings` 的 `authed`，即 Dashboard 既有的
+   *  owner 判据）。只用来决定「常驻链接」这一个入口画不画：那条端点只对 legacy
+   *  管理 cookie 开放，H5/平台身份点了必然 401。缺省 false = fail closed。
+   *  与 `authenticated`（能进工作台）和 `capabilities`（三类会话操作）都不同轴，
+   *  所以单独一个字段，不塞进能力集。 */
+  manageAuthed?: boolean;
   initialSessionId?: string | null;
   locale?: string;
   now?: number;
@@ -545,7 +551,9 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
             >关闭终端 ✕</button>
           ) : null}
           {/* 手机上不重复给入口：列表页顶栏的 ◐ 已经直达同一块面板（底部 sheet）。 */}
-          {responsive.mode !== 'mobile' ? <WorkbenchAppearanceMenu /> : null}
+          {responsive.mode !== 'mobile'
+            ? <WorkbenchAppearanceMenu standingLink={props.manageAuthed === true} api={api} />
+            : null}
         </div>
       </header>
       <div className="wb-pane-stack">
@@ -632,7 +640,13 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
                   : workspace}
             </div>
           )}
-          <WorkbenchAppearanceSheet open={appearanceSheetOpen} onClose={() => setAppearanceSheetOpen(false)} />
+          <WorkbenchAppearanceSheet
+            open={appearanceSheetOpen}
+            onClose={() => setAppearanceSheetOpen(false)}
+            // owner 在手机浏览器里同样能自取常驻链接（入口挂在这块 sheet 里）。
+            standingLink={props.manageAuthed === true}
+            api={api}
+          />
         </div>
       ) : (
         <div className={`wb-desktop-layout${railCollapsed ? ' is-rail-collapsed' : ''}${terminalSession ? '' : ' is-terminal-closed'}`}>

@@ -217,6 +217,36 @@ export function controlRequestOriginState(headers: ControlRequestHeadersLike): C
 }
 
 /**
+ * `Referer` 兜底的同源判定：请求既没带 `Origin` 也没带 `Sec-Fetch-Site` 时，用
+ * Referer 的 origin 与本请求的候选 authority 比一次（复用上面那套归一化，不另写
+ * 一份比较逻辑）。
+ *
+ * 为什么需要它：同源 **GET** 在浏览器里通常两个信号都没有——`Origin` 只在跨源和
+ * 非 GET 请求上发，`Sec-Fetch-*` 是较新的浏览器才有（Safari 16.4 之前没有）。对
+ * 「有副作用的 POST」两信号缺席一律 fail closed 是对的（那条路径没有需要放行的非
+ * 浏览器调用方），但一条**发放凭证的 GET** 若照搬那条规则，会把老浏览器上的真
+ * owner 一起挡在门外。Referer 在默认的 `strict-origin-when-cross-origin` 策略下
+ * 对同源请求带完整 URL，正好补上这一格。
+ *
+ * 这不放宽防线：Referer 同样是浏览器写、页面改不了的头，而**明确判为跨站**
+ * （`controlRequestOriginState` 已经返回 `foreign`）的请求绝不会走到这里——调用方
+ * 只在 `unknown` 时才用它兜底。
+ */
+export function refererMatchesHost(headers: ControlRequestHeadersLike): boolean {
+  const referer = headerValue(headers.referer);
+  if (!referer) return false;
+  let origin: string;
+  try {
+    const parsed = new URL(referer);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    origin = parsed.origin;
+  } catch {
+    return false;
+  }
+  return originMatchesHost(origin, requestAuthorities(headers));
+}
+
+/**
  * 管理类 WebSocket 升级的 Origin 判定（terminal / debug-terminal）。
  * 带 Origin 就必须同源（`null` 也算带了，直接拒）；不带 Origin 视为非浏览器客
  * 户端放行。Preview 自身的 WS 不走这里，见文件头注释。

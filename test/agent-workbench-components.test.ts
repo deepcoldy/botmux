@@ -40,6 +40,9 @@ const api: WorkbenchApi = {
   getH5Context: async () => null,
   getTerminalViewLink: async () => null,
   locateSession: async () => {},
+  // 常驻链接是 owner 独占的管理面入口；这些用例验的是会话操作能力，一律回落
+  // 「取不到」，⋯ 菜单里那一项也就不会出现（manageAuthed 缺省也是 false）。
+  getStandingLink: async () => null,
 };
 
 function sessions(count = 320): WorkbenchSessionRow[] {

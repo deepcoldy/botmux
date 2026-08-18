@@ -29511,6 +29511,49 @@ body:has(.workbench-route-host) { min-width: 0; }
 .wb-appearance-group-label { color: var(--text-3); font-size: 11px; }
 .wb-appearance-note { margin: 0; color: var(--text-3); font-size: 11px; line-height: 16px; }
 
+/* 常驻链接弹层：定位/描边/投影完全由 .wb-appearance-pop 那一份负责（同一族浮层，
+   不另起一套），这里只排里面的三样东西——只读链接框、复制按钮、说明。
+   链接是一长串等宽字符，宽一点才不至于一眼全是省略号。 */
+.wb-standing-link-pop { width: 300px; }
+.wb-standing-link-body { display: grid; gap: 8px; }
+/* 只读文本框而不是 <code>：能整条选中、能用系统的复制手势，是自动复制被浏览器
+   策略拦掉时唯一还管用的退路。折行显示——链接有六七十个字符，单行框里只看得见
+   开头一截，而这块弹层的用途就是把**完整**链接摆出来。 */
+.wb-standing-link-url {
+  width: 100%;
+  min-height: var(--touch-target);
+  padding: 6px 8px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  background: var(--bg-l1);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  line-height: 17px;
+  word-break: break-all;
+  resize: none;
+}
+.wb-standing-link-copy,
+.wb-standing-link-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--touch-target);
+  padding: 0 12px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  background: var(--bg-l2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.wb-standing-link-copy:hover,
+.wb-standing-link-open:hover { background: var(--bg-l3); }
+/* sheet 里那枚入口占满一行：底部 sheet 的其余控件都是整行节奏。 */
+.wb-standing-link-open { width: 100%; }
+.wb-standing-link-status { margin: 0; color: var(--text-3); font-size: 12px; }
+.wb-standing-link-note { margin-top: 12px; }
+
 /* 4 枚色板走形态 (b)：它们是单选项不是操作按钮，四枚等距同尺寸本身已经读成一组。
    给色板加一块容器底反而会干扰对色相的判读 —— 底色会影响对色相的感知。 */
 .wb-skin-swatches { display: flex; gap: 12px; }

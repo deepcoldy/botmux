@@ -2,6 +2,12 @@
  * 「外观」面板：4 套配色 + 明暗模式 + 终端渲染风格，桌面是 `⋯` 菜单里的下拉浮层，
  * 移动端是同一块内容的底部 sheet。两处（以及终端标题栏那枚分段控件）共用
  * `workbenchAppearance` 一个状态源，任一处改动其余立刻跟着变。
+ *
+ * `⋯` 菜单同时是 owner「自取常驻链接」的入口（{@link WorkbenchStandingLinkPanel}）：
+ * 同一个菜单、同一族浮层样式，移动端则挂在同一块底部 sheet 里，所以 owner 在手机
+ * 浏览器里也能把工作台收进书签。这一项**只对本机完整管理身份渲染**（调用方传
+ * `standingLink`，取自 Dashboard 既有的 `ui.authed`）——服务端那条端点对其它身份
+ * 一律 401/404，画出来只会是个点了必然失败的按钮。
  */
 import {
   useCallback,
@@ -13,6 +19,8 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { t, ui } from './ui.js';
+import { copyText } from './clipboard.js';
+import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
 import type { ThemeMode } from './preferences.js';
 import {
   WORKBENCH_SKIN_IDS,
@@ -43,6 +51,13 @@ const TERM_OPTIONS: ReadonlyArray<{ value: WorkbenchTermStyle; labelKey: string 
   { value: 'reader', labelKey: 'workbench.appearance.term.reader' },
   { value: 'classic', labelKey: 'workbench.appearance.term.classic' },
 ];
+
+/** 调用方没传 api 时的兜底客户端。只建一次：每次渲染新建会让面板的 useEffect
+ *  依赖每帧变化，进而每帧重取一次链接。 */
+let fallbackWorkbenchApi: WorkbenchApi | null = null;
+function defaultWorkbenchApi(): WorkbenchApi {
+  return (fallbackWorkbenchApi ??= createWorkbenchApi());
+}
 
 function subscribe(listener: () => void): () => void {
   return workbenchAppearance.subscribe(listener);
@@ -193,6 +208,96 @@ export function WorkbenchAppearanceControls(): JSX.Element {
   );
 }
 
+// ─── 常驻链接 ────────────────────────────────────────────────────────────────
+
+/** 复制反馈三态。`idle` 之外的两态只改按钮文案，不弹 toast——弹层本身就在眼前。 */
+type CopyState = 'idle' | 'copied' | 'failed';
+
+export interface WorkbenchStandingLinkPanelProps {
+  api: WorkbenchApi;
+  onClose(): void;
+  /** 测试注入用的复制实现。生产默认是 web/clipboard.ts 的 `copyText`：先
+   *  `navigator.clipboard.writeText`，被拒或不可用时降级到
+   *  `document.execCommand('copy')`。 */
+  copy?: (text: string) => Promise<boolean>;
+}
+
+/**
+ * 「常驻链接」面板正文：显示完整链接（只读、聚焦即全选）、一键复制、以及一句
+ * 说明它为什么安全可用（收藏进书签长期用；怀疑泄漏时 `botmux dashboard rotate`
+ * 立刻作废）。
+ *
+ * 链接**只在这里现取**（点开才请求），拿不到就只显示一行「暂时取不到」——绝不
+ * 显示半截链接，也不区分「无权」和「服务端还没有 token」：对前端来说都是没有
+ * 这个入口。
+ */
+export function WorkbenchStandingLinkPanel(props: WorkbenchStandingLinkPanelProps): JSX.Element {
+  const [link, setLink] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [copyState, setCopyState] = useState<CopyState>('idle');
+  const fieldRef = useRef<HTMLTextAreaElement | null>(null);
+  const { api } = props;
+
+  useEffect(() => {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let alive = true;
+    void api.getStandingLink(controller?.signal).then(result => {
+      if (!alive) return;
+      setLink(result?.url ?? null);
+      setLoading(false);
+    });
+    return () => { alive = false; controller?.abort(); };
+  }, [api]);
+
+  const copy = props.copy ?? copyText;
+  const onCopy = async (): Promise<void> => {
+    if (!link) return;
+    setCopyState(await copy(link) ? 'copied' : 'failed');
+  };
+
+  return (
+    <>
+      <header className="wb-appearance-head">
+        <strong>{t('workbench.standingLink.title')}</strong>
+        <button type="button" aria-label={t('workbench.appearance.close')} onClick={props.onClose}>✕</button>
+      </header>
+      {loading ? (
+        <p className="wb-standing-link-status" role="status">{t('workbench.standingLink.loading')}</p>
+      ) : !link ? (
+        <p className="wb-standing-link-status" role="status">{t('workbench.standingLink.error')}</p>
+      ) : (
+        <div className="wb-standing-link-body">
+          {/* 折行的 textarea 而不是单行 input：链接有六七十个字符，单行框里只能看见
+              开头一截，而这块弹层的用途就是「把完整链接摆出来」。只读 + 点击即全选，
+              自动复制被浏览器策略拦掉时还能手动 Ctrl/⌘+C。 */}
+          <textarea
+            ref={fieldRef}
+            className="wb-standing-link-url"
+            readOnly
+            rows={3}
+            value={link}
+            aria-label={t('workbench.standingLink.fieldLabel')}
+            onFocus={event => event.currentTarget.select()}
+            onClick={event => event.currentTarget.select()}
+          />
+          <button
+            type="button"
+            className="wb-standing-link-copy"
+            onClick={() => { void onCopy(); }}
+          >
+            {copyState === 'copied'
+              ? t('workbench.standingLink.copied')
+              : copyState === 'failed'
+                ? t('workbench.standingLink.copyFailed')
+                : t('workbench.standingLink.copy')}
+          </button>
+        </div>
+      )}
+      <p className="wb-standing-link-note wb-appearance-note">{t('workbench.standingLink.note')}</p>
+    </>
+  );
+}
+
 /** Esc 关闭 + 焦点离开/点击面板外关闭。浮层和 sheet 用同一套关闭语义。 */
 function useDismiss(open: boolean, onClose: () => void, ref: { current: HTMLElement | null }): void {
   useEffect(() => {
@@ -211,10 +316,22 @@ function useDismiss(open: boolean, onClose: () => void, ref: { current: HTMLElem
   }, [onClose, open, ref]);
 }
 
-/** 移动端：同一块内容的底部 sheet（列表页顶栏 `◐` 直达）。 */
-export function WorkbenchAppearanceSheet(props: { open: boolean; onClose(): void }): JSX.Element | null {
+export interface WorkbenchAppearanceSheetProps {
+  open: boolean;
+  onClose(): void;
+  /** 只有本机完整管理身份才渲染「常驻链接」入口（见文件头注释）。 */
+  standingLink?: boolean;
+  api?: WorkbenchApi;
+}
+
+/** 移动端：同一块内容的底部 sheet（列表页顶栏 `◐` 直达）。owner 的常驻链接也挂在
+ *  这里——手机浏览器同样能把工作台收进书签，不必回到桌面端。 */
+export function WorkbenchAppearanceSheet(props: WorkbenchAppearanceSheetProps): JSX.Element | null {
   const ref = useRef<HTMLDivElement | null>(null);
+  const [standingOpen, setStandingOpen] = useState(false);
+  const api = props.api ?? defaultWorkbenchApi();
   useDismiss(props.open, props.onClose, ref);
+  useEffect(() => { if (!props.open) setStandingOpen(false); }, [props.open]);
   if (!props.open) return null;
   return (
     <div className="wb-appearance-backdrop">
@@ -224,24 +341,47 @@ export function WorkbenchAppearanceSheet(props: { open: boolean; onClose(): void
         role="dialog"
         aria-label={t('workbench.appearance.title')}
       >
-        <header className="wb-appearance-head">
-          <strong>{t('workbench.appearance.title')}</strong>
-          <button type="button" aria-label={t('workbench.appearance.close')} onClick={props.onClose}>✕</button>
-        </header>
-        <WorkbenchAppearanceControls />
+        {standingOpen ? (
+          <WorkbenchStandingLinkPanel api={api} onClose={props.onClose} />
+        ) : (
+          <>
+            <header className="wb-appearance-head">
+              <strong>{t('workbench.appearance.title')}</strong>
+              <button type="button" aria-label={t('workbench.appearance.close')} onClick={props.onClose}>✕</button>
+            </header>
+            <WorkbenchAppearanceControls />
+            {props.standingLink ? (
+              <div className="wb-appearance-group">
+                <button
+                  type="button"
+                  className="wb-standing-link-open"
+                  onClick={() => setStandingOpen(true)}
+                >{t('workbench.standingLink.title')}</button>
+              </div>
+            ) : null}
+          </>
+        )}
       </div>
     </div>
   );
 }
 
+export interface WorkbenchAppearanceMenuProps {
+  /** 只有本机完整管理身份才渲染「常驻链接」项（见文件头注释）。 */
+  standingLink?: boolean;
+  api?: WorkbenchApi;
+}
+
 /**
- * 桌面 / 会话坞头部的 `⋯` 菜单。菜单第一项是「外观」，点开同一块内容的下拉浮层。
+ * 桌面 / 会话坞头部的 `⋯` 菜单。第一项是「外观」，owner 还多一项「常驻链接」，
+ * 两项点开的都是同一族下拉浮层（`.wb-appearance-pop`）。
  * 菜单和浮层都能用键盘走：Esc 关闭并把焦点还给 `⋯`，方向键在单选组里移动。
  */
-export function WorkbenchAppearanceMenu(): JSX.Element {
-  const [open, setOpen] = useState<'menu' | 'panel' | null>(null);
+export function WorkbenchAppearanceMenu(props: WorkbenchAppearanceMenuProps = {}): JSX.Element {
+  const [open, setOpen] = useState<'menu' | 'panel' | 'standing' | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const api = props.api ?? defaultWorkbenchApi();
   const close = useCallback(() => {
     setOpen(current => {
       if (current !== null) buttonRef.current?.focus();
@@ -270,6 +410,14 @@ export function WorkbenchAppearanceMenu(): JSX.Element {
             autoFocus
             onClick={() => setOpen('panel')}
           >{t('workbench.appearance.title')}</button>
+          {props.standingLink ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="wb-more-item"
+              onClick={() => setOpen('standing')}
+            >{t('workbench.standingLink.title')}</button>
+          ) : null}
         </div>
       ) : null}
       {open === 'panel' ? (
@@ -279,6 +427,15 @@ export function WorkbenchAppearanceMenu(): JSX.Element {
             <button type="button" aria-label={t('workbench.appearance.close')} onClick={close}>✕</button>
           </header>
           <WorkbenchAppearanceControls />
+        </div>
+      ) : null}
+      {open === 'standing' ? (
+        <div
+          className="wb-appearance-pop wb-standing-link-pop"
+          role="dialog"
+          aria-label={t('workbench.standingLink.title')}
+        >
+          <WorkbenchStandingLinkPanel api={api} onClose={close} />
         </div>
       ) : null}
     </div>

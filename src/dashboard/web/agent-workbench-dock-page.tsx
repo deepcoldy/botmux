@@ -18,6 +18,8 @@ function AgentWorkbenchDockRoutePage(): JSX.Element {
       sessions={[...snapshot.sessions.values()] as WorkbenchSessionRow[]}
       online={snapshot.online}
       authenticated={ui.workbenchAuthed}
+      // 同完整工作台：常驻链接只对本机完整管理身份可见。
+      manageAuthed={ui.authed}
       initialSessionId={route?.surface === 'dock' ? route.sessionId : null}
       locale="zh-CN"
       now={now}

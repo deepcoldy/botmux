@@ -2356,6 +2356,15 @@ const zh = {
   'workbench.appearance.term.reader': '阅读',
   'workbench.appearance.term.classic': '经典',
   'workbench.appearance.termNote': '阅读：低饱和大行距，久看不累 · 经典：原汁原味终端渲染',
+  // ─── 工作台「常驻链接」（owner 自取，收藏进书签）──────────────────────────
+  'workbench.standingLink.title': '常驻链接',
+  'workbench.standingLink.loading': '正在获取…',
+  'workbench.standingLink.error': '暂时取不到常驻链接',
+  'workbench.standingLink.fieldLabel': '工作台常驻链接',
+  'workbench.standingLink.copy': '复制',
+  'workbench.standingLink.copied': '已复制',
+  'workbench.standingLink.copyFailed': '复制失败，请手动选中',
+  'workbench.standingLink.note': '收藏到浏览器书签长期使用；怀疑泄漏时 rotate 可立即作废。',
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
@@ -4709,6 +4718,14 @@ const en: Record<keyof typeof zh, string> = {
   'workbench.appearance.term.reader': 'Reader',
   'workbench.appearance.term.classic': 'Classic',
   'workbench.appearance.termNote': 'Reader: muted colours and roomy line spacing for long sessions · Classic: the terminal rendered exactly as it comes',
+  'workbench.standingLink.title': 'Standing link',
+  'workbench.standingLink.loading': 'Fetching…',
+  'workbench.standingLink.error': 'Standing link is unavailable right now',
+  'workbench.standingLink.fieldLabel': 'Workbench standing link',
+  'workbench.standingLink.copy': 'Copy',
+  'workbench.standingLink.copied': 'Copied',
+  'workbench.standingLink.copyFailed': 'Copy failed — select it manually',
+  'workbench.standingLink.note': 'Keep it as a browser bookmark for the long run; if you suspect it leaked, `botmux dashboard rotate` kills it instantly.',
 };
 
 const dictionaries: Record<DashboardLocale, DashboardMessages> = { zh, en };

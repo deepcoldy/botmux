@@ -91,9 +91,13 @@ export function workbenchSpaUrl(dashboardUrl: string): string | null {
  * 分支）。终端/脚本里复制粘贴一条不带 `#` 的 URL 更不容易被截断或被 shell 当注释，
  * 所以 CLI 打印这一形态。同样在无法解析时返回 null。
  *
- * ⚠️ 这是**唯一**保留「长期 token 直拼进 URL」的形态，只给 `botmux dashboard`
- * 的终端输出用（终端是私人环境）。飞书卡片等持久化载体一律走
- * {@link workbenchTicketRedeemUrl} 的短时票据（P2-1）。
+ * ⚠️ 这是**唯一**保留「长期 token 直拼进 URL」的形态，只出现在两个**私人上下文**：
+ *   1. `botmux dashboard` 的终端输出（cli/dashboard-command.ts，终端是私人环境）；
+ *   2. owner 在工作台里自取常驻链接的响应（`GET /api/workbench/standing-link`，
+ *      仅本机完整管理身份可取、同源、`no-store`、每次落审计，见
+ *      dashboard/standing-link.ts）。
+ * 飞书卡片等**持久化载体**一律走 {@link workbenchTicketRedeemUrl} 的短时票据
+ * （P2-1）——长期 token 不进聊天记录这条红线不变。
  */
 export function workbenchEntryUrl(dashboardUrl: string): string | null {
   const u = parseHttpUrl(dashboardUrl);

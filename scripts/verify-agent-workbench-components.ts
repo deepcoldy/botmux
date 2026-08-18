@@ -32,6 +32,7 @@ const api: WorkbenchApi = {
   getH5Context: async () => null,
   getTerminalViewLink: async () => null,
   locateSession: async () => {},
+  getStandingLink: async () => null,
 };
 const sessions: WorkbenchSessionRow[] = Array.from({ length: 320 }, (_, index) => ({
   sessionId: `session-${index}`,

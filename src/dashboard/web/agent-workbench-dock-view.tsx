@@ -29,6 +29,9 @@ export interface AgentWorkbenchDockViewProps {
   sessions: readonly WorkbenchSessionRow[];
   online: boolean;
   authenticated: boolean;
+  /** 本机完整管理身份（`ui.authed`）。同完整工作台：只决定 ⋯ 菜单里那一项
+   *  「常驻链接」画不画，缺省 false = fail closed。 */
+  manageAuthed?: boolean;
   initialSessionId?: string | null;
   locale?: string;
   now?: number;
@@ -104,7 +107,7 @@ export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.
         <div><span aria-hidden="true">◖</span><strong>会话坞</strong></div>
         <span className={props.online ? 'is-online' : 'is-offline'}>{props.online ? '● 在线' : '○ 离线'}</span>
         {/* 精简形态头部放不下单列图标，外观仍走 ⋯ 菜单——和完整工作台同一个状态源。 */}
-        <WorkbenchAppearanceMenu />
+        <WorkbenchAppearanceMenu standingLink={props.manageAuthed === true} api={api} />
       </header>
       <WorkbenchSessionList
         sessions={props.sessions}
