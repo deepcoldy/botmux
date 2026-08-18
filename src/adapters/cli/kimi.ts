@@ -27,7 +27,15 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
       }
       if (!resume) return args;
       if (resumeSessionId) return [...args, '--resume', resumeSessionId];
-      return [...args, '--continue'];
+      // No persisted session id: start FRESH, never `--continue`. Kimi's
+      // `--continue` resumes the most recent session, which is shared across
+      // every botmux session of this bot (same Kimi config home). A worker
+      // restart whose cliSessionId was never captured would then silently load
+      // a SIBLING session's conversation — e.g. a topic group's context
+      // leaking into a private chat. Losing this session's context is the
+      // lesser evil; matches reasonix/antigravity, which reject `--continue`
+      // for the same "most recent is racy" reason.
+      return args;
     },
 
     buildResumeCommand({ cliSessionId }) {
