@@ -590,8 +590,16 @@ export interface Session {
    * re-close of an already-closed row still reports `closed_with_residual`
    * instead of a false all-clear. Distinct from `mojoQuarantinedLineage` (which
    * names a surviving REMOTE session): this names a host subtree whose
-   * containment handle is still held, and its cleanup is local. Cleared only
-   * when the containment handle is released.
+   * containment handle is still held, and its cleanup is local.
+   *
+   * DERIVED DISPLAY STATE — never cleared, and that is deliberate. The handle
+   * ledger is the source of truth: the paths that discharge a handle (boot
+   * reconciliation, operator revoke) operate on the one global ledger and do not
+   * — must not — chase per-bot session rows. Consumers therefore report this
+   * field only while `hasUnprovenContainment(sessionId)` still holds a handle
+   * (see `liveLocalResidual` in worker-pool); with the handle gone the field is
+   * stale and reads as nothing, and an unreadable ledger keeps it reported
+   * (fail-closed).
    */
   mojoLocalResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   /**

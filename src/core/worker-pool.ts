@@ -34,6 +34,7 @@ import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../ser
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { hasUnprovenContainment } from './mojo-containment.js';
 import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
 import {
   buildEffectiveMojoConfig,
@@ -3366,9 +3367,9 @@ async function prepareLiveRemoteWorkerClose(
     return {
       ok: true,
       ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
-      ...(ds.remoteCloseState.localResidual
-        ? { residual: { reason: ds.remoteCloseState.localResidual } }
-        : {}),
+      // Stored residual → derived at read time (see liveLocalResidual): the
+      // journal write above still republishes the original proof verbatim.
+      ...(residualField(liveLocalResidual(ds.session.sessionId, ds.remoteCloseState.localResidual))),
     };
   }
   if (ds.remoteShutdownState) {
@@ -4019,11 +4020,12 @@ async function prepareMojoExplicitClose(
       ...((durableClose.taskId ?? remoteId)
         ? { taskId: (durableClose.taskId ?? remoteId)! }
         : {}),
+      // The journal's residual is a stored copy of the original proof; whether
+      // it still describes reality is the ledger's call (a reboot between the
+      // prepare and this replay may have discharged the handle).
       ...(parked
         ? { residual: parked }
-        : durableClose.localResidual
-          ? { residual: { reason: durableClose.localResidual } }
-          : {}),
+        : residualField(liveLocalResidual(session.sessionId, durableClose.localResidual))),
     };
   }
   const matchingRuntimePreparedProof = durableClose?.phase === 'preparing'
@@ -4052,9 +4054,7 @@ async function prepareMojoExplicitClose(
         ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
         ...(parked
           ? { residual: parked }
-          : ds.remoteCloseState!.localResidual
-            ? { residual: { reason: ds.remoteCloseState!.localResidual } }
-            : {}),
+          : residualField(liveLocalResidual(session.sessionId, ds.remoteCloseState!.localResidual))),
       };
     } catch (err) {
       logger.error(
@@ -4370,8 +4370,42 @@ export function mojoCloseResidualForRow(session: Session | undefined): CloseResi
   // single residual slot. The local residual surfaces whenever nothing is parked.
   const parked = session?.mojoQuarantinedLineage;
   if (parked) return { reason: 'mojo_lineage_quarantined', taskId: parked };
-  if (session?.mojoLocalResidual) return { reason: session.mojoLocalResidual };
+  if (session?.mojoLocalResidual) return liveLocalResidual(session.sessionId, session.mojoLocalResidual);
   return undefined;
+}
+
+/**
+ * Surface a stored LOCAL residual only while its containment handle is still
+ * outstanding.
+ *
+ * The containment-handle ledger is the SOURCE OF TRUTH for the device-isolation
+ * blocker; `Session.mojoLocalResidual` (and a journal's `localResidual`) are
+ * DERIVED display state with deliberately no clear path of their own: the two
+ * paths that discharge a handle — boot reconciliation and operator revoke —
+ * operate on the one global ledger, and having them also rewrite session rows
+ * would tie a global cleanup to whichever bots' per-bot row files happen to be
+ * loaded at the time. Deriving at read time keeps the two stores fork-free: the
+ * handle is gone → the "credentialed process may remain on this host" claim is
+ * no longer true, report nothing; the ledger cannot be read → we cannot rule the
+ * claim out, keep reporting it (fail-closed, matching hasUnprovenContainment's
+ * own contract of throwing rather than answering false).
+ */
+/** Spread helper: `{ residual }` when present, `{}` otherwise. */
+function residualField(residual: CloseResidual | undefined): { residual?: CloseResidual } {
+  return residual ? { residual } : {};
+}
+
+function liveLocalResidual(
+  sessionId: string,
+  residual: NonNullable<Session['mojoLocalResidual']> | undefined,
+): CloseResidual | undefined {
+  if (!residual) return undefined;
+  try {
+    if (!hasUnprovenContainment(sessionId)) return undefined;
+  } catch {
+    // Unreadable ledger: a handle may exist, so the residual stays reported.
+  }
+  return { reason: residual };
 }
 
 /**

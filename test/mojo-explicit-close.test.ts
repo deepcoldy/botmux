@@ -12,7 +12,7 @@
  * Run:  pnpm vitest run test/mojo-explicit-close.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -78,10 +78,30 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { recordContainmentHandle } from '../src/core/mojo-containment.js';
 
 let dataDir: string;
 let previousDataDir: string;
 const sessionReplyMock = vi.fn(async () => 'om_reply');
+
+/**
+ * Record the outstanding containment handle a residual close implies. Since
+ * round 12, `mojoLocalResidual` (row field + journal copy) is DERIVED state —
+ * consumers report it only while the handle ledger still holds a handle for the
+ * session — so any test asserting a residual survives retries/replays must
+ * mirror production and leave the handle in the ledger.
+ */
+function recordOutstandingHandle(sessionId: string): void {
+  recordContainmentHandle({
+    kind: 'tree-identity',
+    sessionId,
+    generation: 1,
+    rootPid: 4242,
+    bootId: 'boot-close-test',
+    startTime: 999,
+    nonce: `nonce-${sessionId}`,
+  });
+}
 
 function createFixture(options: {
   closeRecovery?: 'retryable' | 'uncertain' | 'irreversible';
@@ -1333,6 +1353,7 @@ describe('local residual survives durable retry, restart replay and the workerle
       liveWorker: true,
       closeResidual: 'local_subtree_boundary_unproven',
     });
+    recordOutstandingHandle(fixture.session.sessionId);
     const realPrepare = sessionStore.markMojoClosePrepared;
     vi.spyOn(sessionStore, 'markMojoClosePrepared')
       .mockImplementationOnce(() => { throw new Error('proof disk full'); })
@@ -1362,6 +1383,7 @@ describe('local residual survives durable retry, restart replay and the workerle
       liveWorker: true,
       closeResidual: 'local_subtree_unprovable_on_platform',
     });
+    recordOutstandingHandle(fixture.session.sessionId);
     const realClose = sessionStore.closeSession;
     vi.spyOn(sessionStore, 'closeSession')
       .mockImplementationOnce(() => { throw new Error('disk full'); })
@@ -1410,6 +1432,7 @@ describe('local residual survives durable retry, restart replay and the workerle
     // client that lost the first response and retries — returned a plain `closed`,
     // a false all-clear while the containment handle and blocker were still held.
     const fixture = createFixture();
+    recordOutstandingHandle(fixture.session.sessionId);
     cancelMojoMock.mockResolvedValue({
       kind: 'cancelled',
       localResidual: 'local_subtree_boundary_unproven',
@@ -1439,6 +1462,7 @@ describe('local residual survives durable retry, restart replay and the workerle
 
   it('workerless durable-retry: the residual survives a failed prepare commit too', async () => {
     const fixture = createFixture();
+    recordOutstandingHandle(fixture.session.sessionId);
     cancelMojoMock.mockResolvedValue({
       kind: 'cancelled',
       localResidual: 'local_subtree_boundary_unproven',
@@ -1464,5 +1488,83 @@ describe('local residual survives durable retry, restart replay and the workerle
     });
     // No second cancel: the retry republished the recorded proof.
     expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('mojoLocalResidual is DERIVED from the handle ledger (round-12 P1)', () => {
+  // The row field has writes but deliberately no clear path: boot reconciliation
+  // and operator revoke discharge the LEDGER only. Without read-time derivation
+  // the field forked from the ledger permanently — a host reboot proved the tree
+  // dead and released the handle, yet the row kept claiming "a credentialed
+  // process may remain on this host" to every dashboard / re-close / repo-switch
+  // consumer forever.
+  it('re-close reports a plain closed once the ledger no longer holds a handle', async () => {
+    // No handle is ever recorded — the ledger reads empty, exactly the state
+    // boot reconciliation leaves behind after a reboot proof.
+    const fixture = createFixture();
+    cancelMojoMock.mockResolvedValue({
+      kind: 'cancelled',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+
+    // The ORIGINAL close reports the live proof it just computed, ungated.
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+    });
+    // The stale row field alone must no longer resurrect the claim.
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoLocalResidual)
+      .toBe('local_subtree_boundary_unproven');
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+  });
+
+  it('journal replay after daemon loss also derives: released handle → plain closed', async () => {
+    const fixture = createFixture({
+      liveWorker: true,
+      closeResidual: 'local_subtree_unprovable_on_platform',
+    });
+    const realClose = sessionStore.closeSession;
+    vi.spyOn(sessionStore, 'closeSession')
+      .mockImplementationOnce(() => { throw new Error('disk full'); })
+      .mockImplementation((...args) => realClose(...args));
+
+    expect((await closeSession(fixture.ds.session.sessionId, fixture.registry)).ok).toBe(false);
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      localResidual: 'local_subtree_unprovable_on_platform',
+    });
+
+    // New daemon, and (unlike the round-6 case above) the ledger holds nothing:
+    // a reboot between the prepare and this replay discharged the handle.
+    setActiveSessionsRegistry(new Map());
+    sessionStore.init('app');
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+  });
+
+  it('an unreadable ledger keeps the residual reported (fail-closed)', async () => {
+    const fixture = createFixture();
+    cancelMojoMock.mockResolvedValue({
+      kind: 'cancelled',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({ ok: true });
+
+    // Corrupt the ledger AFTER the close: "cannot read" must never collapse into
+    // "no handle, claim withdrawn" — that is the exact state in which an
+    // unproven subtree would silently stop being reported.
+    writeFileSync(join(dataDir, 'mojo-containment-handles.json'), '{not json');
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'local_subtree_boundary_unproven' },
+    });
   });
 });
