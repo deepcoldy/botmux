@@ -23,10 +23,15 @@
  *
  * Two strengths of handle
  * -----------------------
- *   STRONG (`cgroup`) — a per-session cgroup v2 directory. Membership is kernel
- *     state that no same-user child can forge, unlink or setsid its way out of,
- *     and `cgroup.procs` being empty is real proof. This is the only kind that
- *     closes the trust gap documented in mojo-process-tree.
+ *   STRONG (`cgroup`) — a per-session cgroup v2 directory. Membership survives
+ *     setsid and is the right tool to KILL a whole turn subtree (cgroup.kill) and
+ *     to ENUMERATE it. But `cgroup.procs` being empty is NOT a boundary proof:
+ *     mojo runs at the daemon's UID, and cgroup v2 lets a same-UID process migrate
+ *     ITSELF out of the leaf (to the parent slice or a sibling) within the
+ *     delegation domain — a move the leaf-down read cannot see. So a cgroup handle
+ *     is treated like a weak one for RELEASE purposes (emptiness stops signalling
+ *     and lets the row close, but the blocker is retained); only a per-session UID
+ *     or namespace the process cannot leave would make emptiness a real proof.
  *
  *   WEAK (`tree-identity`) — a persisted (rootPid, bootId, startTime, nonce)
  *     record for hosts with no usable cgroup v2 (this includes cgroup-v1-only
@@ -983,17 +988,19 @@ export function hasUnprovenContainment(sessionId: string, dataDir?: string): boo
  *
  *   verdict           evidence              boundaryProof  release  residual
  *   ----------------  --------------------  -------------  -------  --------
- *   proven, cgroup    cgroup-empty          true           yes      null
- *   proven, cgroup    cgroup-zombie-only    true           yes      null
  *   proven, weak      boot-id-changed       true           yes      null
+ *   proven, cgroup    cgroup-empty          FALSE          NO       deviceIsolation
+ *   proven, cgroup    cgroup-zombie-only    FALSE          NO       deviceIsolation
  *   proven, weak      scan-clean            FALSE          NO       deviceIsolation
  *   not proven        n/a                   false          NO       deviceIsolation
  *
- * The fourth row is the whole fix: a clean weak scan lets the caller stop
- * re-signalling (`signalsStopped: true`) and lets the SESSION close, but it
- * authorises nothing else. The handle stays in the durable store, so
- * `hasUnprovenContainment` keeps answering true and the device-isolation blocker
- * survives the close.
+ * Only a reboot (boot-id-changed) authorises forgetting a tree. A cgroup being
+ * empty is NOT a boundary proof — a same-UID process can migrate itself out of
+ * the leaf, invisible to the leaf-down read — so a cgroup verdict now behaves
+ * exactly like a weak scan-clean: it lets the caller stop re-signalling
+ * (`signalsStopped: true`) and lets the SESSION close, but authorises nothing
+ * else. The handle stays in the durable store, so `hasUnprovenContainment` keeps
+ * answering true and the device-isolation blocker survives the close.
  */
 export function containmentReleaseDecision(verdict: QuiescenceVerdict): ContainmentReleaseDecision {
     const handle = verdict.handle;
@@ -1014,13 +1021,23 @@ export function containmentReleaseDecision(verdict: QuiescenceVerdict): Containm
     // past it: a weak handle defaults to `scan-clean`, the weakest option.
     const evidence: QuiescenceEvidence = verdict.evidence
         ?? (handle.kind === 'cgroup' ? 'cgroup-empty' : 'scan-clean');
-    // Two, and only two, unforgeable facts. Both are kernel-owned: cgroup
-    // membership the child cannot escape, and a boot id the child cannot rewrite.
-    // `scan-clean` is absent from this set on purpose and a mutation that adds it
-    // is exactly what the reviewer's third /proc probe shape kills.
-    const boundaryProof = handle.kind === 'cgroup'
-        ? (evidence === 'cgroup-empty' || evidence === 'cgroup-zombie-only')
-        : evidence === 'boot-id-changed';
+    // EXACTLY ONE unforgeable fact authorises forgetting a tree: a boot id change.
+    // A reboot provably killed every process; nothing else does.
+    //
+    // A cgroup being empty is DELIBERATELY NOT on this list, reversing an earlier
+    // revision. mojo runs at the daemon's UID, and cgroup v2 lets a same-UID
+    // process migrate ITSELF between cgroups within the delegation domain — up to
+    // the parent slice, or sideways into a sibling. The close proof recurses the
+    // leaf DOWNWARD, so a process that migrated OUT is invisible and the leaf reads
+    // empty. Treating that as proof cleared the device-isolation blocker while a
+    // credentialed process ran on — and "device-isolation fails closed" cannot
+    // back it up, because the blocker is the very thing the false proof clears
+    // (circular). Until a per-session UID or namespace makes the cgroup a boundary
+    // the process cannot leave, a cgroup handle is only a KILL + DIAGNOSTIC tool:
+    // like a weak scan-clean, it may stop signalling and let the row close, but the
+    // close carries a residual and the blocker is RETAINED. `cgroup.kill` + reboot
+    // remain the only things that genuinely remove the tree.
+    const boundaryProof = evidence === 'boot-id-changed';
     if (boundaryProof) {
         return {
             boundaryProof: true,
@@ -1030,15 +1047,17 @@ export function containmentReleaseDecision(verdict: QuiescenceVerdict): Containm
             signalsStopped: true,
         };
     }
+    const reason = evidence === 'cgroup-empty' || evidence === 'cgroup-zombie-only'
+        ? `${evidence} is a KILL/diagnostic signal, not a boundary proof: a same-UID process can `
+            + 'migrate itself out of the cgroup (to the parent slice or a sibling), which a leaf-down '
+            + 'read cannot see. The blocker is retained until a reboot or an operator revoke.'
+        : `${evidence} is a diagnostic signal, not a boundary proof: a descendant that `
+            + 'calls setsid, scrubs its environ and reparents to init is invisible to the scan';
     return {
         boundaryProof: false,
         releaseAuthorised: false,
         evidence,
-        residual: {
-            deviceIsolation: true,
-            reason: `${evidence} is a diagnostic signal, not a boundary proof: a descendant that `
-                + 'calls setsid, scrubs its environ and reparents to init is invisible to the scan',
-        },
+        residual: { deviceIsolation: true, reason },
         signalsStopped: true,
     };
 }
@@ -1051,9 +1070,14 @@ export function containmentReleaseDecision(verdict: QuiescenceVerdict): Containm
  * level, which is the invariant this whole module exists to enforce. A caller
  * holding a `proven: false` verdict has no way to spend it here.
  *
- * For a strong handle the now-empty cgroup directory is removed too; `rmdir` on a
- * cgroup fails if it is non-empty, so this is also a last kernel-side re-check of
- * the proof we were handed.
+ * A CGROUP handle is never released here: cgroup emptiness is no longer a
+ * boundary proof (see containmentReleaseDecision — a same-UID process can migrate
+ * out of the leaf), so a cgroup verdict always resolves to `releaseAuthorised:
+ * false` and returns below with the handle and the device-isolation blocker
+ * retained. The cgroup directory is therefore NOT reclaimed here — the tree is
+ * killed via `cgroup.kill` during teardown, and the handle/dir are cleared only
+ * by a reboot (boot-id-changed on the weak path) or an operator revoke. The one
+ * verdict that DOES authorise a release is a WEAK handle's `boot-id-changed`.
  */
 export function releaseContainmentHandle(
     verdict: QuiescenceVerdict,
@@ -1068,9 +1092,10 @@ export function releaseContainmentHandle(
     const handle = verdict.handle;
     const decision = containmentReleaseDecision(verdict);
     if (!decision.releaseAuthorised) {
-        // Proven, but only diagnostically. Do NOT throw: the caller is allowed to
-        // stop signalling and to close the session. Just refuse to forget the tree,
-        // which is what keeps the device-isolation blocker after the close.
+        // Proven, but only diagnostically (a weak scan-clean, or ANY cgroup verdict
+        // now). Do NOT throw: the caller is allowed to stop signalling and to close
+        // the session. Just refuse to forget the tree, which is what keeps the
+        // device-isolation blocker after the close.
         logger.warn(
             `[mojo] session ${handle.sessionId}: containment looks quiescent by `
             + `${decision.evidence} but that is not a boundary proof; keeping the handle and the `
@@ -1078,58 +1103,8 @@ export function releaseContainmentHandle(
         );
         return decision;
     }
-    // ORDER MATTERS: for a cgroup handle the rmdir is the last kernel-side
-    // re-check of the proof, so it runs BEFORE the store record is removed.
-    // Removing the store entry first (as this once did) meant an rmdir that
-    // failed — because a member raced back in between the proof read and here —
-    // could only be logged as a warning, with the handle and the blocker already
-    // gone. Now a failed rmdir on an empty-cgroup proof VETOES the release: the
-    // handle stays, and the caller gets a residual decision.
-    if (handle.kind === 'cgroup') {
-        // Re-read the AUTHORITATIVE subtree membership before forgetting the tree.
-        // A zombie-only cgroup is genuinely quiescent yet still LISTS its zombie
-        // (and is un-rmdir-able until the parent reaps it), so that proof is
-        // allowed to release without an empty read. Every OTHER populated read at
-        // release means a member raced back in between the proof and here — VETO.
-        // The check keys off the kernel membership read, NOT rmdir success: the
-        // knob-unlinking in rmdirCgroupTree is a test accommodation and must never
-        // be what decides whether the tree is empty.
-        const zombieOnly = decision.evidence === 'cgroup-zombie-only';
-        const vetoRelease = (reason: string, pids?: number[]): ContainmentReleaseDecision => {
-            logger.error(
-                `[mojo] session ${handle.sessionId}: release VETOED — ${reason} `
-                + `(${handle.cgroupPath}); keeping the handle and the device-isolation blocker`,
-            );
-            return {
-                boundaryProof: false,
-                releaseAuthorised: false,
-                evidence: decision.evidence,
-                residual: { deviceIsolation: true, pids, reason },
-                signalsStopped: true,
-            };
-        };
-        if (!zombieOnly) {
-            const recheck = cgroupSubtreePids(handle.cgroupPath);
-            const live = recheck.ok ? recheck.pids : [-1]; // unreadable → treat as populated
-            if (live.length > 0) {
-                return vetoRelease(
-                    recheck.ok ? 'cgroup still has members (member raced back in)' : recheck.reason,
-                    recheck.ok ? live : undefined,
-                );
-            }
-        }
-        // rmdir is the FINAL kernel-side gate, and its result is NOT discarded:
-        // between the membership recheck above and here is a sub-millisecond window
-        // in which a same-uid process could migrate in, after which the kernel
-        // refuses to remove the now-non-empty cgroup. For a non-zombie proof that
-        // refusal MEANS the tree is not empty → VETO rather than forget it. A
-        // zombie-only cgroup is expected to be un-rmdir-able until reaped, so its
-        // failure is tolerated (the handle is still released, dir reclaimed later).
-        const reclaimed = rmdirCgroupTree(handle.cgroupPath);
-        if (!reclaimed && !zombieOnly) {
-            return vetoRelease('cgroup could not be removed — a member raced in after the recheck');
-        }
-    }
+    // Only a WEAK handle's boot-id-changed reaches here. There is no cgroup
+    // directory to reclaim on this path (cgroup handles never authorise release).
     const path = filePath(dataDir);
     mkdirSync(dirname(path), { recursive: true });
     withFileLockSync(path, () => {
@@ -1142,23 +1117,6 @@ export function releaseContainmentHandle(
         else data.sessions[handle.sessionId] = after;
         writeStrict(data, dataDir);
     });
-    if (handle.kind === 'cgroup') {
-        // A zombie-only cgroup was released above without a successful rmdir; the
-        // empty directory can be reclaimed once its parent reaps the zombie. Say
-        // so rather than leaving an operator to find it with no explanation.
-        try {
-            rmdirSync(handle.cgroupPath);
-        } catch (err) {
-            const code = (err as NodeJS.ErrnoException).code;
-            if (code !== 'ENOENT') {
-                logger.warn(
-                    `[mojo] released containment for session ${handle.sessionId} but could not remove `
-                    + `${handle.cgroupPath} (${code ?? 'unknown'}); a zombie-only cgroup is the usual `
-                    + 'cause and the empty directory can be reclaimed once its parent reaps it',
-                );
-            }
-        }
-    }
     return decision;
 }
 
@@ -1208,6 +1166,18 @@ export function revokeContainmentHandles(
             + 'of that turn is no longer tracked; its device-isolation blocker is gone.'
             + (opts.auditNote ? ` [${opts.auditNote}]` : ''),
         );
+        // Reclaim the cgroup directory the runtime no longer removes (a cgroup
+        // handle is never released by proof now). cgroup.kill first, so an operator
+        // who revokes a still-populated tree at least SIGKILLs it rather than
+        // leaving it running behind a now-cleared blocker.
+        if (handle.kind === 'cgroup') {
+            void killPreparedBoundary({
+                sessionId: handle.sessionId,
+                generation: handle.generation,
+                cgroupPath: handle.cgroupPath,
+                nonce: handle.nonce,
+            });
+        }
     }
     return { removed, remaining };
 }

@@ -787,14 +787,25 @@ describe('zombie members do not wedge a cgroup forever', () => {
     }, 20_000);
 });
 
-describe('containment is the ONLY source of boundaryProof: true', () => {
+describe('a reboot is the ONLY source of boundaryProof: true (round-8 same-UID P0)', () => {
     const strong: StrongContainmentHandle = {
         kind: 'cgroup', sessionId: 'sess-p', generation: 1,
         cgroupPath: join(tmpdir(), 'nope'), nonce: 'n',
     };
 
-    it('a proven STRONG handle mints contained-proven', () => {
+    it('a proven STRONG (cgroup) handle is diagnostic-clean, NOT a boundary proof', () => {
+        // cgroup emptiness is no longer a boundary proof: mojo runs at the daemon's
+        // UID and can migrate itself out of the leaf (to the parent slice or a
+        // sibling), invisible to the leaf-down read. The close still proceeds
+        // (signals stop) but as a RESIDUAL — the device-isolation blocker is kept.
         const q = containmentQuiescence({ proven: true, handle: strong });
+        expect(q.boundaryProof).toBe(false);
+        expect(q.kind).toBe('diagnostic-clean');
+    });
+
+    it('a WEAK boot-id-changed verdict is the one thing that DOES mint a boundary proof', () => {
+        // A reboot provably killed every process — the only unforgeable release.
+        const q = containmentQuiescence({ proven: true, handle: weak(), evidence: 'boot-id-changed' });
         expect(q).toEqual({ kind: 'contained-proven', boundaryProof: true });
     });
 
@@ -844,12 +855,15 @@ describe('session-level quiescence takes the weakest outstanding tree', () => {
         expect(q).toEqual({ kind: 'diagnostic-clean', boundaryProof: false });
     });
 
-    it('all-strong and all-proven yields contained-proven', () => {
+    it('all-strong and all-proven is diagnostic-clean now (cgroup emptiness is not a proof)', () => {
         const d = dataDirs();
         recordContainmentHandle(cg('s1', '/cg/a'), d);
         recordContainmentHandle(cg('s1', '/cg/b'), d);
         const q = sessionContainmentQuiescence('s1', h => ({ proven: true, handle: h }), d);
-        expect(q).toEqual({ kind: 'contained-proven', boundaryProof: true });
+        // Every member proven-empty, yet no boundary proof — the blocker survives
+        // (a same-UID process could have migrated out of any of these leaves).
+        expect(q.boundaryProof).toBe(false);
+        expect(q.kind).toBe('diagnostic-clean');
     });
 
     it('ONE weak handle downgrades the whole session to diagnostic-clean', () => {
@@ -1002,86 +1016,42 @@ describe('an impossible verdict is still safe', () => {
     });
 });
 
-describe('release re-checks emptiness BEFORE forgetting the tree (round-7 P1-1)', () => {
-    it('VETOES the release when a member raced back into a cgroup-empty proof', () => {
-        // The exact ordering bug: releasing the store handle first, then finding
-        // rmdir fails, could only warn — with the blocker already gone. Now a
-        // populated cgroup at release time keeps the handle and the blocker.
-        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-veto-'));
-        const dir = mkdtempSync(join(tmpdir(), 'raced-cgroup-'));
-        // A pid appeared after the proof read — release must NOT forget the tree.
-        writeFileSync(join(dir, 'cgroup.procs'), '4242\n');
-        const handle: StrongContainmentHandle = {
-            kind: 'cgroup', sessionId: 'raced-sess', generation: 1, cgroupPath: dir, nonce: 'n',
-        };
-        recordContainmentHandle(handle, dataDir);
-        // Bare proven verdict → evidence defaults to cgroup-empty.
-        const decision = releaseContainmentHandle({ proven: true, handle }, dataDir);
-        expect(decision.releaseAuthorised).toBe(false);
-        expect(decision.residual).not.toBeNull();
-        // Handle and blocker retained.
-        expect(hasUnprovenContainment('raced-sess', dataDir)).toBe(true);
-    });
-
-    it('VETOES when rmdir refuses a non-zombie cgroup (member raced in after the recheck)', () => {
-        // The sub-ms TOCTOU (round-8 P2): the membership recheck read empty, but by
-        // the time rmdir runs a same-uid process has migrated in, so the kernel
-        // refuses to remove the now-non-empty cgroup. rmdir's refusal is the FINAL
-        // gate and must not be discarded. Modelled by a stray non-knob file that
-        // cgroupSubtreePids ignores (not a cgroup.procs, not a dir) but rmdir cannot
-        // remove — the same shape as "empty read, un-rmdir-able".
-        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-toctou-'));
-        const dir = mkdtempSync(join(tmpdir(), 'toctou-cgroup-'));
-        writeFileSync(join(dir, 'cgroup.procs'), '');   // membership recheck reads empty
-        writeFileSync(join(dir, 'intruder'), 'x');       // ...but rmdir will refuse
-        const handle: StrongContainmentHandle = {
-            kind: 'cgroup', sessionId: 'toctou-sess', generation: 1, cgroupPath: dir, nonce: 'n',
-        };
-        recordContainmentHandle(handle, dataDir);
-        const decision = releaseContainmentHandle({ proven: true, handle }, dataDir);
-        expect(decision.releaseAuthorised).toBe(false);
-        expect(hasUnprovenContainment('toctou-sess', dataDir)).toBe(true);
-    });
-
-    it('RELEASES a zombie-only cgroup even when its directory cannot be removed', () => {
-        // Zombie-only is genuinely quiescent (a zombie executes nothing) yet the
-        // kernel refuses rmdir until the parent reaps it. That case must still
-        // release, or a stuck directory would wedge the session forever.
-        const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-zombie-'));
-        const dir = mkdtempSync(join(tmpdir(), 'zombie-cgroup-'));
-        writeFileSync(join(dir, 'cgroup.procs'), '');
-        // A nested dir with a stray (non-knob) file makes rmdir genuinely fail,
-        // standing in for an un-rmdir-able zombie cgroup.
-        mkdirSync(join(dir, 'leaf'));
-        writeFileSync(join(dir, 'leaf', 'not-a-knob'), 'x');
-        const handle: StrongContainmentHandle = {
-            kind: 'cgroup', sessionId: 'zombie-sess', generation: 1, cgroupPath: dir, nonce: 'n',
-        };
-        recordContainmentHandle(handle, dataDir);
-        const decision = releaseContainmentHandle(
-            { proven: true, handle, evidence: 'cgroup-zombie-only' }, dataDir,
-        );
-        expect(decision.releaseAuthorised).toBe(true);
-        // Released despite the leftover: a stuck directory must never wedge a close.
-        expect(hasUnprovenContainment('zombie-sess', dataDir)).toBe(false);
-    });
-
-    it('stays SILENT when the cgroup was already reclaimed (ENOENT)', async () => {
-        // A missing directory is the normal, healthy outcome. Warning on it would
-        // train operators to ignore the warning that actually matters.
-        {
-            const { logger } = await import('../src/utils/logger.js');
-            const dataDir = mkdtempSync(join(tmpdir(), 'rmdir-quiet-'));
+describe('a cgroup handle is NEVER released by proof (round-8 same-UID P0)', () => {
+    // cgroup emptiness stopped being a boundary proof: a same-UID process can
+    // migrate itself out of the leaf. So EVERY cgroup verdict — empty, zombie-only,
+    // or populated — keeps the handle and the device-isolation blocker. Only a
+    // weak boot-id-changed (a reboot) or an operator revoke can drop it.
+    const cases: Array<[string, string, 'cgroup-empty' | 'cgroup-zombie-only']> = [
+        ['an empty cgroup', '', 'cgroup-empty'],
+        ['a populated cgroup', '4242\n', 'cgroup-empty'],
+        ['a zombie-only cgroup', '', 'cgroup-zombie-only'],
+    ];
+    for (const [label, procs, evidence] of cases) {
+        it(`retains the handle and blocker for ${label}`, () => {
+            const dataDir = mkdtempSync(join(tmpdir(), 'cg-no-release-'));
+            const dir = mkdtempSync(join(tmpdir(), 'cg-'));
+            writeFileSync(join(dir, 'cgroup.procs'), procs);
             const handle: StrongContainmentHandle = {
-                kind: 'cgroup', sessionId: 'gone-sess', generation: 1,
-                cgroupPath: join(tmpdir(), `never-existed-${process.pid}`), nonce: 'n',
+                kind: 'cgroup', sessionId: 'nr-sess', generation: 1, cgroupPath: dir, nonce: 'n',
             };
             recordContainmentHandle(handle, dataDir);
-            const warns: string[] = [];
-            const spy = vi.spyOn(logger, 'warn').mockImplementation((m: unknown) => { warns.push(String(m)); });
-            try { releaseContainmentHandle({ proven: true, handle }, dataDir); }
-            finally { spy.mockRestore(); }
-            expect(warns.filter(w => w.includes('could not remove'))).toEqual([]);
-        }
+            const decision = releaseContainmentHandle({ proven: true, handle, evidence }, dataDir);
+            expect(decision.releaseAuthorised).toBe(false);
+            expect(decision.residual).not.toBeNull();
+            // Close still proceeds (signals stop) but the blocker survives.
+            expect(decision.signalsStopped).toBe(true);
+            expect(hasUnprovenContainment('nr-sess', dataDir)).toBe(true);
+        });
+    }
+
+    it('a WEAK boot-id-changed verdict IS released (the one real proof: a reboot)', () => {
+        const dataDir = mkdtempSync(join(tmpdir(), 'cg-reboot-'));
+        const handle = { ...weak(), sessionId: 'reboot-sess' };
+        recordContainmentHandle(handle, dataDir);
+        const decision = releaseContainmentHandle(
+            { proven: true, handle, evidence: 'boot-id-changed' }, dataDir,
+        );
+        expect(decision.releaseAuthorised).toBe(true);
+        expect(hasUnprovenContainment('reboot-sess', dataDir)).toBe(false);
     });
 });

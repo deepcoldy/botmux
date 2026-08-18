@@ -149,7 +149,11 @@ describe('what a weak handle CAN prove, and what a strong one still proves', () 
         expect(containmentQuiescence(verdict)).toEqual({ kind: 'contained-proven', boundaryProof: true });
     });
 
-    it('a strong handle whose cgroup is gone still releases, with no residual', () => {
+    it('a strong handle whose cgroup is gone is STILL not released (round-8 same-UID P0)', () => {
+        // An empty/gone cgroup used to release with no residual. It no longer does:
+        // a same-UID process can migrate out of the leaf, so leaf-emptiness is not a
+        // boundary proof. The close proceeds (signals stop) but the blocker stays;
+        // only a reboot or an operator revoke drops it.
         const dir = dataDir();
         const handle = strong();
         recordContainmentHandle(handle, dir);
@@ -159,10 +163,11 @@ describe('what a weak handle CAN prove, and what a strong one still proves', () 
         if (verdict.proven) expect(verdict.evidence).toBe('cgroup-empty');
 
         const decision = releaseContainmentHandle(verdict, dir);
-        expect(decision.boundaryProof).toBe(true);
-        expect(decision.releaseAuthorised).toBe(true);
-        expect(decision.residual).toBeNull();
-        expect(hasUnprovenContainment(handle.sessionId, dir)).toBe(false);
+        expect(decision.boundaryProof).toBe(false);
+        expect(decision.releaseAuthorised).toBe(false);
+        expect(decision.residual?.deviceIsolation).toBe(true);
+        expect(decision.signalsStopped).toBe(true);
+        expect(hasUnprovenContainment(handle.sessionId, dir)).toBe(true);
     });
 
     it('an UNPROVEN verdict still throws, and keeps the handle', () => {
