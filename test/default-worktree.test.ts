@@ -242,6 +242,26 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices.some(n => n.includes('沙盒已开启'))).toBe(false); // no fail-closed refusal
   });
 
+  it('fail-closed does NOT apply to riff even with BOTMUX_SANDBOX=1 (env must not bypass the riff exemption)', async () => {
+    // Regression: the BOTMUX_SANDBOX env check was short-circuiting OUTSIDE the
+    // riff guard, so a riff bot + BOTMUX_SANDBOX=1 fail-closed on a worktree
+    // failure — bricking a session the worker deliberately leaves unsandboxed
+    // (sandboxRequested = !riffRemoteBackend && (... || BOTMUX_SANDBOX)). The
+    // riff exemption must wrap the WHOLE union, env included.
+    const plain = join(tempRoot, 'not-a-repo-riff-env');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, { cliId: 'riff' }); // no sandbox flag
+    process.env.BOTMUX_SANDBOX = '1';
+    try {
+      const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+        isBotDefaultDir: true, locale: 'zh',
+      });
+      expect(r.dir).toBe(plain); // degraded — riff session still starts
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+  });
+
   it('no-ops (no notice, dir unchanged) when the dir did not come from the bot default', async () => {
     const repo = makeRepo('proj');
     const { mod } = await loadWithBot(repo, true);

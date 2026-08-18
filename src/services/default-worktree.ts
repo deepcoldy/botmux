@@ -111,26 +111,26 @@ export async function maybeCreateDefaultWorktree(
   // protects everything OUTSIDE the whitelist, not the project itself). The
   // auto-worktree is therefore the only barrier between the agent and the real
   // project; a silent fallback to baseDir on failure would be a sandbox escape.
-  // BOTMUX_SANDBOX=1 forces the sandbox on regardless of the bot flag (testing).
-  // Legacy `readIsolation` is auto-migrated to `sandbox` at daemon startup, but
-  // the worker still honors it for an unmigrated read-only BOTS_CONFIG
-  // (sandboxRequested = sandbox || readIsolation || BOTMUX_SANDBOX) — match that
-  // union so fail-closed tracks the REAL sandbox state, not just the new flag.
-  // The worker's sandboxRequested ALSO excludes the riff remote backend
-  // (`!riffRemoteBackend` — localSandboxApplies): riff has no local CLI process,
-  // the agent runs in riff's own remote sandbox and its writes never touch the
-  // real local dir, so the escape rationale does not apply and the old graceful
-  // fallback must keep working for riff bots.
-  const failClosed = process.env.BOTMUX_SANDBOX === '1'
-    || (() => {
-      try {
-        const c = getBot(larkAppId).config;
-        if (c.sandbox !== true && c.readIsolation !== true) return false;
-        return resolvePairedSpawnBackendType(
-          c.cliId, undefined, c.backendType, config.daemon.backendType,
-        ) !== 'riff';
-      } catch { return false; }
-    })();
+  //
+  // Match the worker's sandboxRequested union EXACTLY (worker.ts):
+  //   sandboxRequested = !riffRemoteBackend && (sandbox || readIsolation || BOTMUX_SANDBOX)
+  // - `readIsolation` is in the union because the worker still honors it for an
+  //   unmigrated BOTS_CONFIG (it's auto-migrated to `sandbox` at daemon startup,
+  //   but a read-only config can still carry the legacy flag).
+  // - The riff exemption MUST wrap the WHOLE union: riff has no local CLI process
+  //   (the agent runs in riff's own remote sandbox, its writes never touch the
+  //   real local dir), so the escape rationale does not apply and the old graceful
+  //   fallback must keep working for riff bots — even when BOTMUX_SANDBOX=1.
+  const failClosed = (() => {
+    try {
+      const c = getBot(larkAppId).config;
+      const riff = resolvePairedSpawnBackendType(
+        c.cliId, undefined, c.backendType, config.daemon.backendType,
+      ) === 'riff';
+      if (riff) return false;
+      return c.sandbox === true || c.readIsolation === true || process.env.BOTMUX_SANDBOX === '1';
+    } catch { return false; }
+  })();
   const notify = async (msg: string) => {
     if (!ctx.notify) return;
     try { await ctx.notify(msg); } catch { /* notices are best-effort — never fail a session start */ }
