@@ -108,8 +108,10 @@ import {
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
 import {
   canWakeDormantBackendForAttach,
+  type SessionListWakeRequestContext,
   wakeDormantBackendForAttach,
 } from './cli/session-list-wake.js';
+import { SESSION_WAKE_DEADLINE_HEADER } from './core/session-wake-deadline.js';
 import { terminalCellWidth } from './cli/terminal-width.js';
 import {
   attachFrozenManagedZmxSession,
@@ -5166,7 +5168,10 @@ function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSna
   return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
-async function requestDormantSessionWake(session: SessionData): Promise<
+async function requestDormantSessionWake(
+  session: SessionData,
+  context: SessionListWakeRequestContext,
+): Promise<
   | { ok: true }
   | { ok: false; error: string }
 > {
@@ -5185,7 +5190,11 @@ async function requestDormantSessionWake(session: SessionData): Promise<
 
   try {
     const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/wake`;
-    const response = await fetchDaemonIpc(daemon.ipcPort, path, { method: 'POST' });
+    const response = await fetchDaemonIpc(daemon.ipcPort, path, {
+      method: 'POST',
+      signal: context.signal,
+      headers: { [SESSION_WAKE_DEADLINE_HEADER]: String(context.deadlineMs) },
+    });
     const body: any = await response.json().catch(() => ({}));
     if (response.ok && body?.ok) return { ok: true };
     return { ok: false, error: body?.error ?? `HTTP ${response.status}` };
@@ -5474,16 +5483,23 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     };
     process.stdout.on('resize', onResize);
 
+    let deleteInFlight = false;
+    let wakeInFlight = false;
+    let wakeAbortController: AbortController | null = null;
+    let pickerClosed = false;
+
     function cleanup(): void {
+      if (pickerClosed) return;
+      pickerClosed = true;
+      wakeAbortController?.abort();
+      wakeAbortController = null;
+      process.stdin.off('data', onInput);
       process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
-
-    let deleteInFlight = false;
-    let wakeInFlight = false;
 
     async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
@@ -5515,7 +5531,15 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
-    process.stdin.on('data', async (key: string) => {
+    async function onInput(key: string): Promise<void> {
+      // Exit always wins, including while the wake HTTP or backend probe is
+      // pending. cleanup aborts the shared deadline signal before restoring
+      // the terminal, so Ctrl-C/q/Esc can never be swallowed by in-flight work.
+      if (key === '\x03' || key === 'q' || key === '\x1b') {
+        cleanup();
+        resolve();
+        return;
+      }
       if (deleteInFlight || wakeInFlight) return;
       // Delete confirmation mode
       if (confirmDelete) {
@@ -5527,18 +5551,11 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           flash = { style: 'dim', text: '取消删除' };
         }
-        render();
+        if (!pickerClosed) render();
         return;
       }
 
       flash = null;
-
-      // Ctrl-C or q or Esc
-      if (key === '\x03' || key === 'q' || key === '\x1b') {
-        cleanup();
-        resolve();
-        return;
-      }
 
       if (rows.length === 0) {
         // No sessions left, only q works
@@ -5588,14 +5605,19 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
             return;
           }
           wakeInFlight = true;
+          const wakeController = new AbortController();
+          wakeAbortController = wakeController;
           flash = { style: 'warn', text: `正在恢复 ${target.backendType}: ${persistentTargetDisplay(target)}…` };
           render();
           const recovered = await wakeDormantBackendForAttach({
             target,
-            wake: () => requestDormantSessionWake(selected.session),
+            wake: context => requestDormantSessionWake(selected.session, context),
             probe: probePersistentBackendTarget,
+            signal: wakeController.signal,
           });
+          if (wakeAbortController === wakeController) wakeAbortController = null;
           wakeInFlight = false;
+          if (pickerClosed) return;
           if (!recovered.ok) {
             flash = { style: 'error', text: `恢复失败: ${recovered.error}` };
             render();
@@ -5645,7 +5667,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         resolve();
         return;
       }
-    });
+    }
+
+    process.stdin.on('data', onInput);
   });
 }
 

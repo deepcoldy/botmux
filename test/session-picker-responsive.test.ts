@@ -1,6 +1,7 @@
 import * as pty from 'node-pty';
 import xtermHeadless from '@xterm/headless';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { createServer } from 'node:http';
 import {
   mkdirSync,
   mkdtempSync,
@@ -87,6 +88,7 @@ function makeFixture(
   titleFor?: (index: number) => string,
   adoptTmuxTarget?: string,
   dormantTmux = false,
+  wakeDaemonPort?: number,
 ): { root: string; dataDir: string } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-picker-responsive-'));
   tempDirs.push(root);
@@ -136,6 +138,19 @@ function makeFixture(
     selected.backendType = 'tmux';
     delete selected.pid;
     selected.lastCliInput = 'resume this conversation';
+    if (wakeDaemonPort !== undefined) {
+      selected.larkAppId = 'cli_test_wake';
+      const daemonDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(join(daemonDir, 'cli_test_wake.json'), JSON.stringify({
+        larkAppId: 'cli_test_wake',
+        ipcPort: wakeDaemonPort,
+        lastHeartbeat: Date.now(),
+      }));
+      const configDir = join(root, '.botmux');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, '.dashboard-secret'), 'picker-wake-test-secret');
+    }
   }
   writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(sessions));
   return { root, dataDir };
@@ -148,13 +163,20 @@ async function spawnPicker(
   modern = false,
   adoptTmuxTarget?: string,
   dormantTmux = false,
+  wakeDaemonPort?: number,
 ): Promise<{
   child: pty.IPty;
   terminal: InstanceType<typeof Terminal>;
   renderCount: () => number;
   waitForRender: (minimum: number) => Promise<void>;
 }> {
-  const fixture = makeFixture(multiBot, titleFor, adoptTmuxTarget, dormantTmux);
+  const fixture = makeFixture(
+    multiBot,
+    titleFor,
+    adoptTmuxTarget,
+    dormantTmux,
+    wakeDaemonPort,
+  );
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: fixture.root,
@@ -364,5 +386,41 @@ describe('session picker real terminal responsiveness', () => {
     expect(screen.lines.some(line => line.includes('tmux: bmx-48000000') && line.includes('Enter 恢复并连接'))).toBe(true);
     expect(screen.lines.some(line => line.includes('⏎ 恢复'))).toBe(true);
     await closePicker(picker.child, picker.terminal);
+  });
+
+  it('lets q abort a never-resolving wake and exits raw mode promptly', async () => {
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>(resolve => { markRequestStarted = resolve; });
+    const server = createServer(() => { markRequestStarted(); });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test daemon did not bind a TCP port');
+
+    try {
+      const picker = await spawnPicker(120, false, undefined, false, undefined, true, address.port);
+      const exited = new Promise<void>(resolve => picker.child.onExit(() => resolve()));
+      const beforeWake = picker.renderCount();
+      picker.child.write('\r');
+      await picker.waitForRender(beforeWake + 1);
+      expect(inspectScreen(picker.terminal).lines.some(line => line.includes('正在恢复 tmux'))).toBe(true);
+      await Promise.race([
+        requestStarted,
+        delay(2_000).then(() => { throw new Error('wake request did not reach test daemon'); }),
+      ]);
+
+      picker.child.write('q');
+      await Promise.race([
+        exited,
+        delay(1_000).then(() => { throw new Error('picker did not exit after q'); }),
+      ]);
+      picker.terminal.dispose();
+      const idx = children.indexOf(picker.child);
+      if (idx >= 0) children.splice(idx, 1);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 });

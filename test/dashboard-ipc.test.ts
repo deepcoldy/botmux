@@ -34,6 +34,11 @@ import {
 } from '../src/core/ask-broker.js';
 import { managedOriginAttestationProofPath } from '../src/core/managed-origin-capability.js';
 import { MANAGED_ORIGIN_PROOF_DOMAIN } from '../src/core/managed-origin-attestation.js';
+import {
+  __testOnly_resetBotTurnMutationGates,
+  withBotTurnAdmission,
+} from '../src/core/bot-turn-mutation-gate.js';
+import { SESSION_WAKE_DEADLINE_HEADER } from '../src/core/session-wake-deadline.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -1836,6 +1841,52 @@ describe('POST /api/sessions/:sessionId/wake', () => {
     } finally {
       findSpy.mockRestore();
       forkSpy.mockRestore();
+    }
+  });
+
+  it('times out while another turn holds the bot mutation gate and never wakes later', async () => {
+    const appId = 'app-list-wake-timeout';
+    const ds = {
+      larkAppId: appId,
+      session: { sessionId: 's-list-timeout', cliId: 'codex' },
+      worker: null,
+      adoptedFrom: undefined,
+      hasHistory: true,
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker');
+    let releaseAdmission!: () => void;
+    let markAdmissionStarted!: () => void;
+    const admissionStarted = new Promise<void>(resolve => { markAdmissionStarted = resolve; });
+    const admissionHold = new Promise<void>(resolve => { releaseAdmission = resolve; });
+    const admission = withBotTurnAdmission(appId, async () => {
+      markAdmissionStarted();
+      await admissionHold;
+    });
+
+    try {
+      await admissionStarted;
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const path = '/api/sessions/s-list-timeout/wake';
+      const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: { [SESSION_WAKE_DEADLINE_HEADER]: String(Date.now() + 50) },
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'wake_mutation_timeout' });
+      expect(forkSpy).not.toHaveBeenCalled();
+
+      releaseAdmission();
+      await admission;
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      releaseAdmission();
+      await admission;
+      findSpy.mockRestore();
+      forkSpy.mockRestore();
+      __testOnly_resetBotTurnMutationGates();
     }
   });
 });
