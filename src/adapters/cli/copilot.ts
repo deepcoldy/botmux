@@ -9,7 +9,9 @@ import { delay } from '../../utils/timing.js';
  *  Copilot CLI is an Ink-based interactive agent shipped as the `copilot`
  *  binary (npm `@github/copilot`). It manages sessions internally — botmux's
  *  `sessionId` cannot be forced as the CLI session id, so we always start
- *  fresh and rely on `--resume <id>` (or `--continue`) for resume. */
+ *  fresh and rely on `--resume <id>` for resume (never `--continue`: it
+ *  resumes the globally most recent session, which can belong to a sibling
+ *  botmux session — see buildArgs). */
 export function createCopilotAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
