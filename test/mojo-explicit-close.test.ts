@@ -78,7 +78,12 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
-import { recordContainmentHandle } from '../src/core/mojo-containment.js';
+import {
+  readBootId,
+  recordContainmentHandle,
+  reconcileContainmentHandlesOnBoot,
+  revokeContainmentHandles,
+} from '../src/core/mojo-containment.js';
 
 let dataDir: string;
 let previousDataDir: string;
@@ -1541,6 +1546,67 @@ describe('mojoLocalResidual is DERIVED from the handle ledger (round-12 P1)', ()
     // a reboot between the prepare and this replay discharged the handle.
     setActiveSessionsRegistry(new Map());
     sessionStore.init('app');
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    // And the commit must not RE-PARK the journal's residual onto the row: a
+    // "crash in prepared → host reboot" sequence would otherwise mint a fresh
+    // stale field right after the reconcile cleaned everything up.
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoLocalResidual).toBeUndefined();
+  });
+
+  // Needs a real boot id to prove "recorded handle predates this boot" — on
+  // hosts without /proc the reconcile fails closed and the case is meaningless.
+  it.runIf(readBootId() !== null)(
+    'end-to-end: boot reconciliation releases an old-boot handle and the re-close stops reporting',
+    async () => {
+      const fixture = createFixture();
+      recordContainmentHandle({
+        kind: 'tree-identity',
+        sessionId: fixture.session.sessionId,
+        generation: 1,
+        rootPid: 4242,
+        bootId: 'boot-previous-life', // provably not this boot
+        startTime: 999,
+        nonce: 'nonce-old-boot',
+      });
+      cancelMojoMock.mockResolvedValue({
+        kind: 'cancelled',
+        localResidual: 'local_subtree_boundary_unproven',
+      });
+      expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+        ok: true,
+        outcome: 'closed_with_residual',
+      });
+
+      // The production consumer of the bootId proof, not a hand-emptied ledger.
+      expect(reconcileContainmentHandlesOnBoot()).toMatchObject({ released: 1, retained: 0 });
+
+      expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+        ok: true,
+        outcome: 'closed',
+      });
+    },
+  );
+
+  it('operator revoke is not inherited either: re-close after revoke reports plain closed', async () => {
+    const fixture = createFixture();
+    recordOutstandingHandle(fixture.session.sessionId);
+    cancelMojoMock.mockResolvedValue({
+      kind: 'cancelled',
+      localResidual: 'local_subtree_boundary_unproven',
+    });
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+    });
+
+    const { removed } = revokeContainmentHandles(fixture.session.sessionId, {
+      auditNote: 'round-12 regression',
+    });
+    expect(removed).toHaveLength(1);
 
     expect(await closeSession(fixture.session.sessionId)).toMatchObject({
       ok: true,

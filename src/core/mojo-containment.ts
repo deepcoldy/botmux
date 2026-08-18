@@ -1107,14 +1107,17 @@ export function reconcileContainmentHandlesOnBoot(
  *   verdict           evidence              boundaryProof  release  residual
  *   ----------------  --------------------  -------------  -------  --------
  *   proven, weak      boot-id-changed       true           yes      null
+ *   proven, cgroup    boot-id-changed       true           yes      null
  *   proven, cgroup    cgroup-empty          FALSE          NO       deviceIsolation
  *   proven, cgroup    cgroup-zombie-only    FALSE          NO       deviceIsolation
  *   proven, weak      scan-clean            FALSE          NO       deviceIsolation
  *   not proven        n/a                   false          NO       deviceIsolation
  *
- * Only a reboot (boot-id-changed) authorises forgetting a tree. A cgroup being
+ * Only a reboot (boot-id-changed) authorises forgetting a tree — for BOTH handle
+ * kinds since the strong handle gained a stamped bootId (a reboot kills the
+ * whole tree, sibling-migrant included, and resets cgroupfs). A cgroup being
  * empty is NOT a boundary proof — a same-UID process can migrate itself out of
- * the leaf, invisible to the leaf-down read — so a cgroup verdict now behaves
+ * the leaf, invisible to the leaf-down read — so an emptiness verdict behaves
  * exactly like a weak scan-clean: it lets the caller stop re-signalling
  * (`signalsStopped: true`) and lets the SESSION close, but authorises nothing
  * else. The handle stays in the durable store, so `hasUnprovenContainment` keeps
@@ -1188,14 +1191,17 @@ export function containmentReleaseDecision(verdict: QuiescenceVerdict): Containm
  * level, which is the invariant this whole module exists to enforce. A caller
  * holding a `proven: false` verdict has no way to spend it here.
  *
- * A CGROUP handle is never released here: cgroup emptiness is no longer a
- * boundary proof (see containmentReleaseDecision — a same-UID process can migrate
- * out of the leaf), so a cgroup verdict always resolves to `releaseAuthorised:
- * false` and returns below with the handle and the device-isolation blocker
- * retained. The cgroup directory is therefore NOT reclaimed here — the tree is
- * killed via `cgroup.kill` during teardown, and the handle/dir are cleared only
- * by a reboot (boot-id-changed on the weak path) or an operator revoke. The one
- * verdict that DOES authorise a release is a WEAK handle's `boot-id-changed`.
+ * The ONE evidence that authorises release is `boot-id-changed`, for either
+ * handle kind (a strong handle carries a stamped bootId since round 10).
+ * Emptiness verdicts (cgroup-empty / cgroup-zombie-only / scan-clean) resolve to
+ * `releaseAuthorised: false` and return below with the handle and the
+ * device-isolation blocker retained — cgroup emptiness is not a boundary proof
+ * (a same-UID process can migrate out of the leaf; see
+ * containmentReleaseDecision). No cgroup directory is reclaimed on the release
+ * path: `boot-id-changed` means the host rebooted and cgroupfs came back empty,
+ * so there is nothing to remove. Within a boot the tree is killed via
+ * `cgroup.kill` during teardown and the handle waits for reboot or operator
+ * revoke.
  */
 export function releaseContainmentHandle(
     verdict: QuiescenceVerdict,
@@ -1221,8 +1227,9 @@ export function releaseContainmentHandle(
         );
         return decision;
     }
-    // Only a WEAK handle's boot-id-changed reaches here. There is no cgroup
-    // directory to reclaim on this path (cgroup handles never authorise release).
+    // Only a boot-id-changed proof reaches here (either handle kind). No cgroup
+    // directory needs reclaiming: the reboot that changed the boot id also reset
+    // cgroupfs, so a strong handle's directory is already gone.
     const path = filePath(dataDir);
     mkdirSync(dirname(path), { recursive: true });
     withFileLockSync(path, () => {
