@@ -32,12 +32,13 @@
   --modal-backdrop: rgba(10, 14, 18, 0.48);
   --qr-surface: #ffffff;
   --shadow: 0 18px 44px rgba(15, 23, 42, 0.08);
-  --radius-xs: 12px;
-  --radius-sm: 12px;
-  --radius-md: 12px;
-  --radius-lg: 12px;
-  --radius-xl: 12px;
+  /* 圆角三档 + full，档位定义见下面第二个 :root（那份才是最终生效的）。 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
   --radius-full: 999px;
+  --radius-xs: var(--radius-sm);
+  --radius-xl: var(--radius-lg);
   --radius: var(--radius-md);
   --button-height: 34px;
   --button-compact-height: 34px;
@@ -8055,12 +8056,19 @@ dialog.onboarding-dialog::backdrop {
   --accent: #565ee4;
   --accent-strong: var(--brand-accent-strong);
   --accent-soft: rgba(100, 108, 234, 0.12);
-  --radius-xs: 12px;
-  --radius-sm: 12px;
-  --radius-md: 12px;
-  --radius-lg: 12px;
-  --radius-xl: 12px;
+  /* 圆角三档 + full：每档 1.4–1.7× 递进，肉眼分得出档位。五级全是 12px 的旧体系
+     等于没有尺度——小徽标读成药丸、大面板读成方角。取档按「半径 ≈ 高度 / 3.5」：
+     ≤30px 取 sm（徽标 / chip / 分段控件）· 31–47px 取 md（按钮 / 输入框 / 下拉）·
+     ≥48px 取 lg（卡片 / 面板 / 浮层 / 弹窗）。full 只给正圆（状态点、分栏握把、
+     头像、滚动条 thumb），不许用在矩形上。
+     旧的 xs / xl 不再是独立档位，按就近取档并进 sm / lg —— 全站 200+ 处引用照常
+     工作，非工作台组件的位移不超过 2px。 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
   --radius-full: 999px;
+  --radius-xs: var(--radius-sm);
+  --radius-xl: var(--radius-lg);
   --radius: var(--radius-md);
   --sidebar-width: 190px;
   --topbar-height: 60px;
@@ -27642,11 +27650,15 @@ button.skills-issue-badge:hover {
 .feedback-more { margin-top: 12px; }
 @media (max-width: 1100px) { .feedback-kpis { grid-template-columns: repeat(3, 1fr); } .feedback-deliveries > div { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .feedback-kpis, .feedback-grid { grid-template-columns: 1fr; } }
-/* Agent Workbench — Orca-flavoured terminal surface: soft corners, low-contrast
-   dividers, no gradients, and independent from the Dashboard card/aurora
-   vocabulary. Every border-radius below comes from the four --wb-radius-*
-   tokens; a bare pixel value is a drift bug and the style contract test
-   (test/agent-workbench-style.test.ts) rejects it. */
+/* Agent Workbench — Orca-flavoured terminal surface: no gradients, no decorative
+   rules, and independent from the Dashboard card/aurora vocabulary.
+   段内三条硬约束，改之前先读：
+   ① 实线只给白名单五类（内容区↔固定工具条的功能性边界、chip 的 1px 亮环、脱离
+      文档流的浮层外圈、:focus-visible 焦点环、选中态的 accent 内投影），颜色只能
+      取 var(--border-keep)；其余一律 border: 0，分层交给 --bg-l0..l3 的色差和留白。
+   ② 每一个 border-radius 只能是 var(--radius-sm|md|lg|full) / 0 / 50%，裸像素值
+      是漂移 bug，样式契约测试（test/agent-workbench-style.test.ts）会拦。
+   ③ 段内零渐变、零装饰阴影；只有浮层用 --shadow-pop。 */
 .workbench-route-host,
 .workbench-route-host > #root {
   width: 100%;
@@ -27665,75 +27677,208 @@ button.skills-issue-badge:hover {
   margin: 0;
 }
 
+/* 配色令牌 = 四层底 + 三档文字 + 语义色。四层底之间的亮度差控制在 1.08–1.5：
+   低于 1.02 看不见，高于 1.6 就读成「块」而不是「层」。
+   L0 页面底 · L1 侧栏 / 顶栏 · L2 卡片 / 面板 / 浮层 / 按钮组底板 · L3 选中 & 悬浮。
+   hover 与 selected 共用 L3，靠 accent 竖条和标题色区分，不再引入第五档灰。
+   --term-bg 是第五个特例层：与 L0 同色相再暗一档，且 L0 ↔ term-bg 对比度必须 ≥1.15
+   —— 面板不画描边，边界全靠「留白 + 圆角 + 画布底色」表达，这条不达标就等于没有边界。
+   三档文字在 L0/L1/L2/L3 四个底上全部 ≥4.5:1（WCAG AA）。
+   本块是深色族默认皮肤 slate-blue，没有 data-skin 时也自洽。 */
 .agent-workbench-page,
 .agent-workbench-dock {
-  --wb-bg: #080b10;
-  --wb-surface: #0d1219;
-  --wb-surface-2: #111822;
-  --wb-surface-3: #17212d;
-  --wb-text: #d8e2ed;
-  --wb-muted: #8b9aad;
-  --wb-faint: #5f6d7e;
-  --wb-border: #273344;
-  --wb-border-strong: #3b4a5e;
-  --wb-accent: #67c7f5;
-  --wb-accent-soft: #102b3b;
-  --wb-success: #6fd29b;
-  --wb-success-soft: #10261c;
-  --wb-warning: #e2b35c;
-  --wb-warning-soft: #2b2212;
-  --wb-danger: #f18a94;
-  --wb-danger-soft: #2d171b;
-  --wb-focus: #9bdcff;
-  /* 圆角四级：4 小控件（徽标 / chip）、8 控件（按钮 / 输入 / 下拉 / 行内操作）、
-     10 高亮块与卡片（会话行高亮、组头高亮、行操作浮层）、12 面板与浮层（终端面板、
-     信息抽屉、移动端下钻容器）。.wb-* 里所有 border-radius 只引用这四个令牌，
-     调整整体圆度改这里一处即可。 */
-  --wb-radius-s: 4px;
-  --wb-radius-m: 8px;
-  --wb-radius-l: 10px;
-  --wb-radius-xl: 12px;
-  /* 分割线比 --wb-border 再退一档：会话列表里每行一条的横线原本是整个界面最硬的
-     东西，退到这个色阶后结构还在，但不再抢注意力。--wb-border 继续负责需要被看见
-     的边界（面板描边、栏与栏之间）。 */
-  --wb-divider: #1c2634;
-  /* 面板级阴影只做「浮起一点点」。深色底上黑色阴影几乎只会糊边、看不出层次，所以
-     这里的不透明度比浅色主题更低，靠描边而不是阴影撑层次。 */
-  --wb-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 6px 18px rgba(0, 0, 0, .05);
+  --bg-l0: #141922;
+  --bg-l1: #19212c;
+  --bg-l2: #202a36;
+  --bg-l3: #333f4e;
+  --text-1: #e4ebf2;
+  --text-2: #afbecd;
+  --text-3: #a2b2c3;
+  --accent: #6fcbf7;
+  --ok: #63d6a0;
+  --warn: #edb95c;
+  --err: #f58a94;
+  /* 白名单之外一律 border: 0，这一个色只给白名单五类线用（见下面的实线白名单）。 */
+  --border-keep: #2e3a48;
+  --on-accent: #141922;
+  --term-bg: #030407;
+  --badge-todo: #e6edf4;
+  /* 浮层是唯一保留阴影的东西：它会盖在任意背景上，没有阴影就和背景粘住。
+     面板 / 卡片一律无阴影 —— 深色底上的黑阴影只糊边、出不了层次。 */
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .5);
   color-scheme: dark;
-  color: var(--wb-text);
-  background: var(--wb-bg);
+
+  /* —— 历史令牌 → 上面这套的映射 ——
+     段内还有约 50 处样式读 --wb-*，映射之后换皮肤只改上面一段，不会漏掉任何一处，
+     也不用把 1200 行样式逐条改写。新写的规则一律直接读新令牌。
+     三档线（--wb-border / -strong / --wb-divider）并成一档并已无引用：删线之后剩下的
+     都是白名单里的功能线，不需要「更重 / 更轻」的分级；--wb-surface* 同理，分层统一
+     由 --bg-l0..l3 表达。两组名字都不再保留。
+     语义色的 *-soft 底改成 12% 透明叠加：固定的深色 soft 值换皮肤时会撞色相。 */
+  --wb-bg: var(--bg-l0);
+  --wb-text: var(--text-1);
+  --wb-muted: var(--text-2);
+  --wb-faint: var(--text-3);
+  --wb-accent: var(--accent);
+  --wb-success: var(--ok);
+  --wb-success-soft: color-mix(in srgb, var(--ok) 12%, transparent);
+  --wb-warning: var(--warn);
+  --wb-warning-soft: color-mix(in srgb, var(--warn) 12%, transparent);
+  --wb-danger: var(--err);
+  --wb-focus: var(--accent);
+  /* 圆角改读全站统一的三档 + full（见 :root 的 --radius-*）：原来工作台自带的四级
+     令牌（4/8/10/12）尺度差太小、视觉读数差很大，一屏之内四个值肉眼像随机；10 与 12
+     的差别更是分不出来，只制造不确定感。工作台段内已无 --wb-radius-* 的引用。 */
+  /* 触控目标下限：桌面 28px，(hover: none) 下整体提到 44px。尺寸只写一次，
+     媒体查询只改这个令牌的值，避免同一个高度被四处规则反复重定义。 */
+  --touch-target: 28px;
+  /* 终端渲染风格的三个可继承变量，由 .wb-term-classic / .wb-term-orca 覆盖；
+     挂在任意祖先上都生效（继承），iframe 内的取值由 TS 侧读这里再 postMessage 下发。
+     默认取 classic（现状渲染）。 */
+  --term-pad: 4px 8px 8px 8px;
+  --term-line-height: 1.4;
+  --term-font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg-l0);
   font: 12px/1.4 var(--mono);
 }
 
+/* 浅色族：分层方向反转但规则不变 —— L0 最灰、L2 纯白（卡片浮起）、L3 带蓝调向下沉
+   （浅色里「被按下」必须变暗才有语义）。--term-bg 是唯一不跟着反转的令牌：终端内容是
+   彩色 ANSI，浅底会毁掉前景色可读性，业界通行做法就是留深色画布。 */
 :root[data-theme="light"] .agent-workbench-page,
 :root[data-theme="light"] .agent-workbench-dock {
-  --wb-bg: #edf1f5;
-  --wb-surface: #f8fafc;
-  --wb-surface-2: #ffffff;
-  --wb-surface-3: #e6ebf0;
-  --wb-text: #17202a;
-  --wb-muted: #526172;
-  --wb-faint: #748293;
-  --wb-border: #c5ced8;
-  --wb-border-strong: #9ba9b8;
-  --wb-accent: #096d9d;
-  --wb-accent-soft: #d9eff9;
-  --wb-success: #1b7146;
-  --wb-success-soft: #dff2e8;
-  --wb-warning: #875a05;
-  --wb-warning-soft: #f9edcf;
-  --wb-danger: #a92f3b;
-  --wb-danger-soft: #f8dfe2;
-  --wb-focus: #006da3;
-  /* 半径令牌不分主题，只有颜色相关的两个跟着换。 */
-  --wb-divider: #dde4ea;
-  --wb-shadow: 0 1px 2px rgba(15, 23, 42, .10), 0 6px 18px rgba(15, 23, 42, .08);
+  --bg-l0: #e8ecf1;
+  --bg-l1: #f3f6f9;
+  --bg-l2: #ffffff;
+  --bg-l3: #c9d7e8;
+  --text-1: #131820;
+  --text-2: #3b4855;
+  --text-3: #46525f;
+  --accent: #0b5f8f;
+  --ok: #0f6141;
+  --warn: #6b4904;
+  --err: #9e2531;
+  --border-keep: #c2cdda;
+  --on-accent: #ffffff;
+  --term-bg: #16202b;
+  --badge-todo: #1b2430;
+  /* 浅色下阴影带蓝调，纯黑阴影在白底上会发灰。 */
+  --shadow-pop: 0 8px 24px rgba(20, 30, 45, .16);
+  color-scheme: light;
+}
+
+/* 四套皮肤。分工：mode（现有的明暗机制）决定明暗族，data-skin 决定族内配色；
+   light-frost 属 light 族，其余三套属 dark 族，跟随系统时在「用户最后选的深色皮肤」
+   与 light-frost 之间切换。
+   皮肤只重定义上面那组工作台令牌，不动全站任何变量，也不写 data-theme —— 明暗仲裁
+   仍归 ui.ts 的 applyTheme 管，工作台再插一手必打架。
+   放在浅色块之后：两者特异性相同，显式选中的皮肤要赢过「浅色族」的兜底。 */
+:root[data-skin="orca-ink"] .agent-workbench-page,
+:root[data-skin="orca-ink"] .agent-workbench-dock {
+  /* 完全中性的灰阶外壳，彩色预算只服务状态与身份。L1↔L3 只有 1.46：L3 被 --text-3
+     的 AA 4.53 顶死，抬不动，四套里只有这套付这个代价。 */
+  --bg-l0: #181818;
+  --bg-l1: #212121;
+  --bg-l2: #2b2b2b;
+  --bg-l3: #3c3c3c;
+  --text-1: #ededed;
+  --text-2: #b8b8b8;
+  --text-3: #a6a6a6;
+  --accent: #ff8b63;
+  --ok: #3ed598;
+  --warn: #efc260;
+  --err: #ff8c8f;
+  --border-keep: #3f3f3f;
+  --on-accent: #181818;
+  --term-bg: #030303;
+  --badge-todo: #eaeaea;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .55);
+  color-scheme: dark;
+}
+
+:root[data-skin="slate-blue"] .agent-workbench-page,
+:root[data-skin="slate-blue"] .agent-workbench-dock {
+  /* 默认皮肤：保留产品现有的蓝黑品牌感，只收紧色相、按新分层重排台阶、把 meta
+     文字提到 AA。与上面的基准块同值，显式选中时也要能压过浅色兜底。 */
+  --bg-l0: #141922;
+  --bg-l1: #19212c;
+  --bg-l2: #202a36;
+  --bg-l3: #333f4e;
+  --text-1: #e4ebf2;
+  --text-2: #afbecd;
+  --text-3: #a2b2c3;
+  --accent: #6fcbf7;
+  --ok: #63d6a0;
+  --warn: #edb95c;
+  --err: #f58a94;
+  --border-keep: #2e3a48;
+  --on-accent: #141922;
+  --term-bg: #030407;
+  --badge-todo: #e6edf4;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .5);
+  color-scheme: dark;
+}
+
+:root[data-skin="warm-graphite"] .agent-workbench-page,
+:root[data-skin="warm-graphite"] .agent-workbench-dock {
+  /* 灰阶往暖里偏（色相约 40°、极低饱和），长时间盯屏比纯中性灰舒服。
+     accent 与 --warn 同族，所以 warn 状态在这套里要靠形状而不只是颜色区分。 */
+  --bg-l0: #1b1912;
+  --bg-l1: #24211a;
+  --bg-l2: #2e2b22;
+  --bg-l3: #443e34;
+  --text-1: #f0ebe1;
+  --text-2: #c2baac;
+  --text-3: #b3aa9c;
+  --accent: #f2a33c;
+  --ok: #5fce9b;
+  --warn: #eac14f;
+  --err: #ff9186;
+  --border-keep: #453f35;
+  --on-accent: #1b1912;
+  --term-bg: #040402;
+  --badge-todo: #f2ede3;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .55);
+  color-scheme: dark;
+}
+
+:root[data-skin="light-frost"] .agent-workbench-page,
+:root[data-skin="light-frost"] .agent-workbench-dock {
+  /* 浅色族唯一的一套。选中台阶做到 1.35（现行浅色只有 1.14，几乎等于没有）。 */
+  --bg-l0: #e8ecf1;
+  --bg-l1: #f3f6f9;
+  --bg-l2: #ffffff;
+  --bg-l3: #c9d7e8;
+  --text-1: #131820;
+  --text-2: #3b4855;
+  --text-3: #46525f;
+  --accent: #0b5f8f;
+  --ok: #0f6141;
+  --warn: #6b4904;
+  --err: #9e2531;
+  --border-keep: #c2cdda;
+  --on-accent: #ffffff;
+  --term-bg: #16202b;
+  --badge-todo: #1b2430;
+  --shadow-pop: 0 8px 24px rgba(20, 30, 45, .16);
   color-scheme: light;
 }
 
 .agent-workbench-page *,
 .agent-workbench-dock * { box-sizing: border-box; }
+
+/* 删线的前置：Dashboard 的全局裸元素规则（`button, .btn-link { border: 1px … }`、
+   给所有 select 塞箭头槽的那条）特异性只有 (0,0,1)，会直接漏进工作台 —— 只删
+   .wb-* 自己的描边，线不会消失。这条 reset 用 :where() 保持 0 特异性外壳，选择器
+   实际权重与那些全局规则相同、位置更靠后，于是稳压一头，而任何 .wb-* 规则（≥0,1,0）
+   都能照常覆盖它。 */
+:where(.agent-workbench-page, .agent-workbench-dock) :is(button, select, input, textarea) {
+  border: 0;
+  border-radius: var(--radius-md);
+  min-height: 0;
+  box-shadow: none;
+}
 
 .agent-workbench-page button,
 .agent-workbench-page input,
@@ -27744,15 +27889,15 @@ button.skills-issue-badge:hover {
   font: inherit;
 }
 
-/* 控件基线：所有按钮和链接一律 8px。个别更小的徽标 / chip 会在下面单独降到 4px，
-   面板级容器单独升到 12px。过渡放在这里统一给：底色、描边、文字三者一起走
+/* 控件基线：所有按钮和链接一律 10px（md 档）。更小的徽标 / chip 在下面单独降到
+   6px，面板级容器升到 14px。过渡放在这里统一给：底色、描边、文字三者一起走
    140ms ease-out，悬浮态不再是瞬间跳变；prefers-reduced-motion 那条 !important
    会整体关掉。 */
 .agent-workbench-page button,
 .agent-workbench-dock button,
 .agent-workbench-page a,
 .agent-workbench-dock a {
-  border-radius: var(--wb-radius-m);
+  border-radius: var(--radius-md);
   transition: background-color .14s ease-out, border-color .14s ease-out, color .14s ease-out;
 }
 
@@ -27792,7 +27937,7 @@ button.skills-issue-badge:hover {
 
 .wb-desktop-layout {
   display: grid;
-  grid-template-columns: var(--wb-rail-width) 5px minmax(0, 1fr);
+  grid-template-columns: var(--wb-rail-width) 6px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
 }
@@ -27806,8 +27951,11 @@ button.skills-issue-badge:hover {
   grid-template-rows: 38px 38px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
-  border-right: 1px solid var(--wb-border);
-  background: var(--wb-surface);
+  /* 分栏不画竖线：会话栏是 L1、终端画布是 term-bg，中间隔一条 6px 透明握把带，
+     靠底色差 + 留白分区。原来这里一条 border-right、握把带一整条实色、面板再一圈
+     描边，7 个 CSS 像素里挤了三条不同灰度的竖线。 */
+  border: 0;
+  background: var(--bg-l1);
   overflow: hidden;
 }
 
@@ -27816,7 +27964,6 @@ button.skills-issue-badge:hover {
   display: flex;
   align-items: stretch;
   width: 40px;
-  border-right-color: var(--wb-border-strong);
 }
 
 .wb-rail-expand {
@@ -27832,31 +27979,42 @@ button.skills-issue-badge:hover {
   cursor: pointer;
 }
 
-.wb-rail-expand:hover { color: var(--wb-text); background: var(--wb-surface-2); }
+.wb-rail-expand:hover { color: var(--text-1); background: var(--bg-l3); }
 .wb-rail-expand:not(button) { cursor: default; }
-.wb-rail-vertical-label { writing-mode: vertical-rl; letter-spacing: .14em; font-size: 10px; }
+.wb-rail-vertical-label { writing-mode: vertical-rl; letter-spacing: .14em; font-size: 11px; }
+/* 待办计数：近白实心 + L1 深字，不再是一圈红描边。计数徽章只分两档 —— 待办用这套
+   实心，中性计数用 --bg-l3 底 + --text-3 字，中间不设第三档。 */
 .wb-rail-count {
   position: absolute;
   right: 6px;
   bottom: 8px;
   min-width: 18px;
   padding: 2px 3px;
-  border: 1px solid var(--wb-danger);
-  border-radius: var(--wb-radius-s);
-  color: var(--wb-danger);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--bg-l1);
+  background: var(--badge-todo);
+  font-weight: 600;
   text-align: center;
 }
 
+/* 栏头不画下沿线：它落在 L1 上、列表也在 L1 上，靠 12px 留白和字重分层就够。
+   窄屏上通栏线的线长 / 屏宽比接近 1，一条线就横断整个视野。 */
 .wb-rail-heading {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 8px 0 10px;
-  border-bottom: 1px solid var(--wb-border);
+  /* 左组紧凑排列，只把收起按钮推到最右。原来 space-between 与 .wb-group-dim 自己的
+     margin-left:auto 两套分配机制叠加，中间挂出约 90px 死空白。 */
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 0 12px;
+  border: 0;
 }
 
-.wb-rail-heading > div { display: flex; align-items: center; gap: 7px; letter-spacing: .08em; }
-.wb-rail-heading > div > span { color: var(--wb-faint); }
+/* 「标题 + 计数」是一个短语，不是两端对齐的表格行：计数紧贴标题 6px。 */
+.wb-rail-heading > div { display: flex; align-items: center; gap: 6px; letter-spacing: .08em; }
+.wb-rail-heading > div > span { color: var(--text-3); }
+.wb-rail-heading > button:last-child { margin-left: auto; }
 /* Live/last-snapshot state now rides the list heading instead of a page-wide
    status bar. */
 .wb-rail-heading .is-online { color: var(--wb-success); }
@@ -27866,30 +28024,30 @@ button.skills-issue-badge:hover {
   width: 24px;
   height: 24px;
   padding: 0;
-  border: 1px solid transparent;
-  color: var(--wb-muted);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
   background: transparent;
   cursor: pointer;
 }
-/* 图标按钮 hover 现在还带一层底色：24px 的方块只靠描边变色太弱，圆角配上一小块
-   底色才读得出「这里可以点」。 */
+/* 图标按钮的可点性靠一小块 hover 底色表达，不靠描边变色。 */
 .wb-rail-heading button:hover,
-.wb-session-search button:hover { border-color: var(--wb-border-strong); color: var(--wb-text); background: var(--wb-surface-2); }
+.wb-session-search button:hover { color: var(--text-1); background: var(--bg-l3); }
 
+/* 搜索框改填充式：整圈描边换成 L2 填充，聚焦时才画 2px accent 环（焦点环属白名单）。 */
 .wb-session-search {
   display: flex;
   align-items: center;
   gap: 5px;
-  margin: 6px 7px 4px;
-  padding: 0 5px;
-  border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-faint);
-  background: var(--wb-bg);
-  transition: border-color .14s ease-out;
+  margin: 6px 12px 4px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-3);
+  background: var(--bg-l2);
 }
 
-.wb-session-search:focus-within { border-color: var(--wb-focus); }
+.wb-session-search:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; }
 .wb-session-search input {
   width: 100%;
   min-width: 0;
@@ -27919,8 +28077,8 @@ button.skills-issue-badge:hover {
   align-items: center;
   gap: 4px;
   padding: 5px 9px 3px;
-  color: var(--wb-faint);
-  font-size: 10px;
+  color: var(--text-3);
+  font-size: 11px;
   letter-spacing: .09em;
 }
 .wb-session-group-needs-you { color: var(--wb-danger); }
@@ -27932,9 +28090,11 @@ button.skills-issue-badge:hover {
   align-items: center;
   gap: 4px;
   padding: 6px 8px;
+  /* 每行一条通栏横线原本一屏 18 条，还横穿圆角高亮底板，把药丸上下切平。整条删掉，
+     行间关系交给留白节奏（项间留白 ÷ 项内行距 ≥ 2.5）+ 分组组头 + 选中底板。
+     选中态的 accent 竖条也不再是 border-left（方头、和圆角底板中间夹 5px 缝），
+     并进 ::before 的 inset box-shadow，跟着 14px 圆角走。 */
   border: 0;
-  border-left: 2px solid transparent;
-  border-bottom: 1px solid var(--wb-divider);
   color: var(--wb-text);
   background: transparent;
   text-align: left;
@@ -27960,14 +28120,19 @@ button.skills-issue-badge:hover {
   content: '';
   position: absolute;
   z-index: -1;
-  inset: 2px 5px 3px;
-  border-radius: var(--wb-radius-l);
+  inset: 2px 8px;
+  border-radius: var(--radius-lg);
   background: transparent;
   transition: background-color .14s ease-out;
 }
-.wb-session-row:hover::before { background: var(--wb-surface-3); }
-.wb-session-row.is-selected::before { background: var(--wb-accent-soft); }
-.wb-session-row.is-selected { border-left-color: var(--wb-accent); }
+/* hover 与 selected 共用 L3：区分靠形状和颜色（accent 竖条 + accent 标题），
+   不靠又一个几乎相同的灰。多一档而不可辨 = 噪声。 */
+.wb-session-row:hover::before { background: var(--bg-l3); }
+.wb-session-row.is-selected::before {
+  background: var(--bg-l3);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.wb-session-row.is-selected .wb-session-title { color: var(--accent); }
 .wb-session-row-needs-you .wb-session-state-mark { color: var(--wb-danger); }
 .wb-session-row-active .wb-session-state-mark { color: var(--wb-success); }
 .wb-session-row-recent .wb-session-state-mark { color: var(--wb-faint); }
@@ -27991,40 +28156,41 @@ button.skills-issue-badge:hover {
 .wb-session-copy-link * { text-decoration: none; }
 .wb-session-copy-link:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
 .wb-session-title { overflow: hidden; color: var(--wb-text); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.wb-session-meta { display: flex; justify-content: space-between; gap: 6px; min-width: 0; color: var(--wb-faint); font-size: 10px; }
+.wb-session-meta { display: flex; justify-content: space-between; gap: 6px; min-width: 0; color: var(--text-3); font-size: 11px; }
 .wb-session-meta > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wb-session-meta time { flex: none; }
 .wb-session-reason { color: var(--wb-warning); }
 .wb-session-empty { position: absolute; inset: 60px 8px auto; color: var(--wb-faint); text-align: center; }
 
+/* 分栏带整条透明，只留中间一颗握把。原来这 5px 是一条实色带（比会话栏底色还亮，
+   读起来是「凸起的亮带」而不是分隔线），注释说已经改成细带 + 握把，代码没跟上。
+   握把就是原来那个 ⋮ span（父级 color 已经是 transparent，字形本来就不显示），
+   给它固定尺寸当色块用，不新增任何 DOM。 */
 .wb-rail-separator {
   z-index: 2;
   display: grid;
   place-items: center;
-  width: 5px;
-  min-width: 5px;
+  width: 6px;
+  min-width: 6px;
   padding: 0;
   border: 0;
   color: transparent;
-  background: var(--wb-divider);
+  background: transparent;
   cursor: col-resize;
 }
-/* 分隔条原本是整条 5px 的实色带 + hover 整条变蓝，是页面上最硬的一笔。改成
-   「淡色细带 + 中间一颗圆角握把」：握把就是原来那个 ⋮ span（父级 color 已经是
-   transparent，字形本来就不显示），给它固定尺寸当色块用，不新增任何 DOM。 */
 .wb-rail-separator > span {
   display: block;
   width: 3px;
   height: 28px;
-  border-radius: var(--wb-radius-s);
-  background: var(--wb-border-strong);
+  border-radius: var(--radius-full);
+  background: var(--border-keep);
   overflow: hidden;
   transition: background-color .14s ease-out;
 }
 .wb-rail-separator:hover,
-.wb-rail-separator:focus-visible { color: transparent; background: var(--wb-surface-3); }
+.wb-rail-separator:focus-visible { color: transparent; background: transparent; }
 .wb-rail-separator:hover > span,
-.wb-rail-separator:focus-visible > span { background: var(--wb-accent); }
+.wb-rail-separator:focus-visible > span { background: var(--text-3); }
 
 /* Two children, two rows: the header and the pane stack. Leaving the old
    toolbar/chat-contract rows in place pushed the stack into an `auto` track,
@@ -28044,9 +28210,12 @@ button.skills-issue-badge:hover {
   justify-content: space-between;
   gap: 10px;
   min-width: 0;
-  padding: 0 10px;
-  border-bottom: 1px solid var(--wb-border);
-  background: var(--wb-surface);
+  padding: 0 16px;
+  /* 保留线①（白名单第 1 类）：线两侧一边会滚动、一边不会，这个语义色差表达不了。
+     必须满出血、左右不缩进 —— 缩进的线会读成装饰。 */
+  border: 0;
+  border-bottom: 1px solid var(--border-keep);
+  background: var(--bg-l0);
 }
 .wb-workspace-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .wb-workspace-title > span:last-child { display: grid; min-width: 0; }
@@ -28058,19 +28227,22 @@ button.skills-issue-badge:hover {
   width: 25px;
   height: 25px;
   flex: none;
-  border: 1px solid var(--wb-accent);
-  /* 25px 的身份方块按「圆角图标」处理，比徽标再圆一档。 */
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-accent);
+  border: 0;
+  /* 25px 的身份方块按「圆角图标」处理，比徽标再圆一档；描边换成 L3 底。 */
+  border-radius: var(--radius-md);
+  background: var(--bg-l3);
+  color: var(--accent);
   font-weight: 800;
 }
+/* 标签的 1px 亮环（白名单第 2 类）：在无边框环境里，chip 靠这圈比填充更亮的环
+   跳出来，不靠底色。字号不低于 11px。 */
 .wb-layout-level {
   flex: none;
-  padding: 3px 6px;
-  border: 1px solid var(--wb-border-strong);
-  border-radius: var(--wb-radius-s);
-  color: var(--wb-muted);
-  font-size: 10px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: 11px;
   letter-spacing: .04em;
 }
 
@@ -28080,11 +28252,11 @@ button.skills-issue-badge:hover {
   gap: 5px;
   min-width: 0;
   padding: 4px 7px;
-  border-bottom: 1px solid var(--wb-border);
-  background: var(--wb-surface-2);
+  border: 0;
+  background: var(--bg-l2);
   overflow-x: auto;
 }
-.wb-toolbar-group { display: inline-flex; gap: 2px; padding-right: 5px; border-right: 1px solid var(--wb-divider); }
+.wb-toolbar-group { display: inline-flex; gap: 2px; padding-right: 5px; border: 0; }
 .wb-toolbar-spacer { flex: 1; }
 .wb-pane-toolbar button,
 .wb-pane-actions button,
@@ -28098,9 +28270,12 @@ button.skills-issue-badge:hover {
   justify-content: center;
   gap: 5px;
   min-height: 25px;
-  padding: 2px 7px;
-  border: 1px solid var(--wb-border);
-  color: var(--wb-muted);
+  padding: 2px 8px;
+  /* 次级按钮一律裸排：无描边、无常态底色，只有 hover 才显 L3 底。三个描边框并排的
+     视觉重量之和会超过唯一的主行动按钮，主次就此失守。 */
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
   background: transparent;
   text-decoration: none;
   white-space: nowrap;
@@ -28110,8 +28285,8 @@ button.skills-issue-badge:hover {
 .wb-pane-actions button:hover,
 .wb-pane-actions a:hover,
 .wb-dock-action-grid button:hover,
-.wb-dock-action-grid a:hover { border-color: var(--wb-border-strong); color: var(--wb-text); }
-.wb-pane-toolbar button.is-active { border-color: var(--wb-accent); color: var(--wb-accent); background: var(--wb-accent-soft); }
+.wb-dock-action-grid a:hover { color: var(--text-1); background: var(--bg-l3); }
+.wb-pane-toolbar button.is-active { color: var(--accent); background: var(--bg-l3); }
 .wb-pane-toolbar button:disabled,
 .wb-pane-actions button:disabled { opacity: .5; cursor: not-allowed; }
 
@@ -28121,9 +28296,9 @@ button.skills-issue-badge:hover {
   align-items: center;
   gap: 6px;
   padding: 0 8px;
-  border-bottom: 1px solid var(--wb-border);
-  color: var(--wb-faint);
-  font-size: 10px;
+  border: 0;
+  color: var(--text-3);
+  font-size: 11px;
   overflow: hidden;
 }
 .wb-chat-contract > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -28132,20 +28307,19 @@ button.skills-issue-badge:hover {
 .wb-pane-region { min-width: 0; min-height: 0; padding: 5px; overflow: hidden; }
 .wb-pane,
 .wb-pane-split { width: 100%; height: 100%; min-width: 0; min-height: 0; }
-/* 终端面板是这一页唯一的「卡片」：.wb-pane-region 给了它四周 5px 的空隙，所以圆角
-   看得见，也值得有一层极轻的阴影把它从底色上托起来。
-   上下不同半径是被 iframe 逼出来的，不是手滑：面板 overflow:hidden，圆角会真的裁掉
-   iframe 的像素。上面两角落在 .wb-pane-titlebar（纯色条）里，随便圆；下面两角是终端
-   正文，终端页 #term 只有 4px 内边距（见 v3-terminal.ts），最后一行提示符的首字符就
-   贴在距左下角 4px 处 —— 12px 圆角会啃掉它。4px 圆角（算上 1px 描边，内圆角只有
-   3px）裁掉的完全落在终端页自己的 4px padding 里，一个字形像素都不碰。 */
+/* 终端不再是「工作台里的一块卡片」，而是一块屏幕：描边、圆角、外留白、阴影全部去掉，
+   --term-bg 从标题栏以下一路铺到窗口右缘和下缘，最像本机 tmux / iTerm。
+   原来的「上圆 12px、下方 4px」是同一圈边上下不一致的病根，注释里给的理由（终端页
+   有 4px 内边距）本身就不成立 —— 工作台 iframe 加载的是 /s/<sessionId>，那个页面
+   内边距是 0。去掉圆角之后隐患从根上消失。
+   第二行（反馈行）改 auto：内容为空时整行折叠，省下 25px 和一条线；有内容时照旧。 */
 .wb-pane {
   display: grid;
-  grid-template-rows: 34px 25px minmax(0, 1fr);
-  border: 1px solid var(--wb-border-strong);
-  border-radius: var(--wb-radius-xl) var(--wb-radius-xl) var(--wb-radius-s) var(--wb-radius-s);
-  background: var(--wb-surface);
-  box-shadow: var(--wb-shadow);
+  grid-template-rows: 34px auto minmax(0, 1fr);
+  border: 0;
+  border-radius: 0;
+  background: var(--term-bg);
+  box-shadow: none;
   overflow: hidden;
 }
 .wb-pane-split { display: flex; overflow: hidden; }
@@ -28169,47 +28343,91 @@ button.skills-issue-badge:hover {
 .wb-pane-separator:hover,
 .wb-pane-separator:focus-visible { color: var(--wb-text); background: var(--wb-accent); }
 
+/* 标题栏贴 L1 上、满出血、无下边线：它与终端画布靠 L1 ↔ term-bg 的色差分层，
+   这个对比比 L0 ↔ term-bg 更大，四套配色天然满足。模式标签、风格切换、权限说明
+   都挂在它上面，所以它不能删。 */
 .wb-pane-titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-  padding: 0 7px;
-  border-bottom: 1px solid var(--wb-divider);
-  background: var(--wb-surface-2);
+  padding: 0 8px;
+  border: 0;
+  background: var(--bg-l1);
 }
 .wb-pane-identity,
 .wb-pane-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .wb-pane-glyph { color: var(--wb-accent); font-weight: 800; }
+/* 模式标签的 1px 亮环（白名单第 2 类）。字号从 9px 提到 11px —— 11px 以下不用。 */
 .wb-mode-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 5px;
-  border: 1px solid var(--wb-border-strong);
-  border-radius: var(--wb-radius-s);
-  font-size: 9px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
   letter-spacing: .06em;
 }
+/* 语义态只改字色和 12% 底，不改那圈环的颜色：白名单里的线只允许取 --border-keep，
+   状态由字色 + 填充说，一处一个说法。 */
 .wb-mode-chip.is-controlled,
-.wb-mode-chip.is-interactive { border-color: var(--wb-success); color: var(--wb-success); background: var(--wb-success-soft); }
+.wb-mode-chip.is-interactive { color: var(--ok); background: var(--wb-success-soft); }
 .wb-mode-chip.is-readonly,
-.wb-mode-chip.is-preview { color: var(--wb-warning); background: var(--wb-warning-soft); }
-.wb-lease-time { color: var(--wb-faint); font-size: 9px; white-space: nowrap; }
+.wb-mode-chip.is-preview { color: var(--warn); background: var(--wb-warning-soft); }
+.wb-lease-time { color: var(--text-3); font-size: 11px; white-space: nowrap; }
 .wb-pane-feedback {
   overflow: hidden;
-  padding: 5px 7px;
-  border-bottom: 1px solid var(--wb-divider);
-  color: var(--wb-muted);
-  font-size: 10px;
+  padding: 4px 8px;
+  border: 0;
+  color: var(--text-2);
+  background: var(--bg-l1);
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* position: relative 是 .wb-ws-blocked 的定位基准（实时连接被拦时盖在 iframe 上的那层
-   提示），别去掉。 */
-.wb-pane-frame-shell { position: relative; min-height: 0; background: #05070a; overflow: hidden; }
-.wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: #05070a; }
+/* 没有反馈文案时整行让位：grid 的第二轨是 auto，display:none 之后它收成 0。 */
+.wb-pane-feedback:empty { display: none; }
+/* 终端画布。三件事：
+   ① 底色改读 --term-bg，不再硬编码一个既不属于工作台、也不属于终端页的第三种黑；
+   ② 左安全边距 8px 由这层的 padding 给 —— 外壳和 iframe 同底色，视觉上就是终端本色
+      铺满，但第 0 列字形不会贴在会话栏色块的交界上被抗锯齿吃掉半个。这条与是否有
+      圆角要内切无关：没有圆角要躲，不等于可以归零；
+   ③ position: relative 是 .wb-ws-blocked 的定位基准（实时连接被拦时盖在 iframe 上
+      的那层提示），别去掉。
+   状态条是 CLI 写进终端缓冲区的 TTY 输出，不是工作台自绘 chrome：不加上沿线、不加
+   底色，跟着画布走。 */
+.wb-pane-frame-shell {
+  position: relative;
+  min-height: 0;
+  padding: var(--term-pad);
+  background: var(--term-bg);
+  overflow: hidden;
+}
+.wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: var(--term-bg); }
+
+/* 网页预览面板复用同一套 .wb-pane 骨架，但它装的是普通网页不是终端：底色回到 L2，
+   也不需要为字形留安全边距。 */
+.wb-web-pane,
+.wb-web-pane > .wb-pane-frame-shell { padding: 0; background: var(--bg-l2); }
+.wb-web-pane .wb-pane-frame { background: var(--bg-l2); }
+
+/* 终端渲染风格：两套容器 class 只负责几何（行距 / 内边距 / 字号），配色由 TS 侧的
+   两套 xterm theme 预设承担。class 挂在工作台根或终端面板上都行 —— 下面三个变量是
+   可继承的，落到 .wb-pane-frame-shell 和 iframe 下发通道上都读得到。
+   classic = 现状渲染（存量零变化），orca = 规范里更松的行距与更大的呼吸。
+   两套都保留 8px 左安全边距，这条不因风格而失效。 */
+.wb-term-classic {
+  --term-pad: 4px 8px 8px 8px;
+  --term-line-height: 1.4;
+  --term-font-size: 12px;
+}
+.wb-term-orca {
+  --term-pad: 6px 8px 8px 8px;
+  --term-line-height: 1.55;
+  --term-font-size: 12px;
+}
 .wb-pane-empty {
   display: grid;
   place-content: center;
@@ -28232,22 +28450,22 @@ button.skills-issue-badge:hover {
   position: absolute;
   inset: 0;
   z-index: 3;
-  /* 这层是不透明的，铺满 .wb-pane-frame-shell，也就是面板最底下那一格。下面两角必须
-     和 .wb-pane 的下两角同半径，否则圆角外那一小块会被它重新填成方角。 */
-  border-radius: 0 0 var(--wb-radius-s) var(--wb-radius-s);
-  background: var(--wb-surface);
+  /* 这层是不透明的，铺满 .wb-pane-frame-shell。面板已经不带圆角，它跟着收成方角。 */
+  border-radius: 0;
+  background: var(--bg-l1);
 }
 .wb-ws-blocked a {
   display: inline-flex;
   align-items: center;
   min-height: 32px;
   padding: 0 12px;
-  border: 1px solid var(--wb-border-strong);
-  border-radius: var(--wb-radius-m);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-l3);
 }
-.wb-ws-blocked a:hover { border-color: var(--wb-accent); }
+.wb-ws-blocked a:hover { color: var(--accent); }
 /* 末尾那句「⋯ 菜单」是补充说明，压一号字，别和上面的正文抢注意力 */
-.wb-ws-blocked p:last-of-type { font-size: 10px; }
+.wb-ws-blocked p:last-of-type { font-size: 11px; }
 
 .wb-info-drawer {
   position: absolute;
@@ -28256,11 +28474,14 @@ button.skills-issue-badge:hover {
   bottom: 0;
   z-index: 8;
   width: min(330px, 42%);
-  border-left: 1px solid var(--wb-border-strong);
+  /* 脱离文档流的浮层（白名单第 3 类）：它会盖在任意背景上，底色差不可控，
+     必须有确定的边缘 + --shadow-pop。 */
+  border: 0;
+  border-left: 1px solid var(--border-keep);
   /* 抽屉从右边推出来，只有左侧两角露在外面，圆右侧等于圆到屏幕外。 */
-  border-radius: var(--wb-radius-xl) 0 0 var(--wb-radius-xl);
-  background: var(--wb-surface-2);
-  box-shadow: var(--wb-shadow);
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
   overflow: auto;
 }
 .wb-info-drawer > header {
@@ -28271,18 +28492,21 @@ button.skills-issue-badge:hover {
   justify-content: space-between;
   height: 34px;
   padding: 0 8px;
-  border-bottom: 1px solid var(--wb-divider);
-  background: var(--wb-surface-2);
+  /* 抽屉内部「会滚动的内容 ↔ 不滚动的固定头」的功能性边界，白名单第 1 类。 */
+  border: 0;
+  border-bottom: 1px solid var(--border-keep);
+  background: var(--bg-l2);
 }
-.wb-info-drawer > header button { width: 25px; height: 25px; border: 1px solid var(--wb-border); color: var(--wb-text); background: transparent; }
-.wb-info-drawer > header button:hover { border-color: var(--wb-border-strong); background: var(--wb-surface-3); }
+.wb-info-drawer > header button { width: 25px; height: 25px; border: 0; color: var(--text-1); background: transparent; }
+.wb-info-drawer > header button:hover { background: var(--bg-l3); }
 .wb-info-content { padding: 12px; }
-.wb-info-content h2 { margin: 0 0 12px; color: var(--wb-text); font-size: 14px; overflow-wrap: anywhere; }
-.wb-info-content dl { display: grid; margin: 0; border-top: 1px solid var(--wb-divider); }
-.wb-info-content dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--wb-divider); }
-.wb-info-content dt { color: var(--wb-faint); }
-.wb-info-content dd { margin: 0; overflow: hidden; color: var(--wb-muted); text-overflow: ellipsis; white-space: nowrap; }
-.wb-info-note { padding-left: 8px; border-left: 2px solid var(--wb-accent); color: var(--wb-faint); }
+.wb-info-content h2 { margin: 0 0 12px; color: var(--text-1); font-size: 14px; overflow-wrap: anywhere; }
+/* 键值表靠留白分行，不靠每行一条线。 */
+.wb-info-content dl { display: grid; margin: 0; border: 0; }
+.wb-info-content dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 0; border: 0; }
+.wb-info-content dt { color: var(--text-3); }
+.wb-info-content dd { margin: 0; overflow: hidden; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
+.wb-info-note { padding-left: 8px; border: 0; color: var(--text-3); }
 
 .wb-no-selection {
   display: grid;
@@ -28302,9 +28526,9 @@ button.skills-issue-badge:hover {
    owner and would have parked that single child on it, leaving the 1fr row
    empty. One row, and the child gets the full height. */
 .wb-mobile-stack { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; overflow: hidden; }
-.wb-mobile-nav { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--wb-border); background: var(--wb-surface); }
-.wb-mobile-nav button { border: 0; border-right: 1px solid var(--wb-border); color: var(--wb-muted); background: transparent; }
-.wb-mobile-nav button[aria-current="page"] { color: var(--wb-accent); background: var(--wb-accent-soft); }
+.wb-mobile-nav { display: grid; grid-template-columns: repeat(3, 1fr); border: 0; background: var(--bg-l1); }
+.wb-mobile-nav button { border: 0; color: var(--text-2); background: transparent; }
+.wb-mobile-nav button[aria-current="page"] { color: var(--accent); background: var(--bg-l3); }
 .wb-mobile-stack .wb-session-rail { width: 100%; border-right: 0; }
 .wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
 .wb-mobile-info { overflow: auto; }
@@ -28321,26 +28545,39 @@ button.skills-issue-badge:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 10px;
-  border-bottom: 1px solid var(--wb-border-strong);
-  background: var(--wb-surface);
+  padding: 0 12px;
+  /* 顶栏不画下沿线：顶栏是 L1、内容区是 L0，色差已经分了区。 */
+  border: 0;
+  background: var(--bg-l1);
 }
-.wb-dock-header > div { display: flex; gap: 7px; align-items: center; }
+.wb-dock-header > div { display: flex; gap: 4px; align-items: center; }
 .wb-dock-header > div > span { color: var(--wb-accent); }
 .wb-dock-header .is-online { color: var(--wb-success); }
 .wb-dock-header .is-offline { color: var(--wb-danger); }
 .agent-workbench-dock .wb-session-rail { width: 100%; border-right: 0; }
-.wb-dock-actions { display: grid; gap: 7px; padding: 9px; border-top: 1px solid var(--wb-border-strong); background: var(--wb-surface-2); }
+/* 保留线①（白名单第 1 类）：内容区 ↔ 固定操作条的功能性边界，满出血。 */
+.wb-dock-actions { display: grid; gap: 8px; padding: 12px; border: 0; border-top: 1px solid var(--border-keep); background: var(--bg-l1); }
 .wb-dock-selected { display: grid; min-width: 0; }
 .wb-dock-selected strong,
 .wb-dock-selected span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wb-dock-selected span { color: var(--wb-muted); }
-.wb-primary-action { border-color: var(--wb-accent); color: var(--wb-accent); background: var(--wb-accent-soft); }
-.wb-dock-action-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
-.wb-dock-action-grid > * { min-width: 0; white-space: normal; text-align: center; }
-.wb-dock-action-grid span[aria-disabled="true"] { color: var(--wb-faint); cursor: not-allowed; }
-.wb-dock-actions p { margin: 0; color: var(--wb-faint); }
-.agent-workbench-dock > footer { padding: 5px 8px; border-top: 1px solid var(--wb-border); color: var(--wb-faint); font-size: 9px; text-align: center; }
+/* 页面唯一的主行动改实心：描边式的主按钮压不住下面三个次级按钮的重量之和。 */
+.wb-primary-action {
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--on-accent);
+  background: var(--accent);
+  font-weight: 600;
+}
+.wb-primary-action:hover { color: var(--on-accent); background: var(--accent); }
+/* 三个次级按钮本来就是一组同类操作，走「全裸同行」：等宽、同高、同色、gap 4px、
+   谁都没有底板 —— 这已经读成一组。给它们加容器底会把刚压下去的重量原样抬回来。 */
+.wb-dock-action-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.wb-dock-action-grid > * { min-width: 0; min-height: 40px; white-space: normal; text-align: center; }
+.wb-dock-action-grid span[aria-disabled="true"] { color: var(--text-3); cursor: not-allowed; }
+.wb-dock-actions p { margin: 0; color: var(--text-3); }
+.agent-workbench-dock > footer { padding: 6px 12px; border: 0; color: var(--text-3); font-size: 11px; text-align: center; }
 
 @media (max-width: 767px) {
   /* No hard floor: a Feishu side panel can be narrower than 320px, and forcing
@@ -28372,16 +28609,16 @@ button.skills-issue-badge:hover {
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-muted);
-  background: var(--wb-surface-1);
-  font-size: 10px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
 }
-.wb-session-row-action:hover { border-color: var(--wb-accent); color: var(--wb-accent); }
-.wb-session-row-action:focus-visible { outline: 1px solid var(--wb-accent); outline-offset: 1px; }
+.wb-session-row-action:hover { color: var(--accent); background: var(--bg-l3); }
+.wb-session-row-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 /* The Dashboard's global control rule is `input:not(...)` seven times over,
    which outranks any plain `.wb-… input` selector and was re-skinning the
@@ -28418,9 +28655,8 @@ button.skills-issue-badge:hover {
   flex: 1 1 0;
   min-width: 320px;
   min-height: 0;
-  border-left: 1px solid var(--wb-border);
+  border: 0;
 }
-.wb-stacked-pane:first-child { border-left: 0; }
 .wb-stacked-pane > .wb-pane { flex: 1; min-height: 0; }
 .wb-pane-close {
   position: absolute;
@@ -28430,15 +28666,15 @@ button.skills-issue-badge:hover {
   width: 20px;
   height: 18px;
   padding: 0;
-  border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-muted);
-  background: var(--wb-surface);
-  font-size: 10px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: var(--bg-l2);
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
 }
-.wb-pane-close:hover { border-color: var(--wb-danger, #e0af68); color: var(--wb-text); }
+.wb-pane-close:hover { color: var(--text-1); background: var(--bg-l3); }
 .wb-pane-placeholder {
   display: flex;
   flex: 1;
@@ -28466,13 +28702,13 @@ button.skills-issue-badge:hover {
 .wb-pane-stack { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .wb-pane-stack > .wb-pane { flex: 1; min-height: 0; }
 .wb-terminal-toggle {
-  border: 1px solid var(--wb-border-strong);
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-muted);
-  background: var(--wb-surface-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
   cursor: pointer;
 }
-.wb-terminal-toggle:hover { border-color: var(--wb-accent); color: var(--wb-text); }
+.wb-terminal-toggle:hover { color: var(--text-1); background: var(--bg-l3); }
 
 /* Terminal closed: the rail is the whole product surface, so it takes the full
    width and the workspace column disappears entirely. In the Feishu side panel
@@ -28551,7 +28787,7 @@ a.wb-session-row-action { text-decoration: none; }
      Zero the floor here so `height` is what actually decides the box. */
   min-height: 0;
   padding: 0 6px;
-  border-color: transparent;
+  border: 0;
   background: transparent;
   font-size: 11px;
   line-height: 1;
@@ -28559,8 +28795,7 @@ a.wb-session-row-action { text-decoration: none; }
 }
 .wb-session-row-action:hover,
 .wb-session-row-action:focus-visible {
-  border-color: var(--wb-border);
-  background: var(--wb-surface-2);
+  background: var(--bg-l3);
 }
 
 .wb-workspace-controls { display: flex; align-items: center; gap: 6px; }
@@ -28580,7 +28815,7 @@ body:has(.workbench-route-host) { min-width: 0; }
   .wb-workspace-header { flex-wrap: wrap; gap: 4px; padding: 6px 8px; height: auto; }
   .wb-workspace-controls { flex-wrap: wrap; }
   .wb-workspace-title { min-width: 0; flex: 1 1 100%; }
-  .wb-layout-level { font-size: 10px; padding: 2px 6px; }
+  .wb-layout-level { font-size: 11px; padding: 2px 6px; }
 }
 
 /* Mobile: the page switcher belongs under the thumb, not at the top of a phone
@@ -28594,48 +28829,52 @@ body:has(.workbench-route-host) { min-width: 0; }
   }
   .wb-mobile-stack > .wb-mobile-nav {
     grid-area: nav;
-    border-top: 1px solid var(--wb-border-strong);
-    border-bottom: 0;
+    border: 0;
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .wb-mobile-stack > :not(.wb-mobile-nav) { grid-area: content; min-height: 0; }
   .wb-mobile-nav button { min-height: 44px; font-size: 12px; }
 
   .wb-session-row-action { height: 34px; padding: 0 8px; font-size: 12px; }
-  .wb-session-row { height: 72px; }
   .wb-session-search input { height: 34px; font-size: 13px; }
 }
 
 /* Mobile drill-down chrome: back control, session name, and a compact segment
    for the surfaces inside one session. */
 /* 下钻容器按「盖上来的一张卡」处理：只圆上两角，下面是贴底的导航/终端，圆了会露缝。 */
+/* 只保留一层圆角：外层是 bottom-sheet 的形状语义，内层的终端画布直接铺满，不再
+   套第二个同心圆角（原来两层 12px 圆角贴在一起，容器自己又没有底色，顶角裁出来
+   的是页面底色 —— 首屏顶部就露出两个小缺角）。 */
 .wb-mobile-detail {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
-  border-radius: var(--wb-radius-xl) var(--wb-radius-xl) 0 0;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: var(--bg-l1);
   overflow: hidden;
 }
+.wb-mobile-detail .wb-pane { border-radius: 0; }
 .wb-mobile-detail-bar {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
   padding: 6px 8px;
-  border-bottom: 1px solid var(--wb-divider);
-  background: var(--wb-surface);
+  /* 不画下沿线：这条边界由 L1 ↔ term-bg 的色差表达。 */
+  border: 0;
+  background: var(--bg-l1);
 }
 .wb-mobile-back {
   min-height: 44px;
   padding: 0 8px;
   border: 0;
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-accent);
+  border-radius: var(--radius-md);
+  color: var(--accent);
   background: transparent;
   font-size: 13px;
   cursor: pointer;
 }
-.wb-mobile-back:hover { background: var(--wb-surface-2); }
+.wb-mobile-back:hover { background: var(--bg-l3); }
 .wb-mobile-detail-title {
   flex: 1;
   min-width: 0;
@@ -28645,25 +28884,38 @@ body:has(.workbench-route-host) { min-width: 0; }
   color: var(--wb-text);
   font-size: 12px;
 }
-.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 1px solid var(--wb-border); border-radius: var(--wb-radius-m); overflow: hidden; }
-/* 分段按钮的圆角由外壳的 overflow:hidden 统一裁，自己保持方角，否则两段之间会露出
-   一道由两个圆角拼出来的缝。 */
+/* 分段控件走「共享底板」：一块容器底 + overflow:hidden，圆角完全由容器裁，
+   子项恒为方角 —— 每个元素四角同值仍然成立，不需要 `10px 0 0 10px` 那种四值写法。 */
+.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 0; border-radius: var(--radius-md); background: var(--bg-l2); overflow: hidden; }
 .wb-mobile-detail-seg button {
   min-height: 36px;
   padding: 0 10px;
   border: 0;
   border-radius: 0;
-  color: var(--wb-muted);
+  color: var(--text-3);
   background: transparent;
   font-size: 11px;
+  font-weight: 500;
   cursor: pointer;
 }
-.wb-mobile-detail-seg button[aria-current="page"] { color: var(--wb-accent); background: var(--wb-accent-soft); }
+.wb-mobile-detail-seg button:hover { background: var(--bg-l3); }
+/* 选中段：字色 + 字重 + 2px accent 内底线，不引入第五档灰做 thumb。 */
+.wb-mobile-detail-seg button[aria-current="page"] {
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
 
-/* Fingertip targets for the row actions on touch layouts. */
+/* Fingertip targets for the row actions on touch layouts.
+   行高 84 → 60：84px 里只装「标题 + meta」两行，竖直方向约 24px 是空的。60px 仍是
+   两行（12 padding + 18 标题 + 4 + 14 meta + 12 padding），把空掉的那 24px 换成密度
+   —— 390×844 下同一块列表区从 5 条变成 8 条。
+   ⚠️ 行高是虚拟滚动的硬契约：这个数必须和 workbenchListItemHeight 的触屏分支
+   （agent-workbench-model.ts）一字不差，对不上列表就会滚过自己的末尾。 */
 @media (max-width: 620px) {
   .wb-session-row-action { height: 44px; padding: 0 10px; font-size: 13px; }
   .wb-session-row { height: 84px; }
+  .wb-session-row .wb-session-copy { gap: 4px; }
 }
 
 /* P1-17：指尖目标按「指针类型」补齐，不再只按视口宽度。
@@ -28674,7 +28926,13 @@ body:has(.workbench-route-host) { min-width: 0; }
    一行，行高只能跟着那份宽度契约走（54 / 84）。行操作是绝对定位的浮层，把按钮撑到
    44px 不参与任何一行的摆放，所以两者不冲突。 */
 @media (hover: none) {
+  /* 触控尺寸只在这里改一个令牌，具体元素的下限由 var(--touch-target) 读它。
+     下面那几条 44px 的字面量是历史契约（单测按它们钉住指尖目标），保留。 */
+  .agent-workbench-page,
+  .agent-workbench-dock { --touch-target: 44px; }
   .wb-session-row-action { min-width: 44px; height: 44px; padding: 0 10px; font-size: 13px; }
+  .wb-appearance-btn,
+  .wb-more-btn { min-width: 44px; min-height: 44px; }
   .wb-pane-toolbar button,
   .wb-pane-actions button,
   .wb-pane-actions a,
@@ -28718,13 +28976,14 @@ body:has(.workbench-route-host) { min-width: 0; }
   right: 8px;
   z-index: 2;
   display: flex;
-  gap: 3px;
-  padding: 2px 3px;
-  border: 1px solid var(--wb-border);
-  /* 外壳比里面的按钮（8px）再大一档，包住时圆弧才是同心的。 */
-  border-radius: var(--wb-radius-l);
-  background: var(--wb-surface-2);
-  box-shadow: var(--wb-shadow);
+  gap: 4px;
+  padding: 2px 4px;
+  /* 脱离文档流的浮层（白名单第 3 类）：底色差不可控，必须有确定的边缘 + 阴影。
+     外壳比里面的按钮（10px）再大一档，包住时圆弧才是同心的。 */
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
   transform: translateY(-50%);
   opacity: 0;
   pointer-events: none;
@@ -28742,21 +29001,23 @@ body:has(.workbench-route-host) { min-width: 0; }
 
 /* 会话类型徽标（话题 / 群 / 单聊）。挤在 meta 行里，所以行高由 line-height 锁死，
    总高 16px < meta 行本身的高度，不会把虚拟滚动算好的行高撑开。 */
+/* chip 的 1px 亮环（白名单第 2 类）：在无边框环境里，chip 靠这圈比填充更亮的环
+   跳出来。字号提到 11px，总高仍小于 meta 行本身，撑不开虚拟滚动算好的行高。 */
 .wb-session-kind {
   flex: none;
-  padding: 0 3px;
-  border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-s);
-  color: var(--wb-faint);
-  font-size: 9px;
-  line-height: 14px;
+  padding: 0 5px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 16px;
 }
 /* meta 行是 space-between 的两栏（描述 | 时间）。插进徽标就变成三栏，自由空间
    会被均分到徽标和描述之间。让描述吃掉剩余空间，恢复「左对齐 + 时间靠右」。 */
 .wb-session-kind + span { margin-right: auto; }
 
 /* 定位成功后的短暂确认态 */
-.wb-session-row-action.is-locate.is-located { color: var(--wb-success); border-color: var(--wb-success); }
+.wb-session-row-action.is-locate.is-located { color: var(--ok); }
 
 /* 未读点：时间戳左边一颗 8px 实心圆，accent 蓝在深浅两套主题下都够显眼。
    flex:none 保证 meta 行被挤窄时它不会被压扁成一条线。
@@ -28783,21 +29044,20 @@ body:has(.workbench-route-host) { min-width: 0; }
   height: 24px;
   min-height: 0;
   max-width: 96px;
-  padding: 0 16px 0 4px;
-  margin-left: auto;
-  border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-m);
-  color: var(--wb-muted);
+  padding: 0 16px 0 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
   background-color: transparent;
   background-position: right 3px center;
   font: inherit;
   font-size: 11px;
-  line-height: 22px;
+  line-height: 24px;
   cursor: pointer;
 }
-.wb-group-dim:hover { border-color: var(--wb-border-strong); color: var(--wb-text); background-color: var(--wb-surface-2); }
+.wb-group-dim:hover { color: var(--text-1); background-color: var(--bg-l3); }
 /* 展开的选项列表由浏览器绘制，只保证它跟随当前主题的底色和字色。 */
-.wb-group-dim option { color: var(--wb-text); background: var(--wb-surface-2); }
+.wb-group-dim option { color: var(--text-1); background: var(--bg-l2); }
 
 /* 分组组头 = 折叠开关。它就是原来那个 .wb-session-group 元素本身，只是标签换成了
    <button>，于是全站的按钮基线（min-height 32px / 1px 描边 / raised 底色 / 居中
@@ -28818,7 +29078,7 @@ body:has(.workbench-route-host) { min-width: 0; }
   border: 0;
   border-radius: 0;
   background: transparent;
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1.4;
   letter-spacing: .09em;
   text-align: left;
@@ -28833,8 +29093,9 @@ body:has(.workbench-route-host) { min-width: 0; }
   content: '';
   position: absolute;
   z-index: -1;
-  inset: 1px 5px 1px 0;
-  border-radius: var(--wb-radius-l);
+  /* 与会话行底板同一条 8px 内缩线：两块底板左右对齐，列表左侧只剩一条对齐线。 */
+  inset: 1px 8px;
+  border-radius: var(--radius-lg);
   background: transparent;
   transition: background-color .14s ease-out;
 }
@@ -28843,10 +29104,297 @@ body:has(.workbench-route-host) { min-width: 0; }
 .wb-session-group-toggle > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* hover：中性组提亮文字；语义色的两组只加底色，一 hover 就把红/绿洗成前景色会丢语义。 */
 .wb-session-group-toggle:hover { color: var(--wb-text); }
-.wb-session-group-toggle:hover::before { background: var(--wb-surface-2); }
+.wb-session-group-toggle:hover::before { background: var(--bg-l3); }
 .wb-session-group-toggle.wb-session-group-needs-you:hover { color: var(--wb-danger); }
 .wb-session-group-toggle.wb-session-group-active:hover { color: var(--wb-success); }
 
 /* 拖动会话栏宽度期间：iframe 不抢指针事件，页面不选中文字 */
 .agent-workbench-page.is-rail-dragging { user-select: none; }
 .agent-workbench-page.is-rail-dragging iframe { pointer-events: none; }
+
+/* ───────────────────────────────────────────────────────────────────────────
+   按钮成组：同组操作 = 一个视觉对象
+   分组关系用「共享底板」或「统一裸排」表达，绝不用「每人一块小板」表达。
+   一排各自带圆角、各自带底色、中间还留缝的按钮，读起来是几个互不相干的东西，
+   而不是同一个对象的几个操作 —— 这是本段要从语法上堵死的形态。
+   合法形态只有两种：
+   (a) 共享底板 = 下面的 .wb-action-group；
+   (b) 全裸同行 = 谁都没有底板、同高同色等距（dock 三个次级按钮、⋯ 菜单项、
+       外观面板里的 4 枚色板都走这种，不需要额外的类）。
+   单按钮不成组：给一个按钮套一个盒子只是多一块噪声。
+   ─────────────────────────────────────────────────────────────────────────── */
+.wb-action-group,
+.wb-seg {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  /* 组落在 L0 / L1 上取 L2；落在 L2 上的组加 .on-l2 往亮走一档，永远与父层拉开一档。 */
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: none;
+  /* 组内子项的圆角全靠它裁 */
+  overflow: hidden;
+}
+.wb-action-group.on-l2,
+.wb-seg.on-l2 { background: var(--bg-l3); }
+/* 选择器带上 .agent-workbench-* 前缀不是啰嗦：工作台的控件基线是
+   `.agent-workbench-page button`（0,1,1），比裸的 `.wb-action-group > *`（0,1,0）更特异，
+   不加前缀的话组内子项会被那条规则重新塞回 10px 圆角，「圆角全由容器裁」当场失效。 */
+.agent-workbench-page .wb-action-group > *,
+.agent-workbench-dock .wb-action-group > *,
+.agent-workbench-page .wb-seg-item,
+.agent-workbench-dock .wb-seg-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0 10px;
+  border: 0;
+  /* 恒为 0：两端的圆角由容器裁出来，每个元素仍然四角同值 */
+  border-radius: 0;
+  color: var(--text-2);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.wb-action-group > *:hover,
+.wb-action-group > *[aria-selected="true"],
+.wb-action-group > *[aria-current="page"],
+.wb-seg-item:hover,
+.wb-seg-item.is-on { background: var(--bg-l3); }
+.wb-action-group.on-l2 > *:hover,
+.wb-action-group.on-l2 > *[aria-selected="true"],
+.wb-action-group.on-l2 > *[aria-current="page"],
+.wb-seg.on-l2 > .wb-seg-item:hover,
+.wb-seg.on-l2 > .wb-seg-item.is-on { background: var(--bg-l2); }
+
+/* 组内分线是「按需开」，不是默认开：只允许挂在「≥3 项 且 容器高 ≥40px」的组上。
+   用伪元素而不是 box-shadow —— 分线必须上下各内缩 10px，满高的线会在组的上下边缘
+   顶到容器圆角上，看起来就像组被切成了几块，又回到独立浮块。
+   `> * + *` 本身就保证第一项不画线，也就保证线永远不会出现在组的外缘。 */
+.wb-action-group.has-dividers > * + * { position: relative; }
+.wb-action-group.has-dividers > * + *::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  background: var(--border-keep);
+}
+
+/* 破坏性 / 不可逆动作留在组内，靠字色和字重区分，不靠隔离 —— 距离表达的是「不同类」，
+   而这几个操作恰恰是同一类，只是后果轻重不同。轻重是强调问题，强调用字色和字重。
+   用 accent 而不是 err：err 已经被「会话状态点 = 需要你处理」占了语义。 */
+.wb-action-group .is-danger { color: var(--accent); font-weight: 600; }
+.wb-action-group .is-danger:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+/* 分段控件（Orca / 经典、跟随系统 / 浅色 / 深色）：容器 24px 高，按自身高度取档 → sm。
+   选中段 = 字色 + 600 字重 + 2px accent 内底线，不引入第五档灰做 thumb。
+   只有 2 项、或容器高 < 40px 的组一律不画组内分线（白名单第 6 类第 ③④ 条）。 */
+.wb-seg,
+.wb-action-group.is-segmented {
+  height: 24px;
+  border-radius: var(--radius-sm);
+}
+.agent-workbench-page .wb-seg-item,
+.agent-workbench-dock .wb-seg-item,
+.agent-workbench-page .wb-action-group.is-segmented > *,
+.agent-workbench-dock .wb-action-group.is-segmented > * {
+  min-width: 40px;
+  min-height: 0;
+  padding: 0 8px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.wb-seg-item.is-on,
+.wb-action-group.is-segmented > *[aria-selected="true"],
+.wb-action-group.is-segmented > *[aria-current="page"] {
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+/* 「跟随系统」比另外两段长，给模式分段一个更宽的下限，三段仍然等宽。 */
+.wb-appearance-mode-seg > .wb-seg-item { min-width: 56px; }
+
+/* ⋯ 菜单：`⋯` 是单按钮，不套容器底板 —— 给一个按钮加一个盒子只是多一块噪声。
+   下拉浮层走白名单第 3 类（1px --border-keep + --shadow-pop）；里面的菜单项走形态
+   (b)：全裸列表项，等高等距，谁都没有自己的底板，hover 才显满宽 L3 底。 */
+.wb-more { position: relative; display: inline-flex; }
+.wb-more-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-more-btn:hover,
+.wb-more-btn[aria-expanded="true"] { color: var(--text-1); background: var(--bg-l3); }
+.wb-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  min-width: 156px;
+  padding: 4px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+}
+/* 同样带前缀压过 `.agent-workbench-page button` 的 10px 基线（见上）。 */
+.agent-workbench-page .wb-more-item,
+.agent-workbench-dock .wb-more-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.wb-more-item + .wb-more-item { margin-top: 2px; }
+.wb-more-item:hover { color: var(--text-1); background: var(--bg-l3); }
+/* 破坏性动作（接管）固定在列表最末，靠字色和字重标识，不加分组线、不额外留缝。 */
+.wb-more-item.is-danger { color: var(--accent); font-weight: 600; }
+
+/* ───────────────────────────────────────────────────────────────────────────
+   外观面板：主题（4 枚色板）+ 明暗（分段控件）+ 终端渲染（分段控件）
+   桌面是下拉浮层，移动是底部 sheet；两处入口、一个状态源。
+   ─────────────────────────────────────────────────────────────────────────── */
+/* H5 列表页顶栏那枚 ◐：与右邻的收起按钮各是一个单按钮 —— 等高等色、都没有底板，
+   也不套共享底板（一个管外观、一个管会话，不是同一组操作）。 */
+.wb-appearance-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-appearance-btn:hover { color: var(--text-1); background: var(--bg-l3); }
+
+/* 桌面：挂在 ⋯ 按钮下方的下拉浮层（白名单第 3 类）。宽 260px：
+   4 枚 28px 色板 + 3×12px 间距 + 2×12px 内边距 = 172px，装得下。 */
+.wb-appearance-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  width: 260px;
+  padding: 12px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+}
+/* 移动：同一块内容改底部 sheet。顶角与下钻容器同形、贴屏底不圆下两角 —— 这是
+   「一个元素四角同值」唯一的例外。 */
+.wb-appearance-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: flex-end;
+  background: var(--modal-backdrop, rgba(10, 14, 18, .48));
+}
+.wb-appearance-sheet {
+  width: 100%;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+}
+.wb-appearance-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--text-1);
+  font-size: 13px;
+}
+.wb-appearance-head button {
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-3);
+  background: transparent;
+  cursor: pointer;
+}
+.wb-appearance-head button:hover { color: var(--text-1); background: var(--bg-l3); }
+/* 两组之间 16px 留白 + 组标题，不画分组线（白名单里没有「面板内分组线」这一类）。 */
+.wb-appearance-group { display: grid; gap: 8px; justify-items: start; }
+.wb-appearance-group + .wb-appearance-group { margin-top: 16px; }
+.wb-appearance-group-label { color: var(--text-3); font-size: 11px; }
+.wb-appearance-note { margin: 0; color: var(--text-3); font-size: 11px; line-height: 16px; }
+
+/* 4 枚色板走形态 (b)：它们是单选项不是操作按钮，四枚等距同尺寸本身已经读成一组。
+   给色板加一块容器底反而会干扰对色相的判读 —— 底色会影响对色相的感知。 */
+.wb-skin-swatches { display: flex; gap: 12px; }
+.wb-skin-swatch {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+/* 三色缩影：左 2/3 = 该套的 L1、右上 1/3 = L3、右下 1/3 = accent，一眼看出色相和
+   accent，不用点进去试。三块纯色由两个伪元素叠出来，刻意不用渐变（段内零渐变）。
+   三个色值由 TS 侧按皮肤内联下发（--sw-bg / --sw-raise / --sw-accent）：色板画的是
+   「目标皮肤」的颜色，当前页的令牌给不了。 */
+.wb-skin-swatch-chip {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--sw-bg);
+  overflow: hidden;
+}
+.wb-skin-swatch-chip::before,
+.wb-skin-swatch-chip::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  width: 33.33%;
+  height: 50%;
+}
+.wb-skin-swatch-chip::before { top: 0; background: var(--sw-raise); }
+.wb-skin-swatch-chip::after { bottom: 0; background: var(--sw-accent); }
+/* 选中标识：外圈 2px accent 环（与焦点环同族画法，但常驻） */
+.wb-skin-swatch.is-active .wb-skin-swatch-chip { box-shadow: 0 0 0 2px var(--accent); }
+.wb-skin-swatch-name { color: var(--text-3); font-size: 11px; line-height: 14px; white-space: nowrap; }
+.wb-skin-swatch.is-active .wb-skin-swatch-name { color: var(--text-1); font-weight: 600; }
