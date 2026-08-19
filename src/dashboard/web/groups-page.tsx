@@ -14,6 +14,8 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
+import { toast } from './toast.js';
+import { confirm } from './confirm-modal.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
 import { BotMultiSelect } from './bot-multi-select.js';
 import {
@@ -1095,8 +1097,8 @@ function ManageDialog(props: {
 
   async function leaveSelected(): Promise<void> {
     const checked = [...leaveSelection];
-    if (checked.length === 0) { alert('至少选一个机器人'); return; }
-    if (!confirm(`确定让 ${checked.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`)) return;
+    if (checked.length === 0) { toast('至少选一个机器人', { kind: 'warning' }); return; }
+    if (!await confirm({ title: '退出群聊', message: `确定让 ${checked.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`, danger: true })) return;
     try {
       const r = await fetch(`/api/groups/${encodeURIComponent(chat.chatId)}/leave`, {
         method: 'POST',
@@ -1119,10 +1121,10 @@ function ManageDialog(props: {
             + `${residuals.length ? `，${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}）`;
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
-      alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
+      toast(lines || `Unexpected: ${JSON.stringify(respBody)}`, { kind: 'success' });
       await props.onReloadGroups({ force: true });
     } catch (err) {
-      alert('Network error: ' + err);
+      toast('Network error: ' + err, { kind: 'error' });
     } finally {
       props.onClose();
     }
@@ -1130,7 +1132,7 @@ function ManageDialog(props: {
 
   async function disband(): Promise<void> {
     if (inChat.length === 0) return;
-    if (!confirm(`确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`)) return;
+    if (!await confirm({ title: '解散群聊', message: `确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`, danger: true })) return;
     const ordered = [...inChat].sort((a, b) =>
       (b.larkAppId === ownerAppId ? 1 : 0) - (a.larkAppId === ownerAppId ? 1 : 0),
     );
@@ -1153,7 +1155,7 @@ function ManageDialog(props: {
             ? ''
             : `\n关闭了 ${ok} 个会话${failed ? `，${failed} 个会话关闭失败` : ''}`
               + `${residuals.length ? `\n⚠️ ${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}。`;
-          alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
+          toast(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`, { kind: 'success' });
           await props.onReloadGroups({ force: true });
           props.onClose();
           return;
@@ -1163,7 +1165,7 @@ function ManageDialog(props: {
         errs.push(`${member.botName ?? member.larkAppId}: ${err}`);
       }
     }
-    alert(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`);
+    toast(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`, { kind: 'error' });
   }
 
   return (
@@ -1451,7 +1453,7 @@ function GroupsPage() {
 
   async function openCreateDialog(): Promise<void> {
     if (snapshotRef.current.bots.length === 0) {
-      alert(tr('groups.noBotsOnline'));
+      toast(tr('groups.noBotsOnline'), { kind: 'warning' });
       return;
     }
     let roleProfiles: RoleProfileSummaryLike[] = [];
@@ -1478,7 +1480,7 @@ function GroupsPage() {
     const inChatSet = new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId));
     const missing = snapshotRef.current.bots.filter(bot => !inChatSet.has(bot.larkAppId));
     if (!missing.length) {
-      alert('All configured bots are already in this chat.');
+      toast('All configured bots are already in this chat.', { kind: 'warning' });
       return;
     }
     setDialog({ type: 'add-bots', chat });

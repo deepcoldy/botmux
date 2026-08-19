@@ -29857,6 +29857,7 @@ body:has(.workbench-route-host) { min-width: 0; }
 .toast-message {
   overflow-wrap: break-word;
   min-width: 0;
+  white-space: pre-line;
 }
 /* 深色 chip + 浅色文字的语义配色；info/warning 与 success/error 同族语言 */
 .toast-item-success { background: #17352a; color: #7ee2b2; }

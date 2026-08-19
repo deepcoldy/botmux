@@ -117,6 +117,8 @@ import {
   type SessionsKanbanTeam,
   type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
+import { toast } from './toast.js';
+import { confirm } from './confirm-modal.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
@@ -2460,7 +2462,7 @@ function CreateSessionDialog(props: {
     const response = await fetch(`/api/feed-groups/auth-url${query}`);
     const body = await response.json().catch(() => ({}));
     if (!response.ok || !body.authUrl) {
-      alert(body.error ?? `HTTP ${response.status}`);
+      toast(body.error ?? `HTTP ${response.status}`, { kind: 'error' });
       return;
     }
     setFeedGroupAuthUrl(String(body.authUrl));
@@ -2486,7 +2488,7 @@ function CreateSessionDialog(props: {
       setFeedGroupAuthUrl('');
       setFeedGroupCallbackUrl('');
     } catch (error) {
-      alert(error instanceof Error ? error.message : String(error));
+      toast(error instanceof Error ? error.message : String(error), { kind: 'error' });
     } finally {
       setFeedGroupAuthSubmitting(false);
     }
@@ -2575,21 +2577,21 @@ function CreateSessionDialog(props: {
     const pasteEnd = event.currentTarget.selectionEnd ?? pasteStart;
     const supported = pasted.filter(file => CREATE_IMAGE_TYPES.has(file.type.toLowerCase()));
     if (supported.length !== pasted.length) {
-      alert(t('sessions.create.imageUnsupported'));
+      toast(t('sessions.create.imageUnsupported'), { kind: 'warning' });
       return;
     }
     if (images.length + supported.length > CREATE_IMAGE_MAX_COUNT) {
-      alert(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }));
+      toast(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }), { kind: 'warning' });
       return;
     }
     if (supported.some(file => file.size > CREATE_IMAGE_MAX_BYTES)) {
-      alert(t('sessions.create.imageSizeLimit'));
+      toast(t('sessions.create.imageSizeLimit'), { kind: 'warning' });
       return;
     }
     const nextTotal = images.reduce((sum, image) => sum + image.size, 0)
       + supported.reduce((sum, file) => sum + file.size, 0);
     if (nextTotal > CREATE_IMAGE_MAX_TOTAL_BYTES) {
-      alert(t('sessions.create.imageTotalLimit'));
+      toast(t('sessions.create.imageTotalLimit'), { kind: 'warning' });
       return;
     }
     try {
@@ -2622,16 +2624,16 @@ function CreateSessionDialog(props: {
         textarea.setSelectionRange(inserted.caret, inserted.caret);
       });
     } catch {
-      alert(t('sessions.create.imageReadFailed'));
+      toast(t('sessions.create.imageReadFailed'), { kind: 'error' });
     }
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const text = content.trim();
-    if (!text) { alert(t('sessions.create.errContent')); return; }
-    if (checkedIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
+    if (!text) { toast(t('sessions.create.errContent'), { kind: 'warning' }); return; }
+    if (checkedIds.length === 0) { toast(t('sessions.create.errNoBot'), { kind: 'warning' }); return; }
     const leadLarkAppId = lead || checkedIds[0] || '';
-    if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
+    if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { toast(t('sessions.create.errLead'), { kind: 'warning' }); return; }
     setSubmitting(true);
     setKeptSuccess(null);
     try {
@@ -2668,9 +2670,9 @@ function CreateSessionDialog(props: {
         } else {
           props.onSuccess(body);
         }
-      } else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+      } else if (r.status !== 401) toast(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`, { kind: 'error' });
     } catch (e) {
-      alert(`${t('sessions.create.failed')}: ${e}`);
+      toast(`${t('sessions.create.failed')}: ${e}`, { kind: 'error' });
     } finally {
       setSubmitting(false);
     }
@@ -3179,7 +3181,7 @@ function SessionsPage(): React.JSX.Element {
           else delete board[sessionId];
           return { ...prev, data: { ...prev.data, board } };
         });
-        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       setTeamBoard(prev => {
@@ -3189,7 +3191,7 @@ function SessionsPage(): React.JSX.Element {
         else delete board[sessionId];
         return { ...prev, data: { ...prev.data, board } };
       });
-      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
+      toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
     }
   }, []);
 
@@ -3257,13 +3259,13 @@ function SessionsPage(): React.JSX.Element {
         row.kanbanColumn = prev.column;
         row.kanbanPosition = prev.position;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.kanbanColumn = prev.column;
       row.kanbanPosition = prev.position;
       refresh();
-      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
+      toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
     }
   }, [refresh]);
 
@@ -3314,12 +3316,12 @@ function SessionsPage(): React.JSX.Element {
       if (!r.ok || body?.ok === false) {
         row.title = prevTitle;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.title = prevTitle;
       refresh();
-      alert(`${t('sessions.kanban.renameFail')}: ${e}`);
+      toast(`${t('sessions.kanban.renameFail')}: ${e}`, { kind: 'error' });
     }
   }, [refresh]);
 
@@ -3331,22 +3333,22 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST' });
       const body = await r.json();
       if (body.ok) return true;
-      alert(`Locate failed: ${body.error ?? r.status}`);
+      toast(`Locate failed: ${body.error ?? r.status}`, { kind: 'error' });
       return false;
     } catch (e) {
-      alert(`Locate error: ${e}`);
+      toast(`Locate error: ${e}`, { kind: 'error' });
       return false;
     }
   }, []);
 
   const closeSession = useCallback(async (row: any, closeBtn?: HTMLButtonElement): Promise<boolean> => {
-    if (!confirm(t('sessions.closeConfirm'))) return false;
+    if (!await confirm({ title: '关闭会话', message: t('sessions.closeConfirm'), danger: true })) return false;
     if (closeBtn) closeBtn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`Close failed: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       // Closed locally, but a remote session was left running (its control plane
@@ -3354,11 +3356,11 @@ function SessionsPage(): React.JSX.Element {
       // moment the operator can be told.
       const residual = parseCloseResidual(body);
       if (residual) {
-        alert(closeResidualIsLocal(residual)
+        toast(closeResidualIsLocal(residual)
           ? `⚠️ Closed locally, but a credentialed host subtree could NOT be proven terminated: `
             + `${describeCloseResidual(residual)}. The remote session WAS cancelled — inspect the local host process.`
           : `⚠️ Closed locally, but the remote session was NOT cancelled: `
-            + `${describeCloseResidual(residual)} — manual cleanup required.`);
+            + `${describeCloseResidual(residual)} — manual cleanup required.`, { kind: 'warning' });
       }
       setSelected(prev => {
         const next = new Set(prev);
@@ -3368,7 +3370,7 @@ function SessionsPage(): React.JSX.Element {
       refresh();
       return true;
     } catch (e) {
-      alert(`Close error: ${e}`);
+      toast(`Close error: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (closeBtn) closeBtn.disabled = false;
@@ -3391,7 +3393,7 @@ function SessionsPage(): React.JSX.Element {
       if (!r.ok || body?.ok === false) {
         row.locked = prev;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       row.locked = !!body.locked;
@@ -3400,7 +3402,7 @@ function SessionsPage(): React.JSX.Element {
     } catch (e) {
       row.locked = prev;
       refresh();
-      alert(`${t('sessions.lockFailed')}: ${e}`);
+      toast(`${t('sessions.lockFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (btn) btn.disabled = false;
@@ -3409,20 +3411,20 @@ function SessionsPage(): React.JSX.Element {
 
   const restartSession = useCallback(async (row: any, restartBtn?: HTMLButtonElement): Promise<boolean> => {
     if (restartCooldownIds.current.has(row.sessionId)) return false;
-    if (!confirm(restartConfirmMessage(row))) return false;
+    if (!await confirm({ title: '重启会话', message: restartConfirmMessage(row), danger: true })) return false;
     if (restartBtn) restartBtn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);
       window.setTimeout(() => restartCooldownIds.current.delete(row.sessionId), 5000);
       return true;
     } catch (e) {
-      alert(`${t('sessions.restartFailed')}: ${e}`);
+      toast(`${t('sessions.restartFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (restartBtn) restartBtn.disabled = false;
@@ -3435,12 +3437,12 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        alert(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`);
+        toast(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       return true;
     } catch (e) {
-      alert(`${t('sessions.resumeFailed')}: ${e}`);
+      toast(`${t('sessions.resumeFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (button) button.disabled = false;
@@ -3453,12 +3455,12 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       return true;
     } catch (e) {
-      alert(`${t('sessions.create.startFailed')}: ${e}`);
+      toast(`${t('sessions.create.startFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (button) button.disabled = false;
@@ -3511,7 +3513,7 @@ function SessionsPage(): React.JSX.Element {
   const runBulkClose = useCallback(async (): Promise<void> => {
     const ids = [...selected];
     if (ids.length === 0) return;
-    if (!confirm(t('sessions.closeBulkConfirm', { count: ids.length }))) return;
+    if (!await confirm({ title: '关闭会话', message: t('sessions.closeBulkConfirm', { count: ids.length }), danger: true })) return;
     setBulkCloseProgress({ done: 0, total: ids.length });
     let done = 0;
     let failed = 0;
@@ -3543,14 +3545,14 @@ function SessionsPage(): React.JSX.Element {
     setBulkCloseProgress(null);
     setSelected(new Set());
     refresh();
-    if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
+    if (failed > 0) toast(`Failed: ${failed}/${ids.length}`, { kind: 'error' });
     if (residualIds.length > 0) {
       // Fires even when nothing failed — otherwise an all-residual batch is
       // entirely silent and the operator believes everything is gone. Kind-neutral
       // (a batch can mix a surviving remote session and a local host subtree); each
       // label already states which.
-      alert(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
-        + `requiring manual cleanup: ${residualIds.join(', ')}`);
+      toast(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
+        + `requiring manual cleanup: ${residualIds.join(', ')}`, { kind: 'warning' });
     }
   }, [refresh, selected]);
 
@@ -3592,7 +3594,7 @@ function SessionsPage(): React.JSX.Element {
     await Promise.all(Array.from({ length: Math.min(6, targetRows.length) }, () => worker()));
     setBulkLockProgress(null);
     refresh();
-    if (failed > 0) alert(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`);
+    if (failed > 0) toast(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`, { kind: 'error' });
   }, [refresh, rowsById, selected]);
 
   const addSelectedToMonitorRoom = useCallback((): void => {
@@ -3619,7 +3621,7 @@ function SessionsPage(): React.JSX.Element {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
-        if (r.status !== 401) alert(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         setIdleCleanupStatus('');
         return;
       }
@@ -3642,12 +3644,12 @@ function SessionsPage(): React.JSX.Element {
         // while some rows left a residual (a remote session still running, or a
         // local host subtree not proven terminated) needing manual cleanup.
         // Kind-neutral: a batch can mix both, and each label already says which.
-        alert(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
-          + `requiring manual cleanup: ${idleResiduals.join(', ')}`);
+        toast(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
+          + `requiring manual cleanup: ${idleResiduals.join(', ')}`, { kind: 'warning' });
       }
       refresh();
     } catch (e) {
-      alert(`${t('sessions.idleCleanupFailed')}: ${e}`);
+      toast(`${t('sessions.idleCleanupFailed')}: ${e}`, { kind: 'error' });
       setIdleCleanupStatus('');
     } finally {
       setIdleCleanupBusy(false);
@@ -3754,14 +3756,14 @@ function SessionsPage(): React.JSX.Element {
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false || !body?.url) {
         tab?.close();
-        if (r.status !== 401) alert(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return;
       }
       if (tab) tab.location.href = body.url;
       else window.open(body.url, '_blank', 'noopener');
     } catch (e) {
       tab?.close();
-      alert(`${t('sessions.debugTerminalFail')}: ${e}`);
+      toast(`${t('sessions.debugTerminalFail')}: ${e}`, { kind: 'error' });
     }
   }, []);
 
