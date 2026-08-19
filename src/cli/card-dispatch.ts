@@ -23,6 +23,43 @@ export type UpdateCardMessageFn = (
   cardJson: string,
 ) => Promise<void>;
 
+// ─── help text ───────────────────────────────────────────────────────────────
+
+/** Usage for `botmux card patch` (printed by `card patch --help`). Kept
+ *  consistent with the global help's card patch section and the missing-arg
+ *  errors in parseCardPatchArgs. */
+export const CARD_PATCH_USAGE = `botmux card patch — 原地更新之前发出的自定义卡片
+
+用法:
+  botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]
+
+说明:
+  按 messageId 原地更新之前用 send --card-file/--card-json 发出的自定义卡片
+  （不发新消息、不换群/话题）。messageId 取自 send 成功输出的 .messageId，
+  卡片安全校验与 send 相同。
+
+选项:
+  --message-id <om_xxx>  要更新的消息 id（必填，om_ 开头）
+  --card-file <path>     替换卡片 JSON 文件路径（与 --card-json 二选一）
+  --card-json <json>     替换卡片 JSON 字符串（与 --card-file 二选一）
+  --session-id <sid>     手动指定会话（默认从会话上下文自动推断）`;
+
+/** Usage for `botmux card` (printed by `card --help` / `card` with no
+ *  subcommand). */
+export const CARD_COMMAND_USAGE = `botmux card — 卡片相关命令
+
+用法:
+  botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]
+      原地更新之前用 send --card-file/--card-json 发出的自定义卡片
+      （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
+      卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话`;
+
+/** True when `botmux card patch` argv asks for help. Help wins over the
+ *  missing-arg validation (cli.ts checks this before parseCardPatchArgs). */
+export function cardPatchArgsWantHelp(args: string[]): boolean {
+  return args.includes('--help') || args.includes('-h');
+}
+
 // ─── argv parsing ────────────────────────────────────────────────────────────
 
 export type CardPatchParsedArgs =
@@ -178,14 +215,41 @@ export async function executeCardPatch(
 }
 
 /**
+ * Extract the Feishu business error `{code, msg}` from an AxiosError-shaped
+ * throw: the Lark SDK raises HTTP 4xx/5xx as AxiosError with the parsed
+ * `{code, msg, ...}` body on `err.response.data`. A string body is tried
+ * with JSON.parse first. Returns undefined when no business error can be
+ * extracted (caller falls back to err.message).
+ */
+function extractLarkBusinessError(err: unknown): { code: unknown; msg: string } | undefined {
+  const data = (err as { response?: { data?: unknown } } | null | undefined)?.response?.data;
+  let parsed: unknown = data;
+  if (typeof data === 'string') {
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const msg = (parsed as { msg?: unknown }).msg;
+  if (typeof msg !== 'string' || msg.length === 0) return undefined;
+  return { code: (parsed as { code?: unknown }).code, msg };
+}
+
+/**
  * Map patch failures to exit codes.
  * - MessageWithdrawnError (Lark 230011, already typed by updateMessage) → exit 1
  * - LarkTransportDisabledError → exit 2 (the cli.ts gates normally refuse
  *   first; this is the defensive backstop if a caller bypasses them)
+ * - AxiosError-shaped failures (HTTP 4xx/5xx from the Lark SDK) → exit 1 with
+ *   the provider's business msg+code extracted from err.response.data, so a
+ *   patch on a missing/non-card message surfaces the real reason instead of
+ *   just "Request failed with status code 400"
  * - Everything else (no permission, non-card target, ephemeral, network, …)
- *   → exit 1 with the provider's msg+code passed through verbatim. No
- *   speculative error-code mapping: only 230011 has a typed constant in the
- *   codebase, so unmapped codes surface exactly what the API returned.
+ *   → exit 1 with err.message passed through verbatim. No speculative
+ *   error-code mapping: only 230011 has a typed constant in the codebase, so
+ *   unmapped codes surface exactly what the API returned.
  */
 function mapCardPatchError(err: unknown): { exitCode: number; error: string } {
   const name = (err as { name?: string } | null | undefined)?.name;
@@ -194,6 +258,11 @@ function mapCardPatchError(err: unknown): { exitCode: number; error: string } {
   }
   if (name === 'LarkTransportDisabledError') {
     return { exitCode: 2, error: '当前会话 Bot 无飞书连接（core-only/apiOnly），无法更新卡片' };
+  }
+  const biz = extractLarkBusinessError(err);
+  if (biz) {
+    const codePart = biz.code !== undefined ? ` (code: ${biz.code})` : '';
+    return { exitCode: 1, error: `更新失败: ${biz.msg}${codePart}` };
   }
   const msg = (err as { message?: string } | null | undefined)?.message ?? String(err);
   return { exitCode: 1, error: `更新失败: ${msg}` };

@@ -42,5 +42,6 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 ```
 
 - 更新用的卡片 JSON 与发送时走**同一套安全校验**（纯展示 + open_url，回调控件被拒）。
+- 示例中的 `send` 带 `--no-mention`：进度卡片不需要 @ 任何人，显式声明不提及可避免被 mention 策略门拦截（exit 2）。
 - Bot 身份从会话上下文解析（与 `send` 相同）；消息已撤回、无权限、目标不是卡片消息等错误会原样透出（exit 1）。
 - 成功输出 `{"success":true,"messageId":"om_xxx","sessionId":"..."}`（stdout 只有 JSON）；参数错误 exit 2。

@@ -15,6 +15,9 @@ import { join } from 'node:path';
 
 import {
   buildCardPatchSuccessOutput,
+  CARD_COMMAND_USAGE,
+  CARD_PATCH_USAGE,
+  cardPatchArgsWantHelp,
   executeCardPatch,
   parseCardPatchArgs,
   readCardPatchInput,
@@ -223,6 +226,70 @@ describe('executeCardPatch', () => {
       expect(outcome.error).toBe('更新失败: Failed to update message: bot not in chat (code: 230002)');
     }
   });
+
+  it('extracts the Feishu business error from an AxiosError-shaped throw (err.response.data {code,msg})', async () => {
+    // Live repro: patching a non-existent message — Lark SDK raises HTTP 400 as
+    // AxiosError with the business body on err.response.data; err.message alone
+    // only says "Request failed with status code 400".
+    const updateMessage = vi.fn(async () => {
+      throw { response: { data: { code: 230002, msg: 'not found' } } };
+    });
+    const outcome = await executeCardPatch(
+      { updateMessage },
+      { larkAppId: 'cli_app', messageId: 'om_1', rawCard: JSON.stringify(CARD) },
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.exitCode).toBe(1);
+      expect(outcome.error).toBe('更新失败: not found (code: 230002)');
+    }
+  });
+
+  it('extracts the business error when err.response.data is a JSON string', async () => {
+    const updateMessage = vi.fn(async () => {
+      throw { response: { data: JSON.stringify({ code: 230002, msg: 'not found' }) } };
+    });
+    const outcome = await executeCardPatch(
+      { updateMessage },
+      { larkAppId: 'cli_app', messageId: 'om_1', rawCard: JSON.stringify(CARD) },
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.exitCode).toBe(1);
+      expect(outcome.error).toBe('更新失败: not found (code: 230002)');
+    }
+  });
+
+  it('falls back to err.message without crashing when err.response.data is an unparseable string', async () => {
+    const updateMessage = vi.fn(async () => {
+      throw { response: { data: 'not-json-string' } };
+    });
+    const outcome = await executeCardPatch(
+      { updateMessage },
+      { larkAppId: 'cli_app', messageId: 'om_1', rawCard: JSON.stringify(CARD) },
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.exitCode).toBe(1);
+      expect(outcome.error).toContain('更新失败');
+      expect(outcome.error).not.toContain('code:');
+    }
+  });
+
+  it('falls back to err.message for a plain Error without a response body', async () => {
+    const updateMessage = vi.fn(async () => {
+      throw new Error('network down');
+    });
+    const outcome = await executeCardPatch(
+      { updateMessage },
+      { larkAppId: 'cli_app', messageId: 'om_1', rawCard: JSON.stringify(CARD) },
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.exitCode).toBe(1);
+      expect(outcome.error).toBe('更新失败: network down');
+    }
+  });
 });
 
 describe('sessionHasNoFeishuTransport (gate verdict)', () => {
@@ -246,5 +313,30 @@ describe('buildCardPatchSuccessOutput', () => {
   it('emits only the send-compatible success JSON', () => {
     expect(buildCardPatchSuccessOutput('om_1', 'sid_9'))
       .toBe(JSON.stringify({ success: true, messageId: 'om_1', sessionId: 'sid_9' }));
+  });
+});
+
+describe('card patch --help', () => {
+  it('detects --help / -h in patch argv (and nothing else)', () => {
+    expect(cardPatchArgsWantHelp(['--help'])).toBe(true);
+    expect(cardPatchArgsWantHelp(['-h'])).toBe(true);
+    expect(cardPatchArgsWantHelp(['--message-id', 'om_1', '--card-json', '{}', '--help'])).toBe(true);
+    expect(cardPatchArgsWantHelp(['--message-id', 'om_1', '--card-json', '{}'])).toBe(false);
+    expect(cardPatchArgsWantHelp([])).toBe(false);
+  });
+
+  it('prints the patch usage (cli.ts logs CARD_PATCH_USAGE verbatim on --help, exit 0)', () => {
+    expect(CARD_PATCH_USAGE).toContain('--message-id');
+    expect(CARD_PATCH_USAGE).toContain('--card-file');
+    expect(CARD_PATCH_USAGE).toContain('--card-json');
+    expect(CARD_PATCH_USAGE).toContain('--session-id');
+    expect(CARD_PATCH_USAGE).toContain('botmux card patch');
+  });
+
+  it('prints the card command usage with the patch subcommand on `card --help` / no subcommand', () => {
+    expect(CARD_COMMAND_USAGE).toContain('botmux card');
+    expect(CARD_COMMAND_USAGE).toContain('patch');
+    expect(CARD_COMMAND_USAGE).toContain('--message-id');
+    expect(CARD_COMMAND_USAGE).toContain('原地更新');
   });
 });

@@ -129,7 +129,7 @@ import {
   type Pm2ExactStartClient,
 } from './cli/pm2-exact-start.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
-import { buildCardPatchSuccessOutput, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
+import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -10388,14 +10388,23 @@ async function cmdSend(rest: string[]): Promise<void> {
 
 async function cmdCard(rest: string[]): Promise<void> {
   const sub = rest[0] ?? '';
+  if (sub === '' || sub === '--help' || sub === '-h') {
+    console.log(CARD_COMMAND_USAGE);
+    return;
+  }
   if (sub !== 'patch') {
     console.error(
-      `未知 card 子命令: ${sub || '(空)'}\n` +
+      `未知 card 子命令: ${sub}\n` +
       `用法: botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]`,
     );
     process.exit(2);
   }
   const args = rest.slice(1);
+  // Help wins over the missing-arg validation and the transport gates below.
+  if (cardPatchArgsWantHelp(args)) {
+    console.log(CARD_PATCH_USAGE);
+    return;
+  }
   // Same two transport doors as `botmux send`: a no-transport turn (apiOnly bot
   // or HTTP virtual session) may not originate ANY Feishu write — including a
   // card patch.

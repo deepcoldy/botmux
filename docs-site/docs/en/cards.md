@@ -42,5 +42,6 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 ```
 
 - The replacement card JSON goes through the **same safety validation** as sending (display-only + open_url; callback controls are rejected).
+- The `send` examples pass `--no-mention`: a progress card doesn't need to @ anyone, and explicitly opting out avoids the mention-policy gate (exit 2).
 - Bot identity is resolved from the session context (same as `send`); errors such as a withdrawn message, missing permission, or a non-card target are surfaced as-is (exit 1).
 - Success prints `{"success":true,"messageId":"om_xxx","sessionId":"..."}` (JSON only on stdout); usage errors exit 2.
