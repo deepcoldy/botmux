@@ -671,3 +671,25 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-nonce","war
     }
   }, 30_000);
 });
+
+describe('pipe-holding grandchild (auto-spawned execution daemon)', () => {
+  it('does not wedge the next turn when a grandchild keeps stdio open', async () => {
+    // Host execution auto-spawns the per-workspace mojo-daemon as the CLIENT's
+    // child; it inherits our stdout/stderr pipes, so the client's 'close' event
+    // never fires while the daemon lives. runTurn used to resolve only on
+    // 'close' — turn 1 settled fine (result event) but its promise stayed
+    // pending and every later write queued forever (observed live). `sleep 60 &`
+    // reproduces the shape: a background child holding the pipes after exit.
+    const bin = fakeMojo(`sleep 60 &
+echo '{"type":"system","subtype":"init","session_id":"sid-pipes"}'
+echo '{"type":"result","status":"ok","result":"turn done","session_id":"sid-pipes","warnings":[]}'`);
+    const backend = new MojoBackend({ bin }, 'sid-pipe-hold');
+    let done = 0;
+    backend.onTaskDone(() => { done += 1; });
+    backend.spawn('', [], {} as never);
+    backend.write('turn one');
+    await vi.waitFor(() => expect(done).toBe(1), { timeout: 10_000 });
+    backend.write('turn two');
+    await vi.waitFor(() => expect(done).toBe(2), { timeout: 15_000 });
+  });
+});

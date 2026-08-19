@@ -1400,6 +1400,14 @@ export function sessionMojoConfig(
       + 'localDaemon=false (legacy sandbox behaviour) for this session. '
       + 'Close and reopen the session to adopt the new default.',
     );
+    // A daemon-log line alone leaves the USER staring at a session where tools
+    // and replies silently fail (observed live: the operator retried a pinned
+    // session twice believing the new build was broken). Queue the in-chat
+    // notice; the next turn with a reply context delivers it once.
+    if (ds.session.mojoLegacyPinNoticePending === undefined) {
+      ds.session.mojoLegacyPinNoticePending = true;
+      sessionStore.updateSession(ds.session);
+    }
   }
   // Quarantine is bound to a specific ID, not to the session.
   //
@@ -7605,6 +7613,7 @@ export function sendWorkerInput(
   };
   // First moment with a reply context after a restore/resume-time quarantine.
   deliverPendingMojoQuarantineNotice(ds, turnId, opts.dispatchAttempt);
+  deliverPendingMojoLegacyPinNotice(ds, turnId, opts.dispatchAttempt);
   // #597: the accept-ledger entry is already appended above; if the IPC send
   // fails (returns false or throws) we MUST roll it back or the dispatch ledger
   // keeps a phantom accepted turn. master's ordinary-IM-delivery tracking runs
@@ -7790,6 +7799,52 @@ function deliverPendingMojoQuarantineNotice(
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
   }).finally(() => {
     mojoQuarantineNoticeInFlight.delete(ds.session.sessionId);
+  });
+}
+
+const mojoLegacyPinNoticeInFlight = new Set<string>();
+
+/** In-chat twin of the sessionMojoConfig legacy pin's daemon-log warn: without
+ *  it the user keeps retrying a session whose tools and replies silently fail
+ *  (observed live). Same pending/delivered protocol and suppression rules as
+ *  deliverPendingMojoQuarantineNotice above. */
+function deliverPendingMojoLegacyPinNotice(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  if (ds.session.mojoLegacyPinNoticePending !== true) return;
+  if (mojoLegacyPinNoticeInFlight.has(ds.session.sessionId)) return;
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return; // Bot deregistered — retry once it is back.
+  }
+  if (auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+    logger.info(
+      `[${tag(ds)}] mojo legacy-pin notice deferred — no authorized output channel `
+      + 'for this turn; still pending',
+    );
+    return;
+  }
+  mojoLegacyPinNoticeInFlight.add(ds.session.sessionId);
+  const message = tr('worker.mojo_legacy_pinned', {}, botLocale(botCfg));
+  void callbacks?.sessionReply(
+    sessionAnchorId(ds),
+    message,
+    'text',
+    ds.larkAppId,
+    turnId,
+    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+  ).then(() => {
+    ds.session.mojoLegacyPinNoticePending = false;
+    sessionStore.updateSession(ds.session);
+  }).catch((err) => {
+    // Flag intentionally left set: the next turn retries.
+    logger.warn(`[${tag(ds)}] failed to deliver mojo legacy-pin notice (will retry): ${err}`);
+  }).finally(() => {
+    mojoLegacyPinNoticeInFlight.delete(ds.session.sessionId);
   });
 }
 

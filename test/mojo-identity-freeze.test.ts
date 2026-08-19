@@ -598,6 +598,27 @@ describe('upgrade guard: legacy identities keep the sandbox default (review F1)'
     expect(resolved.config.localDaemon).toBe(false);
   });
 
+  it('the pin queues the user-visible legacy notice exactly once', async () => {
+    const { store, loadPool } = await boot();
+    const session = seed(store, { mojoIdentity: {} });
+    const ds = { session, larkAppId: APP_ID } as never;
+    const pool = await loadPool();
+    pool.sessionMojoConfig(ds, { mojo: {} }, { freeze: false });
+    expect(session.mojoLegacyPinNoticePending).toBe(true);
+    // Delivered state (false) must survive later pins — never re-queued.
+    session.mojoLegacyPinNoticePending = false;
+    pool.sessionMojoConfig(ds, { mojo: {} }, { freeze: false });
+    expect(session.mojoLegacyPinNoticePending).toBe(false);
+  });
+
+  it('a stamped session queues no legacy notice', async () => {
+    const { store, loadPool } = await boot();
+    const session = seed(store, { mojoIdentity: {}, mojoIdentityHostDefault: true });
+    const ds = { session, larkAppId: APP_ID } as never;
+    (await loadPool()).sessionMojoConfig(ds, { mojo: {} }, { freeze: false });
+    expect(session.mojoLegacyPinNoticePending).toBeUndefined();
+  });
+
   it('freezing today stamps the host-default marker', async () => {
     const { store, identity } = await boot();
     const session = seedAsCreated(store, {});
