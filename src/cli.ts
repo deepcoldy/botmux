@@ -129,6 +129,7 @@ import {
   type Pm2ExactStartClient,
 } from './cli/pm2-exact-start.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { buildCardPatchSuccessOutput, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -6976,6 +6977,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
     纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
+  card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
+                       原地更新之前用 send --card-file/--card-json 发出的自定义卡片
+                       （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
+                       卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话
   bots list                            列出当前群聊中的机器人（含 open_id）
   history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
@@ -10379,6 +10384,58 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 }
 
+// ─── Card subcommand (patch a previously-sent custom card in place) ───
+
+async function cmdCard(rest: string[]): Promise<void> {
+  const sub = rest[0] ?? '';
+  if (sub !== 'patch') {
+    console.error(
+      `未知 card 子命令: ${sub || '(空)'}\n` +
+      `用法: botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]`,
+    );
+    process.exit(2);
+  }
+  const args = rest.slice(1);
+  // Same two transport doors as `botmux send`: a no-transport turn (apiOnly bot
+  // or HTTP virtual session) may not originate ANY Feishu write — including a
+  // card patch.
+  assertTurnTransportOrExit('card patch');
+  // Read isolation: register this bot from its own worker-written cred file so
+  // the Lark client resolves without reading the denied bots.json (same as
+  // cmdSend/cmdHistory).
+  await registerSelfFromCredFile();
+
+  const parsed = parseCardPatchArgs(args);
+  if (!parsed.ok) {
+    console.error(`botmux card patch: ${parsed.error}`);
+    process.exit(2);
+  }
+  const input = readCardPatchInput(parsed.cardFile, parsed.cardJson);
+  if (!input.ok) {
+    console.error(`botmux card patch: ${input.error}`);
+    process.exit(input.exitCode);
+  }
+  // Bot identity comes from the session context only (same as send): no
+  // --bot-style explicit selector. Resolves --session-id / ancestor pid marker
+  // / BOTMUX_SESSION_ID / riff sandbox, and registers the bot so getBotClient
+  // works. Exits 1 on failure (session not found / no larkAppId), same as send.
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  // Target-aware door: a --session-id pointing at a virtual/apiOnly session is
+  // refused even from a transport-capable turn.
+  assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
+
+  const { updateMessage } = await import('./im/lark/client.js');
+  const outcome = await executeCardPatch(
+    { updateMessage },
+    { larkAppId, messageId: parsed.messageId, rawCard: input.rawCard },
+  );
+  if (!outcome.ok) {
+    console.error(`botmux card patch: ${outcome.error}`);
+    process.exit(outcome.exitCode);
+  }
+  console.log(buildCardPatchSuccessOutput(outcome.messageId, sid));
+}
+
 // ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
 
 async function postCurrentSessionDaemonRoute(input: {
@@ -13487,6 +13544,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;

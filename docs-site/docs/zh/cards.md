@@ -23,3 +23,24 @@
 卡片正文是终端画面的**实时截图（图片）**，不是文本渲染。CLI 主动发的消息（通过 `botmux send`）则是独立的富文本 / 图文消息，可带图片、文件、@mention；需要完全自定义展示时也可以用 `--card-file` / `--card-json` 发送原始 interactive 卡片 JSON。
 
 > ⚠️ 原始卡片**只允许纯展示 + open_url 跳转按钮**：任何会触发回调的控件——回调按钮（带 `value`）、下拉 / 人员选择、日期时间选择、输入框、表单提交——都会被拒绝。这是防止自定义卡片伪造交互回调。
+
+## 发送后更新卡片（card patch）
+
+`botmux send --card-file/--card-json` 成功后会输出 `{"success":true,"messageId":"om_...",...}`。用 `botmux card patch` 可以按这个 messageId **原地更新**同一张卡片——不发新消息、不换群/话题，适合做进度卡片：
+
+```bash
+# 1. 发一张「进行中」卡片，从输出 JSON 里拿 messageId
+botmux send --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"部署进度"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 0%"}]}}' --no-mention
+# → {"success":true,"messageId":"om_xxx","sessionId":"..."}
+
+# 2. 用 jq 提取 messageId，原地更新到 50%
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"部署进度"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 50%"}]}}'
+
+# 3. 完成时再更新一次
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"green","title":{"tag":"plain_text","content":"部署完成"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"✅ 已上线"}]}}'
+```
+
+- 更新用的卡片 JSON 与发送时走**同一套安全校验**（纯展示 + open_url，回调控件被拒）。
+- Bot 身份从会话上下文解析（与 `send` 相同）；消息已撤回、无权限、目标不是卡片消息等错误会原样透出（exit 1）。
+- 成功输出 `{"success":true,"messageId":"om_xxx","sessionId":"..."}`（stdout 只有 JSON）；参数错误 exit 2。
