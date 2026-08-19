@@ -261,6 +261,11 @@ export class MojoBackend implements SessionBackend {
      *  Populated lazily by resolveCwd(); spawn and close share this exact
      *  string so the close-side daemon-registry match cannot drift. */
     private isolatedWorkspace?: string;
+    /** True for control-plane-only instances (the workerless orphan-cancel
+     *  helper): they never run an agent turn, so isolating their cwd would
+     *  only mint a junk workspace dir (and potentially a junk daemon) for a
+     *  sentinel session id. */
+    private readonly controlPlaneOnly: boolean = false;
     /**
      * Latched once a strong boundary proved unusable at runtime — the shim's
      * enrolment write was rejected (exit 97). The prepare-time probe only opens
@@ -369,9 +374,14 @@ export class MojoBackend implements SessionBackend {
     private extraCliArgs: string[] = [];
     private writeChain: Promise<void> = Promise.resolve();
 
-    constructor(config: EffectiveMojoConfig, sessionId: string) {
+    constructor(
+        config: EffectiveMojoConfig,
+        sessionId: string,
+        opts?: { controlPlaneOnly?: boolean },
+    ) {
         this.config = config;
         this.sessionId = sessionId;
+        this.controlPlaneOnly = opts?.controlPlaneOnly === true;
         // Adopt the nonce of any subtree this session already owns. A replacement
         // generation MUST keep hunting the previous generation's tree, and the env
         // nonce is the only signal that survives setsid + reparenting to init — a
@@ -600,7 +610,7 @@ export class MojoBackend implements SessionBackend {
     }
 
     private resolveCwd(): string | undefined {
-        if (!this.hostExecution()) return this.realWorkingDir();
+        if (this.controlPlaneOnly || !this.hostExecution()) return this.realWorkingDir();
         // Host execution: run the CLI from a physically distinct per-session
         // directory. mojo keys its local execution daemon on
         // hash(process.cwd()) — realpath, so a symlink would collapse back
@@ -2359,7 +2369,7 @@ export async function cancelMojoSessionById(
     // is only used for logging.
     const backend = (() => {
         try {
-            return new MojoBackend(config, 'orphan-cancel');
+            return new MojoBackend(config, 'orphan-cancel', { controlPlaneOnly: true });
         } catch {
             return null;
         }
