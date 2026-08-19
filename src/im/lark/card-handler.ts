@@ -88,6 +88,7 @@ import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
@@ -838,15 +839,18 @@ export async function commitRepoSelection(
  * 仅默认目录 + auto-worktree 的**异步**提交：`ds` 必须已注册进 activeSessions 且处于
  * `pendingRepo` 挂起态（prompt 已 buffer，入站路由不会去抢 fork——见 daemon.ts pendingRepo
  * 分支），本函数在**关键路径之外**（调用方 `void` 掉、立即返回）跑：
- *   1) 在 `baseDir` 建独立 worktree（非 git / 失败 → 回退 baseDir，均经 `notify` 发提示）
+ *   1) 在 `baseDir` 建独立 worktree（非 git / 失败 → 回退 baseDir，均经 `notify` 发提示；
+ *      但**文件沙盒开启时 fail-closed**：抛 {@link AutoWorktreeFailClosedError}，本函数
+ *      拒绝在真实默认目录启动、关闭挂起会话并提示用户——沙盒把 workingDir 直绑真实目录，
+ *      回退等于让 Agent 写入污染真实项目）
  *   2) 用与「选仓库卡」完全相同的 {@link commitRepoSelection} 提交该目录并 fork——复用其
  *      prompt 重建（会 fold 进等待期间 buffer 的后续消息）、代际守卫、僵尸防护。
  *
  * 这样避免了把 git fetch（可长达 30s）同步塞进 spawn/fork 链路的三宗罪：放大重复 spawn
  * 竞态、worker=null 期间被路由在**基目录**抢 fork、阻塞 dashboard/webhook 响应。
  *
- * 永不抛出：worktree 失败已在内部回退；commitRepoSelection 异常被兜底 log（会话仍留在
- * pendingRepo，用户可 /repo 自救），绝不让 unhandled rejection 掀掉 daemon。
+ * 永不抛出：worktree 失败已在内部回退或 fail-closed 收尾；commitRepoSelection 异常被兜底
+ * log（会话仍留在 pendingRepo，用户可 /repo 自救），绝不让 unhandled rejection 掀掉 daemon。
  */
 export async function runAutoWorktreeCommit(deps: {
   ds: DaemonSession;
@@ -870,6 +874,7 @@ export async function runAutoWorktreeCommit(deps: {
     const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
       isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
+      chatId: ds.chatId,
     });
     // The pendingRepo placeholder can legitimately be consumed WHILE this
     // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
@@ -903,6 +908,48 @@ export async function runAutoWorktreeCommit(deps: {
       { suppressConfirmReply: true },
     ));
   } catch (e) {
+    if (e instanceof AutoWorktreeFailClosedError) {
+      // Fail-closed: the file sandbox is on and the auto-worktree could not be
+      // created. Starting in the real default dir would let the agent's writes
+      // land in the real project (the sandbox binds workingDir read-write to
+      // the host — a sandbox escape), so the session is refused, not degraded.
+      // Close the never-started pending session and tell the user how to fix.
+      //
+      // Same mid-build takeover guard as the success path below: a notifier
+      // adoption (etc.) can consume pendingRepo WHILE the up-to-30s build runs
+      // and start its own live session. Closing here would kill that freshly
+      // adopted session, so bail without touching it.
+      if (!ds.pendingRepo) {
+        logger.info(`[${tag(ds)}] auto-worktree fail-closed ignored — pendingRepo already consumed (session taken over): ${e.reason}`);
+        return;
+      }
+      logger.warn(`[${tag(ds)}] auto-worktree fail-closed (sandbox on, session refused): ${e.reason}`);
+      try {
+        await notify(t('worktree.auto_fail_closed', { dir: baseDir, error: e.reason }, localeForBot(larkAppId)));
+      } catch { /* notices are best-effort — never mask the refusal */ }
+      // Re-check AFTER the await: the pendingRepo guard above only proves we
+      // owned the session when the notice STARTED. A notifier adoption (etc.)
+      // can consume pendingRepo WHILE the network notice is in flight and start
+      // its own live session on this same ds. The cleanup below is synchronous,
+      // so this recheck makes refusal+cleanup atomic with respect to that
+      // takeover — otherwise we would delete the freshly-adopted session from
+      // activeSessions and mark its durable record closed, orphaning the
+      // adopted worker (the exact race the preceding guard exists to prevent).
+      if (!ds.pendingRepo) {
+        logger.info(`[${tag(ds)}] auto-worktree fail-closed cleanup skipped — pendingRepo consumed during notice (session taken over): ${e.reason}`);
+        return;
+      }
+      ds.pendingRepo = false;
+      ds.pendingRepoCommitInFlight = false;
+      const key = activeSessionKey(ds);
+      if (activeSessions.get(key) === ds) activeSessions.delete(key);
+      try { sessionStore.closeSession(ds.session.sessionId); } catch { /* already closed */ }
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
+      return;
+    }
     // No recovery fork here: forking with an empty prompt would DROP the buffered
     // first turn (pendingPrompt lives only in-memory, not the message queue). Leave
     // the session as commitRepoSelection left it — the inbound router's worker=null

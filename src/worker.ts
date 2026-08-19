@@ -275,6 +275,7 @@ import {
   startOutboxWatcher,
   sandboxEnabled,
   localSandboxApplies,
+  localSandboxRequested,
 } from './adapters/backend/sandbox.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
@@ -11949,8 +11950,23 @@ async function spawnCli(
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
-  const sandboxRequested = !riffRemoteBackend
-    && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  // Shared with the auto-worktree fail-closed gate (services/default-worktree.ts):
+  // the SAME predicate decides "does the local file sandbox apply to this spawn",
+  // so the two can never drift again (the riff exemption once only existed here,
+  // and the mojo backend then repeated that drift for a provably-remote session).
+  // forkWorker already forces readIsolation=true for a no-transport session
+  // (worker-pool.ts), so that arm of the union is folded into cfg.readIsolation
+  // here; the noTransport arm exists for callers that decide BEFORE the SpawnOpts
+  // forcing exists (auto-worktree fail-closed).
+  const sandboxRequested = localSandboxRequested({
+    backendType: effectiveBackendType,
+    mojoConfig: effectiveBackendType === 'mojo'
+      ? (riffBackendConfig as EffectiveMojoConfig | undefined)
+      : undefined,
+    sandbox: cfg.sandbox === true,
+    readIsolation: cfg.readIsolation === true,
+    envSandboxEnabled: sandboxEnabled(),
+  });
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
     fileSandboxRequested: sandboxRequested,

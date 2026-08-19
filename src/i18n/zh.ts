@@ -343,6 +343,7 @@ export const messages: Record<string, string> = {
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',
   'worktree.auto_created': '🌿 已为本会话自动创建独立 worktree：`{path}`\n分支 `{branch}`，基于 `{base}`。原默认目录不受影响。',
   'worktree.auto_fallback': '⚠️ 无法在默认目录 `{dir}` 创建 worktree（{error}），已回退到直接在默认目录启动会话。',
+  'worktree.auto_fail_closed': '⛔ 文件沙盒已开启，但默认目录 `{dir}` 无法创建独立 worktree（{error}）。为避免 Agent 写入污染真实目录，本次会话未启动。请将默认目录配置为 git 仓库后重新发起，或使用 /repo 手动选择工作目录。',
   'worktree.err_not_git': '默认目录不是 git 仓库（或暂时无法确认）',
   'cmd.skip.opened': '▶️ 已直接开启会话（工作目录：{cwd}）',
   'cmd.status.running': '运行中',
