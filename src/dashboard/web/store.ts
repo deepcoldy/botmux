@@ -16,6 +16,10 @@ export interface StoreSnapshot {
    *  而不是画一个永远为空的面板。false 同时覆盖「没有能力所以没请求」和「请求
    *  失败」两种情况。 */
   schedulesAvailable: boolean;
+  /** True once the first authoritative `/api/sessions` snapshot has been
+   *  installed. UI uses it to hold a skeleton instead of flashing an empty
+   *  list before the bootstrap fetch lands. Stays true forever after. */
+  bootstrapped: boolean;
 }
 
 class Store {
@@ -24,6 +28,7 @@ class Store {
   online = true;
   scheduleTimeZone = '';
   schedulesAvailable = true;
+  private bootstrapped = false;
   private version = 0;
   private snapshot: StoreSnapshot = {
     sessions: this.sessions,
@@ -32,6 +37,7 @@ class Store {
     version: this.version,
     scheduleTimeZone: this.scheduleTimeZone,
     schedulesAvailable: this.schedulesAvailable,
+    bootstrapped: false,
   };
   private listeners = new Set<() => void>();
   // Bot roster changes don't live in this cache (the Bot 配置 page owns its own
@@ -58,6 +64,7 @@ class Store {
     for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
     this.schedulesAvailable = schedules !== null;
     if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
+    this.bootstrapped = true;
     this.emit();
   }
   applySse(type: string, body: any) {
@@ -105,6 +112,7 @@ class Store {
       version: this.version,
       scheduleTimeZone: this.scheduleTimeZone,
       schedulesAvailable: this.schedulesAvailable,
+      bootstrapped: this.bootstrapped,
     };
     for (const fn of this.listeners) fn();
   }

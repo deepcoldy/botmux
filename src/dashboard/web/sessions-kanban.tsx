@@ -10,6 +10,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { LoadingState } from './dashboard-components.js';
 import type { KanbanGroupBy } from './preferences.js';
 import {
@@ -23,11 +24,11 @@ import {
   botDisplayName,
   chatAvatarHtml,
   chatDisplayTitle,
-  escapeHtml,
   relTime,
   stripMentionPrefix,
   t,
 } from './ui.js';
+import { deriveSessionBoardColumn, sessionExchangePreview } from './sessions.js';
 
 export interface SessionsKanbanTeam {
   key: string;
@@ -49,6 +50,7 @@ export interface SessionsKanbanIcons {
   key: string;
   lock: string;
   restart: string;
+  close: string;
   terminal: string;
   unlock: string;
 }
@@ -75,6 +77,7 @@ export interface SessionsKanbanCallbacks {
   icons: SessionsKanbanIcons;
   lockActionLabel: (row: any) => string;
   sessionStatusText: (status: unknown) => string;
+  onClose?: (row: any, button?: HTMLButtonElement) => void;
   onDetails: (row: any) => void;
   onHistory: (row: any) => void;
   onMoveRows: (moves: SessionsKanbanMove[]) => void;
@@ -150,21 +153,15 @@ function boardSignalLabel(s: any): string {
   return '';
 }
 
-function kanbanStatusIcon(id: SessionKanbanColumn): string {
-  const ring = (extra = '') =>
-    `<svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="5.4" fill="none" stroke="currentColor" stroke-width="1.6"${extra}/>`;
+/** 看板列 → 状态色点：与卡片左侧状态条同一套语义（需要你/进行中/待办/空闲）。 */
+function kanbanColumnDotClass(id: SessionKanbanColumn): string {
   switch (id) {
-    case 'backlog':
-      return `${ring(' stroke-dasharray="1.6 2.1"')}</svg>`;
-    case 'in_progress':
-      return `${ring()}<path d="M7,7 L7,3.6 A3.4,3.4 0 0 1 7,10.4 Z" fill="currentColor"/></svg>`;
-    case 'in_review':
-      return `${ring()}<path d="M7,7 L7,3.6 A3.4,3.4 0 1 1 3.6,7 Z" fill="currentColor"/></svg>`;
-    case 'done':
-      return '<svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="6.2" fill="currentColor"/><path d="M4.4 7.2 6.2 9 9.7 5.4" fill="none" stroke="var(--surface)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-    case 'todo':
-    default:
-      return `${ring()}</svg>`;
+    case 'backlog': return 'kanban-col-dot-idle';
+    case 'todo': return 'kanban-col-dot-todo';
+    case 'in_progress': return 'kanban-col-dot-work';
+    case 'in_review': return 'kanban-col-dot-need';
+    case 'done': return 'kanban-col-dot-done';
+    default: return 'kanban-col-dot-idle';
   }
 }
 
@@ -318,26 +315,137 @@ function insertBeforeCard(column: HTMLElement, clientY: number): HTMLElement | n
   return null;
 }
 
-function CardActButton(props: {
-  action: string;
-  className?: string;
-  icon: string;
+type CardMenuItem = {
+  key: string;
   label: string;
-  onClick: (button: HTMLButtonElement) => void;
-}): React.JSX.Element {
+  icon?: string;
+  danger?: boolean;
+  disabled?: boolean;
+  /** Render as an external link instead of a button. */
+  href?: string;
+  onSelect?: (button: HTMLButtonElement | HTMLAnchorElement) => void;
+};
+
+/**
+ * 卡片「⋯」菜单：卡片本身 overflow:hidden（状态条/文本截断依赖它），菜单弹层
+ * 只能 portal 到 body 定位，否则会被卡片裁掉。打开时按触发按钮位置算坐标，
+ * 视口不够就向上弹；外部 pointerdown / Esc 关闭（与 IdleCleanupBar 同一套模式）。
+ */
+function CardMenu(props: { items: CardMenuItem[] }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number; placement: 'top' | 'bottom' } | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  const place = useCallback(() => {
+    const btn = btnRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const width = 190;
+    const margin = 8;
+    const height = props.items.length * 34 + 10;
+    const left = Math.min(Math.max(rect.right - width, margin), window.innerWidth - width - margin);
+    const spaceBelow = window.innerHeight - rect.bottom - margin;
+    const spaceAbove = rect.top - margin;
+    const placement = spaceBelow >= height || spaceBelow > spaceAbove ? 'bottom' : 'top';
+    const top = placement === 'bottom' ? rect.bottom + 6 : rect.top - height - 6;
+    setPos({ top: Math.max(margin, top), left, placement });
+  }, [props.items.length]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const frame = window.requestAnimationFrame(place);
+    const onReposition = () => place();
+    window.addEventListener('resize', onReposition);
+    window.addEventListener('scroll', onReposition, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('resize', onReposition);
+      window.removeEventListener('scroll', onReposition, true);
+    };
+  }, [open, place]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && (btnRef.current?.contains(target) || popRef.current?.contains(target))) return;
+      setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
   return (
-    <button
-      type="button"
-      className={`card-act kanban-card-act${props.className ? ` ${props.className}` : ''}`}
-      data-action={props.action}
-      data-tip={props.label}
-      aria-label={props.label}
-      onClick={(event) => {
-        event.stopPropagation();
-        props.onClick(event.currentTarget);
-      }}
-      dangerouslySetInnerHTML={rawHtml(props.icon)}
-    />
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        className={`kanban-card-more${open ? ' is-open' : ''}`}
+        data-action="more"
+        data-menu-items={props.items.map(item => item.key).join(',')}
+        aria-label={t('sessions.cardMenu')}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen(value => !value);
+        }}
+      >
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="3.2" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="12.8" r="1.3" fill="currentColor"/></svg>
+      </button>
+      {open && typeof document !== 'undefined' ? createPortal(
+        <div
+          ref={popRef}
+          className={`card-menu-pop card-menu-${pos?.placement ?? 'bottom'}`}
+          role="menu"
+          aria-label={t('sessions.cardMenu')}
+          style={{ top: `${pos?.top ?? -10000}px`, left: `${pos?.left ?? -10000}px`, visibility: pos ? 'visible' : 'hidden' }}
+          onClick={event => event.stopPropagation()}
+          onPointerDown={event => event.stopPropagation()}
+        >
+          {props.items.map(item => (
+            item.href ? (
+              <a
+                key={item.key}
+                role="menuitem"
+                className={`card-menu-item${item.danger ? ' danger' : ''}`}
+                href={item.href}
+                target="_blank"
+                rel="noopener"
+                onClick={() => setOpen(false)}
+              >
+                {item.icon ? <span className="card-menu-icon" dangerouslySetInnerHTML={rawHtml(item.icon)} /> : null}
+                <span className="card-menu-label">{item.label}</span>
+              </a>
+            ) : (
+              <button
+                key={item.key}
+                type="button"
+                role="menuitem"
+                disabled={item.disabled}
+                className={`card-menu-item${item.danger ? ' danger' : ''}`}
+                onClick={(event) => {
+                  setOpen(false);
+                  item.onSelect?.(event.currentTarget);
+                }}
+              >
+                {item.icon ? <span className="card-menu-icon" dangerouslySetInnerHTML={rawHtml(item.icon)} /> : null}
+                <span className="card-menu-label">{item.label}</span>
+              </button>
+            )
+          ))}
+        </div>,
+        document.body,
+      ) : null}
+    </>
   );
 }
 
@@ -410,7 +518,12 @@ function KanbanCard(props: {
   const chatTitle = chatDisplayTitle(row);
   const repo = repoBasename(row.workingDir);
   const signal = boardSignalLabel(row);
-  const desc = [chatTitle, repo !== '-' ? repo : null].filter(Boolean).join(' · ');
+  // 状态色条语义与状态板一致：需要你 / 进行中 / 待办 / 空闲；已关闭单独一色。
+  const boardCol = deriveSessionBoardColumn(row);
+  const signalKind = boardCol ?? (row.status === 'closed' ? 'closed' : 'idle');
+  const exchange = sessionExchangePreview(row);
+  const preview = exchange.botText || exchange.userText;
+  const meta = [botName, chatTitle].filter(Boolean).join(' · ');
   const status = String(row.status ?? 'unknown');
   const remote = typeof row.remoteDeployment === 'string' ? row.remoteDeployment : '';
   const isEditing = props.editingId === row.sessionId;
@@ -423,70 +536,67 @@ function KanbanCard(props: {
     props.dragId === row.sessionId ? 'dragging' : '',
     props.dropBeforeId === row.sessionId ? 'drop-before' : '',
   ].filter(Boolean).join(' ');
-  const actionRail = remote ? null : (
-    <span className="kanban-card-actions-rail">
-      <CardActButton
-        action="history"
-        icon={callbacks.icons.history}
-        label={t('sessions.history.title')}
-        onClick={() => callbacks.onHistory(row)}
-      />
-      {row.webPort && callbacks.onOpenTerminal ? (
-        <CardActButton
-          action="terminal"
-          icon={callbacks.icons.terminal}
-          label={t('sessions.openReadonlyTerminal')}
-          onClick={() => callbacks.onOpenTerminal?.(row)}
-        />
-      ) : null}
-      {row.webPort && callbacks.onOpenWritableTerminal ? (
-        <CardActButton
-          action="write-link"
-          icon={callbacks.icons.key}
-          label={t('sessions.openWritableTerminal')}
-          onClick={button => callbacks.onOpenWritableTerminal?.(row, button)}
-        />
-      ) : null}
-      {row.feishuChatLink ? (
-        <a
-          className="card-act kanban-card-act"
-          href={row.feishuChatLink}
-          target="_blank"
-          rel="noopener"
-          data-tip={t('sessions.kanban.openFeishu')}
-          aria-label={t('sessions.kanban.openFeishu')}
-          onClick={event => event.stopPropagation()}
-          dangerouslySetInnerHTML={rawHtml(callbacks.icons.feishu)}
-        />
-      ) : null}
-      <CardActButton
-        action="lock"
-        className={row.locked ? 'locked' : ''}
-        icon={row.locked ? callbacks.icons.unlock : callbacks.icons.lock}
-        label={callbacks.lockActionLabel(row)}
-        onClick={button => callbacks.onToggleLock(row, button)}
-      />
-      <CardActButton
-        action="details"
-        icon={callbacks.icons.details}
-        label={t('sessions.details')}
-        onClick={() => callbacks.onDetails(row)}
-      />
-      {callbacks.canRestartSession(row) ? (
-        <CardActButton
-          action="restart"
-          icon={callbacks.icons.restart}
-          label={t('sessions.restart')}
-          onClick={button => callbacks.onRestart(row, button)}
-        />
-      ) : null}
-    </span>
-  );
+
+  const menuItems: CardMenuItem[] = [];
+  if (!remote) {
+    menuItems.push({
+      key: 'details',
+      label: t('sessions.details'),
+      icon: callbacks.icons.details,
+      onSelect: () => callbacks.onDetails(row),
+    });
+    menuItems.push({
+      key: 'history',
+      label: t('sessions.history.title'),
+      icon: callbacks.icons.history,
+      onSelect: () => callbacks.onHistory(row),
+    });
+    if (row.webPort && callbacks.onOpenWritableTerminal) {
+      menuItems.push({
+        key: 'write-link',
+        label: t('sessions.openWritableTerminal'),
+        icon: callbacks.icons.key,
+        onSelect: button => callbacks.onOpenWritableTerminal?.(row, button as HTMLButtonElement),
+      });
+    }
+    if (row.feishuChatLink) {
+      menuItems.push({
+        key: 'feishu',
+        label: t('sessions.kanban.openFeishu'),
+        icon: callbacks.icons.feishu,
+        href: row.feishuChatLink,
+      });
+    }
+    if (callbacks.canRestartSession(row)) {
+      menuItems.push({
+        key: 'restart',
+        label: t('sessions.restart'),
+        icon: callbacks.icons.restart,
+        onSelect: button => callbacks.onRestart(row, button as HTMLButtonElement),
+      });
+    }
+    menuItems.push({
+      key: 'lock',
+      label: callbacks.lockActionLabel(row),
+      icon: row.locked ? callbacks.icons.unlock : callbacks.icons.lock,
+      onSelect: button => callbacks.onToggleLock(row, button as HTMLButtonElement),
+    });
+    if (row.status !== 'closed' && callbacks.onClose) {
+      menuItems.push({
+        key: 'close',
+        label: t('sessions.close'),
+        icon: callbacks.icons.close,
+        danger: true,
+        onSelect: button => callbacks.onClose?.(row, button as HTMLButtonElement),
+      });
+    }
+  }
 
   return (
     <article
       className={className}
       data-id={row.sessionId}
+      data-signal={signalKind}
       tabIndex={0}
       role="button"
       aria-pressed={selected}
@@ -495,7 +605,7 @@ function KanbanCard(props: {
       onKeyDown={event => props.onCardKeyDown(row, event)}
       onDragStart={event => props.onDragStartCard(row, event)}
     >
-      <div className="kanban-card-top">
+      <div className="kanban-card-head">
         <span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span>
         {row.adopt ? <span className="badge">adopt</span> : null}
         {row.locked ? <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span> : null}
@@ -504,7 +614,8 @@ function KanbanCard(props: {
             {remote}
           </span>
         ) : null}
-        {actionRail}
+        {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
+        {menuItems.length ? <CardMenu items={menuItems} /> : null}
       </div>
       <div className="kanban-card-title-row">
         {isEditing ? (
@@ -523,23 +634,17 @@ function KanbanCard(props: {
           </p>
         )}
       </div>
-      {desc || signal ? (
-        <div className="kanban-card-meta-row">
-          {desc ? (
-            <p className="kanban-card-desc" title={desc}>{desc}</p>
-          ) : (
-            <span className="kanban-card-desc kanban-card-desc-empty" aria-hidden="true" />
-          )}
-          {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
-        </div>
+      {meta ? (
+        <p className="kanban-card-meta" title={repo !== '-' ? `${meta} · ${repo}` : meta}>
+          {meta}
+        </p>
+      ) : null}
+      {preview ? (
+        <p className="kanban-card-preview" title={preview}>
+          {preview}
+        </p>
       ) : null}
       <div className="kanban-card-foot">
-        <span
-          className="kanban-card-owner"
-          dangerouslySetInnerHTML={rawHtml(
-            `${botAvatarHtml({ name: botName, larkAppId: row.larkAppId, size: 'sm' })}<span>${escapeHtml(botName)}</span>`,
-          )}
-        />
         <span className="kanban-card-updated">
           {t('sessions.kanban.updated', { time: relTime(row.lastMessageAt) })}
           <span
@@ -548,6 +653,20 @@ function KanbanCard(props: {
             title={callbacks.sessionStatusText(status)}
           />
         </span>
+        {!remote && row.webPort && callbacks.onOpenTerminal ? (
+          <button
+            type="button"
+            className="kanban-card-term"
+            data-action="terminal"
+            onClick={(event) => {
+              event.stopPropagation();
+              callbacks.onOpenTerminal?.(row);
+            }}
+          >
+            <span dangerouslySetInnerHTML={rawHtml(callbacks.icons.terminal)} />
+            {t('sessions.terminal')}
+          </button>
+        ) : null}
       </div>
     </article>
   );
@@ -846,7 +965,7 @@ export function SessionsKanbanView(props: SessionsKanbanProps): React.JSX.Elemen
           onDragEnd={clearDrag}
         >
           <header>
-            <span className="kanban-col-icon" dangerouslySetInnerHTML={rawHtml(kanbanStatusIcon(column.id))} />
+            <span className={`kanban-col-dot ${kanbanColumnDotClass(column.id)}`} aria-hidden="true" />
             <h2>{t(column.labelKey)}</h2>
             <span className="kanban-col-count">{column.rows.length + column.hiddenCount}</span>
           </header>

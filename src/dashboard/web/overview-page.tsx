@@ -14,14 +14,15 @@ import {
   stripMentionPrefix,
 } from './ui.js';
 import { buildBotCards, loadGroupsSnapshot, type BotCard } from './overview.js';
+import { requestOpenCreateSession } from './create-session-entry.js';
 import {
+  CreateActionButton,
   HeaderAction,
   HeaderControls,
   Html,
   OverviewList,
   OverviewListItem,
   OverviewListMain,
-  OverviewListTail,
   OverflowText,
   SectionHeader,
   SortMenu,
@@ -31,13 +32,16 @@ type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
 type ActiveSortMode = 'time' | 'attention';
 
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
-const IDLE_STATUSES = new Set(['idle', 'dormant']);
+/** 「进行中」口径：working / analyzing / active（starting 是过渡态，不计入）。 */
+const WORKING_STATUSES = new Set(['working', 'analyzing', 'active']);
 const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
 const ACTIVE_SORT_KEY = 'botmux.overview.activeSort';
 const TEAM_DESKTOP_COLUMNS = 5;
 const TEAM_COLLAPSED_ROWS = 1;
-const ACTIVE_SESSIONS_PANEL_MIN_H = 260;
+const ATTENTION_LIST_CAP = 6;
+const WORKING_LIST_CAP = 7;
+const SPARK_SAMPLES = 24;
+const SPARK_INTERVAL_MS = 4000;
 
 function readTeamExpanded(): boolean {
   try { return window.localStorage.getItem(TEAM_EXPAND_KEY) === '1'; } catch { return false; }
@@ -96,21 +100,116 @@ function collapsedCardCount(gridEl: HTMLElement | null): number {
   return cols * TEAM_COLLAPSED_ROWS;
 }
 
-function alignPanelToSidebarBottom(panel: HTMLElement | null, propertyName: string): void {
-  if (!panel) return;
-  const sidebar = document.querySelector<HTMLElement>('.sidebar');
-  if (!sidebar || window.matchMedia('(max-width: 980px)').matches) {
-    panel.style.removeProperty(propertyName);
-    return;
-  }
+/**
+ * 迷你趋势线：在浏览器里对当前指标做滚动采样（纯渲染层，不碰数据层）。
+ * 首屏用当前值填满，画一条平线——没有历史时诚实表达「暂无趋势」，
+ * 随后每 4 秒落一个点，24 个点（约 1.5 分钟）滑窗。
+ */
+function useSparkline(value: number): { line: string; area: string } {
+  const historyRef = useRef<number[] | null>(null);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const [, setTick] = useState(0);
 
-  const sidebarBottom = sidebar.getBoundingClientRect().bottom;
-  const panelTop = panel.getBoundingClientRect().top;
-  const minHeight = Math.max(ACTIVE_SESSIONS_PANEL_MIN_H, Math.round(sidebarBottom - panelTop));
-  const value = `${minHeight}px`;
-  if (panel.style.getPropertyValue(propertyName) !== value) {
-    panel.style.setProperty(propertyName, value);
+  useEffect(() => {
+    if (historyRef.current === null) {
+      historyRef.current = Array(SPARK_SAMPLES).fill(valueRef.current);
+    }
+    const id = window.setInterval(() => {
+      const history = historyRef.current;
+      if (!history) return;
+      history.push(valueRef.current);
+      if (history.length > SPARK_SAMPLES) history.shift();
+      setTick(tick => tick + 1);
+    }, SPARK_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const history = historyRef.current ?? Array(SPARK_SAMPLES).fill(value);
+  const min = Math.min(...history);
+  const max = Math.max(...history);
+  const span = max - min;
+  const width = 100;
+  const height = 32;
+  const pad = 4;
+  const points = history.map((v, i) => {
+    const x = (i / (history.length - 1)) * width;
+    const y = span === 0 ? height / 2 : height - pad - ((v - min) / span) * (height - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const line = points.join(' ');
+  return { line, area: `0,${height} ${line} ${width},${height}` };
+}
+
+type StatTone = 'need' | 'work' | 'active' | 'online';
+
+function StatIcon({ kind }: { kind: StatTone }): React.JSX.Element {
+  const common = {
+    viewBox: '0 0 24 24',
+    width: 18,
+    height: 18,
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    'aria-hidden': true,
+  } as const;
+  if (kind === 'need') {
+    return (
+      <svg {...common}>
+        <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+        <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+      </svg>
+    );
   }
+  if (kind === 'work') {
+    return (
+      <svg {...common}>
+        <path d="M3 12h4l3 8 4-16 3 8h4" />
+      </svg>
+    );
+  }
+  if (kind === 'active') {
+    return (
+      <svg {...common}>
+        <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+      </svg>
+    );
+  }
+  return (
+    <svg {...common}>
+      <rect x="4" y="8" width="16" height="12" rx="3" />
+      <path d="M12 8V4" />
+      <circle cx="12" cy="3" r="1" />
+      <path d="M9 14h.01M15 14h.01" />
+    </svg>
+  );
+}
+
+function StatChip(props: {
+  tone: StatTone;
+  label: string;
+  value: number;
+  suffix?: string;
+}): React.JSX.Element {
+  const { line, area } = useSparkline(props.value);
+  return (
+    <article className={`stat-chip stat-chip--${props.tone}`}>
+      <span className="stat-chip-icon"><StatIcon kind={props.tone} /></span>
+      <div className="stat-chip-body">
+        <b className="stat-chip-value">
+          {props.value}
+          {props.suffix ? <small className="stat-chip-suffix">{props.suffix}</small> : null}
+        </b>
+        <span className="stat-chip-label">{props.label}</span>
+      </div>
+      <svg className="stat-chip-spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
+        <polygon points={area} />
+        <polyline points={line} vectorEffect="non-scaling-stroke" />
+      </svg>
+    </article>
+  );
 }
 
 function MateCard({ card }: { card: BotCard }) {
@@ -172,40 +271,54 @@ function MateCard({ card }: { card: BotCard }) {
   );
 }
 
-function ActiveSessionRow({ session }: { session: SessionRow }) {
+/** 「需要你处理」队列行：琥珀左条 + 头像 + 标题 + 等待原因/时长 + 处理入口。 */
+function AttentionRow({ session }: { session: SessionRow }): React.JSX.Element {
   const tr = useT();
   const botName = botDisplayName(session);
-  const status = String(session.status ?? 'unknown');
-  const reason = attentionReason(session);
+  const reason = attentionReason(session) ?? '';
   return (
-    <OverviewListItem kind="session">
+    <a className="attn-item" href="#/sessions" role="listitem">
       <Html html={botAvatarHtml({ name: botName, larkAppId: session.larkAppId, size: 'sm' })} />
-      <OverviewListMain>
+      <span className="attn-main">
         <b>{(stripMentionPrefix(session.title) || session.sessionId).slice(0, 64)}</b>
-        <span>{botName} · {chatDisplayTitle(session) ?? session.cliId ?? 'unknown'} · {relTime(session.lastMessageAt)}</span>
-      </OverviewListMain>
-      <OverviewListTail>
-        {reason ? (
-          <>
-            <a className="overview-list-action" href="#/sessions">{tr('strip.handle')}</a>
-            <span className="status overview-list-status status-attention">{reason}</span>
-          </>
-        ) : (
-          <span className={`status overview-list-status status-${statusToken(status)}`}>
-            {sessionStatusText(status, tr)}
-          </span>
-        )}
-      </OverviewListTail>
-    </OverviewListItem>
+        <span>{reason} · {tr('overview.waitingFor', { time: relTime(attentionWaitSince(session)) })}</span>
+      </span>
+      <span className="attn-action">{tr('strip.handle')}</span>
+    </a>
   );
 }
 
-function ScheduleMini({ schedule, timeZone }: { schedule: ScheduleRow; timeZone?: string }) {
+/** 「进行中」会话行：头像 + 标题 + bot/群/时间 + 状态徽章。 */
+function WorkingRow({ session }: { session: SessionRow }): React.JSX.Element {
+  const tr = useT();
+  const botName = botDisplayName(session);
+  const status = String(session.status ?? 'unknown');
+  return (
+    <a className="work-item" href="#/sessions" role="listitem">
+      <Html html={botAvatarHtml({ name: botName, larkAppId: session.larkAppId, size: 'sm' })} />
+      <span className="work-main">
+        <b>{(stripMentionPrefix(session.title) || session.sessionId).slice(0, 64)}</b>
+        <span>{botName} · {chatDisplayTitle(session) ?? session.cliId ?? 'unknown'} · {relTime(session.lastMessageAt)}</span>
+      </span>
+      <span className={`status work-status status-${statusToken(status)}`}>
+        {sessionStatusText(status, tr)}
+      </span>
+    </a>
+  );
+}
+
+function ScheduleMini({ schedule, timeZone }: { schedule: ScheduleRow; timeZone?: string }): React.JSX.Element {
   const next = schedule.nextRunAt
     ? new Date(schedule.nextRunAt).toLocaleString(undefined, timeZone ? { timeZone, timeZoneName: 'short' } : undefined)
     : '-';
   return (
     <OverviewListItem kind="schedule">
+      <span className="sched-clock" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" />
+        </svg>
+      </span>
       <OverviewListMain>
         <strong>{schedule.name ?? schedule.id}</strong>
         <span>{botDisplayName(schedule)} · {schedule.parsed?.display ?? ''}</span>
@@ -217,7 +330,7 @@ function ScheduleMini({ schedule, timeZone }: { schedule: ScheduleRow; timeZone?
   );
 }
 
-function ActiveSortControl({ mode, onModeChange }: { mode: ActiveSortMode; onModeChange: (mode: ActiveSortMode) => void }) {
+function ActiveSortControl({ mode, onModeChange }: { mode: ActiveSortMode; onModeChange: (mode: ActiveSortMode) => void }): React.JSX.Element {
   const tr = useT();
   const label = mode === 'attention' ? tr('overview.sortAttentionFirst') : tr('overview.sortByTime');
 
@@ -238,17 +351,16 @@ function ActiveSortControl({ mode, onModeChange }: { mode: ActiveSortMode; onMod
 function OverviewPage() {
   const tr = useT();
   const teamRef = useRef<HTMLDivElement | null>(null);
-  const activePanelRef = useRef<HTMLElement | null>(null);
-  const schedulesPanelRef = useRef<HTMLElement | null>(null);
   const [teamExpanded, setTeamExpanded] = useState(readTeamExpanded);
   const [activeSortMode, setActiveSortMode] = useState<ActiveSortMode>(readActiveSortMode);
   const [collapsedN, setCollapsedN] = useState(TEAM_COLLAPSED_ROWS * TEAM_DESKTOP_COLUMNS);
   const [namesVersion, forceNamesRefresh] = useState(0);
-  const { sessions, schedules, scheduleTimeZone, schedulesAvailable } = useStoreSelector(snapshot => ({
+  const { sessions, schedules, scheduleTimeZone, schedulesAvailable, online } = useStoreSelector(snapshot => ({
     sessions: [...snapshot.sessions.values()] as SessionRow[],
     schedules: [...snapshot.schedules.values()] as ScheduleRow[],
     scheduleTimeZone: snapshot.scheduleTimeZone,
     schedulesAvailable: snapshot.schedulesAvailable,
+    online: snapshot.online,
   }));
 
   useEffect(() => {
@@ -281,13 +393,22 @@ function OverviewPage() {
   const active = useMemo(() => sessions.filter(s => s.status !== 'closed'), [sessions]);
   const cards = useMemo(() => buildBotCards(sessions), [sessions, namesVersion]);
   const visibleCards = teamExpanded ? cards : cards.slice(0, collapsedN);
-  const recent = useMemo(
-    () => sortActiveSessions(
-      active.filter(s => attentionReason(s) || BUSY_STATUSES.has(s.status) || IDLE_STATUSES.has(s.status)),
-      activeSortMode,
-    ).slice(0, 7),
-    [active, activeSortMode],
+
+  // 「需要你处理」：全量计数进统计条/副标题，列表按等待时长排序、限量展示。
+  const attentionAll = useMemo(() => active.filter(s => attentionReason(s)), [active]);
+  const attention = useMemo(
+    () => sortActiveSessions(attentionAll, activeSortMode).slice(0, ATTENTION_LIST_CAP),
+    [attentionAll, activeSortMode],
   );
+  // 「进行中」：只保留 working/analyzing/active，按最近消息排序。
+  const workingAll = useMemo(
+    () => active
+      .filter(s => WORKING_STATUSES.has(String(s.status)))
+      .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0)),
+    [active],
+  );
+  const working = workingAll.slice(0, WORKING_LIST_CAP);
+  const onlineBots = useMemo(() => cards.filter(c => c.online || c.active.length > 0).length, [cards]);
   const upcoming = useMemo(
     () => schedules
       .filter(s => s.nextRunAt)
@@ -295,40 +416,8 @@ function OverviewPage() {
       .slice(0, 5),
     [schedules],
   );
-
-  useEffect(() => {
-    const panels = [
-      { el: activePanelRef.current, propertyName: '--active-sessions-min-height' },
-      { el: schedulesPanelRef.current, propertyName: '--schedules-panel-min-height' },
-    ].filter((entry): entry is { el: HTMLElement; propertyName: string } => !!entry.el);
-    if (!panels.length) return;
-
-    let raf = 0;
-    const update = () => {
-      window.cancelAnimationFrame(raf);
-      raf = window.requestAnimationFrame(() => {
-        for (const panel of panels) alignPanelToSidebarBottom(panel.el, panel.propertyName);
-      });
-    };
-    update();
-
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
-    if (observer) {
-      for (const panel of panels) observer.observe(panel.el);
-      const sidebar = document.querySelector<HTMLElement>('.sidebar');
-      const page = panels[0].el.closest<HTMLElement>('.page');
-      if (sidebar) observer.observe(sidebar);
-      if (page) observer.observe(page);
-    }
-    window.addEventListener('resize', update);
-
-    return () => {
-      window.cancelAnimationFrame(raf);
-      observer?.disconnect();
-      window.removeEventListener('resize', update);
-      for (const panel of panels) panel.el.style.removeProperty(panel.propertyName);
-    };
-  }, [teamExpanded, collapsedN, cards.length, upcoming.length]);
+  // 无排程数据（无能力 或 确实没有 upcoming）时整块隐藏，不画空占位。
+  const showSchedules = schedulesAvailable && upcoming.length > 0;
 
   const toggleTeam = () => {
     setTeamExpanded(v => {
@@ -344,14 +433,78 @@ function OverviewPage() {
   return (
     <section className="page hero-page">
       <div className="page-heading">
-        <div>
+        <div className="overview-head">
           <p className="eyebrow">{tr('app.subtitle')}</p>
           <h1>{tr('overview.title')}</h1>
+          <p className="overview-subtitle">
+            <span>{tr('overview.headingSubtitle', { bots: onlineBots, needs: attentionAll.length })}</span>
+            <span className={`overview-live${online ? ' is-online' : ' is-offline'}`}>
+              <i aria-hidden="true" />
+              {online ? tr('overview.liveSync') : tr('overview.syncOffline')}
+            </span>
+          </p>
+        </div>
+        <div className="page-heading-actions">
+          <a className="btn-link" href="#/monitoring">{tr('nav.monitoring')}</a>
+          <CreateActionButton className="page-primary-action" onClick={() => requestOpenCreateSession()}>
+            {tr('nav.createSession')}
+          </CreateActionButton>
         </div>
       </div>
 
-      <div className="overview-layout">
+      <div className="overview-stats">
+        <StatChip tone="need" label={tr('overview.attention')} value={attentionAll.length} />
+        <StatChip tone="work" label={tr('overview.workingSessions')} value={workingAll.length} />
+        <StatChip tone="active" label={tr('overview.activeSessions')} value={active.length} />
+        <StatChip tone="online" label={tr('overview.onlineBots')} value={onlineBots} suffix={`/ ${cards.length}`} />
+      </div>
+
+      <section className="overview-block attention-section">
+        <SectionHeader
+          title={tr('overview.attention')}
+          count={tr('strip.pending', { count: attentionAll.length })}
+        >
+          {attentionAll.length > 1 ? (
+            <HeaderControls>
+              <ActiveSortControl mode={activeSortMode} onModeChange={changeActiveSortMode} />
+            </HeaderControls>
+          ) : null}
+        </SectionHeader>
+        {attention.length ? (
+          <div className="attn-list" role="list">
+            {attention.map(s => <AttentionRow key={s.sessionId} session={s} />)}
+          </div>
+        ) : (
+          <div className="attn-empty">
+            <span className="attn-empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            </span>
+            <span>{tr('overview.allClear')}</span>
+          </div>
+        )}
+      </section>
+
+      <div className={`overview-layout${showSchedules ? '' : ' overview-layout--single'}`}>
         <div className="overview-main">
+          <section className="overview-block">
+            <SectionHeader title={tr('overview.workingSessions')} count={String(workingAll.length)}>
+              <HeaderControls>
+                <HeaderAction href="#/sessions">{tr('overview.viewAllPlain')}</HeaderAction>
+              </HeaderControls>
+            </SectionHeader>
+            <section className="panel active-sessions-panel">
+              {working.length ? (
+                <div className="work-list" role="list">
+                  {working.map(s => <WorkingRow key={s.sessionId} session={s} />)}
+                </div>
+              ) : (
+                <div className="empty">{tr('overview.noSessions')}</div>
+              )}
+            </section>
+          </section>
+
           <section className="overview-block team-section">
             <SectionHeader
               title={tr('overview.team')}
@@ -371,34 +524,20 @@ function OverviewPage() {
               </button>
             ) : null}
           </section>
-
-          <section className="overview-block">
-            <SectionHeader title={tr('overview.activeSessions')}>
-              <HeaderControls>
-                <ActiveSortControl mode={activeSortMode} onModeChange={changeActiveSortMode} />
-                <HeaderAction href="#/sessions">{tr('overview.viewAllPlain')}</HeaderAction>
-              </HeaderControls>
-            </SectionHeader>
-            <section className="panel active-sessions-panel" ref={activePanelRef}>
-              <OverviewList id="recent-sessions">
-                {recent.length ? recent.map(s => <ActiveSessionRow key={s.sessionId} session={s} />) : <li className="empty">{tr('overview.noSessions')}</li>}
-              </OverviewList>
-            </section>
-          </section>
         </div>
 
         {/* P1-14：排程不在 Workbench-only 身份的能力表里（/api/schedules 明确
             401）。这时排程既不是「暂时空」也不是「没有排程」，而是压根读不到，
             画一个永远为空的面板只会误导——整块隐藏。 */}
-        {schedulesAvailable ? (
+        {showSchedules ? (
           <aside className="overview-side">
             <section className="overview-block">
-              <SectionHeader title={tr('overview.nextSchedules')}>
+              <SectionHeader title={tr('overview.upcomingSchedules')}>
                 <HeaderAction href="#/schedules">{tr('overview.viewAllPlain')}</HeaderAction>
               </SectionHeader>
-              <section className="panel schedules-panel" ref={schedulesPanelRef}>
+              <section className="panel schedules-panel">
                 <OverviewList id="next-schedules">
-                  {upcoming.length ? upcoming.map(s => <ScheduleMini key={s.id} schedule={s} timeZone={scheduleTimeZone} />) : <li className="empty">{tr('overview.noSchedules')}</li>}
+                  {upcoming.map(s => <ScheduleMini key={s.id} schedule={s} timeZone={scheduleTimeZone} />)}
                 </OverviewList>
               </section>
             </section>
