@@ -183,8 +183,16 @@ export class MojoBackend implements SessionBackend {
     private taskDoneCb: (() => void) | null = null;
     private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
     private taskIdCb: ((taskId: string | null) => void) | null = null;
+    private turnFinalCb: ((text: string) => void) | null = null;
 
     private outputBuffer = '';
+    /**
+     * This turn's assistant answer, accumulated from the SAME text the user
+     * sees on the card (emitText is the single choke point for model prose —
+     * tool-call/warning chrome goes through emitLine and is deliberately left
+     * out). Reset per turn in runTurn(); handed to turnFinalCb at settleTurn().
+     */
+    private turnFinalText = '';
     /** mojo-side session id — the resume lineage. */
     private cliSessionId: string | null = null;
     private child: MojoChild | null = null;
@@ -633,6 +641,11 @@ export class MojoBackend implements SessionBackend {
     /** Turn boundary — required: an API-backed backend produces no PTY output, so
      *  botmux's idle detector never fires and nothing else re-arms prompt-ready. */
     onTaskDone(cb: () => void): void { this.taskDoneCb = cb; }
+
+    /** This turn's assistant answer, for the worker's final_output bridge. A
+     *  headless mojo session has no terminal the user could read instead, so an
+     *  answer the agent never `botmux send`s would otherwise reach nobody. */
+    onTurnFinal(cb: (text: string) => void): void { this.turnFinalCb = cb; }
 
     /** Lineage id updates — forwarded to the daemon so multi-turn context
      *  survives a daemon restart. */
@@ -1667,6 +1680,7 @@ export class MojoBackend implements SessionBackend {
             const { bin, args } = this.resolveLaunch(this.buildArgs(prompt));
             this.turnSettled = false;
             this.streamedThisTurn = false;
+            this.turnFinalText = '';
             this.stdoutTail = '';
 
             // The strong boundary must exist BEFORE the child does, and the child
@@ -1982,6 +1996,14 @@ export class MojoBackend implements SessionBackend {
         // it has to be a real lookup here.
         if (this.turnSettled) return;
         this.turnSettled = true;
+        // BEFORE taskDoneCb: that callback re-arms prompt-ready and flushes
+        // queued follow-ups, so emitting the answer afterwards would race the
+        // next turn's card/turn attribution. A turn that produced no prose
+        // (tool-only, cancelled, failed) hands over '' and the worker's gate
+        // drops it — the backend does not decide deliverability.
+        const finalText = this.turnFinalText;
+        this.turnFinalText = '';
+        this.turnFinalCb?.(finalText);
         this.taskDoneCb?.();
     }
 
@@ -2210,6 +2232,9 @@ export class MojoBackend implements SessionBackend {
     private emitText(text: string): void {
         const normalized = text.replace(/\r?\n/g, '\r\n');
         this.outputBuffer += normalized;
+        // Keep the bridge copy in the CLI's own newline convention — it is
+        // destined for a Lark message, not a terminal.
+        this.turnFinalText += text;
         this.dataCb?.(normalized);
     }
 }

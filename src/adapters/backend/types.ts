@@ -152,6 +152,20 @@ export interface SessionBackend {
    * Optional — local backends never implement it.
    */
   onTaskDone?(cb: () => void): void;
+  /**
+   * Turn final answer — headless backends (Mojo) that synthesise their screen
+   * from an event stream also know, exactly, which part of that stream is the
+   * assistant's answer. They hand it over here so the worker can bridge it into
+   * the thread when the agent produced an answer but never called `botmux send`
+   * (a headless CLI has no terminal for the user to read instead).
+   *
+   * Fires at most once per turn, immediately before `onTaskDone`, so the reply
+   * IPC precedes the prompt-ready/idle transition. The text is the RAW answer:
+   * the worker owns the `botmux send` dedup gate and the sentinel handling, so
+   * a backend must not pre-filter it. Optional — backends whose output the user
+   * can already read in a terminal never implement it.
+   */
+  onTurnFinal?(cb: (text: string) => void): void;
   /** Remote-session lineage updates — the worker forwards these to the daemon
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */

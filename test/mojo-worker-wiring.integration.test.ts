@@ -33,7 +33,7 @@ interface Invocation {
  * Write a fake `mojo` that dumps its invocation, then emits a minimal valid
  * stream (init + result) so the turn settles like a real one.
  */
-function writeFakeMojo(dir: string, fileName = 'mojo'): string {
+function writeFakeMojo(dir: string, fileName = 'mojo', streamScript?: string): string {
   const bin = join(dir, fileName);
   // `self` is how the cliPathOverride / wrapper assertions know WHICH binary ran.
   writeFileSync(bin, `#!/usr/bin/env bash
@@ -56,8 +56,8 @@ node -e '
     },
   }, null, 2));
 ' -- "$@"
-echo '{"type":"system","subtype":"init","session_id":"sid-fake-1"}'
-echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-fake-1","warnings":[]}'
+${streamScript ?? `echo '{"type":"system","subtype":"init","session_id":"sid-fake-1"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-fake-1","warnings":[]}'`}
 `);
   chmodSync(bin, 0o755);
   return bin;
@@ -97,12 +97,20 @@ async function runWorker(opts: {
   workerEnv?: Record<string, string>;
   /** Point cliPathOverride at the fake binary written for this run. */
   cliPathOverrideFromBin?: boolean;
+  /** Replace the fake binary's event stream (final-answer bridge tests). The
+   *  shell fragment runs after the invocation dump; `$MARKER_FILE` points at the
+   *  `botmux send` marker file this session's worker reads. */
+  fakeStream?: string;
+  /** Keep the worker alive until this substring shows up in its log. Needed by
+   *  tests that assert on messages emitted at the TURN BOUNDARY: the invocation
+   *  dump lands long before the stream is parsed. */
+  awaitLog?: string;
 }): Promise<RunResult> {
   // realpathSync: macOS os.tmpdir() is a symlink (/var → /private/var); the child
   // reports the resolved path, so normalize here to keep cwd assertions portable.
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-worker-')));
   const dump = join(root, 'invocation.json');
-  const bin = writeFakeMojo(root, opts.binName ?? 'mojo');
+  const bin = writeFakeMojo(root, opts.binName ?? 'mojo', opts.fakeStream);
   let child: ChildProcess | undefined;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
@@ -176,6 +184,14 @@ async function runWorker(opts: {
       opts.timeoutMs ?? 20_000,
       () => `mojo was never invoked (or its dump never became parseable)\n${logs.join('')}`,
     );
+    if (opts.awaitLog) {
+      const needle = opts.awaitLog;
+      await waitFor(
+        () => logs.join('').includes(needle),
+        opts.timeoutMs ?? 20_000,
+        () => `worker never logged ${JSON.stringify(needle)}\n${logs.join('')}`,
+      );
+    }
     return {
       bin,
       invocation: invocation!,
@@ -376,6 +392,89 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       init: { backendConfig: { cloud: true } },
     });
     expect(invocation.argv).toContain('--yolo');
+  }, 40_000);
+
+  // ── Final-answer bridge ───────────────────────────────────────────────────
+  // A headless backend has no terminal to fall back on: an answer the agent
+  // never `botmux send`s exists only on the streaming card, so the thread shows
+  // the turn finishing with no reply at all. These three cases pin the whole
+  // policy: deliver by default, and defer to the two existing suppression rules
+  // (explicit send this turn / nothing-to-send sentinel) rather than inventing
+  // a second dedup scheme.
+  const TURN_SETTLED_LOG = 'task finished — re-arming prompt-ready';
+
+  /** Shell fragment: simulate `botmux send` by appending the same marker line
+   *  cli.ts writes. Deliberately derived from the child's OWN env, so it also
+   *  proves the mojo child inherits what the real CLI needs to find the file. */
+  const WRITE_SEND_MARKER = `node -e '
+  const fs = require("fs"), p = require("path");
+  const dir = p.join(process.env.SESSION_DATA_DIR, "turn-sends");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(
+    p.join(dir, process.env.BOTMUX_SESSION_ID + ".jsonl"),
+    JSON.stringify({ sentAtMs: Date.now(), messageId: "om_explicit_send", contentLength: 4000 }) + "\\n",
+  );
+'`;
+
+  function finalOutputs(messages: WorkerToDaemon[]): Extract<WorkerToDaemon, { type: 'final_output' }>[] {
+    return messages.filter(
+      (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
+    );
+  }
+
+  it('bridges the turn answer into the thread when the agent never called botmux send', async () => {
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-deliver"}'`,
+        `echo '{"type":"result","status":"ok","result":"最终答案是 42","session_id":"sid-bridge-deliver","warnings":[]}'`,
+      ].join('\n'),
+      // Ordinary IM turn shape: the answer must be attributed to the turn that
+      // asked, so the daemon can resolve its reply target and dedupe a retry.
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    const finals = finalOutputs(messages);
+    expect(finals, `no final_output emitted\n${logs}`).toHaveLength(1);
+    expect(finals[0].content).toContain('最终答案是 42');
+    // Stable per turn — the daemon derives both its dedupe key and the Lark
+    // idempotency uuid from lastUuid, so a retry must collapse into one message.
+    expect(finals[0].lastUuid).toBe(finals[0].turnId);
+  }, 40_000);
+
+  it('does not repeat an answer the agent already sent itself', async () => {
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-sent"}'`,
+        WRITE_SEND_MARKER,
+        `echo '{"type":"result","status":"ok","result":"最终答案是 42","session_id":"sid-bridge-sent","warnings":[]}'`,
+      ].join('\n'),
+      // Ordinary IM turn shape: the answer must be attributed to the turn that
+      // asked, so the daemon can resolve its reply target and dedupe a retry.
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    expect(finalOutputs(messages), `duplicate reply delivered\n${logs}`).toHaveLength(0);
+    expect(logs).toContain('model already called botmux send');
+    // The suppressed turn still tells observers which message WAS the reply.
+    expect(messages.some(m => m.type === 'explicit_reply_observed')).toBe(true);
+  }, 40_000);
+
+  it('delivers nothing when the answer is the nothing-to-send sentinel', async () => {
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-sentinel"}'`,
+        `echo '{"type":"result","status":"ok","result":"BOTMUX_NOTHING_TO_SEND","session_id":"sid-bridge-sentinel","warnings":[]}'`,
+      ].join('\n'),
+      // Ordinary IM turn shape: the answer must be attributed to the turn that
+      // asked, so the daemon can resolve its reply target and dedupe a retry.
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    expect(finalOutputs(messages), `sentinel leaked into the thread\n${logs}`).toHaveLength(0);
+    expect(logs).toContain('nothing-to-send sentinel');
   }, 40_000);
 
   it('resumes the persisted lineage from riffParentTaskId', async () => {
