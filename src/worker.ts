@@ -15272,6 +15272,8 @@ function getTerminalHtml(
 <head>
 <meta charset="utf-8">
 <meta id="vp" name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="lk-config" content="{&quot;showBottomNavBar&quot;:false}">
+<meta name="format-detection" content="telephone=no">
 <title>${cliName()} - ${label}</title>
 <link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
@@ -15361,6 +15363,50 @@ body.touch #terminal .xterm-screen *{
   background:rgba(224,175,104,0.12);border:1px solid rgba(224,175,104,0.35);border-radius:4px;
   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
 #login-banner.show{display:inline-block}
+/* ── Mobile input bar (ported from woof's #mobile-input-form) ──
+   On touch devices the floating right-edge toolbar is hidden and this bar
+   replaces it: a row of shortcut keys (Paste/Ctrl-C/Esc/Tab/Enter/Shift-Tab)
+   plus a persistent input row with two modes:
+     • live   : keystrokes are diff'd to ANSI sequences and sent as you type
+     • buffer : text accumulates, sent wholesale on 发送/Enter
+   Lives at the bottom; the terminal resizes above it via --mobile-bar-h. */
+body.touch #toolbar-shell{display:none!important}
+#mobile-input-bar{display:none}
+body.touch.has-token #mobile-input-bar{
+  display:flex;flex-direction:column;position:fixed;left:0;right:0;bottom:0;z-index:60;
+  padding:6px max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));
+  border-top:1px solid #2a2b3d;background:#0f0f14;
+  transform:translateY(calc(-1 * var(--keyboard-inset,0px)));transition:transform .12s ease}
+#mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+#mobile-bar-keys::-webkit-scrollbar{display:none}
+#mobile-bar-keys button{
+  flex:none;min-width:44px;height:32px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
+  background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
+#mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-bar-row{display:flex;align-items:flex-end;gap:5px}
+#mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+#mobile-input{
+  flex:1;min-width:0;min-height:38px;max-height:120px;resize:none;overflow-y:auto;
+  padding:9px 14px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
+  font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  -webkit-text-size-adjust:100%;text-size-adjust:100%}
+#mobile-input::placeholder{color:#565f89}
+#mobile-bar-row button{
+  flex:none;width:38px;min-height:38px;height:38px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
+  background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+#mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
+#mobile-mode{min-width:48px;border-radius:8px;font:600 11px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
+/* live mode: the textarea holds the IME draft but the typed text is already in
+   the terminal, so render the textarea transparent to avoid double-vision. */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input{color:transparent;caret-color:transparent}
+#mobile-live-hint{display:none;position:absolute;inset:0;pointer-events:none;align-items:center;
+  padding:0 56px 0 14px;color:#565f89;font:12px -apple-system,sans-serif;white-space:nowrap;overflow:hidden}
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-live-hint{display:flex}
+/* live mode: the hint replaces the placeholder — hide both to avoid overlap */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input::placeholder{color:transparent}
 </style>
 </head>
 <body>
@@ -15389,6 +15435,27 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     </div>
   </div>
 </div>
+<form id="mobile-input-bar" autocomplete="off" data-mode="buffer" aria-label="手机输入">
+  <div id="mobile-bar-keys">
+    <button type="button" data-sk="paste">Paste</button>
+    <button type="button" data-sk="ctrlc">Ctrl+C</button>
+    <button type="button" data-sk="esc">Esc</button>
+    <button type="button" data-sk="tab">Tab</button>
+    <button type="button" data-sk="enter">Enter</button>
+    <button type="button" data-sk="stab">Shift+Tab</button>
+  </div>
+  <div id="mobile-bar-row">
+    <button id="mobile-mode" type="button" title="切换输入模式" aria-label="切换输入模式">缓冲</button>
+    <div id="mobile-input-wrap">
+      <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="Type a command..." autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
+      <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
+    </div>
+    <button id="mobile-up" type="button" title="上移" aria-label="上移">↑</button>
+    <button id="mobile-bs" type="button" title="删除终端字符" aria-label="删除终端字符">⌫</button>
+    <button id="mobile-down" type="button" title="下移" aria-label="下移">↓</button>
+    <button id="mobile-send" type="submit">发送</button>
+  </div>
+</form>
 <div id="status" class="err">connecting...</div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
@@ -15434,6 +15501,7 @@ try{
 }catch(_e){
   try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
 }
+_applyFontSize();
 fit.fit();
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
 // zellij frame (or relay history seed) can therefore finish after the browser
@@ -15649,9 +15717,23 @@ function sendResize(){
 // bar / on-screen keyboard show & hide, and an un-debounced fit→resize on each
 // reflows the (shared) zellij pane every frame — the status bar toggles and the
 // text re-wraps, i.e. the reported flicker. Coalesce to the settled size.
+// Also re-pick the font size for the viewport (ported from woof's
+// terminalFontSizeForViewport): a fixed 14px renders tiny on a phone, so narrow
+// viewports bump to a larger size; fit then re-derives columns for that size.
+function _fontSizeForViewport(){
+  var w=window.innerWidth||document.documentElement.clientWidth||0;
+  // Touch/narrow phone viewports get a bigger glyph for readability; the TUI
+  // keeps useful columns because FitAddon recomputes cols from the new cell size.
+  if(isTouch&&w>0&&w<=600)return 16;
+  return 14;
+}
+function _applyFontSize(){
+  var fs=_fontSizeForViewport();
+  if(term&&term.options&&term.options.fontSize!==fs){term.options.fontSize=fs;}
+}
 function onViewportResize(){
   clearTimeout(_rzT);
-  _rzT=setTimeout(function(){if(!fixedSize){try{fit.fit()}catch(e){}}sendResize()},250);
+  _rzT=setTimeout(function(){_applyFontSize();if(!fixedSize){try{fit.fit()}catch(e){}}sendResize()},250);
 }
 window.addEventListener('resize',onViewportResize);
 (function connect(){
@@ -15664,6 +15746,10 @@ window.addEventListener('resize',onViewportResize);
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  // Guard against a hung CONNECTING state (proxy/network black hole): if the
+  // socket never opens, close it so onclose retries instead of leaving the
+  // user staring at "connecting" forever.
+  var openTimer=setTimeout(function(){try{ws.close()}catch(e){}},10000);
   // Force a resize on every (re)connect: clear the dedup memory first. On
   // reconnect the browser grid is usually unchanged, so without this the
   // dedup in sendResize() would suppress the resize — but a reconnect often
@@ -15671,7 +15757,7 @@ window.addEventListener('resize',onViewportResize);
   // restart). If we never re-send our real grid, the PTY stays 160 while this
   // xterm renders narrower, and Claude's height-relative redraws drift a row
   // (status-line update bleeds into the line below). Always re-assert size.
-  ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
+  ws.onopen=function(){clearTimeout(openTimer);el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
@@ -16149,6 +16235,124 @@ if(!${isTmuxMode && !isPipeMode}){
   _tTerm.addEventListener('touchend',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
   _tTerm.addEventListener('touchcancel',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
 }
+
+// ── Mobile input bar (ported from woof mobile_live_input + #mobile-input-form) ──
+// Two modes drive the SAME ws {type:'input'} channel the shortcut toolbar uses:
+//   • buffer : textarea text is sent wholesale on 发送/Enter (default, safest)
+//   • live   : each keystroke is diff'd to ANSI cursor/backspace/insert sequences
+//              via a grapheme-aware mirror, so Chinese IME and fast typing work.
+// Read-only sessions never show it (no token ⇒ no body.has-token).
+if(isTouch&&hasToken){(function(){
+  document.body.classList.add('has-token');
+  var bar=document.getElementById('mobile-input-bar');
+  var ta=document.getElementById('mobile-input');
+  var modeBtn=document.getElementById('mobile-mode');
+  var sendBtn=document.getElementById('mobile-send');
+  var upBtn=document.getElementById('mobile-up');
+  var downBtn=document.getElementById('mobile-down');
+  var bsBtn=document.getElementById('mobile-bs');
+  var hint=document.getElementById('mobile-live-hint');
+  var LIVE='live',BUFFER='buffer';
+  var mode=BUFFER;
+
+  // ── grapheme-aware edit-sequence mirror (from woof mobile_live_input.js) ──
+  var CL='\\x1b[D',CR='\\x1b[C',BS='\\x7f';
+  function graphs(s){s=String(s||'');
+    if(typeof Intl!=='undefined'&&typeof Intl.Segmenter==='function'){
+      return Array.from(new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(s),function(p){return p.segment});}
+    return Array.from(s);}
+  function editSeq(prev,next){
+    var b=graphs(prev),a=graphs(next),pre=0;
+    while(pre<b.length&&pre<a.length&&b[pre]===a[pre])pre++;
+    var suf=0;
+    while(suf<b.length-pre&&suf<a.length-pre&&b[b.length-1-suf]===a[a.length-1-suf])suf++;
+    var rem=b.length-pre-suf,ins=a.slice(pre,a.length-suf).join('');
+    return CL.repeat(suf)+BS.repeat(rem)+ins+CR.repeat(suf);}
+  var mirror={sent:'',held:'',composing:false};
+  function sendInput(seq){if(!seq||!ws_||ws_.readyState!==1)return false;
+    try{ws_.send(JSON.stringify({type:'input',data:seq}));return true;}catch(e){return false;}}
+  function mirrorUpdate(v){mirror.held=String(v||'');
+    if(mirror.composing)return '';
+    if(mirror.held===mirror.sent)return '';
+    var seq=editSeq(mirror.sent,mirror.held);mirror.sent=mirror.held;return seq;}
+  function mirrorCommit(){var seq=mirrorUpdate(mirror.held);mirror.sent=mirror.held='';return seq;}
+
+  function setMode(m){mode=m;bar.setAttribute('data-mode',m);
+    modeBtn.textContent=m===LIVE?'实时':'缓冲';
+    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入，点击切换为实时');}
+  function resizeTa(){ta.style.height='38px';ta.style.height=Math.min(ta.scrollHeight,120)+'px';}
+  function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
+
+  function sendBuffered(appendEnter){
+    var text=ta.value;
+    var payload=appendEnter?text+'\\n':text;
+    if(!payload)return;
+    sendInput(payload.replace(/\\x1b/g,''));
+    ta.value='';resizeTa();
+    if(mode===LIVE){mirror.sent=mirror.held='';}
+    showKeyboard();}
+  function sendLiveCommit(appendEnter){
+    var seq=mirrorCommit();
+    if(seq)sendInput(seq);
+    if(appendEnter)sendInput('\\r');
+    ta.value='';resizeTa();
+    showKeyboard();}
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
+
+  // shortcut keys row
+  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',enter:'\\r',stab:'\\x1b[Z'};
+  var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
+  for(var i=0;i<keyBtns.length;i++){(function(btn){
+    btn.addEventListener('click',function(){btn.blur();
+      // flush any pending live text first so the key lands after it
+      if(mode===LIVE){var seq=mirrorCommit();if(seq)sendInput(seq);ta.value='';}
+      var act=btn.getAttribute('data-sk');
+      if(act==='paste'){
+        // Read the clipboard and send as terminal input. Async API; fall back
+        // to focusing the textarea so the user can long-press paste.
+        if(navigator.clipboard&&navigator.clipboard.readText){
+          navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
+        }else{showKeyboard();}
+        return;}
+      sendInput(sk[act]);});})(keyBtns[i]);}
+
+  modeBtn.addEventListener('click',function(){modeBtn.blur();
+    // switching away from live flushes pending held text
+    if(mode===LIVE){var seq=mirrorCommit();if(seq)sendInput(seq);ta.value='';}
+    setMode(mode===LIVE?BUFFER:LIVE);
+    if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+    showKeyboard();});
+
+  upBtn.addEventListener('click',function(){upBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x1b[A');});
+  downBtn.addEventListener('click',function(){downBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x1b[B');});
+  bsBtn.addEventListener('click',function(){bsBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x7f');});
+  bar.addEventListener('submit',function(e){e.preventDefault();submit();});
+
+  ta.addEventListener('compositionstart',function(){mirror.composing=true;},{capture:true,passive:true});
+  ta.addEventListener('compositionend',function(){mirror.composing=false;
+    if(mode===LIVE)sendInput(mirrorUpdate(ta.value));},{capture:true,passive:true});
+  ta.addEventListener('input',function(){
+    resizeTa();
+    if(mode===LIVE&&!mirror.composing)sendInput(mirrorUpdate(ta.value));});
+  ta.addEventListener('keydown',function(e){
+    // live mode intercepts nav keys so they go to the terminal, not the textarea
+    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown'].indexOf(e.key)>=0){
+      e.preventDefault();
+      var s=mirrorCommit();if(s)sendInput(s);ta.value='';
+      sendInput({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B'}[e.key]);return;}
+    if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
+
+  setMode(BUFFER);resizeTa();
+  // tapping the terminal area surfaces the keyboard (mirrors woof's focus hint)
+  document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});
+  // keep the bar above the software keyboard using visualViewport when available
+  if(window.visualViewport){
+    var vkT=0;
+    window.visualViewport.addEventListener('resize',function(){clearTimeout(vkT);vkT=setTimeout(function(){
+      var vv=window.visualViewport;var inset=Math.max(0,window.innerHeight-vv.height-vv.offsetTop);
+      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');},120);});
+  }
+})();}
 </script>
 </body>
 </html>`;

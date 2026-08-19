@@ -547,4 +547,45 @@ describe('projectV3Progress', () => {
     });
     expect(view.updatedAt).toBe(CREATED_AT);
   });
+
+  it('surfaces the latest nodeSessionReady terminal for the card deep-link', () => {
+    const events = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' }),
+      at(3, {
+        type: 'nodeSessionReady',
+        nodeId: 'research',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-aaa', webPort: 8765 },
+      }),
+      at(4, {
+        type: 'nodeSessionReady',
+        nodeId: 'publish',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-bbb' },
+      }),
+    ];
+    const view = projectV3Progress({ envelope: envelope(), dag: dag(), events });
+    // Last nodeSessionReady wins; webPort carried through when present.
+    expect(view.terminal).toEqual({ sessionId: 'sess-bbb' });
+  });
+
+  it('omits terminal when no nodeSessionReady event fired', () => {
+    const view = projectV3Progress({ envelope: envelope(), dag: dag(), events: [] });
+    expect(view.terminal).toBeUndefined();
+  });
+
+  it('ignores nodeSessionReady for private inner-loop nodes', () => {
+    const events = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, {
+        type: 'nodeSessionReady',
+        nodeId: 'loop-body#001',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-secret', webPort: 9999 },
+      }),
+    ];
+    const view = projectV3Progress({ envelope: envelope(), dag: dag(), events });
+    expect(view.terminal).toBeUndefined();
+  });
 });
