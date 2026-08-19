@@ -26692,33 +26692,27 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   }
 }
 
-/* ── Schedule create/edit form modal ─────────────────────────────────────── */
-.schedule-form-overlay {
-  position: fixed;
-  inset: 0;
-  background: color-mix(in srgb, var(--bg) 72%, transparent);
-  backdrop-filter: blur(3px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-  padding: 24px;
-}
-
+/* ── Schedule create/edit form modal（原生 <dialog>） ────────────────────── */
 .schedule-form-dialog {
   background: var(--surface);
   border: 1px solid var(--border-soft);
-  border-radius: 12px;
-  box-shadow: 0 16px 48px color-mix(in srgb, #000 28%, transparent);
-  width: min(560px, 100%);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--sh-lg);
+  width: min(560px, calc(100vw - 32px));
   max-height: 90dvh;
   overflow-y: auto;
   padding: 24px;
+  color: var(--text);
+}
+
+.schedule-form-dialog::backdrop {
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  backdrop-filter: blur(3px);
 }
 
 .schedule-form-dialog h2 {
   margin: 0 0 16px;
-  font-size: 18px;
+  font-size: var(--fs-17);
 }
 
 .schedule-form {
@@ -26744,7 +26738,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border-soft);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
   font-size: 13px;
@@ -26819,6 +26813,88 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   margin: 0;
 }
 
+/* 必填星号 */
+.schedule-form-label .req {
+  color: var(--danger);
+  font-style: normal;
+  font-weight: 700;
+}
+
+/* 内联校验错误 / 下次执行预览 */
+.schedule-form-error-inline {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.schedule-form-preview {
+  font-size: 11px;
+  color: var(--success, var(--st-ok));
+}
+
+/* 快捷模板 chips */
+.schedule-templates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.schedule-template-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color var(--t-fast), color var(--t-fast), background var(--t-fast);
+}
+
+.schedule-template-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.schedule-template-chip.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 手动输入 / 返回选择 链接 */
+.schedule-form-link {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* select 与输入框同宽同风格 */
+.schedule-form-field select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+/* aria-invalid 红框 */
+.schedule-form-field input[aria-invalid="true"],
+.schedule-form-field select[aria-invalid="true"],
+.schedule-form-field textarea[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
 .schedule-form-actions {
   display: flex;
   justify-content: flex-end;
@@ -26829,7 +26905,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .schedule-form-cancel,
 .schedule-form-submit {
   padding: 8px 16px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: 13px;
   cursor: pointer;
   border: 1px solid var(--border-soft);
