@@ -9440,6 +9440,18 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // Restore the daemon-owned display mode BEFORE any card handling: a
+        // fresh worker always boots with displayMode='hidden', and every early
+        // break below (managed / replyAlreadySent / streamingCardDisabled /
+        // CARD_POSTING_SENTINEL) used to skip the re-sync entirely. The
+        // sentinel break is not even rare: a headless backend (mojo) reaches
+        // prompt-ready synchronously on spawn, so screen_update reliably wins
+        // the card-POST race and `ready` breaks at the sentinel — the worker
+        // then never starts its screenshot loop while the daemon keeps
+        // rendering "waiting for first screenshot" forever. Sending before the
+        // card exists is safe: screenshot_uploaded stores currentImageKey
+        // unconditionally and only gates the card PATCH on streamCardId.
+        syncWorkerDisplayMode(ds);
         // Treat `ready` as a full state boundary for the usage refresh: clear
         // any timer inherited from a PRIOR worker generation up front, so the
         // managed/replyAlreadySent/disabled/recovery/sentinel early-breaks below
@@ -9527,7 +9539,6 @@ function setupWorkerHandlers(
         // (if any) is left untouched. The next real user turn clears this flag
         // (rememberLastCliInput) and the normal card flow resumes.
         if (ds.suppressRecoveryCard) {
-          syncWorkerDisplayMode(ds);
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
@@ -9588,8 +9599,6 @@ function setupWorkerHandlers(
               scheduleCodexServiceTierPatch(ds);
             }
             persistStreamCardState(ds);
-            // Re-sync worker's display mode (it starts fresh in 'hidden')
-            syncWorkerDisplayMode(ds);
             // The restored card is now the active one — withdraw any cards
             // frozen before the daemon went down so they don't pile up in the
             // thread on each restart.
@@ -9673,8 +9682,6 @@ function setupWorkerHandlers(
           }
           ds.parkedStreamCardNonce = undefined;
           persistStreamCardState(ds);
-          // Re-sync worker's display mode (it starts fresh in 'hidden')
-          syncWorkerDisplayMode(ds);
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
