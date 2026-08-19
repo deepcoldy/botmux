@@ -175,6 +175,7 @@ import { maybeCreateDefaultWorktree, AutoWorktreeFailClosedError } from '../src/
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -1313,6 +1314,54 @@ describe('repo select card — worktree open', () => {
     expect(closeSession).not.toHaveBeenCalled();
     expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBe(ds);
     expect(notify).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
+  it('runAutoWorktreeCommit fail-closed does NOT close a session taken over WHILE the refusal notice is in flight', async () => {
+    // P2 review: the refusal cleanup used to run AFTER `await notify()`. The
+    // pendingRepo guard only proved ownership when the notice STARTED — a notifier
+    // adoption can consume pendingRepo while the network notice is in flight and
+    // start its own live session on this same ds. The post-await cleanup then
+    // deleted the freshly-adopted session from activeSessions and marked its
+    // durable record closed, orphaning the adopted worker (the exact race the
+    // preceding guard exists to prevent). The cleanup must re-check pendingRepo
+    // after the await — the cleanup itself is synchronous, so the recheck makes
+    // refusal+cleanup atomic with respect to the takeover.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const notice = deferred<unknown>();
+    const notify = vi.fn(() => notice.promise);
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(
+      new AutoWorktreeFailClosedError('默认目录不是 git 仓库（或暂时无法确认）'),
+    );
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+
+    // Wait until the refusal notice is IN FLIGHT (ownership held, cleanup not yet run).
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+
+    // Simulate the notifier adoption consuming pendingRepo while the notice is
+    // in flight, then let the notice settle.
+    ds.pendingRepo = false;
+    notice.resolve(undefined);
+    await run;
+
+    // The adopted session is untouched: not closed, still in the map, no closed
+    // patch — the recheck after the await caught the takeover.
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBe(ds);
+    expect(publishClosedSessionPatch).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.worktreeCreating).toBe(false);

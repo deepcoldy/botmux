@@ -55,7 +55,16 @@ function makeRepo(name: string): string {
 async function loadWithBot(
   dir: string,
   autoWorktree: boolean,
-  agent: { cliId?: string; backendType?: string; sandbox?: boolean; readIsolation?: boolean } = {},
+  agent: {
+    cliId?: string;
+    backendType?: string;
+    sandbox?: boolean;
+    readIsolation?: boolean;
+    apiOnly?: boolean;
+    wrapperCli?: string;
+    env?: Record<string, string>;
+    mojo?: Record<string, unknown>;
+  } = {},
 ) {
   writeFileSync(configPath, JSON.stringify([{
     larkAppId: 'app_wt',
@@ -66,6 +75,10 @@ async function loadWithBot(
     ...(autoWorktree ? { defaultWorkingDirAutoWorktree: true } : {}),
     ...(agent.sandbox ? { sandbox: true } : {}),
     ...(agent.readIsolation ? { readIsolation: true } : {}),
+    ...(agent.apiOnly ? { apiOnly: true } : {}),
+    ...(agent.wrapperCli ? { wrapperCli: agent.wrapperCli } : {}),
+    ...(agent.env ? { env: agent.env } : {}),
+    ...(agent.mojo ? { mojo: agent.mojo } : {}),
   }], null, 2), 'utf-8');
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
@@ -260,6 +273,137 @@ describe('maybeCreateDefaultWorktree', () => {
     } finally {
       delete process.env.BOTMUX_SANDBOX;
     }
+  });
+
+  it('fail-closed does NOT apply to a PROVABLY REMOTE mojo session (cloud on) — sandbox on still DEGRADES', async () => {
+    // Regression (maintainer review): the fail-closed predicate only exempted
+    // backend==='riff' and bricked a mojo {cloud:true} + sandbox bot on a
+    // worktree failure, even though the worker applies NO local sandbox to a
+    // provably-remote mojo session (localSandboxApplies → false). The gate now
+    // reuses the worker's shared localSandboxRequested predicate.
+    const plain = join(tempRoot, 'not-a-repo-mojo-remote');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, {
+      cliId: 'mojo', backendType: 'mojo', sandbox: true, mojo: { cloud: true },
+    });
+    const notices: string[] = [];
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    });
+
+    expect(r.dir).toBe(plain); // degraded — the remote mojo session still starts
+    expect(notices.some(n => n.includes('回退'))).toBe(true); // fallback notice posted
+    expect(notices.some(n => n.includes('沙盒已开启'))).toBe(false); // no fail-closed refusal
+  });
+
+  it('fail-closed does NOT apply to remote mojo even with BOTMUX_SANDBOX=1 (exemption wraps the whole union)', async () => {
+    const plain = join(tempRoot, 'not-a-repo-mojo-remote-env');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, {
+      cliId: 'mojo', backendType: 'mojo', mojo: { cloud: true },
+    });
+    process.env.BOTMUX_SANDBOX = '1';
+    try {
+      const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+        isBotDefaultDir: true, locale: 'zh',
+      });
+      expect(r.dir).toBe(plain); // degraded — remote mojo session still starts
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+  });
+
+  it('fail-closed DOES apply to a LOCAL mojo session (cloud off) — the name alone must not exempt', async () => {
+    // mojo is NOT unconditionally remote: without cloud:true the agent's tools
+    // run on the bot host, so the local sandbox (and the fail-closed gate) must
+    // stay engaged.
+    const plain = join(tempRoot, 'not-a-repo-mojo-local');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, {
+      cliId: 'mojo', backendType: 'mojo', sandbox: true, mojo: {}, // no cloud → local execution
+    });
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh',
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('fail-closed DOES apply to mojo cloud when a top-level wrapperCli voids the remote proof', async () => {
+    // The remote proof needs the SAME effective config the worker builds: a
+    // top-level wrapperCli runs before the binary and can rewrite the env the
+    // decision depends on, so it voids the cloud proof. A narrower snapshot
+    // (mojo block only) would have missed this and skipped the local sandbox.
+    const plain = join(tempRoot, 'not-a-repo-mojo-wrapper');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, {
+      cliId: 'mojo', backendType: 'mojo', sandbox: true, wrapperCli: 'env AGENT_LOCAL_DAEMON=1 mojo',
+      mojo: { cloud: true },
+    });
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh',
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('fail-closed DOES apply to mojo cloud when the merged env voids the remote proof', async () => {
+    // Same proof rule via the merged top-level/mojo env: any env key besides the
+    // canonical JWT name can redirect execution (PATH / loader hooks), so it
+    // voids the cloud proof and the local sandbox stays engaged.
+    const plain = join(tempRoot, 'not-a-repo-mojo-env');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, {
+      cliId: 'mojo', backendType: 'mojo', sandbox: true,
+      mojo: { cloud: true, env: { MOJO_PROOF_TEST_VAR: 'x' } },
+    });
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh',
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('fail-closed: apiOnly bot with NO explicit sandbox flag REFUSES (forkWorker forces readIsolation on no-transport sessions)', async () => {
+    // P1 review: an apiOnly (core-only) bot has no Lark transport, so forkWorker
+    // forces readIsolation=true for it (worker-pool.ts) — the local sandbox IS
+    // engaged even with no sandbox flag. The fail-closed gate must track that
+    // forced isolation, or a worktree failure would fall back to the real
+    // default dir and launch the forced sandbox there (the exact escape this
+    // change prevents).
+    const plain = join(tempRoot, 'not-a-repo-apionly');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, { apiOnly: true }); // no sandbox flag
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh',
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('fail-closed: HTTP virtual chat with NO explicit sandbox flag REFUSES (no-transport forced isolation)', async () => {
+    // Same forced-isolation rule for a synthetic HTTP virtual chat (webhook /
+    // trigger session): forkWorker forces readIsolation on it too.
+    const plain = join(tempRoot, 'not-a-repo-httpvirtual');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true); // no sandbox flag
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', chatId: 'http_async_abc123',
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('fail-closed does NOT apply to apiOnly + riff (the remote exemption wraps the no-transport arm too)', async () => {
+    // A no-transport session on a REMOTE backend still has no local CLI process,
+    // so the remote exemption must wrap the no-transport arm as well — refusing
+    // here would brick a supported config for a local-escape rationale that does
+    // not exist on riff.
+    const plain = join(tempRoot, 'not-a-repo-apionly-riff');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, { cliId: 'riff', apiOnly: true });
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh',
+    });
+
+    expect(r.dir).toBe(plain); // degraded — riff session still starts
   });
 
   it('no-ops (no notice, dir unchanged) when the dir did not come from the bot default', async () => {

@@ -874,6 +874,7 @@ export async function runAutoWorktreeCommit(deps: {
     const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
       isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
+      chatId: ds.chatId,
     });
     // The pendingRepo placeholder can legitimately be consumed WHILE this
     // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
@@ -926,6 +927,18 @@ export async function runAutoWorktreeCommit(deps: {
       try {
         await notify(t('worktree.auto_fail_closed', { dir: baseDir, error: e.reason }, localeForBot(larkAppId)));
       } catch { /* notices are best-effort — never mask the refusal */ }
+      // Re-check AFTER the await: the pendingRepo guard above only proves we
+      // owned the session when the notice STARTED. A notifier adoption (etc.)
+      // can consume pendingRepo WHILE the network notice is in flight and start
+      // its own live session on this same ds. The cleanup below is synchronous,
+      // so this recheck makes refusal+cleanup atomic with respect to that
+      // takeover — otherwise we would delete the freshly-adopted session from
+      // activeSessions and mark its durable record closed, orphaning the
+      // adopted worker (the exact race the preceding guard exists to prevent).
+      if (!ds.pendingRepo) {
+        logger.info(`[${tag(ds)}] auto-worktree fail-closed cleanup skipped — pendingRepo consumed during notice (session taken over): ${e.reason}`);
+        return;
+      }
       ds.pendingRepo = false;
       ds.pendingRepoCommitInFlight = false;
       const key = activeSessionKey(ds);

@@ -15,10 +15,10 @@
  * UNLESS the file sandbox is enabled, in which case the failure is fail-closed
  * (see {@link AutoWorktreeFailClosedError}): falling back to the real default dir
  * would let the agent's writes land in the real project, defeating the isolation
- * the sandbox promises. The riff REMOTE backend is exempt: it has no local CLI
- * process (the agent runs in riff's own remote sandbox), so the local-escape
+ * the sandbox promises. A REMOTE backend is exempt: it has no local CLI process
+ * (the agent runs in the backend's own remote sandbox), so the local-escape
  * rationale does not apply and it keeps degrading — matching the worker's
- * `sandboxRequested = !riffRemoteBackend && …`.
+ * `sandboxRequested` via the shared `localSandboxRequested` predicate.
  *
  * ALL user-facing notices are posted from here via the caller-supplied `notify`
  * callback (best-effort — a failed send never propagates), so the three spawn
@@ -32,6 +32,10 @@
 import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
+import { larkTransportEnabled } from '../core/types.js';
+import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { localSandboxRequested } from '../adapters/backend/sandbox.js';
+import { buildEffectiveMojoConfig, normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import { createRepoWorktree, isGitWorkTree, pushWorktreeBranch } from './git-worktree.js';
 import { worktreeSlugFromContextAI } from './worktree-slug-ai.js';
 import { t } from '../i18n/index.js';
@@ -40,9 +44,10 @@ import { logger } from '../utils/logger.js';
 
 /**
  * Raised when auto-worktree cannot be created AND the file sandbox is enabled
- * on a LOCAL backend. The riff remote backend is exempt (no local CLI process
- * — the agent's writes land in riff's own remote sandbox, never the real local
- * dir), matching the worker's `sandboxRequested = !riffRemoteBackend && …`.
+ * on a LOCAL backend. A remote backend (riff / provably-remote mojo) is exempt
+ * (no local CLI process — the agent's writes land in the backend's own remote
+ * sandbox, never the real local dir), matching the worker's `sandboxRequested`
+ * via the shared `localSandboxRequested` predicate.
  *
  * The file sandbox (bwrap/Seatbelt DIRECT mode) binds `workingDir` read-write
  * to the REAL host directory — the auto-worktree is the only thing keeping a
@@ -72,6 +77,13 @@ export interface MaybeCreateWorktreeCtx {
   locale: Locale;
   /** Best-effort chat notice sink. Omit for silent (e.g. HTTP-virtual sessions). */
   notify?: (message: string) => Promise<unknown> | void;
+  /**
+   * The session's chatId, when known at this point. Used to detect a no-transport
+   * session (apiOnly bot OR HTTP virtual chat), which forkWorker forces
+   * readIsolation on — that forced isolation engages the local sandbox even with
+   * no explicit sandbox flag, so fail-closed must track it here too.
+   */
+  chatId?: string;
 }
 
 /**
@@ -93,10 +105,10 @@ export function botAutoWorktreeEnabled(larkAppId: string): boolean {
  * Given a resolved spawn dir, create a fresh linked worktree off it when the bot
  * opts in AND `isBotDefaultDir` is true. Otherwise returns `baseDir` unchanged.
  * Never throws on a non-git dir / git failure UNLESS the file sandbox is on
- * (local backend only — riff is exempt, see below): with the sandbox enabled,
- * a fallback to the real default dir would let the agent's writes land in the
- * real project (the sandbox binds workingDir read-write to the host), so the
- * spawn is refused instead of degrading.
+ * (local backend only — a remote backend is exempt, see below): with the sandbox
+ * enabled, a fallback to the real default dir would let the agent's writes land
+ * in the real project (the sandbox binds workingDir read-write to the host), so
+ * the spawn is refused instead of degrading.
  */
 export async function maybeCreateDefaultWorktree(
   larkAppId: string,
@@ -112,23 +124,54 @@ export async function maybeCreateDefaultWorktree(
   // auto-worktree is therefore the only barrier between the agent and the real
   // project; a silent fallback to baseDir on failure would be a sandbox escape.
   //
-  // Match the worker's sandboxRequested union EXACTLY (worker.ts):
-  //   sandboxRequested = !riffRemoteBackend && (sandbox || readIsolation || BOTMUX_SANDBOX)
+  // Reuse the worker's EXACT sandbox-request decision via the shared
+  // localSandboxRequested predicate (worker.ts computes sandboxRequested with
+  // the same call), so this gate can never drift from the worker's real sandbox
+  // state again:
+  //   localSandboxApplies(backend, mojoConfig) && (sandbox || readIsolation || noTransport || BOTMUX_SANDBOX)
+  // - The REMOTE exemption wraps the WHOLE union: riff, and a PROVABLY remote
+  //   mojo session (#803), have no local CLI process (the agent runs in the
+  //   backend's own remote sandbox, its writes never touch the real local dir),
+  //   so the escape rationale does not apply and the old graceful fallback must
+  //   keep working there — even when BOTMUX_SANDBOX=1.
+  // - mojo is NOT exempt by name alone: the proof needs the SAME effective
+  //   config the worker builds (buildEffectiveMojoConfig) — cloud on, localDaemon
+  //   off, no top-level wrapperCli, no unprovable merged env. A local mojo
+  //   session stays fail-closed.
   // - `readIsolation` is in the union because the worker still honors it for an
   //   unmigrated BOTS_CONFIG (it's auto-migrated to `sandbox` at daemon startup,
   //   but a read-only config can still carry the legacy flag).
-  // - The riff exemption MUST wrap the WHOLE union: riff has no local CLI process
-  //   (the agent runs in riff's own remote sandbox, its writes never touch the
-  //   real local dir), so the escape rationale does not apply and the old graceful
-  //   fallback must keep working for riff bots — even when BOTMUX_SANDBOX=1.
+  // - `noTransport` mirrors forkWorker's forced readIsolation for a no-transport
+  //   session (apiOnly bot or HTTP virtual chat — worker-pool.ts), which engages
+  //   the local sandbox even with no explicit sandbox flag.
   const failClosed = (() => {
     try {
       const c = getBot(larkAppId).config;
-      const riff = resolvePairedSpawnBackendType(
+      const effectiveBackend = resolvePairedSpawnBackendType(
         c.cliId, undefined, c.backendType, config.daemon.backendType,
-      ) === 'riff';
-      if (riff) return false;
-      return c.sandbox === true || c.readIsolation === true || process.env.BOTMUX_SANDBOX === '1';
+      );
+      // Build the SAME effective mojo config the worker builds (worker.ts →
+      // buildEffectiveMojoConfig): the remote proof needs the merged
+      // top-level/mojo env AND the top-level wrapperCli, not just the mojo
+      // block. A narrower snapshot would re-open the bypass — a top-level
+      // wrapperCli or a PATH in the merged env voids the cloud proof. An
+      // invalid block is treated as "not provably remote" (fail-closed).
+      const mojoValidation = normalizeMojoConfig(c.mojo);
+      const effectiveMojo = effectiveBackend === 'mojo'
+        ? buildEffectiveMojoConfig(mojoValidation.ok ? mojoValidation.value : undefined, {
+            cliPathOverride: c.cliPathOverride,
+            env: c.env ? sanitizePerBotEnv(c.env) : undefined,
+            wrapperCli: c.wrapperCli,
+          })
+        : undefined;
+      return localSandboxRequested({
+        backendType: effectiveBackend,
+        mojoConfig: effectiveMojo,
+        sandbox: c.sandbox === true,
+        readIsolation: c.readIsolation === true,
+        noTransport: !larkTransportEnabled({ chatId: ctx.chatId ?? '', apiOnly: c.apiOnly }),
+        envSandboxEnabled: process.env.BOTMUX_SANDBOX === '1',
+      });
     } catch { return false; }
   })();
   const notify = async (msg: string) => {

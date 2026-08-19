@@ -401,6 +401,53 @@ export function localSandboxApplies(
   return true;
 }
 
+/**
+ * The worker's file-sandbox request decision, as ONE shared pure predicate.
+ *
+ * worker.ts computes `sandboxRequested` with this exact shape; the auto-worktree
+ * fail-closed gate (services/default-worktree.ts) reuses it so the two can never
+ * drift again — the riff exemption once only existed in the worker, which let a
+ * sandboxed riff bot fall back to the real default dir on a worktree failure (a
+ * sandbox escape), and the mojo backend (#803) then repeated the SAME drift for a
+ * provably-remote mojo session.
+ *
+ * Shape:
+ *   localSandboxApplies(backend, mojoConfig) && (sandbox || readIsolation || noTransport || BOTMUX_SANDBOX)
+ *
+ * - The REMOTE exemption (riff / provably-remote mojo) wraps the WHOLE union: a
+ *   remote backend has no local CLI process, so even BOTMUX_SANDBOX=1 must not
+ *   engage a local sandbox there.
+ * - mojo is NOT exempt by name alone: only a PROVABLY remote mojo session is
+ *   (see localSandboxApplies / isMojoFullyRemote — cloud on, localDaemon off,
+ *   no wrapperCli, no unprovable env). A local mojo session stays fail-closed.
+ * - `noTransport` mirrors forkWorker's forced readIsolation for a no-transport
+ *   session (apiOnly bot or HTTP virtual chat — worker-pool.ts), which engages
+ *   the local sandbox even with no explicit sandbox flag. The worker folds that
+ *   forcing into `readIsolation` before this predicate runs, so it omits the arm;
+ *   callers that decide BEFORE the SpawnOpts forcing exists (auto-worktree
+ *   fail-closed) must pass it explicitly.
+ */
+export function localSandboxRequested(input: {
+  backendType: string;
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
+  sandbox?: boolean;
+  readIsolation?: boolean;
+  noTransport?: boolean;
+  envSandboxEnabled?: boolean;
+}): boolean {
+  if (!localSandboxApplies(input.backendType, input.mojoConfig)) return false;
+  return input.sandbox === true
+    || input.readIsolation === true
+    || input.noTransport === true
+    || input.envSandboxEnabled === true;
+}
+
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
