@@ -1875,7 +1875,17 @@ export class MojoBackend implements SessionBackend {
             }
             let stderr = '';
 
-            child.stdout.on('data', (chunk: Buffer) => this.consume(chunk.toString()));
+            child.stdout.on('data', (chunk: Buffer) => {
+                // Fence on child identity for the SAME reason finalize() does:
+                // this client is not awaited (settleTurn resolves the turn), so
+                // its pipe can still deliver bytes hours later — after a LATER
+                // turn has taken over the shared stream/turn state. Without
+                // this, a late line from the OLD client was consumed as the
+                // CURRENT turn's output (reproduced: stale text delivered as
+                // the next turn's answer, real answer dropped).
+                if (this.child !== child) return;
+                this.consume(chunk.toString());
+            });
             child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
 
             child.on('error', (err: Error) => {
@@ -1905,12 +1915,15 @@ export class MojoBackend implements SessionBackend {
                 finalized = true;
                 // Guarded: a LATER turn may already own this.child by the time
                 // this long-lived client finally ends.
-                if (this.child === child) this.child = null;
+                const wasCurrent = this.child === child;
+                if (wasCurrent) this.child = null;
                 // Turn already accounted for via its result event — this late
                 // process end is bookkeeping only. Touching stream/turn state
                 // here would corrupt whichever turn is CURRENTLY in flight.
                 if (resolved) return;
-                this.flushTail();
+                // Same child fence as the stdout handler: never flush an OLD
+                // client's tail into whichever turn currently owns the stream.
+                if (wasCurrent) this.flushTail();
                 // The pre-exec shim's handshake: enrolment into the prepared cgroup
                 // failed, so it exited WITHOUT exec'ing mojo (nothing credentialed
                 // ran). Gated on `usedEnrolShim` so a genuine mojo exit 97 (on a
