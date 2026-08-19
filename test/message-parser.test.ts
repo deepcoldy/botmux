@@ -755,6 +755,7 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
         tag: 'markdown',
         content: '[footer spec](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
       },
+      expected: 'footer spec',
     },
     {
       name: 'wrong marker URL',
@@ -763,8 +764,19 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
         tag: 'markdown',
         content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)',
       },
+      expected: 'reply-card-footer-v1-guide',
     },
-  ])('drops a schema 2.0 footer-id element even with $name', ({ footer }) => {
+    {
+      name: 'unexpected text_size',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        text_size: 'normal_v2',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'reply-card-footer-v1',
+    },
+  ])('keeps a schema 2.0 element-id collision with $name', ({ footer, expected }) => {
     const card = {
       schema: '2.0',
       body: { elements: [
@@ -775,27 +787,7 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
 
     const result = parseApiMessage(makeMsg('interactive', card));
     expect(result.content).toContain('正文内容');
-    expect(result.content).not.toContain('footer spec');
-    expect(result.content).not.toContain('reply-card-footer-v1-guide');
-  });
-
-  it('keeps a schema 2.0 element-id collision with unexpected text_size', () => {
-    const card = {
-      schema: '2.0',
-      body: { elements: [
-        { tag: 'markdown', content: '正文内容' },
-        {
-          element_id: 'botmux_reply_footer',
-          tag: 'markdown',
-          text_size: 'normal_v2',
-          content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-        },
-      ] },
-    };
-
-    const result = parseApiMessage(makeMsg('interactive', card));
-    expect(result.content).toContain('正文内容');
-    expect(result.content).toContain('reply-card-footer-v1');
+    expect(result.content).toContain(expected);
   });
 
   it('drops a footer carrying the complete Botmux structural signature', () => {
@@ -816,21 +808,16 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
     expect(result.content).not.toContain('发送给');
   });
 
-  it('drops a small markdown element that occupies the public footer id even without the visible marker', () => {
+  it('keeps third-party body content that only collides with the public element id', () => {
     const card = {
-      body: { elements: [
-        { tag: 'markdown', content: '正文内容' },
-        {
-          tag: 'markdown',
-          element_id: 'botmux_reply_footer',
-          text_size: 'notation_small_v2',
-          content: "<font color='grey'>发送给：<at id=ou_owner></at></font>",
-        },
-      ] },
+      body: { elements: [{
+        tag: 'markdown',
+        element_id: 'botmux_reply_footer',
+        content: '这是第三方卡片正文',
+      }] },
     };
     const result = parseApiMessage(makeMsg('interactive', card));
-    expect(result.content).toContain('正文内容');
-    expect(result.content).not.toContain('发送给');
+    expect(result.content).toContain('这是第三方卡片正文');
   });
 
   it('drops a custom-brand grey footer carrying the stable separator marker', () => {
