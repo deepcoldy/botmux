@@ -59,6 +59,19 @@ function pnpmGlobalDir(
     cwd: homedir(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
+    // .cmd shims are not directly executable: without cmd.exe the Windows
+    // install path fails with ENOENT/EINVAL. Mirror the update execution
+    // strategy (installLatestBotmuxSync / runGlobalInstall). Args are fixed
+    // literals, so the shell cannot reinterpret anything.
+    shell: platform === 'win32',
+    // This probe runs on request-serving paths (dashboard settings, update
+    // status, scheduled maintenance) with no plan cache before the first
+    // successful update, so a hung pnpm or wedged disk must never freeze the
+    // event loop. Any timeout/error keeps callers on the fail-closed path
+    // (status !== 0 -> undefined). SIGKILL cannot be trapped by the child.
+    timeout: 5_000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 256 * 1024,
   });
   if (result.status !== 0 || typeof result.stdout !== 'string') return undefined;
   let globalRoot: string | undefined;
