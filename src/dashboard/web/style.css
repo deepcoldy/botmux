@@ -23070,6 +23070,15 @@ dialog select[multiple]:hover:not(:disabled) {
   outline-offset: -4px;
 }
 
+/* 保存成功状态 1.5s 后淡出（StatusSpan 以文案为 key 重挂载以重启动画） */
+.bot-defaults-page .oncall-status.hint-ok {
+  animation: bd-status-fade 0.3s ease 1.5s forwards;
+}
+
+@keyframes bd-status-fade {
+  to { opacity: 0; transform: translateY(-2px); }
+}
+
 .bot-defaults-page .bd-tab-hint {
   flex: none;
   color: var(--faint);
