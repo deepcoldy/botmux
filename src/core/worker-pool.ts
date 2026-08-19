@@ -1406,7 +1406,18 @@ export function sessionMojoConfig(
     // notice; the next turn with a reply context delivers it once.
     if (ds.session.mojoLegacyPinNoticePending === undefined) {
       ds.session.mojoLegacyPinNoticePending = true;
-      sessionStore.updateSession(ds.session);
+      // Best-effort persistence: sessionMojoConfig sits on paths that MUST
+      // survive an unwritable store (the workerless orphan-cancel chain is
+      // explicitly tested for it). A failed save only costs notice dedupe
+      // across a restart — the in-memory flag still delivers this run.
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] could not persist the mojo legacy-pin notice flag `
+          + `(will still deliver this run): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
   // Quarantine is bound to a specific ID, not to the session.
