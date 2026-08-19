@@ -91,6 +91,39 @@ function waitForReady(child: ChildProcess, logs: string[]): Promise<Extract<Work
   });
 }
 
+function installSlowDashboardSecretReadHook(root: string, delayMs: number): string {
+  const hookPath = join(root, 'slow-dashboard-secret-read.cjs');
+  writeFileSync(hookPath, `
+const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
+const dashboardSecretFds = new Set();
+const originalOpenSync = fs.openSync;
+const originalReadFileSync = fs.readFileSync;
+const originalCloseSync = fs.closeSync;
+
+fs.openSync = function openSync(path, ...args) {
+  const fd = originalOpenSync.call(this, path, ...args);
+  if (typeof path === 'string' && /[\\/]\.dashboard-secret$/.test(path)) {
+    dashboardSecretFds.add(fd);
+  }
+  return fd;
+};
+fs.readFileSync = function readFileSync(path, ...args) {
+  if (typeof path === 'number' && dashboardSecretFds.has(path)) {
+    const deadline = Date.now() + ${delayMs};
+    while (Date.now() < deadline) {}
+  }
+  return originalReadFileSync.call(this, path, ...args);
+};
+fs.closeSync = function closeSync(fd) {
+  dashboardSecretFds.delete(fd);
+  return originalCloseSync.call(this, fd);
+};
+syncBuiltinESMExports();
+`, { mode: 0o600 });
+  return hookPath;
+}
+
 function rawWsHandshake(port: number, path: string, headers: Record<string, string> = {}): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     const extra = Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('');
@@ -600,9 +633,8 @@ setInterval(() => {}, 1_000);
   // 过期的窥屏通道，中央前门再怎么撤销也够不着它。
   //
   // 这条缝的宽度就等于那次同步文件读：本地 SSD 上 ~0.1ms，$HOME 挂在慢盘/NFS 上就是
-  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。测试把 secret 文件用空白撑大来
-  // 复现慢 HOME 的时序：loadDashboardSecret 读完就 trim，secret 值一个字节没变，生产
-  // 代码一行没动，只是把这条本来就存在的缝拉宽到可稳定观测。
+  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。测试在子进程内只对
+  // `.dashboard-secret` 读注入等价延迟，保持凭证本身符合宿主安全原语的大小限制。
   it('P1-3: a view capability that dies inside the WS handshake is refused at the connection re-check', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-ws-handshake-race-'));
     tempDirs.add(root);
@@ -611,11 +643,8 @@ setInterval(() => {}, 1_000);
     const secret = 'integration-ws-handshake-race-secret';
     const botmuxDir = join(root, '.botmux');
     mkdirSync(botmuxDir, { recursive: true });
-    writeFileSync(
-      join(botmuxDir, '.dashboard-secret'),
-      `${secret}${' '.repeat(32 * 1024 * 1024)}`,
-      { mode: 0o600 },
-    );
+    writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
+    const slowDashboardSecretReadHook = installSlowDashboardSecretReadHook(root, 40);
 
     // 让 scrollback 非空。socket 一旦被登记，worker 会立刻把这段历史种子推过去，于是
     // 「有没有被登记」在客户端侧是直接可观测的事实，不用去断言 worker 的内部集合。
@@ -635,6 +664,9 @@ setInterval(() => {}, 1_000);
       cwd: resolve('.'),
       env: {
         ...process.env,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${slowDashboardSecretReadHook}`]
+          .filter(Boolean)
+          .join(' '),
         HOME: root,
         SESSION_DATA_DIR: dataDir,
         BOTMUX_SESSION_ID: sessionId,
