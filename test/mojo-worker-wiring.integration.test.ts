@@ -358,7 +358,26 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     // Per-bot env and the mojo-specific env block both land in the child.
     expect(invocation.env.PER_BOT_TOKEN).toBe('per-bot-value');
     expect(invocation.env.MOJO_BLOCK_ONLY).toBe('mojo-block-value');
-    // A bot host must never run mojo's local execution daemon by default.
+    // cloud=true (localDaemon unset) is the fully-remote shape — no host daemon.
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
+  }, 40_000);
+
+  it('defaults to host execution when neither cloud nor localDaemon is set', async () => {
+    // Parity with every other CLI adapter (they all run on the bot host): the
+    // old forced AGENT_LOCAL_DAEMON=0 without --cloud dropped the session into
+    // a cloud sandbox where `botmux` does not exist while the skill catalog
+    // still taught `botmux send` — no host access AND no reply path.
+    const { invocation } = await runWorker({});
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('an explicit localDaemon=false still opts out of host execution', async () => {
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { localDaemon: false } },
+      init: { backendConfig: { localDaemon: false } },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
   }, 40_000);
 

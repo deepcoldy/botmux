@@ -36,7 +36,12 @@ export interface MojoConfig {
     jwtEnv?: string;
     /** `AGENT_BASE_URL`. */
     baseUrl?: string;
-    /** `AGENT_LOCAL_DAEMON=1` — runs tools on the bot host. Off by default. */
+    /**
+     * `AGENT_LOCAL_DAEMON=1` — runs tools on the bot host. Host execution is
+     * the DEFAULT when `cloud` is not enabled (matching every other CLI
+     * adapter); set `cloud: true` for the fully-remote sandbox, or an explicit
+     * `false` here to opt out of host tools without going fully remote.
+     */
     localDaemon?: boolean;
     /** `MOJO_PPE_ENV`. */
     ppeEnv?: string;

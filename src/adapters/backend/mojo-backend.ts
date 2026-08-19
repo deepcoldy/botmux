@@ -2106,14 +2106,26 @@ export class MojoBackend implements SessionBackend {
 
         if (this.config.baseUrl) env.AGENT_BASE_URL = this.config.baseUrl;
         if (this.config.ppeEnv) env.MOJO_PPE_ENV = this.config.ppeEnv;
-        // A bot host must not run a local execution daemon on behalf of chat users.
-        // `=== true`, NOT truthy: this value also drives the sandbox bypass
-        // decision via isMojoFullyRemote(), which compares strictly. A truthy
+        // Execution mode. Host execution is the DEFAULT, matching every other
+        // CLI adapter (claude-code, codex, … all run on the bot host): a mojo
+        // bot with no `mojo` block used to be forced into the cloud sandbox
+        // (AGENT_LOCAL_DAEMON=0 without --cloud), where `botmux` does not exist
+        // while the skill catalog still teaches `botmux send` — the session
+        // could neither see the host nor reply through the current bot.
+        // '0' is written exactly when the config itself asks for it:
+        //   · cloud=true with localDaemon unset — the fully-remote shape that
+        //     isMojoFullyRemote() accepts as proof of remote execution, or
+        //   · an explicit localDaemon=false — operator opt-out of host tools
+        //     (without cloud=true the CLI then falls back to its sandbox).
+        // `=== true` / `=== false`, NOT truthy: this value must stay in strict
+        // lockstep with isMojoFullyRemote(), which compares strictly. A truthy
         // check here made the string "false" mean "local execution ON" while the
         // sandbox check read it as "not local, safe to bypass" — isolation off and
         // host execution on at once. Always written (never inherited), so an
-        // ambient AGENT_LOCAL_DAEMON=1 cannot enable host execution either.
-        env.AGENT_LOCAL_DAEMON = this.config.localDaemon === true ? '1' : '0';
+        // ambient AGENT_LOCAL_DAEMON cannot flip the mode either way.
+        const hostExecution = this.config.localDaemon === true
+            || (this.config.localDaemon === undefined && this.config.cloud !== true);
+        env.AGENT_LOCAL_DAEMON = hostExecution ? '1' : '0';
         // Never let an interactive upgrade prompt pollute the NDJSON stream.
         env.MOJO_NO_UPDATE = '1';
         // Termination authority, not configuration: this value is what makes the
