@@ -8124,51 +8124,49 @@ dialog.onboarding-dialog::backdrop {
 .chrome-body {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
-  align-items: stretch;
-  gap: var(--chrome-x);
-  padding: 16px var(--chrome-x) 24px;
+  /* 侧边栏悬浮成 fixed 卡片后不再占栅格列：主内容区用 .workspace 的
+     margin-left 让出侧栏 + 间隙（见 .workspace），这里只留右/上/下内边距。 */
+  display: block;
+  padding: 16px var(--chrome-x) 24px 0;
   overflow: hidden;
-  transition: grid-template-columns 220ms cubic-bezier(.2, .8, .2, 1);
 }
 
 .workspace {
   min-width: 0;
   min-height: 0;
+  /* chrome-body 改块级流后没有 grid stretch 给高度：显式撑满，main 的
+     flex:1 + overflow-y:auto 才有确定的可滚动高度（移动端在 media query 里
+     改回 flex:1，由 flex 分配高度）。 */
+  height: 100%;
   display: flex;
   flex-direction: column;
   overflow: visible;
+  margin-left: calc(var(--sidebar-w, 248px) + 48px);
 }
 
-/* ── 浮动导航 rail：顶栏贯穿全宽，tab 独立成左侧纵向模块 ───────────────── */
+/* ── 悬浮导航卡片：fixed 贴左侧悬浮，主内容区用 margin-left 让位 ──────────── */
 .sidebar {
-  align-self: start;
-  position: sticky;
-  top: calc(var(--topbar-height) + 16px);
-  height: 100%;
-  /* flex column so 创建按钮常驻顶部、导航区占满剩余高度并在矮屏（异形屏）内部纵向滚动，
-     而不是整块溢出被下面的 overflow:hidden 裁掉且无法滚动。 */
+  position: fixed;
+  top: calc(var(--topbar-h) + 16px);
+  bottom: 16px;
+  left: 16px;
+  z-index: 15;
+  width: var(--sidebar-w, 248px);
+  /* flex column：创建按钮常驻顶部，导航区占满剩余高度并在矮屏内部纵向滚动。 */
   display: flex;
   flex-direction: column;
   margin: 0;
-  padding: 12px;
+  padding: var(--sp-4) var(--sp-3);
   border: 1px solid var(--border);
-  border-radius: var(--radius-xl);
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
-  box-shadow: 0 18px 46px rgba(10, 20, 38, 0.08);
-  overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--sh-md);
+  overflow-y: auto;
   transition:
     padding 180ms ease,
     border-radius 180ms ease,
     background-color 160ms ease,
     box-shadow 160ms ease;
-}
-:root[data-theme="dark"] .sidebar {
-  background: color-mix(in srgb, var(--surface) 96%, var(--bg));
-  backdrop-filter: none;
-  border-color: var(--border);
-  box-shadow: 0 22px 56px rgba(0, 0, 0, 0.28);
 }
 
 .sidebar-create-actions {
@@ -8243,6 +8241,18 @@ button.sidebar-create-btn:focus-visible {
   overflow-y: auto;
   padding-right: 2px;
 }
+.nav-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-4, #b0b6c6);
+  text-transform: uppercase;
+  letter-spacing: .7px;
+  padding: 0 var(--sp-3) var(--sp-2);
+  margin-top: var(--sp-4);
+}
+.nav-group:first-child .nav-group-title {
+  margin-top: 0;
+}
 .sidebar-nav a {
   position: relative;
   display: flex;
@@ -8256,7 +8266,6 @@ button.sidebar-create-btn:focus-visible {
   font-size: 13px;
   font-weight: 600;
   text-decoration: none;
-  overflow: hidden;
   outline: none;
   isolation: isolate;
   transition:
@@ -8328,6 +8337,18 @@ button.sidebar-create-btn:focus-visible {
 }
 .sidebar-nav a.active svg {
   transform: translateX(1px);
+}
+/* active 左侧指示条：::before 已被 hover/active 底色占用，指示条走 ::after。
+   锚点不得 overflow:hidden，否则 left:-3px 的探出部分会被裁掉。 */
+.sidebar-nav a.active::after {
+  content: "";
+  position: absolute;
+  left: -3px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
 }
 .sidebar-nav a:focus,
 .sidebar-nav a:focus-visible {
@@ -13235,6 +13256,14 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
     overflow-x: auto;
     overflow-y: hidden;
   }
+  /* 窄屏恢复横向 rail：组容器退化为 contents（锚点直接参与 flex 排列），
+     组标题隐藏，保持与改造前一致的横向滚动导航条。 */
+  .sidebar-nav .nav-group {
+    display: contents;
+  }
+  .sidebar-nav .nav-group-title {
+    display: none;
+  }
   .sidebar-nav a {
     flex: 0 0 auto;
   }
@@ -13242,6 +13271,7 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
     flex: 1;
     min-height: 0;
     overflow: hidden;
+    margin-left: 0;
   }
   .overview-layout { grid-template-columns: 1fr; }
   .active-sessions-panel { min-height: auto; }
@@ -29592,3 +29622,178 @@ body:has(.workbench-route-host) { min-width: 0; }
 .wb-skin-swatch.is-active .wb-skin-swatch-chip { box-shadow: 0 0 0 2px var(--accent); }
 .wb-skin-swatch-name { color: var(--text-3); font-size: 11px; line-height: 14px; white-space: nowrap; }
 .wb-skin-swatch.is-active .wb-skin-swatch-name { color: var(--text-1); font-weight: 600; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Toast 系统（toast.tsx）
+   全局单例 + 事件发射器，容器 <ToastStack /> 在 app.tsx 挂载一次。
+   ═══════════════════════════════════════════════════════════════════ */
+.toast-stack {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  pointer-events: none;
+  max-width: 100vw;
+}
+.toast-item {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--fg);
+  color: var(--bg);
+  padding: 9px 16px;
+  border-radius: var(--radius-md);
+  font-size: var(--fs-13);
+  font-weight: var(--fw-m);
+  line-height: var(--lh-title);
+  box-shadow: var(--sh-lg);
+  animation: toastIn var(--t-norm);
+  max-width: min(90vw, 480px);
+}
+.toast-item.is-leaving {
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 200ms ease-out, transform 200ms ease-out;
+}
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.toast-message {
+  overflow-wrap: break-word;
+  min-width: 0;
+}
+/* 深色 chip + 浅色文字的语义配色；info/warning 与 success/error 同族语言 */
+.toast-item-success { background: #17352a; color: #7ee2b2; }
+.toast-item-error { background: #3d1d22; color: #f2a0aa; }
+.toast-item-info { background: #152f4d; color: #86bdf2; }
+.toast-item-warning { background: #3d2c12; color: #f0c478; }
+:root[data-theme="dark"] .toast-item-success { background: #123528; }
+:root[data-theme="dark"] .toast-item-error { background: #3a1c22; }
+:root[data-theme="dark"] .toast-item-info { background: #122c49; }
+:root[data-theme="dark"] .toast-item-warning { background: #382910; }
+.toast-action {
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, .15);
+  border: none;
+  color: inherit;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: var(--fw-m);
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--t-fast);
+}
+.toast-action:hover { background: rgba(255, 255, 255, .25); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   ConfirmModal 系统（confirm-modal.tsx）
+   基于原生 <dialog>：::backdrop 充当 mask，dialog 靠 UA margin:auto 居中。
+   ═══════════════════════════════════════════════════════════════════ */
+.confirm-modal-dialog {
+  width: 440px;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 40px);
+  padding: 0;
+  border: 0;
+  background: var(--surface);
+  color: var(--fg);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--modal-shadow);
+  animation: confirmModalIn var(--t-norm);
+  overflow: auto;
+}
+.confirm-modal-dialog::backdrop {
+  background: var(--modal-backdrop);
+}
+@keyframes confirmModalIn {
+  from { opacity: 0; transform: translateY(12px) scale(.98); }
+  to { opacity: 1; transform: none; }
+}
+.confirm-modal-title {
+  margin: 0;
+  padding: var(--sp-5) var(--sp-5) 0;
+  font-size: var(--fs-17);
+  font-weight: var(--fw-s);
+  line-height: var(--lh-title);
+}
+.confirm-modal-message {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-5);
+  color: var(--fg-2);
+  font-size: var(--fs-13);
+  line-height: var(--lh-body);
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+}
+.confirm-modal-input-row {
+  padding: 0 var(--sp-5) var(--sp-4);
+}
+.confirm-modal-input {
+  width: 100%;
+}
+.confirm-modal-footer {
+  padding: 0 var(--sp-5) var(--sp-5);
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+/* 按钮：.btn-primary / .btn-danger / .btn-cancel 作用域收在 footer 内，
+   稳压全局裸 button 规则（0-0-1）与 dialog 内 :where() 规则（0-0-0）。 */
+.confirm-modal-footer .btn-primary,
+.confirm-modal-footer .btn-danger,
+.confirm-modal-footer .btn-cancel {
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.confirm-modal-footer .btn-cancel {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-2);
+}
+.confirm-modal-footer .btn-cancel:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--fg);
+}
+.confirm-modal-footer .btn-primary {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--on-accent);
+}
+.confirm-modal-footer .btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.confirm-modal-footer .btn-danger {
+  background: var(--danger);
+  border: 1px solid var(--danger);
+  color: var(--on-danger);
+}
+.confirm-modal-footer .btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 88%, #000);
+  border-color: color-mix(in srgb, var(--danger) 88%, #000);
+}
+.confirm-modal-footer button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-item,
+  .confirm-modal-dialog { animation: none; }
+  .toast-item.is-leaving { transition: none; }
+}
