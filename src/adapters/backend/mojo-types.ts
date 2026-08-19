@@ -41,6 +41,11 @@ export interface MojoConfig {
      * the DEFAULT when `cloud` is not enabled (matching every other CLI
      * adapter); set `cloud: true` for the fully-remote sandbox, or an explicit
      * `false` here to opt out of host tools without going fully remote.
+     *
+     * Note: `localDaemon: false` alone does NOT restore fully-remote
+     * treatment — isMojoFullyRemote() requires `cloud === true`, so the local
+     * sandbox and device-isolation blockers stay engaged as if the session
+     * ran on this host.
      */
     localDaemon?: boolean;
     /** `MOJO_PPE_ENV`. */

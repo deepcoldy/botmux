@@ -372,6 +372,16 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
   }, 40_000);
 
+  it('an ambient AGENT_LOCAL_DAEMON=0 cannot disable default host execution', async () => {
+    // "Always written, never inherited" is a two-way invariant: the ambient=1
+    // case is covered below with cloud:true; this is the reverse direction.
+    const { invocation } = await runWorker({
+      workerEnv: { AGENT_LOCAL_DAEMON: '0' },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
   it('an explicit localDaemon=false still opts out of host execution', async () => {
     const { invocation } = await runWorker({
       botEntry: { mojo: { localDaemon: false } },

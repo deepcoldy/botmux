@@ -461,7 +461,18 @@ export class MojoBackend implements SessionBackend {
         if (this.extraCliArgs.length > 0) {
             logger.info(`[mojo] extra CLI args applied per turn: ${this.extraCliArgs.join(' ')}`);
         }
-        logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn)`);
+        // Execution-mode audit line (review F4): host execution BY DEFAULT is a
+        // posture change, so make "came from default" vs "came from explicit
+        // config" distinguishable in the log. Mirrors buildEnv()'s derivation —
+        // keep the two in lockstep.
+        const execMode = this.config.cloud === true && this.config.localDaemon !== true
+            ? 'cloud-sandbox (--cloud)'
+            : this.config.localDaemon === true
+                ? 'host (explicit localDaemon)'
+                : this.config.localDaemon === false
+                    ? 'sandbox-fallback (localDaemon=false, cloud off)'
+                    : 'host (default)';
+        logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn, execution=${execMode})`);
     }
 
     /**
