@@ -12462,6 +12462,13 @@ async function spawnCli(
   bareShellCheckInProgress = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
+  // Tier 0 (adapter capability): adapters whose buildArgs can only resume a
+  // PRECISE cliSessionId (cursor/copilot/kimi — no --continue/latest fallback,
+  // which would risk resuming a SIBLING session's conversation) start FRESH
+  // when no id was persisted. Demote here so the user-visible fresh notice
+  // fires — leaving effectiveResume=true would have the adapter silently
+  // launch a blank session while the closed card / resume receipt still claim
+  // history was restored.
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
   // → skip --resume, spawn FRESH.
   // Tier 2 (restart count): 2nd consecutive in-worker restart → force FRESH,
@@ -12508,8 +12515,15 @@ async function spawnCli(
     )
     : undefined;
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
+  // Tier 0: see block comment above. The adapter itself drops --resume when
+  // the id is missing (its buildArgs starts fresh); demoting HERE keeps
+  // effectiveResume honest so the fresh-demotion notice below fires.
+  const missingExactResumeId = effectiveResume
+    && !willReattachPersistent
+    && !effectiveCliSessionId
+    && cliAdapter.resumeRequiresCliSessionId === true;
   let tier1ProbeFalse = false;
-  if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {
+  if (effectiveResume && !tier2ForceFresh && !willReattachPersistent && !missingExactResumeId) {
     const probe = cliAdapter.checkResumeTargetExists?.({
       sessionId: effectiveAdapterSessionId,
       cliSessionId: effectiveCliSessionId,
@@ -12520,11 +12534,13 @@ async function spawnCli(
     if (probe === false) tier1ProbeFalse = true;
   }
   const fallBackToFresh =
-    effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh);
+    effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
-      : 'adapter confirmed resume target does not exist on disk';
+      : missingExactResumeId
+        ? 'no persisted CLI session id — this CLI can only resume a precise session (no --continue fallback)'
+        : 'adapter confirmed resume target does not exist on disk';
     log(`Resume fallback: dropping --resume (${reason}) → fresh session ${cfg.sessionId}`);
     effectiveResume = false;
     effectiveCliSessionId = undefined;

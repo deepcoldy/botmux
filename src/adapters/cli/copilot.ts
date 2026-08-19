@@ -59,6 +59,11 @@ export function createCopilotAdapter(pathOverride?: string): CliAdapter {
       return `copilot --resume ${cliSessionId}`;
     },
 
+    // buildArgs can only resume a precise id (no --continue fallback — it
+    // would resume the globally most recent session, a sibling-context leak).
+    // Tells the worker to demote resume-without-id to a fresh launch + notify.
+    resumeRequiresCliSessionId: true,
+
     async writeInput(pty: PtyHandle, content: string) {
       // Copilot's Ink TUI behaves like Gemini/OpenCode: the TextInput
       // component has an async startup phase; writing during that window can

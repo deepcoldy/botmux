@@ -502,13 +502,19 @@ export function buildSessionClosedCard(
   cliResumeCommand?: string | null,
   locale?: Locale,
   runtimeDisplayName?: string,
+  resumeStartsFresh?: boolean,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
     ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
+    : resumeStartsFresh
+      // The CLI can only resume a precise session id and none was persisted:
+      // resuming reactivates the topic's message route, but the next spawn
+      // starts a FRESH session — say so instead of implying history is back.
+      ? t('card.body.resume_starts_fresh', { cliName: escapeMd(cliName) }, locale)
+      : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +

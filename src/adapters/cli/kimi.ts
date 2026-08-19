@@ -49,6 +49,11 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
       return `kimi --resume ${cliSessionId}`;
     },
 
+    // buildArgs can only resume a precise id (no --continue fallback — it
+    // would resume the globally most recent session, a sibling-context leak).
+    // Tells the worker to demote resume-without-id to a fresh launch + notify.
+    resumeRequiresCliSessionId: true,
+
     async writeInput(pty: PtyHandle, content: string) {
       try {
         if (!kimiFirstWriteSeen.has(pty)) {

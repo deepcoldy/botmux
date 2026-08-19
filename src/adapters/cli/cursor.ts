@@ -61,6 +61,11 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       return `cursor-agent --resume ${cliSessionId}`;
     },
 
+    // buildArgs can only resume a precise id (no --continue fallback — it
+    // would resume the globally most recent chat, a sibling-context leak).
+    // Tells the worker to demote resume-without-id to a fresh launch + notify.
+    resumeRequiresCliSessionId: true,
+
     async writeInput(pty: PtyHandle, content: string) {
       // Emit line-by-line instead of writing the whole message at once.
       // cursor-agent's paste detector folds a multi-line chunk that arrives in

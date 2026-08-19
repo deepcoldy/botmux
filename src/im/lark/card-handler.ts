@@ -89,6 +89,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
+import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -2600,7 +2601,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const result = await resumeSession(targetSessionId, activeSessions);
         if (result.ok) {
           const cliName = sessionCliDisplayName(result.ds);
-          const resumeMsg = t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          // Distinguish "route reactivated" from "CLI history restored": when
+          // the adapter can only resume a precise cliSessionId and none was
+          // persisted, the next spawn starts a FRESH session — say so instead
+          // of claiming history is back.
+          const resumeMsg = resumeStartsFresh(result.ds.session)
+            ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+            : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
           await deliverEphemeralOrReply(result.ds, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
         } else if (result.error === 'not_found') {

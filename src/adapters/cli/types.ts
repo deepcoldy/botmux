@@ -227,6 +227,16 @@ export interface CliAdapter {
     cliSessionId?: string;
   }): string | null;
 
+  /** True when this adapter's `buildArgs` can only resume a PRECISE
+   *  `resumeSessionId` — a resume without one silently starts a FRESH session
+   *  (no `--continue` / "latest" fallback, which would risk loading a SIBLING
+   *  botmux session's conversation). The worker treats resume-without-id as a
+   *  fresh-demotion (drops resume, emits the existing "历史会话无法恢复" notice
+   *  once) so upper layers never describe a fresh launch as "history restored".
+   *  Adapters that can always resume (botmux sessionId IS the CLI session id,
+   *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
+  readonly resumeRequiresCliSessionId?: boolean;
+
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.
    *

@@ -2314,6 +2314,34 @@ describe('resume without cliSessionId — cross-session isolation (cursor / copi
   }
 });
 
+// Regression: the worker / closed card / resume receipt must be able to tell
+// "resume will restore history" from "resume starts a fresh session" apart.
+// Adapters whose buildArgs can only resume a PRECISE cliSessionId (no
+// --continue/latest fallback) declare `resumeRequiresCliSessionId`; the worker
+// demotes resume-without-id to a fresh launch + user notice, and the card
+// copy stops claiming history is back.
+describe('resumeRequiresCliSessionId capability', () => {
+  it('cursor / copilot / kimi declare the capability (resume without an id starts fresh)', () => {
+    expect(createCursorAdapter('/usr/bin/cursor-agent').resumeRequiresCliSessionId).toBe(true);
+    expect(createCopilotAdapter('/usr/bin/copilot').resumeRequiresCliSessionId).toBe(true);
+    expect(createKimiAdapter('/usr/bin/kimi').resumeRequiresCliSessionId).toBe(true);
+  });
+
+  it('adapters whose botmux sessionId IS the CLI session id do not declare it', () => {
+    // claude-code / grok resume `resumeSessionId ?? sessionId` — a precise id
+    // is always available, so no demotion is needed.
+    expect(createClaudeCodeAdapter('/usr/bin/claude').resumeRequiresCliSessionId).toBeUndefined();
+    expect(createGrokAdapter('/usr/bin/grok').resumeRequiresCliSessionId).toBeUndefined();
+  });
+
+  it('adapters that ignore resume entirely do not declare it', () => {
+    // gemini always starts fresh regardless — but its resume story is "no
+    // resume at all", not "resume requires an id"; keep it out of the demotion
+    // path so its existing card copy is unchanged.
+    expect(createGeminiAdapter('/usr/bin/gemini').resumeRequiresCliSessionId).toBeUndefined();
+  });
+});
+
 describe('kiro-cli buildArgs', () => {
   const adapter = createKiroCliAdapter('/usr/bin/kiro-cli');
 
