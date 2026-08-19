@@ -1852,7 +1852,19 @@ export class MojoBackend implements SessionBackend {
                 }
                 reject(err);
             });
-            child.on('close', (code: number | null) => {
+            // 'close' alone is NOT a reliable end-of-turn signal here: in host
+            // execution the CLI auto-spawns the per-workspace mojo-daemon as its
+            // CHILD, which inherits our stdout/stderr pipes and keeps them open
+            // for its whole lifetime — 'close' then never fires even though the
+            // client exited minutes ago, the runTurn promise stays pending, and
+            // every later write queues forever (observed live: turn 2 of a DM
+            // session hung 8+ minutes with the daemon healthy). 'exit' + settled
+            // turn is already conclusive; when the turn is NOT settled yet, give
+            // trailing pipe output a bounded grace and then finalize anyway.
+            let finalized = false;
+            const finalize = (code: number | null): void => {
+                if (finalized) return;
+                finalized = true;
                 this.child = null;
                 this.flushTail();
                 // The pre-exec shim's handshake: enrolment into the prepared cgroup
@@ -1899,6 +1911,20 @@ export class MojoBackend implements SessionBackend {
                     this.settleTurn();
                 }
                 resolve(false);
+            };
+            child.on('close', (code: number | null) => finalize(code));
+            child.on('exit', (code: number | null) => {
+                if (this.turnSettled) {
+                    // The result event already accounted for this turn; nothing
+                    // the withheld pipes could still deliver changes the verdict.
+                    finalize(code);
+                    return;
+                }
+                // Not settled: stderr/stdout may still be in flight through the
+                // pipes (they outlive the process). Bounded grace, then the same
+                // single finalize path — 'close' beats the timer when it does fire.
+                const t = setTimeout(() => finalize(code), 2_000);
+                t.unref?.();
             });
         });
     }

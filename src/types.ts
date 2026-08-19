@@ -583,6 +583,14 @@ export interface Session {
    */
   mojoIdentityHostDefault?: boolean;
   /**
+   * mojo backend only. Queues the user-visible "this session is pinned to the
+   * legacy sandbox behaviour — close and reopen" notice (see the localDaemon
+   * pin in sessionMojoConfig). Same tri-state protocol as
+   * mojoQuarantineNoticePending: `true` = queued, `false` = delivered,
+   * `undefined` = never queued.
+   */
+  mojoLegacyPinNoticePending?: boolean;
+  /**
    * mojo backend only. A remote session id that can no longer be trusted: it was
    * created before `mojoIdentity` existed, so nothing records WHICH control plane
    * holds it.
