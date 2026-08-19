@@ -675,14 +675,16 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-nonce","war
 describe('pipe-holding grandchild (auto-spawned execution daemon)', () => {
   it('does not wedge the next turn when a grandchild keeps stdio open', async () => {
     // Host execution auto-spawns the per-workspace mojo-daemon as the CLIENT's
-    // child; it inherits our stdout/stderr pipes, so the client's 'close' event
-    // never fires while the daemon lives. runTurn used to resolve only on
-    // 'close' — turn 1 settled fine (result event) but its promise stayed
-    // pending and every later write queued forever (observed live). `sleep 60 &`
-    // reproduces the shape: a background child holding the pipes after exit.
-    const bin = fakeMojo(`sleep 60 &
-echo '{"type":"system","subtype":"init","session_id":"sid-pipes"}'
-echo '{"type":"result","status":"ok","result":"turn done","session_id":"sid-pipes","warnings":[]}'`);
+    // child and then BABYSITS it: the client process (and its stdio) can stay
+    // alive for hours after the turn's result event (observed live, twice).
+    // runTurn used to resolve only on process end — turn 1 settled fine
+    // (result event) but its promise stayed pending and every later write
+    // queued forever. `exec sleep 30` reproduces the worst shape: the client
+    // itself NEVER exits within the test window, so neither 'exit' nor
+    // 'close' can save us — only settling on the result event does.
+    const bin = fakeMojo(`echo '{"type":"system","subtype":"init","session_id":"sid-pipes"}'
+echo '{"type":"result","status":"ok","result":"turn done","session_id":"sid-pipes","warnings":[]}'
+exec sleep 30`);
     const backend = new MojoBackend({ bin }, 'sid-pipe-hold');
     let done = 0;
     backend.onTaskDone(() => { done += 1; });

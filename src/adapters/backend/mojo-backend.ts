@@ -258,6 +258,10 @@ export class MojoBackend implements SessionBackend {
      *  only mint a junk workspace dir (and potentially a junk daemon) for a
      *  sentinel session id. */
     private readonly controlPlaneOnly: boolean = false;
+    /** One-shot resolver for the CURRENT runTurn promise, fired by settleTurn.
+     *  The turn is accounted for by its result event, never by the client
+     *  process ending — see runTurn for why the process may outlive the turn. */
+    private turnResolve: (() => void) | null = null;
     /**
      * Latched once a strong boundary proved unusable at runtime — the shim's
      * enrolment write was rejected (exit 97). The prepare-time probe only opens
@@ -1516,6 +1520,11 @@ export class MojoBackend implements SessionBackend {
         if (this.hostExecution() && !this.controlPlaneOnly) {
             await cleanupMojoIsolatedWorkspace(this.sessionId, { home: this.isolationHome() })
                 .catch(() => undefined);
+            // Drop the cached realpath WITH the directory: a later CLI
+            // invocation on this instance (a retried close, a repeat cancel)
+            // must re-create the workspace via resolveCwd instead of spawning
+            // into a deleted cwd (ENOENT).
+            this.isolatedWorkspace = undefined;
         }
         return {
             ok: true,
@@ -1735,6 +1744,21 @@ export class MojoBackend implements SessionBackend {
             this.turnSettled = false;
             this.streamedThisTurn = false;
             this.stdoutTail = '';
+            // The client PROCESS is not the turn. In host execution the CLI
+            // auto-spawns the per-workspace mojo-daemon as its child and then
+            // BABYSITS it — the process (and its stdio) can stay alive for
+            // hours after the turn's result event (observed live, twice). The
+            // turn is accounted for the moment settleTurn() runs; resolve
+            // there, and treat any later process end as bookkeeping only.
+            let resolved = false;
+            const resolveOnce = (busy: boolean): void => {
+                if (resolved) return;
+                resolved = true;
+                if (this.turnResolve === settleHook) this.turnResolve = null;
+                resolve(busy);
+            };
+            const settleHook = (): void => resolveOnce(false);
+            this.turnResolve = settleHook;
 
             // The strong boundary must exist BEFORE the child does, and the child
             // must enter it BEFORE exec (see MOJO_CGROUP_ENROLL_SHIM): post-spawn
@@ -1841,7 +1865,7 @@ export class MojoBackend implements SessionBackend {
             child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
 
             child.on('error', (err: Error) => {
-                this.child = null;
+                if (this.child === child) this.child = null;
                 // Spawn failed: nothing ever ran, so nobody enrolled. Reap the
                 // prepared boundary (a recorded handle, if the record already
                 // happened, owns the directory instead and preparedBoundary is null).
@@ -1865,7 +1889,13 @@ export class MojoBackend implements SessionBackend {
             const finalize = (code: number | null): void => {
                 if (finalized) return;
                 finalized = true;
-                this.child = null;
+                // Guarded: a LATER turn may already own this.child by the time
+                // this long-lived client finally ends.
+                if (this.child === child) this.child = null;
+                // Turn already accounted for via its result event — this late
+                // process end is bookkeeping only. Touching stream/turn state
+                // here would corrupt whichever turn is CURRENTLY in flight.
+                if (resolved) return;
                 this.flushTail();
                 // The pre-exec shim's handshake: enrolment into the prepared cgroup
                 // failed, so it exited WITHOUT exec'ing mojo (nothing credentialed
@@ -1884,20 +1914,20 @@ export class MojoBackend implements SessionBackend {
                     );
                     this.emitLine('❌ mojo 启动失败：无法进入进程围栏（cgroup 入组被拒），本轮未执行，后续改用降级隔离。', 'err');
                     this.settleTurn();
-                    return resolve(false);
+                    return resolveOnce(false);
                 }
                 // exit 2 == unknown model; stderr carries the authoritative list.
                 if (code === 2 && /未知模型|unknown model/i.test(stderr)) {
                     this.emitLine(`❌ 模型名无效。${stderr.trim()}`, 'err');
                     this.settleTurn();
-                    return resolve(false);
+                    return resolveOnce(false);
                 }
                 // Busy race: nothing was streamed and the session is still RUNNING.
-                if (!this.turnSettled && SESSION_BUSY_RE.test(stderr)) return resolve(true);
+                if (!this.turnSettled && SESSION_BUSY_RE.test(stderr)) return resolveOnce(true);
                 // Dead resume lineage → drop it and let the user retry fresh.
                 if (!this.turnSettled && this.maybeDropLineage(stderr)) {
                     this.settleTurn();
-                    return resolve(false);
+                    return resolveOnce(false);
                 }
                 // A `result` event already settled the turn in the normal path
                 // (including the ask-user cancellation, which also exits 1).
@@ -1910,7 +1940,7 @@ export class MojoBackend implements SessionBackend {
                     }
                     this.settleTurn();
                 }
-                resolve(false);
+                resolveOnce(false);
             };
             child.on('close', (code: number | null) => finalize(code));
             child.on('exit', (code: number | null) => {
@@ -2076,6 +2106,13 @@ export class MojoBackend implements SessionBackend {
         if (this.turnSettled) return;
         this.turnSettled = true;
         this.taskDoneCb?.();
+        // Free the runTurn promise (and with it the write chain) NOW: the
+        // client process is deliberately not awaited — with an embedded
+        // execution daemon as its child it can legitimately outlive the turn
+        // by hours, and waiting on it wedged every subsequent turn.
+        const r = this.turnResolve;
+        this.turnResolve = null;
+        r?.();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
