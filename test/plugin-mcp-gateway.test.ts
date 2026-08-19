@@ -209,6 +209,8 @@ describe('plugin MCP Gateway', () => {
           requestUserOpenId: 'ou_forged',
           requestUserUnionId: 'on_forged',
         },
+        botmuxImpersonatedUnionId: 'on_sibling_forged',
+        customTrace: 'keep-me',
       },
     } as any);
     const text = (result.content[0] as any).text;
@@ -217,11 +219,92 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"requestLarkAppId":"cli_trusted"');
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
+    expect(text).toContain('"customTrace":"keep-me"');
     expect(text).not.toContain('ou_forged');
     expect(text).not.toContain('on_forged');
+    expect(text).not.toContain('on_sibling_forged');
 
     await client.close();
     await gateway.close();
+  });
+
+  it('strips caller supplied trusted caller metadata when no host identity exists', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-untrusted' },
+    );
+    const client = new Client({ name: 'gateway-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: 'echo',
+      arguments: {},
+      _meta: {
+        botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_forged',
+          requestUserUnionId: 'on_forged',
+        },
+        botmuxImpersonatedUnionId: 'on_sibling_forged',
+        customTrace: 'keep-me',
+      },
+    } as any);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('"customTrace":"keep-me"');
+    expect(text).not.toContain('botmuxTrustedCaller');
+    expect(text).not.toContain('ou_forged');
+    expect(text).not.toContain('on_forged');
+    expect(text).not.toContain('on_sibling_forged');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('strips caller supplied trusted identity headers before adding host-owned values', () => {
+    const untrustedGateway = new PluginMcpGateway(
+      [],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-untrusted' },
+    );
+    const stripped = (untrustedGateway as any).httpHeaders(
+      {
+        'x-botmux-turn-id': 'om_forged',
+        'x-keep': 'keep-me',
+      },
+      {
+        'x-botmux-trusted-open-id': 'ou_forged',
+        'x-botmux-dispatch-attempt': '9',
+      },
+    ) as Headers;
+    expect(stripped.get('x-botmux-trusted-open-id')).toBeNull();
+    expect(stripped.get('x-botmux-turn-id')).toBeNull();
+    expect(stripped.get('x-botmux-dispatch-attempt')).toBeNull();
+    expect(stripped.get('x-keep')).toBe('keep-me');
+
+    const trustedGateway = new PluginMcpGateway(
+      [],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-trusted' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            requestUserUnionId: 'on_trusted',
+            requestLarkAppId: 'cli_trusted',
+          },
+          turnId: 'om_trusted',
+          dispatchAttempt: 2,
+        }),
+      },
+    );
+    const trusted = (trustedGateway as any).httpHeaders(
+      { 'x-botmux-trusted-union-id': 'on_forged' },
+      { 'x-botmux-trusted-open-id': 'ou_forged' },
+    ) as Headers;
+    expect(trusted.get('x-botmux-trusted-open-id')).toBe('ou_trusted');
+    expect(trusted.get('x-botmux-trusted-union-id')).toBe('on_trusted');
+    expect(trusted.get('x-botmux-trusted-app-id')).toBe('cli_trusted');
+    expect(trusted.get('x-botmux-turn-id')).toBe('om_trusted');
+    expect(trusted.get('x-botmux-dispatch-attempt')).toBe('2');
   });
 
   it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {

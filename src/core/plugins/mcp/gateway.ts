@@ -106,6 +106,13 @@ export interface GatewayTrustedTurnIdentity {
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
 
+const BOTMUX_META_RESERVED_PREFIX = 'botmux';
+const BOTMUX_TRUSTED_HEADER_PREFIX = 'x-botmux-trusted-';
+const BOTMUX_TURN_HEADERS = [
+  'x-botmux-turn-id',
+  'x-botmux-dispatch-attempt',
+] as const;
+
 export interface McpGatewayDiagnostic {
   pluginId: string;
   serverName: string;
@@ -507,11 +514,19 @@ export class PluginMcpGateway {
 
   private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(params: T): T {
     const trusted = this.trustedTurnMeta();
-    if (!trusted) return params;
+    const cleanedMeta = Object.fromEntries(
+      Object.entries(params._meta ?? {})
+        .filter(([key]) => !key.toLowerCase().startsWith(BOTMUX_META_RESERVED_PREFIX)),
+    );
+    if (!trusted) {
+      return Object.keys(cleanedMeta).length > 0
+        ? { ...params, _meta: cleanedMeta }
+        : { ...params, _meta: undefined };
+    }
     return {
       ...params,
       _meta: {
-        ...(params._meta ?? {}),
+        ...cleanedMeta,
         botmuxTrustedCaller: trusted,
       },
     };
@@ -524,6 +539,12 @@ export class PluginMcpGateway {
     const headers = new Headers(staticHeaders);
     if (initHeaders) {
       new Headers(initHeaders).forEach((value, key) => headers.set(key, value));
+    }
+    for (const key of Array.from(headers.keys())) {
+      const lower = key.toLowerCase();
+      if (lower.startsWith(BOTMUX_TRUSTED_HEADER_PREFIX) || (BOTMUX_TURN_HEADERS as readonly string[]).includes(lower)) {
+        headers.delete(key);
+      }
     }
     const trusted = this.trustedTurnMeta();
     if (trusted?.requestUserOpenId) headers.set('x-botmux-trusted-open-id', String(trusted.requestUserOpenId));
