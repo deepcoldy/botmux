@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { PluginMcpGateway } from './gateway.js';
+import { PluginMcpGateway, type GatewayTrustedTurnIdentityProvider } from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
 
 export interface SessionMcpGatewayHost {
@@ -47,6 +47,7 @@ function gatewaySocketDir(sessionId: string, dataDir: string): string {
 export async function startSessionMcpGatewayHost(opts: {
   sessionId: string;
   dataDir: string;
+  trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = gatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -74,6 +75,8 @@ export async function startSessionMcpGatewayHost(opts: {
         ...process.env,
         SESSION_DATA_DIR: opts.dataDir,
         BOTMUX_SESSION_ID: opts.sessionId,
+      }, {
+        trustedTurnIdentity: opts.trustedTurnIdentity,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

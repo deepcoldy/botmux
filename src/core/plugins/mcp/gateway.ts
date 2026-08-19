@@ -49,6 +49,7 @@ import {
 } from './session-runtime.js';
 import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
+import type { TrustedCaller } from '../../../types.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -96,6 +97,14 @@ interface ResourceRoute {
   exposedUri: string;
   template?: UriTemplate;
 }
+
+export interface GatewayTrustedTurnIdentity {
+  caller?: TrustedCaller;
+  turnId?: string;
+  dispatchAttempt?: number;
+}
+
+export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
 
 export interface McpGatewayDiagnostic {
   pluginId: string;
@@ -279,6 +288,7 @@ function allocateName(
 export class PluginMcpGateway {
   readonly server: Server;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -289,8 +299,13 @@ export class PluginMcpGateway {
   private resourceRoutes = new Map<string, ResourceRoute>();
   private resourceTemplateRoutes: ResourceRoute[] = [];
 
-  constructor(pluginIds?: string[], env: NodeJS.ProcessEnv = process.env) {
+  constructor(
+    pluginIds?: string[],
+    env: NodeJS.ProcessEnv = process.env,
+    opts: { trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider } = {},
+  ) {
     this.env = env;
+    this.trustedTurnIdentity = opts.trustedTurnIdentity;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -378,8 +393,13 @@ export class PluginMcpGateway {
           stderr: 'inherit',
         });
       } else {
+        const staticHeaders = descriptor.server.headers;
         transport = new StreamableHTTPClientTransport(new URL(descriptor.server.url), {
-          requestInit: descriptor.server.headers ? { headers: descriptor.server.headers } : undefined,
+          requestInit: staticHeaders ? { headers: staticHeaders } : undefined,
+          fetch: (input, init) => fetch(input, {
+            ...init,
+            headers: this.httpHeaders(init?.headers, staticHeaders),
+          }),
         });
       }
 
@@ -470,6 +490,48 @@ export class PluginMcpGateway {
         },
       }),
     };
+  }
+
+  private trustedTurnMeta(): Record<string, unknown> | undefined {
+    const identity = this.trustedTurnIdentity?.();
+    const caller = identity?.caller;
+    if (!caller && !identity?.turnId) return undefined;
+    return {
+      ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
+      ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
+      ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+      ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    };
+  }
+
+  private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(params: T): T {
+    const trusted = this.trustedTurnMeta();
+    if (!trusted) return params;
+    return {
+      ...params,
+      _meta: {
+        ...(params._meta ?? {}),
+        botmuxTrustedCaller: trusted,
+      },
+    };
+  }
+
+  private httpHeaders(
+    initHeaders: HeadersInit | undefined,
+    staticHeaders: Record<string, string> | undefined,
+  ): Headers {
+    const headers = new Headers(staticHeaders);
+    if (initHeaders) {
+      new Headers(initHeaders).forEach((value, key) => headers.set(key, value));
+    }
+    const trusted = this.trustedTurnMeta();
+    if (trusted?.requestUserOpenId) headers.set('x-botmux-trusted-open-id', String(trusted.requestUserOpenId));
+    if (trusted?.requestUserUnionId) headers.set('x-botmux-trusted-union-id', String(trusted.requestUserUnionId));
+    if (trusted?.requestLarkAppId) headers.set('x-botmux-trusted-app-id', String(trusted.requestLarkAppId));
+    if (trusted?.turnId) headers.set('x-botmux-turn-id', String(trusted.turnId));
+    if (trusted?.dispatchAttempt !== undefined) headers.set('x-botmux-dispatch-attempt', String(trusted.dispatchAttempt));
+    return headers;
   }
 
   private capable(capability: keyof ServerCapabilities): GatewayConnection[] {
@@ -604,7 +666,7 @@ export class PluginMcpGateway {
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
       return route.connection.client.callTool(
-        { ...request.params, name: route.originalName },
+        this.withTrustedTurnMeta({ ...request.params, name: route.originalName }),
         undefined,
         this.requestOptions(request, extra),
       );

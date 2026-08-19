@@ -180,6 +180,50 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('injects host-owned per-turn trusted caller metadata and overrides caller supplied metadata', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-trusted' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            requestUserUnionId: 'on_trusted',
+            requestLarkAppId: 'cli_trusted',
+          },
+          turnId: 'om_turn',
+          dispatchAttempt: 2,
+        }),
+      },
+    );
+    const client = new Client({ name: 'gateway-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: 'echo',
+      arguments: {},
+      _meta: {
+        botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_forged',
+          requestUserUnionId: 'on_forged',
+        },
+      },
+    } as any);
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('"requestUserOpenId":"ou_trusted"');
+    expect(text).toContain('"requestUserUnionId":"on_trusted"');
+    expect(text).toContain('"requestLarkAppId":"cli_trusted"');
+    expect(text).toContain('"turnId":"om_turn"');
+    expect(text).toContain('"dispatchAttempt":2');
+    expect(text).not.toContain('ou_forged');
+    expect(text).not.toContain('on_forged');
+
+    await client.close();
+    await gateway.close();
+  });
+
   it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {
     installFixturePlugin('plugin-a', 'alpha');
     refreshSessionMcpRuntimeManifest({
