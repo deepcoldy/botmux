@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
@@ -143,8 +143,12 @@ describe('resolveGlobalInstallPlan', () => {
 
       const startedAt = Date.now();
       expect(tryResolveGlobalInstallPlan(packageRoot, 'linux')).toBeNull();
-      // The probe must have been killed by its hard timeout, not waited out.
-      expect(Date.now() - startedAt).toBeLessThan(30_000);
+      const elapsed = Date.now() - startedAt;
+      // The probe must have been killed by its 5s hard timeout, not waited
+      // out (sleep 60) and not failed instantly for an unrelated reason
+      // (e.g. ENOENT would return in ~0s and pass the upper bound vacuously).
+      expect(elapsed).toBeGreaterThanOrEqual(4_000);
+      expect(elapsed).toBeLessThan(15_000);
     } finally {
       process.env.PATH = previousPath;
       rmSync(tempRoot, { recursive: true, force: true });
@@ -162,22 +166,25 @@ describe('resolveGlobalInstallPlan', () => {
       const globalRoot = join(customGlobal, 'v11');
       // On win32 the probe spawns `pnpm.cmd` via the shell; a shebang script
       // named pnpm.cmd is executable by sh, so the same spawn path is covered.
-      // The marker proves the probe actually ran (a failed spawn would also
-      // fail closed, but without executing pnpm).
-      const probeMarker = join(tempRoot, 'probe-ran');
+      // The marker records the exact argv the probe passed, proving it ran
+      // AND with the expected arguments (a spawn failure or wrong args would
+      // leave the marker absent and fail closed for the wrong reason).
+      const probeMarker = join(tempRoot, 'probe-argv');
       const fakePnpm = join(tempRoot, 'bin', 'pnpm.cmd');
       mkdirSync(packageRoot, { recursive: true });
       mkdirSync(join(tempRoot, 'bin'), { recursive: true });
       writeFileSync(
         fakePnpm,
-        `#!/bin/sh\ntouch '${probeMarker}'\nprintf '%s\\n' '[{"path":"${globalRoot}"}]'\n`,
+        `#!/bin/sh\nprintf '%s\\n' "$@" > '${probeMarker}'\nprintf '%s\\n' '[{"path":"${globalRoot}"}]'\n`,
       );
       chmodSync(fakePnpm, 0o755);
       process.env.PATH = `${join(tempRoot, 'bin')}:${previousPath ?? ''}`;
 
       // Probe runs but no stable link resolves: must fail closed, not throw.
       expect(tryResolveGlobalInstallPlan(packageRoot, 'win32')).toBeNull();
-      expect(existsSync(probeMarker)).toBe(true);
+      expect(readFileSync(probeMarker, 'utf8').split('\n').filter(Boolean)).toEqual([
+        'list', '-g', '--depth', '0', '--json',
+      ]);
     } finally {
       process.env.PATH = previousPath;
       rmSync(tempRoot, { recursive: true, force: true });
