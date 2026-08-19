@@ -7850,7 +7850,17 @@ function deliverPendingMojoLegacyPinNotice(
     ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
   ).then(() => {
     ds.session.mojoLegacyPinNoticePending = false;
-    sessionStore.updateSession(ds.session);
+    // Best-effort, same as the queueing side (review N2): the notice IS
+    // delivered at this point — a failed persist only risks one duplicate
+    // send after a restart, and must not surface as a delivery failure.
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] mojo legacy-pin notice delivered but the delivered marker could not be `
+        + `persisted (may re-send once after a restart): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }).catch((err) => {
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo legacy-pin notice (will retry): ${err}`);

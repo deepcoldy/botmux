@@ -16,7 +16,7 @@
  * Run:  pnpm vitest run test/mojo-close-admission-fence.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -398,5 +398,40 @@ describe('interpretAbortOutcome fails closed', () => {
       expect(interpretAbortOutcome(raw), `raw=${JSON.stringify(raw)}`)
         .toEqual({ admissionRestored: false, reason: 'abort_result_malformed' });
     }
+  });
+});
+
+describe('isolated-workspace cache across a successful close (review N1)', () => {
+  it('a successful close clears the cache so later CLI calls respawn into a real cwd', async () => {
+    // The cleanup rm's the isolated directory; without invalidating the cached
+    // realpath, a retried close (or any later CLI call on this instance)
+    // spawned into the deleted cwd and died with ENOENT — turning a retryable
+    // close into a permanent failure (observed via the retryable case above).
+    const bin = fakeMojo('mojo-adm-cache', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
+echo '{"type":"system","subtype":"init","session_id":"sid-cache"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-cache","warnings":[]}'`);
+    const backend = new FastProofBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    backend.write('start');
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-cache'));
+    (backend as unknown as { terminateChildProven: () => Promise<TerminationOutcome> })
+      .terminateChildProven = async () => ({
+        ok: true,
+        boundaryProven: true,
+        evidence: 'members-empty',
+        residual: null,
+        signalsStopped: true,
+      });
+    const resolveCwd = (): string =>
+      (backend as unknown as { resolveCwd: () => string }).resolveCwd();
+    const before = resolveCwd();
+    expect(existsSync(before)).toBe(true);
+    await expect(backend.destroySession()).resolves.toMatchObject({ ok: true, taskId: 'sid-cache' });
+    // Cleanup removed the directory…
+    expect(existsSync(before)).toBe(false);
+    // …and the cache with it: the next resolution re-creates a REAL cwd
+    // instead of blindly reusing the deleted path.
+    const after = resolveCwd();
+    expect(existsSync(after)).toBe(true);
   });
 });
