@@ -227,10 +227,11 @@ describe('P2 worker onTaskDone generation fence', () => {
     expect(mark).toBeGreaterThan(fence);
   });
 
-  it('all three async backend ready/exit callbacks in setupBackendHandlers carry the generation fence', () => {
-    // Within setupBackendHandlers the herdr onAgentStatus, the riff onTaskDone,
-    // and the backend onExit all guard on `backend !== observedBackend` so a
-    // superseded generation can neither re-arm prompt-ready nor tear down the
+  it('every async backend ready/exit callback in setupBackendHandlers carries the generation fence', () => {
+    // Within setupBackendHandlers the herdr onAgentStatus, the riff/mojo
+    // onTaskDone, the mojo onTurnFinal and the backend onExit all guard on
+    // `backend !== observedBackend` so a superseded generation can neither
+    // re-arm prompt-ready, post into the current turn, nor tear down the
     // replacement. Anchored on the setupBackendHandlers occurrences (the adopt
     // observe-paths use a different, non-fenced onExit by design).
     const setup = workerSource.indexOf('const observedBackend = backend;');
@@ -240,18 +241,21 @@ describe('P2 worker onTaskDone generation fence', () => {
     );
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(handlersStart).toBeGreaterThan(setup);
-    const region = workerSource.slice(setup, setup + 6000);
+    const region = workerSource.slice(setup, setup + 7500);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
     const taskDone = region.indexOf('backend.onTaskDone?.(()');
+    const turnFinal = region.indexOf('backend.onTurnFinal?.((text)');
     const onExit = region.indexOf('backend.onExit((code, signal)');
     expect(agentStatus, 'onAgentStatus').toBeGreaterThanOrEqual(0);
     expect(taskDone, 'onTaskDone').toBeGreaterThanOrEqual(0);
+    expect(turnFinal, 'onTurnFinal').toBeGreaterThanOrEqual(0);
     expect(onExit, 'onExit').toBeGreaterThanOrEqual(0);
 
     for (const [name, start] of [
       ['onAgentStatus', agentStatus],
       ['onTaskDone', taskDone],
+      ['onTurnFinal', turnFinal],
       ['onExit', onExit],
     ] as const) {
       // 900-char window (matches the sibling onTaskDone test above): the merged

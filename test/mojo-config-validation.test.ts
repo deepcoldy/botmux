@@ -17,6 +17,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  deriveMojoExecutionMode,
   diffMojoSessionIdentity,
   findReservedMojoCliFlags,
   MOJO_CONTROL_ENV_KEYS,
@@ -479,6 +480,50 @@ describe('normalizeMojoLivePatch', () => {
   it('rejects a non-object payload', () => {
     for (const bad of ['x', 5, ['a']]) {
       expect(normalizeMojoLivePatch(bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+});
+
+describe('deriveMojoExecutionMode: single source for env/flag/audit-label (review F2/F3)', () => {
+  // Full truth table. env value and --cloud emission MUST stay in lockstep with
+  // isMojoFullyRemote(): '0' + flag exactly on the fully-remote shape.
+  const cases: Array<{
+    cfg: { cloud?: unknown; localDaemon?: unknown } | undefined;
+    env: '0' | '1'; flag: boolean; labelHas: string;
+  }> = [
+    { cfg: undefined, env: '1', flag: false, labelHas: 'host (default)' },
+    { cfg: {}, env: '1', flag: false, labelHas: 'host (default)' },
+    { cfg: { cloud: true }, env: '0', flag: true, labelHas: 'cloud-sandbox' },
+    { cfg: { localDaemon: true }, env: '1', flag: false, labelHas: 'explicit localDaemon' },
+    // Review F3: explicit localDaemon beats cloud — no contradictory argv.
+    { cfg: { cloud: true, localDaemon: true }, env: '1', flag: false, labelHas: 'cloud flag suppressed' },
+    { cfg: { localDaemon: false }, env: '0', flag: false, labelHas: 'sandbox-fallback' },
+    { cfg: { cloud: true, localDaemon: false }, env: '0', flag: true, labelHas: 'cloud-sandbox' },
+    // Non-boolean survivors from pre-strictBoolean frozen snapshots fail closed
+    // AND get a label that says so (the audit line used to claim 'host (default)').
+    { cfg: { localDaemon: 'false' }, env: '0', flag: false, labelHas: 'invalid localDaemon' },
+    { cfg: { cloud: 'true' }, env: '1', flag: false, labelHas: 'host (default)' },
+  ];
+  for (const c of cases) {
+    it(`cfg=${JSON.stringify(c.cfg)} → env=${c.env} flag=${c.flag}`, () => {
+      const mode = deriveMojoExecutionMode(c.cfg as never);
+      expect(mode.agentLocalDaemon).toBe(c.env);
+      expect(mode.passCloudFlag).toBe(c.flag);
+      expect(mode.label).toContain(c.labelHas);
+    });
+  }
+
+  it("emits '0'+flag exactly on the isMojoFullyRemote shape (env keys aside)", () => {
+    for (const cloud of [true, false, undefined]) {
+      for (const localDaemon of [true, false, undefined]) {
+        const mode = deriveMojoExecutionMode({ cloud, localDaemon });
+        // --cloud goes out iff the config has the fully-remote shape.
+        expect(mode.passCloudFlag).toBe(cloud === true && localDaemon !== true);
+        if (isMojoFullyRemote({ cloud, localDaemon })) {
+          expect(mode.agentLocalDaemon).toBe('0');
+          expect(mode.passCloudFlag).toBe(true);
+        }
+      }
     }
   });
 });

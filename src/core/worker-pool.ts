@@ -34,6 +34,7 @@ import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../ser
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
 import { hasUnprovenContainment } from './mojo-containment.js';
 import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
 import {
@@ -1383,6 +1384,22 @@ export function sessionMojoConfig(
     const value = (frozen as Record<string, unknown>)[key];
     if (value === undefined) delete merged[key];
     else merged[key] = value;
+  }
+  // Upgrade guard (review F1): an identity frozen by a pre-host-default build
+  // recorded "localDaemon unset" while double-unset still MEANT the cloud
+  // sandbox. Resuming it through the new default would silently flip the
+  // session cloud→host — the exact transition the freeze exists to prevent,
+  // and the drift log stays silent because frozen and live are both `{}`.
+  // Pin those rows to the legacy behaviour; a new session adopts the new
+  // default and gets stamped mojoIdentityHostDefault by the freeze helper.
+  if ((frozen as Record<string, unknown>).localDaemon === undefined
+      && ds.session.mojoIdentityHostDefault !== true) {
+    merged.localDaemon = false;
+    logger.warn(
+      `[${tag(ds)}] mojo identity predates the host-execution default; pinning `
+      + 'localDaemon=false (legacy sandbox behaviour) for this session. '
+      + 'Close and reopen the session to adopt the new default.',
+    );
   }
   // Quarantine is bound to a specific ID, not to the session.
   //
@@ -4338,6 +4355,11 @@ async function prepareMojoExplicitClose(
   // repeat-cancel is suppressed with an explicit flag rather than by mutating
   // shared state early.
   logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
+  // Workerless twin of MojoBackend.destroySession()'s reap: the close verdict
+  // above is already decided, so a reaping failure only leaks an idle daemon
+  // (logged inside), never fails the close. Host-mode gating lives inside the
+  // helper via the isolated dir's existence — a cloud session never created one.
+  void cleanupMojoIsolatedWorkspace(session.sessionId).catch(() => undefined);
   // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
   // can carry both (restore parked the old id, the session then created a new one).
   // Reporting a plain success here would hide the parked remote session entirely.

@@ -2354,6 +2354,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         currentBotmuxTurnId = msg.turnId;
         currentBotmuxDispatchAttempt = undefined;
         currentVcMeetingImTurnOrigin = undefined;
+        stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
         publishSandboxRelayCapability();
       });
@@ -4113,6 +4114,90 @@ function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | 
     turnId,
     ...(marker.messageId ? { messageId: marker.messageId } : {}),
   });
+}
+
+// ─── Mojo final-answer bridge ───────────────────────────────────────────────
+// A headless backend has no terminal for the user to fall back on: if the agent
+// answers without calling `botmux send`, the answer exists only inside the
+// worker's synthesised screen (the streaming card) and the thread stays silent.
+// So mojo's per-turn `result` text is bridged into the thread through the SAME
+// gate the transcript-driven CLIs use — no second dedup policy: the sentinel and
+// the "already sent this turn" window rules live in shouldSuppressBridgeEmit.
+//
+// The window's lower bound is this record, stamped immediately before the turn's
+// literal write (see prepareNormalWrite) so a still-running previous turn's send
+// cannot land inside it. There is no upper bound to compute: mojo serialises its
+// turns (one child per turn; queued follow-ups wait for prompt-ready), so at the
+// moment the gate runs no later turn has started and no later send can exist.
+let mojoTurnMark: {
+  turnId?: string;
+  dispatchAttempt?: number;
+  markTimeMs: number;
+} | null = null;
+
+/** Stamp the send window at a mojo turn's literal write. Both write paths call
+ *  it (queued message flush + passthrough slash command), each right where it
+ *  rotates currentBotmuxTurnId — that pairing is what the staleness check in
+ *  deliverMojoTurnFinal relies on. */
+function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number | undefined): void {
+  if (effectiveBackendType !== 'mojo') return;
+  mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
+}
+
+function deliverMojoTurnFinal(text: string): void {
+  if (!text.trim()) return;
+  // A mark from an EARLIER turn must not gate this one: its window opened
+  // before the previous turn's sends, which would suppress this answer for the
+  // wrong reason. Falling back to an unmarked window degrades to "always
+  // deliver" (shouldSuppressBridgeEmit needs markTimeMs to suppress on sends),
+  // which is the safe direction for a bug whose symptom is silence.
+  const mark = mojoTurnMark && mojoTurnMark.turnId === currentBotmuxTurnId ? mojoTurnMark : null;
+  const turnId = mark?.turnId ?? currentBotmuxTurnId;
+  // Without a turn id the daemon cannot resolve a reply target, and lastUuid
+  // would not dedupe a retry. Dropping is right: this can only be output that
+  // belongs to no Lark turn.
+  if (!turnId) {
+    log('Mojo final bridge skipped: no turn id for this answer');
+    return;
+  }
+  const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+  // adoptMode is structurally impossible for mojo (no pane to adopt); passing
+  // the real flag keeps this call identical in shape to the other gate callers.
+  const adoptMode = lastInitConfig?.adoptMode === true;
+  const markers = adoptMode ? [] : readSendMarkers();
+  const gateInput = {
+    markTimeMs: mark?.markTimeMs,
+    isLocal: false,
+    finalText: text,
+  };
+  if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode)) {
+    log(
+      `Mojo final bridge suppressed for turn ${turnId.substring(0, 12)} `
+      + `(${isBridgeNothingToSendFinal(text) ? 'nothing-to-send sentinel' : 'model already called botmux send'})`,
+    );
+    // Same as the structured bridge: an explicit send IS this turn's reply, so
+    // tell observers rather than leaving them waiting on a final that the gate
+    // deliberately swallowed.
+    notifyExplicitReplyObserved(
+      turnId,
+      explicitReplyMarkerForTurnWindow(gateInput, undefined, markers, adoptMode),
+    );
+    return;
+  }
+  // Strip a trailing sentinel line: "prose + sentinel" with no send is the
+  // "did the work, forgot to send" shape — post the prose, never the token.
+  const postContent = bridgePostText(text, adoptMode);
+  if (!postContent.trim()) return;
+  send({
+    type: 'final_output',
+    content: postContent,
+    // Stable per turn: the daemon derives both its dedupe key and the Lark
+    // idempotency uuid from this, so a retry collapses into one message.
+    lastUuid: turnId,
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  });
+  log(`Mojo final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
 }
 
 function submitActivityEvidenceSince(sinceMs: number): SubmitActivityEvidence | undefined {
@@ -10368,6 +10453,12 @@ async function flushPending(): Promise<void> {
           if (bridgeTurnId) {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
+        } else {
+          // Same anchoring rule as the transcript bridges above: stamp the send
+          // window's lower bound at the literal write, not on IPC arrival, so a
+          // previous turn's `botmux send` cannot fall inside this turn's window
+          // and falsely suppress its final. No-op for non-mojo backends.
+          stampMojoTurnMark(item.turnId, item.dispatchAttempt);
         }
         if (durableWrite
           && cliAdapter!.reliableTurnTerminal === true
@@ -14303,6 +14394,19 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
+  });
+  // Headless final-answer bridge (mojo): deliver the turn's answer to the
+  // thread when the agent produced one but never called `botmux send`. Same
+  // generation fence as onTaskDone above — a late callback from a backend the
+  // worker has already replaced must not post into the current turn.
+  backend.onTurnFinal?.((text) => {
+    if (fatalWorkerErrorPending) return;
+    if (backend !== observedBackend) return;
+    try {
+      deliverMojoTurnFinal(text);
+    } catch (err) {
+      log(`Mojo final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
   backend.onTaskId?.((taskId) => {

@@ -88,7 +88,12 @@ import type {
     SpawnOpts,
 } from './types.js';
 import {
+    cleanupMojoIsolatedWorkspace,
+    ensureMojoIsolatedWorkspace,
+} from './mojo-isolated-workspace.js';
+import {
     buildEffectiveChildEnv,
+    deriveMojoExecutionMode,
     findReservedMojoCliFlags,
     mojoRemoteProofFailureReason,
     isMojoRemoteGone,
@@ -183,8 +188,16 @@ export class MojoBackend implements SessionBackend {
     private taskDoneCb: (() => void) | null = null;
     private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
     private taskIdCb: ((taskId: string | null) => void) | null = null;
+    private turnFinalCb: ((text: string) => void) | null = null;
 
     private outputBuffer = '';
+    /**
+     * This turn's assistant answer, accumulated from the SAME text the user
+     * sees on the card (emitText is the single choke point for model prose —
+     * tool-call/warning chrome goes through emitLine and is deliberately left
+     * out). Reset per turn in runTurn(); handed to turnFinalCb at settleTurn().
+     */
+    private turnFinalText = '';
     /** mojo-side session id — the resume lineage. */
     private cliSessionId: string | null = null;
     private child: MojoChild | null = null;
@@ -244,6 +257,10 @@ export class MojoBackend implements SessionBackend {
      * hosts without cgroup v2 delegation — those turns get a weak handle instead.
      */
     private preparedBoundary: PreparedContainmentBoundary | null = null;
+    /** Realpath of this session's isolated workspace (host execution only).
+     *  Populated lazily by resolveCwd(); spawn and close share this exact
+     *  string so the close-side daemon-registry match cannot drift. */
+    private isolatedWorkspace?: string;
     /**
      * Latched once a strong boundary proved unusable at runtime — the shim's
      * enrolment write was rejected (exit 97). The prepare-time probe only opens
@@ -463,15 +480,9 @@ export class MojoBackend implements SessionBackend {
         }
         // Execution-mode audit line (review F4): host execution BY DEFAULT is a
         // posture change, so make "came from default" vs "came from explicit
-        // config" distinguishable in the log. Mirrors buildEnv()'s derivation —
-        // keep the two in lockstep.
-        const execMode = this.config.cloud === true && this.config.localDaemon !== true
-            ? 'cloud-sandbox (--cloud)'
-            : this.config.localDaemon === true
-                ? 'host (explicit localDaemon)'
-                : this.config.localDaemon === false
-                    ? 'sandbox-fallback (localDaemon=false, cloud off)'
-                    : 'host (default)';
+        // config" distinguishable in the log. Same shared derivation as
+        // buildArgs/buildEnv — label and env value cannot drift by construction.
+        const execMode = deriveMojoExecutionMode(this.config).label;
         logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn, execution=${execMode})`);
     }
 
@@ -574,8 +585,30 @@ export class MojoBackend implements SessionBackend {
     }
 
     /** bots.json `mojo.cwd` wins; otherwise the worker's session working dir. */
-    private resolveCwd(): string | undefined {
+    /** The operator-facing working directory (the repo). Kept separate from
+     *  resolveCwd(): host execution runs the CLI in an isolated per-session
+     *  directory instead, and the decorate() preamble points the agent back
+     *  here for repo work. */
+    private realWorkingDir(): string | undefined {
         return this.config.cwd ?? this.spawnOpts?.cwd;
+    }
+
+    /** True when this config executes tools on the bot host (shared derivation
+     *  with buildEnv/buildArgs — see deriveMojoExecutionMode). */
+    private hostExecution(): boolean {
+        return deriveMojoExecutionMode(this.config).agentLocalDaemon === '1';
+    }
+
+    private resolveCwd(): string | undefined {
+        if (!this.hostExecution()) return this.realWorkingDir();
+        // Host execution: run the CLI from a physically distinct per-session
+        // directory. mojo keys its local execution daemon on
+        // hash(process.cwd()) — realpath, so a symlink would collapse back
+        // into the shared daemon (see mojo-isolated-workspace.ts for the
+        // whole P0/P1 story). Cached: spawn and close must use the SAME
+        // realpath string or the close-side registry match silently misses.
+        this.isolatedWorkspace ??= ensureMojoIsolatedWorkspace(this.sessionId);
+        return this.isolatedWorkspace;
     }
 
     write(data: string): boolean {
@@ -644,6 +677,11 @@ export class MojoBackend implements SessionBackend {
     /** Turn boundary — required: an API-backed backend produces no PTY output, so
      *  botmux's idle detector never fires and nothing else re-arms prompt-ready. */
     onTaskDone(cb: () => void): void { this.taskDoneCb = cb; }
+
+    /** This turn's assistant answer, for the worker's final_output bridge. A
+     *  headless mojo session has no terminal the user could read instead, so an
+     *  answer the agent never `botmux send`s would otherwise reach nobody. */
+    onTurnFinal(cb: (text: string) => void): void { this.turnFinalCb = cb; }
 
     /** Lineage id updates — forwarded to the daemon so multi-turn context
      *  survives a daemon restart. */
@@ -1462,6 +1500,15 @@ export class MojoBackend implements SessionBackend {
             }
         }
         this.killed = true;
+        // Reap this session's isolated execution daemon LAST, after the close
+        // verdict is already decided: a reaping failure is a leaked idle daemon
+        // (availability), never grounds to fail or roll back a close whose
+        // remote cancel already happened. kill()/shutdown-detach deliberately
+        // do NOT reap — the session survives a daemon restart and its daemon
+        // must keep serving the resumed lineage.
+        if (this.hostExecution()) {
+            await cleanupMojoIsolatedWorkspace(this.sessionId).catch(() => undefined);
+        }
         return {
             ok: true,
             ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
@@ -1627,25 +1674,26 @@ export class MojoBackend implements SessionBackend {
         // but that is NOT what happens on the cloud-sandbox path: verified without
         // --yolo that `echo … > f && cat f` returned return_code 0 with the file
         // actually written, and that `rm -rf <dir>` likewise succeeded — no
-        // rejection, no warning, no interaction. So on the recommended --cloud
-        // config this flag is belt-and-braces rather than load-bearing; we keep it
-        // for explicitness and in case the local-daemon path (AGENT_LOCAL_DAEMON=1,
-        // untested here) does enforce a confirmation gate.
+        // rejection, no warning, no interaction. So this flag is belt-and-braces
+        // rather than load-bearing; we keep it for explicitness and in case a
+        // future mojo build does enforce a confirmation gate headlessly.
         //
-        // Consequence worth stating plainly: a mojo bot's blast radius is bounded
-        // by --cloud, NOT by per-tool approval. Do not run one against a host
-        // filesystem you care about.
+        // Consequence worth stating plainly (review F4): host execution is now
+        // the DEFAULT, and with --yolo there is no per-tool approval — a mojo
+        // bot's blast radius on the host is bounded only by the OS user and the
+        // bot's allowedUsers gate. Operators who don't accept that must set
+        // `cloud: true` (fully-remote sandbox) or `localDaemon: false`.
         if (this.config.disableCliBypass !== true) args.push('--yolo');
         if (this.cliSessionId) args.push('-r', this.cliSessionId);
         if (this.config.model?.trim()) args.push('--model', this.config.model.trim());
         if (this.config.workspaceId) args.push('--workspace-id', this.config.workspaceId);
         if (this.config.agentId && !this.cliSessionId) args.push('--agent-id', this.config.agentId);
         // Run in the cloud sandbox instead of touching the bot host's filesystem.
-        // `=== true` to stay in lockstep with isMojoFullyRemote(), which decides
-        // the sandbox bypass. A truthy check here could add --cloud for a value
-        // the sandbox logic does NOT accept as proof of remote execution (or vice
-        // versa), and the two disagreeing is exactly what produces a fail-open.
-        if (this.config.cloud === true) args.push('--cloud');
+        // Shared derivation with buildEnv()/the spawn audit log — see
+        // deriveMojoExecutionMode for the precedence rules (explicit
+        // localDaemon wins and suppresses --cloud) and why hand-copying this
+        // logic produced fail-opens before.
+        if (deriveMojoExecutionMode(this.config).passCloudFlag) args.push('--cloud');
         if (this.config.idleTimeoutSec) args.push('--idle-timeout', String(this.config.idleTimeoutSec));
         // Before the positional prompt, which must stay last. Placed after our own
         // flags so an operator's CLI_EXTRA_ARGS can override them.
@@ -1678,6 +1726,7 @@ export class MojoBackend implements SessionBackend {
             const { bin, args } = this.resolveLaunch(this.buildArgs(prompt));
             this.turnSettled = false;
             this.streamedThisTurn = false;
+            this.turnFinalText = '';
             this.stdoutTail = '';
 
             // The strong boundary must exist BEFORE the child does, and the child
@@ -1993,6 +2042,14 @@ export class MojoBackend implements SessionBackend {
         // it has to be a real lookup here.
         if (this.turnSettled) return;
         this.turnSettled = true;
+        // BEFORE taskDoneCb: that callback re-arms prompt-ready and flushes
+        // queued follow-ups, so emitting the answer afterwards would race the
+        // next turn's card/turn attribution. A turn that produced no prose
+        // (tool-only, cancelled, failed) hands over '' and the worker's gate
+        // drops it — the backend does not decide deliverability.
+        const finalText = this.turnFinalText;
+        this.turnFinalText = '';
+        this.turnFinalCb?.(finalText);
         this.taskDoneCb?.();
     }
 
@@ -2053,10 +2110,37 @@ export class MojoBackend implements SessionBackend {
      * mode the files are already on disk (~/.mojo/skills) so it stays empty.
      */
     private decorate(prompt: string): string {
-        const preamble = [this.config.systemPrompt?.trim(), this.config.builtinSkillBlock?.trim()]
+        const preamble = [
+            this.config.systemPrompt?.trim(),
+            this.config.builtinSkillBlock?.trim(),
+            this.hostGuidanceBlock(),
+        ]
             .filter((s): s is string => !!s)
             .join('\n\n');
         return preamble ? `${preamble}\n\n---\n\n${prompt}` : prompt;
+    }
+
+    /**
+     * Host-execution guidance (undefined in cloud mode). Two compensations for
+     * the isolated per-session cwd:
+     *   1. the initial working directory is NOT the repo — point the agent at
+     *      the real one so repo work still lands in the right place;
+     *   2. every botmux command carries an explicit `--session-id`: the
+     *      execution daemon's env belongs to whichever session spawned it, so
+     *      an inherited BOTMUX_SESSION_ID must never be what routes a reply
+     *      (defence in depth — the isolated daemon already carries the right
+     *      env, this survives even a regression back to a shared daemon).
+     */
+    private hostGuidanceBlock(): string | undefined {
+        if (!this.hostExecution()) return undefined;
+        const repo = this.realWorkingDir();
+        const lines = [
+            repo
+                ? `你的工作仓库在 ${repo} 。当前初始工作目录是一个会话隔离目录,不含仓库文件;涉及仓库文件的读写或命令,请显式 \`cd ${repo}\` 后再执行。`
+                : '当前初始工作目录是一个会话隔离目录;如需在某个仓库/目录下工作,请先显式 cd 过去。',
+            `所有 botmux 命令请显式带 \`--session-id ${this.sessionId}\`(例:\`botmux send --session-id ${this.sessionId} ...\`),确保回话投递到本会话。`,
+        ];
+        return lines.join('\n');
     }
 
     private buildEnv(): NodeJS.ProcessEnv {
@@ -2134,9 +2218,7 @@ export class MojoBackend implements SessionBackend {
         // sandbox check read it as "not local, safe to bypass" — isolation off and
         // host execution on at once. Always written (never inherited), so an
         // ambient AGENT_LOCAL_DAEMON cannot flip the mode either way.
-        const hostExecution = this.config.localDaemon === true
-            || (this.config.localDaemon === undefined && this.config.cloud !== true);
-        env.AGENT_LOCAL_DAEMON = hostExecution ? '1' : '0';
+        env.AGENT_LOCAL_DAEMON = deriveMojoExecutionMode(this.config).agentLocalDaemon;
         // Never let an interactive upgrade prompt pollute the NDJSON stream.
         env.MOJO_NO_UPDATE = '1';
         // Termination authority, not configuration: this value is what makes the
@@ -2233,6 +2315,9 @@ export class MojoBackend implements SessionBackend {
     private emitText(text: string): void {
         const normalized = text.replace(/\r?\n/g, '\r\n');
         this.outputBuffer += normalized;
+        // Keep the bridge copy in the CLI's own newline convention — it is
+        // destined for a Lark message, not a terminal.
+        this.turnFinalText += text;
         this.dataCb?.(normalized);
     }
 }
