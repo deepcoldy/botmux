@@ -7460,6 +7460,8 @@ let displayMode: DisplayMode = 'hidden';
 let screenshotTimer: ReturnType<typeof setInterval> | null = null;
 let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
 let lastShotHash = '';
+// Throttle for the happy-path upload log in captureAndUpload (one line/min).
+let lastUploadLogAtMs = 0;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
@@ -7564,6 +7566,14 @@ async function captureAndUpload(): Promise<void> {
   }
 
   const status = projectedRuntimeScreenStatus();
+  // Success is otherwise completely silent (skips and failures log above), which
+  // made "loop alive and uploading" indistinguishable from "loop never started"
+  // in the daemon log. One throttled line keeps the happy path observable.
+  const nowMs = Date.now();
+  if (nowMs - lastUploadLogAtMs >= 60_000) {
+    lastUploadLogAtMs = nowMs;
+    log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+  }
   send({
     type: 'screenshot_uploaded',
     imageKey,
@@ -17292,7 +17302,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'refresh_screen': {
-      if (displayMode !== 'screenshot') break;
+      // The daemon only offers manual refresh on a screenshot-mode card, so
+      // landing here in another mode means the display-mode re-sync was lost —
+      // say so instead of eating the click silently.
+      if (displayMode !== 'screenshot') { log(`Manual screenshot refresh ignored: displayMode=${displayMode}`); break; }
       lastShotHash = '';
       if (screenshotTimer) {
         clearInterval(screenshotTimer);

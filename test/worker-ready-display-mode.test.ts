@@ -585,6 +585,135 @@ describe('Worker ready: set_display_mode re-sync', () => {
     });
   });
 
+  it('sentinel early-break (in-flight card POST) still sends set_display_mode', async () => {
+    // The mojo-shape race: a headless backend reaches prompt-ready synchronously
+    // on spawn, so a screen_update wins the card POST and `ready` finds
+    // CARD_POSTING_SENTINEL already set. The old implementation broke out of the
+    // handler right there and the fresh worker stayed displayMode='hidden'
+    // forever ("waiting for first screenshot…"). Note: we only assert the
+    // worker got the mode — the first screenshot_uploaded may still be dropped
+    // by the streamCardPending gate; the next 10s cycle delivers it.
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      displayMode: 'screenshot',
+      streamCardPending: false,
+      streamCardId: CARD_POSTING_SENTINEL,
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    // No duplicate card POST while the sentinel is held.
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(fakeWorker.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
+    );
+  });
+
+  it('managed/silent-suppressed ready (apiOnly transport) still sends set_display_mode', async () => {
+    // apiOnly makes auxUiSuppressedFor() return true — the "worker exists, no
+    // card will ever be posted" shape. The mode re-sync must not be tied to
+    // card delivery. Implementation is restored in finally: clearAllMocks()
+    // does not undo a leaked mockImplementation for later tests.
+    const getBotMock = vi.mocked(getBot);
+    const originalGetBot = getBotMock.getMockImplementation();
+    getBotMock.mockImplementation((() => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', apiOnly: true },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    })) as any);
+    try {
+      const fakeWorker = makeFakeWorker();
+      const ds = makeDs({
+        displayMode: 'screenshot',
+        streamCardPending: false,
+        streamCardId: undefined,
+        worker: fakeWorker,
+      });
+
+      __testOnly_setupWorkerHandlers(ds, fakeWorker);
+      fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+      await flush();
+
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+      expect(fakeWorker.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
+      );
+    } finally {
+      getBotMock.mockImplementation(originalGetBot as any);
+    }
+  });
+
+  it('streamingCardDisabled ready still sends set_display_mode', async () => {
+    const getBotMock = vi.mocked(getBot);
+    const originalGetBot = getBotMock.getMockImplementation();
+    getBotMock.mockImplementation((() => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', disableStreamingCard: true },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    })) as any);
+    try {
+      const fakeWorker = makeFakeWorker();
+      const ds = makeDs({
+        displayMode: 'screenshot',
+        streamCardPending: false,
+        streamCardId: undefined,
+        worker: fakeWorker,
+      });
+
+      __testOnly_setupWorkerHandlers(ds, fakeWorker);
+      fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+      await flush();
+
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+      expect(fakeWorker.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
+      );
+    } finally {
+      getBotMock.mockImplementation(originalGetBot as any);
+    }
+  });
+
+  it('suppressed managed turn screenshot never lands in currentImageKey', async () => {
+    // With the early re-sync, a worker can be uploading during a managed/silent
+    // turn — that frame must not become the next visible card's image.
+    const getBotMock = vi.mocked(getBot);
+    const originalGetBot = getBotMock.getMockImplementation();
+    getBotMock.mockImplementation((() => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', apiOnly: true },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    })) as any);
+    try {
+      const fakeWorker = makeFakeWorker();
+      const ds = makeDs({
+        displayMode: 'screenshot',
+        streamCardPending: false,
+        streamCardId: 'om_visible_card',
+        worker: fakeWorker,
+      });
+
+      __testOnly_setupWorkerHandlers(ds, fakeWorker);
+      fakeWorker.emit('message', {
+        type: 'screenshot_uploaded',
+        imageKey: 'img_managed_frame',
+        status: 'working',
+        turnId: 'turn-managed',
+      });
+      await flush();
+
+      expect(ds.currentImageKey).toBeUndefined();
+      expect(updateMessageMock).not.toHaveBeenCalled();
+    } finally {
+      getBotMock.mockImplementation(originalGetBot as any);
+    }
+  });
+
   it('re-applies readiness when cli_session_id races a restored-card PATCH', async () => {
     let resolveRestorePatch!: () => void;
     updateMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
