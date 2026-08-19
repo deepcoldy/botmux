@@ -346,6 +346,58 @@ describe('first-load serialization against an in-flight offline writer', () => {
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
     }
   });
+
+  it('load does not swallow SQLITE_BUSY into an empty cache', async () => {
+    // busy_timeout 耗尽后若收成 loadFailure + 空 Map，daemon 启动会走
+    // listSessions() 把「锁等待超时」当成「没有会话」并跳过 restore。
+    seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA', title: 'must-survive-busy' }) });
+    init('appA');
+    listSessions();
+    init();
+    const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
+    const releaseMarker = join(tempDir, 'busy-release');
+    const child = spawn(process.execPath, ['-e', `
+      const fs = require('node:fs');
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.exec('PRAGMA busy_timeout = 3000');
+      db.exec('BEGIN IMMEDIATE');
+      process.stdout.write('HELD\\n');
+      const tick = () => {
+        if (!fs.existsSync(${JSON.stringify(releaseMarker)})) return setTimeout(tick, 50);
+        db.exec('COMMIT');
+        db.close();
+      };
+      tick();
+    `], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('writer never signalled HELD')), 5000);
+        child.stdout!.on('data', (chunk: Buffer) => {
+          if (chunk.toString().includes('HELD')) { clearTimeout(timer); resolve(); }
+        });
+        child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`writer exited early (${code})`)); });
+      });
+
+      init('appA');
+      const t0 = Date.now();
+      expect(() => listSessions()).toThrow(/database is locked|SQLITE_BUSY|SQLITE_LOCKED/i);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(2500);
+
+      writeFileSync(releaseMarker, '1');
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('writer did not exit after release')), 5000);
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+
+      const loaded = listSessions();
+      expect(loaded).toHaveLength(1);
+      expect(loaded[0]?.title).toBe('must-survive-busy');
+    } finally {
+      try { writeFileSync(releaseMarker, '1'); } catch { /* already written */ }
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 20_000);
 });
 
 // ─── Node 能力探测 ───────────────────────────────────────────────────────────

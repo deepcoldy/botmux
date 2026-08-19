@@ -26,6 +26,8 @@ function bwrapUsable(): boolean {
       '--unshare-user', '--die-with-parent',
       '--tmpfs', '/', '--proc', '/proc', '--dev', '/dev',
       '--ro-bind', '/usr', '/usr',
+      '--ro-bind-try', '/lib', '/lib',
+      '--ro-bind-try', '/lib64', '/lib64',
       '/usr/bin/true',
     ], { timeout: 10_000 });
     return probe.status === 0;

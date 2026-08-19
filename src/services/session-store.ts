@@ -44,8 +44,8 @@ export function stripLegacyPendingCardFields(session: Record<string, unknown>): 
 }
 
 // ─── SQLite engine plumbing ──────────────────────────────────────────────────
-// Per-bot session rows live in `sessions-<appId>.db` (legacy no-appId store:
-// `sessions.db`), one table, whole-row JSON column. The TS `Session` type stays
+// Per-bot session rows live in `session-stores/<appId>/sessions.db` (legacy
+// no-appId store: `sessions.db`), one table, whole-row JSON column. The TS `Session` type stays
 // the schema authority; the generated columns below only serve hot lookups.
 // The pre-SQLite JSON files are frozen in place on first import and never
 // written again — reinstalling an older botmux and restarting reads them as of
@@ -164,6 +164,13 @@ interface OwnSqliteStore {
   upsert: SqliteStatementLike;
 }
 let ownStore: OwnSqliteStore | undefined;
+
+/** Lock/busy contention is retryable. Swallowing it into loadFailure would let
+ *  the daemon start with an empty cache while the durable store is healthy. */
+function isTransientStoreContentionError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /database is locked|SQLITE_BUSY|SQLITE_LOCKED|file-lock timeout/i.test(message);
+}
 
 function attachOwnStore(path: string): OwnSqliteStore {
   const db = openDbForOwnStore(path);
@@ -406,7 +413,7 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
 
 /**
  * Initialise session store for a specific bot (multi-daemon mode).
- * When appId is set, sessions are stored in `sessions-{appId}.db`.
+ * When appId is set, sessions are stored in `session-stores/{appId}/sessions.db`.
  * When unset, uses the legacy no-appId store (`sessions.db`).
  *
  * `owner: false` marks a non-owning process (worker): it reads whichever
@@ -562,6 +569,7 @@ function load(): void {
         }
       });
     } catch (err) {
+      if (isTransientStoreContentionError(err)) throw err;
       logger.error(`Failed to import sessions into SQLite: ${err}`);
       loadFailure = err instanceof Error ? err : new Error(String(err));
       sessions = new Map();
@@ -571,7 +579,17 @@ function load(): void {
   }
 
   if (existsSync(dbFp)) {
-    const store = attachOwnStore(dbFp);
+    let store: OwnSqliteStore;
+    try {
+      store = attachOwnStore(dbFp);
+    } catch (err) {
+      // Unreadable/corrupt .db: same fail-closed gate as a malformed JSON file.
+      logger.error(`Failed to load sessions: ${err}`);
+      loadFailure = err instanceof Error ? err : new Error(String(err));
+      sessions = new Map();
+      loaded = true;
+      return;
+    }
     sessions = new Map();
     // 排他读：BEGIN IMMEDIATE 与离线 CLI 写者互斥后再取快照。纯 SELECT 不被
     // 写事务排斥——若一个已通过双 abortIf 探测、正持有 IMMEDIATE 的离线 CLI
@@ -579,28 +597,40 @@ function load(): void {
     // 覆盖掉 CLI 的提交（JSON 时代由同一把文件锁保证的 load/离线写串行化）。
     // daemon 先发布 descriptor 再首次 load：新来的写者在探测处让位，已持锁
     // 的写者让本读取等到它 commit 之后。
-    store.db.exec('BEGIN IMMEDIATE');
-    let committed = false;
     try {
-      for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
-      const repaired = repairMissingChatScopes();
+      store.db.exec('BEGIN IMMEDIATE');
+      let committed = false;
       try {
-        for (const session of repaired) {
-          store.upsert.run(session.sessionId, sessionStatusText(session), JSON.stringify(session));
+        for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
+        const repaired = repairMissingChatScopes();
+        try {
+          for (const session of repaired) {
+            store.upsert.run(session.sessionId, sessionStatusText(session), JSON.stringify(session));
+          }
+          store.db.exec('COMMIT');
+          committed = true;
+          if (repaired.length > 0) {
+            logger.info(`Repaired ${repaired.length} scope-less chat session(s) in ${dbFp}`);
+          }
+        } catch (err) {
+          // Loading succeeded, so keep the in-memory sessions available (with
+          // the in-memory repairs) even if the best-effort repair cannot be
+          // persisted yet.
+          logger.error(`Failed to persist repaired chat session scopes: ${err}`);
         }
-        store.db.exec('COMMIT');
-        committed = true;
-        if (repaired.length > 0) {
-          logger.info(`Repaired ${repaired.length} scope-less chat session(s) in ${dbFp}`);
-        }
-      } catch (err) {
-        // Loading succeeded, so keep the in-memory sessions available (with
-        // the in-memory repairs) even if the best-effort repair cannot be
-        // persisted yet.
-        logger.error(`Failed to persist repaired chat session scopes: ${err}`);
+      } finally {
+        if (!committed) { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
       }
-    } finally {
-      if (!committed) { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+    } catch (err) {
+      // Lock contention (SQLITE_BUSY after busy_timeout) must NOT become
+      // loadFailure + empty cache: daemon startup uses listSessions(), which
+      // would then restore nothing while the durable store is healthy.
+      if (ownStore) {
+        try { ownStore.db.close(); } catch { /* already closed */ }
+        ownStore = undefined;
+      }
+      sessions = new Map();
+      throw err;
     }
     logger.info(`Loaded ${sessions.size} sessions from ${dbFp}`);
     loaded = true;

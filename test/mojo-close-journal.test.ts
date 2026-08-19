@@ -19,11 +19,12 @@
  * Run:  pnpm vitest run test/mojo-close-journal.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
+import { readPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const { getBotMock, cancelMojoMock } = vi.hoisted(() => ({
   getBotMock: vi.fn(),
@@ -390,9 +391,7 @@ describe('the journal is actually DURABLE, not just in-memory', () => {
    * feature: the journal exists to survive a daemon crash.
    */
   function journalOnDisk(sessionId: string): Record<string, unknown> | undefined {
-    const raw = JSON.parse(readFileSync(join(dataDir, 'sessions-app.json'), 'utf-8')) as
-      Record<string, { mojoCloseJournal?: Record<string, unknown> }>;
-    return raw[sessionId]?.mojoCloseJournal;
+    return readPersistedSessionRows(dataDir, 'app')[sessionId]?.mojoCloseJournal;
   }
 
   function seedActiveMojoRow(hint: string) {

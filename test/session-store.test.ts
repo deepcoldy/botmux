@@ -447,7 +447,11 @@ describe('write health gate', () => {
     const session = createSession('chat-write-gate', 'root-write-gate', 'Write Gate');
     session.backendType = 'mojo';
     updateSession(session);
-    const fp = join(tempDir, 'sessions.json');
+    // Close the live SQLite connection before overwriting the active store;
+    // corrupting the frozen JSON would not trip the engine now in use.
+    init();
+    const fp = persistedStorePath(tempDir);
+    if (!fp) throw new Error('expected a persisted store after createSession');
     writeFileSync(fp, '{not-json');
     init();
     return { session, fp };
@@ -498,11 +502,12 @@ describe('write health gate', () => {
       SessionStoreUnavailableError,
     );
 
-    writeFileSync(fp, '{}');
+    rmSync(fp, { force: true });
+    new DatabaseSync(fp).close();
     expect(() => createSession('chat-still-blocked', 'root-still-blocked', 'Still Blocked')).toThrow(
       SessionStoreUnavailableError,
     );
-    expect(readFileSync(fp, 'utf-8')).toBe('{}');
+    expect(existsSync(fp)).toBe(true);
 
     init();
     expect(createSession('chat-reloaded', 'root-reloaded', 'Reloaded').status).toBe('active');
@@ -523,7 +528,9 @@ describe('write health gate', () => {
 
   it('rejects writes after a valid JSON value that is not a session projection', () => {
     const session = createSession('chat-array', 'root-array', 'Array Projection');
-    const fp = join(tempDir, 'sessions.json');
+    init();
+    const fp = persistedStorePath(tempDir);
+    if (!fp) throw new Error('expected a persisted store after createSession');
     writeFileSync(fp, '[]');
     init();
 
@@ -689,7 +696,7 @@ describe('closeSession()', () => {
     session.backendType = 'mojo';
     session.riffParentTaskId = 'mojo-sid-retry';
     updateSession(session);
-    fsControl.failSessionWrite = true;
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
 
     expect(() => closeSession(
       session.sessionId,
@@ -702,7 +709,7 @@ describe('closeSession()', () => {
     expect(inMemory?.mojoQuarantineNoticePending).toBeUndefined();
 
     // ...and the same must be true of what is actually on disk.
-    fsControl.failSessionWrite = false;
+    __testOnly_setBeforeRowPersist(undefined);
     init();
     const reloaded = getSession(session.sessionId);
     expect(reloaded).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
@@ -760,7 +767,7 @@ describe('closeSession()', () => {
     updateSession(session);
     beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
     markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
-    fsControl.failSessionWrite = true;
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
 
     expect(() => closeSession(
       session.sessionId,
@@ -772,7 +779,7 @@ describe('closeSession()', () => {
       mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
     });
 
-    fsControl.failSessionWrite = false;
+    __testOnly_setBeforeRowPersist(undefined);
     init();
     expect(getSession(session.sessionId)).toMatchObject({
       status: 'active',
@@ -787,7 +794,7 @@ describe('closeSession()', () => {
     session.riffParentTaskId = 'mojo-sid-journal';
     updateSession(session);
     beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
-    fsControl.failSessionWrite = true;
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
 
     expect(() => markMojoClosePrepared(
       session.sessionId,
@@ -799,7 +806,7 @@ describe('closeSession()', () => {
       requestId: 'request-1',
     });
 
-    fsControl.failSessionWrite = false;
+    __testOnly_setBeforeRowPersist(undefined);
     init();
     expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
       phase: 'preparing',
