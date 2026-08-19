@@ -103,9 +103,10 @@ import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
+  setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
@@ -250,6 +251,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   afterEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
+    setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
@@ -1708,6 +1710,43 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect((await getSkillFeedbackStore('/tmp/test-sessions')).findDeliveryByPlatformMessage(
       'lark', ds.larkAppId, 'om_meeting_fallback',
     )).toBeUndefined();
+  });
+
+  it('delivers a listener-thread result when the receiver uses its dedicated active-session key', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_receiver_fallback');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...listenerFinalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      targetChatId: ds.chatId,
+    })).toEqual(['om_vc_receiver_fallback']);
   });
 
   it('treats a valid skip decision as a successful no-message outcome', async () => {

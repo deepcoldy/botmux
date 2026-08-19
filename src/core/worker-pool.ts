@@ -654,7 +654,7 @@ const pendingRemoteWorkerCloses = new Map<string, {
   resolve: (result: RemoteWorkerCloseResult) => void;
 }>();
 
-export function setActiveSessionsRegistry(m: Map<string, DaemonSession>): void {
+export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefined): void {
   activeSessionsRegistry = m;
 }
 
@@ -9240,7 +9240,7 @@ function setupWorkerHandlers(
     && sessionAnchorId(ds) === handlerAnchor
     && (
       !activeSessionsRegistry
-      || activeSessionsRegistry.get(sessionKey(handlerAnchor, handlerLarkAppId)) === ds
+      || activeSessionsRegistry.get(activeSessionKey(ds)) === ds
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds);
