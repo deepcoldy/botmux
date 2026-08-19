@@ -5,7 +5,11 @@ import { dirname, join } from 'node:path';
 import { ensureGatewayEntry, inspectGatewayEntry, removeGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
+  MCP_GATEWAY_DAEMON_IPC_PORT_ENV,
+  MCP_GATEWAY_LARK_APP_ENV,
   MCP_GATEWAY_OWNER_ENV,
+  MCP_GATEWAY_ORIGIN_CHANNEL_ENV,
+  MCP_GATEWAY_SEND_RELAY_ENV,
 } from '../src/core/plugins/mcp/environment.js';
 
 describe('plugin MCP Gateway installer', () => {
@@ -20,6 +24,16 @@ describe('plugin MCP Gateway installer', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('forwards managed meeting routing paths without forwarding an authorization token', () => {
+    expect(MCP_GATEWAY_FORWARDED_ENV_KEYS).toEqual(expect.arrayContaining([
+      MCP_GATEWAY_SEND_RELAY_ENV,
+      MCP_GATEWAY_LARK_APP_ENV,
+      MCP_GATEWAY_DAEMON_IPC_PORT_ENV,
+      MCP_GATEWAY_ORIGIN_CHANNEL_ENV,
+    ]));
+    expect(MCP_GATEWAY_FORWARDED_ENV_KEYS.some(key => /capability|token/i.test(key))).toBe(false);
   });
 
   it('keeps one Codex gateway entry, preserves user servers, and removes legacy plugin blocks', () => {
@@ -101,6 +115,10 @@ describe('plugin MCP Gateway installer', () => {
         SESSION_DATA_DIR: '${SESSION_DATA_DIR:-}',
         BOTMUX_MCP_GATEWAY_SOCKET: '${BOTMUX_MCP_GATEWAY_SOCKET:-}',
         BOTMUX_MCP_GATEWAY_REQUIRED: '${BOTMUX_MCP_GATEWAY_REQUIRED:-}',
+        BOTMUX_SEND_RELAY: '${BOTMUX_SEND_RELAY:-}',
+        BOTMUX_LARK_APP_ID: '${BOTMUX_LARK_APP_ID:-}',
+        BOTMUX_DAEMON_IPC_PORT: '${BOTMUX_DAEMON_IPC_PORT:-}',
+        BOTMUX_ORIGIN_CHANNEL_ID: '${BOTMUX_ORIGIN_CHANNEL_ID:-}',
       },
     });
 
