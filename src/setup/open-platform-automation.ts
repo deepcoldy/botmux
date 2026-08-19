@@ -1619,6 +1619,43 @@ function readDefaultScopeManifest(): ScopeManifest {
   throw new Error('找不到 botmux lark-scopes.json');
 }
 
+// 宿主机到飞书的偶发网络抖动（DNS EAI_AGAIN、连接被重置、路由瞬断等）会让
+// undici 把整个请求直接抛成 TypeError('fetch failed')，一次失败就中断 console
+// 自动化链路（dashboard 改名/改头像、VC 事件订阅检查都实测偶发中招）。这类
+// 错误按错误码识别，只对幂等请求小步退避重试。
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+const TRANSIENT_FETCH_RETRY_DELAYS_MS = [300, 900];
+
+function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || !(err instanceof Error)) return false;
+  // 调用方主动 abort / 超时不算网络抖动，重试会违背调用方意图。
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true;
+  if (err instanceof AggregateError && err.errors.some(item => isLikelyTransientNetworkError(item, depth + 1))) {
+    return true;
+  }
+  // undici 网络层失败统一表现为 TypeError('fetch failed', { cause })；cause 缺失
+  // （老版本/被吞）时按瞬态处理——多试两次的代价远小于误报一次给用户。
+  if (err instanceof TypeError && err.message === 'fetch failed') {
+    return err.cause === undefined || isLikelyTransientNetworkError(err.cause, depth + 1);
+  }
+  return isLikelyTransientNetworkError((err as { cause?: unknown }).cause, depth + 1);
+}
+
 class MutableCookieJar {
   private cookies: StoredCookie[];
 
@@ -1647,6 +1684,10 @@ class MutableCookieJar {
   async fetchRaw(fetcher: typeof fetch, url: string, init: RequestInit = {}, maxHops = 10): Promise<Response> {
     let current = url;
     let referer: string | undefined;
+    // 只有幂等的 GET/HEAD 允许瞬态网络错误重试：POST 全是 console 写操作或登录
+    // 流程，传输错误时服务端可能已 commit（结果未知），重试等于重复提交。
+    const method = (init.method ?? 'GET').toUpperCase();
+    const retryable = method === 'GET' || method === 'HEAD';
     for (let hop = 0; hop <= maxHops; hop += 1) {
       const headers = new Headers(init.headers);
       const cookieHeader = getCookieHeader(this.cookies, current);
@@ -1654,7 +1695,18 @@ class MutableCookieJar {
       headers.set('user-agent', headers.get('user-agent') ?? DEFAULT_BROWSER_USER_AGENT);
       if (referer && !headers.has('referer')) headers.set('referer', referer);
 
-      const response = await fetcher(current, { ...init, headers, redirect: 'manual' });
+      let response: Response;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          response = await fetcher(current, { ...init, headers, redirect: 'manual' });
+          break;
+        } catch (err) {
+          if (!retryable || attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+            throw err;
+          }
+          await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+        }
+      }
       this.loadFromResponse(current, response.headers);
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
@@ -1951,9 +2003,26 @@ function summarizeOpenPlatformPayload(payload: unknown): string {
   return JSON.stringify(summary).slice(0, 500);
 }
 
-function safeErrorMessage(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.replace(/[A-Za-z0-9_=-]{24,}/g, '***');
+export function safeErrorMessage(err: unknown): string {
+  // undici 把网络失败包成 TypeError('fetch failed', { cause })，真实原因
+  // （ECONNRESET / EAI_AGAIN / 具体地址等）全在 cause 链里——不带上它，用户和
+  // 排障方永远只能看到一句 "fetch failed"。
+  const parts: string[] = [];
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof AggregateError && !current.message && current.errors.length > 0) {
+      current = current.errors[0];
+    }
+    const message = current instanceof Error ? current.message : String(current);
+    const code = (current as { code?: unknown }).code;
+    const part = typeof code === 'string' && code && !message.includes(code)
+      ? (message ? `${message} (${code})` : code)
+      : message;
+    if (part && parts[parts.length - 1] !== part) parts.push(part);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  const combined = parts.join(': ') || (err instanceof Error ? err.message : String(err));
+  return combined.replace(/[A-Za-z0-9_=-]{24,}/g, '***');
 }
 
 function markFinalResponseUrl(response: Response, finalUrl: string): void {

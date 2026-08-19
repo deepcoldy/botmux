@@ -16,6 +16,7 @@ import {
   buildSafeSettingPayload,
   buildScopeUpdatePayload,
   createFeishuOpenPlatformApp,
+  createOpenPlatformApiClient,
   extractOpenPlatformCsrfToken,
   extractOpenPlatformSessionIdentity,
   extractOpenPlatformScopeEntries,
@@ -25,6 +26,7 @@ import {
   parseSetupOpenPlatformAutoFlag,
   prepareFeishuWebSession,
   readStoredCookiesFromSessionFile,
+  safeErrorMessage,
   type StoredCookie,
   vcListenerEventGateError,
   writeStoredCookiesToSessionFile,
@@ -1359,5 +1361,109 @@ describe('automateOpenPlatformSetup 版本可见范围', () => {
 
     expect(result).toMatchObject({ ok: false, reason: 'visibility_unreadable' });
     expect(calls.some(path => path.includes('/app_version/create/'))).toBe(false);
+  });
+});
+
+// 宿主机到飞书的偶发网络抖动会让 undici 抛 TypeError('fetch failed')，一次失败
+// 就中断整条 console 链路（dashboard 改名/改头像实测偶发中招）。页面读取 GET
+// 幂等可重试；console POST 写操作传输错误时结果未知，绝不能重试。
+describe('console 页面读取的瞬态网络错误重试', () => {
+  const transientFetchError = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+
+  it('GET 页面读取遇瞬态网络错误自动重试，抖一次不再让整条链路失败', async () => {
+    let pageAttempts = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://open.feishu.cn/app') {
+        pageAttempts += 1;
+        if (pageAttempts === 1) throw transientFetchError();
+        return new Response(openPlatformPage(), { status: 200 });
+      }
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(result.ok).toBe(true);
+    expect(pageAttempts).toBe(2);
+  });
+
+  it('重试耗尽后返回 network 失败，message 带上 cause 里的真实网络错误', async () => {
+    let pageAttempts = 0;
+    const fetchImpl = (async () => {
+      pageAttempts += 1;
+      throw transientFetchError();
+    }) as typeof fetch;
+
+    const result = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(result).toMatchObject({ ok: false, reason: 'network' });
+    if (!result.ok) {
+      expect(result.message).toContain('fetch failed');
+      expect(result.message).toContain('ECONNRESET');
+    }
+    expect(pageAttempts).toBe(3); // 首次 + 2 次重试
+  });
+
+  it('console POST 写操作不重试：传输错误立刻抛出，避免重复提交', async () => {
+    let postAttempts = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        postAttempts += 1;
+        throw transientFetchError();
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) return;
+    await expect(clientResult.client.postJson('/developers/v1/app/cli_x', {})).rejects.toThrow('fetch failed');
+    expect(postAttempts).toBe(1);
+  });
+
+  it('非网络错误不重试（mock/逻辑错误一次就失败，不白等退避）', async () => {
+    let attempts = 0;
+    const fetchImpl = (async () => {
+      attempts += 1;
+      throw new Error('boom');
+    }) as typeof fetch;
+
+    const result = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(result).toMatchObject({ ok: false, reason: 'network' });
+    expect(attempts).toBe(1);
+  });
+});
+
+describe('safeErrorMessage', () => {
+  it('展开 undici fetch failed 的 cause 链，露出真实网络错误', () => {
+    const err = new TypeError('fetch failed', {
+      cause: Object.assign(new Error('connect ETIMEDOUT 1.2.3.4:443'), { code: 'ETIMEDOUT' }),
+    });
+    expect(safeErrorMessage(err)).toBe('fetch failed: connect ETIMEDOUT 1.2.3.4:443');
+  });
+
+  it('cause 是 happy-eyeballs 的 AggregateError 时取首个真实错误', () => {
+    const err = new TypeError('fetch failed', {
+      cause: new AggregateError([
+        Object.assign(new Error('connect ECONNREFUSED 1.2.3.4:443'), { code: 'ECONNREFUSED' }),
+      ]),
+    });
+    expect(safeErrorMessage(err)).toBe('fetch failed: connect ECONNREFUSED 1.2.3.4:443');
+  });
+
+  it('message 里没有错误码时把 code 补进去', () => {
+    const err = new TypeError('fetch failed', {
+      cause: Object.assign(new Error('getaddrinfo failure'), { code: 'EAI_AGAIN' }),
+    });
+    expect(safeErrorMessage(err)).toBe('fetch failed: getaddrinfo failure (EAI_AGAIN)');
+  });
+
+  it('仍然脱敏长 token', () => {
+    const err = new Error(`bad token ${'a'.repeat(32)}`);
+    expect(safeErrorMessage(err)).toBe('bad token ***');
   });
 });

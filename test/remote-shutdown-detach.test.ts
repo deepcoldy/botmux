@@ -6,19 +6,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 import {
-  abortRiffShutdownFleet,
-  abortPreparedRiffShutdown,
-  canAbortVerifiedExitedRiffPreparation,
+  abortRemoteShutdownFleet,
+  abortPreparedRemoteShutdown,
+  canAbortVerifiedExitedRemotePreparation,
   collectUniqueDaemonShutdownSessions,
-  commitPreparedRiffShutdown,
-  detachRiffWorkerForShutdown,
-  persistPreparedRiffShutdown,
-  persistPreparedRiffShutdownFleet,
-  prepareRiffFleetForShutdown,
-  prepareRiffSessionForShutdown,
-  type FencedRiffShutdownParticipant,
-  type PreparedRiffShutdown,
-} from '../src/core/riff-shutdown-detach.js';
+  commitPreparedRemoteShutdown,
+  detachRemoteWorkerForShutdown,
+  persistPreparedRemoteShutdown,
+  persistPreparedRemoteShutdownFleet,
+  prepareRemoteFleetForShutdown,
+  prepareRemoteSessionForShutdown,
+  type FencedRemoteShutdownParticipant,
+  type PreparedRemoteShutdown,
+} from '../src/core/remote-shutdown-detach.js';
 import { sendWorkerInput } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 
@@ -34,7 +34,7 @@ type FakeWorker = EventEmitter & {
   kill: ReturnType<typeof vi.fn>;
 };
 
-describe('Riff graceful daemon-shutdown detach coordinator', () => {
+describe('Remote graceful daemon-shutdown detach coordinator', () => {
   let dataDir: string;
   let previousDataDir: string;
 
@@ -55,10 +55,11 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
   function fixture(
     initialTaskId: string | undefined,
     onSend: (worker: FakeWorker, message: any) => void,
+    backendType: 'riff' | 'mojo' = 'riff',
   ): { ds: DaemonSession; worker: FakeWorker; messages: any[] } {
     const session = sessionStore.createSession('oc_riff', 'om_riff', 'riff shutdown', 'group');
     session.larkAppId = 'app';
-    session.backendType = 'riff';
+    session.backendType = backendType;
     session.riffParentTaskId = initialTaskId;
     sessionStore.updateSession(session);
     const messages: any[] = [];
@@ -82,22 +83,22 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       workerToken: 'write',
       workerViewToken: 'view',
       managedTurnOrigin: { capability: 'cap' },
-      initConfig: { backendType: 'riff' },
+      initConfig: { backendType },
     } as unknown as DaemonSession;
     return { ds, worker, messages };
   }
 
   function asPrepared(
-    result: Awaited<ReturnType<typeof prepareRiffSessionForShutdown>>,
-  ): PreparedRiffShutdown {
-    if (!result.ok) throw new Error(`expected prepared Riff shutdown: ${result.error}`);
+    result: Awaited<ReturnType<typeof prepareRemoteSessionForShutdown>>,
+  ): PreparedRemoteShutdown {
+    if (!result.ok) throw new Error(`expected prepared remote shutdown: ${result.error}`);
     return result;
   }
 
   function asFenced(
-    result: Awaited<ReturnType<typeof prepareRiffSessionForShutdown>>,
-  ): FencedRiffShutdownParticipant {
-    if (result.fence === 'none') throw new Error(`expected fenced Riff shutdown: ${result.error}`);
+    result: Awaited<ReturnType<typeof prepareRemoteSessionForShutdown>>,
+  ): FencedRemoteShutdownParticipant {
+    if (result.fence === 'none') throw new Error(`expected fenced remote shutdown: ${result.error}`);
     return result;
   }
 
@@ -110,7 +111,7 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     writeFileSync(blockedDataDir, 'block');
     config.session.dataDir = blockedDataDir;
 
-    expect(() => sessionStore.persistActiveRiffLineageExact(session.sessionId, 'task-after')).toThrow();
+    expect(() => sessionStore.persistActiveRemoteLineageExact(session.sessionId, 'task-after')).toThrow();
     expect(session.riffParentTaskId).toBe('task-before');
 
     config.session.dataDir = dataDir;
@@ -140,29 +141,55 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     });
   });
 
+  it('persists and commits a Mojo lineage through the shared remote transaction', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: 'mojo-preinit-lineage',
+        }));
+      }
+    }, 'mojo');
+
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
+    expect(prepared.taskId).toBe('mojo-preinit-lineage');
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toEqual({ ok: true });
+    expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId)
+      .toBe('mojo-preinit-lineage');
+    expect(commitPreparedRemoteShutdown(f.ds, prepared)).toBe(true);
+    expect(f.messages.map(message => message.type)).toEqual([
+      'remote_shutdown_prepare',
+      'remote_shutdown_commit',
+    ]);
+    expect(f.ds.worker).toBeNull();
+  });
+
   it('retains only the ambiguous session fence and restores an unrelated prepared peer', async () => {
     const first = fixture('task-first', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-first-child',
         }));
       }
     });
     const second = fixture('task-second', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-second-child',
         }));
-      } else if (message.type === 'riff_shutdown_abort') {
+      } else if (message.type === 'remote_shutdown_abort') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'abort', ok: true, taskId: 'task-second-child',
         }));
       }
     });
-    const prepared = await prepareRiffFleetForShutdown([first.ds, second.ds]);
+    const prepared = await prepareRemoteFleetForShutdown([first.ds, second.ds]);
     const competingFirst = {
       ...first.ds,
       session: { ...first.ds.session },
@@ -174,50 +201,50 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     ]);
     if (current.ok) throw new Error('expected ambiguous daemon session id');
 
-    const restored = await abortRiffShutdownFleet(prepared
+    const restored = await abortRemoteShutdownFleet(prepared
       .filter(({ ds }) => ds.session.sessionId !== current.sessionId)
       .map(({ ds, result }) => ({ ds, result: asFenced(result) })));
 
     expect(restored).toHaveLength(1);
     expect(restored[0].result.ok).toBe(true);
-    expect(first.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
-    expect(first.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
-    expect(second.ds.riffShutdownState).toBeUndefined();
+    expect(first.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(first.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
+    expect(second.ds.remoteShutdownState).toBeUndefined();
     expect(second.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_abort',
+      'remote_shutdown_prepare',
+      'remote_shutdown_abort',
     ]);
   });
 
   it('refuses an initial durable-read failure before installing any worker fence', async () => {
-    vi.spyOn(sessionStore, 'getActiveRiffShutdownSnapshotsBatch').mockImplementation(() => {
+    vi.spyOn(sessionStore, 'getActiveRemoteShutdownSnapshotsBatch').mockImplementation(() => {
       throw new Error('lock unavailable');
     });
     const f = fixture('task-parent', () => { /* no worker IPC is safe */ });
 
-    await expect(prepareRiffSessionForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(prepareRemoteSessionForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       taskId: 'task-parent',
       error: 'durable_session_read_failed:lock unavailable',
     });
-    expect(f.ds.riffShutdownState).toBeUndefined();
+    expect(f.ds.remoteShutdownState).toBeUndefined();
     expect(f.ds.worker).toBe(f.worker);
     expect(f.messages).toEqual([]);
   });
 
   it('takes one all-owner snapshot before publishing any fleet prepare request', async () => {
     const first = fixture('task-first', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-first-child',
         }));
       }
     });
     const second = fixture('task-second', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-second-child',
         }));
       }
@@ -226,15 +253,15 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     second.ds.session.pid = 202;
     sessionStore.updateSession(first.ds.session);
     sessionStore.updateSession(second.ds.session);
-    const originalSnapshot = sessionStore.getActiveRiffShutdownSnapshotsBatch;
-    const snapshot = vi.spyOn(sessionStore, 'getActiveRiffShutdownSnapshotsBatch')
+    const originalSnapshot = sessionStore.getActiveRemoteShutdownSnapshotsBatch;
+    const snapshot = vi.spyOn(sessionStore, 'getActiveRemoteShutdownSnapshotsBatch')
       .mockImplementation((sessionIds, options) => {
         expect(first.messages).toEqual([]);
         expect(second.messages).toEqual([]);
         return originalSnapshot(sessionIds, options);
       });
 
-    const results = await prepareRiffFleetForShutdown([first.ds, second.ds]);
+    const results = await prepareRemoteFleetForShutdown([first.ds, second.ds]);
 
     expect(snapshot).toHaveBeenCalledTimes(1);
     expect(snapshot).toHaveBeenCalledWith([
@@ -242,25 +269,25 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       second.ds.session.sessionId,
     ], expect.any(Object));
     expect(results.every(entry => entry.result.ok)).toBe(true);
-    expect(first.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
-    expect(second.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(first.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
+    expect(second.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
   });
 
   it('does not inline-abort a timed-out prepare and restores all owners in one concurrent wave', async () => {
     let firstAbortRequestId: string | undefined;
     let secondAbortRequestId: string | undefined;
     const first = fixture('task-first', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-first-child',
         }));
-      } else if (message.type === 'riff_shutdown_abort') {
+      } else if (message.type === 'remote_shutdown_abort') {
         firstAbortRequestId = message.requestId;
       }
     });
     const second = fixture('task-second', (_worker, message) => {
-      if (message.type === 'riff_shutdown_abort') secondAbortRequestId = message.requestId;
+      if (message.type === 'remote_shutdown_abort') secondAbortRequestId = message.requestId;
       // Deliberately never ACK prepare so its fence state is ambiguous.
     });
     first.ds.session.pid = 101;
@@ -268,16 +295,16 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     sessionStore.updateSession(first.ds.session);
     sessionStore.updateSession(second.ds.session);
 
-    const prepared = await prepareRiffFleetForShutdown([first.ds, second.ds], {
+    const prepared = await prepareRemoteFleetForShutdown([first.ds, second.ds], {
       drainTimeoutMs: 5,
       abortTimeoutMs: 200,
     });
     expect(prepared[0].result).toMatchObject({ ok: true, fence: 'prepared' });
     expect(prepared[1].result).toMatchObject({ ok: false, fence: 'possible' });
-    expect(first.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
-    expect(second.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(first.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
+    expect(second.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
 
-    const aborting = abortRiffShutdownFleet(prepared.map(({ ds, result }) => ({
+    const aborting = abortRemoteShutdownFleet(prepared.map(({ ds, result }) => ({
       ds,
       result: asFenced(result),
     })), { abortTimeoutMs: 200 });
@@ -285,51 +312,51 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       expect(firstAbortRequestId).toEqual(expect.any(String));
       expect(secondAbortRequestId).toEqual(expect.any(String));
     });
-    expect(first.messages.filter(message => message.type === 'riff_shutdown_abort')).toHaveLength(1);
-    expect(second.messages.filter(message => message.type === 'riff_shutdown_abort')).toHaveLength(1);
+    expect(first.messages.filter(message => message.type === 'remote_shutdown_abort')).toHaveLength(1);
+    expect(second.messages.filter(message => message.type === 'remote_shutdown_abort')).toHaveLength(1);
 
     first.worker.emit('message', {
-      type: 'riff_shutdown_result', requestId: firstAbortRequestId,
+      type: 'remote_shutdown_result', requestId: firstAbortRequestId,
       phase: 'abort', ok: true, taskId: 'task-first-child',
     });
     second.worker.emit('message', {
-      type: 'riff_shutdown_result', requestId: secondAbortRequestId,
+      type: 'remote_shutdown_result', requestId: secondAbortRequestId,
       phase: 'abort', ok: true, taskId: 'task-second',
     });
     await expect(aborting).resolves.toSatisfy(
       (results: Array<{ result: { ok: boolean } }>) => results.every(entry => entry.result.ok),
     );
-    expect(first.ds.riffShutdownState).toBeUndefined();
-    expect(second.ds.riffShutdownState).toBeUndefined();
+    expect(first.ds.remoteShutdownState).toBeUndefined();
+    expect(second.ds.remoteShutdownState).toBeUndefined();
 
     // A prepare ACK arriving after the exact abort wave is inert.
     second.worker.emit('message', {
-      type: 'riff_shutdown_result', requestId: secondAbortRequestId,
+      type: 'remote_shutdown_result', requestId: secondAbortRequestId,
       phase: 'prepare', ok: true, taskId: 'task-late-ack',
     });
-    expect(second.ds.riffShutdownState).toBeUndefined();
-    expect(second.messages.some(message => message.type === 'riff_shutdown_commit')).toBe(false);
+    expect(second.ds.remoteShutdownState).toBeUndefined();
+    expect(second.messages.some(message => message.type === 'remote_shutdown_commit')).toBe(false);
   });
 
-  it.each(['explicit_close_in_progress', 'not_riff_backend'])(
+  it.each(['explicit_close_in_progress', 'not_remote_backend'])(
     'classifies exact pre-fence worker refusal %s without sending abort',
     async (error) => {
       const f = fixture('task-parent', (worker, message) => {
-        if (message.type === 'riff_shutdown_prepare') {
+        if (message.type === 'remote_shutdown_prepare') {
           queueMicrotask(() => worker.emit('message', {
-            type: 'riff_shutdown_result', requestId: message.requestId,
+            type: 'remote_shutdown_result', requestId: message.requestId,
             phase: 'prepare', ok: false, taskId: null, error,
           }));
         }
       });
 
-      await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+      await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
         ok: false,
         fence: 'none',
         error,
       });
-      expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
-      expect(f.ds.riffShutdownState).toBeUndefined();
+      expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
+      expect(f.ds.remoteShutdownState).toBeUndefined();
       expect(f.ds.worker).toBe(f.worker);
     },
   );
@@ -338,41 +365,41 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     const f = fixture('task-parent', () => { /* send is replaced below */ });
     f.worker.send.mockImplementation(() => { throw new Error('IPC channel closed'); });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       fence: 'none',
-      error: 'riff_shutdown_prepare_send_failed',
+      error: 'remote_shutdown_prepare_send_failed',
     });
     expect(f.messages).toEqual([]);
-    expect(f.ds.riffShutdownState).toBeUndefined();
+    expect(f.ds.remoteShutdownState).toBeUndefined();
     expect(f.ds.worker).toBe(f.worker);
   });
 
   it('does not misclassify an existing older shutdown fence as a pre-fence refusal', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: false, taskId: null,
           error: 'shutdown detach already prepared as older-request',
         }));
       }
     });
 
-    await expect(prepareRiffSessionForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(prepareRemoteSessionForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       fence: 'possible',
       error: 'shutdown detach already prepared as older-request',
     });
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'preparing' });
-    expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
+    expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
   });
 
   it('refuses before a worker fence unless phase-2 plus the abort reserve remain', async () => {
     const f = fixture('task-parent', () => { /* no worker IPC is safe */ });
     const now = 10_000;
 
-    await expect(prepareRiffFleetForShutdown([f.ds], {
+    await expect(prepareRemoteFleetForShutdown([f.ds], {
       deadlineMs: now + 1_500,
       abortTimeoutMs: 1_000,
       now: () => now,
@@ -384,31 +411,31 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       },
     }]);
     expect(f.messages).toEqual([]);
-    expect(f.ds.riffShutdownState).toBeUndefined();
+    expect(f.ds.remoteShutdownState).toBeUndefined();
   });
 
   it('persists all prepared owners through one phase-2 batch call', async () => {
     const first = fixture('task-first', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-first-child',
         }));
       }
     });
     const second = fixture('task-second', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-second-child',
         }));
       }
     });
-    const prepared = await prepareRiffFleetForShutdown([first.ds, second.ds]);
+    const prepared = await prepareRemoteFleetForShutdown([first.ds, second.ds]);
     const entries = prepared.map(({ ds, result }) => ({ ds, result: asPrepared(result) }));
-    const batch = vi.spyOn(sessionStore, 'persistActiveRiffLineagesExactBatch');
+    const batch = vi.spyOn(sessionStore, 'persistActiveRemoteLineagesExactBatch');
 
-    expect(persistPreparedRiffShutdownFleet(entries)).toEqual({ ok: true });
+    expect(persistPreparedRemoteShutdownFleet(entries)).toEqual({ ok: true });
     expect(batch).toHaveBeenCalledTimes(1);
     expect(sessionStore.getSessionFresh(first.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-first-child');
@@ -419,24 +446,24 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
 
   it('retains every fence when verified phase-2 persistence returns after the absolute deadline', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-child',
         }));
       }
     });
-    const prepared = asPrepared(await prepareRiffSessionForShutdown(f.ds));
-    const originalBatch = sessionStore.persistActiveRiffLineagesExactBatch;
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
+    const originalBatch = sessionStore.persistActiveRemoteLineagesExactBatch;
     let now = 10_000;
     const deadlineMs = 10_100;
-    vi.spyOn(sessionStore, 'persistActiveRiffLineagesExactBatch')
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineagesExactBatch')
       .mockImplementation((updates, options) => {
         originalBatch(updates, options);
         now = deadlineMs;
       });
 
-    const result = persistPreparedRiffShutdownFleet(
+    const result = persistPreparedRemoteShutdownFleet(
       [{ ds: f.ds, result: prepared }],
       { deadlineMs, now: () => now },
     );
@@ -450,8 +477,8 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     });
     expect(prepared.lineageVerified).toBe(true);
     expect(f.ds.session.riffParentTaskId).toBe('task-child');
-    expect(f.ds.riffShutdownState).toMatchObject({ requestId: prepared.requestId });
-    expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(f.ds.remoteShutdownState).toMatchObject({ requestId: prepared.requestId });
+    expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
   });
 
   it.each([
@@ -460,31 +487,31 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     ['postrename_ambiguity', 'all'] as const,
   ])('maps %s batch failure to the exact retain-fence set', async (stage, expected) => {
     const first = fixture('task-first', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-first-child',
         }));
       }
     });
     const second = fixture('task-second', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-second-child',
         }));
       }
     });
-    const prepared = await prepareRiffFleetForShutdown([first.ds, second.ds]);
+    const prepared = await prepareRemoteFleetForShutdown([first.ds, second.ds]);
     const entries = prepared.map(({ ds, result }) => ({ ds, result: asPrepared(result) }));
     const affected = stage === 'postrename_ambiguity'
       ? [first.ds.session.sessionId, second.ds.session.sessionId]
       : [second.ds.session.sessionId];
-    vi.spyOn(sessionStore, 'persistActiveRiffLineagesExactBatch').mockImplementation(() => {
-      throw new sessionStore.RiffLineageBatchError(stage, affected, `forced ${stage}`);
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineagesExactBatch').mockImplementation(() => {
+      throw new sessionStore.RemoteLineageBatchError(stage, affected, `forced ${stage}`);
     });
 
-    const result = persistPreparedRiffShutdownFleet(entries);
+    const result = persistPreparedRemoteShutdownFleet(entries);
     expect(result).toMatchObject({ ok: false });
     if (result.ok) throw new Error('expected batch failure');
     expect(result.retainFencedSessionIds).toEqual(
@@ -498,18 +525,18 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
 
   it('retains the exact fence without writing when runtime owner changes after prepare', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-child',
         }));
       }
     });
-    const prepared = asPrepared(await prepareRiffSessionForShutdown(f.ds));
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
     f.ds.session.pid = 999_999;
-    const batch = vi.spyOn(sessionStore, 'persistActiveRiffLineagesExactBatch');
+    const batch = vi.spyOn(sessionStore, 'persistActiveRemoteLineagesExactBatch');
 
-    const result = persistPreparedRiffShutdownFleet([{ ds: f.ds, result: prepared }]);
+    const result = persistPreparedRemoteShutdownFleet([{ ds: f.ds, result: prepared }]);
 
     expect(result).toMatchObject({
       ok: false,
@@ -517,14 +544,14 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       error: expect.stringContaining('runtime_owner_changed'),
     });
     expect(batch).not.toHaveBeenCalled();
-    expect(f.ds.riffShutdownState).toMatchObject({ requestId: prepared.requestId });
+    expect(f.ds.remoteShutdownState).toMatchObject({ requestId: prepared.requestId });
   });
 
   it('persists and fresh-verifies the exact late child before commit', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'prepare',
           ok: true,
@@ -533,15 +560,15 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       }
     });
 
-    const result = await detachRiffWorkerForShutdown(f.ds);
+    const result = await detachRemoteWorkerForShutdown(f.ds);
     expect(result).toMatchObject({
       ok: true,
       taskId: 'task-late-child',
       disposition: 'lineage_persisted',
     });
     expect(f.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_commit',
+      'remote_shutdown_prepare',
+      'remote_shutdown_commit',
     ]);
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)).toMatchObject({
       status: 'active',
@@ -553,9 +580,9 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
 
   it('treats null as authoritative and clears a stale durable parent before commit', async () => {
     const f = fixture('task-stale-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'prepare',
           ok: true,
@@ -564,35 +591,35 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: true,
       taskId: null,
       disposition: 'lineage_persisted',
     });
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId).toBeUndefined();
     expect(f.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_commit',
+      'remote_shutdown_prepare',
+      'remote_shutdown_commit',
     ]);
   });
 
   it('restores the prepared worker without cancellation when durable persistence fails', async () => {
-    vi.spyOn(sessionStore, 'persistActiveRiffLineageExact').mockImplementation(() => {
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineageExact').mockImplementation(() => {
       throw new Error('disk full');
     });
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'prepare',
           ok: true,
           taskId: 'task-exact-child',
         }));
       }
-      if (message.type === 'riff_shutdown_abort') {
+      if (message.type === 'remote_shutdown_abort') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'abort',
           ok: true,
@@ -601,41 +628,41 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       taskId: 'task-exact-child',
       error: expect.stringContaining('lineage_persist_failed:disk full'),
     });
     expect(f.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_abort',
+      'remote_shutdown_prepare',
+      'remote_shutdown_abort',
     ]);
     // Persistence never advanced, so the accepted remote task and its exact
     // worker generation remain live with admission restored.
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId).toBe('task-parent');
     expect(f.ds.worker).toBe(f.worker);
-    expect(f.ds.riffShutdownState).toBeUndefined();
-    expect(f.messages.some(message => message.type === 'riff_shutdown_commit')).toBe(false);
-    expect(f.messages.some(message => message.type === 'riff_shutdown_cancel')).toBe(false);
+    expect(f.ds.remoteShutdownState).toBeUndefined();
+    expect(f.messages.some(message => message.type === 'remote_shutdown_commit')).toBe(false);
+    expect(f.messages.some(message => message.type === 'remote_shutdown_cancel')).toBe(false);
   });
 
   it('fails closed without commit or signal when persistence fails and abort is not ACKed', async () => {
-    vi.spyOn(sessionStore, 'persistActiveRiffLineageExact').mockImplementation(() => {
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineageExact').mockImplementation(() => {
       throw new Error('disk full');
     });
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'prepare',
           ok: true,
           taskId: 'task-uncancellable',
         }));
       }
-      if (message.type === 'riff_shutdown_abort') {
+      if (message.type === 'remote_shutdown_abort') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'abort',
           ok: false,
@@ -645,49 +672,49 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       taskId: 'task-uncancellable',
       error: expect.stringContaining('admission_restore_failed:admission restore refused'),
     });
     expect(f.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_abort',
+      'remote_shutdown_prepare',
+      'remote_shutdown_abort',
     ]);
-    expect(f.messages.some(message => message.type === 'riff_shutdown_commit')).toBe(false);
+    expect(f.messages.some(message => message.type === 'remote_shutdown_commit')).toBe(false);
     expect(f.worker.kill).not.toHaveBeenCalled();
     expect(f.ds.worker).toBe(f.worker);
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
   });
 
   it('keeps the fence when an abort ACK reports a different task lineage', async () => {
-    vi.spyOn(sessionStore, 'persistActiveRiffLineageExact').mockImplementation(() => {
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineageExact').mockImplementation(() => {
       throw new Error('disk full');
     });
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-prepared-child',
         }));
       }
-      if (message.type === 'riff_shutdown_abort') {
+      if (message.type === 'remote_shutdown_abort') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'abort', ok: true, taskId: 'task-unexpected-child',
         }));
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       error: expect.stringContaining('abort_task_lineage_mismatch'),
     });
     expect(f.ds.worker).toBe(f.worker);
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
     expect(f.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_abort',
+      'remote_shutdown_prepare',
+      'remote_shutdown_abort',
     ]);
   });
 
@@ -701,31 +728,31 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     // child while the durable row still names its parent.
     f.ds.session.riffParentTaskId = 'task-runtime-child';
 
-    const prepared = asPrepared(await prepareRiffSessionForShutdown(f.ds));
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
     expect(prepared.worker).toBeNull();
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-durable-parent');
 
-    expect(persistPreparedRiffShutdown(f.ds, prepared)).toEqual({ ok: true });
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toEqual({ ok: true });
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-runtime-child');
-    expect(commitPreparedRiffShutdown(f.ds, prepared)).toBe(true);
-    expect(f.ds.riffShutdownState).toBeUndefined();
+    expect(commitPreparedRemoteShutdown(f.ds, prepared)).toBe(true);
+    expect(f.ds.remoteShutdownState).toBeUndefined();
     expect(f.messages).toEqual([]);
   });
 
   it('aborts every prepared peer and commits none when one workerless lineage write fails', async () => {
     const live = fixture('task-live-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-live-child',
         }));
       }
-      if (message.type === 'riff_shutdown_abort') {
+      if (message.type === 'remote_shutdown_abort') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'abort', ok: true, taskId: 'task-live-child',
         }));
       }
@@ -735,11 +762,11 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     workerless.ds.session.riffParentTaskId = 'task-workerless-runtime-child';
 
     const [livePrepared, workerlessPrepared] = await Promise.all([
-      prepareRiffSessionForShutdown(live.ds),
-      prepareRiffSessionForShutdown(workerless.ds),
+      prepareRemoteSessionForShutdown(live.ds),
+      prepareRemoteSessionForShutdown(workerless.ds),
     ]).then(results => results.map(asPrepared));
-    const originalPersist = sessionStore.persistActiveRiffLineageExact;
-    vi.spyOn(sessionStore, 'persistActiveRiffLineageExact').mockImplementation(
+    const originalPersist = sessionStore.persistActiveRemoteLineageExact;
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineageExact').mockImplementation(
       (sessionId, taskId) => {
         if (sessionId === workerless.ds.session.sessionId) throw new Error('target disk full');
         return originalPersist(sessionId, taskId);
@@ -747,8 +774,8 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     );
 
     const persistence = [
-      persistPreparedRiffShutdown(live.ds, livePrepared!),
-      persistPreparedRiffShutdown(workerless.ds, workerlessPrepared!),
+      persistPreparedRemoteShutdown(live.ds, livePrepared!),
+      persistPreparedRemoteShutdown(workerless.ds, workerlessPrepared!),
     ];
     expect(persistence[0]).toEqual({ ok: true });
     expect(persistence[1]).toMatchObject({
@@ -757,46 +784,46 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     });
 
     await Promise.all([
-      abortPreparedRiffShutdown(live.ds, livePrepared!),
-      abortPreparedRiffShutdown(workerless.ds, workerlessPrepared!),
+      abortPreparedRemoteShutdown(live.ds, livePrepared!),
+      abortPreparedRemoteShutdown(workerless.ds, workerlessPrepared!),
     ]);
     expect(live.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_abort',
+      'remote_shutdown_prepare',
+      'remote_shutdown_abort',
     ]);
-    expect(live.messages.some(message => message.type === 'riff_shutdown_commit')).toBe(false);
+    expect(live.messages.some(message => message.type === 'remote_shutdown_commit')).toBe(false);
     expect(live.ds.worker).toBe(live.worker);
-    expect(live.ds.riffShutdownState).toBeUndefined();
-    expect(workerless.ds.riffShutdownState).toBeUndefined();
+    expect(live.ds.remoteShutdownState).toBeUndefined();
+    expect(workerless.ds.remoteShutdownState).toBeUndefined();
     expect(sessionStore.getSessionFresh(workerless.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-workerless-parent');
   });
 
   it('retains a fail-closed fence when an unverified prepared worker exits before abort', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-unverified-child',
         }));
       }
     });
-    const prepared = asPrepared(await prepareRiffSessionForShutdown(f.ds));
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
     f.worker.exitCode = 1;
     // worker-pool clears the exact dead child handle but retains this request's
     // shutdown fence for the coordinator.
     f.ds.worker = null;
 
-    expect(persistPreparedRiffShutdown(f.ds, prepared)).toMatchObject({
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toMatchObject({
       ok: false,
       error: 'stale_worker_generation',
     });
-    await expect(abortPreparedRiffShutdown(f.ds, prepared)).resolves.toMatchObject({
+    await expect(abortPreparedRemoteShutdown(f.ds, prepared)).resolves.toMatchObject({
       ok: false,
       error: 'worker_exited_before_admission_restore',
     });
     expect(f.ds.worker).toBeNull();
-    expect(f.ds.riffShutdownState).toMatchObject({
+    expect(f.ds.remoteShutdownState).toMatchObject({
       phase: 'prepared',
       requestId: prepared.requestId,
     });
@@ -805,7 +832,7 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
 
   it('classifies an unexpected durable lineage as ownership loss and never overwrites it', async () => {
     const f = fixture('task-durable-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => {
           // Simulate a different process advancing the durable owner after
           // prepare, without changing this daemon's runtime generation.
@@ -814,49 +841,49 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
           projection[f.ds.session.sessionId]!.riffParentTaskId = 'task-external-owner';
           writeFileSync(sessionsPath, JSON.stringify(projection, null, 2));
           worker.emit('message', {
-            type: 'riff_shutdown_result', requestId: message.requestId,
+            type: 'remote_shutdown_result', requestId: message.requestId,
             phase: 'prepare', ok: true, taskId: 'task-prepared-child',
           });
         });
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       error: expect.stringContaining('compare-and-set failed'),
       rollbackDisposition: 'retain_fence',
     });
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-external-owner');
-    expect(f.ds.riffShutdownState).toMatchObject({
+    expect(f.ds.remoteShutdownState).toMatchObject({
       phase: 'prepared',
     });
-    expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
   });
 
   it('retains the fence when durable worker ownership changes with the same lineage', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => {
           const sessionsPath = join(dataDir, 'sessions-app.json');
           const projection = JSON.parse(readFileSync(sessionsPath, 'utf8')) as Record<string, any>;
           projection[f.ds.session.sessionId]!.pid = 999_999;
           writeFileSync(sessionsPath, JSON.stringify(projection, null, 2));
           worker.emit('message', {
-            type: 'riff_shutdown_result', requestId: message.requestId,
+            type: 'remote_shutdown_result', requestId: message.requestId,
             phase: 'prepare', ok: true, taskId: 'task-prepared-child',
           });
         });
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       error: expect.stringContaining('owner compare-and-set failed'),
       rollbackDisposition: 'retain_fence',
     });
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
-    expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)).toMatchObject({
       pid: 999_999,
       riffParentTaskId: 'task-parent',
@@ -864,8 +891,8 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
   });
 
   it('retains the fence when ownership is replaced after CAS with the same task id', async () => {
-    const originalPersist = sessionStore.persistActiveRiffLineageExact;
-    vi.spyOn(sessionStore, 'persistActiveRiffLineageExact').mockImplementation(
+    const originalPersist = sessionStore.persistActiveRemoteLineageExact;
+    vi.spyOn(sessionStore, 'persistActiveRemoteLineageExact').mockImplementation(
       (sessionId, taskId, options) => {
         const result = originalPersist(sessionId, taskId, options);
         // Exact replacement race: CAS wrote the expected task, then a new
@@ -878,22 +905,22 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       },
     );
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-same-after-replacement',
         }));
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       taskId: 'task-same-after-replacement',
       error: expect.stringContaining('fresh_lineage_verification_failed:'),
       rollbackDisposition: 'retain_fence',
     });
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
-    expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)).toMatchObject({
       pid: 888_888,
       riffParentTaskId: 'task-same-after-replacement',
@@ -909,62 +936,62 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       return originalFresh(sessionId);
     });
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-written-not-verified',
         }));
       }
     });
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       error: 'fresh_lineage_verification_failed:lock unavailable',
       rollbackDisposition: 'retain_fence',
     });
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'prepared' });
-    expect(f.messages.map(message => message.type)).toEqual(['riff_shutdown_prepare']);
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'prepared' });
+    expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
     expect(originalFresh(f.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-written-not-verified');
   });
 
   it('can release an exited prepared generation only after its lineage was durably verified', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-verified-child',
         }));
       }
     });
-    const prepared = asPrepared(await prepareRiffSessionForShutdown(f.ds));
-    expect(persistPreparedRiffShutdown(f.ds, prepared)).toEqual({ ok: true });
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toEqual({ ok: true });
     f.worker.exitCode = 0;
     f.ds.worker = null;
 
-    expect(canAbortVerifiedExitedRiffPreparation(f.ds, prepared)).toBe(true);
+    expect(canAbortVerifiedExitedRemotePreparation(f.ds, prepared)).toBe(true);
 
-    await expect(abortPreparedRiffShutdown(f.ds, prepared)).resolves.toEqual({
+    await expect(abortPreparedRemoteShutdown(f.ds, prepared)).resolves.toEqual({
       ok: true,
       taskId: 'task-verified-child',
     });
     expect(f.ds.worker).toBeNull();
-    expect(f.ds.riffShutdownState).toBeUndefined();
+    expect(f.ds.remoteShutdownState).toBeUndefined();
     expect(sessionStore.getSessionFresh(f.ds.session.sessionId)?.riffParentTaskId)
       .toBe('task-verified-child');
   });
 
   it('does not bless a replacement generation when the verified prepared worker exits', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_prepare') {
+      if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result', requestId: message.requestId,
+          type: 'remote_shutdown_result', requestId: message.requestId,
           phase: 'prepare', ok: true, taskId: 'task-verified-before-replacement',
         }));
       }
     });
-    const prepared = asPrepared(await prepareRiffSessionForShutdown(f.ds));
-    expect(persistPreparedRiffShutdown(f.ds, prepared)).toEqual({ ok: true });
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toEqual({ ok: true });
     f.worker.exitCode = 0;
     const replacement = new EventEmitter() as FakeWorker;
     replacement.killed = false;
@@ -974,15 +1001,15 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     replacement.kill = vi.fn();
     f.ds.worker = replacement;
 
-    expect(canAbortVerifiedExitedRiffPreparation(f.ds, prepared)).toBe(false);
+    expect(canAbortVerifiedExitedRemotePreparation(f.ds, prepared)).toBe(false);
 
-    await expect(abortPreparedRiffShutdown(f.ds, prepared)).resolves.toMatchObject({
+    await expect(abortPreparedRemoteShutdown(f.ds, prepared)).resolves.toMatchObject({
       ok: false,
       taskId: 'task-verified-before-replacement',
       error: 'new_worker_generation',
     });
     expect(f.ds.worker).toBe(replacement);
-    expect(f.ds.riffShutdownState).toMatchObject({
+    expect(f.ds.remoteShutdownState).toMatchObject({
       phase: 'prepared',
       requestId: prepared.requestId,
     });
@@ -991,9 +1018,9 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
 
   it('times out boundedly and restores the worker instead of falling through to generic kill', async () => {
     const f = fixture('task-parent', (worker, message) => {
-      if (message.type === 'riff_shutdown_abort') {
+      if (message.type === 'remote_shutdown_abort') {
         queueMicrotask(() => worker.emit('message', {
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: message.requestId,
           phase: 'abort',
           ok: true,
@@ -1001,15 +1028,15 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
         }));
       }
     });
-    const result = await detachRiffWorkerForShutdown(f.ds, {
+    const result = await detachRemoteWorkerForShutdown(f.ds, {
       drainTimeoutMs: 10,
       abortTimeoutMs: 100,
     });
 
-    expect(result).toMatchObject({ ok: false, error: 'riff_shutdown_prepare_timeout' });
+    expect(result).toMatchObject({ ok: false, error: 'remote_shutdown_prepare_timeout' });
     expect(f.messages.map(message => message.type)).toEqual([
-      'riff_shutdown_prepare',
-      'riff_shutdown_abort',
+      'remote_shutdown_prepare',
+      'remote_shutdown_abort',
     ]);
     expect(f.worker.kill).not.toHaveBeenCalled();
     expect(f.ds.worker).toBe(f.worker);
@@ -1018,21 +1045,21 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
   it('keeps daemon admission fenced until delayed abort restoration is ACKed', async () => {
     let abortRequestId: string | undefined;
     const f = fixture('task-parent', (_worker, message) => {
-      if (message.type === 'riff_shutdown_abort') abortRequestId = message.requestId;
+      if (message.type === 'remote_shutdown_abort') abortRequestId = message.requestId;
     });
-    const detach = detachRiffWorkerForShutdown(f.ds, {
+    const detach = detachRemoteWorkerForShutdown(f.ds, {
       drainTimeoutMs: 5,
       abortTimeoutMs: 200,
     });
     await vi.waitFor(() => expect(abortRequestId).toEqual(expect.any(String)));
 
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'preparing' });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
     expect(sendWorkerInput(f.ds, 'must remain fenced', 'turn-during-abort')).toBe(false);
-    expect(f.messages.some(message => message.type === 'riff_shutdown_commit')).toBe(false);
+    expect(f.messages.some(message => message.type === 'remote_shutdown_commit')).toBe(false);
     expect(f.worker.kill).not.toHaveBeenCalled();
 
     f.worker.emit('message', {
-      type: 'riff_shutdown_result',
+      type: 'remote_shutdown_result',
       requestId: abortRequestId,
       phase: 'abort',
       ok: true,
@@ -1040,9 +1067,9 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     });
     await expect(detach).resolves.toMatchObject({
       ok: false,
-      error: 'riff_shutdown_prepare_timeout',
+      error: 'remote_shutdown_prepare_timeout',
     });
-    expect(f.ds.riffShutdownState).toBeUndefined();
+    expect(f.ds.remoteShutdownState).toBeUndefined();
   });
 
   it('refuses before worker prepare when daemon-owned raw/follow-up input is pending', async () => {
@@ -1053,7 +1080,7 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
       cliInput: '<user_message>follow-up</user_message>',
     };
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       error: expect.stringContaining('daemon_inputs_not_drained:'),
     });
@@ -1066,7 +1093,7 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
     const f = fixture('task-parent', () => { /* no worker IPC is safe */ });
     f.ds.session.queued = true;
 
-    await expect(detachRiffWorkerForShutdown(f.ds)).resolves.toMatchObject({
+    await expect(detachRemoteWorkerForShutdown(f.ds)).resolves.toMatchObject({
       ok: false,
       error: expect.stringContaining('queued=1'),
     });
@@ -1077,16 +1104,16 @@ describe('Riff graceful daemon-shutdown detach coordinator', () => {
 
   it('retains the fail-closed fence when abort restoration cannot be confirmed', async () => {
     const f = fixture('task-parent', () => { /* prepare and abort both held */ });
-    const result = await detachRiffWorkerForShutdown(f.ds, {
+    const result = await detachRemoteWorkerForShutdown(f.ds, {
       drainTimeoutMs: 5,
       abortTimeoutMs: 5,
     });
 
     expect(result).toMatchObject({
       ok: false,
-      error: expect.stringContaining('admission_restore_failed:riff_shutdown_abort_timeout'),
+      error: expect.stringContaining('admission_restore_failed:remote_shutdown_abort_timeout'),
     });
-    expect(f.ds.riffShutdownState).toMatchObject({ phase: 'preparing' });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
     expect(sendWorkerInput(f.ds, 'still blocked', 'turn-fail-closed')).toBe(false);
     expect(f.worker.kill).not.toHaveBeenCalled();
   });

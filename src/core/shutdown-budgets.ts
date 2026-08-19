@@ -1,32 +1,33 @@
 /**
  * Graceful-shutdown budgets are shared with the CLI/PM2 supervisor. Keep the
- * ordering monotonic: a Riff create/follow-up fetch is bounded at 10s,
+ * ordering monotonic: the longest pre-lineage remote operation is bounded at
+ * 10s (Riff create/follow-up; Mojo init waits at most 8s),
  * admission restoration after a refused prepare at 11s, and ordinary worker
- * exit at 3s. Shutdown never cancels accepted Riff work as a fallback.
+ * exit at 3s. Shutdown never cancels accepted remote work as a fallback.
  */
-export const RIFF_SHUTDOWN_DRAIN_TIMEOUT_MS = 12_000;
+export const REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS = 12_000;
 
 /** Admission restoration can wait for the same bounded 10s create/follow-up
  * that prepare was draining. The daemon keeps its retirement fence throughout. */
-export const RIFF_ADMISSION_RESTORE_TIMEOUT_MS = 11_000;
+export const REMOTE_ADMISSION_RESTORE_TIMEOUT_MS = 11_000;
 
 /** Bounded acquisition of the bot-wide mutation lease. A timed-out waiter is
  * removed and can never run after shutdown has already been refused. */
 export const BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS = 1_000;
 
 /** Initial all-owner snapshot and phase-2 batch CAS each use one short lock. */
-export const RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS = 1_000;
-export const RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS = 1_000;
+export const REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS = 1_000;
+export const REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS = 1_000;
 
 /** Scheduling/logging slack inside the supervisor-visible daemon budget. */
 export const DAEMON_SHUTDOWN_OVERHEAD_MS = 2_000;
 export const DAEMON_WORKER_EXIT_GRACE_MS = 3_000;
 export const DAEMON_SHUTDOWN_MAX_MS =
   BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
-  + RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
-  + RIFF_SHUTDOWN_DRAIN_TIMEOUT_MS
-  + RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
-  + Math.max(RIFF_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
+  + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
+  + REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS
+  + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
+  + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
   + DAEMON_SHUTDOWN_OVERHEAD_MS;
 export const PM2_DAEMON_KILL_TIMEOUT_MS = 29_000;
 export const PM2_DAEMON_RESTART_DELAY_MS = 3_000;

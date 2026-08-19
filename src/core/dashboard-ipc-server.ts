@@ -85,13 +85,14 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
-import { isSuspendableBackendType } from './persistent-backend.js';
+import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -207,7 +208,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
-import { isRiffBackendSession } from './persistent-backend.js';
+import { isRemoteBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
@@ -1049,7 +1050,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     // never clear a stale pre-drain snapshot while a turn is still preparing.
     const current = findSessionRecord(params.sessionId);
     if (current && current.status === 'closed') {
-      return jsonRes(res, 200, { ok: true, alreadyClosed: true });
+      // A closed row can still carry an UNCANCELLED remote session (a quarantined
+      // lineage is parked, not cancelled). Short-circuiting to a bare success here
+      // meant a retry — or any client that lost the first response — could never
+      // learn about it, so replay the same outcome the close itself would report.
+      const residual = mojoCloseResidualForRow(current);
+      return jsonRes(res, 200, residual
+        ? { ok: true, outcome: 'closed_with_residual', residual, alreadyClosed: true }
+        : { ok: true, outcome: 'closed', alreadyClosed: true });
     }
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
@@ -1161,14 +1169,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
   }
-  // Riff owns a remote task lineage. Its worker deliberately refuses restart
-  // because destroy + respawn would sever or replace that lineage. Reject at
-  // the daemon boundary so the dashboard never reports HTTP 200 for a no-op.
-  if (isRiffBackendSession(ds)) {
+  // Every REMOTE backend owns a remote lineage that destroy + respawn would
+  // sever or replace (for mojo the worker restart actively cancels the remote
+  // session and cold-boots a context-less replacement). Reject at the daemon
+  // boundary so the dashboard never reports HTTP 200 for a lineage-destroying
+  // restart.
+  if (isRemoteBackendSession(ds)) {
     return jsonRes(res, 409, {
       ok: false,
-      error: 'riff_restart_unsupported',
-      message: t('cmd.restart.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+      error: 'remote_restart_unsupported',
+      message: t('cmd.restart.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
   if (rejectProtectedSessionMutation(res, [ds])) return;
@@ -1377,6 +1387,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_inject_unsupported' });
   }
+  // Remote backends (riff / mojo) have no TUI to inject a slash line into. For mojo
+  // the injection does not no-op either: MojoBackend.write() starts a REAL remote
+  // turn, and this IPC carries no credential snapshot (unlike message / raw_input),
+  // so an allowlisted slash sent after a JWT rotation or clear would run the turn
+  // on the worker's stale token. Refused rather than wired up: this is a TUI-only
+  // channel, and the same reasoning already hides the PTY quick-action keys for
+  // these backends.
+  const injectFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (injectFrozenType && isRemoteBackendType(injectFrozenType)) {
+    return jsonRes(res, 409, { ok: false, error: 'remote_backend_inject_unsupported' });
+  }
   if ((!ds.worker || ds.worker.killed) && !isSessionTransferring(ds)) {
     return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
   }
@@ -1496,14 +1517,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
   }
-  // Riff restart/kill is intentionally refused to preserve remote task
-  // lineage. Reject before validation/repin so the persisted cwd cannot drift
-  // from the still-running sandbox.
-  if (isRiffBackendSession(ds)) {
+  // Remote retirement (Riff AND Mojo) is intentionally refused without
+  // prepare/commit, so a cold restart cannot follow a repin here. Reject
+  // before validation/repin so the persisted cwd cannot drift from the
+  // still-running remote lineage — mojo used to slip past the riff-only
+  // guard, repin, and then killWorker's refusal left the live worker on the
+  // old cwd while the route reported cold-restart (P1-a split brain).
+  if (isRemoteBackendSession(ds)) {
     return jsonRes(res, 409, {
       ok: false,
-      error: 'riff_cd_unsupported',
-      message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+      error: 'remote_cd_unsupported',
+      message: t('cmd.cd.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
@@ -3168,6 +3192,7 @@ async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
   return { ok: true, listener, limit: normalizeMessageListenerPreviewLimit(raw.limit) };
 }
 
+
 async function collectMessageListenerPreviewMatches(
   larkAppId: string,
   chatId: string,
@@ -4133,13 +4158,15 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       delete entry.readIsolation;
       readIsolationCleared = true;
     }
-    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
-    if (selected.cliId === 'riff') {
-      entry.backendType = 'riff';
-    } else if (entry.backendType === 'riff') {
-      // 从 riff 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在 RiffBackend 上（PTY 分块输入被当成一串 riff
-      // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
+    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
+    // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
+    // 硬编码 riff。
+    if (isRemoteCliId(selected.cliId)) {
+      entry.backendType = selected.cliId as typeof entry.backendType;
+    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
       delete entry.backendType;
     }
     return { write: true, result: { nextReasoningEffort } };
@@ -4167,9 +4194,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
     else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
     if (readIsolationCleared) bot.config.readIsolation = false;
-    if (selected.cliId === 'riff') {
-      bot.config.backendType = 'riff';
-    } else if (bot.config.backendType === 'riff') {
+    if (isRemoteCliId(selected.cliId)) {
+      bot.config.backendType = selected.cliId as typeof bot.config.backendType;
+    } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
       bot.config.backendType = undefined;
     }
 
@@ -4188,7 +4215,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       selectionKey,
-      closedMismatchedSessions,
+      // Number kept for compatibility with an older dashboard bundle; the residual
+      // count rides alongside so a hot CLI switch cannot silently strand a remote
+      // session behind a plain "closed N". (mojo/riff sessions live off-box, so a
+      // local row can close while the remote one survives.)
+      closedMismatchedSessions: closedMismatchedSessions.closed,
+      closedMismatchedResidual: closedMismatchedSessions.residual,
+      closedMismatchedFailed: closedMismatchedSessions.failed,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.

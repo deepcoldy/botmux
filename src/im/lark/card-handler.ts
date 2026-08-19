@@ -5,6 +5,7 @@
  */
 import { execSync } from 'node:child_process';
 import { basename as pathBasename, dirname, join } from 'node:path';
+import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
@@ -102,7 +103,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { isRiffBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
@@ -454,14 +455,16 @@ export async function commitRepoSelection(
     return false;
   }
 
-  // A live Riff generation cannot use the generic close-and-refork branch.
-  // Riff teardown is a remote prepare/commit protocol; a failed cancellation
-  // followed by forkWorker would reach the double-fork kill and orphan the
-  // still-live remote task.  Require an explicit /close before any card,
-  // worktree, or manual-directory selection can replace this generation.
-  if (!ds.pendingRepo && isRiffBackendSession(ds)) {
-    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, locTarget));
-    logger.warn(`[${tag(ds)}] Repo switch refused: Riff session requires explicit close before replacement`);
+  // A live REMOTE generation (Riff or Mojo) cannot use the generic
+  // close-and-refork branch. Remote teardown is a prepare/commit protocol; a
+  // failed cancellation followed by forkWorker would reach the double-fork
+  // kill and orphan the still-live remote task. Require an explicit /close
+  // before any card, worktree, or manual-directory selection can replace this
+  // generation. (Fourth-round review: the riff-only predicate left the card
+  // entry point open for mojo.)
+  if (!ds.pendingRepo && isRemoteBackendSession(ds)) {
+    await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, locTarget));
+    logger.warn(`[${tag(ds)}] Repo switch refused: remote session requires explicit close before replacement`);
     return false;
   }
 
@@ -717,7 +720,25 @@ export async function commitRepoSelection(
         // frozen-card file; it is re-keyed under the replacement session below.
         parkStreamCard(current);
         const oldSession = current.session;
-        await closeWorkerPoolSession(targetSessionId);
+        const closeResult = await closeWorkerPoolSession(targetSessionId);
+        // A refused close (remote cancellation unproven) leaves the row ACTIVE on
+        // purpose. Deleting the owner anyway would strand an active row with no
+        // owner — a ghost — while the remote session keeps running and holding the
+        // injected credential. Abort the switch instead. (Same guard as the text
+        // /repo path in command-handler.)
+        if (!closeResult.ok) {
+          return { ok: false as const, error: 'close_refused' as const };
+        }
+        if (closeResult.outcome === 'closed_with_residual') {
+          // Same rule as the text /repo path: picking a directory is not consent
+          // to leave a remote session running, so stop instead of spawning a
+          // replacement on top of it.
+          return {
+            ok: false as const,
+            error: 'close_residual' as const,
+            residual: closeResult.residual,
+          };
+        }
         if (activeSessions.get(key) === current) activeSessions.delete(key);
         if (activeSessions.has(key)) {
           return { ok: false as const, error: 'session_replaced' as const };
@@ -767,6 +788,24 @@ export async function commitRepoSelection(
         await sessionReply(
           rootId,
           '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+        );
+      } else if (switched.error === 'close_residual') {
+        await sessionReply(
+          rootId,
+          closeResidualIsLocal(switched.residual)
+            ? '⚠️ 原会话已在本地关闭、远端会话已取消，但**本机可能残留带凭证的子进程未确认终止**'
+              + `（${describeCloseResidual(switched.residual)}），请人工核查该主机进程。\n`
+              + '**未创建新会话** —— 请先确认该子进程已终止，再重新切换仓库。'
+            : '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+              + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+              + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
+        );
+      } else if (switched.error === 'close_refused') {
+        // Without this the user taps the card and gets nothing back, while the old
+        // session is still active and its remote session still running.
+        await sessionReply(
+          rootId,
+          '⚠️ 无法切换仓库：原会话的远端会话未能确认取消，已保留原会话以便重试。请稍后重试。',
         );
       }
       return false;
@@ -2389,12 +2428,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
-      // New Riff cards omit this button, but old/stale cards remain clickable.
-      // Surface the same explicit close-and-recreate guidance as /restart
-      // instead of forwarding an IPC the Riff worker must silently refuse.
-      if (isRiffBackendSession(ds)) {
-        logger.warn(`[${tag(ds)}] Rejected restart on Riff backend session`);
-        const unsupported = t('cmd.restart.riff_unsupported', undefined, locDs);
+      // New remote cards omit this button, but old/stale cards remain
+      // clickable. Surface the same explicit close-and-recreate guidance as
+      // /restart. This must cover EVERY remote backend: unlike riff (whose
+      // worker refuses restart), a mojo worker EXECUTES restart — its teardown
+      // cancels the remote session and cold-boots a context-less replacement —
+      // so a riff-only guard here was a real user entry point into a silent
+      // remote-session destruction (fourth-round review, gate 1).
+      if (isRemoteBackendSession(ds)) {
+        logger.warn(`[${tag(ds)}] Rejected restart on remote backend session`);
+        const unsupported = t('cmd.restart.remote_unsupported', undefined, locDs);
         await deliverEphemeralOrReply(
           ds,
           operatorOpenId,
@@ -2460,11 +2503,30 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Build the closed card BEFORE closeWorkerPoolSession — it reads the
         // live session's identity off `current`.
         const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+        let closeResult;
         try {
-          await closeWorkerPoolSession(targetSessionId);
+          closeResult = await closeWorkerPoolSession(targetSessionId);
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
           return { status: 'teardown_failed' as const, err };
+        }
+        // Returned (not thrown) refusal: the remote session could not be proven
+        // cancelled, so the row stays active. Sending the closed card here would
+        // tell the user it is gone while it keeps running.
+        if (!closeResult.ok) {
+          logger.error(
+            `[${tag(current)}] Refused close: remote cancellation not proven (${closeResult.error})`,
+          );
+          return { status: 'close_refused' as const, result: closeResult };
+        }
+        if (closeResult.outcome === 'closed_with_residual') {
+          return {
+            status: 'closed_with_residual' as const,
+            current,
+            botCfg,
+            card,
+            residual: closeResult.residual,
+          };
         }
         return { status: 'closed' as const, current, botCfg, card };
       });
@@ -2476,6 +2538,35 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           toast: {
             type: 'warning',
             content: `会话关闭失败：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
+          },
+        };
+      }
+      if (closed.status === 'closed_with_residual') {
+        // Closed locally, with a residual. A LOCAL-subtree residual has no taskId,
+        // so the old wording rendered "远端会话 undefined 未被取消" and pointed the
+        // operator at a nonexistent remote session (round-11 P1-2).
+        return {
+          toast: {
+            type: 'warning',
+            content: closeResidualIsLocal(closed.residual)
+              ? `会话已在本地关闭、远端会话已取消，但本机可能残留带凭证子进程未确认终止`
+                + `（${describeCloseResidual(closed.residual)}），请人工核查该主机进程。`
+              : `会话已在本地关闭，但远端会话 ${closed.residual.taskId} 未被取消`
+                + '（控制面无法验证），需要人工清理。',
+          },
+        };
+      }
+      if (closed.status === 'close_refused') {
+        const locClose = localeForBot(larkAppId);
+        return {
+          toast: {
+            type: 'warning',
+            content: closed.result.taskId
+              ? t('card.action.close_refused_with_task', {
+                  error: closed.result.error,
+                  taskId: closed.result.taskId,
+                }, locClose)
+              : t('card.action.close_refused', { error: closed.result.error }, locClose),
           },
         };
       }
@@ -3535,12 +3626,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
   }
 
-  // Reject a live Riff repo/worktree replacement before slug generation or
+  // Reject a live REMOTE repo/worktree replacement before slug generation or
   // any local/remote Git side effect. First-spawn pendingRepo selections stay
-  // recoverable when a synchronous fork failure has already stamped Riff.
-  if (!targetDs.pendingRepo && isRiffBackendSession(targetDs)) {
-    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, localeForBot(targetDs.larkAppId)));
-    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: Riff session requires explicit close before replacement`);
+  // recoverable when a synchronous fork failure has already stamped the
+  // remote backend.
+  if (!targetDs.pendingRepo && isRemoteBackendSession(targetDs)) {
+    await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, localeForBot(targetDs.larkAppId)));
+    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: remote session requires explicit close before replacement`);
     return;
   }
 

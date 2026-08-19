@@ -34,9 +34,11 @@ export function requestAgentSessionRename(
     return { status: 'not_running', ...(cliId ? { cliId } : {}) };
   }
 
-  // Riff's write() creates a remote task per call; a TUI command split into
-  // text + Enter would create two unrelated tasks. It has no local TUI anyway.
-  if ((ds.initConfig?.backendType ?? ds.session.backendType) === 'riff') {
+  // A remote backend's write() creates one remote turn/task per call, so a TUI
+  // command split into text + Enter would create two unrelated ones. Neither
+  // riff nor mojo has a local TUI to rename anyway.
+  const renameBackend = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (renameBackend === 'riff' || renameBackend === 'mojo') {
     return { status: 'unsupported', ...(cliId ? { cliId } : {}) };
   }
 

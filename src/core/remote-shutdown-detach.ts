@@ -4,11 +4,12 @@ import type { DaemonToWorker, WorkerToDaemon } from '../types.js';
 import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 import type { DaemonSession } from './types.js';
+import { isRemoteBackendType } from './persistent-backend.js';
 import {
-  RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
-  RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
-  RIFF_SHUTDOWN_DRAIN_TIMEOUT_MS,
-  RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
+  REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from './shutdown-budgets.js';
 
 type ShutdownPhase = 'prepare' | 'abort';
@@ -19,7 +20,7 @@ type ShutdownPhaseResult = {
   error?: string;
 };
 
-export type PreparedRiffShutdown = {
+export type PreparedRemoteShutdown = {
   ok: true;
   fence: 'prepared';
   requestId: string;
@@ -46,7 +47,7 @@ export type PreparedRiffShutdown = {
   worker: ChildProcess | null;
 };
 
-export type RiffShutdownFailure = {
+export type RemoteShutdownFailure = {
   ok: false;
   requestId?: string;
   taskId: string | null;
@@ -58,44 +59,44 @@ export type RiffShutdownFailure = {
 
 /** A prepare refusal that is proven to have happened before the worker/backend
  * fence. It must never be sent an abort request. */
-export type UnfencedRiffShutdownRefusal = RiffShutdownFailure & {
+export type UnfencedRemoteShutdownRefusal = RemoteShutdownFailure & {
   fence: 'none';
 };
 
 /** A prepare attempt whose exact worker may have installed its backend fence.
  * Preparation deliberately does not restore admission inline; the fleet
  * coordinator includes this handle in its one concurrent abort wave. */
-export type PossiblyFencedRiffShutdown = RiffShutdownFailure & {
+export type PossiblyFencedRemoteShutdown = RemoteShutdownFailure & {
   fence: 'possible';
   requestId: string;
   worker: ChildProcess;
   expectedAbortTaskId?: string | null;
 };
 
-export type RiffShutdownPrepareResult =
-  | PreparedRiffShutdown
-  | UnfencedRiffShutdownRefusal
-  | PossiblyFencedRiffShutdown;
+export type RemoteShutdownPrepareResult =
+  | PreparedRemoteShutdown
+  | UnfencedRemoteShutdownRefusal
+  | PossiblyFencedRemoteShutdown;
 
-export type RiffShutdownPrepareOptions = {
+export type RemoteShutdownPrepareOptions = {
   drainTimeoutMs?: number;
   abortTimeoutMs?: number;
   /** Absolute transaction deadline. A worker is never asked to fence unless
    * phase-2 plus the configured admission-restore reserve remain after drain. */
   deadlineMs?: number;
   now?: () => number;
-  /** One projection sampled by prepareRiffFleetForShutdown before any fence. */
-  durableSnapshot?: sessionStore.ActiveRiffShutdownSnapshot;
+  /** One projection sampled by prepareRemoteFleetForShutdown before any fence. */
+  durableSnapshot?: sessionStore.ActiveRemoteShutdownSnapshot;
 };
 
-export type RiffFleetPrepareEntry = {
+export type RemoteFleetPrepareEntry = {
   ds: DaemonSession;
-  result: RiffShutdownPrepareResult;
+  result: RemoteShutdownPrepareResult;
 };
 
-export type FencedRiffShutdownParticipant =
-  | PreparedRiffShutdown
-  | PossiblyFencedRiffShutdown;
+export type FencedRemoteShutdownParticipant =
+  | PreparedRemoteShutdown
+  | PossiblyFencedRemoteShutdown;
 
 export type UniqueDaemonShutdownSessions =
   | { ok: true; sessions: DaemonSession[] }
@@ -129,7 +130,7 @@ export function collectUniqueDaemonShutdownSessions(
   return { ok: true, sessions };
 }
 
-export type RiffShutdownDetachOutcome =
+export type RemoteShutdownDetachOutcome =
   | {
       ok: true;
       requestId: string;
@@ -137,7 +138,7 @@ export type RiffShutdownDetachOutcome =
       disposition: 'lineage_persisted';
       worker?: ChildProcess;
     }
-  | RiffShutdownFailure;
+  | RemoteShutdownFailure;
 
 function label(ds: DaemonSession): string {
   return ds.session.sessionId.slice(0, 8);
@@ -178,7 +179,7 @@ function requestPhase(
     };
     const onMessage = (raw: unknown): void => {
       const msg = raw as WorkerToDaemon;
-      if (msg?.type !== 'riff_shutdown_result'
+      if (msg?.type !== 'remote_shutdown_result'
           || msg.requestId !== requestId
           || msg.phase !== phase) return;
       if (ds.worker !== worker) {
@@ -199,16 +200,16 @@ function requestPhase(
     const timer = setTimeout(() => finish({
       ok: false,
       taskId: null,
-      error: `riff_shutdown_${phase}_timeout`,
+      error: `remote_shutdown_${phase}_timeout`,
     }), timeoutMs);
     timer.unref?.();
     worker.on('message', onMessage);
     worker.once('exit', onExit);
     const message: DaemonToWorker = phase === 'prepare'
-      ? { type: 'riff_shutdown_prepare', requestId }
-      : { type: 'riff_shutdown_abort', requestId };
+      ? { type: 'remote_shutdown_prepare', requestId }
+      : { type: 'remote_shutdown_abort', requestId };
     if (!send(worker, message)) {
-      finish({ ok: false, taskId: null, error: `riff_shutdown_${phase}_send_failed` });
+      finish({ ok: false, taskId: null, error: `remote_shutdown_${phase}_send_failed` });
     }
   });
 }
@@ -220,13 +221,13 @@ function clearWorkerOwnership(ds: DaemonSession, worker: ChildProcess): void {
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.managedTurnOrigin = undefined;
-  ds.riffShutdownState = undefined;
+  ds.remoteShutdownState = undefined;
 }
 
 function clearWorkerlessShutdownState(ds: DaemonSession, requestId: string): void {
-  if (ds.riffShutdownState?.requestId !== requestId) return;
+  if (ds.remoteShutdownState?.requestId !== requestId) return;
   if (ds.worker) return;
-  ds.riffShutdownState = undefined;
+  ds.remoteShutdownState = undefined;
 }
 
 /** Daemon-owned accepted input has not crossed worker IPC yet. The bot-wide
@@ -257,7 +258,7 @@ async function abortWorkerPreparation(
     if (ds.worker && ds.worker !== worker) {
       return {
         ok: false,
-        taskId: ds.riffShutdownState?.taskId ?? ds.session.riffParentTaskId ?? null,
+        taskId: ds.remoteShutdownState?.taskId ?? ds.session.riffParentTaskId ?? null,
         error: 'new_worker_generation',
       };
     }
@@ -269,8 +270,8 @@ async function abortWorkerPreparation(
     // No backend remains to ACK admission restoration and the drained lineage
     // was not durably recovered. Retain a daemon-side fence instead of claiming
     // rollback success and permitting a stale-lineage replacement.
-    if (!ds.riffShutdownState || ds.riffShutdownState.requestId === requestId) {
-      ds.riffShutdownState = {
+    if (!ds.remoteShutdownState || ds.remoteShutdownState.requestId === requestId) {
+      ds.remoteShutdownState = {
         phase: 'prepared',
         requestId,
         taskId: ds.session.riffParentTaskId ?? null,
@@ -285,7 +286,7 @@ async function abortWorkerPreparation(
   if (ds.worker !== worker) {
     return {
       ok: false,
-      taskId: ds.riffShutdownState?.taskId ?? ds.session.riffParentTaskId ?? null,
+      taskId: ds.remoteShutdownState?.taskId ?? ds.session.riffParentTaskId ?? null,
       error: 'new_worker_generation',
     };
   }
@@ -298,8 +299,8 @@ async function abortWorkerPreparation(
         + `actual=${result.taskId ?? 'none'}`,
     };
   }
-  if (result.ok && ds.riffShutdownState?.requestId === requestId) {
-    ds.riffShutdownState = undefined;
+  if (result.ok && ds.remoteShutdownState?.requestId === requestId) {
+    ds.remoteShutdownState = undefined;
   }
   return result;
 }
@@ -308,7 +309,7 @@ function unfencedRefusal(
   ds: DaemonSession,
   error: string,
   requestId?: string,
-): UnfencedRiffShutdownRefusal {
+): UnfencedRemoteShutdownRefusal {
   return {
     ok: false,
     fence: 'none',
@@ -318,22 +319,22 @@ function unfencedRefusal(
   };
 }
 
-/** Phase 1: fence one exact Riff generation and drain task-id materialization.
+/** Phase 1: fence one exact remote generation and drain lineage materialization.
  * Nothing exits or restores admission here. A failure after the prepare send
  * returns an exact possibly-fenced handle so all peers can be restored in one
  * concurrent fleet wave rather than serial drain+abort chains. */
-export async function prepareRiffSessionForShutdown(
+export async function prepareRemoteSessionForShutdown(
   ds: DaemonSession,
-  options: RiffShutdownPrepareOptions = {},
-): Promise<RiffShutdownPrepareResult> {
+  options: RemoteShutdownPrepareOptions = {},
+): Promise<RemoteShutdownPrepareResult> {
   const frozenBackend = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozenBackend !== 'riff') {
-    return unfencedRefusal(ds, 'not_riff_backend');
+  if (!frozenBackend || !isRemoteBackendType(frozenBackend)) {
+    return unfencedRefusal(ds, 'not_remote_backend');
   }
-  if (ds.riffCloseState || ds.riffShutdownState) {
+  if (ds.remoteCloseState || ds.remoteShutdownState) {
     return unfencedRefusal(
       ds,
-      ds.riffCloseState ? 'explicit_close_in_progress' : 'shutdown_detach_in_progress',
+      ds.remoteCloseState ? 'explicit_close_in_progress' : 'shutdown_detach_in_progress',
     );
   }
   const daemonBlockerBeforePrepare = daemonInputBlocker(ds);
@@ -345,7 +346,7 @@ export async function prepareRiffSessionForShutdown(
   let durableSnapshot = options.durableSnapshot;
   if (!durableSnapshot) {
     try {
-      [durableSnapshot] = sessionStore.getActiveRiffShutdownSnapshotsBatch([
+      [durableSnapshot] = sessionStore.getActiveRemoteShutdownSnapshotsBatch([
         ds.session.sessionId,
       ]);
     } catch (err) {
@@ -376,12 +377,12 @@ export async function prepareRiffSessionForShutdown(
   }
 
   const now = options.now ?? Date.now;
-  const abortReserveMs = options.abortTimeoutMs ?? RIFF_ADMISSION_RESTORE_TIMEOUT_MS;
-  let drainTimeoutMs = options.drainTimeoutMs ?? RIFF_SHUTDOWN_DRAIN_TIMEOUT_MS;
+  const abortReserveMs = options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS;
+  let drainTimeoutMs = options.drainTimeoutMs ?? REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS;
   if (options.deadlineMs !== undefined) {
     const availableDrainMs = options.deadlineMs
       - now()
-      - RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
+      - REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
       - abortReserveMs;
     if (availableDrainMs <= 0) {
       return unfencedRefusal(ds, 'insufficient_abort_budget_before_fence');
@@ -399,7 +400,7 @@ export async function prepareRiffSessionForShutdown(
     // Workerless rows can still carry a newer runtime-only lineage after a
     // failed ordinary riff_task_id save. Fence daemon admission now; phase 2
     // performs an exact owner/lineage CAS and fresh disk verification.
-    ds.riffShutdownState = {
+    ds.remoteShutdownState = {
       phase: 'prepared',
       requestId,
       taskId: ds.session.riffParentTaskId ?? null,
@@ -417,7 +418,7 @@ export async function prepareRiffSessionForShutdown(
     };
   }
 
-  ds.riffShutdownState = { phase: 'preparing', requestId };
+  ds.remoteShutdownState = { phase: 'preparing', requestId };
   const prepared = await requestPhase(
     ds,
     worker,
@@ -430,11 +431,11 @@ export async function prepareRiffSessionForShutdown(
     // fence. Every other failure has ambiguous fence state and requires a
     // positive admission-restored ACK.
     const unfencedWorkerRefusal = prepared.error === 'explicit_close_in_progress'
-      || prepared.error === 'not_riff_backend'
-      || prepared.error === 'riff_shutdown_prepare_send_failed'
+      || prepared.error === 'not_remote_backend'
+      || prepared.error === 'remote_shutdown_prepare_send_failed'
       || prepared.error?.startsWith('worker_inputs_not_drained:') === true;
-    if (unfencedWorkerRefusal && ds.riffShutdownState?.requestId === requestId) {
-      ds.riffShutdownState = undefined;
+    if (unfencedWorkerRefusal && ds.remoteShutdownState?.requestId === requestId) {
+      ds.remoteShutdownState = undefined;
     }
     if (unfencedWorkerRefusal) {
       return {
@@ -442,7 +443,7 @@ export async function prepareRiffSessionForShutdown(
         fence: 'none',
         requestId,
         taskId: prepared.taskId,
-        error: prepared.error ?? 'riff_shutdown_prepare_failed',
+        error: prepared.error ?? 'remote_shutdown_prepare_failed',
       };
     }
     return {
@@ -450,7 +451,7 @@ export async function prepareRiffSessionForShutdown(
       fence: 'possible',
       requestId,
       taskId: prepared.taskId,
-      error: prepared.error ?? 'riff_shutdown_prepare_failed',
+      error: prepared.error ?? 'remote_shutdown_prepare_failed',
       worker,
     };
   }
@@ -464,7 +465,7 @@ export async function prepareRiffSessionForShutdown(
       worker,
     };
   }
-  ds.riffShutdownState = { phase: 'prepared', requestId, taskId: prepared.taskId };
+  ds.remoteShutdownState = { phase: 'prepared', requestId, taskId: prepared.taskId };
 
   // Worker events can release a queued-activation journal/tail independently
   // of bot-turn admission. Re-sample after drain so commit cannot strand input.
@@ -494,8 +495,8 @@ export async function prepareRiffSessionForShutdown(
   };
 }
 
-export type RiffFleetPrepareOptions = Omit<
-  RiffShutdownPrepareOptions,
+export type RemoteFleetPrepareOptions = Omit<
+  RemoteShutdownPrepareOptions,
   'durableSnapshot'
 > & {
   snapshotTimeoutMs?: number;
@@ -503,14 +504,14 @@ export type RiffFleetPrepareOptions = Omit<
 
 /** Take one fresh projection for the complete candidate set, then (and only
  * then) publish prepare requests concurrently. */
-export async function prepareRiffFleetForShutdown(
+export async function prepareRemoteFleetForShutdown(
   candidates: readonly DaemonSession[],
-  options: RiffFleetPrepareOptions = {},
-): Promise<RiffFleetPrepareEntry[]> {
+  options: RemoteFleetPrepareOptions = {},
+): Promise<RemoteFleetPrepareEntry[]> {
   if (candidates.length === 0) return [];
   const now = options.now ?? Date.now;
   const configuredSnapshotTimeout = options.snapshotTimeoutMs
-    ?? RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS;
+    ?? REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS;
   const remaining = options.deadlineMs === undefined
     ? configuredSnapshotTimeout
     : Math.max(0, options.deadlineMs - now());
@@ -521,9 +522,9 @@ export async function prepareRiffFleetForShutdown(
     }));
   }
 
-  let snapshots: sessionStore.ActiveRiffShutdownSnapshot[];
+  let snapshots: sessionStore.ActiveRemoteShutdownSnapshot[];
   try {
-    snapshots = sessionStore.getActiveRiffShutdownSnapshotsBatch(
+    snapshots = sessionStore.getActiveRemoteShutdownSnapshotsBatch(
       candidates.map(ds => ds.session.sessionId),
       { maxWaitMs: Math.min(configuredSnapshotTimeout, remaining) },
     );
@@ -537,19 +538,19 @@ export async function prepareRiffFleetForShutdown(
   const snapshotsBySession = new Map(snapshots.map(snapshot => [snapshot.sessionId, snapshot]));
   return Promise.all(candidates.map(async ds => ({
     ds,
-    result: await prepareRiffSessionForShutdown(ds, {
+    result: await prepareRemoteSessionForShutdown(ds, {
       ...options,
       durableSnapshot: snapshotsBySession.get(ds.session.sessionId),
     }),
   })));
 }
 
-function validatePreparedRiffShutdownForPersistence(
+function validatePreparedRemoteShutdownForPersistence(
   ds: DaemonSession,
-  prepared: PreparedRiffShutdown,
-): { ok: true } | RiffShutdownFailure {
-  if (ds.riffShutdownState?.requestId !== prepared.requestId
-      || ds.riffShutdownState.phase !== 'prepared') {
+  prepared: PreparedRemoteShutdown,
+): { ok: true } | RemoteShutdownFailure {
+  if (ds.remoteShutdownState?.requestId !== prepared.requestId
+      || ds.remoteShutdownState.phase !== 'prepared') {
     return {
       ok: false,
       requestId: prepared.requestId,
@@ -620,38 +621,38 @@ function validatePreparedRiffShutdownForPersistence(
   return { ok: true };
 }
 
-export type PreparedRiffFleetEntry = {
+export type PreparedRemoteFleetEntry = {
   ds: DaemonSession;
-  result: PreparedRiffShutdown;
+  result: PreparedRemoteShutdown;
 };
 
-export type RiffFleetPersistenceResult = { ok: true }
-| (RiffShutdownFailure & {
+export type RemoteFleetPersistenceResult = { ok: true }
+| (RemoteShutdownFailure & {
   sessionIds: readonly string[];
   retainFencedSessionIds: readonly string[];
 });
 
 /** Phase 2 fleet transaction: validate every runtime generation, then compare
  * and publish all durable lineage rows with one lock and one rename. */
-export function persistPreparedRiffShutdownFleet(
-  entries: readonly PreparedRiffFleetEntry[],
+export function persistPreparedRemoteShutdownFleet(
+  entries: readonly PreparedRemoteFleetEntry[],
   options: {
     persistTimeoutMs?: number;
     deadlineMs?: number;
     now?: () => number;
   } = {},
-): RiffFleetPersistenceResult {
+): RemoteFleetPersistenceResult {
   if (entries.length === 0) return { ok: true };
   const now = options.now ?? Date.now;
 
   const validationFailures = entries
     .map(({ ds, result }) => ({
       sessionId: ds.session.sessionId,
-      failure: validatePreparedRiffShutdownForPersistence(ds, result),
+      failure: validatePreparedRemoteShutdownForPersistence(ds, result),
     }))
     .filter((entry): entry is {
       sessionId: string;
-      failure: RiffShutdownFailure;
+      failure: RemoteShutdownFailure;
     } => !entry.failure.ok);
   if (validationFailures.length > 0) {
     const retainFencedSessionIds = validationFailures
@@ -660,7 +661,7 @@ export function persistPreparedRiffShutdownFleet(
     return {
       ok: false,
       taskId: null,
-      error: `Riff fleet persistence preflight failed: ${validationFailures
+      error: `Remote fleet persistence preflight failed: ${validationFailures
         .map(({ sessionId, failure }) => `${sessionId}:${failure.error}`)
         .join(';')}`,
       rollbackDisposition: retainFencedSessionIds.length > 0 ? 'retain_fence' : 'abort_safe',
@@ -670,7 +671,7 @@ export function persistPreparedRiffShutdownFleet(
   }
 
   const configuredPersistTimeout = options.persistTimeoutMs
-    ?? RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS;
+    ?? REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS;
   const remaining = options.deadlineMs === undefined
     ? configuredPersistTimeout
     : Math.max(0, options.deadlineMs - now());
@@ -678,7 +679,7 @@ export function persistPreparedRiffShutdownFleet(
     return {
       ok: false,
       taskId: null,
-      error: 'Riff fleet lineage batch failed (prewrite_io): shutdown deadline elapsed',
+      error: 'Remote fleet lineage batch failed (prewrite_io): shutdown deadline elapsed',
       rollbackDisposition: 'abort_safe',
       sessionIds: entries.map(({ ds }) => ds.session.sessionId),
       retainFencedSessionIds: [],
@@ -686,7 +687,7 @@ export function persistPreparedRiffShutdownFleet(
   }
 
   try {
-    sessionStore.persistActiveRiffLineagesExactBatch(entries.map(({ ds, result }) => ({
+    sessionStore.persistActiveRemoteLineagesExactBatch(entries.map(({ ds, result }) => ({
       sessionId: ds.session.sessionId,
       taskId: result.durableTaskIdAtPrepare,
       owner: result.durableOwnerAtPrepare,
@@ -696,7 +697,7 @@ export function persistPreparedRiffShutdownFleet(
       maxWaitMs: Math.min(configuredPersistTimeout, remaining),
     });
   } catch (error) {
-    const batchError = error instanceof sessionStore.RiffLineageBatchError ? error : undefined;
+    const batchError = error instanceof sessionStore.RemoteLineageBatchError ? error : undefined;
     const stage = batchError?.stage ?? 'prewrite_io';
     const retainFencedSessionIds = stage === 'postrename_ambiguity'
       ? entries.map(({ ds }) => ds.session.sessionId)
@@ -706,7 +707,7 @@ export function persistPreparedRiffShutdownFleet(
     return {
       ok: false,
       taskId: null,
-      error: `Riff fleet lineage batch failed (${stage}): ${error instanceof Error
+      error: `Remote fleet lineage batch failed (${stage}): ${error instanceof Error
         ? error.message
         : String(error)}`,
       rollbackDisposition: retainFencedSessionIds.length > 0 ? 'retain_fence' : 'abort_safe',
@@ -731,7 +732,7 @@ export function persistPreparedRiffShutdownFleet(
     };
   }
   const lost = entries
-    .filter(({ ds, result }) => !isPreparedRiffSessionCurrent(ds, result))
+    .filter(({ ds, result }) => !isPreparedRemoteSessionCurrent(ds, result))
     .map(({ ds }) => ds.session.sessionId);
   if (lost.length > 0) {
     return {
@@ -748,15 +749,15 @@ export function persistPreparedRiffShutdownFleet(
 
 /** Single-session compatibility path. Fleet shutdown uses the batch function
  * above; this API remains for explicit focused operations and older callers. */
-export function persistPreparedRiffShutdown(
+export function persistPreparedRemoteShutdown(
   ds: DaemonSession,
-  prepared: PreparedRiffShutdown,
-): { ok: true } | RiffShutdownFailure {
-  const validation = validatePreparedRiffShutdownForPersistence(ds, prepared);
+  prepared: PreparedRemoteShutdown,
+): { ok: true } | RemoteShutdownFailure {
+  const validation = validatePreparedRemoteShutdownForPersistence(ds, prepared);
   if (!validation.ok) return validation;
 
   try {
-    sessionStore.persistActiveRiffLineageExact(ds.session.sessionId, prepared.taskId, {
+    sessionStore.persistActiveRemoteLineageExact(ds.session.sessionId, prepared.taskId, {
       expectedCurrentTaskIds: [prepared.durableTaskIdAtPrepare, prepared.taskId],
       expectedOwner: prepared.durableOwnerAtPrepare,
     });
@@ -766,7 +767,7 @@ export function persistPreparedRiffShutdown(
       requestId: prepared.requestId,
       taskId: prepared.taskId,
       error: `lineage_persist_failed:${err instanceof Error ? err.message : String(err)}`,
-      rollbackDisposition: err instanceof sessionStore.RiffLineageOwnershipError
+      rollbackDisposition: err instanceof sessionStore.RemoteLineageOwnershipError
         ? 'retain_fence'
         : 'abort_safe',
     };
@@ -814,7 +815,7 @@ export function persistPreparedRiffShutdown(
   ds.session.riffParentTaskId = prepared.taskId ?? undefined;
   prepared.lineageVerified = true;
 
-  if (!isPreparedRiffSessionCurrent(ds, prepared)) {
+  if (!isPreparedRemoteSessionCurrent(ds, prepared)) {
     return {
       ok: false,
       requestId: prepared.requestId,
@@ -826,12 +827,12 @@ export function persistPreparedRiffShutdown(
   return { ok: true };
 }
 
-export function isPreparedRiffSessionCurrent(
+export function isPreparedRemoteSessionCurrent(
   ds: DaemonSession,
-  prepared: PreparedRiffShutdown,
+  prepared: PreparedRemoteShutdown,
 ): boolean {
-  if (ds.riffShutdownState?.requestId !== prepared.requestId
-      || ds.riffShutdownState.phase !== 'prepared') return false;
+  if (ds.remoteShutdownState?.requestId !== prepared.requestId
+      || ds.remoteShutdownState.phase !== 'prepared') return false;
   if (prepared.worker) {
     return ds.worker === prepared.worker && !workerHasExited(prepared.worker);
   }
@@ -841,25 +842,25 @@ export function isPreparedRiffSessionCurrent(
 /** After verified lineage persistence, an exact prepared worker that exited
  * and was cleared by worker-pool can be safely rolled back locally. A new
  * worker generation or a different fence remains ownership ambiguity. */
-export function canAbortVerifiedExitedRiffPreparation(
+export function canAbortVerifiedExitedRemotePreparation(
   ds: DaemonSession,
-  prepared: PreparedRiffShutdown,
+  prepared: PreparedRemoteShutdown,
 ): boolean {
   return prepared.lineageVerified
     && !!prepared.worker
     && workerHasExited(prepared.worker)
     && ds.worker === null
-    && ds.riffShutdownState?.requestId === prepared.requestId;
+    && ds.remoteShutdownState?.requestId === prepared.requestId;
 }
 
 /** Roll back one prepared participant. State clears only after the exact worker
  * ACKs admission restoration; timeout/late ACK remains deliberately fail-closed. */
-export async function abortPreparedRiffShutdown(
+export async function abortPreparedRemoteShutdown(
   ds: DaemonSession,
-  prepared: PreparedRiffShutdown,
+  prepared: PreparedRemoteShutdown,
   options: { abortTimeoutMs?: number } = {},
 ): Promise<ShutdownPhaseResult> {
-  if (ds.riffShutdownState?.requestId !== prepared.requestId) {
+  if (ds.remoteShutdownState?.requestId !== prepared.requestId) {
     return { ok: false, taskId: prepared.taskId, error: 'shutdown_prepare_ownership_lost' };
   }
   if (!prepared.worker) {
@@ -874,7 +875,7 @@ export async function abortPreparedRiffShutdown(
       ds,
       prepared.worker,
       prepared.requestId,
-      options.abortTimeoutMs ?? RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
+      options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
       prepared.lineageVerified,
       { taskId: prepared.taskId },
     );
@@ -883,18 +884,18 @@ export async function abortPreparedRiffShutdown(
     ds,
     prepared.worker,
     prepared.requestId,
-    options.abortTimeoutMs ?? RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
+    options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
     prepared.lineageVerified,
     { taskId: prepared.taskId },
   );
 }
 
-async function abortPossiblyFencedRiffShutdown(
+async function abortPossiblyFencedRemoteShutdown(
   ds: DaemonSession,
-  participant: PossiblyFencedRiffShutdown,
+  participant: PossiblyFencedRemoteShutdown,
   timeoutMs: number,
 ): Promise<ShutdownPhaseResult> {
-  if (ds.riffShutdownState?.requestId !== participant.requestId) {
+  if (ds.remoteShutdownState?.requestId !== participant.requestId) {
     return {
       ok: false,
       taskId: participant.taskId,
@@ -913,29 +914,29 @@ async function abortPossiblyFencedRiffShutdown(
   );
 }
 
-export type RiffFleetAbortEntry = {
+export type RemoteFleetAbortEntry = {
   ds: DaemonSession;
-  result: FencedRiffShutdownParticipant;
+  result: FencedRemoteShutdownParticipant;
 };
 
-export type RiffFleetAbortResult = {
+export type RemoteFleetAbortResult = {
   ds: DaemonSession;
-  participant: FencedRiffShutdownParticipant;
+  participant: FencedRemoteShutdownParticipant;
   result: ShutdownPhaseResult;
 };
 
 /** Restore every exact prepared/possibly-fenced generation concurrently. No
  * participant can consume another's timeout budget. */
-export async function abortRiffShutdownFleet(
-  entries: readonly RiffFleetAbortEntry[],
+export async function abortRemoteShutdownFleet(
+  entries: readonly RemoteFleetAbortEntry[],
   options: {
     abortTimeoutMs?: number;
     deadlineMs?: number;
     now?: () => number;
   } = {},
-): Promise<RiffFleetAbortResult[]> {
+): Promise<RemoteFleetAbortResult[]> {
   const now = options.now ?? Date.now;
-  const configuredTimeout = options.abortTimeoutMs ?? RIFF_ADMISSION_RESTORE_TIMEOUT_MS;
+  const configuredTimeout = options.abortTimeoutMs ?? REMOTE_ADMISSION_RESTORE_TIMEOUT_MS;
   const remaining = options.deadlineMs === undefined
     ? configuredTimeout
     : Math.max(0, options.deadlineMs - now());
@@ -954,8 +955,8 @@ export async function abortRiffShutdownFleet(
       };
     }
     const result = participant.ok
-      ? await abortPreparedRiffShutdown(ds, participant, { abortTimeoutMs: timeoutMs })
-      : await abortPossiblyFencedRiffShutdown(ds, participant, timeoutMs);
+      ? await abortPreparedRemoteShutdown(ds, participant, { abortTimeoutMs: timeoutMs })
+      : await abortPossiblyFencedRemoteShutdown(ds, participant, timeoutMs);
     return { ds, participant, result };
   }));
 }
@@ -963,16 +964,16 @@ export async function abortRiffShutdownFleet(
 /** Phase 3: synchronous, infallible-after-validation commit. The coordinator
  * validates every participant first, then calls this without an intervening
  * await, so one session can never refuse after a peer was detached. */
-export function commitPreparedRiffShutdown(
+export function commitPreparedRemoteShutdown(
   ds: DaemonSession,
-  prepared: PreparedRiffShutdown,
+  prepared: PreparedRemoteShutdown,
 ): boolean {
-  if (!isPreparedRiffSessionCurrent(ds, prepared)) return false;
+  if (!isPreparedRemoteSessionCurrent(ds, prepared)) return false;
   if (!prepared.worker) {
     clearWorkerlessShutdownState(ds, prepared.requestId);
     return true;
   }
-  if (!send(prepared.worker, { type: 'riff_shutdown_commit', requestId: prepared.requestId })) {
+  if (!send(prepared.worker, { type: 'remote_shutdown_commit', requestId: prepared.requestId })) {
     // Lineage is already durably fresh-verified. Direct retirement is safe even
     // if the final IPC channel closed between validation and send.
     try { prepared.worker.kill('SIGTERM'); } catch { /* already exited */ }
@@ -982,20 +983,21 @@ export function commitPreparedRiffShutdown(
 }
 
 /** Single-session compatibility wrapper. Daemon shutdown intentionally uses
- * the explicit three-phase API above so a multi-Riff fleet cannot half-commit. */
-export async function detachRiffWorkerForShutdown(
+ * the explicit three-phase API above so a multi-backend remote fleet cannot
+ * half-commit. */
+export async function detachRemoteWorkerForShutdown(
   ds: DaemonSession,
   options: { drainTimeoutMs?: number; abortTimeoutMs?: number } = {},
-): Promise<RiffShutdownDetachOutcome> {
-  const prepared = await prepareRiffSessionForShutdown(ds, options);
+): Promise<RemoteShutdownDetachOutcome> {
+  const prepared = await prepareRemoteSessionForShutdown(ds, options);
   if (!prepared.ok) {
     if (prepared.fence === 'none') return prepared;
-    const [aborted] = await abortRiffShutdownFleet([{ ds, result: prepared }], options);
+    const [aborted] = await abortRemoteShutdownFleet([{ ds, result: prepared }], options);
     const abortSuffix = aborted.result.ok
       ? ''
       : `;admission_restore_failed:${aborted.result.error ?? 'unknown'}`;
     logger.error(
-      `[${label(ds)}] Riff shutdown drain failed (${prepared.error}${abortSuffix}); `
+      `[${label(ds)}] Remote shutdown drain failed (${prepared.error}${abortSuffix}); `
       + (aborted.result.ok
         ? 'worker retained with admission restored'
         : 'worker retained and admission fence kept fail-closed'),
@@ -1007,10 +1009,10 @@ export async function detachRiffWorkerForShutdown(
       error: prepared.error + abortSuffix,
     };
   }
-  const persisted = persistPreparedRiffShutdown(ds, prepared);
+  const persisted = persistPreparedRemoteShutdown(ds, prepared);
   if (!persisted.ok) {
     if (persisted.rollbackDisposition === 'retain_fence') return persisted;
-    const aborted = await abortPreparedRiffShutdown(ds, prepared, options);
+    const aborted = await abortPreparedRemoteShutdown(ds, prepared, options);
     return {
       ok: false,
       requestId: prepared.requestId,
@@ -1019,7 +1021,7 @@ export async function detachRiffWorkerForShutdown(
         + (aborted.ok ? '' : `;admission_restore_failed:${aborted.error ?? 'unknown'}`),
     };
   }
-  if (!commitPreparedRiffShutdown(ds, prepared)) {
+  if (!commitPreparedRemoteShutdown(ds, prepared)) {
     return {
       ok: false,
       requestId: prepared.requestId,
@@ -1029,7 +1031,7 @@ export async function detachRiffWorkerForShutdown(
     };
   }
   logger.info(
-    `[${label(ds)}] Riff shutdown detach committed after durable lineage `
+    `[${label(ds)}] Remote shutdown detach committed after durable lineage `
     + `${prepared.taskId ?? 'none'}`,
   );
   return {

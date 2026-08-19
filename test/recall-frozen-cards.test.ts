@@ -457,7 +457,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
-    ds.riffCloseState = { phase: 'preparing', requestId: 'close-before-post' };
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-before-post' };
     const sessionReply = vi.fn(async () => 'om_forbidden');
 
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
@@ -666,7 +666,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    ds.riffCloseState = { phase: 'preparing', requestId: 'close-1' };
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-1' };
     resolvePost('om_riff_orphan_card');
 
     await expect(post).resolves.toBe(false);
@@ -690,7 +690,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    ds.riffShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
+    ds.remoteShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
     resolvePost('om_riff_shutdown_orphan_card');
 
     await expect(post).resolves.toBe(false);
@@ -715,11 +715,11 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
 
     const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    ds.riffCloseState = { phase: 'preparing', requestId: 'close-abort' };
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-abort' };
     resolveFirst('om_aborted_close_orphan_card');
     await expect(firstPost).resolves.toBe(false);
 
-    ds.riffCloseState = undefined;
+    ds.remoteCloseState = undefined;
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
 
     expect(sessionReply).toHaveBeenCalledTimes(2);
