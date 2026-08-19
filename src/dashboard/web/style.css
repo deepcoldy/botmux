@@ -18762,10 +18762,103 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .settings-layout {
   display: grid;
-  gap: 12px;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 20px;
   width: 100%;
   max-width: none;
   min-width: 0;
+  align-items: start;
+}
+
+.settings-content {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* ── 粘性锚点导航 ───────────────────────────────────────────────────────── */
+.settings-nav {
+  position: sticky;
+  top: calc(var(--topbar-height, 56px) + 12px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-3) 0;
+}
+
+.settings-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-group-label {
+  margin: 0 0 2px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-nav-link {
+  display: block;
+  width: 100%;
+  padding: 5px var(--sp-2);
+  border: none;
+  border-left: 2px solid transparent;
+  background: none;
+  color: var(--muted);
+  font-size: var(--fs-13);
+  text-align: left;
+  cursor: pointer;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+}
+
+.settings-nav-link:hover {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+.settings-nav-link.is-active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+  font-weight: 600;
+}
+
+@media (max-width: 960px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
+  .settings-nav {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    padding: 0;
+  }
+  .settings-nav-group {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .settings-nav-group-label {
+    margin: 0;
+    padding: 0;
+  }
+  .settings-nav-link {
+    width: auto;
+    padding: 3px 10px;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-full);
+    font-size: var(--fs-12);
+  }
+  .settings-nav-link.is-active {
+    border-left-color: var(--accent);
+  }
 }
 
 .settings-module {
@@ -19056,7 +19149,32 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .settings-alert-card,
 .settings-status-row {
-  grid-column: 1 / -1;
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 900;
+  pointer-events: none;
+}
+
+.settings-status-row .oncall-status {
+  display: inline-block;
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  box-shadow: var(--sh-md);
+  font-size: var(--fs-12);
+  transition: opacity var(--t-norm), transform var(--t-norm);
+}
+
+.settings-status-row .oncall-status:empty {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.settings-status-row .oncall-status.hint-ok {
+  border-color: color-mix(in srgb, var(--success, var(--st-ok)) 40%, var(--border-soft));
+  color: var(--success, var(--st-ok));
 }
 
 .settings-block {
@@ -19341,14 +19459,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
   align-self: flex-end;
   min-height: 42px;
   margin-top: 0;
-}
-
-.settings-status-row {
-  min-height: 24px;
-}
-
-.settings-status-row .oncall-status:empty {
-  display: none;
 }
 
 .update-actions .page-primary-action {
