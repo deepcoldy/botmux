@@ -153,14 +153,26 @@ export type BackendGateDecision =
  * abandoning it would spawn a duplicate CLI and orphan the real conversation.
  * tmux/zellij capability probes use disposable sessions; ZMX checks its
  * version and full-list control plane; Herdr uses `herdr --version`.
+ *
+ * `existingSessionUnknown` is the third state of that existence check: the
+ * probe itself got no answer (a timeout under host load), which a
+ * `hasSession()`-style boolean reports as "no session". Gating on that turns a
+ * false negative on the CHEAP check into a hard refusal for a session whose
+ * pane is alive. So an indeterminate existence answer spawns rather than gates
+ * — the reverse asymmetry from a kill-verification, where an unanswered probe
+ * must NOT be read as success. Callers that deliberately gate on an
+ * indeterminate result (ZMX ownership / protocol version, where adopting
+ * someone else's session is the worse outcome) simply leave this unset.
  */
 export function decideBackendGate(opts: {
   requested: BackendType;
   available: boolean;
   hasExistingSession: boolean;
+  existingSessionUnknown?: boolean;
 }): BackendGateDecision {
   if (opts.requested === 'pty') return { action: 'spawn' };
   if (opts.hasExistingSession) return { action: 'spawn' };
+  if (opts.existingSessionUnknown) return { action: 'spawn' };
   if (opts.available) return { action: 'spawn' };
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
 }
