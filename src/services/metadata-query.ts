@@ -2,14 +2,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-const DEFAULT_METADATA_ENV_FILE = join(homedir(), '.config', 'ksher-agent-data-mcp', 'env');
+const DEFAULT_METADATA_ENV_FILE = join(homedir(), '.config', 'botmux', 'metadata-query.env');
 const DEFAULT_METADATA_PORT = 8123;
-const DEFAULT_METADATA_DATABASE = 'ksher_bi_dense';
+const DEFAULT_METADATA_DATABASE = 'default';
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_METADATA_LIMIT = 10_000;
 
 const ALLOWED_METADATA_TABLES = new Set([
-  'ksher_bi_dense.s_indicator_dict_detail_info',
+  `${DEFAULT_METADATA_DATABASE}.s_indicator_dict_detail_info`,
 ]);
 
 const FORBIDDEN_SQL_RE = /\b(insert|update|delete|drop|truncate|alter|create|grant|revoke|attach|optimize|rename|exchange|undrop|system|kill|use)\b/i;
@@ -52,7 +52,13 @@ export function parseEnvFile(content: string): Record<string, string> {
   return vars;
 }
 
-export function resolveMetadataQueryConfig(envFile: string = DEFAULT_METADATA_ENV_FILE): MetadataQueryConfig {
+export function resolveMetadataQueryConfig(
+  envFile: string = DEFAULT_METADATA_ENV_FILE,
+  env: NodeJS.ProcessEnv = process.env,
+): MetadataQueryConfig {
+  if (env.BOTMUX_METADATA_QUERY_ENABLED !== 'true') {
+    throw new Error('metadata query is disabled by default; set BOTMUX_METADATA_QUERY_ENABLED=true only in a trusted host environment');
+  }
   if (!existsSync(envFile)) {
     throw new Error(`metadata env file not found: ${envFile}`);
   }
@@ -60,6 +66,7 @@ export function resolveMetadataQueryConfig(envFile: string = DEFAULT_METADATA_EN
   const addr = vars.AGENT_METADATA_CK_ADDR?.trim();
   const username = vars.AGENT_METADATA_CK_USERNAME?.trim();
   const password = vars.AGENT_METADATA_CK_PASSWORD?.trim();
+  const database = vars.AGENT_METADATA_CK_DATABASE?.trim() || DEFAULT_METADATA_DATABASE;
   if (!addr) throw new Error('missing AGENT_METADATA_CK_ADDR');
   if (!username) throw new Error('missing AGENT_METADATA_CK_USERNAME');
   if (!password) throw new Error('missing AGENT_METADATA_CK_PASSWORD');
@@ -78,7 +85,7 @@ export function resolveMetadataQueryConfig(envFile: string = DEFAULT_METADATA_EN
     port: Number(match.groups.port) || DEFAULT_METADATA_PORT,
     username,
     password,
-    database: DEFAULT_METADATA_DATABASE,
+    database,
     timeoutMs: Number(vars.AGENT_METADATA_CK_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS,
     envFile,
   };
@@ -174,6 +181,9 @@ export function validateMetadataSql(sql: string): string {
   }
   if (/\bfrom\s*\(/i.test(normalized)) {
     throw new Error('metadata query does not allow subquery sources');
+  }
+  if (/[`"]\s*\(/.test(normalized) || /\b(?:url|remote|file|s3|hdfs|mysql|postgresql|jdbc|odbc|dictGet\w*)\s*\(/i.test(normalized)) {
+    throw new Error('metadata query does not allow table functions or external dictionary functions');
   }
   if (FORBIDDEN_SQL_RE.test(normalized)) {
     throw new Error('metadata query contains forbidden keywords');

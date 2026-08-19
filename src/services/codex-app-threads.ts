@@ -99,6 +99,7 @@ export interface ListCodexAppThreadsOptions {
   limit?: number;
   searchTerm?: string;
   timeoutMs?: number;
+  initializeTimeoutMs?: number;
 }
 
 export interface SetCodexAppThreadNameOptions {

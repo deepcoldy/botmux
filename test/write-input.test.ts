@@ -83,13 +83,6 @@ import { codexHistoryPath } from '../src/services/codex-paths.js';
 process.env.BOTMUX_TIME_SCALE ??= '0.05';
 const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
 
-const CODEX_DATA_MCP_ARGS = [
-  '-c',
-  'mcp_servers.platform-ksher-agent-data-mcp.command="botmux"',
-  '-c',
-  'mcp_servers.platform-ksher-agent-data-mcp.args=["mcp-identity-proxy","data-agent"]',
-];
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1280,7 +1273,6 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
-      ...CODEX_DATA_MCP_ARGS,
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1302,7 +1294,6 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
-      ...CODEX_DATA_MCP_ARGS,
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1322,7 +1313,6 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
-      ...CODEX_DATA_MCP_ARGS,
       'new-codex-session',
     ]);
   });
@@ -1343,7 +1333,6 @@ describe('codex writeInput submission confirmation', () => {
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         '-c',
         'check_for_update_on_startup=false',
-        ...CODEX_DATA_MCP_ARGS,
         'custom-codex-session',
       ]);
 
@@ -1369,7 +1358,6 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
-      ...CODEX_DATA_MCP_ARGS,
     ]);
   });
 
@@ -1388,7 +1376,6 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
-      ...CODEX_DATA_MCP_ARGS,
       '-C',
       '/repo/root',
     ]);

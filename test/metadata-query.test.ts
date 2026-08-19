@@ -27,15 +27,16 @@ describe('metadata-query', () => {
       'AGENT_METADATA_CK_ADDR=10.0.0.1:9000',
       'AGENT_METADATA_CK_USERNAME=tester',
       'AGENT_METADATA_CK_PASSWORD=secret',
+      'AGENT_METADATA_CK_DATABASE=metadata_db',
       'AGENT_METADATA_CK_TIMEOUT_MS=3210',
     ].join('\n'));
     try {
-      const cfg = resolveMetadataQueryConfig(envFile);
+      const cfg = resolveMetadataQueryConfig(envFile, { BOTMUX_METADATA_QUERY_ENABLED: 'true' });
       expect(cfg.host).toBe('10.0.0.1');
       expect(cfg.port).toBe(9000);
       expect(cfg.username).toBe('tester');
       expect(cfg.password).toBe('secret');
-      expect(cfg.database).toBe('ksher_bi_dense');
+      expect(cfg.database).toBe('metadata_db');
       expect(cfg.timeoutMs).toBe(3210);
       expect(cfg.envFile).toBe(envFile);
     } finally {
@@ -52,7 +53,7 @@ describe('metadata-query', () => {
       'AGENT_METADATA_CK_PASSWORD=secret',
     ].join('\n'));
     try {
-      expect(() => resolveMetadataQueryConfig(envFile)).toThrow(/expected host:port/i);
+      expect(() => resolveMetadataQueryConfig(envFile, { BOTMUX_METADATA_QUERY_ENABLED: 'true' })).toThrow(/expected host:port/i);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -61,6 +62,10 @@ describe('metadata-query', () => {
   it('allows select from approved metadata table with limit', () => {
     const sql = validateMetadataSql('SELECT table_name FROM s_indicator_dict_detail_info LIMIT 20');
     expect(sql).toContain('FORMAT JSON');
+  });
+
+  it('requires an explicit feature gate before resolving host credentials', () => {
+    expect(() => resolveMetadataQueryConfig('/tmp/missing-env', {})).toThrow(/disabled by default/i);
   });
 
   it('rejects non-select metadata sql', () => {
@@ -81,19 +86,28 @@ describe('metadata-query', () => {
 
   it('rejects comma joins that include disallowed tables', () => {
     expect(() => validateMetadataSql(
-      'SELECT a.table_name FROM ksher_bi_dense.s_indicator_dict_detail_info a, ksher_bi_dense.dim_agent_ck_user_info b LIMIT 1',
+      'SELECT a.table_name FROM default.s_indicator_dict_detail_info a, default.dim_agent_ck_user_info b LIMIT 1',
     )).toThrow(/disallowed table/i);
   });
 
   it('rejects CTE metadata sql', () => {
     expect(() => validateMetadataSql(
-      'WITH x AS (SELECT * FROM ksher_bi_dense.s_indicator_dict_detail_info LIMIT 1) SELECT * FROM x LIMIT 1',
+      'WITH x AS (SELECT * FROM default.s_indicator_dict_detail_info LIMIT 1) SELECT * FROM x LIMIT 1',
     )).toThrow(/only allows SELECT|does not allow CTE/i);
   });
 
   it('rejects subquery sources', () => {
     expect(() => validateMetadataSql(
-      'SELECT * FROM (SELECT * FROM ksher_bi_dense.s_indicator_dict_detail_info LIMIT 1) t LIMIT 1',
+      'SELECT * FROM (SELECT * FROM default.s_indicator_dict_detail_info LIMIT 1) t LIMIT 1',
     )).toThrow(/subquery sources/i);
+  });
+
+  it('rejects quoted table functions and external dictionary functions', () => {
+    expect(() => validateMetadataSql(
+      "SELECT a.table_name FROM default.s_indicator_dict_detail_info a JOIN `url`('http://127.0.0.1:8123/', 'JSON') b ON 1 LIMIT 1",
+    )).toThrow(/table functions|dictionary/i);
+    expect(() => validateMetadataSql(
+      "SELECT dictGetString('arbitrary_dictionary', 'name', toUInt64(1)) FROM default.s_indicator_dict_detail_info LIMIT 1",
+    )).toThrow(/table functions|dictionary/i);
   });
 });

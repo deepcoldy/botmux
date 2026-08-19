@@ -458,10 +458,6 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
-      '-c',
-      'mcp_servers.platform-ksher-agent-data-mcp.command="botmux"',
-      '-c',
-      'mcp_servers.platform-ksher-agent-data-mcp.args=["mcp-identity-proxy","data-agent"]',
       '-C',
       '/repo/root',
     ]);
@@ -475,10 +471,6 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
-      '-c',
-      'mcp_servers.platform-ksher-agent-data-mcp.command="botmux"',
-      '-c',
-      'mcp_servers.platform-ksher-agent-data-mcp.args=["mcp-identity-proxy","data-agent"]',
       '-C',
       '/repo/root',
     ]);

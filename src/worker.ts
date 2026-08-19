@@ -15,7 +15,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { clearTrustedTurnFile, trustedTurnFilePath, writeTrustedTurnFile } from './utils/trusted-turn-store.js';
 import { join, basename, dirname, delimiter } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -1882,23 +1881,6 @@ function ensureZellijAttachConfig(): string {
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let closeRequested = false;
-function trustedTurnFileForSession(): string | undefined {
-  if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
-  return trustedTurnFilePath(process.env.SESSION_DATA_DIR, sessionId);
-}
-function publishTrustedTurn(trustedCaller?: import('./types.js').TrustedCaller, turnId?: string): void {
-  const filePath = trustedTurnFileForSession();
-  if (!trustedCaller) {
-    clearTrustedTurnFile(filePath);
-    return;
-  }
-  if (!filePath) return;
-  try {
-    writeTrustedTurnFile(filePath, { sessionId, turnId, trustedCaller });
-  } catch (err: any) {
-    log(`Failed to publish trusted turn identity: ${err?.message ?? err}`);
-  }
-}
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
  *  持久化。仅有写权限的 dashboard 视图可见。 */
@@ -10329,7 +10311,6 @@ async function flushPending(): Promise<void> {
         currentBotmuxTurnId = item.turnId;
         currentBotmuxDispatchAttempt = item.dispatchAttempt;
         currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
-        publishTrustedTurn(item.trustedCaller, item.turnId);
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
         // this input is known not to have started and must not leave a latch
@@ -12727,11 +12708,6 @@ async function spawnCli(
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.
   childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
-  // Do not freeze a per-turn trusted identity file into long-lived CLI env.
-  // The Data MCP proxy derives the current file from BOTMUX_SESSION_ID +
-  // SESSION_DATA_DIR, which avoids stale BOTMUX_TRUSTED_TURN_FILE values after
-  // session resume or worker reuse.
-  delete childEnv.BOTMUX_TRUSTED_TURN_FILE;
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
@@ -13152,15 +13128,6 @@ async function spawnCli(
         mcpRuntimeManifest,
         config.session.dataDir,
       ).map(canonical));
-    }
-    mandatoryDenyPaths.push(
-      canonical(join(userInfo().homedir, '.config', 'ksher-agent-data-mcp')),
-      canonical(join(userInfo().homedir, '.cache', 'ksher-agent-data-mcp')),
-      canonical(join(dataDir, 'trusted-turns')),
-    );
-    const currentTrustedTurnFile = trustedTurnFileForSession();
-    if (currentTrustedTurnFile) {
-      mandatoryReadOnlyPaths.push(canonical(currentTrustedTurnFile));
     }
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
@@ -16180,7 +16147,6 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
-      publishTrustedTurn(msg.trustedCaller, msg.turnId);
       refreshTerminalViewToken();
       refreshTerminalWriteToken();
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
