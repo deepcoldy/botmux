@@ -45,6 +45,9 @@ describe('VC meeting worker-exit recovery wiring', () => {
     expect(daemonSource.slice(workerStart, workerEnd)).toContain('failCloseIdempotentTurnIfConvergenceWriteFailed(ds, context.workerGeneration)');
     // The wrapper closes the session on write_failed (observable fail-closed).
     expect(daemonSource).toContain("outcome === 'write_failed'");
-    expect(daemonSource).toMatch(/failCloseIdempotentTurnIfConvergenceWriteFailed[\s\S]*closeSessionHelper/);
+    // Closes via the BACKGROUND wrapper, which also reports a refusal/residual —
+    // this path has no user surface, so the log is the only signal.
+    expect(daemonSource)
+      .toMatch(/failCloseIdempotentTurnIfConvergenceWriteFailed[\s\S]*closeSessionForBackgroundCleanup/);
   });
 });

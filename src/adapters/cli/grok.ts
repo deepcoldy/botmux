@@ -154,9 +154,19 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       if (resume) {
         const sid = resumeSessionId || sessionId;
-        if (sid) args.push('--resume', sid);
-        else args.push('--continue');
-        // Branch the source transcript into the child's Botmux UUID.
+        if (sid) {
+          // `--resume <botmux-sessionId>` is precise: grok's fresh spawn pins
+          // `--session-id <botmux-uuid>` (below), so the botmux id IS the
+          // grok session id.
+          args.push('--resume', sid);
+        }
+        // No --continue fallback (#927): it would resume the globally most
+        // recent grok session, which is shared across every botmux session of
+        // this bot (same GROK_HOME) — a worker restart with no id would then
+        // load a SIBLING session's conversation (topic-group context leaking
+        // into a private chat). Start fresh instead, matching
+        // reasonix/antigravity.
+        // Branch the source transcript into the child's Botmux UUID (#931).
         // The explicit child id preserves exact ownership on restart.
         if (forkSession) {
           args.push('--fork-session');

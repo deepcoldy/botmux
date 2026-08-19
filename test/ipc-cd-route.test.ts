@@ -121,6 +121,48 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_cd_unsupported' });
   });
 
+  it('409s MOJO sessions before repin/kill — remote retirement cannot follow a repin (P1-a)', async () => {
+    // killWorker refuses unprepared live retirement for every remote backend
+    // (P0-2). The riff-only guard let mojo through: repin ran, killWorker
+    // no-opped, and the route reported cold-restart while the live worker kept
+    // running on the OLD cwd. The guard must fire before any mutation.
+    const send = vi.fn();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      larkAppId: 'app-mojo',
+      session: { sessionId: 's-mojo-cd', cliId: 'mojo', backendType: 'mojo' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send, killed: false },
+      initConfig: { backendType: 'mojo' },
+    } as any);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
+
+    const res = await postCd('s-mojo-cd', roleDir);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'remote_cd_unsupported' });
+    expect(send).not.toHaveBeenCalled();
+    expect(repinSpy).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('409s RIFF sessions with the same remote guard (unchanged contract)', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      larkAppId: 'app-riff',
+      session: { sessionId: 's-riff-cd', cliId: 'riff', backendType: 'riff' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send: vi.fn(), killed: false },
+      initConfig: { backendType: 'riff' },
+    } as any);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+
+    const res = await postCd('s-riff-cd', roleDir);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'remote_cd_unsupported' });
+    expect(repinSpy).not.toHaveBeenCalled();
+  });
+
   it('403s an existing dir outside the role library root — repin/kill never happen', async () => {
     const send = vi.fn();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({

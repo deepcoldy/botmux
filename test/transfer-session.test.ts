@@ -2103,6 +2103,7 @@ describe('closeSession concurrency', () => {
 
     await expect(closeSession('foreign-session')).resolves.toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: true,
       known: false,
     });

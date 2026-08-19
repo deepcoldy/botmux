@@ -506,38 +506,78 @@ describe('dashboard secret persistence', () => {
   it('loadDashboardSecret returns null when file is absent or whitespace-only', () => {
     expect(loadDashboardSecret(secretPath)).toBeNull();
     const p = join(dir, 'empty-secret');
-    writeFileSync(p, '   \n');
+    writeFileSync(p, '   \n', { mode: 0o600 });
     expect(loadDashboardSecret(p)).toBeNull();
   });
 
   it('loadOrCreateDashboardSecret overwrites whitespace-only file with a fresh 0600 secret', () => {
     mkdirSync(join(dir, 'nested'));
-    writeFileSync(secretPath, ' \n');
+    writeFileSync(secretPath, ' \n', { mode: 0o600 });
     const secret = loadOrCreateDashboardSecret(secretPath);
     expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(loadDashboardSecret(secretPath)).toBe(secret);
     expect(statSync(secretPath).mode & 0o777).toBe(0o600);
   });
 
-  it('ignores a legacy stale repair lock and converges through a permanent seed', () => {
+  it('legacy repair-seed / repair-lock residue does not block creation', () => {
+    // 旧版 link(2) 选举机制留下的 .repair-seed / .repair.lock 残留不应阻塞
+    // 新版基于文件锁的 get-or-create，也不会再生成新的 repair-seed。
     mkdirSync(join(dir, 'nested'));
-    writeFileSync(secretPath, ' \n');
-    const lockPath = `${secretPath}.repair.lock`;
-    writeFileSync(lockPath, '');
+    writeFileSync(`${secretPath}.repair-seed`, 'legacy', { mode: 0o600 });
+    writeFileSync(`${secretPath}.repair.lock`, '');
 
     const secret = loadOrCreateDashboardSecret(secretPath);
 
     expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(loadDashboardSecret(secretPath)).toBe(secret);
     expect(statSync(secretPath).mode & 0o777).toBe(0o600);
-    expect(loadDashboardSecret(`${secretPath}.repair-seed`)).toBe(secret);
-    expect(statSync(`${secretPath}.repair-seed`).mode & 0o777).toBe(0o600);
-    expect(existsSync(lockPath)).toBe(true); // ignored legacy residue cannot block startup
+    expect(existsSync(`${secretPath}.repair.lock`)).toBe(true); // 残留被忽略，不阻塞启动
   });
 
-  it('concurrent processes repairing one corrupt secret converge on the repair seed', async () => {
+  it('refuses to read a secret leaf symlink without touching its target', () => {
+    if (process.platform === 'win32') return;
     mkdirSync(join(dir, 'nested'));
-    writeFileSync(secretPath, ' \n');
+    const victim = join(dir, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    symlinkSync(victim, secretPath);
+
+    expect(() => loadDashboardSecret(secretPath)).toThrow(UnsafeHostAuthorityFileError);
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
+  it('refuses to create through a secret leaf symlink without touching its target', () => {
+    if (process.platform === 'win32') return;
+    mkdirSync(join(dir, 'nested'));
+    const victim = join(dir, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    symlinkSync(victim, secretPath);
+
+    expect(() => loadOrCreateDashboardSecret(secretPath)).toThrow(UnsafeHostAuthorityFileError);
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
+  it('fails closed when the secret file has loose permissions', () => {
+    if (process.platform === 'win32') return;
+    mkdirSync(join(dir, 'nested'));
+    writeFileSync(secretPath, 'x'.repeat(43), { mode: 0o644 });
+    expect(() => loadDashboardSecret(secretPath)).toThrow(/0600/);
+  });
+
+  it('fails closed when the credential directory is group-writable', () => {
+    if (process.platform === 'win32') return;
+    const nested = join(dir, 'nested');
+    mkdirSync(nested);
+    chmodSync(nested, 0o770); // 组内用户可替换叶子凭证文件
+    try {
+      expect(() => loadOrCreateDashboardSecret(secretPath))
+        .toThrow(/组内或其它用户写入|不可信祖先/);
+    } finally {
+      chmodSync(nested, 0o700);
+    }
+  });
+
+  it('concurrent processes creating one absent secret converge on a single value', async () => {
+    mkdirSync(join(dir, 'nested'));
     const goPath = join(dir, 'go');
     const authModuleUrl = new URL('../src/dashboard/auth.ts', import.meta.url).href;
     const childSource = `
@@ -564,7 +604,7 @@ describe('dashboard secret persistence', () => {
     try {
       const deadline = Date.now() + 10_000;
       while (!children.every(entry => existsSync(entry.readyPath))) {
-        if (Date.now() >= deadline) throw new Error('repair children did not reach barrier');
+        if (Date.now() >= deadline) throw new Error('secret children did not reach barrier');
         await new Promise(resolve => setTimeout(resolve, 10));
       }
       writeFileSync(goPath, 'go');
@@ -578,7 +618,6 @@ describe('dashboard secret persistence', () => {
       const secrets = exits.map(result => result.stdout);
       expect(new Set(secrets).size).toBe(1);
       expect(secrets[0]).toBe(loadDashboardSecret(secretPath));
-      expect(secrets[0]).toBe(loadDashboardSecret(`${secretPath}.repair-seed`));
       expect(statSync(secretPath).mode & 0o777).toBe(0o600);
     } finally {
       for (const { child } of children) {

@@ -83,6 +83,44 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /**
+   * Unprovable launcher-env keys this worker generation was ever HANDED, kept as
+   * a monotonically growing set for the life of the generation.
+   *
+   * `initConfig.env` is only written at spawn/refork, and a live `/restart`
+   * updates the worker's own copy without touching it — so neither the spawn-time
+   * snapshot nor the current live bot config can answer "what is the running
+   * child actually executing?". Three-phase counter-example: start clean → add
+   * `LD_PRELOAD` and `/restart` (child now hooked) → clear the config WITHOUT
+   * restarting. Both observable layers read clean while the child stays hooked,
+   * and the device-isolation proof wrongly returned safe_remote.
+   *
+   * Monotonic on purpose: a value is only ever removed by starting a brand-new
+   * worker generation (spawn/refork clears it). Clearing it when a *clean*
+   * restart is merely SENT would reintroduce the same amnesia, because a restart
+   * can fail or be coalesced and leave the dangerous child running.
+   *
+   * Only key NAMES are stored — never values — since the proof inspects names
+   * only and these keys can carry credentials.
+   */
+  mojoAppliedUnprovableEnvKeys?: string[];
+  /**
+   * Same ledger, inherited from EVERY previous generation of this session.
+   *
+   * `forkWorker`'s double-fork guard sends `close` + `kill()` and then continues
+   * synchronously to spawn the replacement — it never awaits the old worker's
+   * exit. And even that exit would not be enough: the dangerous env acts on the
+   * mojo CLI *child*, whose `kill()` is a bare SIGTERM with no escalation and no
+   * wait, which a trapping/detached child survives (its descendants too). So no
+   * observable exit signal proves the injected process is gone.
+   *
+   * Therefore monotonic for the life of the DaemonSession: parked on every
+   * generation boundary, never released. Being in-memory, it disappears only when
+   * the session ends or the daemon restarts. Cost: a session ever handed a
+   * dangerous launcher env stays unprovable until it ends — an availability
+   * trade, not a credential leak.
+   */
+  mojoRetiringUnprovableEnvKeys?: string[];
   /** Per-session snapshot of the final-answer feedback policy. New config takes
    * effect on the next new/restarted session, matching sandbox send-cred state. */
   feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
@@ -299,15 +337,19 @@ export interface DaemonSession {
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
-  /** Explicit-close transaction: while present, no new Riff input may be
+  /** Remote explicit-close transaction: while present, no new input may be
    * admitted until cancellation commits or admission restoration is ACKed. */
-  riffCloseState?: {
-    phase: 'preparing' | 'prepared' | 'uncertain';
+  remoteCloseState?: {
+    phase: 'preparing' | 'prepared' | 'abort_restored' | 'uncertain';
     requestId: string;
     taskId?: string;
+    /** LOCAL subtree residual carried by a `prepared` proof, so a retry after a
+     *  failed durable commit republishes the SAME residual close instead of
+     *  degrading it to a plain `closed` (see Session.mojoCloseJournal). */
+    localResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   };
-  /** Graceful-shutdown transaction for the exact Riff worker generation. */
-  riffShutdownState?: {
+  /** Graceful-shutdown transaction for the exact remote worker generation. */
+  remoteShutdownState?: {
     phase: 'preparing' | 'prepared';
     requestId: string;
     taskId?: string | null;
@@ -486,11 +528,12 @@ export interface DaemonSession {
   };
 }
 
-/** A non-null value means this Riff generation is deliberately rejecting new
- * input until a close/shutdown commit or an ACKed admission restore. */
-export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
-  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
-  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+/** A non-null value means this remote generation is deliberately rejecting new
+ * input until a close commit, remote shutdown commit, or ACKed admission restore. */
+export function remoteRetirementAdmissionPhase(ds: DaemonSession): string | null {
+  if (ds.remoteShutdownState) return `shutdown-${ds.remoteShutdownState.phase}`;
+  if (ds.remoteCloseState) return `close-${ds.remoteCloseState.phase}`;
+  if (ds.session.mojoCloseJournal) return `close-${ds.session.mojoCloseJournal.phase}`;
   return null;
 }
 

@@ -74,7 +74,12 @@ const mocks = vi.hoisted(() => {
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
     }),
-    closeWorkerPoolSession: vi.fn(async () => undefined),
+    // Must mirror the real contract: closeSession() always resolves a
+    // CloseSessionResult. Returning undefined made the remote-close guard
+    // (riff/mojo `closeResult.ok` / `outcome`) read a property of undefined.
+    closeWorkerPoolSession: vi.fn(async () => ({
+      ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true,
+    })),
     discoverAdoptableSessions: vi.fn(() => [] as any[]),
     discoverAdoptableZellijSessions: vi.fn(() => [] as any[]),
     discoverClaudeFamilySessions: vi.fn(() => [] as any[]),
@@ -534,8 +539,9 @@ describe('/rename production routing — must not pre-create a session (review P
         candidate.session.status = 'closed';
         activeSessions.delete(key);
         mocks.closeSession(sessionId);
-        return;
+        return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
       }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: true, known: false };
     });
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.discoverAdoptableSessions.mockReturnValue([]);

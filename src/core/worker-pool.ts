@@ -14,7 +14,8 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -32,6 +33,23 @@ import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
+import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { hasUnprovenContainment } from './mojo-containment.js';
+import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
+import {
+  buildEffectiveMojoConfig,
+  diffMojoSessionIdentity,
+  MOJO_IDENTITY_KEYS,
+  pickMojoLivePatch,
+  isMojoRemoteGone,
+  mojoUnprovableEnvKeys,
+  pickMojoSessionIdentity,
+  type EffectiveMojoConfig,
+  type MojoConfig,
+  type MojoLivePatch,
+} from '../adapters/backend/mojo-types.js';
+import { sanitizePerBotEnv } from './per-bot-env.js';
+import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import {
@@ -66,8 +84,10 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
+import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -88,6 +108,13 @@ function workerForkExecArgv(): string[] {
   return [...process.execArgv, '--import', pathToFileURL(preloadPath).href];
 }
 
+/** Secondary index of the same retirements by session id: the WeakMap above is
+ *  keyed by ds OBJECT and not iterable, but the VC fence's producer-liveness
+ *  gate must find a dying process after the registry entry (and possibly the
+ *  ds reference itself) is gone. Entries release on worker exit, so the map
+ *  stays bounded by in-flight retirements. */
+const lifecycleRetiringBySessionId = new Map<string, Set<ChildProcess>>();
+
 function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   let workers = lifecycleRetiringWorkers.get(ds);
   if (!workers) {
@@ -96,18 +123,87 @@ function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
   }
   if (workers.has(worker)) return;
   workers.add(worker);
+  const sessionId = ds.session.sessionId;
+  let byId = lifecycleRetiringBySessionId.get(sessionId);
+  if (!byId) {
+    byId = new Set();
+    lifecycleRetiringBySessionId.set(sessionId, byId);
+  }
+  byId.add(worker);
   const release = (): void => {
     const current = lifecycleRetiringWorkers.get(ds);
     current?.delete(worker);
     if (current?.size === 0) lifecycleRetiringWorkers.delete(ds);
+    const currentById = lifecycleRetiringBySessionId.get(sessionId);
+    currentById?.delete(worker);
+    if (currentById?.size === 0) lifecycleRetiringBySessionId.delete(sessionId);
   };
   worker.once('exit', release);
+}
+
+/**
+ * Retiring worker processes for a session id — for liveness gates that outlive
+ * the registry entry. A collision loser (or any process-only retirement) is
+ * deleted from the registry while its process is still dying; a VC fence armed
+ * in that window would otherwise find no ds, skip its producer-liveness gate,
+ * and clear on pane probes alone (fifth-round review, A1 residual).
+ */
+export function retiringWorkersForSession(sessionId: string): ChildProcess[] {
+  return [...(lifecycleRetiringBySessionId.get(sessionId) ?? [])];
 }
 
 function clearLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   const workers = lifecycleRetiringWorkers.get(ds);
   workers?.delete(worker);
   if (workers?.size === 0) lifecycleRetiringWorkers.delete(ds);
+  const byId = lifecycleRetiringBySessionId.get(ds.session.sessionId);
+  byId?.delete(worker);
+  if (byId?.size === 0) lifecycleRetiringBySessionId.delete(ds.session.sessionId);
+}
+
+/**
+ * Start a new worker generation's launcher-env ledger.
+ *
+ * The previous generation's keys are PARKED, never dropped — and deliberately
+ * WITHOUT consulting whether that worker has exited.
+ *
+ * A worker exit does not prove the dangerous process is gone, and the dangerous
+ * env acts on the mojo CLI *child*, not on the worker that parents it:
+ *   - `MojoBackend.kill()` sends a bare `SIGTERM`, nulls its handle and reports
+ *     `exitCb(0)` immediately — no SIGKILL escalation, no wait. A child that
+ *     traps/ignores TERM, or is slow, survives it.
+ *   - the worker's close path then runs `killCli()` and `process.exit(0)` without
+ *     awaiting the child, so worker exit can precede child death.
+ *   - a mojo child may also have detached descendants, so even a per-PID exit
+ *     proof would not cover the process tree.
+ * `PATH`-substituted launchers and `LD_PRELOAD` hooks live in exactly that child,
+ * which is what holds the activated device credential.
+ *
+ * So the ledger is monotonic for the life of this DaemonSession: it disappears
+ * only when the session ends or the daemon restarts (it is in-memory), never on
+ * an exit signal we cannot verify. A stricter alternative — escalating to SIGKILL
+ * and waiting for process-GROUP quiescence before releasing — is the only way to
+ * make release sound, and is deliberately out of scope here: it needs new
+ * teardown machinery and would still have to cover descendants, whereas monotonic
+ * retention is fail-closed by construction.
+ *
+ * Cost: a session that was ever handed a dangerous launcher env stays
+ * unprovable until it ends. That is an availability trade, not a credential leak.
+ *
+ * Exported so the behavioural guards can assert this directly — deleting the
+ * three call sites used to leave every test green.
+ */
+export function startNewGenerationEnvLedger(
+  ds: DaemonSession,
+  initEnv: Record<string, string> | undefined,
+): void {
+  const parked = new Set([
+    ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
+    ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
+  ]);
+  ds.mojoRetiringUnprovableEnvKeys = parked.size > 0 ? [...parked] : undefined;
+  ds.mojoAppliedUnprovableEnvKeys = undefined;
+  rememberAppliedUnprovableEnvKeys(ds, initEnv);
 }
 
 /** Symmetric lifecycle fence: relay must not start while another operation is
@@ -129,7 +225,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
   // worker after riff reconciliation; fall back to persisted session metadata
   // while restoring sessions that do not yet have an initConfig.
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  return backendType === 'riff'
+  return (backendType !== undefined && isRemoteBackendType(backendType))
     || ds.session.sandbox === true
     || ds.initConfig?.readIsolation === true
     || sandboxEnabled()
@@ -295,7 +391,7 @@ import {
   storedSessionAnchorId,
   isDocNativeSession,
   larkTransportEnabled,
-  riffRetirementAdmissionPhase,
+  remoteRetirementAdmissionPhase,
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -337,7 +433,7 @@ import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
-import { RIFF_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -535,16 +631,23 @@ function requireCallbacks(): WorkerPoolCallbacks {
 // linear-scan by sessionId.
 let activeSessionsRegistry: Map<string, DaemonSession> | undefined;
 
-type RiffWorkerCloseResult = {
+type RemoteWorkerCloseResult = {
   ok: boolean;
   taskId?: string;
   error?: string;
+  /** Absent means `retryable`, the historical behaviour. See SessionDestroyResult. */
+  recovery?: 'retryable' | 'uncertain' | 'irreversible';
+  /** Absent means: derive from `recovery`. See mayRestoreWriteAdmission. */
+  admission?: 'restorable' | 'fenced';
+  /** Local subtree left unproven by an otherwise successful close. Never
+   *  re-derivable here: only the backend saw the evidence grade. */
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
 };
 
-const pendingRiffWorkerCloses = new Map<string, {
+const pendingRemoteWorkerCloses = new Map<string, {
   sessionId: string;
   worker: ChildProcess;
-  resolve: (result: RiffWorkerCloseResult) => void;
+  resolve: (result: RemoteWorkerCloseResult) => void;
 }>();
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession>): void {
@@ -1122,6 +1225,181 @@ function sessionAgentConfig(
   };
 }
 
+
+export { freezeMojoIdentityForSession } from './mojo-session-identity.js';
+
+/**
+ * Freeze the control-plane identity of every restored mojo session at daemon
+ * startup, instead of waiting for each one's next worker fork.
+ *
+ * The lazy path left a window: after a restart but before a session was next
+ * woken, an operator could change the bot's endpoint/workspace, and the session
+ * would then adopt THAT as its "original" identity — pairing a remote lineage
+ * created on tenant A with tenant B. Migrating during restore closes it, because
+ * restore runs before the dispatcher can deliver a message.
+ *
+ * A legacy row that already holds a remote lineage cannot be migrated safely (no
+ * record of its original control plane), so sessionMojoConfig drops that lineage;
+ * this pass reuses the same helper so both entry points behave identically.
+ */
+export function migrateMojoSessionIdentities(activeSessions: Map<string, DaemonSession>): void {
+  let migrated = 0;
+  for (const ds of activeSessions.values()) {
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    if (backendType !== 'mojo') continue;
+    if (ds.session.mojoIdentity) continue;
+    let botCfg;
+    try {
+      botCfg = getBot(ds.larkAppId).config;
+    } catch {
+      // Bot deregistered — no config to freeze from. Leave the row untouched so a
+      // later re-registration can migrate it.
+      continue;
+    }
+    void botCfg;
+    freezeMojoIdentityForSession(ds.session, ds.larkAppId);
+    migrated += 1;
+  }
+  if (migrated > 0) {
+    logger.info(`[mojo] froze the control-plane identity of ${migrated} restored session(s)`);
+  }
+}
+
+/**
+ * READ-ONLY frozen launch identity, for teardown paths that must not mutate the
+ * session (sessionAgentConfig freezes and writes to the session store).
+ *
+ * Reads the values frozen at session creation, exactly like a live spawn would.
+ * Only a legacy session that was never frozen (`agentFrozen` unset) falls back to
+ * the live bot config, mirroring sessionAgentConfig's back-fill.
+ *
+ * This matters for cancelling an orphaned remote session: the remote session was
+ * created through THIS session's wrapper/binary, so cancelling it through a
+ * wrapper the bot gained later can hit the wrong gateway or tenant. And because
+ * `agentFrozen=true` with `wrapperCli=undefined` explicitly means "frozen as
+ * no-wrapper", inheriting a later-added wrapper would break that contract.
+ */
+function frozenSessionLaunchIdentity(
+  ds: DaemonSession,
+  botCfg: { cliPathOverride?: string; wrapperCli?: string },
+): { cliPathOverride?: string; wrapperCli?: string } {
+  if (ds.session.agentFrozen) {
+    return {
+      cliPathOverride: ds.session.cliPathOverride,
+      wrapperCli: ds.session.wrapperCli,
+    };
+  }
+  // Legacy, never frozen: it was launching off the live bot config, so that is
+  // the faithful reconstruction.
+  return {
+    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    wrapperCli: ds.session.wrapperCli ?? botCfg.wrapperCli,
+  };
+}
+
+/**
+ * Resolve the mojo config a session must run on, freezing its control-plane
+ * identity the first time and honouring that snapshot forever after.
+ *
+ * Split by purpose:
+ *   - identity (cloud / localDaemon / baseUrl / ppeEnv / workspaceId / agentId)
+ *     comes from the FROZEN snapshot. A live edit must not move an existing
+ *     session between execution modes or tenants — a cold resume would continue,
+ *     and `/close` would cancel, against an endpoint that never created it.
+ *   - credentials (jwt / jwtEnv / env) and behaviour knobs (stream /
+ *     systemPrompt / idleTimeoutSec) stay LIVE, so a rotated token takes effect
+ *     and no plaintext JWT is persisted into session state.
+ *
+ * `freeze` is false on read-only paths (workerless cancel) so teardown never
+ * mutates session state; a session that predates this field then simply runs on
+ * live config, exactly as it did before.
+ */
+/**
+ * Resolve the mojo config a session must run on, plus whether its remote lineage
+ * may still be used.
+ *
+ * Returns an explicit state rather than a bare config, because "we have a config"
+ * and "this lineage is safe to resume/cancel" are different questions and
+ * conflating them is what let a cancel reach the wrong tenant:
+ *   - `usable`      — identity is frozen (or freshly frozen); lineage is trusted
+ *   - `quarantined` — legacy row with a remote lineage but no frozen identity.
+ *                     Nothing records which control plane holds it, so it must not
+ *                     be resumed or cancelled automatically.
+ *   - `none`        — legacy row with no lineage at all; nothing at risk.
+ *
+ * Identity (cloud / localDaemon / baseUrl / ppeEnv / workspaceId / agentId) comes
+ * from the FROZEN snapshot; credentials (jwt / jwtEnv / env) and behaviour knobs
+ * stay LIVE so a rotated token takes effect and no plaintext JWT is persisted.
+ *
+ * `freeze` is false on read-only paths (workerless cancel) so teardown never
+ * mutates session state.
+ */
+export function sessionMojoConfig(
+  ds: DaemonSession,
+  botCfg: { mojo?: MojoConfig },
+  opts: { freeze: boolean },
+): { config: MojoConfig; lineage: 'usable' | 'quarantined' | 'none' } {
+  const live = botCfg.mojo ?? {};
+  const liveIdentity = pickMojoSessionIdentity(live);
+
+  if (!ds.session.mojoIdentity) {
+    // Legacy row, never frozen. Delegate to the shared helper rather than
+    // duplicating the freeze/quarantine rules — two copies of this had already
+    // started to drift. `undefined` means "predates this field"; an empty object
+    // means "frozen with nothing configured", which is why the helper persists
+    // `{}` instead of skipping it.
+    if (opts.freeze) {
+      freezeMojoIdentityForSession(ds.session, ds.larkAppId);
+    } else if (ds.session.riffParentTaskId) {
+      // Read-only path (teardown): the row still has an unverifiable lineage and
+      // we must not write, so report it without mutating.
+      return { config: live, lineage: 'quarantined' };
+    }
+    // Fall through: the helper may have frozen an identity just now, so re-derive
+    // the answer from the (possibly updated) row below.
+  }
+
+  if (!ds.session.mojoIdentity) {
+    // Still unfrozen — the bot was deregistered, so there is nothing to freeze
+    // from. Behave as before: usable only if there is no lineage at risk.
+    return {
+      config: live,
+      lineage: ds.session.riffParentTaskId ? 'quarantined' : 'none',
+    };
+  }
+
+  const frozen = ds.session.mojoIdentity;
+  const drift = diffMojoSessionIdentity(frozen, liveIdentity);
+  if (drift.length > 0) {
+    // Loud on purpose: the operator changed the control plane and this session is
+    // deliberately NOT following, which is otherwise invisible.
+    logger.warn(
+      `[${tag(ds)}] mojo control-plane config changed after session creation; `
+      + `keeping the frozen identity (${drift.join(', ')}). `
+      + 'Start a new session to use the new configuration.',
+    );
+  }
+  // Live credentials/behaviour, frozen identity.
+  const merged: Record<string, unknown> = { ...live };
+  for (const key of MOJO_IDENTITY_KEYS) {
+    const value = (frozen as Record<string, unknown>)[key];
+    if (value === undefined) delete merged[key];
+    else merged[key] = value;
+  }
+  // Quarantine is bound to a specific ID, not to the session.
+  //
+  // Once an identity is frozen, any lineage created AFTERWARDS was created on that
+  // known control plane and is therefore trustworthy. Treating the session as
+  // permanently quarantined meant a new session could never be cancelled after its
+  // worker died — it kept consuming cloud sandbox time and holding credentials.
+  // The parked id remains as an audit record only.
+  const active = ds.session.riffParentTaskId;
+  const lineage = active === undefined
+    ? 'none'
+    : (active === ds.session.mojoQuarantinedLineage ? 'quarantined' : 'usable');
+  return { config: merged as MojoConfig, lineage };
+}
+
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
   const crossRef = readPeerCrossRef(dataDir, larkAppId);
@@ -1429,7 +1707,7 @@ export async function postTurnStartingCard(
   turnId: string,
 ): Promise<boolean> {
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
-  if (riffRetirementAdmissionPhase(ds)) return false;
+  if (remoteRetirementAdmissionPhase(ds)) return false;
   if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
   if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
   if (!workerHasInitialized(ds)) return false;
@@ -1485,9 +1763,9 @@ export async function postTurnStartingCard(
     && ds.streamCardNonce === nonce
     && (!activeSessionsRegistry || activeSessionsRegistry.get(registryKeyAtPost) === ds);
   const stillOwnsPost = (): boolean =>
-    ownsPostIdentity() && riffRetirementAdmissionPhase(ds) === null;
+    ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null;
   const restorePrePostIdentityForRetirement = (): boolean => {
-    if (riffRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    if (remoteRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
     ds.streamCardId = previousCardId;
     ds.streamCardNonce = previousNonce;
     persistStreamCardState(ds);
@@ -2254,19 +2532,48 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
+/**
+ * Retire a session's worker (and, worker-less, its orphaned backing session).
+ *
+ * CONTRACT FOR REMOTE BACKENDS (riff / mojo): a LIVE remote worker is refused
+ * unless the call carries the prepare/commit `remoteCloseCommitRequestId` —
+ * the function RETURNS WITHOUT RETIRING and the worker keeps running. Callers
+ * must not assume success. Today that refusal is absorbed differently per
+ * call site:
+ *   - /cd (IM + dashboard) rejects remote sessions BEFORE repinning, so this
+ *     refusal is never reached from there;
+ *   - the explicit-close path always carries the commit requestId;
+ *   - crash-loop, collision-loser, VC restore/upgrade and device-isolation
+ *     sweeps still call this best-effort and, for a live remote worker, keep
+ *     the generation alive with its lineage intact (fail-safe: never a silent
+ *     remote cancel). A caller that needs the worker GONE must go through
+ *     prepare/commit or the shutdown-detach flow — not this function.
+ */
 export function killWorker(
   ds: DaemonSession,
-  opts: { riffCloseCommitRequestId?: string } = {},
+  opts: {
+    remoteCloseCommitRequestId?: string;
+    /** Set by the authoritative mojo close once its cancel is PROVEN, so the
+     *  best-effort orphan teardown below does not cancel the same session again. */
+    mojoCancelAlreadyProven?: boolean;
+  } = {},
 ): void {
   const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (ds.worker && !ds.worker.killed
-      && closeFrozenType === 'riff'
-      && !opts.riffCloseCommitRequestId) {
-    // A generic synchronous retirement cannot safely detach Riff. An accepted
-    // create/follow-up may still be waiting for the task id that becomes the
-    // only durable lineage anchor.
+      && closeFrozenType !== undefined
+      && isRemoteBackendType(closeFrozenType)
+      && !opts.remoteCloseCommitRequestId) {
+    // A generic synchronous retirement cannot safely detach ANY remote backend,
+    // not just Riff. An accepted create/follow-up may still be waiting for the
+    // task id that becomes the only durable lineage anchor — and for Mojo the
+    // worker's legacy close path used to answer a request-less `close` with
+    // `mojo session cancel`, so every generic retirement (/cd cold restart,
+    // crash-loop, collision loser, restore/upgrade) silently and irreversibly
+    // cancelled the remote session with no close_result to carry the outcome.
+    // Only the prepare/commit flow (remoteCloseCommitRequestId) may retire a
+    // live remote worker.
     logger.error(
-      `[${tag(ds)}] Refused unprepared live Riff worker retirement; `
+      `[${tag(ds)}] Refused unprepared live ${closeFrozenType} worker retirement; `
       + 'preserving worker and remote-task lineage',
     );
     return;
@@ -2293,26 +2600,28 @@ export function killWorker(
     // lazy-restore keep the CLI alive for later resume), so /close on such a
     // session would leave an orphaned CLI running in tmux that still replies.
     // Destroy the backing session directly here so /close always terminates it.
-    destroyOrphanedBackingSession(ds);
-    if (opts.riffCloseCommitRequestId
-        && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
-      ds.riffCloseState = undefined;
+    destroyOrphanedBackingSession(ds, {
+      ...(opts.mojoCancelAlreadyProven ? { skipRemoteCancel: true } : {}),
+    });
+    if (opts.remoteCloseCommitRequestId
+        && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
+      ds.remoteCloseState = undefined;
     }
     return;
   }
   try {
-    if (opts.riffCloseCommitRequestId) {
+    if (opts.remoteCloseCommitRequestId) {
       ds.worker.send({
         type: 'close_commit',
-        requestId: opts.riffCloseCommitRequestId,
+        requestId: opts.remoteCloseCommitRequestId,
       } as DaemonToWorker);
     } else {
       ds.worker.send({ type: 'close' } as DaemonToWorker);
     }
   } catch { /* IPC already closed */ }
-  if (opts.riffCloseCommitRequestId
-      && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
-    ds.riffCloseState = undefined;
+  if (opts.remoteCloseCommitRequestId
+      && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
+    ds.remoteCloseState = undefined;
   }
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
@@ -2321,7 +2630,49 @@ export function killWorker(
   // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
   // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
   // < SIGTERM 24s < SIGKILL 29s；正常路径 worker 自行 exit，不会等满）。
-  armWorkerKillBackstop(w, tag(ds), closeFrozenType === 'riff' ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  // mojo needs the same grace: destroySession() shells out to
+  // `mojo session cancel` (CLI timeout up to 60s) and waits for an in-flight
+  // turn to publish its lineage first, so 2s kills it before the cancel lands.
+  const closeNeedsRemoteGrace = closeFrozenType !== undefined
+    && isRemoteBackendType(closeFrozenType);
+  armWorkerKillBackstop(w, tag(ds), closeNeedsRemoteGrace ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  ds.worker = null;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  ds.workerViewToken = null;
+}
+
+/**
+ * Retire the worker PROCESS only — no close semantics of any kind.
+ *
+ * No `close` IPC (a request-less remote close is refused by the worker, and a
+ * local one would destroy the backing session), no remote cancel, lineage and
+ * containment handles intact. SIGTERM is sent immediately (the worker's
+ * handler runs killCli() — for mojo that is backend.kill(), which by contract
+ * never cancels the remote session) and armWorkerKillBackstop guarantees
+ * SIGKILL if it wedges.
+ *
+ * For callers that must make a worker generation DIE while its logical/remote
+ * state lives on: the collision loser (its registry entry is deleted right
+ * after, so a refused killWorker left a live credential-carrying worker
+ * unreachable — the P0-new orphan shape) and the VC runtime-lease fence
+ * (which must prove the local producer process dead before admitting replay).
+ */
+export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
+  restartCoordinator.cancelSession(ds.session.sessionId);
+  clearUsageLimitState(ds);
+  ds.workerReady = false;
+  clearUsageRefreshTimer(ds);
+  ds.localProcessAttestation = undefined;
+  ds.managedTurnOrigin = undefined;
+  invalidateStuckWarning(ds, reason);
+  invalidateTuiPrompt(ds, reason);
+  const w = ds.worker;
+  if (w && !w.killed) {
+    trackLifecycleRetirement(ds, w);
+    try { w.kill('SIGTERM'); } catch { /* already gone */ }
+    armWorkerKillBackstop(w, tag(ds));
+  }
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -2563,10 +2914,98 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
  * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
  */
 export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
+  // Two failure modes that must NOT be conflated. The old single try/catch
+  // swallowed both, so a quarantine write failure silently returned `undefined`
+  // (restart proceeds, risk unrecorded) — the exact fail-open this ledger exists
+  // to prevent.
+  let env: Record<string, string> | null;
   try {
-    return getBot(ds.larkAppId).config.env ?? null;
+    env = getBot(ds.larkAppId).config.env ?? null;
   } catch {
+    // Bot deregistered: nothing to hot-update. Keep the worker's snapshot (legacy
+    // behaviour) — this is a benign, expected state.
     return undefined;
+  }
+  // Record what this generation is being handed BEFORE the restart is sent.
+  //
+  // This is the single choke point all four restart senders share (dashboard-ipc
+  // operator + working-dir, requestSessionRestart, cli_crash auto-restart), so
+  // recording here cannot be missed by adding a fifth caller — which is exactly
+  // how the device-isolation proof lost track of the env the running child had
+  // actually been given.
+  //
+  // Accumulate, never replace: the restart may fail or be coalesced, so a later
+  // clean env is not evidence that the dangerous child is gone.
+  //
+  // Any throw here propagates on purpose: the caller must not send a restart while
+  // believing a risk was recorded when it was not.
+  rememberAppliedUnprovableEnvKeys(ds, env ?? undefined);
+  return env;
+}
+
+/**
+ * Fold the unprovable keys of an env payload into the generation's ledger.
+ *
+ * Names only — the values can be credentials, and the proof only inspects names.
+ * Exported for the restart-timeline tests, which must be able to assert the
+ * ledger itself rather than infer it from a classifier result.
+ */
+export function rememberAppliedUnprovableEnvKeys(
+  ds: DaemonSession,
+  env: Record<string, string> | undefined,
+): void {
+  // MOJO ONLY. This choke point is shared by every backend's restart, so an
+  // ungated call quarantined codex/tmux sessions as "mojo" forever: a bot with
+  // LD_PRELOAD in bots.json env poisoned unrelated backends (cross-backend
+  // contamination + permanent unprovability). The ledger exists solely to answer
+  // "could a hooked MOJO client still be running", so only mojo may write to it.
+  if (!isMojoSession(ds)) return;
+
+  // BOTH env layers. `mojoUnprovableEnvKeys` is fed the top-level per-bot env AND
+  // the mojo block's own env: they are peers (see the `init` message), the mojo
+  // block wins the merge, and a dangerous key living only in `mojo.env` used to be
+  // recorded nowhere — so it survived a daemon restart as "clean".
+  const mojoBlockEnv = sessionMojoBlockEnv(ds);
+  const keys = mojoUnprovableEnvKeys({ env: { ...(env ?? {}), ...mojoBlockEnv } });
+  if (keys.length === 0) return;
+  const merged = new Set([...(ds.mojoAppliedUnprovableEnvKeys ?? []), ...keys]);
+  ds.mojoAppliedUnprovableEnvKeys = [...merged];
+  // Also persist, because the in-memory ledger cannot answer the question after
+  // a daemon restart or an explicit /close: the SIGTERM-ed mojo child (and any
+  // detached descendants) can outlive both, while still holding an activated
+  // credential. The durable record is keyed by session id and never retracted.
+  const sessionId = ds.session?.sessionId;
+  if (!sessionId) {
+    // Cannot key the durable record without a session id. Never swallow this:
+    // keeping the risk in memory only is the fail-open direction, and this branch
+    // should be unreachable for a real DaemonSession.
+    throw new Error(
+      '[mojo-quarantine] refusing to lose an unprovable launcher env: session id missing'
+      + ` (keys: ${keys.join(', ')})`,
+    );
+  }
+  // Deliberately NOT wrapped in try/catch: a failed persist means the daemon
+  // cannot prove this host is clean, and swallowing it would hand back a false
+  // "recorded" to every restart sender.
+  recordQuarantinedLauncherEnvKeys(sessionId, keys);
+}
+
+/** Is this session frozen onto the mojo backend? Prefers the live worker stamp. */
+function isMojoSession(ds: DaemonSession): boolean {
+  return (ds.initConfig?.backendType ?? ds.session?.backendType) === 'mojo';
+}
+
+/**
+ * The mojo block's own `env`, from whichever layer the next turn will actually
+ * use: the config frozen onto the live worker, else the live bot config.
+ */
+function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
+  const fromInit = (ds.initConfig?.backendConfig as MojoConfig | undefined)?.env;
+  if (fromInit) return fromInit;
+  try {
+    return getBot(ds.larkAppId).config.mojo?.env ?? {};
+  } catch {
+    return {};
   }
 }
 
@@ -2611,7 +3050,85 @@ export function __testOnly_resetRestartCoordinator(): void {
  * false worker-side too), so killing it would violate the bridge invariant of
  * leaving the user's own CLI untouched.
  */
-function destroyOrphanedBackingSession(ds: DaemonSession): void {
+/**
+ * Build the launch config for cancelling a mojo session's remote lineage, or say
+ * why it must not be attempted.
+ *
+ * Shared by the best-effort killWorker teardown and the awaited explicit-close
+ * path so the two cannot cancel through DIFFERENT configs — the launch identity
+ * and control plane decide which tenant the cancel reaches, so a second copy of
+ * these rules drifting would silently cancel against the wrong endpoint.
+ */
+function resolveMojoCancelLaunch(
+  ds: DaemonSession,
+  remoteId: string,
+  label: string,
+): { ok: true; launchCfg: EffectiveMojoConfig } | { ok: false; reason: 'quarantined' | 'bot_gone' } {
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    // Bot deregistered — nothing to cancel WITH. The caller decides what that
+    // means; the explicit-close path treats it as a RETRYABLE refusal, because
+    // re-registering the bot restores exactly the config this needs.
+    logger.warn(
+      `[${tag(ds)}] ${label}: cannot cancel mojo session ${remoteId} — bot `
+      + `${ds.larkAppId} is deregistered. Lineage retained for manual cleanup.`,
+    );
+    return { ok: false, reason: 'bot_gone' };
+  }
+  // mojo needs no baseUrl gate — the CLI resolves its own endpoint, and an absent
+  // `mojo` config block is a valid setup.
+  //
+  // Build the SAME effective config the worker would (shared helper): a bare
+  // `botCfg.mojo` carries neither the pinned binary (cliPathOverride) nor the
+  // per-bot env holding the JWT, so a bot that ran fine on a custom path/identity
+  // would fail to cancel here — the remote session then keeps burning cloud
+  // sandbox time while still holding injected credentials.
+  //
+  // The launch IDENTITY (binary + wrapper) must come from the values FROZEN on the
+  // session, not from live bot config: the remote session was created through
+  // those, so cancelling through a wrapper the bot gained afterwards can reach the
+  // wrong gateway/tenant. Session cwd is not persisted for a dead worker, so that
+  // one falls back to the bot's configured working dir.
+  const frozenLaunch = frozenSessionLaunchIdentity(ds, botCfg);
+  // freeze:false — teardown must not mutate session state. Cancel has to reach the
+  // endpoint/tenant that CREATED the remote session, so the frozen control plane
+  // matters here as much as the frozen binary.
+  const frozenMojo = sessionMojoConfig(ds, botCfg, { freeze: false });
+  // A quarantined lineage must NOT be cancelled: nothing records which control
+  // plane holds it, so cancelling through the current config could reach a
+  // different tenant. Callers capture `remoteId` BEFORE this call, so clearing the
+  // field would not have stopped it — the explicit state is what makes the refusal
+  // reliable.
+  if (frozenMojo.lineage === 'quarantined') {
+    logger.warn(
+      `[${tag(ds)}] ${label}: NOT cancelling mojo session ${remoteId} — `
+      + 'its control plane is unverifiable (quarantined). It is preserved on the '
+      + 'session for manual cleanup.',
+    );
+    return { ok: false, reason: 'quarantined' };
+  }
+  return {
+    ok: true,
+    launchCfg: buildEffectiveMojoConfig(frozenMojo.config, {
+      cliPathOverride: frozenLaunch.cliPathOverride,
+      workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
+      env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+      wrapperCli: frozenLaunch.wrapperCli,
+    }),
+  };
+}
+
+function destroyOrphanedBackingSession(
+  ds: DaemonSession,
+  opts: {
+    /** The authoritative close already PROVED the remote cancel; firing the
+     *  best-effort one again would cancel a second time (and, for an already-gone
+     *  session, report a spurious failure). */
+    skipRemoteCancel?: boolean;
+  } = {},
+): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
   reclaimParkedCrashDiagnostic(ds);
   // Riff cancellation is asynchronous and cannot be made safe from this
@@ -2628,6 +3145,56 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
     }
     return;
   }
+  if (frozenType === 'mojo') {
+    // Remote backends persist their lineage in the same field riff uses.
+    const remoteId = ds.session.riffParentTaskId;
+    if (!remoteId || opts.skipRemoteCancel) return;
+    const resolved = resolveMojoCancelLaunch(ds, remoteId, 'killWorker');
+    if (!resolved.ok) return;
+    // Best-effort ONLY. The authoritative /close path (prepareMojoExplicitClose)
+    // awaits the same cancellation before publishing the closed row; this branch
+    // exists for the killWorker callers that are not an explicit close (crash
+    // retirement, transfer teardown), where there is no result to report to.
+    //
+    // Clear the lineage ONLY once the remote session is really gone. This used to
+    // clear unconditionally right after firing, so a failed cancel erased the only
+    // id — the exact leak master's riff change above calls out.
+    void cancelMojoSessionById(resolved.launchCfg, remoteId).then((outcome) => {
+      // Structured outcome, not a boolean — `if (!outcome)` would be always-false
+      // and silently treat every failure as a success (an object is truthy).
+      if (!isMojoRemoteGone(outcome)) {
+        logger.warn(
+          `[${tag(ds)}] killWorker: orphan mojo session ${remoteId} NOT cancelled; `
+          + 'retaining the lineage — note nothing retries this automatically, so an '
+          + 'explicit /close (which DOES await the cancel) or manual cleanup is required',
+        );
+        return;
+      }
+      logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
+      ds.session.riffParentTaskId = undefined;
+      sessionStore.updateSession(ds.session);
+    }).catch((err: unknown) => {
+      // Defence in depth for a FIRE-AND-FORGET promise. This helper is
+      // synchronous, so there is no caller to reject to: an escaping rejection
+      // becomes an unhandledRejection, and the daemon installs no handler for
+      // those (only worker.ts does), so Node v22 terminates the process --
+      // taking down every OTHER session this daemon serves. The awaited call
+      // site already guards itself the same way; tmux-pipe-backend.ts documents
+      // a real incident of exactly this shape.
+      //
+      // Reachable, not theoretical: cancelMojoSessionById constructs a backend
+      // before its own try block, so an unreadable containment store throws out
+      // of it rather than returning the structured failure its type promises.
+      // sessionStore.updateSession above can throw for the same reason (a failed
+      // save). Both must degrade to a retained lineage, never to a crash.
+      logger.error(
+        `[${tag(ds)}] killWorker: orphan mojo cancel for ${remoteId} threw; `
+        + `retaining the lineage for explicit /close or manual cleanup: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    return;
+  }
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
@@ -2638,8 +3205,15 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   }
 }
 
-type RiffClosePreparation =
-  | { ok: true; taskId?: string }
+type RemoteClosePreparation =
+  | {
+      ok: true;
+      taskId?: string;
+      residual?: CloseResidual;
+      /** Move this still-uncancellable lineage into the PARKED slot as part of the
+       *  durable close, so the residual decision survives and replays. */
+      parkMojoLineage?: string;
+    }
   | {
       ok: false;
       error:
@@ -2650,30 +3224,71 @@ type RiffClosePreparation =
         | 'riff_row_inconsistent'
         | 'riff_durable_close_failed'
         | 'riff_close_reconciliation_required'
-        | 'riff_shutdown_fence_in_progress';
-      retryable: true;
+        | 'remote_shutdown_fence_in_progress'
+        // mojo reuses this preparation contract: same problem (a remote,
+        // credential-bearing session that must be proven gone before the row is
+        // published as closed), same retryable-failure shape.
+        | 'mojo_cancel_failed'
+        | 'mojo_durable_close_failed'
+        | 'mojo_close_reconciliation_required'
+        /** Bot deregistered — retryable once it is registered again. */
+        | 'mojo_config_missing'
+        /** Durable lineage with no active owner to cancel through. */
+        | 'mojo_close_identity_missing'
+        /**
+         * The remote teardown already happened irreversibly, but the local close
+         * did not finish. ONLY the local commit may be retried.
+         */
+        | 'mojo_close_commit_required';
+      /**
+       * May the caller simply try the SAME close again?
+       *
+       * This was hardcoded `true`, which contradicted the tri-state it was
+       * reporting: an `uncertain` prepare needs explicit reconciliation (a blind
+       * retry cannot cancel a session nobody can name), and an `irreversible`
+       * one must never re-run the remote cancel. `false` means "do not loop on
+       * this; a human/reconciler decides".
+       */
+      retryable: boolean;
+      /**
+       * The exact worker verdict, when this refusal came from one. `retryable`
+       * appears here too: a close whose WRITES stay fenced may still itself be
+       * retryable, and flattening that into `uncertain` would demand manual
+       * reconciliation for a failure the retry can clear.
+       */
+      recovery?: 'retryable' | 'uncertain' | 'irreversible';
       taskId?: string;
     };
 
-async function abortLiveRiffWorkerClose(
+async function abortLiveRemoteWorkerClose(
   ds: DaemonSession,
   requestId: string,
   opts: { allowAbsentAfterProvenRestore?: boolean } = {},
 ): Promise<boolean> {
-  if (ds.riffCloseState?.requestId !== requestId) return false;
+  if (ds.remoteCloseState?.requestId !== requestId) return false;
   const worker = ds.worker;
   if (!worker || worker.killed) {
     if (opts.allowAbsentAfterProvenRestore) {
-      ds.riffCloseState = undefined;
+      ds.remoteCloseState = undefined;
       return true;
     }
-    ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
     return false;
   }
 
-  const restored = await new Promise<{ ok: boolean; error?: string }>(resolve => {
+  const restored = await new Promise<{
+    ok: boolean;
+    admissionRestored?: boolean;
+    fenceReason?: string;
+    error?: string;
+  }>(resolve => {
     let settled = false;
-    const finish = (result: { ok: boolean; error?: string }): void => {
+    const finish = (result: {
+      ok: boolean;
+      admissionRestored?: boolean;
+      fenceReason?: string;
+      error?: string;
+    }): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -2688,7 +3303,17 @@ async function abortLiveRiffWorkerClose(
         finish({ ok: false, error: 'stale_worker_generation' });
         return;
       }
-      finish({ ok: msg.ok, ...(msg.error ? { error: msg.error } : {}) });
+      // `ok` says the abort was HANDLED; `admissionRestored` says whether writes
+      // actually came back. A backend holding a latched fence answers ok:true /
+      // admissionRestored:false, and inferring restoration from `ok` journalled a
+      // cleared fence while write() kept returning false. Absent means `ok`
+      // (legacy backends, riff).
+      finish({
+        ok: msg.ok,
+        admissionRestored: msg.admissionRestored ?? msg.ok,
+        ...(msg.fenceReason ? { fenceReason: msg.fenceReason } : {}),
+        ...(msg.error ? { error: msg.error } : {}),
+      });
     };
     const onExit = (): void => finish({
       ok: false,
@@ -2696,7 +3321,7 @@ async function abortLiveRiffWorkerClose(
     });
     const timer = setTimeout(
       () => finish({ ok: false, error: 'close_abort_result_timeout' }),
-      RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
+      REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
     );
     timer.unref?.();
     worker.on?.('message', onMessage);
@@ -2708,68 +3333,249 @@ async function abortLiveRiffWorkerClose(
     }
   });
 
-  if (restored.ok && ds.riffCloseState?.requestId === requestId) {
-    ds.riffCloseState = undefined;
+  // A handled-but-REFUSED abort must not clear the fence. `ok` alone did, which
+  // is the same laundering as before, one path over.
+  const admissionRestored = restored.ok && restored.admissionRestored !== false;
+  if (admissionRestored && ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = undefined;
     return true;
   }
+  // A proven earlier restore excuses a MISSING ack, never a refused one: the
+  // backend just told us writes are still fenced.
   if (opts.allowAbsentAfterProvenRestore
-      && ds.riffCloseState?.requestId === requestId) {
-    ds.riffCloseState = undefined;
+      && restored.admissionRestored !== false
+      && ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = undefined;
     return true;
   }
-  if (ds.riffCloseState?.requestId === requestId) {
-    ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+  if (ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
   }
   logger.warn(
-    `[${tag(ds)}] Riff close abort was not acknowledged (${restored.error ?? 'unknown'}); `
+    `[${tag(ds)}] Remote close abort did not restore write admission `
+    + `(${restored.fenceReason ?? restored.error ?? 'unknown'}); `
     + 'retaining admission fence pending explicit lineage reconciliation',
   );
   return false;
 }
 
-async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffClosePreparation> {
+async function prepareLiveRemoteWorkerClose(
+  ds: DaemonSession,
+  backendType: 'riff' | 'mojo',
+): Promise<RemoteClosePreparation> {
   const worker = ds.worker;
   if (!worker || worker.killed) {
-    return { ok: false, error: 'riff_worker_close_failed', retryable: true };
-  }
-  if (ds.riffCloseState || ds.riffShutdownState) {
     return {
       ok: false,
-      error: 'riff_worker_close_failed',
+      error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
       retryable: true,
-      ...((ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)
-        ? { taskId: (ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)! }
+    };
+  }
+  if (backendType === 'mojo' && ds.remoteCloseState?.phase === 'abort_restored') {
+    const restoredState = ds.remoteCloseState;
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        ds.session.sessionId,
+        restoredState.requestId,
+        {
+          admissionRestored: true,
+          ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+        },
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo admission restore proof could not clear the durable close journal: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+      };
+    }
+  }
+  if (backendType === 'mojo' && ds.remoteCloseState?.phase === 'prepared') {
+    try {
+      const committed = sessionStore.markMojoClosePrepared(
+        ds.session.sessionId,
+        ds.remoteCloseState.requestId,
+        ds.remoteCloseState.taskId,
+        // The retry must republish the SAME proof, residual included — the
+        // original prepare saw the local evidence grade; this replay did not.
+        ds.remoteCloseState.localResidual,
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo close proof could not be persisted for durable commit: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    }
+    return {
+      ok: true,
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      // Stored residual → derived at read time (see liveLocalResidual): the
+      // journal write above still republishes the original proof verbatim.
+      ...(residualField(liveLocalResidual(ds.session.sessionId, ds.remoteCloseState.localResidual))),
+    };
+  }
+  if (ds.remoteShutdownState) {
+    return {
+      ok: false,
+      error: 'remote_shutdown_fence_in_progress',
+      retryable: true,
+      ...(typeof ds.remoteShutdownState.taskId === 'string' && ds.remoteShutdownState.taskId
+        ? { taskId: ds.remoteShutdownState.taskId }
         : {}),
     };
   }
+  let takenOverRuntimeState: DaemonSession['remoteCloseState'];
+  if (ds.remoteCloseState) {
+    const runtimeUncertain = backendType === 'mojo'
+      && ds.remoteCloseState.phase === 'uncertain';
+    // A runtime `uncertain` fence used to be a dead end: "a blind retry proves
+    // nothing" was true when the journal refused every restart, so /close
+    // failed with retryable:false for the daemon's whole lifetime and the only
+    // exit was a daemon restart — a process-level soft deadlock (third-round
+    // review, gate 1). The retry is no longer blind: an explicit close with a
+    // LIVE worker re-runs the full destroySession, which can produce fresh
+    // evidence. When the runtime fence and the DURABLE journal describe the
+    // same failed attempt — same phase, same requestId, same lineage — the
+    // fence is cleared and the close re-enters prepare under a new requestId
+    // (beginMojoCloseJournal accepts the uncertain takeover). Anything less
+    // than an exact match keeps the refusal: a mismatched pair means runtime
+    // and disk disagree about which attempt happened, and clearing on that
+    // would launder an unknown state.
+    const durableForTakeover = ds.session.mojoCloseJournal;
+    // Three legs, each covering a REAL production writer of this pair
+    // (fourth-round review named the two the exact-match version missed):
+    //   phase   — the runtime fence is `uncertain` for every non-irreversible
+    //             failed prepare, while the DURABLE phase differs by verdict:
+    //             `uncertain` for an uncertain one, `preparing` (with
+    //             recovery 'retryable') for a retryable-but-fenced one. Both
+    //             pairs describe the same failed attempt; matching only
+    //             uncertain/uncertain left retryable+fenced soft-deadlocked
+    //             with a durable row that itself promises a retry (gap A).
+    //   requestId — exact, always: both sides were written by that attempt.
+    //   lineage — equal, or the durable side is a superset (the worker may
+    //             have reported the pre-init lineage into the journal while
+    //             the runtime fence kept none, gap B). A CONFLICTING pair
+    //             still refuses: runtime and disk disagreeing about which
+    //             remote session was touched must never be laundered.
+    const durablePhaseMatches = durableForTakeover?.phase === 'uncertain'
+      || (durableForTakeover?.phase === 'preparing'
+        && durableForTakeover.recovery === 'retryable');
+    const runtimeTaskId = ds.remoteCloseState.taskId ?? undefined;
+    const durableTaskId = durableForTakeover?.taskId ?? undefined;
+    const takeoverEligible = runtimeUncertain
+      && durableForTakeover !== undefined
+      && durablePhaseMatches
+      && durableForTakeover.requestId === ds.remoteCloseState.requestId
+      && (durableTaskId === runtimeTaskId || runtimeTaskId === undefined);
+    if (takeoverEligible) {
+      logger.warn(
+        `[${tag(ds)}] explicit close takes over ${durableForTakeover.phase} Mojo journal `
+        + `(${ds.remoteCloseState.requestId}); re-running the cancel through the live worker`,
+      );
+      // Cleared only in memory here; restored if the fresh attempt's durable
+      // write below fails, so the runtime fence (and everything keyed on it,
+      // e.g. the shutdown-detach explicit-close guard) never vanishes without
+      // a successor journal actually on disk.
+      takenOverRuntimeState = ds.remoteCloseState;
+      ds.remoteCloseState = undefined;
+    } else if (runtimeUncertain) {
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: false,
+        recovery: 'uncertain',
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    } else {
+      return {
+        ok: false,
+        error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+        retryable: true,
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    }
+  }
   const requestId = randomUUID();
-  ds.riffCloseState = {
+  if (backendType === 'mojo') {
+    try {
+      const committed = sessionStore.beginMojoCloseJournal(
+        ds.session.sessionId,
+        requestId,
+        ds.session.riffParentTaskId,
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+    } catch (err) {
+      // Reinstate a runtime fence the takeover cleared: without this, a failed
+      // durable write left the ds fence-less while disk still said uncertain,
+      // and guards keyed on ds.remoteCloseState (shutdown-detach's
+      // explicit-close check) silently lost their signal.
+      if (takenOverRuntimeState) ds.remoteCloseState = takenOverRuntimeState;
+      logger.error(
+        `[${tag(ds)}] Mojo close journal could not be persisted before cancellation: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
+      };
+    }
+  }
+  ds.remoteCloseState = {
     phase: 'preparing',
     requestId,
     ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
   };
   let matchedCloseResult = false;
-  const result = await new Promise<RiffWorkerCloseResult>((resolve) => {
+  const result = await new Promise<RemoteWorkerCloseResult>((resolve) => {
     let settled = false;
-    const finish = (value: RiffWorkerCloseResult): void => {
+    const finish = (value: RemoteWorkerCloseResult): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       worker.removeListener?.('exit', onExit);
-      pendingRiffWorkerCloses.delete(requestId);
+      pendingRemoteWorkerCloses.delete(requestId);
       resolve(value);
     };
+    // The worker died mid-prepare, so whatever destroySession() had already done
+    // is unknown -- including a completed irreversible cancel. Fence.
     const onExit = (): void => finish({
       ok: false,
       error: 'worker_exited_before_close_result',
+      recovery: 'uncertain',
     });
+    // Riff's adapter has its own 20s destroy deadline. Mojo may first spend 8s
+    // waiting for system/init, then up to 60s in `mojo session cancel`; aborting
+    // at the old 23s Riff budget re-opened admission while that irreversible
+    // cancellation was still in flight. Stay above both bounded Mojo phases.
+    const closeResultTimeoutMs = backendType === 'mojo'
+      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
+      : 23_000;
     const timer = setTimeout(
-      () => finish({ ok: false, error: 'worker_close_result_timeout' }),
-      23_000,
+      // A timed-out prepare may still be running remotely; the outcome is unknown.
+      () => finish({ ok: false, error: 'worker_close_result_timeout', recovery: 'uncertain' }),
+      closeResultTimeoutMs,
     );
     timer.unref?.();
     worker.once?.('exit', onExit);
-    pendingRiffWorkerCloses.set(requestId, {
+    pendingRemoteWorkerCloses.set(requestId, {
       sessionId: ds.session.sessionId,
       worker,
       resolve: value => {
@@ -2785,14 +3591,247 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
   });
 
   const taskId = result.taskId ?? ds.session.riffParentTaskId;
+  if (backendType === 'mojo') {
+    if (result.ok) {
+      try {
+        const committed = sessionStore.markMojoClosePrepared(
+          ds.session.sessionId,
+          requestId,
+          taskId,
+          // Durable ON PURPOSE: the residual is part of the close outcome, and a
+          // daemon restart replaying this prepared journal must still publish
+          // `closed_with_residual` (only the worker saw the evidence grade).
+          result.residual,
+        );
+        ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+        ds.session.riffParentTaskId = committed.riffParentTaskId;
+      } catch (err) {
+        // Cancellation is irreversible. The runtime proof stays prepared and
+        // admission remains fenced; a retry republishes that same proof without
+        // asking the worker to cancel twice — residual included, or the retry
+        // would silently downgrade a residual close to a plain one. The durable
+        // `preparing` journal makes a daemon crash fail closed rather than
+        // resume this generation.
+        ds.remoteCloseState = {
+          phase: 'prepared',
+          requestId,
+          ...(taskId ? { taskId } : {}),
+          ...(result.residual ? { localResidual: result.residual } : {}),
+        };
+        logger.error(
+          `[${tag(ds)}] Mojo close proof persistence failed after cancellation; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+
+      ds.remoteCloseState = {
+        phase: 'prepared',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+        ...(result.residual ? { localResidual: result.residual } : {}),
+      };
+      logger.info(`[${tag(ds)}] mojo worker close prepared and remote cancellation confirmed`);
+      // The remote lineage is confirmed cancelled, but that says nothing about the
+      // LOCAL process tree. When the backend could not prove its subtree gone it
+      // kept the containment handle, so this row must NOT be published as an
+      // ordinary closed one: the device-isolation blocker is still live and an
+      // operator reading "closed" would believe a credentialed process was gone.
+      //
+      // Kept distinct from the remote lineage residual on purpose. That one names a
+      // surviving remote task id and asks for remote cleanup; this one names a host
+      // subtree and asks for local cleanup, and collapsing them would send the
+      // operator after the wrong thing. Hence no taskId here even when one exists —
+      // the remote side really was cancelled.
+      if (result.residual) {
+        logger.warn(
+          `[${tag(ds)}] mojo remote cancellation confirmed, but the LOCAL subtree was not `
+          + `proven gone (${result.residual}); publishing a residual close so the `
+          + 'device-isolation blocker stays visible',
+        );
+        return {
+          ok: true,
+          ...(taskId ? { taskId } : {}),
+          residual: { reason: result.residual },
+        };
+      }
+      return { ok: true, ...(taskId ? { taskId } : {}) };
+    }
+
+    // Only a REVERSIBLE failure may be rolled back. Sending close_abort for every
+    // ok:false re-opened write admission after an `uncertain` verdict (an unnamed
+    // remote session may exist) and after an `irreversible` one (the remote side is
+    // already gone), which laundered both back into `retryable` end to end.
+    const recovery = result.recovery ?? 'retryable';
+    // Whether writes may be admitted is a DIFFERENT question from whether the
+    // close may be retried. Keying the rollback on `recovery` re-opened admission
+    // for an unproven local child termination (retryable, yet a credentialed
+    // process may still be alive); absent `admission` keeps the historical
+    // derivation so riff and older workers are unaffected.
+    // Delegated to the shared helper rather than re-implementing the derivation:
+    // two copies of this rule is how the daemon drifted back to reading
+    // `recovery` and re-opened admission on a latched fence.
+    const mayRestore = mayRestoreWriteAdmission({
+      ok: false,
+      ...(result.recovery ? { recovery: result.recovery } : {}),
+      ...(result.admission ? { admission: result.admission } : {}),
+    });
+    if (!mayRestore) {
+      // No abort: the runtime fence stays up, so the session remains active and
+      // keeps its device-isolation blocker. But the DURABLE row must also stop
+      // saying `preparing` with the pre-prepare task id -- a crash here left a
+      // journal that could not be told apart from an interrupted cancel, and
+      // silently discarded the exact lineage the worker just reported.
+      const irreversible = recovery === 'irreversible';
+      let journalled = false;
+      try {
+        const committed = sessionStore.markMojoCloseUnresolved(
+          ds.session.sessionId,
+          requestId,
+          {
+            recovery,
+            // The EXACT id from close_result (the pre-init window means the worker
+            // may be the first to know it), not the pre-prepare guess.
+            ...(taskId ? { taskId } : {}),
+            // Persisted verbatim and separately from `recovery`: no close_abort
+            // was sent, so writes are still fenced even when the close itself is
+            // retryable. Re-deriving this on restore is what re-opened admission.
+            admission: 'fenced',
+          },
+        );
+        ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+        ds.session.riffParentTaskId = committed.riffParentTaskId;
+        journalled = true;
+      } catch (err) {
+        // Fail closed: keep the runtime fence exactly as strict as the disk state
+        // is ambiguous. Never fall back to a rollback.
+        logger.error(
+          `[${tag(ds)}] Mojo ${recovery} close verdict could not be journalled: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      // An irreversible teardown leaves ONLY the local commit outstanding, so the
+      // runtime state must be `prepared` -- parking it at `uncertain` made every
+      // retry bounce off the fence and the row could never be closed at all.
+      // NOTE: the runtime phase deliberately stays `uncertain` for everything
+      // that is not a journalled irreversible teardown. A retryable-but-fenced
+      // close is recorded as `preparing` in the DURABLE journal (a restart may
+      // retry the cancel), but within this process the reconciliation gate
+      // refuses a retry either way, so distinguishing the runtime phase here
+      // would be an untestable claim.
+      ds.remoteCloseState = {
+        phase: irreversible && journalled ? 'prepared' : 'uncertain',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.error(
+        `[${tag(ds)}] mojo worker close prepare failed as ${recovery} `
+        + `(${result.error ?? 'unknown'}); admission stays fenced, `
+        + `journal=${journalled ? ds.session.mojoCloseJournal?.phase ?? 'unknown' : 'unwritten'}`,
+      );
+      if (!journalled) {
+        return {
+          ok: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          recovery,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+      // Fenced but still retryable (an unproven LOCAL termination; the
+      // irreversible remote cancel never ran). The close may be retried as a
+      // close -- reporting it as `mojo_close_reconciliation_required` would
+      // strand a session a plain retry can still finish.
+      if (recovery === 'retryable') {
+        return {
+          ok: false,
+          error: 'mojo_cancel_failed',
+          retryable: true,
+          recovery,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+      return irreversible
+        // Retryable, but only as a LOCAL commit: the durable journal is now
+        // commit-only, so a retry can never issue a second cancel.
+        ? {
+            ok: false,
+            error: 'mojo_close_commit_required',
+            retryable: true,
+            recovery,
+            ...(taskId ? { taskId } : {}),
+          }
+        // Unknown outcome: a blind retry proves nothing. Demand reconciliation
+        // instead of advertising a retry that cannot succeed.
+        : {
+            ok: false,
+            error: 'mojo_close_reconciliation_required',
+            retryable: false,
+            recovery,
+            ...(taskId ? { taskId } : {}),
+          };
+    }
+    const admissionRestored = await abortLiveRemoteWorkerClose(ds, requestId, {
+      allowAbsentAfterProvenRestore: matchedCloseResult,
+    });
+    // NOTE: no separate "refused" branch here. finishMojoCloseAbort already keeps
+    // a durable fenced row when admissionRestored is false; the bug was never its
+    // behaviour but the CALLER inventing that flag from `close_abort_result.ok`.
+    // An extra branch differing only in which non-clearing row it writes was not
+    // distinguishable by any test, so it is not claimed as a fix.
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        ds.session.sessionId,
+        requestId,
+        { admissionRestored, ...(taskId ? { taskId } : {}) },
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+    } catch (err) {
+      // The worker may have restored admission, but without a durable journal
+      // clear a crash would still be ambiguous. Keep the daemon fence aligned
+      // with the disk-side uncertainty instead of accepting new input.
+      ds.remoteCloseState = {
+        phase: admissionRestored ? 'abort_restored' : 'uncertain',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.error(
+        `[${tag(ds)}] Mojo close abort could not be committed durably: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(taskId ? { taskId } : {}),
+      };
+    }
+    logger.warn(
+      `[${tag(ds)}] mojo worker close prepare failed: ${result.error ?? 'unknown'}; `
+      + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      ...(taskId ? { taskId } : {}),
+    };
+  }
+
   if (result.taskId) {
     ds.session.riffParentTaskId = result.taskId;
     try {
       sessionStore.updateSession(ds.session);
     } catch (err) {
-      await abortLiveRiffWorkerClose(ds, requestId);
+      await abortLiveRemoteWorkerClose(ds, requestId);
       logger.error(
-        `[${tag(ds)}] Riff close lineage persistence failed; close aborted: `
+        `[${tag(ds)}] ${backendType} close lineage persistence failed; close aborted: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
       return {
@@ -2805,11 +3844,11 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
   }
 
   if (!result.ok) {
-    await abortLiveRiffWorkerClose(ds, requestId, {
+    await abortLiveRemoteWorkerClose(ds, requestId, {
       allowAbsentAfterProvenRestore: matchedCloseResult,
     });
     logger.warn(
-      `[${tag(ds)}] Riff worker close prepare failed: ${result.error ?? 'unknown'}; `
+      `[${tag(ds)}] ${backendType} worker close prepare failed: ${result.error ?? 'unknown'}; `
       + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
     );
     return {
@@ -2820,12 +3859,12 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
     };
   }
 
-  ds.riffCloseState = {
+  ds.remoteCloseState = {
     phase: 'prepared',
     requestId,
     ...(taskId ? { taskId } : {}),
   };
-  logger.info(`[${tag(ds)}] Riff worker close prepared and remote task cancellation confirmed`);
+  logger.info(`[${tag(ds)}] ${backendType} worker close prepared and remote cancellation confirmed`);
   return { ok: true, ...(taskId ? { taskId } : {}) };
 }
 
@@ -2835,28 +3874,28 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
 async function prepareRiffExplicitClose(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
-): Promise<RiffClosePreparation> {
+): Promise<RemoteClosePreparation> {
   const session = ds?.session ?? stored;
   if (!session) return { ok: true };
   const backendType = ds?.initConfig?.backendType ?? session.backendType;
   const taskId = session.riffParentTaskId;
-  if (ds?.riffShutdownState) {
-    const fencedTaskId = Object.prototype.hasOwnProperty.call(ds.riffShutdownState, 'taskId')
-      ? ds.riffShutdownState.taskId
+  if (ds?.remoteShutdownState) {
+    const fencedTaskId = Object.prototype.hasOwnProperty.call(ds.remoteShutdownState, 'taskId')
+      ? ds.remoteShutdownState.taskId
       : taskId;
     return {
       ok: false,
-      error: 'riff_shutdown_fence_in_progress',
+      error: 'remote_shutdown_fence_in_progress',
       retryable: true,
       ...(typeof fencedTaskId === 'string' && fencedTaskId ? { taskId: fencedTaskId } : {}),
     };
   }
-  if (ds?.riffCloseState) {
+  if (ds?.remoteCloseState) {
     return {
       ok: false,
       error: 'riff_close_reconciliation_required',
       retryable: true,
-      ...(ds.riffCloseState.taskId ? { taskId: ds.riffCloseState.taskId } : {}),
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
     };
   }
   if (backendType !== 'riff') return { ok: true };
@@ -2871,7 +3910,7 @@ async function prepareRiffExplicitClose(
         ...(taskId ? { taskId } : {}),
       };
     }
-    return prepareLiveRiffWorkerClose(ds);
+    return prepareLiveRemoteWorkerClose(ds, 'riff');
   }
 
   const durableBefore = sessionStore.getSession(session.sessionId);
@@ -2935,6 +3974,496 @@ async function prepareRiffExplicitClose(
 
   logger.info(`[${closeLabel}] Riff task ${cleanup.taskId} cancellation prepared for explicit close`);
   return { ok: true, taskId: cleanup.taskId };
+}
+
+/**
+ * Prove a mojo session's remote lineage is cancelled BEFORE its row is published
+ * as closed — the mojo half of what prepareRiffExplicitClose does.
+ *
+ * Without this, `/close` on a workerless mojo session marked the row closed and
+ * returned success while the cancel was still in flight, so a failed cancel left
+ * the operator believing the session was gone while the remote one kept running
+ * and holding the injected credential. The retained lineage was not a recovery
+ * path either: cancelMojoSessionById has exactly one call site (the best-effort
+ * killWorker teardown), which a second `/close` can no longer reach because the
+ * first close removed the session from the active registry.
+ *
+ * A live worker uses prepare/commit: MojoBackend.destroySession() awaits the
+ * cancel (including the pre-init window), then the daemon durably closes the row
+ * before committing worker retirement. A failed durable write keeps the exact
+ * generation prepared so retry commits without cancelling twice.
+ *
+ * An open durable row with no entry in the active registry cannot be cancelled
+ * from here at all (every helper the cancel needs is keyed on DaemonSession), so
+ * it is refused as retryable rather than published as closed — restoring the owner
+ * makes the retry work.
+ */
+async function prepareMojoExplicitClose(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): Promise<RemoteClosePreparation> {
+  const session = ds?.session ?? stored;
+  if (!session) return { ok: true };
+  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  // A row whose lineage was PARKED (restore-time quarantine moves the id here and
+  // clears the active slot) still has a remote session running. It is reported as
+  // a residual on every close of this row, including replays of an already-closed
+  // one — which is what makes the outcome idempotent instead of degrading to a
+  // failure once the owner is gone.
+  const parked = mojoCloseResidualForRow(stored ?? session);
+  const remoteId = stored ? stored.riffParentTaskId : session.riffParentTaskId;
+  const runtimeClose = ds?.session.mojoCloseJournal;
+  const storedClose = stored?.mojoCloseJournal;
+  if (ds && stored && ds.session !== stored && runtimeClose) {
+    const runtimeMatchesDurable = !!storedClose
+      && runtimeClose.phase === storedClose.phase
+      && runtimeClose.requestId === storedClose.requestId
+      && runtimeClose.taskId === storedClose.taskId
+      && runtimeClose.updatedAt === storedClose.updatedAt;
+    if (!runtimeMatchesDurable) {
+      // A runtime copy is not durable authority. In particular, a stale/forged
+      // in-memory `prepared` value must never bypass cancellation, while a real
+      // prepared store row must not be re-cancelled because a detached runtime
+      // copy missed the last sync.
+      logger.error(
+        `[${session.sessionId.slice(0, 8)}] explicit close refused: runtime/durable Mojo journal mismatch`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...((storedClose?.taskId ?? runtimeClose.taskId ?? remoteId)
+          ? { taskId: (storedClose?.taskId ?? runtimeClose.taskId ?? remoteId)! }
+          : {}),
+      };
+    }
+  }
+  let durableClose = storedClose ?? runtimeClose;
+  if (durableClose && !sessionStore.isValidMojoCloseJournal(durableClose)) {
+    logger.error(
+      `[${session.sessionId.slice(0, 8)}] explicit close refused: malformed Mojo close journal`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...(remoteId ? { taskId: remoteId } : {}),
+    };
+  }
+  // Already closed is normally an idempotent replay. A journal on a closed row
+  // is NOT normal (the status transition clears it atomically), so do not flatten
+  // that contradictory disk state into an ordinary success.
+  if (stored && stored.status === 'closed') {
+    if (durableClose) {
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...((durableClose.taskId ?? remoteId)
+          ? { taskId: (durableClose.taskId ?? remoteId)! }
+          : {}),
+      };
+    }
+    return parked ? { ok: true, residual: parked } : { ok: true };
+  }
+  if (durableClose?.phase === 'prepared') {
+    // A prior daemon already received and durably recorded the irreversible
+    // worker cancellation proof. Finish only the local status/lineage commit;
+    // repeating the CLI cancel would turn an idempotent recovery into failure.
+    // A parked remote lineage outranks the journal's LOCAL residual in the one
+    // slot the response has (it names a live remote session); the local marker
+    // still surfaces whenever nothing is parked.
+    return {
+      ok: true,
+      ...((durableClose.taskId ?? remoteId)
+        ? { taskId: (durableClose.taskId ?? remoteId)! }
+        : {}),
+      // The journal's residual is a stored copy of the original proof; whether
+      // it still describes reality is the ledger's call (a reboot between the
+      // prepare and this replay may have discharged the handle).
+      ...(parked
+        ? { residual: parked }
+        : residualField(liveLocalResidual(session.sessionId, durableClose.localResidual))),
+    };
+  }
+  const matchingRuntimePreparedProof = durableClose?.phase === 'preparing'
+    && ds?.remoteCloseState?.phase === 'prepared'
+    && ds.remoteCloseState.requestId === durableClose.requestId;
+  const matchingRuntimeAbortRestoreProof = durableClose?.phase === 'preparing'
+    && ds?.remoteCloseState?.phase === 'abort_restored'
+    && ds.remoteCloseState.requestId === durableClose.requestId;
+  const hasLiveWorker = !!ds?.worker && !ds.worker.killed;
+  if (ds && matchingRuntimePreparedProof && !hasLiveWorker) {
+    // Workerless cancellation is irreversible too. If publishing `prepared`
+    // failed after the CLI proved cancellation, retain the in-memory proof and
+    // let a retry publish that SAME proof before committing the row. Never issue
+    // a second cancel merely because the first durable write failed.
+    try {
+      const committed = sessionStore.markMojoClosePrepared(
+        session.sessionId,
+        ds.remoteCloseState!.requestId,
+        ds.remoteCloseState!.taskId,
+        ds.remoteCloseState!.localResidual,
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      return {
+        ok: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+        ...(parked
+          ? { residual: parked }
+          : residualField(liveLocalResidual(session.sessionId, ds.remoteCloseState!.localResidual))),
+      };
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo close proof could not be persisted for durable commit: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+      };
+    }
+  }
+  if (ds && matchingRuntimeAbortRestoreProof && !hasLiveWorker) {
+    // No worker admission changed on this path, but the durable intent must be
+    // cleared before another cancel attempt is allowed. A failed clear keeps the
+    // central admission fence aligned with disk.
+    try {
+      const restoredState = ds.remoteCloseState!;
+      const committed = sessionStore.finishMojoCloseAbort(
+        session.sessionId,
+        restoredState.requestId,
+        {
+          admissionRestored: true,
+          ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+        },
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+      durableClose = undefined;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo abort proof could not clear the durable close journal: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+      };
+    }
+  }
+  const livePreparedProof = matchingRuntimePreparedProof
+    && !!ds.worker
+    && !ds.worker.killed;
+  const liveAbortRestoreProof = matchingRuntimeAbortRestoreProof
+    && !!ds.worker
+    && !ds.worker.killed;
+  if (durableClose && !livePreparedProof && !liveAbortRestoreProof) {
+    const journalLineage = durableClose.taskId ?? remoteId;
+    // The RECONCILIATION EXIT this journal has always promised (types.ts:
+    // "pending explicit reconciliation"). Before it existed, every journal
+    // without a matching runtime proof was refused here forever: restore
+    // downgraded crashed closes to `uncertain` and quarantined the row
+    // unregistered, this branch then refused each /close as
+    // reconciliation_required, and CLI-mismatch cleanup re-quarantined it —
+    // a permanent brick whose remote session kept credentials, fixable only
+    // by hand-editing JSON state (P1-1). Two journal shapes are reconcilable
+    // by an EXPLICIT close:
+    //   * `uncertain` — no retry can classify the crashed cancel without a
+    //     remote status oracle, so the row DRAINS: it closes with the lineage
+    //     parked as an explicit residual (same isolation-over-deletion shape
+    //     as a quarantined lineage — cleanup is remote, the id is preserved,
+    //     and replays keep reporting it).
+    //   * `preparing` + recovery 'retryable' — the failed prepare durably
+    //     recorded that retrying the cancel is legitimate (P1-2). With a
+    //     registered owner the close falls through and re-runs the cancel
+    //     under a fresh requestId (beginMojoCloseJournal accepts the restart);
+    //     without one there is nothing to cancel through, so it drains like
+    //     `uncertain`.
+    const retryableJournal = durableClose.phase === 'preparing'
+      && durableClose.recovery === 'retryable';
+    // NEVER drain past a live worker (P0-new). Draining set the row closed and
+    // deleted the registry entry while killWorker's remote guard (P0-2) refused
+    // the request-less retirement — the still-running, credential-carrying mojo
+    // worker became unreachable by every entry point. A live worker is also the
+    // one owner that can produce FRESH evidence, so it falls through to
+    // prepare/commit below instead: beginMojoCloseJournal accepts the takeover
+    // of an uncertain/retryable journal under the new requestId, the worker
+    // re-runs destroySession, and killWorker retires it legally with the commit
+    // requestId. (An in-process runtime `uncertain` fence still refuses inside
+    // prepareLiveRemoteWorkerClose — deliberately; refusal keeps the worker
+    // reachable, which is exactly what the drain violated.)
+    const drainable = !hasLiveWorker
+      && (durableClose.phase === 'uncertain' || (retryableJournal && !ds));
+    if (drainable) {
+      logger.warn(
+        `[${session.sessionId.slice(0, 8)}] explicit close drains ${durableClose.phase} Mojo `
+        + `journal (${durableClose.requestId}): the row closes`
+        + (journalLineage
+          ? ` and lineage ${journalLineage} is parked as a residual for manual cleanup`
+          : ' with no lineage to park'),
+      );
+      if (!journalLineage) return parked ? { ok: true, residual: parked } : { ok: true };
+      return {
+        ok: true,
+        residual: parked ?? { reason: 'mojo_lineage_quarantined', taskId: journalLineage },
+        parkMojoLineage: journalLineage,
+      };
+    }
+    const liveWorkerReconciles = hasLiveWorker
+      && (durableClose.phase === 'uncertain' || retryableJournal);
+    if (!retryableJournal && !liveWorkerReconciles) {
+      logger.warn(
+        `[${session.sessionId.slice(0, 8)}] explicit close requires Mojo reconciliation: `
+        + `durable journal is ${durableClose.phase} (${durableClose.requestId})`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...(journalLineage ? { taskId: journalLineage } : {}),
+      };
+    }
+    // Fall through: a retryable journal with a registered owner re-runs the
+    // cancel (live worker → prepare/commit; workerless → the cancel below),
+    // and an uncertain journal with a LIVE worker goes to prepare/commit.
+  }
+  // A live worker is the only authority that can cover the pre-init window:
+  // destroySession waits for system/init, then returns the exact lineage in its
+  // close_result. This must run even when the durable row has no id yet.
+  if (ds?.worker && !ds.worker.killed) {
+    if (!stored || stored.status !== 'active') {
+      return {
+        ok: false,
+        error: 'mojo_close_identity_missing',
+        retryable: true,
+        ...(remoteId ? { taskId: remoteId } : {}),
+      };
+    }
+    return prepareLiveRemoteWorkerClose(ds, 'mojo');
+  }
+  // Nothing ACTIVE to cancel: either a clean row, or a parked-only one.
+  if (!remoteId) return parked ? { ok: true, residual: parked } : { ok: true };
+  if (!ds) {
+    // An open durable row carrying a lineage, with no owner in the active
+    // registry. Everything the cancel needs (frozen identity, launch identity)
+    // hangs off DaemonSession, so this cannot be cancelled from here — and
+    // silently publishing it as closed would be the same lie as before, just
+    // through a different door. Fail closed; a restore/adopt puts the owner back
+    // and makes the retry work.
+    logger.warn(
+      `[${session.sessionId.slice(0, 8)}] explicit close refused: mojo lineage ${remoteId} `
+      + 'has no active owner to cancel through; row stays open',
+    );
+    return { ok: false, error: 'mojo_close_identity_missing', retryable: true, taskId: remoteId };
+  }
+  const resolved = resolveMojoCancelLaunch(ds, remoteId, 'explicit close');
+  if (!resolved.ok) {
+    if (resolved.reason === 'bot_gone') {
+      // NOT permanent: re-registering the bot restores the config this needs, so
+      // this is retryable and must not close the row behind the operator's back.
+      return { ok: false, error: 'mojo_config_missing', retryable: true, taskId: remoteId };
+    }
+    // Quarantined: cancelling could reach a different tenant, and no retry can
+    // ever make an unverifiable control plane verifiable. Refusing forever would
+    // strand the row, so the close proceeds — but as an EXPLICIT residual, never
+    // as an ordinary success, and the lineage stays on the row for manual cleanup.
+    //
+    // The id is PARKED as part of the durable close (see parkMojoLineage), which is
+    // what makes the decision replayable: a second close reads it back out of the
+    // parked slot instead of tripping over an active lineage with no owner.
+    return {
+      ok: true,
+      residual: parked ?? { reason: 'mojo_lineage_quarantined', taskId: remoteId },
+      parkMojoLineage: remoteId,
+    };
+  }
+
+  const requestId = randomUUID();
+  try {
+    const committed = sessionStore.beginMojoCloseJournal(
+      session.sessionId,
+      requestId,
+      remoteId,
+    );
+    session.mojoCloseJournal = committed.mojoCloseJournal;
+    session.riffParentTaskId = committed.riffParentTaskId;
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Workerless Mojo close journal could not be persisted before cancellation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: remoteId,
+    };
+  }
+  ds.remoteCloseState = { phase: 'preparing', requestId, taskId: remoteId };
+  const outcome = await cancelMojoSessionById(resolved.launchCfg, remoteId).catch((err: unknown) => ({
+    kind: 'failed' as const,
+    message: err instanceof Error ? err.message : String(err),
+    retryable: true,
+  }));
+  // Structured, NOT a boolean: `if (!outcome)` on an object is always false and
+  // would turn every failure into a silent success. `already_terminal` counts as
+  // gone, but only when the classifier could PROVE it (see MojoCancelOutcome).
+  if (!isMojoRemoteGone(outcome)) {
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        session.sessionId,
+        requestId,
+        { admissionRestored: true, taskId: remoteId },
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+    } catch (err) {
+      // There was no live worker admission to restore, but accepting input while
+      // disk still says `preparing` would recreate the same split-brain. Retain
+      // an abort-restored runtime proof so a retry clears the journal first.
+      ds.remoteCloseState = { phase: 'abort_restored', requestId, taskId: remoteId };
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo close abort could not be committed durably: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        taskId: remoteId,
+      };
+    }
+    logger.warn(
+      `[${tag(ds)}] explicit close refused: mojo session ${remoteId} could not be `
+      + 'cancelled; the row stays open and the lineage is retained so the close is retryable'
+      + (outcome.kind === 'failed' ? ` (${outcome.message})` : ''),
+    );
+    return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
+  }
+  // The workerless local-subtree proof travels ON the outcome (see
+  // cancelMojoSessionById): a weak-only proof keeps its containment handle, and
+  // this close must say so — durably, so retries and restarts republish it.
+  const localResidual = outcome.kind !== 'failed' ? outcome.localResidual : undefined;
+  try {
+    const committed = sessionStore.markMojoClosePrepared(
+      session.sessionId,
+      requestId,
+      remoteId,
+      localResidual,
+    );
+    session.mojoCloseJournal = committed.mojoCloseJournal;
+    session.riffParentTaskId = committed.riffParentTaskId;
+  } catch (err) {
+    // Cancellation is proven and cannot be rolled back. Keep the runtime proof
+    // prepared so the same daemon can publish it on retry; after a crash the
+    // durable `preparing` journal remains fenced for explicit reconciliation.
+    ds.remoteCloseState = {
+      phase: 'prepared',
+      requestId,
+      taskId: remoteId,
+      ...(localResidual ? { localResidual } : {}),
+    };
+    logger.error(
+      `[${tag(ds)}] Workerless Mojo close proof persistence failed after cancellation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: remoteId,
+    };
+  }
+  ds.remoteCloseState = {
+    phase: 'prepared',
+    requestId,
+    taskId: remoteId,
+    ...(localResidual ? { localResidual } : {}),
+  };
+  // Deliberately does NOT clear the runtime lineage here. sessionStore commonly
+  // holds the very same Session object, so an early clear is visible to the durable
+  // save — and if that save then fails, the rollback has already lost the id it
+  // would restore while the on-disk row may still carry it. The lineage is cleared
+  // atomically with the status change instead (clearRiffParentTaskId), and the
+  // repeat-cancel is suppressed with an explicit flag rather than by mutating
+  // shared state early.
+  logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
+  // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
+  // can carry both (restore parked the old id, the session then created a new one).
+  // Reporting a plain success here would hide the parked remote session entirely.
+  // With nothing parked, the LOCAL residual takes the slot for the same reason.
+  return {
+    ok: true,
+    taskId: remoteId,
+    ...(parked
+      ? { residual: parked }
+      : localResidual
+        ? { residual: { reason: localResidual } }
+        : {}),
+  };
+}
+
+/**
+ * The residual a row carries because a lineage was PARKED as unverifiable.
+ *
+ * Read from the parked slot, never from the active one: restore-time quarantine
+ * moves the id into `mojoQuarantinedLineage` and clears `riffParentTaskId`, so a
+ * check against the active slot misses the production shape completely — the row
+ * would close as an ordinary success while its remote session kept running.
+ *
+ * May hold more than one id (comma-joined) when two unverifiable lineages were
+ * parked together; it is passed through verbatim so manual cleanup sees both.
+ */
+export function mojoCloseResidualForRow(session: Session | undefined): CloseResidual | undefined {
+  // A parked REMOTE lineage outranks a local residual: it names a live remote
+  // session burning cloud time, the more urgent cleanup, and the response has a
+  // single residual slot. The local residual surfaces whenever nothing is parked.
+  const parked = session?.mojoQuarantinedLineage;
+  if (parked) return { reason: 'mojo_lineage_quarantined', taskId: parked };
+  if (session?.mojoLocalResidual) return liveLocalResidual(session.sessionId, session.mojoLocalResidual);
+  return undefined;
+}
+
+/**
+ * Surface a stored LOCAL residual only while its containment handle is still
+ * outstanding.
+ *
+ * The containment-handle ledger is the SOURCE OF TRUTH for the device-isolation
+ * blocker; `Session.mojoLocalResidual` (and a journal's `localResidual`) are
+ * DERIVED display state with deliberately no clear path of their own: the two
+ * paths that discharge a handle — boot reconciliation and operator revoke —
+ * operate on the one global ledger, and having them also rewrite session rows
+ * would tie a global cleanup to whichever bots' per-bot row files happen to be
+ * loaded at the time. Deriving at read time keeps the two stores fork-free: the
+ * handle is gone → the "credentialed process may remain on this host" claim is
+ * no longer true, report nothing; the ledger cannot be read → we cannot rule the
+ * claim out, keep reporting it (fail-closed, matching hasUnprovenContainment's
+ * own contract of throwing rather than answering false).
+ */
+/** Spread helper: `{ residual }` when present, `{}` otherwise. */
+function residualField(residual: CloseResidual | undefined): { residual?: CloseResidual } {
+  return residual ? { residual } : {};
+}
+
+function liveLocalResidual(
+  sessionId: string,
+  residual: NonNullable<Session['mojoLocalResidual']> | undefined,
+): CloseResidual | undefined {
+  if (!residual) return undefined;
+  try {
+    if (!hasUnprovenContainment(sessionId)) return undefined;
+  } catch {
+    // Unreadable ledger: a handle may exist, so the residual stays reported.
+  }
+  return { reason: residual };
 }
 
 /**
@@ -3377,28 +4906,130 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
  * Calling this on an unknown sessionId, an already-closed session, or a session
  * whose worker died asynchronously must still resolve with `{ ok: true }`.
  */
+/**
+ * Why a close left something behind even though the local row closed.
+ *
+ * Two causes qualify, and they are deliberately NOT merged, because they send the
+ * operator to different places:
+ *
+ *  - `mojo_lineage_quarantined` — REMOTE residual. Nothing records which control
+ *    plane holds the remote session, so cancelling could reach a different tenant.
+ *    Carries the surviving remote `taskId`; cleanup is remote.
+ *  - `local_subtree_*` — LOCAL residual. The remote lineage really was cancelled,
+ *    but the backend could not prove its own process subtree on THIS host was gone,
+ *    so it kept the containment handle and the device-isolation blocker with it.
+ *    No `taskId`: there is no surviving remote id to chase, and offering one would
+ *    point cleanup at the wrong system.
+ *
+ * In both cases refusing forever would strand the row (no retry can make an
+ * unverifiable control plane verifiable, nor make an unenumerable host
+ * enumerable), so the row closes — but the caller must SAY so rather than showing
+ * the ordinary "closed" confirmation.
+ */
+export interface CloseResidual {
+  reason:
+    | 'mojo_lineage_quarantined'
+    | 'local_subtree_unprovable_on_platform'
+    | 'local_subtree_boundary_unproven';
+  /** Present only for a REMOTE residual; a local one has no remote id to name. */
+  taskId?: string;
+}
+
+/**
+ * `outcome` is a REQUIRED discriminant on success, not an optional warning field.
+ *
+ * An optional flag on an otherwise ordinary success is exactly what every call site
+ * forgets to read, so making it mandatory does help — but ONLY across a typed call.
+ * It is not a completeness guarantee: a consumer that reads just `.ok` compiles
+ * fine, and every JSON boundary (the dashboard IPC route, the CLI's daemon POST,
+ * the sessions card) erases the type entirely. Reviewing this change found exactly
+ * such consumers silently flattening a residual into a plain success.
+ *
+ * So the invariant is held by the consumer TESTS, not by this type. Any new close
+ * consumer needs one.
+ */
 export type CloseSessionResult =
-  | { ok: true; alreadyClosed: boolean; known: boolean }
+  | { ok: true; outcome: 'closed'; alreadyClosed: boolean; known: boolean }
+  | {
+      ok: true;
+      outcome: 'closed_with_residual';
+      residual: CloseResidual;
+      alreadyClosed: boolean;
+      known: boolean;
+    }
   | ({
       ok: false;
       alreadyClosed: false;
-    } & Exclude<RiffClosePreparation, { ok: true }>);
+    } & Exclude<RemoteClosePreparation, { ok: true }>);
+
+/**
+ * Close from a BACKGROUND path — one with no user surface to report to
+ * (trigger-session cleanup, deferred-schedule settlement, sweeps).
+ *
+ * These callers cannot show a card or a toast, so the only honest thing they can
+ * do with a residual or a refusal is make it OBSERVABLE: an uncancelled remote
+ * session is still burning cloud time and holding an injected credential, and
+ * silently discarding the result is how that became invisible everywhere else.
+ *
+ * Returns the untouched result so a caller that DOES care can still branch.
+ */
+export async function closeSessionForBackgroundCleanup(
+  sessionId: string,
+  context: string,
+): Promise<CloseSessionResult> {
+  const result = await closeSession(sessionId);
+  const tagId = sessionId.slice(0, 8);
+  if (!result.ok) {
+    logger.error(
+      `[${tagId}] ${context}: close REFUSED (${result.error}); the row stays active `
+      + 'and its remote session may still be running'
+      + (result.taskId ? ` (remote ${result.taskId})` : ''),
+    );
+    return result;
+  }
+  if (result.outcome === 'closed_with_residual') {
+    // Kind-aware: a LOCAL-subtree residual has no taskId, so the old wording
+    // logged "remote session undefined was NOT cancelled" and pointed cleanup at
+    // a nonexistent remote session instead of the host process (round-11 P1-2).
+    logger.warn(
+      `[${tagId}] ${context}: closed locally — ${closeResidualClause(result.residual)} `
+      + `(${result.residual.reason})`,
+    );
+  }
+  return result;
+}
 
 export async function closeSession(
   sessionId: string,
 ): Promise<CloseSessionResult> {
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
+  const closeFrozenBackendType = ds?.initConfig?.backendType
+    ?? ds?.session.backendType ?? stored?.backendType;
+  const isOwnedClose = !ds?.initConfig?.adoptMode
+    && !ds?.adoptedFrom
+    && !stored?.adoptedFrom;
+  const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
+  const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
+  const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
+  if (closeJournal && !isOwnedMojoClose) {
+    // Never let a Mojo cancellation journal silently disappear through another
+    // backend's ordinary close path. It may be corrupt metadata, but only an
+    // explicit reconciliation/repair may remove that fence.
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...(closeJournal.taskId ? { taskId: closeJournal.taskId } : {}),
+    };
+  }
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
   // replacement paths reuse the same helper before their own state transition.
   const teardownTarget = ds ?? stored;
   if (teardownTarget) {
     teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
   }
-  const isOwnedRiffClose = !ds?.initConfig?.adoptMode
-    && !ds?.adoptedFrom
-    && !stored?.adoptedFrom
-    && (ds?.initConfig?.backendType ?? ds?.session.backendType ?? stored?.backendType) === 'riff';
   let killedLive = false;
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
@@ -3415,17 +5046,27 @@ export async function closeSession(
     recordUsageForDaemonSession(ds);
   }
 
-  // Riff owns a remote credential-bearing process. Prove cancellation before
-  // mutating routing, transient capabilities, or the durable row. Non-Riff
-  // closes retain master's synchronous state-transition path.
-  const prepared: RiffClosePreparation = isOwnedRiffClose
+  // Riff and mojo both own a remote, credential-bearing session. Prove
+  // cancellation before mutating routing, transient capabilities, or the durable
+  // row — publishing "closed" while the cancel is still in flight is how a failed
+  // cancel became a silent leak. Other backends retain master's synchronous
+  // state-transition path.
+  const prepared: RemoteClosePreparation = isOwnedRiffClose
     ? await prepareRiffExplicitClose(ds, stored)
-    : { ok: true };
+    : isOwnedMojoClose
+      ? await prepareMojoExplicitClose(ds, stored)
+      : { ok: true };
   if (!prepared.ok) {
     return { ...prepared, alreadyClosed: false };
   }
-  const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
-    ? ds.riffCloseState.requestId
+  // Only when the cancel actually happened: a quarantined / bot-gone mojo session
+  // keeps its lineage on the row for manual cleanup.
+  const clearMojoLineage = isOwnedMojoClose && !!prepared.taskId;
+  // NOTE: the residual is derived from the COMMITTED row at the end of this
+  // function, not captured here — the store merges parked ids, so a value computed
+  // before the transaction can disagree with what was actually persisted.
+  const preparedRemoteRequestId = ds?.remoteCloseState?.phase === 'prepared'
+    ? ds.remoteCloseState.requestId
     : undefined;
 
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
@@ -3446,14 +5087,42 @@ export async function closeSession(
   if (wasOpen) {
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
     try {
+      // Parking is handed to the store as part of ITS transaction rather than
+      // pre-written here: the runtime object is not always the authoritative row,
+      // and a pre-write survives a failed save (the store's rollback cannot restore
+      // a field it never set). Same mistake as the early lineage clear fixed
+      // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
-        ...(isOwnedRiffClose ? { clearRiffParentTaskId: true } : {}),
+        ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
+        // Park a LOCAL residual so an idempotent re-close still reports it — the
+        // journal (its runtime home) is wiped by this same transaction.
+        ...(prepared.residual
+          && prepared.residual.reason !== 'mojo_lineage_quarantined'
+          ? { parkLocalResidual: prepared.residual.reason }
+          : {}),
+        ...(isOwnedRiffClose || clearMojoLineage || prepared.parkMojoLineage
+          ? { clearRiffParentTaskId: true }
+          : {}),
       });
     } catch (err) {
+      if (isOwnedMojoClose
+          && (preparedRemoteRequestId || stored?.mojoCloseJournal?.phase === 'prepared')) {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] Durable session close failed after Mojo cancel; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          alreadyClosed: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+        };
+      }
       if (!isOwnedRiffClose) throw err;
-      if (ds && preparedRiffRequestId) {
-        await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+      if (ds && preparedRemoteRequestId) {
+        await abortLiveRemoteWorkerClose(ds, preparedRemoteRequestId);
       }
       logger.error(
         `[${sessionId.slice(0, 8)}] Durable session close failed after Riff prepare; `
@@ -3471,12 +5140,28 @@ export async function closeSession(
     if (ds) {
       ds.session.status = 'closed';
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+      // Sync the parking back from the store's committed row. Only reached after a
+      // SUCCESSFUL save, and skipped when the two are the same object anyway, so
+      // the runtime view cannot end up carrying a park the disk does not have.
+      if (after && after !== ds.session) {
+        ds.session.mojoCloseJournal = after.mojoCloseJournal;
+        if (clearMojoLineage || prepared.parkMojoLineage) {
+          ds.session.riffParentTaskId = after.riffParentTaskId;
+        }
+      }
+      if (prepared.parkMojoLineage && after && after !== ds.session) {
+        ds.session.mojoQuarantinedLineage = after.mojoQuarantinedLineage;
+        ds.session.mojoQuarantineNoticePending = after.mojoQuarantineNoticePending;
+      }
     }
   }
 
   if (ds) {
     killWorker(ds, {
-      ...(preparedRiffRequestId ? { riffCloseCommitRequestId: preparedRiffRequestId } : {}),
+      ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
+      // The prepare above already proved this cancel; the durable row cleared the
+      // lineage in the same transaction. Suppress the best-effort repeat.
+      ...(clearMojoLineage ? { mojoCancelAlreadyProven: true } : {}),
     });
     // A transferred/restored exact object may remain under more than one alias.
     // Remove only identity matches, never a same-key successor.
@@ -3580,7 +5265,26 @@ export async function closeSession(
 
   // alreadyClosed = nothing happened on either path.
   const alreadyClosed = !killedLive && !wasOpen;
-  return { ok: true, alreadyClosed, known };
+  // The local row IS closed, but a remote session was deliberately left running
+  // (its control plane could not be verified, so cancelling it might have hit
+  // another tenant). Callers must render this differently from an ordinary close.
+  // Read the residual back off the authoritative row so it always matches disk
+  // (including the merge when a second id was parked). `prepared.residual` is only
+  // a fallback for the paths that never reached the store.
+  const closeResidual = isOwnedMojoClose
+    ? (mojoCloseResidualForRow(sessionStore.getOwnedSession(sessionId) ?? stored ?? ds?.session)
+      ?? prepared.residual)
+    : undefined;
+  if (closeResidual) {
+    return {
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: closeResidual,
+      alreadyClosed,
+      known,
+    };
+  }
+  return { ok: true, outcome: 'closed', alreadyClosed, known };
 }
 
 /**
@@ -3736,7 +5440,35 @@ async function closeUnregisteredCollisionLoser(
     return { ok: false, error: 'durable_close_failed' };
   }
 
-  killWorker(loser);
+  // The registry entry is deleted right below, so the loser's worker must be
+  // put on a guaranteed path to death here. killWorker refuses an unprepared
+  // live remote worker (P0-2) — correct for lineage, but on this path the
+  // refusal recreated the P0-new orphan: row closed, registry cleared,
+  // credential-carrying worker alive and unreachable. A remote loser is
+  // therefore retired process-only: SIGTERM now, SIGKILL by backstop. To be
+  // precise about the claim (fourth-round review): this SIGNALS death and arms
+  // the escalation — it does not synchronously prove the exit. That is
+  // acceptable here because nothing downstream gates on this process being
+  // gone (unlike the VC fence, which separately demands exit proof before
+  // admitting replay); the registry delete below is safe either way.
+  //
+  // No remote cancel is issued: the lineage stays on the CLOSED row
+  // (riffParentTaskId) as the manual-cleanup handle, mirroring the drain's
+  // isolation-over-deletion shape — named in the log below so an operator can
+  // actually find it. Local losers keep killWorker so their backing session
+  // is destroyed.
+  if (isRemoteBackendSession(loser)) {
+    if (loser.session.riffParentTaskId) {
+      logger.warn(
+        `[${tag(loser)}] collision loser owns remote lineage `
+        + `${loser.session.riffParentTaskId}; it is NOT cancelled and stays on the closed `
+        + 'row for manual cleanup',
+      );
+    }
+    retireWorkerProcessOnly(loser, 'collision_loser');
+  } else {
+    killWorker(loser);
+  }
   for (const [registeredKey, candidate] of map) {
     if (candidate === loser) map.delete(registeredKey);
   }
@@ -5772,20 +7504,23 @@ export function sendWorkerInput(
     atMostOnce?: true;
   } = {},
 ): boolean {
-  const riffRetirementPhase = riffRetirementAdmissionPhase(ds);
-  if (riffRetirementPhase) {
+  const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
+  if (remoteRetirementPhase) {
+    const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
+      ? 'Mojo'
+      : 'Riff';
     logger.warn(
-      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while Riff retirement fence is ${riffRetirementPhase}`,
+      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
     );
     void callbacks?.sessionReply(
       sessionAnchorId(ds),
-      tr('worker.riff_close_in_progress', undefined, localeForBot(ds.larkAppId)),
+      tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
       'text',
       ds.larkAppId,
       turnId,
     ).catch(err => {
       logger.warn(
-        `[${tag(ds)}] Failed to notify rejected Riff close-race turn: `
+        `[${tag(ds)}] Failed to notify rejected remote close-race turn: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
     });
@@ -5902,7 +7637,10 @@ export function sendWorkerInput(
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
+    ...(mojoLivePatchForSession(ds) ?? {}),
   };
+  // First moment with a reply context after a restore/resume-time quarantine.
+  deliverPendingMojoQuarantineNotice(ds, turnId, opts.dispatchAttempt);
   // #597: the accept-ledger entry is already appended above; if the IPC send
   // fails (returns false or throws) we MUST roll it back or the dispatch ledger
   // keeps a phantom accepted turn. master's ordinary-IM-delivery tracking runs
@@ -5934,6 +7672,163 @@ export function sendWorkerInput(
   }
   return true;
 }
+
+/**
+ * Complete live-credential snapshot to ride along with a turn, so a live mojo
+ * session picks up a rotated / cleared JWT without a refork.
+ *
+ * Sent on EVERY turn rather than only when it differs from the init snapshot. The
+ * daemon cannot know which patches a live worker has already applied, so diffing
+ * against init was wrong in both directions:
+ *   - a deleted `mojo.jwt` produced no patch, leaving the old token in place;
+ *   - `init A → patch B → config rolled back to A` compared A against A and sent
+ *     nothing, leaving the backend on B.
+ * The backend de-duplicates against its own current value, which is the only
+ * authoritative source.
+ *
+ * The control plane is NOT included — it stays frozen for the session's lifetime.
+ */
+export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePatch } | undefined {
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backendType !== 'mojo') return undefined;
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return undefined;
+  }
+  // Resolves jwtEnv daemon-side across the same layers buildEnv() uses, so the
+  // worker receives a value and never an env map.
+  return {
+    mojoLivePatch: pickMojoLivePatch(botCfg.mojo, {
+      genericEnv: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+    }),
+  };
+}
+
+/**
+ * Is auxiliary UI an authorized output channel for this session/turn?
+ *
+ * The single source of truth for this policy: setupWorkerHandlers' own
+ * `managedAuxUiSuppressed` now delegates here instead of keeping a parallel copy
+ * that could drift. Deliberately conservative: a
+ * dedicated VC receiver, a silent scheduled turn, or a session with no real Lark
+ * transport must never receive a bypass message. Those cases still get the
+ * persisted quarantine state for dashboard/audit — the notice is only about the
+ * chat channel.
+ */
+/** Sessions with a quarantine notice send in flight, so it cannot double-post. */
+const mojoQuarantineNoticeInFlight = new Set<string>();
+
+/**
+ * THE auxiliary-UI suppression policy. One definition, two call sites.
+ *
+ * Previously setupWorkerHandlers held this as a closure and the quarantine notice
+ * COPIED three of its four checks — dropping `ordinaryManagedSuppression`, so a
+ * durable-suppressed turn still posted to Lark. Copying a policy is how the two
+ * diverge; this is the shared implementation both now call.
+ *
+ * Returns true when auxiliary UI must be suppressed.
+ */
+export function auxUiSuppressedFor(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
+  // Feishu chat to render into.
+  try {
+    if (!larkTransportEnabled({
+      chatId: ds.chatId,
+      apiOnly: getBot(ds.larkAppId).config.apiOnly,
+    })) return true;
+  } catch {
+    // Bot deregistered — fail closed.
+    return true;
+  }
+  if (isSilentScheduledTurn(ds, turnId)) return true;
+  if (ds.session.vcMeetingReceiver) return true;
+  // Durable ledger: an attempt at or below the armed watermark is a replay whose
+  // output already happened (or was deliberately suppressed).
+  const armedThrough = turnId ? ds.suppressedFinalOutputTurns?.get(turnId) : undefined;
+  return dispatchAttempt !== undefined
+    && armedThrough !== undefined
+    && dispatchAttempt <= armedThrough;
+}
+
+/**
+ * Deliver the one-time notice that a mojo session's earlier remote lineage was
+ * parked, then clear the flag.
+ *
+ * Quarantining happens during restore/resume where there is no reply context, so
+ * the notice is deferred to the first ACCEPTED turn — hot send and cold fork both
+ * call this, since a cold-resumed session goes straight to forkWorker and would
+ * otherwise never deliver it.
+ *
+ * The flag is marked delivered (`false`) only AFTER a successful send, so a
+ * transient Lark failure retries on the next turn instead of losing the notice
+ * permanently. For a suppressed channel (durable replay / silent schedule / VC
+ * receiver / no transport) the flag STAYS PENDING: that turn merely had no
+ * authorized output channel, so a later ordinary IM turn delivers it. The
+ * quarantine state itself is persisted for dashboard/audit either way.
+ */
+function deliverPendingMojoQuarantineNotice(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  if (ds.session.mojoQuarantineNoticePending !== true) return;
+  // In-flight guard: two turns can be accepted before the first sessionReply
+  // resolves, which would post the notice twice.
+  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) return;
+  const lineage = ds.session.mojoQuarantinedLineage;
+  if (!lineage) {
+    ds.session.mojoQuarantineNoticePending = undefined;
+    sessionStore.updateSession(ds.session);
+    return;
+  }
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return; // Bot deregistered — retry once it is back.
+  }
+  // `false` = DELIVERED, distinct from `undefined` = never queued. Clearing to
+  // undefined made the restore migration read it as "old build, never notified"
+  // and queue the notice again after every restart.
+  const markDelivered = (): void => {
+    ds.session.mojoQuarantineNoticePending = false;
+    sessionStore.updateSession(ds.session);
+  };
+  if (auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+    // Stay PENDING: this turn simply had no authorized channel (durable replay,
+    // silent schedule, VC receiver, no transport). A later ordinary IM turn
+    // delivers it. The quarantine state itself is already persisted for
+    // dashboard/audit either way.
+    logger.info(
+      `[${tag(ds)}] mojo quarantine notice deferred — no authorized output channel `
+      + 'for this turn; still pending',
+    );
+    return;
+  }
+  mojoQuarantineNoticeInFlight.add(ds.session.sessionId);
+  const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
+  void callbacks?.sessionReply(
+    sessionAnchorId(ds),
+    message,
+    'text',
+    ds.larkAppId,
+    // The turn that actually carried this delivery, not a stale reply target.
+    turnId,
+    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+  ).then(markDelivered).catch((err) => {
+    // Flag intentionally left set: the next turn retries.
+    logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
+  }).finally(() => {
+    mojoQuarantineNoticeInFlight.delete(ds.session.sessionId);
+  });
+}
+
 
 /** Promote the oldest durable activation successor into a fresh tokened
  * journal and (for Codex App) its single accepted-ledger owner in one store
@@ -6246,6 +8141,37 @@ export function forkWorker(
   resumeOrTurnId: ForkResumeOrTurnId = false,
 ): boolean {
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
+  if (remoteRetirementPhase) {
+    // A close/shutdown coordinator owns this exact remote generation. Never
+    // spawn a replacement behind its back: a fork can materialize the opening
+    // prompt before sendWorkerInput gets a chance to reject it. Route non-empty
+    // input through the ordinary fence solely for the user-visible warning.
+    if (gatedPrompt.content !== '') {
+      const gatedTurnId = typeof resumeOrTurnId === 'string'
+        ? resumeOrTurnId
+        : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.turnId
+        : undefined;
+      const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.dispatchAttempt
+        : undefined;
+      sendWorkerInput(ds, promptInput, gatedTurnId, {
+        ...(gatedDispatchAttempt !== undefined
+          ? { dispatchAttempt: gatedDispatchAttempt }
+          : {}),
+        ...(gatedPrompt.codexAppSteerable === true
+          ? { codexAppSteerable: true as const }
+          : {}),
+      });
+    }
+    logger.warn(
+      `[${tag(ds)}] Refused worker fork while remote retirement fence is ${remoteRetirementPhase}`,
+    );
+    // The request was handled by the retirement fence; false is reserved for
+    // tail-only quarantine promotion failures by this function's contract.
+    return true;
+  }
   const transferGate = transferInputGates.get(ds);
   if (transferGate && !transferReplacementForkBypass.has(ds)) {
     if (gatedPrompt.content !== '') {
@@ -6802,15 +8728,15 @@ export function forkWorker(
       } else {
         reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
       }
-      const retainExactRetirementGeneration = ds.riffShutdownState !== undefined
-        || ds.riffCloseState !== undefined;
+      const retainExactRetirementGeneration = ds.remoteShutdownState !== undefined
+        || ds.remoteCloseState !== undefined;
       if (!retainExactRetirementGeneration) {
         ds.worker = null;
         ds.workerPort = null;
         ds.workerToken = null;
         ds.workerViewToken = null;
         ds.managedTurnOrigin = undefined;
-        ds.riffCloseState = undefined;
+        ds.remoteCloseState = undefined;
       }
       // The retirement coordinator owns a prepared generation. Keep the exact
       // ChildProcess pointer until exit so it can decide whether abort/commit
@@ -6906,16 +8832,23 @@ export function forkWorker(
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
-    // HARD credential boundary for a no-transport session (apiOnly bot OR HTTP
-    // virtual chat): force read isolation so the CLI physically cannot read the
-    // full bots.json / sibling BOT_HOME / send-cred / lark-cli store — a model
-    // that deletes/forges the ancestry marker or bypasses the CLI still cannot
-    // build ANY (sibling) Lark client. The pid-marker gate is only friendly
-    // early-reject; THIS is the fail-closed boundary. Reuses the existing unified
-    // fs-policy (mac+Linux fail-closed); a backend that can't isolate locally
-    // refuses to spawn rather than leak creds.
-    readIsolation: botCfg.readIsolation === true
-      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
+    // Opt-in only, driven purely by explicit per-bot `readIsolation`. A
+    // no-transport session (apiOnly bot OR HTTP virtual chat) is NO LONGER
+    // force-isolated: disk read scope now follows the owner's own sandbox config,
+    // symmetric with a normal chat session (unset/false → not isolated). Accepted
+    // trade-off: a no-transport session with no sandbox config can read the full
+    // bots.json / sibling BOT_HOME on disk; protecting sibling creds from lateral
+    // read on a multi-bot host now depends on the owner explicitly enabling
+    // sandbox/readIsolation, not on this force. Two adjacent boundaries are
+    // unchanged and independent: (1) this bot's own transport secret is still
+    // withheld from the CLI env (gated on larkTransportEnabled below), so a
+    // no-transport session cannot drive Botmux's own send path even though it can
+    // read the file; (2) mandatory device-credential isolation (worker.ts) still
+    // masks the device authority dir / enrolled creds on enrolled hosts. Full-file
+    // sandbox stays independently driven worker-side by sandboxRequested
+    // (cfg.sandbox || cfg.readIsolation || BOTMUX_SANDBOX=1); session.sandbox is
+    // frozen from botCfg.sandbox at create time, so "follow local sandbox" holds.
+    readIsolation: botCfg.readIsolation === true,
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
@@ -6931,7 +8864,18 @@ export function forkWorker(
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
-    backendConfig: botCfg.riff,
+    // One backendConfig channel shared by the remote backends; the selector
+    // picks the shape matching backendType. A mojo bot with no `mojo` block is
+    // valid (all fields optional), so an undefined here is not an error.
+    //
+    // mojo goes through sessionMojoConfig so the control-plane identity frozen at
+    // creation survives a cold resume: without it, editing the bot between two
+    // messages would silently move a live session from cloud to host execution,
+    // or resume it against a different tenant/workspace than the one holding its
+    // remote session.
+    backendConfig: botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
+      ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
+      : botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
@@ -7013,6 +8957,14 @@ export function forkWorker(
     }
   }
   ds.initConfig = initMsg;
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
+  // Cold-resume path: a workerless session goes straight here without passing
+  // through sendWorkerInput, so without this the "notice on the next message"
+  // promise was never kept for exactly the sessions most likely to need it.
+  deliverPendingMojoQuarantineNotice(ds, initAttributionTurnId, initDispatchAttempt);
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Do this before installing worker handlers:
@@ -7081,6 +9033,10 @@ export function forkWorker(
     throw err;
   }
   ds.initConfig = initMsg;
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
   try {
     sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   } catch (err) {
@@ -7317,19 +9273,14 @@ function setupWorkerHandlers(
   };
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
-  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
-    // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
-    // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
-    // the single source every aux-UI handler funnels through — this is the
-    // authoritative fix, NOT a fake "success" message id from sessionReply (a
-    // synthetic id would get stored as streamCardId and later scheduleCardPatch
-    // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
-    // still updated before these guards, so the terminal view is unaffected.
-    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
-    if (isSilentScheduledTurn(ds, turnId)) return true;
-    if (ds.session.vcMeetingReceiver) return true;
-    return ordinaryManagedSuppression(turnId, dispatchAttempt);
-  };
+  // Delegates to the shared policy (auxUiSuppressedFor) so this and the mojo
+  // quarantine notice cannot drift apart. Suppressing here is the authoritative
+  // fix, NOT a fake "success" message id from sessionReply (a synthetic id would
+  // get stored as streamCardId and later scheduleCardPatch → updateMessage would
+  // still dial Feishu). Dashboard/web-terminal state is updated before these
+  // guards, so the terminal view is unaffected.
+  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean =>
+    auxUiSuppressedFor(ds, turnId, dispatchAttempt);
   /** final_output is the sole exception: listener_thread and exact IM replies
    * may proceed into the durable action ledger; silent/stale attempts do not. */
   const managedFinalOutputSuppressed = (
@@ -7901,6 +9852,10 @@ function setupWorkerHandlers(
           sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
+            // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
+            // so they must carry the same credential snapshot a normal message
+            // does — otherwise a cleared or rotated JWT simply did not apply here.
+            ...(mojoLivePatchForSession(ds) ?? {}),
             ...((ds.session.queuedActivationTurnId ?? rawTurnId)
               ? { turnId: ds.session.queuedActivationTurnId ?? rawTurnId }
               : {}),
@@ -8706,22 +10661,23 @@ function setupWorkerHandlers(
           break;
         }
 
-        // Riff is a remote lineage-owning backend, not a local CLI process.
-        // The worker intentionally refuses restart because tearing it down can
-        // destroy or orphan the remote sandbox. Stop before crash-loop
-        // accounting and tell the user how to recover, rather than logging an
-        // "auto-restart" whose IPC is guaranteed to be a no-op.
-        if (isRiffBackendSession(ds)) {
-          const retirementPhase = riffRetirementAdmissionPhase(ds);
+        // EVERY remote backend is a lineage-owning backend, not a local CLI
+        // process. Stop before crash-loop accounting: for riff the restart IPC
+        // is a guaranteed no-op, and for mojo it is WORSE than a no-op — the
+        // worker executes it, cancelling the remote session and cold-booting a
+        // context-less replacement, so treating a mojo backend exit as a local
+        // CLI crash silently destroyed remote context (fourth-round review).
+        if (isRemoteBackendSession(ds)) {
+          const retirementPhase = remoteRetirementAdmissionPhase(ds);
           logger.warn(
-            `[${t}] Riff backend exited; automatic restart is unsupported`
+            `[${t}] Remote backend exited; automatic restart is unsupported`
             + (retirementPhase ? ` (${retirementPhase})` : ''),
           );
           // Explicit /close and daemon shutdown already own the user-visible
           // lifecycle. Only an unexpected backend exit needs recovery guidance.
           if (!retirementPhase && !suppressExitUi) {
             try {
-              await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', undefined);
+              await scopedReply(tr('cmd.restart.remote_unsupported', undefined, loc), 'text', undefined);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -8887,19 +10843,28 @@ function setupWorkerHandlers(
       }
 
       case 'close_result': {
-        const pending = pendingRiffWorkerCloses.get(msg.requestId);
+        const pending = pendingRemoteWorkerCloses.get(msg.requestId);
         if (!pending
           || pending.worker !== worker
           || pending.sessionId !== ds.session.sessionId
           || ds.worker !== worker) {
-          logger.warn(`[${t}] Ignored stale/unmatched Riff close result ${msg.requestId}`);
+          logger.warn(`[${t}] Ignored stale/unmatched remote close result ${msg.requestId}`);
           break;
         }
-        pendingRiffWorkerCloses.delete(msg.requestId);
+        pendingRemoteWorkerCloses.delete(msg.requestId);
         pending.resolve({
           ok: msg.ok,
           ...(msg.taskId ? { taskId: msg.taskId } : {}),
           ...(msg.error ? { error: msg.error } : {}),
+          ...(msg.recovery ? { recovery: msg.recovery } : {}),
+          // Forwarded, never re-derived: the backend may keep writes fenced on a
+          // close that is otherwise retryable, and only it knows that.
+          ...(msg.admission ? { admission: msg.admission } : {}),
+          // Same reason, and this one was the leak: an ok:true close carrying a
+          // local residual arrived here, lost the field, and was published as an
+          // ordinary closed row while the backend still held the containment
+          // handle for a subtree it could not prove gone.
+          ...(msg.residual ? { residual: msg.residual } : {}),
         });
         break;
       }
@@ -9596,10 +11561,10 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
-      if (ds.riffCloseState) {
-        ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+      if (ds.remoteCloseState) {
+        ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
       }
-      // Do not clear riffShutdownState here. Only the shutdown coordinator can
+      // Do not clear remoteShutdownState here. Only the shutdown coordinator can
       // release a generation after lineage persistence or admission restore.
       // This worker generation is gone. Invalidate any stuck-warning card it
       // posted so a late click cannot inject keys into a replacement worker.
@@ -9685,6 +11650,30 @@ export function codexAppFinalSettlementCount(): number {
 
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
+}
+
+/**
+ * Stable Lark `uuid` idempotency token for an ordinary bridge final_output
+ * delivery. Derived from the same identity as the daemon-side dedupe key, so
+ * every retry of the same answer — and any duplicate IPC/re-emit of the same
+ * turn — collapses into ONE Lark message (the Feishu `uuid` field is
+ * idempotent for 1h and returns the original message_id on repeat).
+ *
+ * Without it, the daemon's own transient-failure retry
+ * (`FINAL_OUTPUT_RETRY_BACKOFF_MS`, up to 3 attempts) is at-least-once: an
+ * ambiguous first attempt whose reply the server accepted but whose response
+ * the client never saw (network error/timeout) creates a brand-new copy on
+ * each retry — the user-visible "the answer repeated 3 times" incident. The
+ * VC-managed (`vcp_*`) and Codex App settlement (`ca_*`) paths already carry
+ * their own stable provider keys; this closes the same gap for the ordinary
+ * thread/chat fallback path.
+ */
+function bridgeFinalOutputUuid(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+): string {
+  const seed = finalOutputDedupeKey(ds, msg);
+  return `bf_${createHash('sha256').update(seed, 'utf8').digest('hex').slice(0, 46)}`;
 }
 
 function shouldDropMismatchedFinalOutput(
@@ -10217,7 +12206,7 @@ function deliverFinalOutput(
                 }
               : {}),
           }
-        : codexAppSettlementReply;
+        : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
       const messageId = await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
@@ -10607,6 +12596,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Adopt sessions inherit the adopted CLI's id.
   // Do this before installing worker handlers: a fast worker can emit `ready`

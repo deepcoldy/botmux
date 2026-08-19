@@ -1,8 +1,4 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
-import {
-  readFileSync, existsSync, mkdirSync, chmodSync, linkSync, unlinkSync, writeFileSync,
-} from 'node:fs';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
 import {
   readSecureHostFileSync,
@@ -99,61 +95,40 @@ export function generateToken(): string {
 /**
  * Load a dashboard HMAC secret from disk. Empty / whitespace-only files are
  * treated as missing so callers never sign requests with an empty key.
+ *
+ * Goes through the same strict host-authority primitives as the persisted
+ * token: the leaf must be a regular 0600 file owned by the current user and
+ * must not be a symlink, and its directory (`~/.botmux`) must not be
+ * group/other-writable. An unsafe shape throws
+ * {@link UnsafeHostAuthorityFileError} (fail-closed) instead of being followed:
+ * a symlinked or loose-perms secret could be planted by a local attacker who
+ * can replace the credential directory, letting them forge CLI HMAC headers
+ * and mint dashboard tokens.
  */
 export function loadDashboardSecret(secretPath: string): string | null {
-  if (!existsSync(secretPath)) return null;
-  const secret = readFileSync(secretPath, 'utf8').trim();
-  return secret.length > 0 ? secret : null;
+  const secret = readSecureHostFileSync(secretPath, 256)?.trim();
+  return secret ? secret : null;
 }
 
-/** Load the dashboard HMAC secret, creating a fresh 0600 secret when absent. */
+/**
+ * Load the dashboard HMAC secret, creating a fresh 0600 secret when absent or
+ * empty. The credential directory is pinned once (Linux: via an open directory
+ * descriptor) and the lock, the read, and the write all resolve through that
+ * same anchor — so a symlinked HOME / shared-drive ancestor still works while
+ * an ancestor rename mid-section cannot redirect the secret into a substituted
+ * directory, and a leaf symlink is refused. The file lock makes get-or-create
+ * linearizable across dashboard processes.
+ */
 export function loadOrCreateDashboardSecret(secretPath: string): string {
-  const existing = loadDashboardSecret(secretPath);
-  if (existing) return existing;
-  const secret = randomBytes(32).toString('base64url');
-  mkdirSync(dirname(secretPath), { recursive: true });
-  // Daemon fleets and the dashboard start concurrently on a fresh install.
-  // A rename-based "atomic write" is individually atomic but not
-  // create-if-absent: two winners can each return a different key while only
-  // the last rename remains on disk. Publish a fully-written temp inode with
-  // link(2) instead. The link is atomic and fails with EEXIST for every loser;
-  // losers then read the single winner's complete value.
-  const temp = `${secretPath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
-  try {
-    writeFileSync(temp, secret, { mode: 0o600, flag: 'wx' });
-    try {
-      linkSync(temp, secretPath);
-      chmodSync(secretPath, 0o600);
+  return withSecureHostParentSync(secretPath, (parent) =>
+    parent.withLeafLock(() => {
+      const existing = parent.readLeaf(256)?.trim();
+      if (existing) return existing;
+      const secret = randomBytes(32).toString('base64url');
+      parent.writeLeaf(secret);
       return secret;
-    } catch (err) {
-      const raced = loadDashboardSecret(secretPath);
-      if (raced) return raced;
-      // Existing-but-empty/corrupt file: publish one permanent repair seed via
-      // link(2). Every concurrent initializer either wins that O_EXCL election
-      // or reads the same fully-written seed, then atomically restores the main
-      // path with the identical value. Keeping the 0600 seed makes crash recovery
-      // replayable and avoids stale PID locks (and their delete/recreate races).
-      const repairSeedPath = `${secretPath}.repair-seed`;
-      let repairSecret: string;
-      try {
-        linkSync(temp, repairSeedPath);
-        chmodSync(repairSeedPath, 0o600);
-        repairSecret = secret;
-      } catch (seedErr) {
-        if ((seedErr as NodeJS.ErrnoException).code !== 'EEXIST') throw seedErr;
-        const published = loadDashboardSecret(repairSeedPath);
-        if (!published) {
-          throw new Error(`dashboard secret repair seed is unreadable: ${repairSeedPath}`);
-        }
-        repairSecret = published;
-      }
-      atomicWriteFileSync(secretPath, repairSecret, { mode: 0o600 });
-      chmodSync(secretPath, 0o600);
-      return repairSecret;
-    }
-  } finally {
-    try { unlinkSync(temp); } catch { /* already absent */ }
-  }
+    }),
+  );
 }
 
 /**

@@ -22,6 +22,7 @@ vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   HerdrBackend: class MockHerdrBackend {
     static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
     static managedSessionName = vi.fn(() => 'botmux');
+    static defaultAgentName = vi.fn(() => 'botmux');
     static hasSession = vi.fn(() => false);
     static probeSession = vi.fn(() => 'missing');
     static hasAgent = vi.fn(() => false);
@@ -343,6 +344,64 @@ describe('selectSessionBackend', () => {
       isReattach: true,
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
     });
+  });
+
+  // ── Owned isolation/MCP Herdr host: agent-precise reattach-vs-fresh (generational
+  //    race symmetric case). host = bmx-<sid8>. Must use TRI-STATE probes; NEVER
+  //    predict reattach from the session alone (a live host whose botmux agent
+  //    vanished would loop the backend's frozen reattach guard, and the worker
+  //    would have skipped the PENDING + credential wrapper cold-path). ──
+  const OWNED_SID = 'aabbccdd-197d-4781-845b-c541dceb8980';
+  const ownedHost = `bmx-${OWNED_SID.slice(0, 8)}`;
+
+  it('owned host + agent BOTH exist → warm reattach the same owned host', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    expect((selected.backend as any).sessionName).toBe(ownedHost);
+    expect(selected.isReattach).toBe(true);
+    expect((selected.backend as any).opts.isReattach).toBe(true);
+  });
+
+  it('owned host EXISTS but agent MISSING → cold start IN the same host (isReattach:false), no teardown, no migrate to shared', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    // SAME owned host retained (not migrated to the shared 'botmux' host)…
+    expect((selected.backend as any).sessionName).toBe(ownedHost);
+    // …but cold: worker will write PENDING + assemble the credential wrapper first.
+    expect(selected.isReattach).toBe(false);
+    expect((selected.backend as any).opts.isReattach).toBe(false);
+    // Never tore down the still-live host.
+    expect(vi.mocked(HerdrBackend.killAgent)).not.toHaveBeenCalled();
+  });
+
+  it('owned host exists but agent probe UNKNOWN → refuse (no kill, no spawn)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('unknown');
+    expect(() => selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' }))
+      .toThrow(/agent .* probe inconclusive|reattach-vs-fresh/);
+    expect(vi.mocked(HerdrBackend.killAgent)).not.toHaveBeenCalled();
+  });
+
+  it('owned host probe UNKNOWN → refuse (never fail-open by collapsing unknown to a fresh migrate)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockReturnValue(false);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'unknown' : 'missing');
+    expect(() => selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' }))
+      .toThrow(/owned herdr session .* probe inconclusive|reattach-vs-fresh/);
+  });
+
+  it('owned host MISSING → migrate to the shared machine-wide botmux host (fresh)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux'); // shared exists, owned missing
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'missing' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    // Falls through to the shared 'botmux' host cold path.
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect(selected.isReattach).toBe(false);
   });
 });
 

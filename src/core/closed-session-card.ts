@@ -4,6 +4,7 @@ import { resolveCliRuntime, runtimePathOverride } from '../adapters/cli/runtime.
 import { decorateResumeForWrapper } from '../setup/cli-selection.js';
 import { buildSessionClosedCard } from '../im/lark/card-builder.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
+import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import type { Locale } from '../i18n/index.js';
 
 function shellQuote(value: string): string {
@@ -84,5 +85,9 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
     cliResumeCommand,
     locale,
     runtimeDisplayName,
+    // No precise resume command AND the adapter can only resume a precise id:
+    // resuming reactivates the route but starts a FRESH session — the card
+    // must not imply history is restored.
+    !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: ds.session.cliSessionId }),
   );
 }

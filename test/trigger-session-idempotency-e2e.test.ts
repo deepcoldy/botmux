@@ -73,13 +73,14 @@ vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(
 // worker-pool: forkWorker is the dispatch side effect we make throw on demand.
 let forkShouldThrow = false;
 const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injected fork failure'); });
-const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
+const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: vi.fn(() => true),
   getCurrentCliVersion: vi.fn(() => 'test'),
   setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => { map.set(key, ds); return true; },
   closeSession: (...a: any[]) => mockCloseSession(...a),
+  closeSessionForBackgroundCleanup: (...a: any[]) => mockCloseSession(a[0]),
   getDaemonBootId: () => 'boot-CURRENT',
   // master refactor: trigger-session now takes the active-session key lock and
   // checks the queued-activation admission gate. The lock just runs the action;

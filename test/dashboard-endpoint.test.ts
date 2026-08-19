@@ -64,7 +64,8 @@ function makeFetch(ports: Record<number, PortBehaviour>): typeof fetch {
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'bmx-dash-'));
-  writeFileSync(join(dir, '.dashboard-secret'), SECRET);
+  // 生产环境 secret 始终以 0600 落盘；fixture 必须匹配，否则安全读取会 fail-closed。
+  writeFileSync(join(dir, '.dashboard-secret'), SECRET, { mode: 0o600 });
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -117,7 +118,7 @@ describe('callDashboard', () => {
   });
 
   it('returns no-secret when the secret file is whitespace-only', async () => {
-    writeFileSync(join(dir, '.dashboard-secret'), ' \n');
+    writeFileSync(join(dir, '.dashboard-secret'), ' \n', { mode: 0o600 });
     const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl: makeFetch({}) });
     expect(r).toEqual({ ok: false, reason: 'no-secret' });
   });

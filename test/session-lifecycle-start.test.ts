@@ -471,6 +471,53 @@ describe('persistent backend target handoff', () => {
   });
 });
 
+describe('no-transport read isolation follows local sandbox config (not forced)', () => {
+  // Behavioral lock for the 2026-08 change: a no-transport session (apiOnly bot
+  // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in
+  // only — driven purely by explicit per-bot `readIsolation` — so a no-transport
+  // session with no sandbox config reads the disk like a normal chat. The env
+  // secret-withhold (asserted in api-only-mode-wiring) is a SEPARATE boundary and
+  // stays independent of this.
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('apiOnly bot WITHOUT sandbox config → readIsolation:false (was forced true)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: '' }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+
+  it('HTTP virtual session (http_wait_) on a normal bot WITHOUT sandbox → readIsolation:false', () => {
+    const ds = makeDs({ chatId: 'http_wait_abc', session: { ...makeDs().session, chatId: 'http_wait_abc' } });
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+
+  it('HTTP virtual session (http_async_) on a normal bot WITHOUT sandbox → readIsolation:false', () => {
+    const ds = makeDs({ chatId: 'http_async_xyz', session: { ...makeDs().session, chatId: 'http_async_xyz' } });
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+
+  it('no-transport session with explicit bot readIsolation:true STILL isolates (follows config)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: '', readIsolation: true }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    // Proves the follow-config path: the owner can still opt in; the change only
+    // removed the FORCED disjunct, not the explicit opt-in.
+    expect(readInit().readIsolation).toBe(true);
+  });
+
+  it('a normal transport-enabled chat is unaffected (readIsolation:false by default)', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+});
+
 describe('CLI runtime session freeze', () => {
   it('migrates an old agentFrozen session from its own cliPathOverride', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({

@@ -1569,6 +1569,48 @@ export function evaluateAskAnswerTalk(
     : evaluateTalk(larkAppId, chatId, senderOpenId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed;
 }
 
+/** 一条 thread reply 被判定为「待答 ask 的文字答复」后，拦截器需要的三个已收窄值。 */
+export interface AskCustomReplyCandidate {
+  senderOpenId: string;
+  chatId: string;
+  text: string;
+}
+
+/**
+ * 这条 thread reply 能不能被待答 ask 当成「自定义回复」吞掉——handleThreadReply
+ * 里那道拦截器的唯一生产判据。
+ *
+ * 命中时该消息会走 submitCustomReply settle 掉 ask，**不再**作为新一轮输入转发给
+ * CLI。因此只有**真正的纯文字答复**才可以被吞：
+ *
+ *  - `resourceCount > 0` 一律不吞。文件 / 图片消息也有非空正文（解析器给的
+ *    `[文件 1: x.pdf]` / `[图片 1]` 占位文本），只看文本非空会让成员在旧操作卡
+ *    有效期内发的新附件被当成旧问题的答案消费掉：新资料不进附件路由，旧 ask 被
+ *    一段占位文本 settle。带资源的消息必须落回正常消息 / 附件路由。
+ *  - workflow grill 触发（`/workflow [new] <目标>`）不吞：grill 分支只改写
+ *    promptContent 后 fall-through，cmdContent 仍是字面量，被吞掉 grill 就永远
+ *    不启动。
+ *  - 没有 senderOpenId / chatId 时不吞：答复权限与 ask 归属都无从判定。
+ *
+ * 抽成导出谓词（而非把条件内联进 daemon）的意义与 {@link evaluateAskAnswerTalk}
+ * 一致：让**判据本身**能被回归测试直接咬住。拦截命中后的鉴权仍在 broker 内由
+ * canTalkChecker 判定，本函数不涉及权限。
+ */
+export function askCustomReplyCandidate(input: {
+  senderOpenId: string | undefined;
+  chatId: string | undefined;
+  cmdContent: string;
+  resourceCount: number;
+  isWorkflowGrillTrigger: boolean;
+}): AskCustomReplyCandidate | undefined {
+  if (!input.senderOpenId || !input.chatId) return undefined;
+  if (input.isWorkflowGrillTrigger) return undefined;
+  if (input.resourceCount > 0) return undefined;
+  const text = input.cmdContent.trim();
+  if (!text) return undefined;
+  return { senderOpenId: input.senderOpenId, chatId: input.chatId, text };
+}
+
 export function canOperate(
   larkAppId: string,
   _chatId: string | undefined,

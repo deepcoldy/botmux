@@ -34,6 +34,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
+import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
   findAncestorSessionContext as findLiveAncestorSessionContext,
   resolveSessionContext,
@@ -4723,8 +4724,16 @@ async function postOwningDaemonSessionMutation(
   return 'applied';
 }
 
+/**
+ * A remote session the daemon closed LOCALLY but could not cancel.
+ *
+ * Carried all the way to the CLI/TUI: collapsing it into a plain success is the
+ * same lie the daemon-side result matrix exists to prevent, just one process
+ * boundary further out. JSON is `any` at this seam, so nothing but an explicit
+ * read keeps it — the discriminant cannot help here.
+ */
 type AuthoritativeAbandonResult =
-  | { ok: true; mode: 'daemon' }
+  | { ok: true; mode: 'daemon'; residual?: ParsedCloseResidual }
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
@@ -4751,7 +4760,15 @@ async function abandonSessionAuthoritatively(
         // stays fail-closed at the daemon's sessionCliIpcAuth check.
         const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
         const body = await res.json().catch(() => ({} as Record<string, unknown>));
-        if (res.ok && (body as { ok?: unknown }).ok) return { ok: true, mode: 'daemon' };
+        if (res.ok && (body as { ok?: unknown }).ok) {
+          // Shared parser: a body that DECLARES a residual must warn even when the
+          // `residual` object is missing/malformed, or a bad payload silently
+          // becomes an ordinary success again.
+          const residual = parseCloseResidual(body);
+          return residual
+            ? { ok: true, mode: 'daemon', residual }
+            : { ok: true, mode: 'daemon' };
+        }
         // Surface the daemon's own rejection reason (e.g. origin_unproven) and
         // never fall back to a partial local kill: a fresh descriptor means the
         // daemon may still hold authoritative in-memory state.
@@ -5110,14 +5127,19 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  if (s.backendType === 'riff') {
-    // Riff runs the CLI on a remote sandbox, not a local multiplexer pane: there
-    // is nothing to probe, attach to, or name as a PersistentBackendTarget
-    // (sessionPersistentTarget returns undefined for it, by design). Surface a
-    // stable label and report the nonexistent local backing as missing — exactly
-    // like pty — so it never slips into the legacy tmux branch and dereferences an
-    // undefined target.
-    return { backendType: 'riff', probe: 'missing', label: 'riff' };
+  if (s.backendType === 'riff' || s.backendType === 'mojo') {
+    // A remote backend (riff / mojo) runs its agent off-box, not in a local
+    // multiplexer pane: there is nothing to probe, attach to, or name as a
+    // PersistentBackendTarget (sessionPersistentTarget returns undefined for it, by
+    // design). Surface a stable label and report the nonexistent local backing as
+    // missing — exactly like pty — so it never slips into the legacy tmux branch
+    // and dereferences an undefined target.
+    //
+    // Listed literally, not via isRemoteBackendType(): a boolean helper does not
+    // narrow the union, and the exhaustiveness guard at the end of this function
+    // depends on that narrowing. Adding a remote backend therefore fails to
+    // compile here until it is listed — which is how mojo was caught.
+    return { backendType: s.backendType, probe: 'missing', label: s.backendType };
   }
   if (s.backendType === undefined) {
     // Legacy rows predate backend stamping. Only tmux was externally attachable,
@@ -5467,7 +5489,15 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       // abandonSessionAuthoritatively is `mode` (see its return type ~3573),
       // NOT master's `via` — that belongs to a different helper.
       flash = result.mode === 'daemon'
-        ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
+        ? (result.residual
+          // Local row closed, remote session still running: never the green
+          // "deleted" text, or the operator walks away from a live agent that
+          // still holds the injected credential.
+          ? {
+            style: 'warn',
+            text: `⚠ 本地已删除 ${s.sessionId.substring(0, 8)}，但${closeResidualClause(result.residual)}`,
+          }
+          : { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` })
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
@@ -5767,6 +5797,7 @@ async function cmdDelete(): Promise<void> {
   let closed = 0;
   let offline = 0;
   let failed = 0;
+  let residual = 0;
   for (const s of toDelete) {
     // Explicit abandon boundary: route through the owning daemon so the ledger
     // FIFO is cleared atomically with close; offline fallback rereads the row
@@ -5782,9 +5813,18 @@ async function cmdDelete(): Promise<void> {
       offline++;
       if (result.cleanedBacking) console.log(`  killed ${result.cleanedBacking}`);
     }
+    if (result.mode === 'daemon' && result.residual) {
+      // Local row closed, remote session NOT cancelled. Reported per session AND
+      // counted in the summary, so a bulk delete cannot bury it.
+      residual++;
+      console.warn(
+        `⚠ ${s.sessionId.substring(0, 8)} ${s.title}：本地已关闭，但${closeResidualClause(result.residual)}`,
+      );
+      continue;
+    }
     console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.mode === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
   }
-  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
+  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}${residual ? `，${residual} 个有残留需人工清理` : ''}`);
   if (failed > 0) process.exitCode = 1;
 }
 
@@ -6846,6 +6886,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  mojo-containment list|revoke
+              查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
+              blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -13254,6 +13297,13 @@ switch (command) {
   case 'device': {
     const { runDeviceCommand } = await import('./platform/device-command.js');
     process.exitCode = await runDeviceCommand(process.argv.slice(3));
+    break;
+  }
+  case 'mojo-containment': {
+    // The auditable operator exit for fail-closed containment blockers that can
+    // never self-release (weak handles on non-cgroup hosts, unprovable handles).
+    const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
+    process.exitCode = await runMojoContainmentCommand(process.argv.slice(3));
     break;
   }
   case 'list':

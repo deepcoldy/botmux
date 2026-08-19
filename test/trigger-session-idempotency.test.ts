@@ -30,9 +30,14 @@ vi.mock('../src/utils/logger.js', () => ({
 
 // closeSession is the only worker-pool symbol the reconcile path calls; stub the
 // rest that trigger-session imports at load. getDaemonBootId returns a fixed id.
-const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
+const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true }));
+// Separate spy: cleanup here must go through the BACKGROUND wrapper (which logs a
+// residual/refusal), not bare closeSession. Aliasing both to one spy could not
+// tell those apart, so a revert to the bare call would have stayed green.
+const mockBackgroundClose = vi.fn(async (...a: any[]) => mockCloseSession(a[0] as never));
 vi.mock('../src/core/worker-pool.js', () => ({
   closeSession: (...a: any[]) => mockCloseSession(...a),
+  closeSessionForBackgroundCleanup: (...a: any[]) => mockBackgroundClose(...a),
   forkWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test'),
   sendWorkerInput: vi.fn(() => true),
@@ -72,6 +77,7 @@ beforeEach(() => {
   process.env.SESSION_DATA_DIR = tempDir;
   sessionRows.clear();
   mockCloseSession.mockClear();
+  mockBackgroundClose.mockClear();
 });
 afterEach(() => {
   vi.restoreAllMocks(); // guarantee any listAllForOwner/etc spy is undone even if an assertion threw
@@ -363,5 +369,23 @@ describe('reconcileIdempotencyLeasesOnBoot (crash convergence)', () => {
     // Our reserved orphan converged; the foreign corruption was never opened.
     expect(idempotencyStore.lookup(OWNER, 'k-ours')).toBeUndefined();
     expect(quarantined.has('sess-ours')).toBe(true);
+  });
+
+
+  it('routes cleanup through the BACKGROUND close wrapper, with a context label', async () => {
+    // Wiring evidence: reverting any of these call sites to bare closeSession()
+    // would lose the residual/refusal logging that is the only signal on a path
+    // with no user surface.
+    idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-bg', triggerId: 'trg_bg', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-bg', now: 1 });
+    sessionRows.set('sess-bg', { sessionId: 'sess-bg', status: 'open' });
+
+    await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    // Anchor on THIS session's call rather than a global index: other cases in
+    // the file share the spy.
+    const call = (mockBackgroundClose.mock.calls as unknown as [string, string][])
+      .find(([sessionId]) => sessionId === 'sess-bg');
+    expect(call, 'cleanup did not go through the background wrapper').toBeDefined();
+    expect(call![1]).toContain('trigger-session');
   });
 });

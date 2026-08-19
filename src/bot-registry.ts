@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
+import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
@@ -1020,6 +1021,15 @@ function normalizeMessageListeners(raw: unknown, botIndex: number): Record<strin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * A bots.json row may omit `cliId`. Historically that means claude-code, and such
+ * a row can still carry a legacy `cliPathOverride`. Anything that derives a
+ * selection from a RAW row must apply this same default, otherwise the selection
+ * looks changed and preservation logic is skipped. Exported so there is exactly
+ * one definition of the legacy default.
+ */
+export const LEGACY_DEFAULT_CLI_ID = 'claude-code';
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -1353,6 +1363,14 @@ export interface BotConfig {
    * selection, and auth settings for riff's HTTP API.
    */
   riff?: RiffBackendConfig;
+
+  /**
+   * Configuration for the mojo backend (@byted/mojo headless CLI). Optional
+   * even when `backendType` is `'mojo'`: every field has a working default
+   * (`mojo` on PATH + an ambient login is a valid setup). Use it to pin the
+   * model, inject a JWT, or force `--cloud` execution.
+   */
+  mojo?: MojoConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -2574,6 +2592,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
+    // Validate the `mojo` block through the SHARED normalizer, so a hand-edited
+    // bots.json is held to exactly the same rules as `/config set mojo`.
+    //
+    // Fail CLOSED, and on types as well as names: `localDaemon: "false"` used to
+    // satisfy the sandbox check's `!== true` (bypassing local isolation) while
+    // being truthy in buildEnv (enabling host execution) — isolation off AND
+    // local execution on. A typo like `cluod: true` would likewise leave the
+    // cloud sandbox silently disabled.
+    if (entry.mojo !== undefined) {
+      const normalized = normalizeMojoConfig(entry.mojo);
+      if (!normalized.ok) {
+        throw new Error(`Bot config [${i}]: ${normalized.errors.join('; ')}`);
+      }
+    }
     // apiOnly (core-only) bots drive purely over the HTTP control API and never
     // connect to Feishu, so a real app secret is not required. larkAppId is still
     // mandatory (daemon identity + dashboard routing + cachedLarkAppId gate); use
@@ -2604,7 +2636,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // also persist an exactly-equal path shadow so a rollback to an older
     // BotMux still launches the same distribution. Any unequal pair would make
     // old and new versions disagree, so it fails closed below.
-    const entryCliId = entry.cliId ?? 'claude-code';
+    const entryCliId = entry.cliId ?? LEGACY_DEFAULT_CLI_ID;
     if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
       throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
     }
@@ -2904,6 +2936,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
+      mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
