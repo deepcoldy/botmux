@@ -34,9 +34,21 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../../utils/logger.js';
 
-/** Raw (pre-realpath) isolated workspace directory for a botmux session. */
+/**
+ * Raw (pre-realpath) isolated workspace directory for a botmux session.
+ *
+ * `BOTMUX_MOJO_WORKSPACE_ROOT` overrides the whole root. Its primary consumer
+ * is the test setup (test/unit-setup.ts), which fences it into a temp dir the
+ * same way SESSION_DATA_DIR is fenced — without it, every unit test that
+ * drives a real MojoBackend turn mints directories under the developer's real
+ * ~/.botmux/mojo-workspaces (observed live). Operators may also point it at a
+ * faster/bigger volume; spawn and close read the same value, so the pairing
+ * stays consistent within one daemon process.
+ */
 export function mojoIsolatedWorkspacePath(sessionId: string, home: string = homedir()): string {
-    return join(home, '.botmux', 'mojo-workspaces', sessionId);
+    const rootOverride = process.env.BOTMUX_MOJO_WORKSPACE_ROOT?.trim();
+    const root = rootOverride ? rootOverride : join(home, '.botmux', 'mojo-workspaces');
+    return join(root, sessionId);
 }
 
 /**

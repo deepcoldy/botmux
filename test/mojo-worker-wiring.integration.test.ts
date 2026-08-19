@@ -388,7 +388,9 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     // uniqueness is what gives every session its own mojo daemon + env.
     // (The fake binary dumps a filtered env, so the shape is asserted off the
     // reported cwd itself; realpath mechanics are pinned by the module tests.)
-    expect(invocation.cwd.replace(/\\/g, '/')).toMatch(/\.botmux\/mojo-workspaces\/sid-mojo-wiring$/);
+    // Root-agnostic: the workspace root is env-fenced in tests
+    // (BOTMUX_MOJO_WORKSPACE_ROOT, see test/unit-setup.ts).
+    expect(invocation.cwd.replace(/\\/g, '/')).toMatch(/mojo-workspaces\/sid-mojo-wiring$/);
     // The dir necessarily existed at spawn time (the fake binary ran with it
     // as cwd; spawn would ENOENT otherwise) — the harness removes its tmp
     // root on return, so no on-disk assertion here. mkdir/realpath mechanics

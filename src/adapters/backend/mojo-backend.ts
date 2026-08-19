@@ -601,6 +601,16 @@ export class MojoBackend implements SessionBackend {
         return deriveMojoExecutionMode(this.config).agentLocalDaemon === '1';
     }
 
+    /** HOME for the isolated workspace root. Prefer the CHILD env the worker
+     *  hands over — in production it equals the daemon's own HOME (so the
+     *  workerless close path, which uses os.homedir(), matches), while in
+     *  tests it keeps backend instances from minting directories under the
+     *  developer's real ~/.botmux (the full suite did exactly that once). */
+    private isolationHome(): string | undefined {
+        const home = this.config.env?.HOME ?? this.spawnOpts?.injectEnv?.HOME ?? this.spawnOpts?.env?.HOME;
+        return typeof home === 'string' && home.length > 0 ? home : undefined;
+    }
+
     private resolveCwd(): string | undefined {
         if (this.controlPlaneOnly || !this.hostExecution()) return this.realWorkingDir();
         // Host execution: run the CLI from a physically distinct per-session
@@ -609,7 +619,7 @@ export class MojoBackend implements SessionBackend {
         // into the shared daemon (see mojo-isolated-workspace.ts for the
         // whole P0/P1 story). Cached: spawn and close must use the SAME
         // realpath string or the close-side registry match silently misses.
-        this.isolatedWorkspace ??= ensureMojoIsolatedWorkspace(this.sessionId);
+        this.isolatedWorkspace ??= ensureMojoIsolatedWorkspace(this.sessionId, this.isolationHome());
         return this.isolatedWorkspace;
     }
 
@@ -1503,8 +1513,9 @@ export class MojoBackend implements SessionBackend {
         // remote cancel already happened. kill()/shutdown-detach deliberately
         // do NOT reap — the session survives a daemon restart and its daemon
         // must keep serving the resumed lineage.
-        if (this.hostExecution()) {
-            await cleanupMojoIsolatedWorkspace(this.sessionId).catch(() => undefined);
+        if (this.hostExecution() && !this.controlPlaneOnly) {
+            await cleanupMojoIsolatedWorkspace(this.sessionId, { home: this.isolationHome() })
+                .catch(() => undefined);
         }
         return {
             ok: true,
