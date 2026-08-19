@@ -57,7 +57,7 @@ export class PluginServiceDeleteError extends Error {
   }
 }
 
-interface Pm2AppInfo {
+export interface Pm2AppInfo {
   name: string;
   pid?: number;
   status?: string;
@@ -302,6 +302,32 @@ function selectedRecords(pluginIds?: readonly string[], autoOnly = false): Insta
     .filter(record => !!record.manifest.service)
     .filter(record => !autoOnly || record.manifest.service?.mode === 'auto')
     .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/** Capture manual services that must be restored after the shared PM2 God rotates. */
+export async function snapshotRunningManualPluginServiceIds(): Promise<string[]> {
+  return withPluginServiceLock(async () => {
+    return selectRunningManualPluginServiceIds(selectedRecords(), readPm2Apps());
+  });
+}
+
+export function selectRunningManualPluginServiceIds(
+  records: readonly InstalledPluginRecord[],
+  pm2Apps: readonly Pm2AppInfo[],
+): string[] {
+  const apps = new Map(pm2Apps.map(app => [app.name, app]));
+  return records
+    .filter(record => record.manifest.service?.mode === 'manual')
+    .filter(record => {
+      const app = apps.get(pluginPm2AppName(record.id));
+      return !!app
+        && app.status !== 'stopped'
+        && app.status !== 'errored'
+        && ((typeof app.pid === 'number' && app.pid > 1)
+          || app.status === 'online'
+          || app.status === 'launching');
+    })
+    .map(record => record.id);
 }
 
 function reportFromState(

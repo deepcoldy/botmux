@@ -5,10 +5,24 @@ import { join } from 'node:path';
 
 const childProcess = vi.hoisted(() => ({
   spawnSync: vi.fn(),
+  ownershipProcesses: [
+    { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'fixture-birth' },
+  ] as Array<{ pid: number; cgroup: string; startIdentity: string }>,
 }));
 
 vi.mock('node:child_process', () => ({
   spawnSync: childProcess.spawnSync,
+}));
+
+vi.mock('../src/core/pm2-lifecycle-owner.js', () => ({
+  describeExternalPm2Owner: () => '',
+  inspectLinuxPm2Command: () => ({
+    ownership: {
+      kind: 'owned',
+      processes: childProcess.ownershipProcesses,
+    },
+    plan: { kind: 'direct' },
+  }),
 }));
 
 describe('plugin PM2 environment', () => {
@@ -20,6 +34,9 @@ describe('plugin PM2 environment', () => {
     vi.stubEnv('kill_timeout', '3500');
     vi.resetModules();
     childProcess.spawnSync.mockReset();
+    childProcess.ownershipProcesses = [
+      { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'fixture-birth' },
+    ];
     childProcess.spawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
   });
 
@@ -41,6 +58,8 @@ describe('plugin PM2 environment', () => {
     expect(options.env.kill_timeout).toBeUndefined();
     expect(options.env.PLUGIN_VALUE).toBe('preserved');
     expect(options.env.PM2_HOME).toBe(join(home, '.botmux', 'pm2'));
+    expect(options.env.PM2_SILENT).toBeUndefined();
+    expect(options.env.PM2_USAGE).toBeUndefined();
   });
 
   it('does not leak the daemon PM2 graceful-exit sentinel into plugin PM2 apps', async () => {
@@ -58,5 +77,18 @@ describe('plugin PM2 environment', () => {
 
     const options = childProcess.spawnSync.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
     expect(options.env[PM2_GRACEFUL_EXIT_CODE_ENV]).toBeUndefined();
+  });
+
+  it('refuses a mutation when multiple service-owned Gods share the plugin home', async () => {
+    childProcess.ownershipProcesses = [
+      { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'birth-a' },
+      { pid: 456, cgroup: '/user.slice/botmux.service', startIdentity: 'birth-b' },
+    ];
+    vi.resetModules();
+    const { runPluginPm2 } = await import('../src/core/plugins/pm2.js');
+
+    expect(() => runPluginPm2(['start', 'fixture'], { inherit: false }))
+      .toThrow(/exactly one.*123, 456/);
+    expect(childProcess.spawnSync).not.toHaveBeenCalled();
   });
 });

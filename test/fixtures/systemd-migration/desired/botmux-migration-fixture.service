@@ -1,0 +1,14 @@
+[Unit]
+Description=botmux systemd migration desired fixture
+
+[Service]
+Type=forking
+PIDFile=%t/botmux-migration-god.pid
+KillMode=process
+KillSignal=SIGCONT
+RestartKillSignal=SIGCONT
+FinalKillSignal=SIGCONT
+SendSIGKILL=no
+TimeoutStopSec=2
+ExecStart=/bin/sh -c 'pid="$(cat %t/botmux-migration-god.pid 2>/dev/null || true)"; if ! kill -0 "$pid" 2>/dev/null; then sleep 300 & echo $! > %t/botmux-migration-god.pid; fi'
+ExecStop=/bin/sh -c 'pid="$(cat %t/botmux-migration-god.pid 2>/dev/null || true)"; if kill -0 "$pid" 2>/dev/null; then kill "$pid"; while kill -0 "$pid" 2>/dev/null; do sleep 0.05; done; fi'

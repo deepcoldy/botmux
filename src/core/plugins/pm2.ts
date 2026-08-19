@@ -3,10 +3,20 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
+import { captureReadonlyPm2Jlist } from '../../cli/pm2-readonly.js';
+import { runExistingPm2Command } from '../../cli/pm2-existing.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
+import {
+  ExternalPm2GodOwnershipError,
+  inspectLinuxPm2Command,
+  inspectLinuxPm2ReadonlyTarget,
+  type LinuxPm2GodProcess,
+} from '../pm2-lifecycle-owner.js';
 
 const require = createRequire(import.meta.url);
+const PKG_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const BOTMUX_HOME = join(homedir(), '.botmux');
 export const PLUGIN_PM2_HOME = join(BOTMUX_HOME, 'pm2');
 export const PLUGIN_PM2_PREFIX = 'botmux-plugin-';
@@ -39,11 +49,55 @@ function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
 }
 
+function assertPluginPm2MutationOwned() {
+  if (process.platform !== 'linux') return undefined;
+  const { ownership, plan } = inspectLinuxPm2Command({
+    command: 'plugin', home: PLUGIN_PM2_HOME,
+  });
+  if (plan.kind === 'direct') return { ownership, plan };
+  if (plan.kind === 'reject') {
+    if (ownership.kind !== 'external') {
+      throw new Error('plugin PM2 ownership plan rejected a non-external God');
+    }
+    throw new ExternalPm2GodOwnershipError(ownership);
+  }
+  throw new Error('plugin PM2 尚无 botmux.service owner；请先运行 `botmux start`。');
+}
+
+function pluginPm2Query(): { available: boolean; expectedGod?: LinuxPm2GodProcess } {
+  if (process.platform !== 'linux') return { available: true };
+  const target = inspectLinuxPm2ReadonlyTarget(PLUGIN_PM2_HOME);
+  if (!target) return { available: false };
+  return typeof target === 'object'
+    ? { available: true, expectedGod: target }
+    : { available: true };
+}
+
 export function runPluginPm2(args: string[], opts: { inherit?: boolean; timeoutMs?: number; env?: Record<string, string> } = {}): void {
+  const inspection = assertPluginPm2MutationOwned();
+  const env = pm2Env(opts.env);
+  if (inspection?.ownership.kind === 'owned') {
+    if (inspection.ownership.processes.length !== 1) {
+      throw new Error(
+        `plugin PM2 mutation requires exactly one botmux.service-owned God; found `
+        + `${inspection.ownership.processes.map(process => process.pid).join(', ') || 'none'}`,
+      );
+    }
+    runExistingPm2Command({
+      pkgRoot: PKG_ROOT,
+      home: PLUGIN_PM2_HOME,
+      args,
+      inherit: opts.inherit,
+      timeoutMs: opts.timeoutMs,
+      env,
+      expectedGod: inspection.ownership.processes[0]!,
+    });
+    return;
+  }
   const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
   const result = spawnSync(pm2.command, pm2.args, {
     stdio: opts.inherit === false ? 'pipe' : 'inherit',
-    env: pm2Env(opts.env),
+    env,
     shell: pm2.shell ?? false,
     timeout: opts.timeoutMs,
   });
@@ -55,22 +109,16 @@ export function runPluginPm2(args: string[], opts: { inherit?: boolean; timeoutM
 }
 
 export function capturePluginPm2(args: string[], opts: { timeoutMs?: number; env?: Record<string, string> } = {}): string {
-  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
-  const result = spawnSync(pm2.command, pm2.args, {
-    encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: pm2Env(opts.env),
-    shell: pm2.shell ?? false,
-    timeout: opts.timeoutMs ?? 10_000,
-    // `pm2 jlist` output scales with the process count (full env per process);
-    // Node's 1 MiB default spawnSync buffer overflows to ENOBUFS on large
-    // fleets. Match cli.ts pm2Capture — lift the cap far above any real size.
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  if (result.status !== 0) {
-    const detail = result.error?.message
-      ?? ((result.stderr ? String(result.stderr).trim() : '') || `status ${result.status}`);
-    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  if (args.length !== 1 || args[0] !== 'jlist') {
+    throw new Error(`unsupported read-only plugin PM2 command: ${args.join(' ')}`);
   }
-  return typeof result.stdout === 'string' ? result.stdout : '';
+  const query = pluginPm2Query();
+  if (!query.available) return '[]';
+  return captureReadonlyPm2Jlist({
+    pkgRoot: PKG_ROOT,
+    home: PLUGIN_PM2_HOME,
+    timeoutMs: opts.timeoutMs,
+    env: pm2Env(opts.env),
+    expectedGod: query.expectedGod,
+  });
 }

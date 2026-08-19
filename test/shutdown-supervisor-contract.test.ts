@@ -125,6 +125,25 @@ describe('graceful shutdown supervisor contract', () => {
     expect(stop).toContain('PM2 registry mutation incomplete');
   });
 
+  it('lets systemd retire only the exact owned God after an attested fleet stop', () => {
+    const helperStart = cli.indexOf('function terminateSystemdOwnedPm2God()');
+    const helperEnd = cli.indexOf('async function cmdStop()', helperStart);
+    const helper = cli.slice(helperStart, helperEnd);
+    expect(helper).toContain('process.env[BOTMUX_SYSTEMD_SERVICE_ENV]');
+    expect(helper).toContain('currentLinuxSystemdCgroup()');
+    expect(helper).toContain("ownership.processes.length !== 1");
+    expect(helper).toContain('readSupervisorProcessStartIdentity(target.pid)');
+    expect(helper).toContain("process.kill(target.pid, 'SIGTERM')");
+    expect(helper).not.toContain('SIGKILL');
+
+    const stopStart = cli.indexOf('async function cmdStop()');
+    const stopEnd = cli.indexOf('async function cmdRestart()', stopStart);
+    const stop = cli.slice(stopStart, stopEnd);
+    expect(stop).toContain("process.argv.includes('--systemd-service')");
+    expect(stop.indexOf('terminateSystemdOwnedPm2God()', stop.indexOf('PM2 registry mutation incomplete')))
+      .toBeGreaterThan(stop.indexOf('PM2 registry mutation incomplete'));
+  });
+
   it('restart waits for the fleet decision before any PM2 delete', () => {
     const start = cli.indexOf('function deleteAllBotmuxProcesses(');
     const end = cli.indexOf('/**\n * One-time migration', start);
@@ -398,8 +417,12 @@ describe('graceful shutdown supervisor contract', () => {
     const restartStart = cli.indexOf('async function cmdRestart()');
     const restartEnd = cli.indexOf('/**\n * Bring a SINGLE bot', restartStart);
     const restart = cli.slice(restartStart, restartEnd);
-    expect(restart).toContain("process.argv.includes('--bootstrap-shutdown-protocol')");
-    expect(restart).toContain("process.argv.includes('--yes')");
+    const flagsStart = cli.indexOf('function validateRestartLifecycleFlags(');
+    const flagsEnd = cli.indexOf('async function preflightRestartGenerationForSystemdRepair()', flagsStart);
+    const flags = cli.slice(flagsStart, flagsEnd);
+    expect(flags).toContain("argv.includes('--bootstrap-shutdown-protocol')");
+    expect(flags).toContain("argv.includes('--yes')");
+    expect(restart).toContain('validateRestartLifecycleFlags()');
     expect(restart).toContain("bootstrapDeleteAllBotmuxProcesses('restart')");
     expect(restart).toContain('deleteAllBotmuxProcesses()');
     expect(restart.lastIndexOf('deleteAllBotmuxProcesses()'))
