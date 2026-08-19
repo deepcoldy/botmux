@@ -678,6 +678,42 @@ describe('Worker ready: set_display_mode re-sync', () => {
     }
   });
 
+  it('suppressed managed turn screenshot never lands in currentImageKey', async () => {
+    // With the early re-sync, a worker can be uploading during a managed/silent
+    // turn — that frame must not become the next visible card's image.
+    const getBotMock = vi.mocked(getBot);
+    const originalGetBot = getBotMock.getMockImplementation();
+    getBotMock.mockImplementation((() => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', apiOnly: true },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    })) as any);
+    try {
+      const fakeWorker = makeFakeWorker();
+      const ds = makeDs({
+        displayMode: 'screenshot',
+        streamCardPending: false,
+        streamCardId: 'om_visible_card',
+        worker: fakeWorker,
+      });
+
+      __testOnly_setupWorkerHandlers(ds, fakeWorker);
+      fakeWorker.emit('message', {
+        type: 'screenshot_uploaded',
+        imageKey: 'img_managed_frame',
+        status: 'working',
+        turnId: 'turn-managed',
+      });
+      await flush();
+
+      expect(ds.currentImageKey).toBeUndefined();
+      expect(updateMessageMock).not.toHaveBeenCalled();
+    } finally {
+      getBotMock.mockImplementation(originalGetBot as any);
+    }
+  });
+
   it('re-applies readiness when cli_session_id races a restored-card PATCH', async () => {
     let resolveRestorePatch!: () => void;
     updateMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
