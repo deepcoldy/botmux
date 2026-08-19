@@ -88,6 +88,10 @@ import type {
     SpawnOpts,
 } from './types.js';
 import {
+    cleanupMojoIsolatedWorkspace,
+    ensureMojoIsolatedWorkspace,
+} from './mojo-isolated-workspace.js';
+import {
     buildEffectiveChildEnv,
     deriveMojoExecutionMode,
     findReservedMojoCliFlags,
@@ -245,6 +249,10 @@ export class MojoBackend implements SessionBackend {
      * hosts without cgroup v2 delegation — those turns get a weak handle instead.
      */
     private preparedBoundary: PreparedContainmentBoundary | null = null;
+    /** Realpath of this session's isolated workspace (host execution only).
+     *  Populated lazily by resolveCwd(); spawn and close share this exact
+     *  string so the close-side daemon-registry match cannot drift. */
+    private isolatedWorkspace?: string;
     /**
      * Latched once a strong boundary proved unusable at runtime — the shim's
      * enrolment write was rejected (exit 97). The prepare-time probe only opens
@@ -569,8 +577,30 @@ export class MojoBackend implements SessionBackend {
     }
 
     /** bots.json `mojo.cwd` wins; otherwise the worker's session working dir. */
-    private resolveCwd(): string | undefined {
+    /** The operator-facing working directory (the repo). Kept separate from
+     *  resolveCwd(): host execution runs the CLI in an isolated per-session
+     *  directory instead, and the decorate() preamble points the agent back
+     *  here for repo work. */
+    private realWorkingDir(): string | undefined {
         return this.config.cwd ?? this.spawnOpts?.cwd;
+    }
+
+    /** True when this config executes tools on the bot host (shared derivation
+     *  with buildEnv/buildArgs — see deriveMojoExecutionMode). */
+    private hostExecution(): boolean {
+        return deriveMojoExecutionMode(this.config).agentLocalDaemon === '1';
+    }
+
+    private resolveCwd(): string | undefined {
+        if (!this.hostExecution()) return this.realWorkingDir();
+        // Host execution: run the CLI from a physically distinct per-session
+        // directory. mojo keys its local execution daemon on
+        // hash(process.cwd()) — realpath, so a symlink would collapse back
+        // into the shared daemon (see mojo-isolated-workspace.ts for the
+        // whole P0/P1 story). Cached: spawn and close must use the SAME
+        // realpath string or the close-side registry match silently misses.
+        this.isolatedWorkspace ??= ensureMojoIsolatedWorkspace(this.sessionId);
+        return this.isolatedWorkspace;
     }
 
     write(data: string): boolean {
@@ -1457,6 +1487,15 @@ export class MojoBackend implements SessionBackend {
             }
         }
         this.killed = true;
+        // Reap this session's isolated execution daemon LAST, after the close
+        // verdict is already decided: a reaping failure is a leaked idle daemon
+        // (availability), never grounds to fail or roll back a close whose
+        // remote cancel already happened. kill()/shutdown-detach deliberately
+        // do NOT reap — the session survives a daemon restart and its daemon
+        // must keep serving the resumed lineage.
+        if (this.hostExecution()) {
+            await cleanupMojoIsolatedWorkspace(this.sessionId).catch(() => undefined);
+        }
         return {
             ok: true,
             ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
@@ -2049,10 +2088,37 @@ export class MojoBackend implements SessionBackend {
      * mode the files are already on disk (~/.mojo/skills) so it stays empty.
      */
     private decorate(prompt: string): string {
-        const preamble = [this.config.systemPrompt?.trim(), this.config.builtinSkillBlock?.trim()]
+        const preamble = [
+            this.config.systemPrompt?.trim(),
+            this.config.builtinSkillBlock?.trim(),
+            this.hostGuidanceBlock(),
+        ]
             .filter((s): s is string => !!s)
             .join('\n\n');
         return preamble ? `${preamble}\n\n---\n\n${prompt}` : prompt;
+    }
+
+    /**
+     * Host-execution guidance (undefined in cloud mode). Two compensations for
+     * the isolated per-session cwd:
+     *   1. the initial working directory is NOT the repo — point the agent at
+     *      the real one so repo work still lands in the right place;
+     *   2. every botmux command carries an explicit `--session-id`: the
+     *      execution daemon's env belongs to whichever session spawned it, so
+     *      an inherited BOTMUX_SESSION_ID must never be what routes a reply
+     *      (defence in depth — the isolated daemon already carries the right
+     *      env, this survives even a regression back to a shared daemon).
+     */
+    private hostGuidanceBlock(): string | undefined {
+        if (!this.hostExecution()) return undefined;
+        const repo = this.realWorkingDir();
+        const lines = [
+            repo
+                ? `你的工作仓库在 ${repo} 。当前初始工作目录是一个会话隔离目录,不含仓库文件;涉及仓库文件的读写或命令,请显式 \`cd ${repo}\` 后再执行。`
+                : '当前初始工作目录是一个会话隔离目录;如需在某个仓库/目录下工作,请先显式 cd 过去。',
+            `所有 botmux 命令请显式带 \`--session-id ${this.sessionId}\`(例:\`botmux send --session-id ${this.sessionId} ...\`),确保回话投递到本会话。`,
+        ];
+        return lines.join('\n');
     }
 
     private buildEnv(): NodeJS.ProcessEnv {

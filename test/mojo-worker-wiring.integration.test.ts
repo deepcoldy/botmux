@@ -382,6 +382,37 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
   }, 40_000);
 
+  it('host mode runs the CLI in a per-session isolated workspace (T2) with repo guidance (T3)', async () => {
+    const { invocation } = await runWorker({});
+    // T2: cwd is the isolated per-session dir, NOT the repo — realpath
+    // uniqueness is what gives every session its own mojo daemon + env.
+    // (The fake binary dumps a filtered env, so the shape is asserted off the
+    // reported cwd itself; realpath mechanics are pinned by the module tests.)
+    expect(invocation.cwd.replace(/\\/g, '/')).toMatch(/\.botmux\/mojo-workspaces\/sid-mojo-wiring$/);
+    // The dir necessarily existed at spawn time (the fake binary ran with it
+    // as cwd; spawn would ENOENT otherwise) — the harness removes its tmp
+    // root on return, so no on-disk assertion here. mkdir/realpath mechanics
+    // are pinned by test/mojo-isolated-workspace.test.ts.
+    // T3: the preamble points the agent back at the real repo and pins every
+    // botmux command to this session id (env-independent routing).
+    const positional = invocation.argv[invocation.argv.length - 1];
+    expect(positional).toContain('--session-id sid-mojo-wiring');
+    expect(positional).toContain('会话隔离目录');
+  }, 40_000);
+
+  it('cloud mode keeps the original cwd and gets no host guidance (T4)', async () => {
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    expect(invocation.cwd).not.toContain('mojo-workspaces');
+    const positional = invocation.argv[invocation.argv.length - 1];
+    expect(positional).not.toContain('--session-id sid-mojo-wiring');
+    expect(positional).not.toContain('会话隔离目录');
+    expect(invocation.argv).toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
+  }, 40_000);
+
   it('an explicit localDaemon=true runs on the host without --cloud', async () => {
     const { invocation } = await runWorker({
       botEntry: { mojo: { localDaemon: true } },

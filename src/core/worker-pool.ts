@@ -34,6 +34,7 @@ import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../ser
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
 import { hasUnprovenContainment } from './mojo-containment.js';
 import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
 import {
@@ -4354,6 +4355,11 @@ async function prepareMojoExplicitClose(
   // repeat-cancel is suppressed with an explicit flag rather than by mutating
   // shared state early.
   logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
+  // Workerless twin of MojoBackend.destroySession()'s reap: the close verdict
+  // above is already decided, so a reaping failure only leaks an idle daemon
+  // (logged inside), never fails the close. Host-mode gating lives inside the
+  // helper via the isolated dir's existence — a cloud session never created one.
+  void cleanupMojoIsolatedWorkspace(session.sessionId).catch(() => undefined);
   // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
   // can carry both (restore parked the old id, the session then created a new one).
   // Reporting a plain success here would hide the parked remote session entirely.
