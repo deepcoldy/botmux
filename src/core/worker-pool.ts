@@ -1384,6 +1384,22 @@ export function sessionMojoConfig(
     if (value === undefined) delete merged[key];
     else merged[key] = value;
   }
+  // Upgrade guard (review F1): an identity frozen by a pre-host-default build
+  // recorded "localDaemon unset" while double-unset still MEANT the cloud
+  // sandbox. Resuming it through the new default would silently flip the
+  // session cloud→host — the exact transition the freeze exists to prevent,
+  // and the drift log stays silent because frozen and live are both `{}`.
+  // Pin those rows to the legacy behaviour; a new session adopts the new
+  // default and gets stamped mojoIdentityHostDefault by the freeze helper.
+  if ((frozen as Record<string, unknown>).localDaemon === undefined
+      && ds.session.mojoIdentityHostDefault !== true) {
+    merged.localDaemon = false;
+    logger.warn(
+      `[${tag(ds)}] mojo identity predates the host-execution default; pinning `
+      + 'localDaemon=false (legacy sandbox behaviour) for this session. '
+      + 'Close and reopen the session to adopt the new default.',
+    );
+  }
   // Quarantine is bound to a specific ID, not to the session.
   //
   // Once an identity is frozen, any lineage created AFTERWARDS was created on that

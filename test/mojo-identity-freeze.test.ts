@@ -557,3 +557,52 @@ describe('delivered notice is not re-queued after a reload', () => {
     expect(never.mojoQuarantineNoticePending).toBe(true);
   });
 });
+
+describe('upgrade guard: legacy identities keep the sandbox default (review F1)', () => {
+  // A zero-config identity frozen by a pre-host-default build is `{}` with no
+  // stamp. Resuming it through the new default would silently flip the session
+  // cloud→host — the exact transition the freeze exists to prevent — and the
+  // drift log stays silent because frozen and live are both `{}`.
+  it('pins an unstamped {} identity to localDaemon=false', async () => {
+    const { store, loadPool } = await boot();
+    const session = seed(store, { mojoIdentity: {} });
+    const ds = { session, larkAppId: APP_ID } as never;
+    const resolved = (await loadPool()).sessionMojoConfig(ds, { mojo: {} }, { freeze: false });
+    expect(resolved.config.localDaemon).toBe(false);
+  });
+
+  it('a host-default-stamped {} identity adopts the new default', async () => {
+    const { store, loadPool } = await boot();
+    const session = seed(store, { mojoIdentity: {}, mojoIdentityHostDefault: true });
+    const ds = { session, larkAppId: APP_ID } as never;
+    const resolved = (await loadPool()).sessionMojoConfig(ds, { mojo: {} }, { freeze: false });
+    expect(resolved.config.localDaemon).toBeUndefined();
+  });
+
+  it('an explicit frozen localDaemon is never touched by the pin', async () => {
+    const { store, loadPool } = await boot();
+    const session = seed(store, { mojoIdentity: { localDaemon: true } });
+    const ds = { session, larkAppId: APP_ID } as never;
+    const resolved = (await loadPool()).sessionMojoConfig(ds, { mojo: {} }, { freeze: false });
+    expect(resolved.config.localDaemon).toBe(true);
+  });
+
+  it('a legacy identity with only cloud=true keeps exact old behaviour', async () => {
+    // Pin lands as localDaemon=false alongside the frozen cloud=true — same
+    // AGENT_LOCAL_DAEMON='0' + --cloud the session always had.
+    const { store, loadPool } = await boot({ cloud: true });
+    const session = seed(store, { mojoIdentity: { cloud: true } });
+    const ds = { session, larkAppId: APP_ID } as never;
+    const resolved = (await loadPool()).sessionMojoConfig(ds, { mojo: { cloud: true } }, { freeze: false });
+    expect(resolved.config.cloud).toBe(true);
+    expect(resolved.config.localDaemon).toBe(false);
+  });
+
+  it('freezing today stamps the host-default marker', async () => {
+    const { store, identity } = await boot();
+    const session = seedAsCreated(store, {});
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    expect(session.mojoIdentity).toEqual({});
+    expect(session.mojoIdentityHostDefault).toBe(true);
+  });
+});

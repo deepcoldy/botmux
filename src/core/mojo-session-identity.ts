@@ -100,6 +100,7 @@ export function freezeMojoIdentityForSession(session: Session, larkAppId: string
       session.riffParentTaskId = undefined;
       session.mojoQuarantineNoticePending = true;
       session.mojoIdentity = pickMojoSessionIdentity(liveMojo);
+      session.mojoIdentityHostDefault = true;
       sessionStore.updateSession(session);
       return;
     }
@@ -122,5 +123,10 @@ export function freezeMojoIdentityForSession(session: Session, larkAppId: string
   // and must stay distinguishable from `undefined` ("predates this field"),
   // otherwise the row is migrated again on every boot.
   session.mojoIdentity = pickMojoSessionIdentity(liveMojo);
+  // Stamp the default era. An unstamped `{}` identity was frozen by a build
+  // whose double-unset default was the CLOUD SANDBOX; sessionMojoConfig pins
+  // those to localDaemon=false so an upgrade cannot silently move a live
+  // session's tools onto the host (review F1).
+  session.mojoIdentityHostDefault = true;
   sessionStore.updateSession(session);
 }

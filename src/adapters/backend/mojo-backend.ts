@@ -89,6 +89,7 @@ import type {
 } from './types.js';
 import {
     buildEffectiveChildEnv,
+    deriveMojoExecutionMode,
     findReservedMojoCliFlags,
     mojoRemoteProofFailureReason,
     isMojoRemoteGone,
@@ -463,15 +464,9 @@ export class MojoBackend implements SessionBackend {
         }
         // Execution-mode audit line (review F4): host execution BY DEFAULT is a
         // posture change, so make "came from default" vs "came from explicit
-        // config" distinguishable in the log. Mirrors buildEnv()'s derivation —
-        // keep the two in lockstep.
-        const execMode = this.config.cloud === true && this.config.localDaemon !== true
-            ? 'cloud-sandbox (--cloud)'
-            : this.config.localDaemon === true
-                ? 'host (explicit localDaemon)'
-                : this.config.localDaemon === false
-                    ? 'sandbox-fallback (localDaemon=false, cloud off)'
-                    : 'host (default)';
+        // config" distinguishable in the log. Same shared derivation as
+        // buildArgs/buildEnv — label and env value cannot drift by construction.
+        const execMode = deriveMojoExecutionMode(this.config).label;
         logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn, execution=${execMode})`);
     }
 
@@ -1627,25 +1622,26 @@ export class MojoBackend implements SessionBackend {
         // but that is NOT what happens on the cloud-sandbox path: verified without
         // --yolo that `echo … > f && cat f` returned return_code 0 with the file
         // actually written, and that `rm -rf <dir>` likewise succeeded — no
-        // rejection, no warning, no interaction. So on the recommended --cloud
-        // config this flag is belt-and-braces rather than load-bearing; we keep it
-        // for explicitness and in case the local-daemon path (AGENT_LOCAL_DAEMON=1,
-        // untested here) does enforce a confirmation gate.
+        // rejection, no warning, no interaction. So this flag is belt-and-braces
+        // rather than load-bearing; we keep it for explicitness and in case a
+        // future mojo build does enforce a confirmation gate headlessly.
         //
-        // Consequence worth stating plainly: a mojo bot's blast radius is bounded
-        // by --cloud, NOT by per-tool approval. Do not run one against a host
-        // filesystem you care about.
+        // Consequence worth stating plainly (review F4): host execution is now
+        // the DEFAULT, and with --yolo there is no per-tool approval — a mojo
+        // bot's blast radius on the host is bounded only by the OS user and the
+        // bot's allowedUsers gate. Operators who don't accept that must set
+        // `cloud: true` (fully-remote sandbox) or `localDaemon: false`.
         if (this.config.disableCliBypass !== true) args.push('--yolo');
         if (this.cliSessionId) args.push('-r', this.cliSessionId);
         if (this.config.model?.trim()) args.push('--model', this.config.model.trim());
         if (this.config.workspaceId) args.push('--workspace-id', this.config.workspaceId);
         if (this.config.agentId && !this.cliSessionId) args.push('--agent-id', this.config.agentId);
         // Run in the cloud sandbox instead of touching the bot host's filesystem.
-        // `=== true` to stay in lockstep with isMojoFullyRemote(), which decides
-        // the sandbox bypass. A truthy check here could add --cloud for a value
-        // the sandbox logic does NOT accept as proof of remote execution (or vice
-        // versa), and the two disagreeing is exactly what produces a fail-open.
-        if (this.config.cloud === true) args.push('--cloud');
+        // Shared derivation with buildEnv()/the spawn audit log — see
+        // deriveMojoExecutionMode for the precedence rules (explicit
+        // localDaemon wins and suppresses --cloud) and why hand-copying this
+        // logic produced fail-opens before.
+        if (deriveMojoExecutionMode(this.config).passCloudFlag) args.push('--cloud');
         if (this.config.idleTimeoutSec) args.push('--idle-timeout', String(this.config.idleTimeoutSec));
         // Before the positional prompt, which must stay last. Placed after our own
         // flags so an operator's CLI_EXTRA_ARGS can override them.
@@ -2134,9 +2130,7 @@ export class MojoBackend implements SessionBackend {
         // sandbox check read it as "not local, safe to bypass" — isolation off and
         // host execution on at once. Always written (never inherited), so an
         // ambient AGENT_LOCAL_DAEMON cannot flip the mode either way.
-        const hostExecution = this.config.localDaemon === true
-            || (this.config.localDaemon === undefined && this.config.cloud !== true);
-        env.AGENT_LOCAL_DAEMON = hostExecution ? '1' : '0';
+        env.AGENT_LOCAL_DAEMON = deriveMojoExecutionMode(this.config).agentLocalDaemon;
         // Never let an interactive upgrade prompt pollute the NDJSON stream.
         env.MOJO_NO_UPDATE = '1';
         // Termination authority, not configuration: this value is what makes the

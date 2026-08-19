@@ -382,6 +382,27 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
   }, 40_000);
 
+  it('an explicit localDaemon=true runs on the host without --cloud', async () => {
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { localDaemon: true } },
+      init: { backendConfig: { localDaemon: true } },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('localDaemon=true wins over cloud=true and suppresses --cloud (review F3)', async () => {
+    // Previously both flags were emitted and the CLI received contradictory
+    // instructions (env said host, argv said cloud — and the real CLI obeys
+    // --cloud). Explicit localDaemon now takes precedence.
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { cloud: true, localDaemon: true } },
+      init: { backendConfig: { cloud: true, localDaemon: true } },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
   it('an explicit localDaemon=false still opts out of host execution', async () => {
     const { invocation } = await runWorker({
       botEntry: { mojo: { localDaemon: false } },
