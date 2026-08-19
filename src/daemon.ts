@@ -615,6 +615,7 @@ import {
   type VcMeetingImRoutingCandidate,
   type VcMeetingSealedReceiverSessionBinding,
 } from './services/vc-meeting-im-routing.js';
+import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -17097,7 +17098,10 @@ async function startInitialPassthroughSession(args: {
 
 
 function vcMeetingApplicationContext(ctx: RoutingContext): string {
-  return (ctx.vcMeetingContextLifecycle === 'sealed'
+  return (ctx.vcMeetingImTurnOrigin
+    ? VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT
+    : '')
+    + (ctx.vcMeetingContextLifecycle === 'sealed'
     ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
     : '')
     + (ctx.vcMeetingContextMayLag

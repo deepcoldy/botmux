@@ -12032,7 +12032,24 @@ function deliverFinalOutput(
           }
         : undefined;
       let visibleAssistantText = msg.content;
-      if (!imOrigin
+      // A listener-chat @mention is a direct human IM turn. Its normal sink is
+      // already plain text, but an existing receiver context may have taught
+      // the model the automatic delivery's decision envelope. Do not expose
+      // that internal protocol to the human; recover its user-visible content
+      // when the stale envelope is valid. (The trusted per-turn instruction
+      // added by the daemon prevents new turns from producing it.)
+      if (imOrigin) {
+        const directImControlledOutput = parseVcMeetingListenerOutput(msg.content);
+        if (directImControlledOutput.ok) {
+          visibleAssistantText = directImControlledOutput.decision === 'publish'
+            ? directImControlledOutput.content
+            : '本次没有生成可展示的答复，请重新提问。';
+          logger.warn(
+            `[${t}] VC listener IM reply recovered stale control envelope `
+            + `turn=${msg.turnId.substring(0, 8)} decision=${directImControlledOutput.decision}`,
+          );
+        }
+      } else if (!imOrigin
         && listenerOutputOwner
         && msg.dispatchAttempt !== undefined
         && listenerOutputProtocol === 'decision_v1') {
