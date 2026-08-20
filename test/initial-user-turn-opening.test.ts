@@ -147,11 +147,12 @@ function writeBots(entries: unknown[]): void {
 
 function makeEventData(messageId: string, text: string, rootId?: string, extra?: {
   senderOpenId?: string;
+  senderType?: string;
   mentions?: any[];
   parentId?: string;
 }): any {
   return {
-    sender: { sender_id: { open_id: extra?.senderOpenId ?? OWNER }, sender_type: 'user' },
+    sender: { sender_id: { open_id: extra?.senderOpenId ?? OWNER }, sender_type: extra?.senderType ?? 'user' },
     message: {
       message_id: messageId,
       root_id: rootId,
@@ -407,6 +408,49 @@ describe('empty-started session — first real business turn must use the new-to
     // on. The test does NOT hand-inject the flag anywhere.
     const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
     expect(opts?.codexAppSteerable).toBe(true);
+  });
+
+  it('live worker: a foreign-bot @steer turn is steerable and the directive is not model content', async () => {
+    const anchor = 'om_bot_steer_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_bot_steer_msg', '@steer\n改用新的 API 继续做', anchor, { senderType: 'bot' }),
+      makeCtx(anchor, 'om_bot_steer_msg'),
+    );
+
+    const payload = liveInputs()[0]!;
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBe(true);
+    expect(payload.content).toContain('改用新的 API 继续做');
+    expect(payload.content).not.toContain('@steer');
+  });
+
+  it('live worker: a plain foreign-bot @mention stays queued', async () => {
+    const anchor = 'om_bot_queue_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_bot_queue_msg', '普通 bot-to-bot 消息', anchor, { senderType: 'bot' }),
+      makeCtx(anchor, 'om_bot_queue_msg'),
+    );
+
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBeUndefined();
   });
 
   it('worker-null refork: a plain human Codex App opening carries the frozen steerable flag on the fork payload (R4-B1)', async () => {
@@ -790,6 +834,7 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
     adopted: false,
     isForeignBot: false,
     isBotSenderType: false,
+    explicitBotSteer: false,
     substituteTrigger: false,
     controlRewrite: false,
     messageListener: false,
@@ -824,5 +869,32 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
     expect(computeCodexAppSteerable({
       ...humanFacts, humanSender: false, isForeignBot: true,
     })).toBe(false);
+  });
+
+  it('authorizes a known peer bot only when it carries an explicit @steer directive', () => {
+    const botFacts = {
+      ...humanFacts,
+      humanSender: false,
+      isForeignBot: true,
+      isBotSenderType: true,
+    };
+    expect(computeCodexAppSteerable({ ...botFacts })).toBe(false);
+    expect(computeCodexAppSteerable({ ...botFacts, explicitBotSteer: true })).toBe(true);
+  });
+
+  it('keeps every special control lane serial even for explicit bot @steer', () => {
+    const botFacts = {
+      ...humanFacts,
+      humanSender: false,
+      isForeignBot: true,
+      isBotSenderType: true,
+      explicitBotSteer: true,
+    };
+    for (const key of [
+      'adopted', 'substituteTrigger', 'controlRewrite', 'messageListener',
+      'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+    ] as const) {
+      expect(computeCodexAppSteerable({ ...botFacts, [key]: true })).toBe(false);
+    }
   });
 });
