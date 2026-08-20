@@ -21,7 +21,7 @@ function tmp(prefix: string): string {
 
 const jsonl = (...lines: unknown[]): string => lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
 
-describe('discoverClaudeFamilySessions', () => {
+describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
   let dataDir: string;
   beforeEach(() => { dataDir = tmp('bmx-claude-'); });
 
@@ -68,6 +68,23 @@ describe('discoverClaudeFamilySessions', () => {
     expect(out[0]?.title).toBe('Latest name');
   });
 
+  // Regression: Claude-family / Genius append `custom-title` records after
+  // the transcript's initial metadata. The bounded head scan must not hide a
+  // valid rename that lands beyond its 5,000-line safety window.
+  it('finds a customTitle appended after line 5000', async () => {
+    const lines: unknown[] = [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'initial prompt' } },
+    ];
+    for (let i = 0; i < 5_001; i++) {
+      lines.push({ type: 'assistant', message: { role: 'assistant', content: `filler ${i}` } });
+    }
+    lines.push({ type: 'custom-title', customTitle: 'Late parser title' });
+    writeSession('-root-proj', 'rename-after-head-cap', lines);
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Late parser title');
+  });
+
   it('falls back to the first real user prompt when customTitle is absent or invalid', async () => {
     writeSession('-root-proj', 'rename-fallback', [
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'the fallback prompt' } },
@@ -83,6 +100,7 @@ describe('discoverClaudeFamilySessions', () => {
       { type: 'user', cwd: '/root/proj', isSidechain: true, message: { role: 'user', content: 'subagent noise' } },
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: '<command-name>/clear</command-name>' } },
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'the real first question' } },
+      { type: 'custom-title', isSidechain: true, customTitle: 'subagent title noise' },
     ]);
     const out = await discoverClaudeFamilySessions(dataDir, 10);
     expect(out[0]?.title).toBe('the real first question');
@@ -116,7 +134,7 @@ describe('discoverClaudeFamilySessions', () => {
     expect(out.map((s) => s.cliSessionId).sort()).toEqual(['ext-discuss-1', 'ext-discuss-2']);
   });
 
-  // Regression (whiteboard /adopt leak): Claude-family CLIs with
+  // Regression (whiteboard /adopt leak): Claude-family / Genius CLIs with
   // injectsSessionContext=true get routing/identity/session_id via system
   // prompt, so when no team/group role is configured the botmux prompt STARTS
   // with the <whiteboard> block directly. No ^-anchored pattern matched that
@@ -136,7 +154,7 @@ describe('discoverClaudeFamilySessions', () => {
 
   // The ^<whiteboard>-opening pattern matches ANY board id (id="[^"]+"), not
   // just the default `wb_` prefix — a user-created board (`create --id
-  // <custom>`) bound to a Claude-family + role-less session also opens with
+  // <custom>`) bound to a Claude-family / Genius + role-less session also opens with
   // <whiteboard id="<custom>"> and must be dropped from /adopt.
   it('drops botmux-origin Claude sessions opening with a custom-id <whiteboard>', async () => {
     writeSession('-root-wb', 'wb-custom-1', [

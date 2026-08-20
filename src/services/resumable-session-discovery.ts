@@ -6,16 +6,14 @@
  * runs `<cli> --resume <id>` in the recorded cwd.
  *
  * Three storage shapes are covered (one parser each, shared across CLIs):
- *   - Claude-family JSONL  (`claude-code`, `seed`, `relay`): <dataDir>/projects/<hash>/<id>.jsonl
+ *   - Claude-family JSONL  (`claude-code`, `seed`, `relay`, `genius`): <dataDir>/projects/<hash>/<id>.jsonl
  *   - Codex/TRAE rollout   (`codex`, `traex`):       <sessionsRoot>/YYYY/MM/DD/rollout-*.jsonl
  *   - Antigravity history  (`antigravity`):          <home>/history.jsonl (flat submit log)
  *
  * All scans are daemon-side, pure filesystem (no PTY / subprocess), and run
- * only on an explicit `/adopt` — so we favour correctness over cleverness: take
- * the most-recent files by mtime, then stream each line by line (NOT a bounded
- * byte prefix, which truncates oversized records and hides an append-only log's
- * fresh tail). Parsers stop early once the needed metadata is in hand where
- * possible; Claude scans the bounded transcript so a later `/rename` wins.
+ * only on an explicit `/adopt`: take the most-recent files by mtime, stream
+ * metadata records line by line, and use a bounded tail window for Claude
+ * `/rename` records. Parsers stop early once metadata is in hand where possible.
  */
 import { promises as fs, createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -24,16 +22,24 @@ import type { ResumableSession } from '../adapters/cli/types.js';
 
 const TITLE_MAX = 80;
 
-/** Safety cap on lines scanned per transcript when searching for metadata.
- *  Session id / cwd / first prompt live near the top, but Claude custom titles
- *  may appear later after `/rename`, so its parser intentionally scans up to
- *  this bound. The cap only bounds pathological / corrupt files. Antigravity's
- *  flat submit log is read in full (see its own higher cap) so tail entries are
- *  never missed. */
-const MAX_LINES_PER_FILE = 5_000;
+/** Forward/head cap for transcript metadata; Claude custom titles use the
+ *  separate bounded tail read below. Antigravity has its own higher cap. */
+const MAX_HEAD_LINES_PER_FILE = 5_000;
+/** Maximum bytes inspected from the end for the latest valid customTitle. */
+const CLAUDE_CUSTOM_TITLE_TAIL_BYTES = 4 * 1024 * 1024;
 
 function asRecord(v: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  const line = raw.trim();
+  if (!line) return null;
+  try {
+    return asRecord(JSON.parse(line));
+  } catch {
+    return null;
+  }
 }
 
 /** Stream a JSONL file line by line, invoking `onLine` for each parsed object.
@@ -46,7 +52,7 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 async function forEachJsonLine(
   path: string,
   onLine: (rec: Record<string, unknown>) => boolean | void,
-  maxLines = MAX_LINES_PER_FILE,
+  maxLines = MAX_HEAD_LINES_PER_FILE,
 ): Promise<void> {
   const stream = createReadStream(path, { encoding: 'utf8' });
   // A missing/unreadable file emits 'error' asynchronously; without a listener
@@ -57,13 +63,8 @@ async function forEachJsonLine(
   let n = 0;
   try {
     for await (const raw of rl) {
-      const line = raw.trim();
-      if (line) {
-        let parsed: unknown = null;
-        try { parsed = JSON.parse(line); } catch { /* corrupt line — skip */ }
-        const rec = asRecord(parsed);
-        if (rec && onLine(rec) === true) break;
-      }
+      const rec = parseJsonRecord(raw);
+      if (rec && onLine(rec) === true) break;
       if (++n >= maxLines) break;
     }
   } catch {
@@ -191,21 +192,63 @@ async function collectRecentJsonl(
   return out.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit);
 }
 
-// ─── Claude-family JSONL (claude-code, seed, relay) ──────────────────────────
+// ─── Claude-family JSONL (claude-code, seed, relay, genius) ──────────────────
+
+/** Scan a bounded tail for the latest valid customTitle. The first line may be
+ *  truncated at the byte boundary, so it is skipped. */
+async function findLatestClaudeCustomTitle(path: string): Promise<string> {
+  let stat;
+  try {
+    stat = await fs.stat(path);
+  } catch {
+    return '';
+  }
+  if (stat.size <= 0) return '';
+
+  const start = Math.max(0, stat.size - CLAUDE_CUSTOM_TITLE_TAIL_BYTES);
+  const stream = createReadStream(path, {
+    encoding: 'utf8',
+    start,
+    end: stat.size - 1,
+  });
+  stream.on('error', () => { /* handled via try/catch */ });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  let latest = '';
+  let first = start > 0;
+  try {
+    for await (const raw of rl) {
+      if (first) {
+        first = false;
+        continue;
+      }
+      const rec = parseJsonRecord(raw);
+      if (!rec || rec.isSidechain === true || typeof rec.customTitle !== 'string') continue;
+      const title = truncateTitle(rec.customTitle);
+      if (title) latest = title;
+    }
+  } catch {
+    // Missing, unreadable, or concurrently rotated transcripts return what we have.
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  return latest;
+}
 
 /** Parse one Claude JSONL transcript. The session id is the filename; cwd,
  *  first user prompt, and the latest valid customTitle come from the content.
- *  Sidechain / synthetic / slash-command entries are skipped. A custom title
- *  wins when present; otherwise the user's real first turn is the fallback. */
+ *  Sidechain / synthetic / slash-command entries are skipped. The head pass
+ *  finds the identity/origin metadata, then a bounded tail pass finds the
+ *  latest valid custom title. A custom title wins when present; otherwise the
+ *  user's real first turn is the fallback. */
 async function parseClaudeTranscript(path: string, mtimeMs: number): Promise<ResumableSession | null> {
   const cliSessionId = basename(path, '.jsonl');
   if (!cliSessionId) return null;
   // Accumulate into an object (see parseRolloutTranscript) so the post-loop
   // guard narrows correctly despite closure mutation.
-  const acc: { cwd: string | null; fallbackTitle: string; customTitle: string; botmux: boolean } = {
+  const acc: { cwd: string | null; fallbackTitle: string; botmux: boolean } = {
     cwd: null,
     fallbackTitle: '',
-    customTitle: '',
     botmux: false,
   };
   await forEachJsonLine(path, (rec) => {
@@ -222,18 +265,16 @@ async function parseClaudeTranscript(path: string, mtimeMs: number): Promise<Res
         if (clean) acc.fallbackTitle = truncateTitle(clean);
       }
     }
-    if (typeof rec.customTitle === 'string') {
-      const title = truncateTitle(rec.customTitle);
-      if (title) acc.customTitle = title;
-    }
+    return Boolean(acc.cwd && acc.fallbackTitle);
   });
   // Drop botmux-origin sessions and empties (no real user prompt → command-only
   // / aborted — not worth importing).
   if (acc.botmux || !acc.cwd || !acc.fallbackTitle) return null;
+  const tailTitle = await findLatestClaudeCustomTitle(path);
   return {
     cliSessionId,
     cwd: acc.cwd,
-    title: acc.customTitle || acc.fallbackTitle,
+    title: tailTitle || acc.fallbackTitle,
     lastActivityAt: mtimeMs,
   };
 }
