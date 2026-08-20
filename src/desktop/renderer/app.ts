@@ -92,6 +92,10 @@ const desktopShellInjectedCss = `
     grid-column: 1 / -1 !important;
     min-width: 0 !important;
     width: 100% !important;
+    /* 浏览器端侧边栏悬浮成 fixed 卡片后，.workspace 用 margin-left 让位；
+       桌面端靠注入 CSS 隐藏 .sidebar，必须把这段让位清零，否则内容整体右移
+       留下一条与隐藏侧栏等宽的空隙。 */
+    margin-left: 0 !important;
   }
 
   .attention-strip {
@@ -103,6 +107,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': '飞书 AI CLI 控制台',
     'nav.overview': '总览',
     'nav.sessions': '会话',
+    'nav.workbench': '驾驶舱',
     'nav.insights': '洞察',
     'nav.workflows': '工作流',
     'nav.groups': '群组',
@@ -186,6 +191,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': 'Feishu AI CLI Control',
     'nav.overview': 'Overview',
     'nav.sessions': 'Sessions',
+    'nav.workbench': 'Cockpit',
     'nav.insights': 'Insight',
     'nav.workflows': 'Workflows',
     'nav.groups': 'Groups',

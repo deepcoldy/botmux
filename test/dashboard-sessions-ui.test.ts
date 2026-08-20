@@ -35,11 +35,13 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
     key: '<svg></svg>',
     lock: '<svg></svg>',
     restart: '<svg></svg>',
+    close: '<svg></svg>',
     terminal: '<svg></svg>',
     unlock: '<svg></svg>',
   },
   lockActionLabel: row => (row.locked ? 'unlock' : 'lock'),
   sessionStatusText: status => String(status ?? 'unknown'),
+  onClose: () => {},
   onDetails: () => {},
   onHistory: () => {},
   onMoveRows: () => {},
@@ -629,7 +631,7 @@ describe('dashboard sessions kanban react view', () => {
       rows: [
         { sessionId: 's-backlog', status: 'idle', kanbanColumn: 'backlog', cliId: 'codex', title: 'Backlog', botName: 'Bot A', lastMessageAt: 1000 },
         { sessionId: 's-todo', status: 'idle', cliId: 'codex', title: 'Todo', botName: 'Bot A', lastMessageAt: 2000 },
-        { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000 },
+        { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000, webPort: 3001 },
         { sessionId: 's-review', status: 'limited', cliId: 'codex', title: 'Review', botName: 'Bot A', lastMessageAt: 4000 },
         { sessionId: 's-stalled', status: 'stalled', cliId: 'codex-app', title: 'Stalled', botName: 'Bot A', lastMessageAt: 4500 },
         { sessionId: 's-done', status: 'closed', cliId: 'codex', title: 'Done', botName: 'Bot A', lastMessageAt: 5000 },
@@ -646,7 +648,11 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('role="button"');
     expect(html).toContain('class="session-signal"');
     expect(html).toContain('长时间无进展');
-    expect(html).toContain('class="card-act kanban-card-act"');
+    // 重设计后：状态色条 + 「终端」文字按钮 + 「⋯」菜单（原 icon rail 已移除）
+    expect(html).toContain('data-signal="needs-you"');
+    expect(html).toContain('class="kanban-card-term"');
+    expect(html).toContain('data-action="more"');
+    expect(html).toContain('kanban-col-dot kanban-col-dot-');
   });
 
   it('clusters cards by chat and preserves the done column cap', () => {
@@ -716,8 +722,9 @@ describe('dashboard sessions kanban react view', () => {
       }],
     });
 
+    // 只读终端 = 底部「终端」文字按钮；可写终端收进「⋯」菜单（data-menu-items 静态标记）
     expect(html).toContain('data-action="terminal"');
-    expect(html).toContain('data-action="write-link"');
+    expect(html).toContain('data-menu-items="details,history,write-link,restart,lock,close"');
   });
 });
 

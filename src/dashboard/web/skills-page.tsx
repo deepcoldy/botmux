@@ -21,6 +21,7 @@ import {
   sourceLabel,
 } from './skills/shared.js';
 import { useSkillsData } from './skills/use-skills-data.js';
+import { toast } from './toast.js';
 import type {
   BotRow,
   DashboardRequestError,
@@ -1288,7 +1289,7 @@ export function SkillsPage() {
       if (!mountedRef.current) return;
       setTrustProjectSkills(body.trustProjectSkills === 'all' ? 'all' : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -1305,7 +1306,7 @@ export function SkillsPage() {
       if (!mountedRef.current) return;
       setDelivery(body.delivery === 'prompt' || body.delivery === 'native' ? body.delivery : next);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setGlobalBusy(null);
     }
@@ -1318,7 +1319,7 @@ export function SkillsPage() {
       if (!mountedRef.current) return;
       await waitForSkillJob(body.job as SkillJob, setInstallStatus);
     } catch (err: any) {
-      if (mountedRef.current) window.alert(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`);
+      if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
       if (mountedRef.current) setSkillBusy(null);
     }
@@ -1665,6 +1666,7 @@ export function SkillsPage() {
                   : { tab: 'packs', focusPackIds: packIdsOfSkill });
               }}
               onShowSkillBots={name => navigateTo({ tab: 'bots', focusSkill: name })}
+              onAssignInstalledSkill={name => navigateTo({ tab: 'bots', focusSkill: name })}
             />
           )}
 

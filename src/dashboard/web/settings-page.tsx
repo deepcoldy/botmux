@@ -6,6 +6,8 @@ import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
 import { ui } from './ui.js';
+import { confirm } from './confirm-modal.js';
+import { toast } from './toast.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -365,6 +367,10 @@ function SettingsPage() {
       // instead of the generic "saved" toast.
       const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
       setSettingsMsg(traexMsg ?? { text: tr('settings.saved'), cls: 'hint-ok' });
+      // 成功轻反馈 1.5s 后淡出；错误/安装结果不自动清
+      if (!traexMsg) {
+        setTimer(() => { if (mountedRef.current) setSettingsMsg(null); }, 1500);
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       // The PUT may have committed before a proxy/browser timeout dropped its
@@ -469,21 +475,21 @@ function SettingsPage() {
     const s = upStatus;
     if (!s) return;
     if (!s.node.ok) {
-      window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
+      toast(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }), { kind: 'warning' });
       return;
     }
     if (!s.updateSupported || !s.updateCommand) {
-      window.alert(tr('update.unsupportedInstall'));
+      toast(tr('update.unsupportedInstall'), { kind: 'warning' });
       return;
     }
     if (s.installs.multiple) {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
-      if (!window.confirm(tr('update.confirmMultiInstall', { paths }))) return;
+      if (!await confirm({ title: tr('update.confirmMultiInstallTitle'), message: tr('update.confirmMultiInstall', { paths }), confirmLabel: tr('update.btnContinue'), cancelLabel: tr('update.btnCancel') })) return;
     }
     const confirmMsg = s.latest
       ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand })
       : tr('update.confirmUpdateNoVer', { command: s.updateCommand });
-    if (!window.confirm(confirmMsg)) return;
+    if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: tr('update.updating', { command: s.updateCommand }) });
     try {
@@ -499,7 +505,7 @@ function SettingsPage() {
       if (body.changed) {
         setUpBusy(false);
         setUpMsg({ text: tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` }), cls: 'hint-ok' });
-        if (window.confirm(tr('update.confirmRestart'))) {
+        if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnLater') })) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
           setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
@@ -542,7 +548,7 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
-      onRestart={() => { if (window.confirm(tr('update.confirmPlainRestart'))) void doRestart(null); }}
+      onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
 
@@ -642,6 +648,8 @@ function SettingsBody(props: {
   ], [settings.vcMeetingAgent.listenerBotOptions, tr]);
   return (
     <div className="settings-layout">
+      <SettingsNav tr={tr} />
+      <div className="settings-content">
       {canWrite ? null : (
         <article className="bd-card settings-card settings-alert-card">
           <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
@@ -652,7 +660,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleGeneralHelp')}
       >
       <SettingsGroup className="settings-group-main">
-        <SettingsBlock title={tr('settings.sectionAccess')}>
+        <SettingsBlock id="settings-access" title={tr('settings.sectionAccess')}>
           <ToggleRow
             title={tr('settings.publicReadOnly')}
             help={tr('settings.publicReadOnlyHelp')}
@@ -670,7 +678,7 @@ function SettingsBody(props: {
             />
           ) : null}
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionCards')}>
+        <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
           <ToggleRow
             title={tr('settings.openTerminalInFeishu')}
             help={tr('settings.openTerminalInFeishuHelp')}
@@ -700,7 +708,7 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionGroupCreation')}>
+        <SettingsBlock id="settings-group-creation" title={tr('settings.sectionGroupCreation')}>
           <GroupNamePrefixRow
             value={settings.groupNamePrefix}
             disabled={dis || savingKey === 'groupNamePrefix'}
@@ -711,7 +719,7 @@ function SettingsBody(props: {
             )}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionExperimental')}>
+        <SettingsBlock id="settings-experimental" title={tr('settings.sectionExperimental')}>
           <ToggleRow
             title={tr('settings.chatBotDiscovery')}
             help={tr('settings.chatBotDiscoveryHelp')}
@@ -761,7 +769,7 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionHostOverloadAlert')}>
+        <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>
           <HostOverloadAlertSettingsEditor
             value={settings.hostOverloadAlert}
             disabled={dis}
@@ -769,7 +777,7 @@ function SettingsBody(props: {
             onSave={saveHostOverloadAlert}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionWhiteboard')}>
+        <SettingsBlock id="settings-whiteboard" title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
             title={tr('settings.whiteboardEnable')}
             help={tr('settings.whiteboardEnableHelp')}
@@ -780,7 +788,7 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionRepoPicker')}>
+        <SettingsBlock id="settings-repo-picker" title={tr('settings.sectionRepoPicker')}>
           <div className="settings-field-row">
             <FieldTitle help={tr('settings.repoPickerModeHelp')}>{tr('settings.repoPickerMode')}</FieldTitle>
             <DropdownMenu
@@ -796,7 +804,7 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionSchedule')}>
+        <SettingsBlock id="settings-schedule" title={tr('settings.sectionSchedule')}>
           <TimeZoneRow
             value={settings.scheduleTimeZone}
             host={settings.hostTimeZone}
@@ -819,7 +827,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleMeetingHelp')}
       >
       <SettingsGroup className="settings-group-meeting">
-        <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
+        <SettingsBlock id="settings-vc" className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
           <ToggleRow
             title={tr('settings.vcMeetingAgent')}
             help={tr('settings.vcMeetingAgentHelp')}
@@ -881,6 +889,7 @@ function SettingsBody(props: {
       >
       <SettingsGroup className="settings-group-ops">
         <SettingsBlock
+          id="settings-maintenance"
           title={tr('settings.sectionMaintenance')}
           titleExtra={settings.localDevInstall
             ? <span className="settings-title-note">{tr('settings.autoUpdateLocalDev')}</span>
@@ -938,13 +947,67 @@ function SettingsBody(props: {
             </div>
           </div>
         </SettingsBlock>
-        {props.updateBlock}
+        <div id="settings-update">{props.updateBlock}</div>
       </SettingsGroup>
       </SettingsModule>
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
+      </div>
     </div>
+  );
+}
+
+function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+  const tr = props.tr;
+  const groups = [
+    {
+      label: tr('settings.moduleGeneral'),
+      items: [
+        { id: 'settings-access', label: tr('settings.sectionAccess') },
+        { id: 'settings-cards', label: tr('settings.sectionCards') },
+        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
+        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
+        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
+        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
+        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
+        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
+      ],
+    },
+    {
+      label: tr('settings.moduleMeeting'),
+      items: [
+        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
+      ],
+    },
+    {
+      label: tr('settings.moduleSystem'),
+      items: [
+        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
+        { id: 'settings-update', label: tr('settings.sectionUpdate') },
+      ],
+    },
+  ];
+  return (
+    <nav className="settings-nav" aria-label={tr('settings.title')}>
+      {groups.map(group => (
+        <div key={group.label} className="settings-nav-group">
+          <p className="settings-nav-group-label">{group.label}</p>
+          {group.items.map(item => (
+            <button
+              key={item.id}
+              type="button"
+              className="settings-nav-link"
+              onClick={() => {
+                document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      ))}
+    </nav>
   );
 }
 
@@ -1001,13 +1064,14 @@ function SettingsGroup(props: {
 
 function SettingsBlock(props: {
   className?: string;
+  id?: string;
   title: ReactNode;
   titleExtra?: ReactNode;
   children: ReactNode;
 }): React.JSX.Element {
   const cls = ['settings-block', props.className].filter(Boolean).join(' ');
   return (
-    <section className={cls}>
+    <section className={cls} id={props.id}>
       <article className="bd-card settings-card">
         <div className="settings-block-title-row">
           <h2 className="bd-section-title">{props.title}</h2>

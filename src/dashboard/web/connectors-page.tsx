@@ -6,6 +6,7 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
+import { confirm } from './confirm-modal.js';
 
 interface Connector {
   id: string;
@@ -689,7 +690,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   }
 
   async function deleteConnector(connector: Connector): Promise<void> {
-    if (!confirm(tr('connectors.delConfirm'))) return;
+    if (!await confirm({ title: '删除连接器', message: tr('connectors.delConfirm'), danger: true })) return;
     setEditMsg({ id: connector.id, text: tr('connectors.deleting') });
     const r = await jsend('DELETE', `/api/connectors/${encodeURIComponent(connector.id)}`);
     if (!mountedRef.current) return;

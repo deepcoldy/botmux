@@ -10,6 +10,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, InfoTip, dropdownLabel } from './dashboard-components.js';
+import { confirm } from './confirm-modal.js';
 import { useDashboardLocale, useT } from './react-hooks.js';
 import type {
   VcMeetingAgentOptionDto,
@@ -540,9 +541,9 @@ export function VcConsumerProfilesSection(props: {
               value={targetBot}
               label={dropdownLabel(botOptions, targetBot)}
               options={botOptions}
-              onChange={(value) => {
+              onChange={async (value) => {
                 if (value === targetBot) return;
-                if (dirty && !window.confirm(tr('settings.vcProfiles.discardConfirm'))) return;
+                if (dirty && !await confirm({ title: '放弃修改', message: tr('settings.vcProfiles.discardConfirm'), danger: false })) return;
                 setTargetBot(value);
               }}
             />

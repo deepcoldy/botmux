@@ -373,7 +373,8 @@ function statusClass(status: StatusMessage, extra = ''): string {
 }
 
 function StatusSpan(props: { status: StatusMessage; attr?: Record<string, string> }) {
-  return <span role="status" aria-live="polite" className={statusClass(props.status)} {...(props.attr ?? {})}>{props.status?.text ?? ''}</span>;
+  // key 随文案变化：成功状态 1.5s 后 CSS 淡出，新消息到达时重挂载以重启动画
+  return <span key={props.status?.text ?? ''} role="status" aria-live="polite" className={statusClass(props.status)} {...(props.attr ?? {})}>{props.status?.text ?? ''}</span>;
 }
 
 function InfoTip(props: { children: ReactNode }) {
