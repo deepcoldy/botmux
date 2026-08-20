@@ -96,7 +96,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
-import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -200,6 +200,8 @@ import {
   type WorkerSessionReplyOptions,
   migrateMojoSessionIdentities,
   mojoLivePatchForSession,
+  silentIdleCardFlag,
+  recordTurnExplicitMention,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
@@ -4651,6 +4653,9 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
       runtimeDisplayName,
       previousCodexTierBadge,
+      // A silently-closed previous turn freezes with its honest label
+      // (「已处理 · 判定无需回复」), not a misleading 「等待输入」.
+      silentIdleCardFlag(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -4673,6 +4678,9 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
   }
+  // New turn — the previous turn's deliberate-silence marker (if any) has been
+  // baked into the frozen card above; live cards return to normal labels.
+  ds.silentIdleTurnId = undefined;
   ds.usageLimit = undefined;
   ds.streamCardPending = true;
   ds.streamCardPendingTurnId = turnId;
@@ -20180,6 +20188,22 @@ async function handleThreadReplyAdmitted(
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
   publishSessionMessagePreviewPatch(ds);
+
+  // Turn-origin record for the deliberate-silence receipt: an explicitly-@'d
+  // turn is a dispatched task, so if the model later closes it with a bare
+  // nothing-to-send sentinel, turn_terminal owes the thread an auto receipt
+  // instead of ghosting the dispatcher. Recorded for BOTH the live-worker and
+  // refork branches below (same parsed.messageId turn identity); undispatched
+  // early-return turns never record. Raw `data.message.content` rides along so
+  // post-message inline `at` nodes count the same as `mentions[]` entries.
+  {
+    const selfBotForMention = getBot(larkAppId);
+    recordTurnExplicitMention(ds, parsed.messageId, messageMentionsBot(
+      { mentions: parsed.mentions, content: data?.message?.content },
+      larkAppId,
+      selfBotForMention.botOpenId,
+    ));
+  }
 
   // codexAppSteerable was computed ONCE above (R5-B1-1), before every admission /
   // fork branch; reuse that frozen value for the live-worker / worker-null split.

@@ -924,6 +924,26 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
+    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).not.toContain('等待输入');
+    });
+
+    it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.title.content).toContain('工作中');
+    });
+
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',

@@ -857,6 +857,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -910,6 +911,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -918,6 +920,40 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
   if (!ds.pendingActiveRuntimeCardRefresh) return;
   ds.pendingActiveRuntimeCardRefresh = undefined;
   scheduleActiveRuntimePatch(ds);
+}
+
+/** Card-label flag for a turn that completed as DELIBERATE silence (worker
+ *  terminal outputDisposition 'nothing_to_send'): every live-card rebuild —
+ *  status edges, button toggles, runtime/tier patches — must keep rendering
+ *  「已处理 · 判定无需回复」 instead of 「等待输入」 until beginNewTurn clears
+ *  the flag, or an unrelated patch would silently revert the label. */
+export function silentIdleCardFlag(ds: DaemonSession): boolean {
+  return !!ds.silentIdleTurnId;
+}
+
+const TURN_EXPLICIT_MENTION_MAX = 8;
+
+/** Record, at dispatch time, whether the Lark message that opened `turnId`
+ *  explicitly @-mentioned this bot. Read back at turn_terminal to decide if a
+ *  deliberately-silent turn owes an auto receipt (an explicit @ is a dispatched
+ *  task — its final status must be reported, silence included). Bounded FIFO so
+ *  unconsumed entries (crashed turns, non-Lark turns) cannot grow unbounded. */
+export function recordTurnExplicitMention(ds: DaemonSession, turnId: string, explicitMention: boolean): void {
+  if (!turnId) return;
+  const map = ds.turnExplicitMentions ?? (ds.turnExplicitMentions = new Map());
+  map.delete(turnId);
+  map.set(turnId, explicitMention);
+  while (map.size > TURN_EXPLICIT_MENTION_MAX) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function takeTurnExplicitMention(ds: DaemonSession, turnId: string): boolean {
+  const value = ds.turnExplicitMentions?.get(turnId) ?? false;
+  ds.turnExplicitMentions?.delete(turnId);
+  return value;
 }
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
@@ -962,6 +998,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1040,6 +1077,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // path fires every 12s while a turn works, so omitting it would drop the
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1122,6 +1160,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1718,6 +1757,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1968,6 +2008,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: status === 'idle' }),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -2032,6 +2073,7 @@ export async function postTurnStartingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -2161,6 +2203,7 @@ export async function postFreshStreamingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -10413,6 +10456,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              silentIdleCardFlag(ds),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -10493,6 +10537,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            silentIdleCardFlag(ds),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -10923,6 +10968,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            silentIdleCardFlag(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -11005,6 +11051,7 @@ function setupWorkerHandlers(
             }),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            silentIdleCardFlag(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -11079,6 +11126,7 @@ function setupWorkerHandlers(
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -11488,6 +11536,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              silentIdleCardFlag(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -11559,6 +11608,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              silentIdleCardFlag(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -12011,6 +12061,34 @@ function setupWorkerHandlers(
             // concurrent sibling keyed turn's convergence entry is untouched.
             ds.idempotentAsyncTurns?.delete(msg.turnId);
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
+          }
+        }
+        // Deliberate-silence closure (positive evidence only — the same
+        // 'nothing_to_send' contract as the async settle above):
+        //   ① mark the session so every idle-card rebuild renders
+        //     「已处理 · 判定无需回复」 instead of 「等待输入」 (a user cannot
+        //     tell "chose silence" from "hung" on the bare idle label), and
+        //     re-patch the live card if it already settled to idle before this
+        //     terminal arrived (the common ordering);
+        //   ② an explicitly-@'d turn is a dispatched task — its final status
+        //     must be reported even when that status is "no reply needed", so
+        //     post a small auto receipt into the thread. No @ in the receipt:
+        //     it must never re-trigger the bot (or a peer bot) that went quiet.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'nothing_to_send'
+          && !ds.session.vcMeetingReceiver) {
+          const explicitMention = takeTurnExplicitMention(ds, msg.turnId);
+          ds.silentIdleTurnId = msg.turnId;
+          if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+          if (explicitMention && ds.silentReceiptTurnId !== msg.turnId) {
+            ds.silentReceiptTurnId = msg.turnId;
+            void scopedReply(
+              tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
+              'text',
+              msg.turnId,
+            ).catch(err => {
+              logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+            });
           }
         }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {

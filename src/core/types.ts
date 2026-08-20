@@ -350,6 +350,19 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** turnId → the triggering Lark message explicitly @-mentioned this bot.
+   *  Bounded FIFO (see recordTurnExplicitMention). Read at turn_terminal to
+   *  decide whether a deliberately-silent turn owes an auto receipt. In-memory
+   *  only: a daemon restart mid-turn just skips that turn's receipt. */
+  turnExplicitMentions?: Map<string, boolean>;
+  /** Set when the LAST completed turn ended as deliberate silence (worker
+   *  terminal outputDisposition 'nothing_to_send'). Drives the idle-card label
+   *  「已处理 · 判定无需回复」 instead of 「等待输入」 so users can tell "chose
+   *  silence" from "stuck". Cleared by beginNewTurn. In-memory only. */
+  silentIdleTurnId?: string;
+  /** Dedupe guard: silent-turn auto receipt already posted for this turnId
+   *  (dispatchAttempt replays must not double-post). */
+  silentReceiptTurnId?: string;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
