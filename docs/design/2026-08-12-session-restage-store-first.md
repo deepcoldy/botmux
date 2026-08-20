@@ -2,10 +2,10 @@
 title: Session 架构拆解回收与 store-first 重新分步
 type: design
 date: 2026-08-12
-updated: 2026-08-19（Step 3 第一 PR rebase 到 origin/master@47b2c11a 后，按现行基线修订口径与收益判定）
+updated: 2026-08-20（Step 3 第一 PR rebase 到 origin/master@3d84aaad 后，按现行基线修订口径与收益判定）
 topic: session-restage-store-first
 status: proposed
-baseline: origin/master@47b2c11a（0819 复核基线；0813 复核基线 16fde8a27；原始基线 723c79ade）
+baseline: origin/master@3d84aaad（0820 复核基线；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
 references:
   - feat/virtual_actor_stage2@b6a4982ea（不合入；仅作参考实现、竞态清单与写点地图）
   - docs/design/2026-08-08-virtual-actor-session-runtime.md（原始提案；本目录保留未跟踪副本）
@@ -35,6 +35,12 @@ references:
 > 稳定后的第二 PR）。0813 之后 master 还叠了 Remote lineage 改名、Mojo close
 > journal、`SessionStoreUnavailableError` 写门，Step 3 必须带着这些 API 一起
 > 换引擎，不能只按 0813 的 JSON store 形状施工。
+>
+> **2026-08-20 修订**：#852 再 rebase 到 `origin/master@3d84aaad`。#846 的
+> 唯一门仍然健壮：src 无会话行直写绕过，CLI 只委托 `loadAllSessionsSnapshot` /
+> `mutateSessionRowOffline`，provenance 仍走 `readSessionRowCopiesAcrossStores`。
+> 0819 之后 master 新增的 Workbench `previewTarget` 在 close/resume 路径上清除，
+> 已语义化并进本 PR 的 `persistRow`。收益判定不变；原则 1 仍待第二 PR 净删除。
 
 ## 0. 背景与决策
 
@@ -212,7 +218,7 @@ v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 d
 验收：第一 PR = 引擎互换 + 混合窗口 + 行为等价（含 0819 基线新增 API）；
 第二 PR = 上述净删除。durability 首版与今日等价。
 
-**执行结果（2026-08-19，#852 rebase onto origin/master@47b2c11a）**：
+**执行结果（2026-08-20，#852 rebase onto origin/master@3d84aaad）**：
 
 - store 公共签名保持；内部 SQLite 单表 + 整行 JSON 列 + VIRTUAL 生成列索引。
 - 混合窗口统一 db-else-json；abortIf 双探测保留；首次 load 走 BEGIN IMMEDIATE。
@@ -220,7 +226,9 @@ v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 d
   损坏 store 的写门对 .db 同样 fail-closed。`BEGIN IMMEDIATE` 超时
   （SQLITE_BUSY）**不得**收成空投影：daemon restore 走 `listSessions()`，
   锁等待必须抛错而不能当成「没有会话」。
-- 体量：master `session-store.ts` 1390 行 → 本 PR ~2135 行。这是「JSON 机器
+- 0820 基线新增面：Workbench `previewTarget` 在 `closeSession` / `reactivateClosedSession`
+  清除并随 `persistRow` 回滚；#846 四导出在 SQLite + 混合窗口下仍是唯一门。
+- 体量：0813 master `session-store.ts` 1390 行 → 本 PR ~2161 行。这是「JSON 机器
   + SQLite 机器」共存的中间态，印证原则 1 的兑现点在第二 PR，不在本 PR。
 - src 无 SessionRuntime / virtual-actor 缝隙回流。
 

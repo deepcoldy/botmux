@@ -623,7 +623,9 @@ describe('closeSession()', () => {
     // (read by offline/cross-store row readers) may still carry the target.
     init();
     expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
-    const raw = readFileSync(join(tempDir, 'sessions.json'), 'utf-8');
+    const persisted = readPersistedRows(tempDir)[session.sessionId];
+    expect(persisted.previewTarget).toBeUndefined();
+    const raw = JSON.stringify(persisted);
     expect(raw).not.toContain('previewTarget');
     expect(raw).not.toContain('4173');
   });
@@ -636,7 +638,7 @@ describe('closeSession()', () => {
       registeredAt: '2026-08-11T12:00:00.000Z',
     };
     updateSession(session);
-    fsControl.failSessionWrite = true;
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
 
     expect(() => closeSession(session.sessionId))
       .toThrow(/simulated session repair write failure/);
