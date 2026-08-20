@@ -41,6 +41,9 @@ references:
 > `mutateSessionRowOffline`，provenance 仍走 `readSessionRowCopiesAcrossStores`。
 > 0819 之后 master 新增的 Workbench `previewTarget` 在 close/resume 路径上清除，
 > 已语义化并进本 PR 的 `persistRow`。收益判定不变；原则 1 仍待第二 PR 净删除。
+> 同日补记：残余 `findDaemon` probe-vs-publish TOCTOU 的消法是 **store 内占位
+> 租约**（与行写同一 `BEGIN IMMEDIATE`），不是 virtual actor / SessionRuntime；
+> 见 Step 4 候选 (f)。本 PR 不实施。
 
 ## 0. 背景与决策
 
@@ -169,7 +172,8 @@ v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 d
    **写排序**由 `BEGIN IMMEDIATE` 承担。**不是**「findDaemon 探测可以删」——
    SQLite 锁只排序写者，防的是写写交错；探测防的是「daemon 内存缓存与磁盘
    分叉」，二者不可互替。残余 probe-vs-publish TOCTOU 与 JSON 时代等宽，仍
-   是 Step 4 的事务化候选，不是本步验收项。
+   是 Step 4 候选 (f)，不是本步验收项。消法见该候选：占位进 store，不是再包
+   actor。
 2. **消灭整图覆盖丢失更新这一整类问题**：今天 daemon 进程终身持有一份
    `Map<string, Session>` 缓存（`load()` 仅一次），每次 `save()` 把**整个 map**
    序列化重写文件——任何外部进程在窗口内写入的行都会被陈旧整图覆盖。改成
@@ -257,8 +261,46 @@ v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 d
   若队首激活的 FIFO 语义由事务表达，这套进程内计数器机器就是它替代并删除的
   ad-hoc 防御。
 - (e) `initial-user-turn` 的 best-effort persist（落盘失败退化为进程内生效）。
+- (f) **离线写 `findDaemon` probe-vs-publish TOCTOU**（0820 口径备忘，未立项）。
+  Step 3 收益第 1 条已写明：SQLite 只排序写者，`abortIf` + `findDaemon` 必须留；
+  残余窗口与 JSON 时代等宽。下面「占位租约」是这条候选若立项时的**消法**，
+  不是本步或 Step 3 的验收项。
 
 stage2 的 receipts / per-session lane 语义仍作设计参考，代码不搬。
+
+#### 候选 (f) 消法：占位进 store，不必叫 actor
+
+这段窗口**不是**「daemon 进程内少了一个 mailbox」。产品规定了两种权威——
+daemon 活着时内存 `Map` 是权威；daemon 不在时 CLI 必须能改盘（离线 close /
+abandon）。第二种权威不会消失。TOCTOU 来自实现选择：`findDaemon` 读的是旁路
+descriptor（`dashboard-daemons/*.json` 心跳），写的是会话库——检查 A、动手 B。
+
+因此：
+
+- **必然存在的**：daemon 挂了仍要有人能写盘。
+- **不是必然的**：探 descriptor 和写会话行之间的缝。那是占位放在旁路文件上。
+- **与 virtual actor 无关的**：stage2 的 `SessionRuntime` 管进程内怎么改字段；
+  窗口发生在 CLI 进程 vs daemon 进程之间。进程内单线程化消不掉它。stage2 也
+  没消：CLI 仍是第二写者，descriptor 仍在库外。用缝隙层消这条是用错工具。
+- **相关的只是 occupancy 协议**（Orleans grain directory / Durable Object 的
+  瘦身版）：同一时刻一个 activation；没有 activation 才允许 failover 写存储；
+  **占位和数据在同一个原子里**。落到本仓库就是 store 元数据，不是 actor 框架，
+  也不是 §3 禁止的 BotId 注册表。
+
+若立项（仍要 test-first 复现 + 合入即删旧探测），形态是：
+
+1. 会话库持有占位：`owner_pid` / `boot_id` / `lease_until`（或 SQLite 锁会话）。
+2. daemon 启动：与首次 load **同一事务**占位（现协议是先写 descriptor 再 load，
+   占位与行不在同一原子）。
+3. CLI 离线写：`BEGIN IMMEDIATE` → 读占位 → 租约有效则 abort 去 IPC，否则改行
+   并 COMMIT。检查和动手一次事务。
+4. 租约靠心跳续期；过期才允许 CLI 当 failover 写者（90s 心跳过期已有，只是
+   和行不在同一原子）。
+
+验收必须**删掉或降级**旁路 `findDaemon` 探路（发现仍可读 descriptor，所有权
+不得再靠它 abort），不能两套探测并存——否则违反「上新必须删旧」。
+`BEGIN IMMEDIATE` 单独代替 `findDaemon` 不构成验收：锁看不见「对面有一份会
+写回的缓存」。禁止 CLI 写盘也不构成验收：离线收尸没了。
 
 ### Step 5 — 资产归档（无代码）
 
@@ -271,9 +313,11 @@ stage2 的 receipts / per-session lane 语义仍作设计参考，代码不搬�
 - 不迁移调用方群组，不建 actor 抽象层，不引入 SessionRuntime/SessionProjection 缝隙；
   virtual-actor（#831 / feat/virtual_actor_stage2）维持不合入，不在 Step 3/4
   「顺便固化」。store-first 就是对它的替代，不是前置。
-- 不引入分配式身份或任何注册表（BotId 保持地址纯推导）；
+- 不引入分配式身份或任何注册表（BotId 保持地址纯推导）。会话库内的**占位租约**
+  （Step 4 候选 f：哪个 daemon 此刻拥有本 bot 的行）是 store 元数据，不是身份
+  注册表，立项时不得借此引入 BotId 分配。
 - 不动内存 DaemonSession 的共享可变语义——它在单 daemon 进程内工作正常，
-  重构它需要独立的实测理由；
+  重构它需要独立的实测理由；也**消不掉**跨进程离线写 TOCTOU（见候选 f）。
 - （0813 明确）不把 sessionId 旁路存储（turn-sends、frozen-card、whiteboard、
   usage-ledger、idempotency、vc-meeting-*）卷进 Step 2/3 的范围。
 
