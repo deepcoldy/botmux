@@ -177,6 +177,7 @@ import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath 
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
 import { drainPiTranscript } from './services/pi-transcript.js';
+import { drainOmpTranscript, type OmpTranscriptState } from './services/omp-transcript.js';
 import {
   drainGrokUpdates,
   findGrokSessionByPid,
@@ -1739,6 +1740,7 @@ const adoptWriteQueue = new AsyncSerialQueue();
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
+let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
 let lastSpawnQueuedInitialPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
@@ -4081,6 +4083,10 @@ let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+let ompBridgeState: OmpTranscriptState = {};
+let ompQuietCandidateKey: string | undefined;
+let ompQuietCandidateCompleteOffset: number | undefined;
+const ompRetiredTranscriptPaths = new Set<string>();
 /** Settings are observed on the same append-only cursor as bridge output.
  *  The tracker owns rollout-generation clear/update semantics and publishes a
  *  dedicated IPC event, independent of PTY redraw frequency. */
@@ -5449,6 +5455,10 @@ function structuredBridgeIsPi(): boolean {
   return lastInitConfig?.cliId === 'pi';
 }
 
+function structuredBridgeIsOmp(): boolean {
+  return lastInitConfig?.cliId === 'oh-my-pi';
+}
+
 function structuredBridgeIsGrok(): boolean {
   return lastInitConfig?.cliId === 'grok';
 }
@@ -5461,7 +5471,11 @@ function currentHermesBridgeDbPath(): string {
   return hermesBridgeDbPath ?? resolveHermesStateDbPath();
 }
 
-function structuredBridgeIngestPath(path: string, offset: number) {
+function structuredBridgeIngestPath(
+  path: string,
+  offset: number,
+  opts: { flushOmpTrailingFinal?: boolean } = {},
+) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
   // transcript text verbatim, so a synthesised token would leak into Lark.
@@ -5470,6 +5484,13 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   }
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
+  if (structuredBridgeIsOmp()) {
+    const result = drainOmpTranscript(path, offset, ompBridgeState, {
+      flushTrailingFinal: opts.flushOmpTrailingFinal,
+    });
+    ompBridgeState = result.state;
+    return result;
+  }
   if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset, currentHermesBridgeDbPath());
@@ -5557,6 +5578,7 @@ function codexBridgeStartTimer(): void {
       // fd is process-scoped, so following that fd cannot select a sibling
       // TRAE process merely because it shares the working directory.
       maybeFollowTraexSessionRotationViaPid();
+      maybeFollowOmpTranscriptRotation();
       if (!codexBridgeRolloutPath) {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
@@ -5595,6 +5617,7 @@ function codexBridgeStartTimer(): void {
         }
       }
       codexBridgeIngest();
+      maybeFlushOmpTrailingFinalOnQuietTick();
       if (isPromptReady) emitReadyCodexTurns();
     } catch (err: any) {
       log(`Codex bridge tick error: ${err.message}`);
@@ -5691,6 +5714,9 @@ function mtrBridgeIngest(): void {
 }
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
+  ompBridgeState = {};
+  ompQuietCandidateKey = undefined;
+  ompQuietCandidateCompleteOffset = undefined;
   codexBridgeRolloutPath = rolloutPath;
   if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
@@ -5862,6 +5888,9 @@ function codexBridgeDetachFile(): void {
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
+  ompBridgeState = {};
+  ompQuietCandidateKey = undefined;
+  ompQuietCandidateCompleteOffset = undefined;
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
@@ -6185,9 +6214,32 @@ function maybeFollowTraexSessionRotationViaPid(): void {
   codexBridgeNotifyCliSessionId(observed.cliSessionId);
 }
 
+/** OMP may create a new JSONL in the same isolated Botmux session directory.
+ * Follow only that exact directory; no pid/global-session discovery is used. */
+function maybeFollowOmpTranscriptRotation(): void {
+  if (!structuredBridgeIsOmp() || !codexBridgeRolloutPath
+    || !lastSpawnEffectiveAdapterSessionId) return;
+  const next = resolveFileBridgePath('oh-my-pi', {
+    sessionId: lastSpawnEffectiveAdapterSessionId,
+  });
+  if (!next || next === codexBridgeRolloutPath || ompRetiredTranscriptPaths.has(next)) return;
+  const retired = codexBridgeRolloutPath;
+  try {
+    codexBridgeIngest();
+    emitReadyCodexTurns();
+  } catch (err: any) {
+    log(`OMP pre-rotation bridge drain failed: ${err.message}`);
+  }
+  log(`OMP transcript rotated: ${codexBridgeRolloutPath} → ${next}`);
+  ompRetiredTranscriptPaths.add(retired);
+  codexBridgeDetachFile();
+  codexBridgeAttach(next, 'fresh-empty');
+}
+
 function codexBridgeIngest(opts: {
   signalIdle?: boolean;
   hydrationOwnerKey?: string;
+  flushOmpTrailingFinal?: boolean;
 } = {}): void {
   // Follow-up RPC turns install their exact bridge mark only after the
   // turn/start ACK passes the generation fence. Ordinary ingest must not
@@ -6207,7 +6259,9 @@ function codexBridgeIngest(opts: {
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
-  const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
+  const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
+    flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
+  });
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   if (structuredBridgeIsTraex()) {
@@ -6241,6 +6295,40 @@ function codexBridgeIngest(opts: {
   if (opts.signalIdle !== false && result.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
+}
+
+/** Confirm an OMP file-tail terminal only after one complete quiet bridge tick
+ * and an authoritative current viewport with no busy marker. This deliberately
+ * runs while lifecycle blocking is asserted; ingesting the final releases it. */
+function maybeFlushOmpTrailingFinalOnQuietTick(): void {
+  if (!structuredBridgeIsOmp()) return;
+  const candidate = ompBridgeState.provisionalFinal;
+  if (!candidate) {
+    ompQuietCandidateKey = undefined;
+    ompQuietCandidateCompleteOffset = undefined;
+    return;
+  }
+  const key = candidate.event.uuid;
+  if (ompQuietCandidateKey !== key
+    || ompQuietCandidateCompleteOffset !== codexBridgeOffset) {
+    ompQuietCandidateKey = key;
+    ompQuietCandidateCompleteOffset = codexBridgeOffset;
+    return;
+  }
+  if (codexBridgePendingTail || !hasStructuredLifecycleBlock() || !backend
+    || !backendScreenEvidenceIsAuthoritativeForMutation()
+    || !cliAdapter?.busyPattern) return;
+  try {
+    const screen = captureBackendScreen(backend);
+    if (!screen || cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
+  } catch (err: any) {
+    log(`OMP quiet-final viewport capture failed: ${err.message}`);
+    return;
+  }
+
+  ompQuietCandidateKey = undefined;
+  ompQuietCandidateCompleteOffset = undefined;
+  codexBridgeIngest({ flushOmpTrailingFinal: true });
 }
 
 /** 将 Codex 的结构化 429 终态同步为既有的限流状态。 */
@@ -6818,6 +6906,10 @@ function stopCodexBridge(): void {
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
+  ompBridgeState = {};
+  ompQuietCandidateKey = undefined;
+  ompQuietCandidateCompleteOffset = undefined;
+  ompRetiredTranscriptPaths.clear();
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
   hermesBridgeSourceSessionId = undefined;
@@ -12860,6 +12952,8 @@ async function spawnCli(
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
   lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
+  lastSpawnEffectiveAdapterSessionId = effectiveAdapterSessionId;
+  ompRetiredTranscriptPaths.clear();
 
   // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
   // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
@@ -14594,7 +14688,7 @@ async function spawnCli(
     } else {
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok') {
+  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok' || cfg.cliId === 'oh-my-pi') {
     // File-backed: pin path when known (pi session id / grok --session-id
     // UUID), else arm the poller. Grok collision-fallback (dir already
     // exists → no --session-id → grok mints id) is recovered via writeInput
@@ -14738,7 +14832,8 @@ async function spawnCli(
       // itself fail-opens on non-authoritative screens (ZMX), so a stale
       // `Working...` in ZMX history can never block a structured terminal.
       const busyGuardedIdle = evidenceSource === 'screen'
-        || (evidenceSource === 'external' && structuredBridgeIsPi());
+        || (evidenceSource === 'external'
+          && (structuredBridgeIsPi() || structuredBridgeIsOmp()));
       if (busyGuardedIdle && idleBackend
         && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       drainBridgesThenMarkReady(evidenceSource);

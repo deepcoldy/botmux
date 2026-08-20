@@ -240,7 +240,7 @@ describe('P2 worker onTaskDone generation fence', () => {
     );
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(handlersStart).toBeGreaterThan(setup);
-    const region = workerSource.slice(setup, setup + 6000);
+    const region = workerSource.slice(setup, setup + 7000);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
     const taskDone = region.indexOf('backend.onTaskDone?.(()');
