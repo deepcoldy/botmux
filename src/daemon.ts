@@ -112,13 +112,26 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { CliTurnPayload, Session, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
+import type { CliTurnPayload, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+
+function trustedCallerForTurn(
+  larkAppId: string,
+  senderOpenId?: string,
+  senderUnionId?: string,
+): TrustedCaller | undefined {
+  if (!senderOpenId && !senderUnionId) return undefined;
+  return {
+    ...(senderOpenId ? { requestUserOpenId: senderOpenId } : {}),
+    ...(senderUnionId ? { requestUserUnionId: senderUnionId } : {}),
+    requestLarkAppId: larkAppId,
+  };
+}
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import {
@@ -272,6 +285,15 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import {
+  DEFAULT_SESSION_OWNER_REMINDER,
+  SessionOwnerReminderController,
+} from './core/session-owner-reminder.js';
+import {
+  loadSessionOwnerReminderRecords,
+  saveSessionOwnerReminderRecords,
+} from './services/session-owner-reminder-store.js';
+import { sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
@@ -487,7 +509,7 @@ import {
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
-import { maybeBirthSessionGroup } from './core/session-group-birth.js';
+import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle } from './services/session-group-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
@@ -3550,8 +3572,11 @@ async function revokeQuotaGrant(
   senderOpenId: string,
   ev: TalkEvaluation,
 ): Promise<void> {
+  // 会话群里的 chatGrant 是**继承**来的：授权记录挂在出生前那个私聊上（ev.grantChatId），
+  // 不在会话群自己身上。撤销必须落到来源 chat，否则删了个不存在的记录，硬上限失效。
+  const grantChatId = ev.grantChatId ?? chatId;
   const result = ev.reason === 'chatGrant'
-    ? await removeChatGrant(larkAppId, chatId, senderOpenId)
+    ? await removeChatGrant(larkAppId, grantChatId, senderOpenId)
     : ev.reason === 'globalGrant'
       ? await removeGlobalGrant(larkAppId, senderOpenId)
       : { ok: true as const, removed: false };
@@ -3589,9 +3614,22 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
-  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean },
+  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean; alreadyAuthorizedAndCharged?: boolean },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) return true;
+  // 会话群出生轮：**同一条消息**的授权判定与扣费，刚刚由本函数在原 DM 上下文里
+  // 一起做完（handleNewTopicAdmitted 的建群前扣费点：扣费被拒必须零外部副作用，
+  // 所以它必须排在 createGroupWithBots 之前）。这一轮绝不能再复查一次：
+  //   • 新群是 bot 刚为这个发送者建的，chat 维度的 talk 来源（chatGrant /
+  //     allowedChatGroup / oncall / p2p 专属的 p2pOpen）按定义不可能已经落在它
+  //     上面，复查只会产出假阴性；
+  //   • 而这条消息**已经扣过一次费**——被假阴性丢掉就成了「扣了费还把任务丢了」：
+  //     用户额度少一格，任务无声消失，连一句拒绝提示都没有（丢弃分支只打 debug 日志）。
+  // 「扣了费就不能丢任务，丢任务就不能扣费」是这道闸的硬不变量，两侧只能同进同退。
+  // 授权本身并没有被放宽：真正的判定就是 DM 那次（真实 chatId + chatType='p2p'），
+  // 这里只是不拿一个必然更严的新上下文去推翻它。跨 chat 的授权继承缺口是另一件事
+  //（新群里的**后续**消息仍按新 chat 判定），不由这条已扣费的出生轮来承担。
+  if (opts?.alreadyAuthorizedAndCharged) return true;
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
   // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
@@ -16615,12 +16653,13 @@ export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitte
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[], trustedCaller?: TrustedCaller): void {
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
+  if (trustedCaller) input.trustedCaller = trustedCaller;
   rememberLastCliInput(ds, userPrompt, input);
   const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
-  forkWorker(ds, input, turnId ? { turnId } : false);
+  forkWorker(ds, input, turnId ? { turnId, trustedCaller } : false);
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
   // still set. forkWorker materializes the exact opening as a tokened
@@ -17201,6 +17240,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
   let anchor = ctx.anchor;
+  let quotaConsumedBeforeSessionGroupBirth = false;
 
   // ─── p2pMode='group'：会话群出生 ────────────────────────────────────────
   // group 模式下，顶层 DM 消息在任何会话机制启动前先改道：建一个专属会话群
@@ -17218,10 +17258,40 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     && !substituteTrigger
     && scope === 'thread'
     && anchor === messageId
+    // 「话题内发送 + 同时发送到会话」的消息 root_id 为空但带 thread_id——
+    // 语境属于既有话题，绝不当全新会话建群（回退 thread 旧行为）。
     && !data?.message?.thread_id
+    // 斜杠命令判定必须**早于扣费**：/help、/login、/close 本来就不进 CLI，既不该
+    // 被预扣一次额度，也不该在额度耗尽时被这道闸静默丢掉（下面的 return 会让命令
+    // 根本执行不到）。maybeBirthSessionGroup 对同一条消息本就返回 null（命令不建
+    // 群），所以这里只是把它的结论提前一步，建群行为一字未改；命令随后照常走
+    // parseSlashCommandInvocation 分支，真正会注入 CLI 的消息（含未注册的 /foo，
+    // 它落不进命令分支）仍由下面 pre-worker 那道闸按原样扣一次费——净扣费不变。
+    // 谓词刻意复用 birth 内部的同一个：两侧同源才能保证「跳过扣费」与「不建群」
+    // 是同一个判断——窄于它会退回本 bug，宽于它则会让本该建群的消息不再建群。
+    && !declinesSessionGroupBirthAsSlashCommand(data)
   ) {
+    // A quota denial must have zero external side effects. Charge the original
+    // DM before creating the real Feishu chat, then mark the rewritten turn so
+    // the ordinary pre-worker gate below does not charge it a second time.
+    const quotaSenderOpenId: string | undefined = data.sender?.sender_id?.open_id;
+    const quotaSenderUnionId: string | undefined = data.sender?.sender_id?.union_id;
+    const quotaTeamTrustUnionId = (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot')
+      ? quotaSenderUnionId
+      : undefined;
+    if (!await enforceMessageQuotaForCliInput(
+      larkAppId,
+      chatId,
+      quotaSenderOpenId,
+      messageId,
+      anchor,
+      quotaTeamTrustUnionId,
+      quotaSenderUnionId,
+      chatType,
+    )) return;
+    quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
-    if (reborn) return handleNewTopic(data, reborn);
+    if (reborn) return handleNewTopic(data, { ...reborn, sessionGroupQuotaConsumed: true });
   }
 
   // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
@@ -17321,6 +17391,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
+  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId);
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
   // union_id 报成"自家 bot"，那个真人就会在全团队机器上被当队友 bot 放行（talk +
@@ -17630,9 +17701,20 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     && buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) === ''
     && !ctx.forwardSeedData
     && !messageListener;
+  // Session-group birth charges the ORIGINAL DM before creating the Feishu chat
+  // (a quota denial must have zero external side effects), so by the time the
+  // rewritten group turn gets here THIS message is already authorized AND
+  // already paid for — see `alreadyAuthorizedAndCharged` in
+  // enforceMessageQuotaForCliInput for why re-deciding it here can only lose
+  // the unit we just took. `skipCharge` stays set as well so that even if that
+  // short-circuit is ever removed, the worst case is a redundant recheck, never
+  // a double charge.
+  const sessionGroupAlreadyCharged = !!ctx.sessionGroupQuotaConsumed
+    || quotaConsumedBeforeSessionGroupBirth;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
     listenerAuthorized: !!messageListener,
-    skipCharge: isBareForceTopic,
+    skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
+    alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
   })) {
     return;
   }
@@ -17948,7 +18030,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    forkReservedInitialSession(ds, availableBots, trustedCaller);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -17999,7 +18081,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    forkReservedInitialSession(ds, availableBots, trustedCaller);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -18735,6 +18817,7 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
+  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId);
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -19695,7 +19778,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
@@ -19734,7 +19817,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
     }
 
     return;
@@ -19829,7 +19912,10 @@ async function handleThreadReplyAdmitted(
     let accepted = false;
     try {
       accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
-        codexAppSteerable ? { codexAppSteerable: true } : {});
+        {
+          ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+        });
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
       // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
@@ -19919,6 +20005,7 @@ async function handleThreadReplyAdmitted(
         // the live-worker path (admission computed once at line ~18431; COPIED
         // here, never re-inferred). System/recovery openings keep it absent.
         if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
+        if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
         admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: currentFollowUp,
@@ -19954,6 +20041,9 @@ async function handleThreadReplyAdmitted(
             resume: ds.session.queuedActivationResume ?? ds.hasHistory,
             turnId: ds.session.queuedActivationTurnId,
             dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+            ...(ds.session.queuedActivationInput?.trustedCaller
+              ? { trustedCaller: ds.session.queuedActivationInput.trustedCaller }
+              : {}),
           },
         );
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
@@ -19978,6 +20068,7 @@ async function handleThreadReplyAdmitted(
           resume: ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,
           dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          ...(retainedQueuedActivation.trustedCaller ? { trustedCaller: retainedQueuedActivation.trustedCaller } : {}),
         });
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
@@ -20108,6 +20199,9 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
           wrappedInput.codexAppSteerable = true;
         }
+        if (threadTrustedCaller && !queuedHasDurableTail) {
+          wrappedInput.trustedCaller = threadTrustedCaller;
+        }
         reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
@@ -20115,6 +20209,7 @@ async function handleThreadReplyAdmitted(
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
+          ...(wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {}),
         });
       }
     } catch (e) {
@@ -21988,6 +22083,45 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
+  const sessionOwnerReminder = new SessionOwnerReminderController({
+    load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
+    save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
+    canSend: ds => larkTransportEnabled({
+      chatId: ds.chatId,
+      apiOnly: getBot(ds.larkAppId).config.apiOnly,
+    }),
+    send: async (ds, text, uuid) => {
+      await sendSessionOwnerThreadNotification({
+        larkAppId: ds.larkAppId,
+        rootMessageId: ds.session.rootMessageId,
+        ownerOpenId: ds.session.ownerOpenId!,
+      }, text, uuid);
+    },
+    onError: (ds, error) => logger.warn(
+      `[session-owner-reminder] send failed session=${ds.session.sessionId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ),
+  });
+  let sessionOwnerReminderScanInFlight = false;
+  const scanSessionOwnerReminders = async (): Promise<void> => {
+    if (sessionOwnerReminderScanInFlight) return;
+    sessionOwnerReminderScanInFlight = true;
+    try {
+      const currentConfig = getBot(cfg.larkAppId).config.sessionOwnerReminder
+        ?? DEFAULT_SESSION_OWNER_REMINDER;
+      await sessionOwnerReminder.scan(activeSessions.values(), currentConfig);
+    } catch (error) {
+      logger.warn(`[session-owner-reminder] scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      sessionOwnerReminderScanInFlight = false;
+    }
+  };
+  const sessionOwnerReminderTimer = setInterval(() => {
+    void scanSessionOwnerReminders();
+  }, 60_000);
+  sessionOwnerReminderTimer.unref?.();
+  void scanSessionOwnerReminders();
+
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
   // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
   // mountpoints + per-session tree of a killed-but-still-active sandboxed session
@@ -22344,6 +22478,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -22555,6 +22690,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
+    clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);

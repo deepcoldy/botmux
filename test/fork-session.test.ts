@@ -81,6 +81,7 @@ import {
   isForkCapableSession,
   forkWorker,
   setActiveSessionsRegistry,
+  turnStartingCardStatus,
 } from '../src/core/worker-pool.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -148,8 +149,8 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex'] as const) {
+  it('accepts claude-code / seed / relay / codex / grok (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'grok'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
@@ -192,6 +193,27 @@ describe('isForkCapableSession', () => {
   it('refuses a non-forkable CLI (e.g. gemini)', () => {
     const ds = makeSourceDs({ cliId: 'gemini' });
     expect(isForkCapableSession(ds)).toBe(false);
+  });
+});
+
+describe('turnStartingCardStatus', () => {
+  it('starts a live Grok turn as working, not starting', () => {
+    const live = makeSourceDs({ cliId: 'grok' }, { workerReady: true });
+    expect(turnStartingCardStatus(live, 'grok')).toBe('working');
+    expect(turnStartingCardStatus(live, 'codex')).toBe('starting');
+  });
+
+  it('keeps Grok on starting until the worker has initialized', () => {
+    const cold = makeSourceDs({ cliId: 'grok' }, { workerReady: false });
+    expect(turnStartingCardStatus(cold, 'grok')).toBe('starting');
+  });
+
+  it('surfaces limited when a usage-limit state is present', () => {
+    const limited = makeSourceDs({ cliId: 'grok' }, {
+      workerReady: true,
+      usageLimit: { retryLabel: 'later' } as DaemonSession['usageLimit'],
+    });
+    expect(turnStartingCardStatus(limited, 'grok')).toBe('limited');
   });
 });
 

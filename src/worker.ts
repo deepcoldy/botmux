@@ -28,6 +28,16 @@ import {
   buildSeatbeltProfile,
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
+  evaluatePersistentPaneMigration,
+  executePersistentPaneMigration,
+  type PersistentPaneMigrationEffects,
+  persistentTeardownKillKind,
+  isolationPaneMarkerPath,
+  policyOffTombstonePath,
+  policyOffTombstoneContent,
+  policyOffTombstoneValid,
+  provenancePendingContent,
+  provenancePendingNonce,
   sendCredFilePath,
   botHomePath,
   buildCliExecutableReadCarveOuts,
@@ -123,12 +133,19 @@ import {
 } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
-  deriveTerminalViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
+import {
+  deriveWorkerViewGeneration,
+  looksLikeTerminalControlGrant,
+  TERMINAL_VIEW_FORWARD_HEADER,
+  verifyTerminalControlGrant,
+  verifyTerminalViewForward,
+} from './core/terminal-control-grant.js';
+import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
@@ -192,6 +209,7 @@ import type {
   DisplayMode,
   TermActionKey,
   ScreenStatus,
+  TrustedCaller,
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { t, setDefaultLocale } from './i18n/index.js';
@@ -1527,6 +1545,7 @@ async function prepareCliPluginGenerationAndGateway(
     sessionMcpGatewayHost = await startSessionMcpGatewayHost({
       sessionId: cfg.sessionId,
       dataDir: config.session.dataDir,
+      trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
       onError: error => log(`[mcp-gateway] host error: ${error.message}`),
     });
     log(`[mcp-gateway] trusted host listening for ${manifest.entries.length} plugin server(s)`);
@@ -1820,8 +1839,14 @@ const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
 // daemon restart re-forks every worker — a per-process random token would 403
 // every previously-issued operate link).
 let writeToken = randomBytes(16).toString('hex');
-// Standalone/test fallback. Production replaces this after init with a stable
-// per-session HMAC derived from the host-only dashboard secret.
+// Per-BOOT random read capability, reported to the daemon in `ready` and
+// embedded in Feishu card 「打开 Web 终端」 links. Deliberately NOT the stable
+// per-session HMAC any more (P1-5): a stable view token could never be revoked
+// — a viewer who fetched it once kept terminal read access forever, across
+// worker restarts included. Per-boot randomness bounds every card link to this
+// worker generation (restart ⇒ all previously issued view tokens die), and the
+// dashboard view-link API mints its own short-lived signed read grants instead
+// of ever handing this value out (see resolveTerminalAccessForReq).
 let viewToken = randomBytes(32).toString('base64url');
 
 // Active dashboard token, persisted by the dashboard process at this stable
@@ -1831,9 +1856,33 @@ let viewToken = randomBytes(32).toString('base64url');
 const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 
-function refreshTerminalViewToken(): void {
+// Test-only seam (inert in production): widen the SYNCHRONOUS `.dashboard-secret`
+// read that happens twice inside the terminal WS handshake — once at
+// `verifyClient`, once at the post-upgrade `connection` re-check — so the
+// integration test can land a capability's expiry inside that gap and prove the
+// second check still fail-closes it (see worker-terminal-read-auth P1-3). A real
+// slow HOME (NFS/slow disk) produces the same window in production. The old test
+// bloated the secret file with 32MB of whitespace to force this delay, which is
+// incompatible with #920's strict 0600 host-authority reader (its 256-byte cap
+// rejects a padded file); this env-gated busy-wait reproduces the timing without
+// an oversized or otherwise unsafe credential file. Only ever set by that test.
+const HANDSHAKE_SECRET_READ_DELAY_MS = Number.isFinite(
+  Number(process.env.BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS),
+)
+  ? Math.max(0, Number(process.env.BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS))
+  : 0;
+
+/** Read the dashboard secret on the terminal WS-handshake path. Identical to
+ *  {@link loadDashboardSecret} in production; adds a bounded synchronous delay
+ *  ONLY when the test seam env var is set, to make the handshake read window
+ *  observable without an oversized secret file. */
+function loadHandshakeSecret(): string | null {
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
-  if (secret && sessionId) viewToken = deriveTerminalViewToken(secret, sessionId);
+  if (HANDSHAKE_SECRET_READ_DELAY_MS > 0) {
+    const until = Date.now() + HANDSHAKE_SECRET_READ_DELAY_MS;
+    while (Date.now() < until) { /* busy-wait: mimic a slow synchronous fs read */ }
+  }
+  return secret;
 }
 
 /** Re-derive the stable write (operate) token from the host-only dashboard
@@ -1859,14 +1908,101 @@ function refreshTerminalWriteToken(): void {
  * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
  * restarting this worker, so a cached value would go stale.
  */
-function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): TerminalAccessDecision {
-  return resolveTerminalAccessForRequest(
+interface WorkerTerminalAccess extends TerminalAccessDecision {
+  /** Signed Dashboard identity used only for content-free input audit rows. */
+  auditUser?: string;
+  /** Fixed grant expiry. Writable WS connections are closed at this boundary. */
+  controlExpiresAt?: number;
+}
+
+function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerminalAccess {
+  // P1-6 invariant: an explicit, matching write-link `?token=` is an
+  // independent capability with the HIGHEST priority. It wins outright — before
+  // the internal control-grant header is even looked at — so a central proxy
+  // that attaches a read-scope grant can never silently downgrade an explicitly
+  // issued 「操作链接」 to read-only for a viewer the platform authenticated as
+  // teammate/guest. (The front proxy additionally refrains from injecting a
+  // grant next to explicit query capabilities; this ordering makes the
+  // guarantee hold regardless of proxy behavior, not by accident of it.)
+  if (safeTerminalTokenEqual(url.searchParams.get('token'), writeToken)) {
+    return { hasRead: true, hasWrite: true, platformReadonly: false };
+  }
+  // `?viewToken=` read capability, two accepted forms (P1-5):
+  //   • this worker's per-boot random token (Feishu card links) — plain
+  //     equality; dies with the worker generation;
+  //   • a short-lived signed read grant minted by the dashboard view-link API.
+  // The retired stable per-session HMAC matches neither form, so every
+  // previously issued stable view token fails closed on this worker.
+  //
+  // The signed form is accepted ONLY when all four hold, because this worker
+  // has no view of dashboard logout state and a URL is trivially copied:
+  //   1. signature + expiry + session binding verify (stateless base check);
+  //   2. scope is `read` — a leaked write-scope loopback grant must never
+  //      double as a browser-shareable capability;
+  //   3. audience is `central` AND the central front proxy countersigned THIS
+  //      capability (X-Botmux-Terminal-View). That header is computed from the
+  //      host-only dashboard secret and is only emitted after the proxy checked
+  //      the capability's auth session is still live, so a raw view URL replayed
+  //      against this port — or against the daemon's own network-bound `/s/`
+  //      reverse proxy — cannot produce it and dies here;
+  //   4. the pinned worker generation matches this boot. A restart re-randomizes
+  //      `viewToken`, so grants minted for the previous boot fail closed even
+  //      though `.dashboard-secret` is unchanged.
+  // The WebSocket is additionally closed at the grant's expiresAt.
+  const viewParam = url.searchParams.get('viewToken');
+  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken);
+  let viewGrantUser: string | undefined;
+  let viewGrantExpiresAt: number | undefined;
+  if (!viewTokenMatches && looksLikeTerminalControlGrant(viewParam) && sessionId) {
+    const secret = loadHandshakeSecret();
+    if (secret && verifyTerminalViewForward(secret, viewParam, req.headers[TERMINAL_VIEW_FORWARD_HEADER])) {
+      const viewGrant = verifyTerminalControlGrant(secret, viewParam, sessionId);
+      if (viewGrant.ok
+        && viewGrant.claims.scope === 'read'
+        && viewGrant.claims.audience === 'central'
+        && viewGrant.claims.workerGeneration === deriveWorkerViewGeneration(secret, viewToken)) {
+        viewTokenMatches = true;
+        viewGrantUser = viewGrant.claims.userId;
+        viewGrantExpiresAt = viewGrant.claims.expiresAt;
+      }
+    }
+  }
+  const legacy: WorkerTerminalAccess = resolveTerminalAccessForRequest(
     req.headers,
-    safeTerminalTokenEqual(url.searchParams.get('token'), writeToken),
-    safeTerminalTokenEqual(url.searchParams.get('viewToken'), viewToken),
+    false,
+    viewTokenMatches,
     () => readPlatformBinding() !== null,
     () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
   );
+  if (viewGrantExpiresAt !== undefined && legacy.hasRead && !legacy.hasWrite) {
+    legacy.auditUser = viewGrantUser;
+    legacy.controlExpiresAt = viewGrantExpiresAt;
+  }
+  // Most terminal HTTP/WS requests use the query capabilities above. Avoid a
+  // second synchronous secret-file read on that hot path; only the central
+  // front proxy supplies this internal header.
+  if (req.headers['x-botmux-terminal-control'] === undefined) return legacy;
+  const secret = loadHandshakeSecret();
+  if (!secret || !sessionId) return legacy;
+  const grant = verifyTerminalControlGrant(
+    secret,
+    req.headers['x-botmux-terminal-control'],
+    sessionId,
+  );
+  if (!grant.ok) return legacy;
+  return {
+    hasRead: true,
+    hasWrite: grant.claims.scope === 'write',
+    platformReadonly: grant.claims.scope === 'read',
+    auditUser: grant.claims.userId,
+    controlExpiresAt: grant.claims.expiresAt,
+  };
+}
+
+function auditTerminalInput(user: string | undefined, data: string): void {
+  appendControlAudit(controlAuditRecord(user ?? 'legacy-capability', sessionId, 'terminal.input', {
+    bytes: Buffer.byteLength(data),
+  }));
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
@@ -2353,6 +2489,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
         currentBotmuxTurnId = msg.turnId;
         currentBotmuxDispatchAttempt = undefined;
+        currentGatewayTrustedCaller = undefined;
         currentVcMeetingImTurnOrigin = undefined;
         stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
@@ -2462,6 +2599,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                 msg.followUpTurnId,
                 undefined,
                 undefined,
+                undefined,
                 fence,
               );
               if (result === 'stale-before-write') {
@@ -2508,8 +2646,18 @@ const inflightInputs = new InflightInputTracker();
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+let currentGatewayTrustedCaller: TrustedCaller | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
+
+function currentGatewayTrustedTurnIdentity() {
+  return {
+    ...(currentGatewayTrustedCaller ? { caller: currentGatewayTrustedCaller } : {}),
+    ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
+    ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+  };
+}
+
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const capability = {
@@ -7151,6 +7299,7 @@ async function writeAdoptMessage(
   turnId: string | undefined,
   dispatchAttempt?: number,
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
+  trustedCaller?: TrustedCaller,
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -7163,6 +7312,7 @@ async function writeAdoptMessage(
   const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
+  currentGatewayTrustedCaller = trustedCaller;
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
   writeCliPidMarker();
@@ -7401,6 +7551,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.turnId,
       item.dispatchAttempt,
       item.vcMeetingImTurnOrigin,
+      item.trustedCaller,
       fence,
     ),
   });
@@ -9623,7 +9774,12 @@ function markPromptReady(): void {
   // so a dropped Enter cannot create permanent false-busy.
   // Reject the heuristic and re-arm IdleDetector so the later transcript-final
   // fireIdle() can drive the real ready edge.
-  if (hasStructuredLifecycleBlock()) {
+  if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {
+    // Grok is lifecycle-blocking, but its FIRST ready is still a pre-execution
+    // SessionStart / idle-detector edge while the argv-baked prompt is running.
+    // The spawnArgvInitialPromptBusy arm below must publish working and consume
+    // itself on that first edge. After the arm is gone, later TUI redraws stay
+    // blocked until turn_completed so they cannot publish idle mid-turn.
     const remainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
     log('Ignoring prompt-ready heuristic while a structured turn is unfinished or submit verification/start is pending');
@@ -10421,6 +10577,7 @@ async function flushPending(): Promise<void> {
         renderer?.markNewTurn();
         currentBotmuxTurnId = item.turnId;
         currentBotmuxDispatchAttempt = item.dispatchAttempt;
+        currentGatewayTrustedCaller = item.trustedCaller;
         currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
@@ -10618,7 +10775,11 @@ async function flushPending(): Promise<void> {
               adapterInputHandle(writeBackend),
               msg,
               item.codexAppInput!,
-              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
+              {
+                turnId: item.turnId,
+                ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+                ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+              },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -10632,7 +10793,11 @@ async function flushPending(): Promise<void> {
             () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
-              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
+              {
+                turnId: item.turnId,
+                ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+                ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
+              },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -10951,6 +11116,7 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       if (shouldStopPendingBatch(item, pendingMessages[0])) break;
     }
   } finally {
@@ -11001,6 +11167,7 @@ function sendToPty(
     codexAppSteerable?: true;
     queuedActivationToken?: string;
     replyTurnId?: string;
+    trustedCaller?: import('./types.js').TrustedCaller;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
     /** mojo credential snapshot delivered with this turn; applied at write time. */
     mojoLivePatch?: MojoLivePatch;
@@ -11021,6 +11188,7 @@ function sendToPty(
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.mojoLivePatch ? { mojoLivePatch: opts.mojoLivePatch } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
+    ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -12280,17 +12448,65 @@ async function spawnCli(
   // so the probe below sees no pane and we cold-spawn fresh isolated. A pane from
   // this lifetime (suspend→resume) keeps its marker → reattaches normally (it is
   // still the isolated process). This lets isolated bots use tmux/zellij/herdr.
+  //
+  // The MIRROR case is just as load-bearing: policy is now OFF (no sandbox, not
+  // enrolled → appliedIsolationCapabilities empty), but a pane spawned by an OLDER
+  // build under the previous FORCED no-transport isolation is still alive AND still
+  // stamped. That pane runs confined against a policy we no longer want; a bare
+  // `capabilities.length > 0` gate would skip the check entirely and warm-reattach
+  // the still-isolated process, silently contradicting "read scope follows local
+  // config" on resume/restart (the 2026-08 no-transport放宽 upgrade path). So we
+  // also enter when a boot marker is present on disk for THIS session — then the
+  // policy-off arm below (no expected capabilities) demands the marker be truly
+  // absent to reattach, else kills + cold-spawns unconfined. Presence is checked
+  // by the no-follow existence probe (a planted/tampered leaf that reads as null
+  // still counts as present, so it cannot be used to force a silent reattach).
   let persistentPaneOriginChannelId: string | undefined;
-  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
+  const stalePaneMarkerPath = isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId);
+  const policyOffTombstoneFilePath = policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId);
+  // no-transport (apiOnly bot OR HTTP virtual chat) is the ONLY session shape the
+  // removed force-isolation rule ever confined; the policy-off migration arm is
+  // scoped to it so an ordinary transport-enabled chat is never subjected to the
+  // tombstone requirement (no false kills). Computed locally — the merge-scoped
+  // `noTransport` above is out of scope here.
+  const noTransportSession = cfg.apiOnly === true
+    || cfg.chatId?.startsWith('http_async_') === true
+    || cfg.chatId?.startsWith('http_wait_') === true;
+  const isolationCapableBackend = effectiveBackendType === 'tmux';
+  // Existence via no-follow probes so a planted/tampered leaf still counts as
+  // present (→ triggers cleanup / conservative kill) and can never be used to
+  // force a silent reattach.
+  const stalePaneMarkerPresent = hostEntryExistsNoFollow(stalePaneMarkerPath);
+  const policyOffTombstonePresent = hostEntryExistsNoFollow(policyOffTombstoneFilePath);
+  // The guard must ENTER the state machine whenever it could have anything to
+  // decide, WITHOUT depending on provenance already being present for the live-
+  // pane arms — else a no-transport pane whose best-effort isolation marker write
+  // was lost would (NEITHER file) skip the guard and warm-reattach still confined.
+  // Enter for:
+  //   · any policy-ON spawn (capability check runs on every persistent backend,
+  //     incl. credential-only zellij/herdr/zmx), OR
+  //   · a policy-OFF no-transport tmux session (the file-sandbox migration scope), OR
+  //   · ANY session (incl. transport-enabled, any backend) that has stale
+  //     provenance on disk — so a dead pane's leftover marker/tombstone is cleared
+  //     before cold-spawn on EVERY backend. Otherwise a transport chat that turned
+  //     sandbox OFF leaves a matching marker that would later warm-reattach a fresh
+  //     UNisolated pane as "isolated" when sandbox is re-enabled.
+  const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0
+    || (noTransportSession && isolationCapableBackend)
+    || stalePaneMarkerPresent || policyOffTombstonePresent;
+  if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneGuardApplies) {
     const persistentTarget = selectedBackend.persistentBackendTarget;
     // ZMX ownership is verified against the frozen PID, not just the name — a
     // same-named session may belong to the user or to a newer generation.
     const zmxOwnedProbe = effectiveBackendType === 'zmx'
       ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
       : undefined;
-    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe must
-    // fail closed. Other persistent backends retain the upstream semantics:
-    // their target probe returning unknown is not proof that a pane exists.
+    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe is not
+    // proof of anything. Other persistent backends: their target probe returning
+    // unknown is likewise not proof that a pane exists. Liveness is passed TRI-STATE
+    // (paneProbe) into the state machine, which fail-closes on `unknown` for EVERY
+    // backend (refuse-inconclusive-probe) — no longer only ZMX, and no longer
+    // collapsed into "dead" (which would clear a still-confined pane's provenance).
     const paneProbe = zmxOwnedProbe?.probe
       ?? (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
     if (
@@ -12303,91 +12519,119 @@ async function spawnCli(
         'ZMX session appeared after the frozen launch probe',
       );
     }
-    if (effectiveBackendType === 'zmx' && paneProbe === 'unknown') {
-      throw new Error(
-        `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
-        `could not verify existing ${effectiveBackendType} pane`,
-      );
-    }
     const paneLive = paneProbe === 'exists';
-    if (paneLive) {
-      const markerPath = join(
-        isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`,
-      );
-      const marker = readManagedOriginAuthorityFile(markerPath);
-      const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
-      // A stamped pane must match even when the new policy is OFF. Otherwise a
-      // disable followed by restart could reattach the still-confined process
-      // without rebuilding its authority/profile. An unsafe planted marker
-      // leaf is treated as stamped/unknown by the no-follow existence check.
-      const policyMatches = appliedIsolationCapabilities.length > 0
-        ? isolatedPaneReattachSafe(marker, {
-            requiredCapabilities: appliedIsolationCapabilities,
-            exactCapabilities: true,
-            ...(originChannelPolicyExpected ? {
-              readIsolation: willReadIsolate,
-              writeSandbox: willWriteSandbox,
-              requireOriginChannel: true,
-              policyDigest: managedOriginChannelPolicyDigest,
-            } : {}),
-          })
-        : marker === null && !hostEntryExistsNoFollow(markerPath);
-      if (policyMatches) {
-        if (originChannelPolicyExpected) {
-          persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
-        }
-        // Pane was spawned under the current isolation policy → still confined
-        // on the running process across daemon restarts; warm reattach preserves
-        // resume/context + tmux idle-suspend.
-        log(`[read-isolation] reattaching isolated persistent pane (${cfg.sessionId})`);
-      } else {
-        // Missing/legacy marker → pane predates the current policy and may retain
-        // obsolete permissions. Kill it before publishing any new capability.
-        log(`[read-isolation] legacy/unmarked persistent pane for ${cfg.sessionId} — killing + cold-spawning with current policy`);
-        // Capture the name before re-selection: `persistentSessionName` is
-        // reassigned from the new selection below and widens back to
-        // `string | undefined`, but the backing name we are tearing down is
-        // this one and does not change.
-        const staleSessionName = persistentSessionName;
-        const stalePersistentTarget = selectedBackend.persistentBackendTarget;
+    const markerPath = stalePaneMarkerPath;
+    const marker = paneLive ? readManagedOriginAuthorityFile(markerPath) : null;
+    const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
+    // isolatedPaneReattachSafe only means anything under a policy-ON spawn; the
+    // state machine consults it only in that arm.
+    const isolationMarkerReattachSafe = appliedIsolationCapabilities.length > 0
+      && isolatedPaneReattachSafe(marker, {
+        requiredCapabilities: appliedIsolationCapabilities,
+        exactCapabilities: true,
+        ...(originChannelPolicyExpected ? {
+          readIsolation: willReadIsolate,
+          writeSandbox: willWriteSandbox,
+          requireOriginChannel: true,
+          policyDigest: managedOriginChannelPolicyDigest,
+        } : {}),
+      });
+    // Tombstone authorizes a policy-off warm reattach ONLY when it passes a SECURE
+    // read (real 0600 regular file, right owner) + schema/version validation — a
+    // bare lstat "present" (empty / dir / symlink / garbage) must NOT authorize.
+    // Presence (above) still drives cleanup; validity drives authorization.
+    const policyOffTombstoneIsValid = paneLive && policyOffTombstonePresent
+      && policyOffTombstoneValid(readManagedOriginAuthorityFile(policyOffTombstoneFilePath));
+    // PENDING provenance: a present marker OR tombstone whose secure-read body is a
+    // `state:'pending'` record. This is a generation whose fresh-attribution never
+    // completed (crash between pending-write and commit, or an uncommitted
+    // late-flip/collision). It DOMINATES the state machine (all backends, both
+    // policy directions) — see evaluatePersistentPaneMigration. Secure-read (not
+    // lstat) because only a real 0600 file we wrote can be a trusted pending
+    // record; a planted/garbage leaf reads as null → not pending → falls through
+    // to the normal presence-but-invalid handling (still conservative).
+    const pendingProvenancePresent =
+      (stalePaneMarkerPresent
+        && provenancePendingNonce(readManagedOriginAuthorityFile(stalePaneMarkerPath)) !== null)
+      || (policyOffTombstonePresent
+        && provenancePendingNonce(readManagedOriginAuthorityFile(policyOffTombstoneFilePath)) !== null);
+    const migration = evaluatePersistentPaneMigration({
+      appliedIsolationCapabilities,
+      isolationCapableBackend,
+      noTransport: noTransportSession,
+      isolationMarkerPresent: stalePaneMarkerPresent,
+      policyOffTombstonePresent,
+      policyOffTombstoneValid: policyOffTombstoneIsValid,
+      paneProbe,
+      pendingProvenancePresent,
+      isolationMarkerReattachSafe,
+    });
+    // Verified removal of a provenance file: unlink then confirm it is truly gone
+    // (no-follow). A leaf we cannot remove (directory / planted / perm) must FAIL
+    // CLOSED — never fall through to publish a new generation, or a later restart
+    // re-reads the stale proof and mis-kills the fresh pane in a loop.
+    const removeProvenanceOrThrow = (path: string, label: string): void => {
+      try { unlinkSync(path); } catch { /* may already be absent — verified below */ }
+      if (hostEntryExistsNoFollow(path)) {
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not remove stale ${label} at ${path}`,
+        );
+      }
+    };
+    // Capture the stale name/target BEFORE any re-selection below (reselect
+    // reassigns persistentSessionName and widens it back to string | undefined).
+    const staleSessionName = persistentSessionName;
+    const stalePersistentTarget = selectedBackend.persistentBackendTarget;
+    const migrationEffects: PersistentPaneMigrationEffects = {
+      killStalePane: () => {
         try {
           // ZMX keeps its own call here rather than going through the target
           // helper: only this path holds the frozen PID, which makes the
           // ownership check stricter than the name+label check.
           if (effectiveBackendType === 'zmx') {
-            ZmxBackend.killManagedSession(
-              persistentSessionName,
-              cfg.sessionId,
-              resolvedZmxSessionPid,
-            );
+            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid);
+          } else if (stalePersistentTarget) {
+            killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
           } else {
-            if (stalePersistentTarget) killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
-            else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
+            killPersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName, cfg.sessionId);
           }
         } catch (e) {
           throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
         }
+      },
+      confirmPaneGone: () => {
         const postKillProbe = effectiveBackendType === 'zmx'
           ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
           : (stalePersistentTarget
             ? probePersistentBackendTarget(stalePersistentTarget)
-            : probePersistentSession(
-                effectiveBackendType as PersistentBackendType,
-                staleSessionName,
-              ));
-        if (shouldRejectPersistentPostKillProbe(
-          effectiveBackendType as PersistentBackendType,
-          postKillProbe,
-        )) {
+            : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
+        // Migration teardown fail-closes on ANY non-`missing` post-kill probe for
+        // EVERY backend — not just ZMX. `exists` (kill didn't take) and `unknown`
+        // (kill unconfirmed: tmux swallows kill errors incl. timeout, zellij does
+        // not check its spawnSync exit) both mean "the confined pane may still be
+        // alive", so publishing a new generation around it would silently keep the
+        // old confinement. Only an authoritative `missing` confirms termination.
+        // (This is STRICTER than the shared shouldRejectPersistentPostKillProbe,
+        // which the separate mcp-gateway gate still uses with its own semantics.)
+        if (postKillProbe !== 'missing') {
           throw new Error(
-            `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
-            `could not confirm stale ${effectiveBackendType} pane termination`,
+            `[read-isolation] refusing to start session ${cfg.sessionId}: `
+            + `could not confirm stale ${effectiveBackendType} pane termination `
+            + `(post-kill probe: ${postKillProbe})`,
           );
         }
         if (effectiveBackendType === 'zmx') {
           resolvedZmxSessionProbe = postKillProbe;
           resolvedZmxSessionPid = undefined;
         }
+      },
+      clearProvenanceVerified: () => {
+        // Clear BOTH files (verified). Order-independent — both must end absent.
+        if (stalePaneMarkerPresent) removeProvenanceOrThrow(stalePaneMarkerPath, 'isolation marker');
+        if (policyOffTombstonePresent) removeProvenanceOrThrow(policyOffTombstoneFilePath, 'policy-off tombstone');
+      },
+      reselectBackend: () => {
         // ZMX backend selection consumes the frozen probe. Refresh it before
         // re-selecting or the replacement keeps isReattach=true for the pane
         // that this gate just proved was removed.
@@ -12398,8 +12642,39 @@ async function spawnCli(
         backend = selectedBackend.backend;
         cliLifetimeNonce++;
         persistentSessionName = selectedBackend.persistentSessionName;
+      },
+      refuseInconclusiveProbe: (): never => {
+        // The liveness probe was `unknown` where acting would be unsafe (the pane
+        // may still be alive AND still confined under an obsolete policy). No
+        // provenance is touched, no reselect — fail closed and let the next launch
+        // re-probe once the backend is answering again.
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not verify existing ${effectiveBackendType} pane `
+          + `(liveness probe: ${paneProbe})`,
+        );
+      },
+    };
+    if (migration.action === 'reattach') {
+      if (originChannelPolicyExpected) {
+        persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
       }
+      // Pane matches the current policy (isolated pane stamped under it, or a
+      // no-transport pane with a VALIDATED policy-off tombstone) → still valid on
+      // the running process across daemon restarts; warm reattach preserves
+      // resume/context + tmux idle-suspend.
+      log(`[read-isolation] reattaching persistent pane under current policy (${cfg.sessionId})`);
+    } else if (migration.action === 'clear-stale-then-cold-spawn') {
+      log(`[read-isolation] clearing stale provenance for dead pane before cold-spawn (${cfg.sessionId})`);
+    } else if (migration.action === 'kill-then-cold-spawn') {
+      log(`[read-isolation] persistent pane provenance mismatch for ${cfg.sessionId} — killing + cold-spawning with current policy`);
+    } else if (migration.action === 'refuse-inconclusive-probe') {
+      log(`[read-isolation] inconclusive liveness probe (${paneProbe}) for ${cfg.sessionId} — refusing to start rather than clear/cold-spawn around a possibly-live confined pane`);
     }
+    // Ordered, fail-closed side effects (kill → confirm → clear → reselect) live
+    // in executePersistentPaneMigration so the ordering + stop-on-failure
+    // guarantees are unit-testable with injected mocks.
+    executePersistentPaneMigration(migration, migrationEffects);
   }
   readIsolationOriginChannelId = managedOriginChannelRequired
     ? (persistentPaneOriginChannelId ?? randomBytes(32).toString('hex'))
@@ -12563,6 +12838,13 @@ async function spawnCli(
   bareShellCheckInProgress = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
+  // Tier 0 (adapter capability): adapters whose buildArgs can only resume a
+  // PRECISE cliSessionId (cursor/copilot/kimi — no --continue/latest fallback,
+  // which would risk resuming a SIBLING session's conversation) start FRESH
+  // when no id was persisted. Demote here so the user-visible fresh notice
+  // fires — leaving effectiveResume=true would have the adapter silently
+  // launch a blank session while the closed card / resume receipt still claim
+  // history was restored.
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
   // → skip --resume, spawn FRESH.
   // Tier 2 (restart count): 2nd consecutive in-worker restart → force FRESH,
@@ -12609,8 +12891,15 @@ async function spawnCli(
     )
     : undefined;
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
+  // Tier 0: see block comment above. The adapter itself drops --resume when
+  // the id is missing (its buildArgs starts fresh); demoting HERE keeps
+  // effectiveResume honest so the fresh-demotion notice below fires.
+  const missingExactResumeId = effectiveResume
+    && !willReattachPersistent
+    && !effectiveCliSessionId
+    && cliAdapter.resumeRequiresCliSessionId === true;
   let tier1ProbeFalse = false;
-  if (effectiveResume && !tier2ForceFresh && !willReattachPersistent) {
+  if (effectiveResume && !tier2ForceFresh && !willReattachPersistent && !missingExactResumeId) {
     const probe = cliAdapter.checkResumeTargetExists?.({
       sessionId: effectiveAdapterSessionId,
       cliSessionId: effectiveCliSessionId,
@@ -12621,11 +12910,13 @@ async function spawnCli(
     if (probe === false) tier1ProbeFalse = true;
   }
   const fallBackToFresh =
-    effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh);
+    effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
-      : 'adapter confirmed resume target does not exist on disk';
+      : missingExactResumeId
+        ? 'no persisted CLI session id — this CLI can only resume a precise session (no --continue fallback)'
+        : 'adapter confirmed resume target does not exist on disk';
     log(`Resume fallback: dropping --resume (${reason}) → fresh session ${cfg.sessionId}`);
     effectiveResume = false;
     effectiveCliSessionId = undefined;
@@ -13586,16 +13877,53 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
     }
   }
-  // Fresh sandboxed spawn on a persistent backend: stamp the pane with this
-  // daemon's boot id so a later reattach can be trusted (see the stale-pane
-  // guard above). pty needs no marker (never reattached).
+  // Fresh spawn on a persistent backend: write a PENDING generation proof BEFORE
+  // the pane is created, then COMMIT it after spawn only once the fresh generation
+  // is attributably established (see the post-spawn commit below). pty needs no
+  // marker (never reattached).
+  //
+  // Why pending-then-commit and not a single pre-spawn write: `backend.spawn()` may
+  // bind this launch to a LATE-ARRIVING same-named pane (zellij/TmuxBackend
+  // dynamically flip fresh→reattach; TmuxPipe/herdr/zmx throw on collision). A
+  // committed proof written before spawn would then "certify" a foreign/unknown-
+  // confinement pane the worker never actually created fresh — a circular,
+  // self-written proof. So we write PENDING first (both validators reject it, its
+  // presence drives the conservative guard), and only rewrite it to committed after
+  // spawn confirms a genuine fresh generation.
+  //
+  // Policy ON → ISOLATION marker; policy OFF on a no-transport isolation-capable
+  // (tmux) session → POLICY-OFF TOMBSTONE. The tombstone is tmux-only
+  // (isolationCapableBackend === tmux), so the policy-off circular-proof concern is
+  // fully closed synchronously. See PersistentPaneCommit below for the ZELLIJ
+  // exception (option B: isolation-capable zellij stays pending → always cold-spawn).
+  type PersistentPaneCommit = {
+    path: string;
+    nonce: string;
+    committedContent: string;
+    /** Also clear this sibling proof (mutual exclusivity) at commit time, verified. */
+    clearSiblingPath?: string;
+    label: string;
+  };
+  let pendingProvenanceCommit: PersistentPaneCommit | null = null;
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {
+    // Policy-ON isolation marker. The PENDING write is a spawn-time ADMISSION
+    // PRECONDITION, NOT best-effort: if we cannot durably record the pending proof
+    // and then backend.spawn() dynamically reattaches a late-arriving same-named
+    // pane (zellij/TmuxBackend flip), the whole commit/teardown block below —
+    // gated on pendingProvenanceCommit — would be SKIPPED, so the late-flip
+    // teardown never runs and this launch keeps running attached to an
+    // unattributed generation. "No committed proof → next launch cold-spawns" only
+    // protects the NEXT launch, not THIS one. So a write failure must FAIL CLOSED
+    // here (throw before spawn), exactly like the policy-off arm.
     try {
-      const markerDir = join(isolationRuntimeDataDir, 'read-isolation');
-      mkdirSync(markerDir, { recursive: true });
-      replaceManagedOriginCapabilityFile(
-        join(markerDir, `${cfg.sessionId}.boot`),
-        isolationPaneMarkerContent(
+      mkdirSync(join(isolationRuntimeDataDir, 'read-isolation'), { recursive: true });
+      const nonce = randomBytes(32).toString('hex');
+      const markerPath = isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId);
+      replaceManagedOriginCapabilityFile(markerPath, provenancePendingContent(nonce));
+      pendingProvenanceCommit = {
+        path: markerPath,
+        nonce,
+        committedContent: isolationPaneMarkerContent(
           cfg.daemonBootId ?? '',
           appliedIsolationCapabilities,
           managedOriginChannelPolicyDigest
@@ -13607,8 +13935,43 @@ async function spawnCli(
               }
             : undefined,
         ),
+        // A committed policy-ON generation must not carry a stale policy-off
+        // tombstone (a later flip to policy-off could read it as a no-sandbox gen).
+        clearSiblingPath: policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId),
+        label: 'isolation marker',
+      };
+    } catch (e) {
+      throw new Error(
+        `[read-isolation] refusing to start session ${cfg.sessionId}: `
+        + `could not record pending isolation-marker generation proof (${(e as Error).message})`,
       );
-    } catch { /* non-fatal: worst case a same-lifetime reattach cold-spawns instead */ }
+    }
+  } else if (appliedIsolationCapabilities.length === 0 && persistentSessionName
+      && !willReattachPersistent && noTransportSession && isolationCapableBackend) {
+    // Policy-OFF generation proof (tmux-only: isolationCapableBackend === tmux).
+    // NOT best-effort: if we cannot durably record the PENDING proof we must fail
+    // closed rather than spawn a pane we can never prove. The committed tombstone
+    // is written post-spawn only on a confirmed fresh generation.
+    try {
+      mkdirSync(join(isolationRuntimeDataDir, 'read-isolation'), { recursive: true });
+      const nonce = randomBytes(32).toString('hex');
+      const tombstonePath = policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId);
+      replaceManagedOriginCapabilityFile(tombstonePath, provenancePendingContent(nonce));
+      pendingProvenanceCommit = {
+        path: tombstonePath,
+        nonce,
+        committedContent: policyOffTombstoneContent(cfg.daemonBootId ?? ''),
+        // A committed policy-off generation must not be shadowed by a stale
+        // isolation marker (which DOMINATES the tombstone in the guard).
+        clearSiblingPath: isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId),
+        label: 'policy-off tombstone',
+      };
+    } catch (e) {
+      throw new Error(
+        `[read-isolation] refusing to start session ${cfg.sessionId}: `
+        + `could not record pending policy-off generation proof (${(e as Error).message})`,
+      );
+    }
   }
 
   // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
@@ -13917,6 +14280,118 @@ async function spawnCli(
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // ── Generational-race commit/teardown for the read-isolation provenance proof ──
+  // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
+  // has returned we know whether a FRESH generation was actually established.
+  if (pendingProvenanceCommit) {
+    const commit = pendingProvenanceCommit;
+    // Verified removal of a proof file: unlink then confirm truly gone (no-follow).
+    // A leaf we cannot remove must FAIL CLOSED — never leave an ambiguous proof.
+    const removeProofOrThrow = (path: string, label: string): void => {
+      try { unlinkSync(path); } catch { /* may already be absent — verified below */ }
+      if (hostEntryExistsNoFollow(path)) {
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not remove ${label} at ${path}`,
+        );
+      }
+    };
+    // Teardown the exact just-launched target, confirm authoritative `missing`,
+    // and only THEN keep/clear the pending proof per the tri-state result. On a
+    // non-missing (exists/unknown) post-kill probe we KEEP the pending proof and
+    // refuse — never erase evidence of a possibly-live pane.
+    //
+    // CRITICAL: kill the EXACT backend target, NOT the session name. An isolated /
+    // MCP herdr task lives as an agent on the SHARED host session `botmux`
+    // (target = {sessionName:'botmux', agentName:<this topic>}); a name-only
+    // killPersistentSession('herdr','botmux') would tear down the whole shared host
+    // (every bot/topic agent). Mirror the migration effects' killStalePane /
+    // confirmPaneGone: target helper for herdr's agent scope, frozen-PID path for
+    // ZMX identity, name only as the last-resort fallback when no target exists.
+    const teardownTarget = selectedBackend.persistentBackendTarget;
+    const tearDownAndRefuse = (why: string): never => {
+      if (persistentSessionName) {
+        // Pure policy (behaviorally tested): herdr's shared-host agent MUST be
+        // killed via its target, never by the 'botmux' session name.
+        const killKind = persistentTeardownKillKind({
+          backendType: effectiveBackendType,
+          hasBackendTarget: !!teardownTarget,
+        });
+        try {
+          if (killKind === 'zmx') {
+            ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid);
+          } else if (killKind === 'target') {
+            killPersistentBackendTarget(teardownTarget!, cfg.sessionId);
+          } else {
+            killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
+          }
+        } catch (killErr: any) {
+          throw new Error(
+            `[read-isolation] refusing to start session ${cfg.sessionId}: ${why}; `
+            + `could not kill the exact target (${killErr?.message ?? killErr}) — pending proof retained`,
+          );
+        }
+        const postKill = killKind === 'zmx'
+          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+          : (killKind === 'target'
+            ? probePersistentBackendTarget(teardownTarget!)
+            : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
+        if (postKill !== 'missing') {
+          throw new Error(
+            `[read-isolation] refusing to start session ${cfg.sessionId}: ${why}; `
+            + `post-kill probe ${postKill} (not missing) — pending proof retained`,
+          );
+        }
+      }
+      throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${why}`);
+    };
+
+    // Condition #2: a predicted-fresh launch that backend.spawn() dynamically
+    // flipped into a reattach (a same-named pane arrived before the in-spawn probe)
+    // must NOT keep running — the live pane is a foreign/unknown generation. Tear
+    // it down and refuse rather than "don't commit but keep running".
+    if (actuallyReattachedPersistent) {
+      tearDownAndRefuse('predicted-fresh persistent launch dynamically reattached a late-arriving pane');
+    } else if (effectiveBackendType === 'zellij') {
+      // Option B: zellij's session is created ASYNCHRONOUSLY inside the pty child,
+      // so a synchronous `!isReattach` here does NOT prove a fresh generation
+      // attributable to THIS launch (a late collision can still occur after the
+      // last in-spawn hasSession probe). We have no synchronous attributable
+      // signal, so we DELIBERATELY do not commit: the pending proof is left on
+      // disk, and this isolation-capable zellij pane will always cold-spawn on the
+      // next daemon restart/suspend-resume (no warm-reattach). The attributable-ack
+      // protocol that would restore zellij warm-reattach is a separate follow-up.
+      log(`[read-isolation] zellij persistent pane ${cfg.sessionId}: leaving PENDING proof (isolation-capable zellij does not warm-reattach; cold-spawn on next launch)`);
+    } else {
+      // tmux(-pipe) / herdr / zmx: attributable-fresh at the synchronous spawn
+      // return — TmuxPipe throws on new-session collision, herdr/zmx throw on a
+      // name collision / verify their own bootstrap+launchPid handshake. So a
+      // returned spawn + !isReattach here IS a fresh generation created by THIS
+      // launch. COMMIT with compare-before-replace + generation fence.
+      try {
+        // F1 generation fence: a superseded spawn must not let this commit run.
+        if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+        // F2 compare-before-replace: the pending file on disk must STILL be our
+        // nonce (a same-worker restart / backend replacement between the pending
+        // write and here could have replaced it with a newer generation's pending).
+        const current = provenancePendingNonce(readManagedOriginAuthorityFile(commit.path));
+        if (current !== commit.nonce) {
+          throw new Error(`pending proof nonce mismatch (superseded generation) at ${commit.path}`);
+        }
+        // Mutual exclusivity: clear the sibling proof (verified) BEFORE committing,
+        // so the committed generation is never shadowed by a stale sibling.
+        if (commit.clearSiblingPath) removeProofOrThrow(commit.clearSiblingPath, `stale ${commit.label} sibling`);
+        // Atomic replace pending → committed.
+        replaceManagedOriginCapabilityFile(commit.path, commit.committedContent);
+      } catch (err) {
+        if (err instanceof CliSpawnSupersededError) throw err;
+        // Condition #3: a commit-write failure must not leave an ambiguous started
+        // pane running as if successful — tear down the exact target and refuse.
+        // (The pending proof, if it survived, keeps the next launch fail-closed.)
+        tearDownAndRefuse(`could not commit ${commit.label} generation proof (${(err as Error).message})`);
+      }
+    }
+  }
   try {
     finalizeCodexAppControlGeneration(
       cfg,
@@ -14571,6 +15046,7 @@ async function spawnCli(
     isPromptReady = false;
     currentBotmuxTurnId = undefined;
     currentBotmuxDispatchAttempt = undefined;
+    currentGatewayTrustedCaller = undefined;
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
         type: 'restart_result',
@@ -14807,6 +15283,7 @@ function killCli(opts: {
   readIsolationOriginChannelId = null;
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
+  currentGatewayTrustedCaller = undefined;
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();
   pendingCodexAppSteerAckIds.clear();
@@ -15094,21 +15571,59 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
     });
 
     wss.on('connection', (ws, req: IncomingMessage) => {
-      wsClients.add(ws);
-
-      // Read access was already checked before the WebSocket handshake. Resolve
-      // again here only to decide whether this client may write.
+      // P1-3 — the pre-handshake verdict is a SNAPSHOT, and this callback runs
+      // strictly after it: ws only completes the upgrade once verifyClient
+      // called back, and re-resolving access here re-reads `.dashboard-secret`
+      // synchronously. A capability whose expiry — or the worker generation it
+      // is pinned to, or the host secret it is signed under — turns over inside
+      // that window was authorized by the FIRST check and is already dead by
+      // this one. This callback used to recompute `access` but consume only
+      // `hasWrite`, so such a socket was registered in `wsClients`, seeded with
+      // the terminal scrollback, and — the second resolution carrying no
+      // controlExpiresAt — never given an expiry timer at all: an unbounded
+      // read-only stream outliving its own credential.
+      //
+      // FAIL CLOSED on the SECOND result instead. A socket that no longer
+      // resolves to read authority is closed before any registration, so it
+      // never joins a broadcast set and never receives the history seed; and
+      // the expiry timer below is armed from THIS resolution's expiresAt —
+      // never inherited from the handshake and never skipped.
       const url = parseWorkerRequestUrl(req);
       if (!url) {
         log(`Bad worker WS URL rejected: ${JSON.stringify(req.url ?? '')}`);
-        wsClients.delete(ws);
         ws.close(1008, 'Bad Request');
         return;
       }
-      const { hasWrite } = resolveTerminalAccessForReq(req, url);
+      const access = resolveTerminalAccessForReq(req, url);
+      const { hasRead, hasWrite, auditUser, controlExpiresAt } = access;
+      if (!hasRead || (controlExpiresAt !== undefined && controlExpiresAt <= Date.now())) {
+        log('WS client refused at the connection re-check: capability no longer valid');
+        ws.close(4003, 'authorization expired');
+        return;
+      }
+      wsClients.add(ws);
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
+      // A signed Dashboard grant is fixed-expiry — for READ scope as much as
+      // for write (P1-5). Even if the central proxy's socket invalidation is
+      // delayed or bypassed, the worker independently removes any granted
+      // authority and closes this connection at the signed boundary; a
+      // reconnect must then present a still-valid credential. Read-only
+      // sockets used to outlive their authentication here; now they cannot.
+      let controlExpiryTimer: NodeJS.Timeout | undefined;
+      if (controlExpiresAt !== undefined) {
+        const expiredReason = hasWrite ? 'control expired' : 'view expired';
+        controlExpiryTimer = setTimeout(() => {
+          authedClients.delete(ws);
+          if (ws.readyState === WebSocket.OPEN) ws.close(4003, expiredReason);
+        }, Math.max(0, controlExpiresAt - Date.now()));
+        controlExpiryTimer.unref();
+      }
+      ws.once('close', () => {
+        if (controlExpiryTimer) clearTimeout(controlExpiryTimer);
+        authedClients.delete(ws);
+      });
 
       if (isTmuxMode && !isPipeMode && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
@@ -15189,6 +15704,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -15233,7 +15749,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             name: 'xterm-256color',
             cols,
             rows,
-            env: zellijEnv() as { [key: string]: string },
+            // redactChildEnv first, matching the tmux viewer above (tmuxEnv()
+            // folds REDACTED_CHILD_ENV_KEYS into its own strip set, zellijEnv()
+            // only drops ZELLIJ*). A viewer client needs none of the daemon's
+            // secrets — bare IM-app creds, GitHub tokens, or the Dashboard H5
+            // credentials — so it must not carry them into a pty it owns.
+            env: zellijEnv(redactChildEnv(process.env)) as { [key: string]: string },
           });
           attachStarted = true;
           observeBe?.setLiveAttach(true);
@@ -15259,6 +15780,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -15335,6 +15857,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
@@ -15523,12 +16046,46 @@ if(!hasToken){
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
 }
 
+// ── 终端字号按容器宽度自适应 ─────────────────────────────────────────────────
+// xterm 的 fontSize 是这一页唯一的几何输入：字号写死，列数就只能被容器宽度被动
+// 决定。14px 是照桌面宽度调的，手机把这一页直嵌进 390px 宽的 iframe 之后一行只
+// 剩约 44 列 —— 字大得离谱，CLI 的 TUI 还被迫在 44 列上硬折行，逻辑行换行稀碎。
+// 这里把因果反过来：先定一个可读的目标列数，再由容器实际宽度反推字号。
+//
+// _WB_FONT_ADVANCE 是等宽字体的标称「字宽 / 字号」比（JetBrains Mono、Fira Code、
+// Menlo、DejaVu Sans Mono 都是 0.6），只用于估算；真实列数仍由 xterm 量完字体后
+// 自己 fit() 出来，估算偏一点最多让列数在目标附近浮动，不会错位。
+// 只缩不放：算出来比 _WB_FONT_BASE 大一律按 base 走，所以宽度够（约 521px 以上）
+// 的桌面一律还是 14px，存量渲染零变化；窄容器才往下缩，最低到 _WB_FONT_MIN。
+//
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+var _WB_FONT_MIN=9,_WB_FONT_MAX=15,_WB_FONT_BASE=14,_WB_FONT_ADVANCE=.6,_WB_TARGET_COLS=62;
+function _wbAutoFontSize(width){
+  if(!(width>0))return _WB_FONT_BASE;
+  var ideal=width/(_WB_TARGET_COLS*_WB_FONT_ADVANCE);
+  var capped=ideal>_WB_FONT_BASE?_WB_FONT_BASE:ideal;
+  // 半档取整：比整数细一档，又不会停在容易糊掉的亚像素字号上。
+  var stepped=Math.round(capped*2)/2;
+  // 硬边界：字号是这一页唯一的几何输入，任何异常宽度都不许把它推到读不了的档位。
+  if(stepped<_WB_FONT_MIN)return _WB_FONT_MIN;
+  if(stepped>_WB_FONT_MAX)return _WB_FONT_MAX;
+  return stepped;
+}
+function _wbTerminalWidth(){
+  var host=document.getElementById('terminal');
+  var w=host?host.clientWidth:0;
+  if(w>0)return w;
+  // 容器还没布局出宽度（隐藏面板、刚插进 DOM 的 iframe）时退回视口宽；再量不到就
+  // 返回 0，_wbAutoFontSize 保持基准字号，等尺寸事件到了再纠正。
+  return window.innerWidth||0;
+}
 var term=new Terminal({
   theme:{background:'#1a1b26',foreground:'#a9b1d6',cursor:'#c0caf5',
     selectionBackground:'#33467c',black:'#15161e',red:'#f7768e',
     green:'#9ece6a',yellow:'#e0af68',blue:'#7aa2f7',magenta:'#bb9af7',
     cyan:'#7dcfff',white:'#a9b1d6'},
-  fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
+  fontSize:_wbAutoFontSize(_wbTerminalWidth()),fontFamily:"'JetBrains Mono','Fira Code',monospace",
   cursorBlink:!isTouch,scrollback:50000,allowProposedApi:true
 });
 var fit=new FitAddon.FitAddon();
@@ -15548,7 +16105,53 @@ try{
 }catch(_e){
   try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
 }
+// 首帧字号已经在 new Terminal 里按容器宽度定好了；这个函数负责后续尺寸变化
+// （转屏、iframe 改宽、分屏、地址栏收放）时复算。返回 true 表示字号真的换了档。
+function _wbApplyAutoFontSize(){
+  var next=_wbAutoFontSize(_wbTerminalWidth());
+  if(term.options.fontSize===next)return false;
+  term.options.fontSize=next;
+  return true;
+}
 fit.fit();
+// 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
+// iframe 里，父页换 class / 换 CSS 变量都传不进来，配色只能靠 postMessage 递过来。
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+// 安全边界：这个页面会被跨 origin 嵌入，因此只认 window.parent 发来的、结构完全
+// 对得上的消息，且每个颜色都必须是 #rgb / #rrggbb 十六进制字面量；少一个键、多一个
+// 非法值，整条消息丢弃（宁可保持现状，也不要把半套主题刷到画布上）。
+var _WB_THEME_KEYS=['background','foreground','cursor','selectionBackground',
+  'black','red','green','yellow','blue','magenta','cyan','white'];
+function _wbSanitizeTheme(raw){
+  if(!raw||typeof raw!=='object')return null;
+  var out={};
+  for(var _i=0;_i<_WB_THEME_KEYS.length;_i++){
+    var _k=_WB_THEME_KEYS[_i],_v=raw[_k];
+    if(typeof _v!=='string'||!/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(_v))return null;
+    out[_k]=_v;
+  }
+  return out;
+}
+window.addEventListener('message',function(_ev){
+  if(_ev.source===window||_ev.source!==window.parent)return;
+  var _d=_ev.data;
+  if(!_d||_d.type!=='botmux:wb-appearance')return;
+  var _theme=_wbSanitizeTheme(_d.theme);
+  if(!_theme)return;
+  try{
+    term.options.theme=_theme;
+    // 阅读风是大行距 1.3；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
+    // 经典那套色值与上面写死的字面量逐色相同，所以没开阅读风的用户零变化。
+    // 这两个数字的唯一出处是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts），
+    // 接缝测试按那张表比对这一行的字面量：改一处必须两处一起改。
+    // 曾经是 1.55，单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome（提示 + 输入框 +
+    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走。
+    term.options.lineHeight=_d.termStyle==='reader'?1.3:1;
+    // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
+    fit.fit();
+  }catch(_e){}
+});
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
 // zellij frame (or relay history seed) can therefore finish after the browser
 // has initialised the viewport scrollbar, leaving that viewport at scrollTop=0
@@ -15765,9 +16368,25 @@ function sendResize(){
 // text re-wraps, i.e. the reported flicker. Coalesce to the settled size.
 function onViewportResize(){
   clearTimeout(_rzT);
-  _rzT=setTimeout(function(){if(!fixedSize){try{fit.fit()}catch(e){}}sendResize()},250);
+  _rzT=setTimeout(function(){
+    // 先复算字号再 fit：字号换档字宽就变，反过来 fit 出来的是旧字号下的列数。
+    // 只动画布内的渲染几何，与后端的 resize 语义一如既往由下面的 sendResize 决定。
+    try{_wbApplyAutoFontSize()}catch(e){}
+    if(!fixedSize){try{fit.fit()}catch(e){}}
+    sendResize();
+  },250);
 }
 window.addEventListener('resize',onViewportResize);
+// 转屏：部分 iOS 版本只发 orientationchange 或先于 resize 发，重复触发被防抖吃掉。
+window.addEventListener('orientationchange',onViewportResize);
+// 嵌入方（工作台终端面板、会话坞）单独改 iframe 宽度时，窗口 resize 未必可靠地传
+// 进来。直接盯容器自己的尺寸，这一页才真正自包含 —— 任何嵌入方都跟着受益。
+if(typeof ResizeObserver!=='undefined'){
+  try{
+    var _wbHost=document.getElementById('terminal');
+    if(_wbHost)new ResizeObserver(onViewportResize).observe(_wbHost);
+  }catch(_e){}
+}
 (function connect(){
   // Derive base from the current path so the WS connects to the same prefix the
   // page was served under — works both directly (path '/') and behind the
@@ -16519,7 +17138,8 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
-      refreshTerminalViewToken();
+      // The view token intentionally stays per-boot random (no refresh): a
+      // worker restart must invalidate every previously issued read link.
       refreshTerminalWriteToken();
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves
@@ -16592,6 +17212,7 @@ process.on('message', async (raw: unknown) => {
         if (msg.turnId) {
           currentBotmuxTurnId = msg.turnId;
           currentBotmuxDispatchAttempt = msg.dispatchAttempt;
+          currentGatewayTrustedCaller = msg.trustedCaller;
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
           writeCliPidMarker();
           publishSandboxRelayCapability();
@@ -16713,6 +17334,7 @@ process.on('message', async (raw: unknown) => {
                 : undefined),
             codexAppInput: entry.codexAppInput,
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
+            trustedCaller: msg.trustedCaller,
           }));
         let initialInputCommitted = false;
         if (shouldQueueInitialPrompt({
@@ -16740,6 +17362,7 @@ process.on('message', async (raw: unknown) => {
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+            trustedCaller: msg.trustedCaller,
             codexAppInput: msg.promptCodexAppInput,
             // Thread the root's steer authorization so ordered pre-final steer can
             // fold follow-ups into THIS turn (the runner's canSteer requires the
@@ -16912,6 +17535,7 @@ process.on('message', async (raw: unknown) => {
           codexAppDispatchId: msg.codexAppDispatchId,
           queuedActivationToken: msg.queuedActivationToken,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          trustedCaller: msg.trustedCaller,
           codexAppInput,
         };
         // process.on('message') does not serialize async listeners. Hold the
@@ -16941,6 +17565,7 @@ process.on('message', async (raw: unknown) => {
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          trustedCaller: msg.trustedCaller,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
         });

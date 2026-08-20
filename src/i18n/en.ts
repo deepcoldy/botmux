@@ -54,6 +54,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_or_run': 'Click "Resume Session" to continue, or run in your terminal:',
   'card.body.click_resume_only': 'Click "Resume Session" to continue.',
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',
+  'card.body.resume_starts_fresh': 'Click "Resume Session" to reactivate this topic\'s message route; but {cliName} has no precisely resumable history session — your next message starts a **fresh session** without the old context.',
   'card.body.working_dir': '📁 Working dir:',
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
@@ -792,6 +793,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 Re-launched {cliName}',
   'card.action.resume_missing_session_id': '⚠️ Missing session_id, cannot resume.',
   'card.action.resume_success': '✅ Session resumed. Send a message to continue with {cliName}.',
+  'card.action.resume_success_fresh': '✅ Topic route reactivated. {cliName} has no precisely resumable history session — your next message starts a **fresh session** without the old context.',
   'card.action.resume_not_found': '⚠️ Session {short} not found — it may have been cleaned up.',
   'card.action.resume_not_closed': 'Session is already active, no need to resume.',
   'card.action.resume_anchor_occupied': '⚠️ This topic already has a newer session{detail}; cannot resume the older one.',
@@ -1112,6 +1114,19 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 Schedules',
   'card.dashboard.overview.goto_settings': '📂 Settings',
   'card.dashboard.overview.goto_groups': '📂 Groups',
+  // Plain link button (appCenter AppLink) — not a `dash_overview_*` callback.
+  'card.dashboard.overview.open_workbench': 'Open Workbench',
+  // The button's link carries the long-lived token and never expires (product
+  // decision — see core/workbench-link.ts). This note is the user's side of that
+  // trade: the entry never expires AND here is how to revoke it if it ever leaks.
+  // The card shows the button only (no plain-text link row), so this note names
+  // the rotate command and never the URL itself.
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 Standing entry — never expires; if you suspect a leak, run <font color="grey">botmux dashboard rotate</font> to revoke it instantly',
+  // Degraded path: token unreadable, so the button's link carries no credential.
+  // Say so plainly instead of advertising a standing entry that isn't one.
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 Dashboard credential unavailable — sign in from the browser once it opens',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

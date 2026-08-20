@@ -929,8 +929,7 @@ setInterval(() => {}, 1_000);
     }
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
 
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 4_000));
-    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(true);
+    await waitForPromptReady(child, messages, logs);
   }, 15_000);
 
   it('forces the synthetic working seed before classifying a limited settle', async () => {

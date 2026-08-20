@@ -57,6 +57,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_or_run': '点击「恢复会话」继续，或在终端执行：',
   'card.body.click_resume_only': '点击「恢复会话」继续。',
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
+  'card.body.resume_starts_fresh': '点击「恢复会话」可重新激活本话题的消息路由；但 {cliName} 没有可精确恢复的历史会话，下次对话将**新起干净会话**，旧上下文不会带回。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
@@ -793,6 +794,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 已重新启动 {cliName}',
   'card.action.resume_missing_session_id': '⚠️ 缺少 session_id，无法恢复。',
   'card.action.resume_success': '✅ 会话已恢复，发条消息继续与 {cliName} 对话。',
+  'card.action.resume_success_fresh': '✅ 话题路由已重新激活。{cliName} 没有可精确恢复的历史会话，下条消息将**新起干净会话**，旧上下文不会带回。',
   'card.action.resume_not_found': '⚠️ 找不到会话 {short}，可能已被清理。',
   'card.action.resume_not_closed': '会话已是活跃状态，无需恢复。',
   'card.action.resume_anchor_occupied': '⚠️ 当前话题已有新会话{detail}，无法恢复旧会话。',
@@ -1113,6 +1115,16 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
   'card.dashboard.overview.goto_groups': '📂 群组',
+  // 「打开工作台」是纯链接按钮（appCenter AppLink），不是 dash_overview_* 回调。
+  'card.dashboard.overview.open_workbench': '打开工作台',
+  // 按钮链接带长期 token、常驻不过期（产品决策，见 core/workbench-link.ts）。这行
+  // 小字承担用户侧的知情权：告诉他这个入口不会过期，也告诉他怀疑泄漏时怎么自己
+  // 作废。卡片里只有按钮、没有明文链接行，所以这里也不写链接本体，只写 rotate。
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 常驻入口，不会过期；怀疑泄漏用 <font color="grey">botmux dashboard rotate</font> 轮换 token 立即作废',
+  // 降级路径：读不到 token 时按钮链接不带凭证，如实说明，别吹「常驻不过期」。
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 暂时读不到 Dashboard 凭证，打开后需在浏览器里登录',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

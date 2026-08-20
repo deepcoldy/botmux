@@ -886,6 +886,7 @@ export function closeSession(
     const priorRiffParentTaskId = session.riffParentTaskId;
     const priorDashboardAttachments = session.dashboardAttachments;
     const priorQueuedAttachments = session.queuedAttachments;
+    const priorPreviewTarget = session.previewTarget;
     const priorQuarantinedLineage = session.mojoQuarantinedLineage;
     const priorQuarantineNoticePending = session.mojoQuarantineNoticePending;
     const priorLocalResidual = session.mojoLocalResidual;
@@ -896,6 +897,17 @@ export function closeSession(
     session.closedAt = new Date().toISOString();
     session.dashboardAttachments = undefined;
     session.queuedAttachments = undefined;
+    // `previewTarget` is a live loopback (host, port) the session's agent
+    // registered with `botmux preview <port>` for its CURRENT worker
+    // generation — routing state, not a durable property of the conversation.
+    // A closed session owns no port any more, and the OS is free to hand that
+    // number to an unrelated local server; the preview proxy dials a target by
+    // host/port alone, so a retained value would let a later reader (resume,
+    // an offline row copy, a dashboard snapshot) proxy the user into someone
+    // else's service. Drop it in the same atomic save as status='closed'.
+    // Cleanup only: registration and proxying are untouched, and a resumed
+    // session simply re-runs `botmux preview <port>`.
+    session.previewTarget = undefined;
     session.mojoCloseJournal = undefined;
     // Survives close on purpose — the containment handle is still in the durable
     // store, so the row must keep reporting the residual until the handle clears.
@@ -920,6 +932,7 @@ export function closeSession(
       session.riffParentTaskId = priorRiffParentTaskId;
       session.dashboardAttachments = priorDashboardAttachments;
       session.queuedAttachments = priorQueuedAttachments;
+      session.previewTarget = priorPreviewTarget;
       // Without these two the row keeps a parked lineage after a FAILED close, so
       // the next turn treats a still-live remote session as quarantined and starts
       // a new one — i.e. the "close failed, retry unchanged" guarantee is broken.
@@ -955,6 +968,10 @@ export function closeSession(
  * since 2026-07, but older closed rows can still contain prepared input.  A
  * generic resume is an explicit new lifecycle and must never revive that
  * abandoned FIFO.
+ *
+ * `previewTarget` is cleared here for the same reason: closeSession() now drops
+ * it, but rows closed by an older build still carry one on disk, and resume
+ * starts a new worker generation that has not registered any port.
  */
 export function reactivateClosedSession(
   sessionId: string,
@@ -984,6 +1001,7 @@ export function reactivateClosedSession(
     queuedActivationTail: session.queuedActivationTail,
     queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
     pendingRepoSetup: session.pendingRepoSetup,
+    previewTarget: session.previewTarget,
     mojoCloseJournal: session.mojoCloseJournal,
   };
 
@@ -1005,6 +1023,7 @@ export function reactivateClosedSession(
   session.queuedActivationTail = undefined;
   session.queuedActivationTailNextOrder = undefined;
   session.pendingRepoSetup = undefined;
+  session.previewTarget = undefined;
   session.mojoCloseJournal = undefined;
 
   try {

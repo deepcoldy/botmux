@@ -25,6 +25,7 @@ describe('dashboard bot payload helpers', () => {
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
       'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',
+      'sessionOwnerReminder',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });

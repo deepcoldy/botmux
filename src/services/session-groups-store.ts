@@ -14,15 +14,19 @@
  *      session group whose session was /close'd resumes that session instead
  *      of spawning a fresh one (的话题内续聊同款体验).
  *   3. ownerOpenId                 — the DM user the group was born for.
+ *   4. origin* provenance          — WHICH authorization birthed the group, so
+ *      the dispatcher can keep charging that same quota/expiry instead of
+ *      minting a fresh per-group allowance (see the origin* fields below).
  *
  * File layout mirrors session-store / chat-first-seen-store: one file per bot
  * at `${config.session.dataDir}/session-groups-${appId}.json`, written
  * atomically via tmp + rename. One daemon process serves one bot, so the
  * per-appId singleton pattern applies.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 
 export interface SessionGroupEntry {
@@ -34,8 +38,36 @@ export interface SessionGroupEntry {
   createdAt: number;
   /** Epoch ms of the last observed activity (birth, resume, new session). */
   lastActiveAt: number;
+  /**
+   * Provenance of the authorization that birthed this group — the DM-side
+   * `evaluateTalk` verdict, captured at birth.
+   *
+   * A session group is minted for ONE user off ONE authorization, so every
+   * later message in it must keep charging that SAME authorization instead of
+   * being re-judged against the brand-new chat id (which no chatGrant, no
+   * quota counter and no expiry has ever seen). Without this, the auto-written
+   * oncall binding — created only to carry the working dir — became the group's
+   * talk source: unlimited when no `messageQuota.defaultLimit` is configured,
+   * a FRESH per-group allowance when one is, and `restrictGrantCommands`
+   * silently defeated because the reason was no longer `chatGrant`/`globalGrant`.
+   *
+   * Typed as a plain string (not `TalkReason`) on purpose: importing the type
+   * from `im/lark/event-dispatcher` would close an import cycle, since the
+   * dispatcher reads this registry.
+   */
+  originReason?: string;
+  /** quotaKey of that authorization; absent = the source carried no quota. */
+  originQuotaKey?: string;
+  /** Chat the source authorization lives on (the DM). Revoke / expiry cleanup
+   *  must target it — the session group itself holds no grant record. */
+  originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
+  /** Failed scheduling rounds (each round contains the service's bounded
+   * in-call retry). Persisted so later messages cannot spawn unbounded CLIs. */
+  titleAttempts?: number;
+  /** Earliest epoch-ms at which another healing round may start. */
+  titleRetryAt?: number;
 }
 
 let entries: Map<string, SessionGroupEntry> = new Map();
@@ -78,10 +110,8 @@ function load(): void {
 function persist(): void {
   ensureDir();
   const fp = getFilePath();
-  const tmp = `${fp}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(entries), null, 2), 'utf-8');
-    renameSync(tmp, fp);
+    atomicWriteFileSync(fp, `${JSON.stringify(Object.fromEntries(entries), null, 2)}\n`, { mode: 0o600 });
   } catch (err) {
     logger.error(`[session-groups] failed to persist ${fp}: ${err}`);
   }
@@ -96,7 +126,12 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     lastSessionId: entry.lastSessionId,
     createdAt: entry.createdAt ?? now,
     lastActiveAt: now,
+    originReason: entry.originReason,
+    originQuotaKey: entry.originQuotaKey,
+    originChatId: entry.originChatId,
     titled: entry.titled,
+    titleAttempts: entry.titleAttempts,
+    titleRetryAt: entry.titleRetryAt,
   });
   persist();
 }
@@ -130,7 +165,22 @@ export function markSessionGroupTitled(chatId: string): void {
   const cur = entries.get(chatId);
   if (!cur || cur.titled) return;
   cur.titled = true;
+  cur.titleRetryAt = undefined;
   persist();
+}
+
+/** Record a failed title round and its next backoff boundary. */
+export function markSessionGroupTitleFailed(chatId: string, failedAt = Date.now()): SessionGroupEntry | undefined {
+  load();
+  const cur = entries.get(chatId);
+  if (!cur || cur.titled) return cur;
+  const attempts = (cur.titleAttempts ?? 0) + 1;
+  cur.titleAttempts = attempts;
+  // 30s, 2m, then 10m. Three rounds is the lifetime cap.
+  const backoff = attempts === 1 ? 30_000 : attempts === 2 ? 120_000 : 600_000;
+  cur.titleRetryAt = failedAt + backoff;
+  persist();
+  return cur;
 }
 
 /** Remove a registry entry (group disbanded / bot removed / gc). */

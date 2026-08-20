@@ -11,8 +11,9 @@ import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
 import { findTraexRolloutBySessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
+import { findGrokUpdatesBySessionId } from './grok-transcript.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'antigravity';
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -264,7 +265,7 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'antigravity',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'grok', 'antigravity',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -324,6 +325,15 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
     case 'traex': {
       const path = cachedTranscriptPathLookup(`traex:${sid}`, null, () => findTraexRolloutBySessionId(sid) ?? null, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
+    }
+    case 'grok': {
+      const path = cachedTranscriptPathLookup(
+        `grok:${sid}:${q.cwd ?? ''}`,
+        null,
+        () => findGrokUpdatesBySessionId(sid, q.cwd) ?? null,
+        { retryMiss: q.fresh },
+      );
+      return path ? { path, kind: 'grok' } : null;
     }
     case 'pi': {
       const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => findPiTranscriptBySessionId(sid, q.cwd) ?? null, { retryMiss: q.fresh });

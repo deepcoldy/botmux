@@ -448,8 +448,10 @@ describe('worker pipe initial screen ordering', () => {
     const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
     expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
     // Two additional checks normalize nested spawn failures before the three
-    // restart/init/message handlers consume them.
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    // restart/init/message handlers consume them; plus the generational-race
+    // provenance commit re-throws a superseded spawn instead of tearing down
+    // (the commit-fail path must not swallow CliSpawnSupersededError).
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(6);
     const restartHandler = source.slice(
       source.indexOf('async function restartCliProcess('),
       source.indexOf('// ─── HTTP + WebSocket Server'),

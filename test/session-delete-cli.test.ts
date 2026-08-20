@@ -41,6 +41,8 @@ interface StoredSession {
   closedAt?: string;
   larkAppId?: string;
   adoptedFrom?: { source: 'tmux'; tmuxTarget: string; cwd: string };
+  /** Live preview loopback registered by the worker generation being closed. */
+  previewTarget?: { host: string; port: number; registeredAt: string };
 }
 
 afterEach(() => {
@@ -293,6 +295,10 @@ describe('botmux delete — daemon-first close', () => {
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-offline', {
       adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' },
+      // A retained target would let a later reader proxy into whatever local
+      // server re-acquires the port; offline close must drop it exactly like
+      // the daemon-side closeSession() does.
+      previewTarget: { host: '127.0.0.1', port: 43111, registeredAt: '2026-07-22T00:00:00.000Z' },
     });
     const sessionsPath = writeSessions(dataDir, [session]);
 
@@ -308,6 +314,7 @@ describe('botmux delete — daemon-first close', () => {
     const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
     expect(stored[session.sessionId].status).toBe('closed');
     expect(stored[session.sessionId].closedAt).toBeTruthy();
+    expect(stored[session.sessionId]).not.toHaveProperty('previewTarget');
   });
 
   it('orders the current session last for delete all', async () => {

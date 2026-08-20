@@ -171,6 +171,19 @@ describe('built-in botmux-bots skill (collaboration roster)', () => {
     expect(skill!.content).toContain('/introduce');
     expect(skill!.content).toContain('botmux-handoff');
   });
+
+  it('documents the dispatch/collaboration decision fields and the inline help', () => {
+    // Guards against doc drift: the CLI output carries dispatch/collaboration
+    // blocks + a top-level collaborationHelp. An agent that reads this skill
+    // (not just the injected inline help) must learn those fields exist and
+    // that `unknown` means "no evidence", not "offline".
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
+    expect(skill!.content).toContain('dispatch');
+    expect(skill!.content).toContain('collaboration');
+    expect(skill!.content).toContain('collaborationHelp');
+    expect(skill!.content).toContain('operate');
+    expect(skill!.content).toContain('unknown');
+  });
 });
 
 describe('built-in botmux-handoff skill', () => {

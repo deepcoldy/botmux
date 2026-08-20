@@ -12,9 +12,16 @@
  * written at creation, session spawn, streaming card) behaves exactly like a
  * normal solo-group chat-scope session.
  *
+ * The oncall binding written at creation carries ONLY the working dir: the
+ * group's talk/quota identity comes from the authorization provenance recorded
+ * in the registry (origin* fields), which the dispatcher replays for every
+ * later message. See evaluateSessionGroupTalk in im/lark/event-dispatcher.
+ *
  * Returns null to fall through to the legacy thread behavior:
  *   - the message is a slash command (never birth a group for /help, /login …)
  *   - group creation failed (a DM notice explains the fallback)
+ *   - the requested working-dir binding did not commit (the group would spawn
+ *     its sessions in the wrong directory)
  */
 import { getBot } from '../bot-registry.js';
 import { createGroupWithBots } from '../services/group-creator.js';
@@ -25,7 +32,8 @@ import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
 import { sendMessage, replyMessage } from '../im/lark/client.js';
-import { extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
+import { evaluateTalk, extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
+import { stripLeadingMentions } from '../im/lark/message-parser.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 
@@ -39,6 +47,43 @@ export function buildPlaceholderName(text: string | null, prefix: string, locale
     ? Array.from(flat).slice(0, PLACEHOLDER_MAX_CHARS).join('')
     : t('sg.placeholder_untitled', undefined, locale);
   return `${prefix}${base}`;
+}
+
+/**
+ * Does this inbound message decline session-group birth because it is a slash
+ * command? Exported so the CALLER can ask BEFORE it charges message quota.
+ *
+ * A command (`/help`, `/login`, `/close`, …) never reaches a CLI, so it must
+ * neither spend a quota unit nor be blocked by an exhausted one — but the
+ * pre-birth charge has to run before the real Feishu chat is created (a quota
+ * denial must have zero external side effects), i.e. long before the router's
+ * own slash parsing. Hoisting THIS predicate is what keeps both invariants.
+ *
+ * Single source of truth on purpose: the caller's "skip the charge" decision and
+ * this function's "don't birth" decision have to be the SAME decision. A caller
+ * predicate NARROWER than this one re-opens the charge-a-command bug; a WIDER
+ * one silently stops births for messages this function would still birth. Both
+ * sides must call this.
+ *
+ * Leading @mentions are stripped FIRST, with the same helper and the same
+ * mention list the router later uses to build `cmdContent`. Without that step
+ * this predicate and the router disagree about the exact same message: Lark
+ * delivers "@Bot /help" as text "@_user_1 /help" (resolved to "@Bot /help"),
+ * which does not start with "/" here — so the message was charged a quota unit
+ * AND birthed a group — while the router, reading the mention-stripped text,
+ * still routed it as /help and never reached a CLI. That is a pure quota loss
+ * on the most natural way to type a command at a bot.
+ */
+export function declinesSessionGroupBirthAsSlashCommand(data: any): boolean {
+  const text = extractMessageTextForRouting(data?.message);
+  if (!text) return false;
+  // Only mentions that actually carry a display name are usable by the
+  // name-based strip; when none do, the empty list lets stripLeadingMentions
+  // fall back to its best-effort `@<token>` regex, which also clears the raw
+  // "@_user_1" placeholders extractMessageTextForRouting could not resolve.
+  const named = (Array.isArray(data?.message?.mentions) ? data.message.mentions : [])
+    .filter((m: any) => typeof m?.name === 'string' && m.name.length > 0);
+  return stripLeadingMentions(text.trim(), named).startsWith('/');
 }
 
 export async function maybeBirthSessionGroup(
@@ -56,11 +101,22 @@ export async function maybeBirthSessionGroup(
   const trimmed = (text ?? '').trim();
   // Slash commands (daemon or passthrough) must never birth a group — /close,
   // /login, /relay … are conversation-management, not conversations.
-  if (trimmed.startsWith('/')) return null;
+  // Shared predicate: handleNewTopic asks the same question before charging
+  // quota, so a command is neither charged nor blocked by an exhausted quota.
+  if (declinesSessionGroupBirthAsSlashCommand(data)) return null;
 
   const prefix = sg.namePrefix ?? '';
   const placeholder = buildPlaceholderName(text, prefix, locale);
   const workingDir = sg.workingDir?.trim() || botCfg.defaultWorkingDir?.trim() || botCfg.workingDir?.trim() || undefined;
+
+  // Provenance snapshot, taken in the DM context BEFORE the new chat exists:
+  // WHICH authorization is paying for this group. The dispatcher replays it for
+  // every later message in the group (same quota counter, same reason, same
+  // expiry/revocation) instead of re-judging against a brand-new chat id that
+  // no grant has ever seen — see evaluateSessionGroupTalk. This is the same
+  // verdict the caller's pre-birth quota charge was made on (chatType is 'p2p'
+  // by construction here, which the p2pOpen leg needs).
+  const originEv = evaluateTalk(larkAppId, dmChatId, senderOpenId, undefined, undefined, ctx.chatType);
 
   try {
     const result = await createGroupWithBots({
@@ -87,7 +143,29 @@ export async function maybeBirthSessionGroup(
       throw new Error(`user invite rejected (${senderOpenId.substring(0, 12)}…)`);
     }
 
-    registerSessionGroup(newChatId, { ownerOpenId: senderOpenId, lastSessionId: '' });
+    // A requested oncall binding that did NOT commit leaves the group unable to
+    // resolve its working dir — every turn would spawn in the wrong place. The
+    // binding result was previously never inspected, so this failed silently.
+    // Treat it like the rejected-invite case: disband and fall back to the
+    // legacy DM thread rather than hand the user a half-working group.
+    if (workingDir && !result.oncallBindings.some(b => b.larkAppId === larkAppId && b.ok)) {
+      const detail = result.oncallBindings.find(b => b.larkAppId === larkAppId)?.error ?? 'not attempted';
+      await deleteChat(larkAppId, newChatId)
+        .then(r => { if (!r.ok) logger.warn(`[session-group] orphan chat ${newChatId.substring(0, 12)} disband failed: ${r.error}`); })
+        .catch(err => logger.warn(`[session-group] orphan chat disband threw: ${err}`));
+      await unbindOncall(larkAppId, newChatId)
+        .catch(err => logger.warn(`[session-group] orphan oncall unbind threw: ${err}`));
+      throw new Error(`working-dir binding failed (${detail})`);
+    }
+
+    registerSessionGroup(newChatId, {
+      ownerOpenId: senderOpenId,
+      lastSessionId: '',
+      // Persisted provenance — the group's talk/quota identity for its whole life.
+      originReason: originEv.reason,
+      originQuotaKey: originEv.quotaKey,
+      originChatId: dmChatId,
+    });
 
     // Intro message: quote the user's DM text so the group is self-explaining.
     // Its message_id becomes the turn's IN-GROUP anchor (ctx.messageId below):
@@ -136,7 +214,7 @@ export async function maybeBirthSessionGroup(
     logger.info(
       `[session-group] born chat=${newChatId.substring(0, 12)} for dm=${dmChatId.substring(0, 12)} ` +
       `msg=${messageId.substring(0, 12)} intro=${introMessageId?.substring(0, 12) ?? '-'} ` +
-      `name="${placeholder}" workingDir=${workingDir ?? '-'}`,
+      `name="${placeholder}" workingDir=${workingDir ?? '-'} origin=${originEv.reason}`,
     );
 
     return {

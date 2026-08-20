@@ -69,6 +69,7 @@ describe('bot defaults focused layout', () => {
     // 会话后端 stays under 高级; 启动环境(Shell+env) stays under 高级 too.
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');
+    expect(advanced).toContain('<SessionOwnerReminderSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
@@ -124,5 +125,15 @@ describe('bot defaults focused layout', () => {
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
     expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
+  });
+
+  it('offers granular Session owner reminder controls in advanced settings', () => {
+    expect(page).toContain('function SessionOwnerReminderSection');
+    for (const state of ['idle', 'dormant', 'pending_repo', 'tui_prompt', 'agent_attention', 'limited']) {
+      expect(page).toContain(`value: '${state}'`);
+    }
+    for (const key of ['ownerReminderTitle', 'ownerReminderInterval', 'ownerReminderText', 'ownerReminderStates']) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
   });
 });

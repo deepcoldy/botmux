@@ -44,7 +44,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
-import { codexReasoningEffortsForModel } from '../../services/codex-reasoning-effort.js';
+import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -939,6 +939,7 @@ function BotDefaultsCard(props: {
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
       </div>
@@ -1018,6 +1019,129 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
+    </section>
+  );
+}
+
+type OwnerReminderState = NonNullable<BotDefaultsRow['sessionOwnerReminder']>['states'][number];
+const OWNER_REMINDER_STATE_OPTIONS = [
+  { value: 'idle', labelKey: 'botDefaults.ownerReminderStateIdle' },
+  { value: 'dormant', labelKey: 'botDefaults.ownerReminderStateDormant' },
+  { value: 'pending_repo', labelKey: 'botDefaults.ownerReminderStatePendingRepo' },
+  { value: 'tui_prompt', labelKey: 'botDefaults.ownerReminderStateTuiPrompt' },
+  { value: 'agent_attention', labelKey: 'botDefaults.ownerReminderStateAgentAttention' },
+  { value: 'limited', labelKey: 'botDefaults.ownerReminderStateLimited' },
+] as const;
+
+// Offline/error rows can lack the daemon-provided default payload. Keep this
+// browser fallback aligned with DEFAULT_SESSION_OWNER_REMINDER.
+const DEFAULT_OWNER_REMINDER = {
+  enabled: false,
+  intervalMinutes: 30,
+  text: '该会话已等待处理，请继续跟进。',
+  states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
+};
+
+function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.sessionOwnerReminder ?? DEFAULT_OWNER_REMINDER;
+  const [enabled, setEnabled] = useState(initial.enabled === true);
+  const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
+  const [text, setText] = useState(initial.text);
+  const [states, setStates] = useState<OwnerReminderState[]>([...initial.states]);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.sessionOwnerReminder ?? DEFAULT_OWNER_REMINDER;
+    setEnabled(next.enabled === true);
+    setIntervalValue(String(next.intervalMinutes));
+    setText(next.text);
+    setStates([...next.states]);
+  }, [props.bot.sessionOwnerReminder]);
+
+  function toggleState(state: OwnerReminderState, checked: boolean): void {
+    setStates(current => checked
+      ? (current.includes(state) ? current : [...current, state])
+      : current.filter(item => item !== state));
+  }
+
+  async function save(): Promise<void> {
+    const minutes = Number(interval);
+    const cleanText = text.trim();
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10_080) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderIntervalInvalid')}` });
+      return;
+    }
+    if (!cleanText || Array.from(cleanText).length > 500 || /<\s*at\b/i.test(cleanText)) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderTextInvalid')}` });
+      return;
+    }
+    if (enabled && states.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`,
+        payload,
+      );
+      if (res.ok && res.body.ok) {
+        const next = res.body.sessionOwnerReminder ?? payload;
+        props.patchBot(props.bot.larkAppId, { sessionOwnerReminder: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-owner-reminder">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.ownerReminderHelp')}>{tr('botDefaults.ownerReminderTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-owner-reminder"
+        title={tr('botDefaults.ownerReminderEnabled')}
+        help={tr('botDefaults.ownerReminderEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.ownerReminderInterval')}</span>
+          <input type="number" min={1} max={10080} step={1} data-input="ownerReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.ownerReminderStates')}</h4>
+        <div className="bd-owner-reminder-states">
+          {OWNER_REMINDER_STATE_OPTIONS.map(option => (
+            <label key={option.value}>
+              <input type="checkbox" checked={states.includes(option.value)} disabled={busy} onChange={event => toggleState(option.value, event.currentTarget.checked)} />
+              <span>{tr(option.labelKey)}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.ownerReminderTextHelp')}>{tr('botDefaults.ownerReminderText')}</FieldTitle></span>
+          <textarea rows={3} maxLength={500} data-input="ownerReminderText" value={text} disabled={busy} onChange={event => setText(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-owner-reminder" disabled={busy} onClick={() => void save()}>{tr('botDefaults.ownerReminderSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-owner-reminder-status': '' }} />
+      </div>
     </section>
   );
 }
@@ -1580,7 +1704,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: (cliKey === 'grok' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -1759,9 +1883,13 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  const isReasoningSelection = isCodexSelection || cliKey === 'grok';
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
-  const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
+  const reasoningEffortOptions = useMemo(
+    () => reasoningEffortsForCliModel(cliKey === 'grok' ? 'grok' : isCodexSelection ? 'codex' : undefined, model),
+    [cliKey, isCodexSelection, model],
+  );
 
   useEffect(() => {
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
@@ -1980,7 +2108,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isCodexSelection && (
+      {isReasoningSelection && (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.agentReasoningEffortHelp')}>{tr('botDefaults.agentReasoningEffort')}</FieldTitle>
@@ -1990,7 +2118,16 @@ export function BotAgentSection(props: {
               value={reasoningEffort}
               disabled={agentBusy}
               options={[
-                { value: '', label: tr('botDefaults.agentReasoningEffortDefault') },
+                {
+                  value: '',
+                  label: tr(
+                    cliKey === 'grok'
+                      ? 'botDefaults.agentReasoningEffortDefaultGrok'
+                      : isCodexSelection
+                        ? 'botDefaults.agentReasoningEffortDefaultCodex'
+                        : 'botDefaults.agentReasoningEffortDefault',
+                  ),
+                },
                 ...reasoningEffortOptions.map(value => ({
                   value,
                   label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),
@@ -3889,17 +4026,18 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
  *  - off：不打标签
  *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
  *  → 本行轮询到 authorized 后徽标变绿。 */
-function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
+export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const lifecycle = useRef({ generation: 0, mounted: true });
 
-  const fetchStatus = async (): Promise<boolean> => {
+  const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
-      if (res.ok && res.body.ok) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation && res.ok && res.body.ok) {
         setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'feed-group') });
         return !!res.body.authorized;
       }
@@ -3907,30 +4045,55 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     return false;
   };
 
-  useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+  useEffect(() => {
+    lifecycle.current.mounted = true;
+    const generation = ++lifecycle.current.generation;
+    // The row instance can survive a bot switch. Clear the previous bot's
+    // in-flight UI state as well as invalidating its polling generation.
+    setStatus(null);
+    setAuthBusy(false);
+    setModeBusy(false);
+    setErr(null);
+    void fetchStatus(generation);
+    return () => {
+      lifecycle.current.mounted = false;
+      lifecycle.current.generation += 1;
+    };
+  }, [props.bot.larkAppId]);
 
   async function saveMode(next: string): Promise<void> {
+    // Capture the row's generation: a bot switch bumps it (see the effect
+    // above), and a slow response for the previous bot must not overwrite the
+    // new bot's row state — drop it silently instead.
+    const generation = lifecycle.current.generation;
     setModeBusy(true);
     setErr(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
         setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
       } else {
         setErr(responseErrorText(res));
       }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setModeBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setModeBusy(false);
     }
   }
 
   async function startAuth(): Promise<void> {
+    const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
     try {
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
+      // A bot switch while the POST was in flight must neither surface the old
+      // bot's error nor open the old bot's authorization page in a new tab.
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (!res.ok || !res.body.ok || !res.body.authUrl) {
         setErr(responseErrorText(res));
         return;
@@ -3939,13 +4102,18 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 3000));
-        if (await fetchStatus()) return;
+        if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+        if (await fetchStatus(generation)) return;
       }
-      setErr(tr('botDefaults.sgTagAuthTimeout'));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(tr('botDefaults.sgTagAuthTimeout'));
+      }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setAuthBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
     }
   }
 

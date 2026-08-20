@@ -133,6 +133,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     logicalSessionCount: typeof j?.logicalSessionCount === 'number' ? j.logicalSessionCount : 0,
     residentSessionCount: typeof j?.residentSessionCount === 'number' ? j.residentSessionCount : 0,
     dormantSessionCount: typeof j?.dormantSessionCount === 'number' ? j.dormantSessionCount : 0,
+    sessionOwnerReminder: j?.sessionOwnerReminder && typeof j.sessionOwnerReminder === 'object'
+      ? j.sessionOwnerReminder
+      : null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     customPassthroughCommands: typeof j?.customPassthroughCommands === 'string' ? j.customPassthroughCommands : '',
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',

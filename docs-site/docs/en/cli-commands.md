@@ -7,7 +7,7 @@ Manage the daemon and sessions from the terminal.
 | `botmux setup` | Interactive configuration (first run / add / edit / delete a bot) |
 | `botmux start` | Start the daemon (managed by PM2) |
 | `botmux stop` | Stop the daemon |
-| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` also restarts botmux's PM2 God daemon |
+| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` additionally retires botmux's PM2 God daemon after the fleet is safely shut down, so the whole process tree restarts from the invoking shell's clean environment (plugin services are gracefully stopped first; auto ones come back after the restart) |
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |

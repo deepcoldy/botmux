@@ -226,9 +226,26 @@ describe('graceful shutdown supervisor contract', () => {
       const region = cli.slice(start, end);
       expect(start, label).toBeGreaterThanOrEqual(0);
       expect(end, label).toBeGreaterThan(start);
-      expect(region, label).toContain('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
-      expect(region, label).not.toContain('withFileLockSync(PM2_FLEET_MUTATION_LOCK_TARGET');
+      expect(region, label).toContain('withPm2FleetMutationLock(');
+      expect(region, label).not.toContain('withPm2FleetMutationLockSync(');
     }
+
+    // Plugin services live under the SAME God, so their lifecycle must share
+    // the same fleet lock — in fixed order (fleet first, service second), and
+    // even for the status probe, whose pm2 jlist can lazily birth a God.
+    const serviceManager = readFileSync(
+      new URL('../src/core/plugins/service-manager.ts', import.meta.url), 'utf8',
+    );
+    expect(serviceManager).toContain(
+      'withPm2FleetMutationLockSync(\n    () => withFileLockSync(serviceLockTarget()',
+    );
+    expect(serviceManager).toContain(
+      'withPm2FleetMutationLock(\n    () => withFileLock(serviceLockTarget()',
+    );
+    const statusFn = serviceManager.slice(
+      serviceManager.indexOf('export async function listPluginServiceStatus('),
+    );
+    expect(statusFn.slice(0, statusFn.indexOf('\n}'))).toContain('withPluginServiceLock(');
 
     const exactHelper = cli.slice(
       cli.indexOf('async function cmdInternalPm2StartExact('),
@@ -237,6 +254,49 @@ describe('graceful shutdown supervisor contract', () => {
     expect(exactHelper).toContain('BOTMUX_PM2_FLEET_LOCK_OWNER_PID');
     expect(exactHelper).toContain('PM2_FLEET_MUTATION_LOCK_TARGET}.lock');
     expect(exactHelper).toContain('lockPid !== process.ppid');
+  });
+
+  it('read-only status/logs cannot lazily birth a PM2 God', () => {
+    // Any pm2 client invocation with no live God daemonizes one from its own
+    // env (pm2 Client.start → pingDaemon false → launchDaemon).
+    //
+    // cmdStatus keeps a REAL atomic gate: the God scan and the pm2 call both
+    // run inside the fleet lock (runPm2 is synchronous), and God retirement
+    // needs that same lock, so no interleaving can retire the observed God
+    // before the client connects. On lock-wait timeout it exits non-zero.
+    const statusStart = cli.indexOf('async function cmdStatus(');
+    const status = cli.slice(statusStart, cli.indexOf('function cmdUpgrade(', statusStart));
+    expect(status).toContain('withPm2FleetMutationLock(');
+    const statusGate = status.indexOf('listPm2GodDaemonPids().length === 0');
+    const statusRun = status.indexOf("runPm2(['status'])");
+    expect(statusGate).toBeGreaterThanOrEqual(0);
+    expect(statusRun).toBeGreaterThan(statusGate);
+    expect(status).toContain('process.exitCode = 1');
+
+    // cmdLogs cannot get the same shape — its PM2 client would outlive any
+    // held lock, and "gate, release, then spawn" is a check/use race (the God
+    // can be retired between release and the client's connect). So logs runs
+    // NO pm2 client at all: it tails the log files pm2 writes. Structurally
+    // there is nothing left to race — pin the absence of every pm2 entry
+    // point across the TRANSITIVE call chain, not just the function body
+    // (warnIfLegacyBotmuxAlive once hid a legacy-home jlist client that a
+    // body-only scan missed).
+    const logsStart = cli.indexOf('async function cmdLogs(');
+    const logs = cli.slice(logsStart, statusStart);
+    expect(logs).toContain('LogFileFollower');
+    const legacyWarnStart = cli.indexOf('function warnIfLegacyBotmuxAlive(');
+    const legacyWarn = cli.slice(legacyWarnStart, cli.indexOf('\n}', legacyWarnStart));
+    const logTail = readFileSync(new URL('../src/cli/log-tail.ts', import.meta.url), 'utf8');
+    for (const banned of ['runPm2(', 'pm2Capture(', 'pm2Bin(', 'buildPm2SpawnCommand(', 'pm2Env(']) {
+      expect(logs, `cmdLogs: ${banned}`).not.toContain(banned);
+      expect(legacyWarn, `warnIfLegacyBotmuxAlive: ${banned}`).not.toContain(banned);
+      expect(logTail, `log-tail: ${banned}`).not.toContain(banned);
+    }
+    // The legacy warning verifies the recorded pid against the process-table
+    // God marker scan (a stale pid file must not match a reused pid) and
+    // reads PM2's own pid files instead of asking a client.
+    expect(legacyWarn).toContain('listPm2GodDaemonPids(legacyHome).includes(legacyPid)');
+    expect(legacyWarn).toContain("join(legacyHome, 'pids')");
   });
 
   it('fails closed before PM2 mutation on duplicate Gods, stale preflight, or unregistered descriptors', () => {
@@ -384,7 +444,12 @@ describe('graceful shutdown supervisor contract', () => {
     expect(legacy).toContain('assertNoDuplicatePm2GodDaemons(legacyHome)');
     expect(legacy).toContain('preflightNodeSanity(legacyHome)');
 
-    expect(cli).not.toContain("runPm2(['kill']");
+    // `pm2 kill` slaughters every managed app without the safe shutdown
+    // handshake, so the ONLY permitted call site is the include-pm2 God
+    // retirement inside cmdRestart, which runs strictly after the fleet is
+    // verified retired (pinned by the God-retirement contract test below).
+    expect(legacy).not.toContain("runPm2(['kill']");
+    expect(cli.split("runPm2(['kill']").length - 1).toBe(1);
   });
 
   it('exposes an explicit double-confirmed first-upgrade bootstrap without weakening normal shutdown', () => {
@@ -407,21 +472,39 @@ describe('graceful shutdown supervisor contract', () => {
     expect(cli).toContain('botmux restart --bootstrap-shutdown-protocol --yes');
   });
 
-  it('rejects include-pm2 before breadcrumb/fleet mutation when a live God exists', () => {
+  it('retires the God only after the fleet is verified retired, and never by PID signal', () => {
     const start = cli.indexOf('async function cmdRestart()');
     const end = cli.indexOf('/**\n * Bring a SINGLE bot', start);
     const restart = cli.slice(start, end);
-    const admission = restart.indexOf(
-      'assertIncludePm2RestartAdmission(listPm2GodDaemonPids())',
-    );
-    const consume = restart.indexOf('consumeRestartIntentTo(');
-    const retire = restart.indexOf('deleteAllBotmuxProcesses()');
-    expect(admission).toBeGreaterThanOrEqual(0);
-    expect(consume).toBeGreaterThan(admission);
-    expect(retire).toBeGreaterThan(consume);
+    const coreRetire = restart.indexOf('deleteAllBotmuxProcesses()');
+    const pluginStop = restart.indexOf('stopPluginServicesForCli(undefined, {})');
+    const strictStops = restart.indexOf("report.action === 'failed'");
+    const verifyEmpty = restart.indexOf("readVerifiedBotmuxPm2Projection('restart-start')");
+    const quiescentGate = restart.indexOf('assertPm2RegistryQuiescentForGodRetirement(');
+    const godRetire = restart.indexOf('retireSoleLivePm2God(');
+    const freshStart = restart.indexOf('runBoundedPm2StartTransaction(');
+    expect(coreRetire).toBeGreaterThanOrEqual(0);
+    expect(pluginStop).toBeGreaterThan(coreRetire);
+    // A plugin stop failure is a collected report, not a thrown error — the
+    // include-pm2 path must re-check reports and refuse before touching the God.
+    expect(strictStops).toBeGreaterThan(pluginStop);
+    expect(verifyEmpty).toBeGreaterThan(strictStops);
+    // Whole-registry quiescence proof (plugin rows and orphans included)
+    // strictly between the core projection check and the kill.
+    expect(quiescentGate).toBeGreaterThan(verifyEmpty);
+    expect(godRetire).toBeGreaterThan(quiescentGate);
+    expect(freshStart).toBeGreaterThan(godRetire);
+    // A God that appears between retirement and the fresh start was born from
+    // some other client's environment — the start transaction refuses it.
+    const replacementGuard = restart.indexOf('assertNoReplacementPm2God(listPm2GodDaemonPids())');
+    expect(replacementGuard).toBeGreaterThan(godRetire);
+    expect(replacementGuard).toBeLessThan(restart.indexOf("runPm2(['start', cfg], true, PM2_HOME, timeoutMs)"));
+    // Socket-addressed kill only — a raw PID signal cannot be generation-bound.
+    expect(restart).toContain("runPm2(['kill']");
     expect(restart).not.toContain('killPm2GodDaemon');
-    expect(cli).toContain('--include-pm2 仅允许“入场时没有 live PM2 God”的干净启动');
-    expect(cli).not.toContain('--include-pm2 同时重启 PM2 God');
+    const godRetirement = readFileSync(new URL('../src/cli/pm2-god-retirement.ts', import.meta.url), 'utf8');
+    expect(godRetirement).not.toContain('process.kill');
+    expect(cli).toContain('cannot be combined with --include-pm2');
   });
 
   it('attests the whole daemon fleet then uses exact IPC batch/successor requests', () => {

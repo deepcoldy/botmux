@@ -125,7 +125,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
-import { resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -178,6 +178,9 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
   vi.mocked(buildStreamingCard).mockClear();
+  vi.mocked(getBot).mockReturnValue({
+    config: { larkAppId: APP_ID, cliId: 'claude-code' },
+  } as any);
   setTerminalProxyPort(8800);
 });
 
@@ -465,6 +468,65 @@ describe('postTurnStartingCard', () => {
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.streamCardPending).toBe(true);
     expect(ds.streamCardPendingTurnId).toBe('om_turn_1');
+  });
+
+  it('starts a live Grok turn as working instead of starting', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: APP_ID, cliId: 'grok' },
+    } as any);
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const sessionReply = vi.fn(async () => 'om_grok_card');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(vi.mocked(buildStreamingCard).mock.calls[0]?.[5]).toBe('working');
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('reconciles the posted card when worker status changes during the POST', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.lastScreenStatus = 'idle';
+    ds.lastScreenContent = '';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(buildStreamingCard).mock.calls[0]?.[5]).toBe('starting');
+
+    ds.lastScreenStatus = 'working';
+    ds.lastScreenContent = 'Grok is thinking';
+    ds.streamCardStatusRevision = (ds.streamCardStatusRevision ?? 0) + 1;
+
+    resolvePost('om_turn_card_1');
+    await expect(post).resolves.toBe(true);
+    await flush();
+
+    const statuses = vi.mocked(buildStreamingCard).mock.calls.map(call => call[5]);
+    expect(statuses).toContain('working');
+    expect(vi.mocked(buildStreamingCard).mock.calls.at(-1)?.[4]).toBe('Grok is thinking');
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1', '{}');
+  });
+
+  it('does not patch when no newer worker status arrived during the POST', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const sessionReply = vi.fn(async () => 'om_turn_card_stable');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
   it('posts a new-turn card immediately without waiting for screen_update', async () => {

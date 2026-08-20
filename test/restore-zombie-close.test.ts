@@ -1155,6 +1155,106 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
   });
 });
 
+// ─── Preview-target lifecycle across a worker generation change ──────────────
+//
+// `previewTarget` is the literal loopback (host, port) an agent registers with
+// `botmux preview <port>`; the dashboard proxy dials it by host/port alone.
+// It is scoped to the worker that was live at registration time. A daemon
+// restart opens a NEW generation (every restored row is rebuilt with
+// worker:null and killStalePids has reaped the previous run's CLI processes),
+// so the process that owned the port is gone and the OS may have handed the
+// number to an unrelated local server. Carrying the old target back would
+// proxy a user's preview into that stranger's service.
+describe('restoreActiveSessions — stale preview target cleanup', () => {
+  const staleTarget = {
+    host: '127.0.0.1' as const,
+    port: 4173,
+    registeredAt: '2026-08-11T12:00:00.000Z',
+    // 上一代留下的完整持有证明：即便形状完全合法，也不能跨 restore 继续使用。
+    owner: { pid: 4242, procStart: '918273', inode: '556677' },
+    workerGeneration: 3,
+  };
+
+  it('does not carry a previous generation\'s preview target into the restored row', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_restore');
+    s.previewTarget = { ...staleTarget };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // The row is restored normally — cleanup must not close or skip it.
+    const restored = map.get(sessionKey('om_preview_restore', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(restored!.session.sessionId).toBe(s.sessionId);
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    // Runtime row (what composeRowFromActive / the SSE patch read) is clean…
+    expect(restored!.session.previewTarget).toBeUndefined();
+    // …and so is the announced dashboard row.
+    const announced = vi.mocked(announceSessionRow).mock.calls
+      .map(([ds]) => ds)
+      .find(ds => ds.session.sessionId === s.sessionId);
+    expect(announced).toBeDefined();
+    expect(announced!.session.previewTarget).toBeUndefined();
+  });
+
+  it('drops the stale target durably, so it stays dead across a store reload', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_durable');
+    s.previewTarget = { ...staleTarget };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // Re-read from disk: a target that survived the write would come back on
+    // the next restart (or through any offline row reader).
+    sessionStore.init();
+    expect(sessionStore.getSession(s.sessionId)?.previewTarget).toBeUndefined();
+  });
+
+  it('drops the target on an adopt restore too — a live adopted CLI is no proof its dev server survived', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_adopt');
+    s.title = 'Adopt: proj';
+    s.adoptedFrom = {
+      source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 111, cliId: 'claude-code', cwd: '/tmp/proj',
+    } as any;
+    s.previewTarget = { ...staleTarget };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // Genuine adopt restore (validateAdoptTargetState is mocked to 'alive').
+    expect(vi.mocked(forkAdoptWorker).mock.calls
+      .some(([ds]) => ds.session.sessionId === s.sessionId)).toBe(true);
+    const restored = map.get(sessionKey('om_preview_adopt', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(restored!.adoptedFrom).toBeDefined();
+    expect(restored!.session.previewTarget).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)?.previewTarget).toBeUndefined();
+  });
+
+  it('leaves rows without a registered preview target untouched', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_absent');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    const restored = map.get(sessionKey('om_preview_absent', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(restored!.session.previewTarget).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+  });
+});
+
 describe('resumeSession — disk-only legacy anchor collision', () => {
   it('refuses a legacy unscoped real owner instead of ghosting it', async () => {
     const target = makeActivePersistentSession('om_resume_legacy_conflict');

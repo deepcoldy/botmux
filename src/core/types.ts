@@ -216,7 +216,7 @@ export interface DaemonSession {
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
-  /** Sender (open_id + type + resolved name) of the initial message — stashed
+  /** Sender (open_id + type + resolved name/email) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
@@ -254,6 +254,11 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
+  /** Incremented for every worker status observation, including same-value
+   *  edges. A screen update can land while the Feishu starting-card POST is
+   *  in flight; the revision lets the POST completion distinguish that from
+   *  the pre-turn cached idle state and immediately reconcile the new card. */
+  streamCardStatusRevision?: number;
   /** Monotonic in-memory generation for accepted user turns. Card POST
    * completions use it to avoid clearing a newer turn's pending state. */
   streamCardTurnGeneration?: number;

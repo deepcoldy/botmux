@@ -152,7 +152,7 @@ describe('botmux grant chat CLI boundary', () => {
     mkdirSync(configDir, { recursive: true });
     mkdirSync(registryDir, { recursive: true });
     const secret = 'exact-grant-cli-test-secret';
-    writeFileSync(join(configDir, '.dashboard-secret'), secret);
+    writeFileSync(join(configDir, '.dashboard-secret'), secret, { mode: 0o600 });
     const botsConfig = join(root, 'bots.json');
     writeFileSync(botsConfig, JSON.stringify([{
       larkAppId: 'cli_receiver',
@@ -272,7 +272,7 @@ describe('botmux grant chat CLI boundary', () => {
     const registryDir = join(dataDir, 'dashboard-daemons');
     mkdirSync(configDir, { recursive: true });
     mkdirSync(registryDir, { recursive: true });
-    writeFileSync(join(configDir, '.dashboard-secret'), 'exact-grant-cli-stable-subject-secret');
+    writeFileSync(join(configDir, '.dashboard-secret'), 'exact-grant-cli-stable-subject-secret', { mode: 0o600 });
     const botsConfig = join(root, 'bots.json');
     writeFileSync(botsConfig, JSON.stringify([{
       larkAppId: 'cli_receiver',

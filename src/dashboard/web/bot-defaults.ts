@@ -100,6 +100,12 @@ export type BotDefaultsRow = {
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  sessionOwnerReminder?: {
+    enabled: boolean;
+    intervalMinutes: number;
+    text: string;
+    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
+  } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   canTalkDaemonCommands?: string;

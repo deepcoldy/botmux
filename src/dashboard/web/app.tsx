@@ -38,6 +38,10 @@ import {
   readDashboardClientShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  parseWorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -1166,6 +1170,28 @@ function DashboardShell(): React.JSX.Element {
     expiredShown = false;
     setAuthExpiredOpen(false);
   };
+  const workbenchSurface = activeHash.startsWith('#/agent-workbench-dock')
+    ? 'dock'
+    : activeHash.startsWith('#/agent-workbench')
+      ? 'appCenter'
+      : null;
+  if (workbenchSurface) {
+    return (
+      <>
+        <div className="workbench-route-host" data-workbench-surface={workbenchSurface}>
+          <main id="root" ref={setRouteRoot} />
+        </div>
+        {/* 工作台是无边框壳（没有 topbar / 侧栏），登录态失效时这个浮层是它唯一
+            的自救出口——漏传 loginUrl 会让浮层退化成「访问链接已失效 / 知道了」
+            的死胡同，一键登录压根不渲染。与下面普通壳的传参保持一致。 */}
+        <AuthExpiredOverlay
+          open={authExpiredOpen}
+          loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+          onClose={closeAuthExpired}
+        />
+      </>
+    );
+  }
   return (
     <>
       <div className="aurora" aria-hidden="true"><i className="a1" /><i className="a2" /><i className="a3" /></div>
@@ -1326,6 +1352,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    // Management reads are intentionally outside an H5/platform Workbench
+    // identity's capability map. The server marks that expected narrow denial;
+    // an unmarked 401 still means the identity expired and opens the login UI.
+    if (res.headers.get('x-botmux-auth-scope') === 'workbench') return res;
     const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
@@ -1335,19 +1365,57 @@ window.fetch = async function patchedFetch(
   return res;
 };
 
-async function loadAuthState(): Promise<void> {
+/**
+ * P1-4：拉取服务端投影的最小操作能力集。走 origFetch 绕过全局 401 包装——匿名
+ * （含 publicReadOnly 访客）在这里 401 是预期的能力探测结果，不是登录过期事件。
+ * 任何失败（401、网络错误、响应不合形）严格回落全 false：操作入口宁可少画，
+ * 不给无权身份画出会 401/403 的按钮。
+ */
+async function loadWorkbenchCapabilities(): Promise<void> {
   try {
-    const r = await fetch('/api/settings');
+    const r = await origFetch('/api/workbench/capabilities', { cache: 'no-store' });
+    ui.workbenchCapabilities = r.ok
+      ? parseWorkbenchCapabilities(await r.json())
+      : NO_WORKBENCH_CAPABILITIES;
+  } catch {
+    ui.workbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
+  }
+}
+
+async function loadAuthState(): Promise<void> {
+  // 能力探测与 /api/settings 并行：两者互不依赖，也都在首次 route() 之前完成。
+  const capabilitiesProbe = loadWorkbenchCapabilities();
+  try {
+    // Use the unwrapped request: a valid narrow Workbench identity is supposed
+    // to get a scoped 401 here, and that is auth-state data rather than an
+    // expiry event for the global fetch wrapper.
+    const r = await origFetch('/api/settings');
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
+      ui.workbenchAuthed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
+    } else if (r.status === 401 && r.headers.get('x-botmux-auth-scope') === 'workbench') {
+      // H5/platform identities can use Workbench control leases but must never
+      // become Dashboard owners merely because the shell probed /api/settings.
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = true;
+      publicReadOnly = false;
+      ui.publicReadOnly = false;
+    } else if (r.status === 401) {
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = false;
+      const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
+      showAuthExpiredOverlay(loginUrl);
     }
   } catch { /* keep defaults */ }
+  await capabilitiesProbe;
 }
 
 async function loadPinnedPluginNavItems(): Promise<void> {
@@ -1542,7 +1610,14 @@ void (async () => {
   }, 30 * 60_000);
   initOwnerAvatar();
   try {
-    await bootstrap();
+    await bootstrap({
+      // P1-14：排程只对「本机管理身份」和「publicReadOnly 匿名访客」开放。
+      // Workbench-only 身份（飞书 H5 / 平台 teammate|guest，loadAuthState 里把
+      // authed 置 false、workbenchAuthed 置 true）对 /api/schedules 是既定的
+      // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
+      // 依赖它对不对。
+      canReadSchedules: () => ui.authed || ui.publicReadOnly,
+    });
   } catch (err) {
     console.error('botmux dashboard bootstrap failed', err);
     store.setOnline(false);

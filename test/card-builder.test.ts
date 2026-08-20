@@ -1664,6 +1664,34 @@ describe('buildSessionClosedCard', () => {
     expect(md).not.toMatch(/```/);
   });
 
+  it('warns that resume starts a FRESH session when resumeStartsFresh is set', () => {
+    // Copilot/Kimi without a persisted cliSessionId: resuming reactivates the
+    // topic route, but the next spawn starts a fresh session — the card must
+    // not imply history is restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-fresh', 'om_root', 'topic', 'copilot', undefined, null, 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('新起干净会话');
+    expect(md).toContain('重新激活');
+    // The generic "可在飞书内 resume" line must NOT appear — it implies the
+    // CLI history comes back.
+    expect(md).not.toContain('可在飞书内 resume');
+    expect(md).not.toMatch(/```/);
+  });
+
+  it('does not show the fresh-session warning when a precise resume command exists', () => {
+    // resumeStartsFresh is only meaningful in the no-command branch; with a
+    // precise command the history really will be restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-cmd', 'om_root', 'topic', 'cursor', undefined,
+      'cursor-agent --resume chat-1', 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('cursor-agent --resume chat-1');
+    expect(md).not.toContain('新起干净会话');
+  });
+
   it('emits a Resume button targeting the closed sessionId', () => {
     const card = parse(buildSessionClosedCard(
       'sess-4', 'om_root_X', 'topic', 'claude-code', undefined,

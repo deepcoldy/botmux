@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
@@ -15,6 +15,7 @@ export interface PendingCliInput {
   codexAppSteerable?: true;
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  trustedCaller?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
   /**
    * mojo only: the credential snapshot that arrived WITH this turn.

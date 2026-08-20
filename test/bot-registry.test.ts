@@ -215,6 +215,24 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps only a valid sessionOwnerReminder configuration', () => {
+    const reminder = {
+      enabled: true,
+      intervalMinutes: 45,
+      text: '请处理当前会话。',
+      states: ['idle', 'agent_attention'],
+    };
+    const [valid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', sessionOwnerReminder: reminder },
+    ]));
+    expect(valid.sessionOwnerReminder).toEqual(reminder);
+
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', sessionOwnerReminder: { ...reminder, intervalMinutes: 0 } },
+    ]));
+    expect(invalid.sessionOwnerReminder).toBeUndefined();
+  });
+
   it('keeps a trimmed displayName and drops blank/non-string values', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', displayName: '  小助手  ' },

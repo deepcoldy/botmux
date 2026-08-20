@@ -1,7 +1,7 @@
 // test/dashboard-ipc.test.ts
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -249,6 +249,98 @@ describe('dashboard IPC server', () => {
       headers: trustedHostHeaders('GET', '/api/sessions', handle.port, rotatedSecret),
     });
     expect(currentSecret.status).toBe(200);
+  });
+});
+
+// The verifier's REAL on-disk secret read (ipcAuthSecret → loadDashboardSecret)
+// — every other test injects the key via setIpcAuthSecret and never exercises
+// this branch. This is a per-request verifier on ~96 daemon IPC routes; a
+// symlinked / loose-perms `.dashboard-secret` planted after boot must not be
+// followed and trusted as the HMAC key (it fails closed → 401), and a genuine
+// 0600 secret must still authenticate. We point HOME at a temp dir so
+// dashboardSecretPath() resolves there; loadDashboardSecret re-reads per call.
+describe('IPC auth reads the on-disk dashboard secret through the secure primitive', () => {
+  const REAL_SECRET = 'real-ondisk-ipc-secret-cafebabe';
+  let home: string;
+  let botmuxDir: string;
+  let secretPath: string;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    // Force the disk path (no injected override) for this whole describe.
+    setIpcAuthSecret(null);
+    home = mkdtempSync(join(tmpdir(), 'bmx-ipc-home-'));
+    botmuxDir = join(home, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
+    secretPath = join(botmuxDir, '.dashboard-secret');
+    prevHome = process.env.HOME;
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    // Loosen back to a removable shape before rm (a 0700 dir is fine here).
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  it('authenticates a valid trusted-host signature against a real 0600 secret', async () => {
+    writeFileSync(secretPath, REAL_SECRET, { mode: 0o600 });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const authed = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, REAL_SECRET),
+    });
+    expect(authed.status).toBe(200);
+
+    const wrongKey = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, 'not-the-secret'),
+    });
+    expect(wrongKey.status).toBe(401);
+  });
+
+  it('fails closed (401) when the secret leaf is a symlink, without following it', async () => {
+    if (process.platform === 'win32') return;
+    // A local attacker who can write ~/.botmux plants a symlink to content they
+    // know; the secure reader must refuse it rather than sign with that value.
+    const planted = join(home, 'attacker-known');
+    writeFileSync(planted, REAL_SECRET, { mode: 0o600 });
+    symlinkSync(planted, secretPath);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    // Even signing with the exact planted content is rejected: the leaf is a
+    // symlink, so its value is never loaded as the HMAC key.
+    const forged = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, REAL_SECRET),
+    });
+    expect(forged.status).toBe(401);
+    // The symlink target is untouched.
+    expect(readFileSync(planted, 'utf8')).toBe(REAL_SECRET);
+  });
+
+  it('fails closed (401) when the secret file has loose (0644) permissions', async () => {
+    if (process.platform === 'win32') return;
+    writeFileSync(secretPath, REAL_SECRET, { mode: 0o644 });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const res = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, REAL_SECRET),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('fails closed (401) when the secret is absent', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const res = await fetch(`${base}/api/sessions`, {
+      headers: trustedHostHeaders('GET', '/api/sessions', handle.port, REAL_SECRET),
+    });
+    expect(res.status).toBe(401);
   });
 });
 
@@ -2539,6 +2631,45 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
     expect(body.ok).toBe(true);
     expect(typeof body.url).toBe('string');
     expect(body.url).toContain('token=secret-tok');
+    spy.mockRestore();
+  });
+});
+
+describe('GET /api/sessions/:sessionId/view-link', () => {
+  it('returns the LIVE per-boot view token so the central mint can pin a generation', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's2', webPort: 4321 },
+      workerPort: 4321,
+      workerToken: 'secret-tok',
+      workerViewToken: 'boot-view-token',
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s2/view-link`, { headers: tokenAuthHeaders() });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.url).toContain('viewToken=boot-view-token');
+    // 只读入口，绝不带写 token（这条 URL 会被中央改写后送进浏览器）。
+    expect(body.url).not.toContain('secret-tok');
+    spy.mockRestore();
+  });
+
+  it('P1-5: refuses when only a STALE persisted port survives the dead worker', async () => {
+    // session.webPort 是落盘的，worker 死掉后还在；workerViewToken 只在 ready 时写入。
+    // 这种「端口还在、boot token 没了」的状态下不能给链接：中央拿不到当前这一代的
+    // generation，签出来的能力就会钉在一个已经不存在的 worker 上。
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's3', webPort: 4321 },
+      workerPort: null,
+      workerToken: null,
+      workerViewToken: null,
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s3/view-link`, { headers: tokenAuthHeaders() });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('terminal_unavailable');
     spy.mockRestore();
   });
 });

@@ -652,6 +652,18 @@ describe('renderSenderTag', () => {
     expect(out).toContain('name="张三"');
   });
 
+  it('includes and XML-escapes the optional sender email', () => {
+    const out = renderSenderTag({
+      openId: 'ou_email',
+      type: 'user',
+      name: 'Alice',
+      email: 'alice&ops@example.com',
+    });
+    expect(out).toBe(
+      '<sender type="user" open_id="ou_email" name="Alice" email="alice&amp;ops@example.com" />',
+    );
+  });
+
   it('preserves bot type for foreign botmux peers', () => {
     const out = renderSenderTag({ openId: 'ou_b', type: 'bot', name: 'CoCo' });
     expect(out).toContain('type="bot"');
