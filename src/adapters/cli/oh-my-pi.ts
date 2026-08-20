@@ -1,8 +1,13 @@
+import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 
+import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { delay } from '../../utils/timing.js';
 
 const OMP_INPUT_CHUNK_CHARS = 512;
@@ -10,6 +15,24 @@ const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
+
+export function ompSessionDir(sessionId: string): string {
+  if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
+    throw new Error(`Invalid Botmux session id for OMP: ${sessionId}`);
+  }
+  const lexicalHome = homedir();
+  let canonicalHome = lexicalHome;
+  try { canonicalHome = realpathSync(lexicalHome); } catch { /* lexical fallback */ }
+  return join(canonicalHome, '.omp', 'agent', 'sessions', 'botmux', sessionId);
+}
+
+export function ompTranscriptPath(sessionId: string): string | null {
+  return findLatestJsonl(ompSessionDir(sessionId));
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
 /** Match OMP's paste semantics before putting content on a key-event path. */
 function normalizeOmpInput(text: string): string {
@@ -115,19 +138,23 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
   return {
     id: 'oh-my-pi',
-    authPaths: ['~/.omp/agent/auth.json'],
+    authPaths: ['~/.omp/agent'],
     resolvedBin: bin,
 
-    // oh-my-pi has no --session-id; sessions are managed internally.
-    // buildResumeCommand handles resume separately. Do NOT pass Lark prompts
+    // oh-my-pi has no --session-id. Keep each Botmux session in its own OMP
+    // directory and resume only an exact transcript from that directory.
+    // Do NOT pass Lark prompts
     // as positional launch args: OMP deposits those in the TUI composer but
     // does not auto-submit them. Route prompts through writeInput, where botmux
     // controls the final submit key.
-    buildArgs({ model, workingDir, disableCliBypass }) {
-      const args = [
-        '--tools', 'read,bash,edit,write,browser,web_search,ast_grep,ast_edit,lsp,debug,find,eval,search,task,ask',
-        '--no-title',
-      ];
+    buildArgs({ sessionId, resume, model, workingDir, disableCliBypass }) {
+      const sessionDir = ompSessionDir(sessionId);
+      const args = ['--no-title'];
+      if (resume) {
+        const transcript = ompTranscriptPath(sessionId);
+        if (transcript) args.push('--resume', transcript);
+      }
+      args.push('--session-dir', sessionDir);
       if (!disableCliBypass) {
         args.push('--approval-mode', 'yolo');
       }
@@ -140,11 +167,14 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     // the reliable path.
     passesInitialPromptViaArgs: false,
 
-    // --continue resumes the latest local session.  No precise session-id
-    // mapping exists (gemini/opencode share this limitation), so this is
-    // best-effort convenience rather than guaranteed per-session resume.
-    buildResumeCommand() {
-      return 'omp --continue';
+    buildResumeCommand({ sessionId }) {
+      const transcript = ompTranscriptPath(sessionId);
+      if (!transcript) return null;
+      return `omp --resume ${shellQuote(transcript)} --session-dir ${shellQuote(ompSessionDir(sessionId))}`;
+    },
+
+    checkResumeTargetExists({ sessionId }) {
+      return ompTranscriptPath(sessionId) !== null;
     },
 
     async writeInput(pty: PtyHandle, content: string) {

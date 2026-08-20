@@ -15,7 +15,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter } from 'node:path';
+import { join, basename, dirname, delimiter, relative } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -259,6 +259,7 @@ import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
+import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -13748,6 +13749,25 @@ async function spawnCli(
       return p; // not even '/' resolved (impossible) → lexical fallback
     };
 
+    // OMP keeps all transcripts under one shared state root. Materialize this
+    // Botmux session's exact directory before allow-path existence filtering;
+    // the policy below masks the shared sessions parent and re-opens only this
+    // deeper directory read-write.
+    const ompCurrentSessionDir = cliAdapter.id === 'oh-my-pi'
+      ? ompSessionDir(effectiveAdapterSessionId)
+      : undefined;
+    if (ompCurrentSessionDir) mkdirSync(ompCurrentSessionDir, { recursive: true, mode: 0o700 });
+    const canonicalOmpSessionsRoot = ompCurrentSessionDir
+      ? canonical(dirname(dirname(ompCurrentSessionDir)))
+      : undefined;
+    const canonicalOmpSessionDir = ompCurrentSessionDir
+      ? canonical(ompCurrentSessionDir)
+      : undefined;
+    if (canonicalOmpSessionsRoot && canonicalOmpSessionDir
+      && relative(canonicalOmpSessionsRoot, canonicalOmpSessionDir) !== join('botmux', effectiveAdapterSessionId)) {
+      throw new Error('[sandbox] OMP session directory escapes its managed sessions root');
+    }
+
     // User three-tier lists: the new sandboxPaths field, or a pre-migration
     // session/config's legacy fields mapped through the SAME lossless mapping
     // the startup migration uses.
@@ -13855,6 +13875,9 @@ async function spawnCli(
     // the child can't see them.
     if (process.platform === 'linux') {
       mandatoryDenyPaths.push(join(canonical(dataDir), 'sandboxes', cfg.sessionId));
+    }
+    if (canonicalOmpSessionsRoot) {
+      mandatoryDenyPaths.push(canonicalOmpSessionsRoot);
     }
     if (process.platform === 'darwin') {
       const osUserHomeDir = userInfo().homedir;
@@ -14085,7 +14108,7 @@ async function spawnCli(
       ]),
       botmuxInstallRoot,
       outbox,
-      extraWritePaths: keepExisting([process.env.TMPDIR]),
+      extraWritePaths: keepExisting([process.env.TMPDIR, canonicalOmpSessionDir]),
       userPaths,
       mandatoryDenyPaths,
       mandatoryDenyRegexes,
