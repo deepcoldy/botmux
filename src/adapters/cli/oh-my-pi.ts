@@ -217,6 +217,8 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    busyPattern: /Working(?:\.\.\.|…)/,
+    supportsTypeAhead: true,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
     skillsDir: '~/.omp/agent/skills',

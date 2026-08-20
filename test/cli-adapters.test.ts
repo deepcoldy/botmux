@@ -1012,6 +1012,11 @@ describe('oh-my-pi buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(false);
     expect(adapter.altScreen).toBe(true);
     expect(adapter.authPaths).toEqual(['~/.omp/agent']);
+    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.busyPattern?.test('Working...')).toBe(true);
+    expect(adapter.busyPattern?.test('Working…')).toBe(true);
+    expect(adapter.mergeQueuedInput).not.toBe(true);
+    expect(adapter.reliableTurnTerminal).not.toBe(true);
   });
 
   it('does not include --session-id (oh-my-pi has none)', () => {
