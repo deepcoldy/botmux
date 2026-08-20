@@ -1245,6 +1245,10 @@ function DashboardShell(): React.JSX.Element {
           loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
           onClose={closeAuthExpired}
         />
+        {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关）。
+            workbench 无边框壳也需要挂载，否则将来 workbench 内调用 confirm() 会永久挂起。 */}
+        <ToastStack />
+        <ConfirmModalRoot />
       </>
     );
   }

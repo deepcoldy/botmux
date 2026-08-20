@@ -62,6 +62,8 @@ function beginExit(id: number): void {
 }
 
 export function toast(message: string, options?: ToastOptions): void {
+  // node 环境（如 vitest 无 jsdom）无 window，静默丢弃——toast 是纯 UI 反馈
+  if (typeof window === 'undefined') return;
   const id = ++seq;
   const item: ToastItem = {
     id,

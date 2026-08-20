@@ -8,6 +8,15 @@ import {
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG } from '../src/services/vc-meeting-consumer-profile-templates.js';
 
+// 组件已从 window.confirm 迁移到模块级 confirm()（confirm-modal.js），
+// 测试需 mock 模块而非 window 全局。默认 resolve(true) = 用户点「确认」。
+const { confirmMock } = vi.hoisted(() => ({
+  confirmMock: vi.fn(async () => true),
+}));
+vi.mock('../src/dashboard/web/confirm-modal.js', () => ({
+  confirm: (...args: unknown[]) => confirmMock(...args),
+}));
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -166,11 +175,9 @@ function putCalls(fetchMock: ReturnType<typeof vi.fn>): Json[] {
     .map(call => JSON.parse(String((call[1] as RequestInit).body)) as Json);
 }
 
-let confirmMock: ReturnType<typeof vi.fn>;
-
 beforeEach(() => {
-  confirmMock = vi.fn(() => true);
-  vi.stubGlobal('window', { confirm: confirmMock });
+  confirmMock.mockReset();
+  confirmMock.mockResolvedValue(true);
 });
 
 afterEach(() => {
@@ -329,7 +336,7 @@ describe('VcConsumerProfilesSection · Listener 归属与语义文案', () => {
 
     await openProfile(r, 0);
     await setInput(labelInput(r, 0), 'edited');
-    confirmMock.mockReturnValueOnce(false);
+    confirmMock.mockResolvedValueOnce(false);
     await clickOption(optionButton(r, 'Bot B')!);
     expect(confirmMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
