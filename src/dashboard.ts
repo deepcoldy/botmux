@@ -288,6 +288,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
+import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
@@ -6901,11 +6902,12 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
     // Merge per-bot team-visibility config (showInTeam) from bots.json by
     // larkAppId so the platform team page can hide bots. Default: showInTeam =
     // true (shown). bots.json may be unreadable from the dashboard process →
-    // fall back to the default.
-    const cfgByAppId = new Map<string, { showInTeam?: boolean }>();
+    // fall back to the default. apiOnly is read from the same config to derive
+    // `mentionable` (a core-only bot has no Feishu transport → can't be @-ed).
+    const cfgByAppId = new Map<string, { showInTeam?: boolean; apiOnly?: boolean }>();
     try {
       for (const cfg of loadBotConfigs()) {
-        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam });
+        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam, apiOnly: cfg.apiOnly });
       }
     } catch {
       /* defaults below */
@@ -6923,6 +6925,13 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
           unionId: e.larkAppId ? getBotUnionId(config.session.dataDir, e.larkAppId) : undefined,
+          // 团队维度 Agent 互查（additive，交接契约 §端点2 / register|heartbeat）：
+          //  · specialties：owner 预配的专长标签（bot-profiles），发现/拉群匹配依据，仅展示不可信。
+          //  · mentionable：是否有飞书传输身份能被 @（core-only/apiOnly → false）。cfg 读不到
+          //    时保守按可传输(true)，与 team-bot-directory「undefined 按可传输」同源
+          //    （fail-open 仅在本机自报、无跨部署放大风险；真正的 no-transport 由 apiOnly 明示）。
+          specialties: e.larkAppId ? getBotSpecialties(config.session.dataDir, e.larkAppId) : [],
+          mentionable: cfg?.apiOnly !== true,
         };
       })
       .filter((b) => b.appId);

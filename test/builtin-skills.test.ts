@@ -190,6 +190,21 @@ describe('built-in botmux-bots skill (collaboration roster)', () => {
     expect(skill!.content).toContain('operate');
     expect(skill!.content).toContain('unknown');
   });
+
+  it('documents team-scope discovery + cross-machine group creation and their opt-in gate', () => {
+    // Team维度 Agent 互查: --scope team discovery + create-group --team, plus the
+    // opt-in (team.bots) gate and the boundary vs the Feishu /invite slash.
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
+    expect(skill!.content).toContain('--scope team');
+    expect(skill!.content).toContain('create-group --team');
+    expect(skill!.content).toContain('bots invite');
+    expect(skill!.content).toContain('--agent');
+    expect(skill!.content).toContain('specialties');
+    expect(skill!.content).toContain('opt-in');
+    // Self-reported → not a trusted credential; CLI does no authorization.
+    expect(skill!.content).toContain('不是可信凭据');
+    expect(skill!.content).toContain('/invite');
+  });
 });
 
 describe('built-in botmux-handoff skill', () => {

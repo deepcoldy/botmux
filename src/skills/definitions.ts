@@ -528,12 +528,16 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 
 const BOTS_SKILL = `---
 name: botmux-bots
-description: 列出当前飞书群里可协作的机器人（协作花名册：含能力标签、是否有团队角色、以及你能否可靠 @ 到它）。在需要点名其他机器人协作、或交棒给队友前查看时使用。
+description: 列出可协作的机器人（协作花名册）。默认列**当前飞书群内**的 bot（含能力标签、是否有团队角色、能否可靠 @ 到它）；加 --scope team 则跨机列**同团队、已 opt-in** 的 agent 供按专长发现，并可用 create-group --team 拉进新群、或 bots invite 补进已有团队群。在需要点名协作、交棒队友、或跨机找/拉别人的 agent 前使用。
 ---
 
-# botmux-bots — 群内协作花名册
+# botmux-bots — 协作花名册（群内 + 团队维度）
 
-## 用法
+两种 scope，用途不同：
+- **chat（默认）**：\`botmux bots list\` —— 列**当前群里**的 bot，判断能不能 @、派活。
+- **team**：\`botmux bots list --scope team\` —— 跨机列**同团队、已 opt-in** 的 agent（在别人机器上、还没进你的群），用于按专长发现后拉群协作。
+
+## 用法（chat scope，默认）
 
 \`\`\`bash
 botmux bots list
@@ -577,13 +581,44 @@ botmux bots list
 }
 \`\`\`
 
-## 关键规则
+## 关键规则（chat scope）
 
 1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
 2. 按 \`capability\` 挑合适的队友，而不是乱点。
 3. **\`unknown\` ≠ 不可用、更 ≠ 离线**：只是这条命令当前没有足够证据。别把 \`unknown\` 当成"它挂了"而放弃派活；语义拿不准就查 \`collaborationHelp\`。
 4. \`authorization.operate\` 默认按 \`false\`/\`unknown\` 处理：能对话不等于能让它跑 \`/repo\`、\`/restart\` 等管理动作，那类要单独授权。
 5. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+
+## 团队维度：跨机发现 + 拉群（--scope team）
+
+用途：找到**同团队、还没进你群、在别人机器上**的 agent，按专长挑出来，拉进一个聚焦新群一起干活。
+
+\`\`\`bash
+# 1) 发现：列同团队已 opt-in 的 agent（本机在多团队时用 --team 指定）
+botmux bots list --scope team [--team <teamId>]
+
+# 2a) 建新群：把发现到的 agent（按 appId）+ 各自 owner 拉进一个平台代建的**新群**
+botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
+
+# 2b) 往已有群补人：把 agent + 各自 owner 加进一个**你已在场的**群（恒带 owner）
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+\`\`\`
+
+team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`。
+
+**必须知道的语义**：
+- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`）。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
+- **specialties / mentionable / online 是 agent 自报**：仅供你挑选参考，**不是可信凭据**，别拿它当权限判断。
+- **CLI 不做任何授权判断**：团队成员校验、opt-in 闸全在平台。你只管发现 + 拉群/补人，平台会拒绝越权的调用。
+- **只认 appId、不需要 @**：正因为别人 bot 进你群前你根本 @不到它，team 拉群/补人全走 appId + machine-auth，天然绕开"看不见就点不着"。结果里 \`invalidBotIds\` / \`invalidOwnerUnionIds\` 是平台过滤掉的（未 opt-in / 拉不动），如实展示即可。
+- \`bots invite\` 的目标群要满足：**平台机器人（BotmuxPlatform）已在群里**（否则平台加不进人 → 403 \`platform_bot_not_in_chat\`，先把它拉进群）+ **你本人已在该群**（→ 403 \`requester_not_in_chat\`，只能往你自己在场的群补人）+ **非机器人大厅**（→ 403 \`chat_is_hall\`）。补人恒把 agent + 各自 owner 一起拉进。
+- 平台端点没上线时命令会明确提示「平台尚未部署…端点」——那是平台侧还没部署，不是你调错。
+
+**三条拉人路径 —— 别混**：
+- \`create-group --team\`：跨机、把**同团队但不在任何共同群**的 agent + owner **新建**成一个聚焦群。"首次把没见过面的 agent 聚到一起"。
+- \`bots invite --chat\`：把同团队 agent + 各自 owner 加进一个**你已在场、且平台机器人也在**的群（跨机、machine-auth、只认 appId）。"群已经在了，往里补同团队的人（含其 owner）"。
+- \`/invite\`（飞书群内 slash）：把 bot 加进**当前已存在的**群，走飞书原生加成员，**限同租户**、只拉 bot 不带 owner。"群在了，把某个同租户 bot 也拉进来"。
+- 一句话：跨 team 从零聚人 → \`create-group --team\`；往你已在场的群补同团队的人 → \`bots invite\`；当前群补同租户 bot → \`/invite\`。
 
 ## 要把任务交棒给别的机器人？
 

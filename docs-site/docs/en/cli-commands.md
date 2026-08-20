@@ -45,7 +45,8 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | Command | Description |
 |------|------|
 | `botmux send [content]` | Send a message to the current topic (stdin / heredoc / `--content-file`; `--images`/`--files`/`--videos`/`--card-file`/`--card-json`/`--mention`) |
-| `botmux bots list` | List the bots in the current group (including open_id) |
+| `botmux bots list` | List the bots in the current group (including open_id); `--scope team [--team <id>]` discovers same-team, opted-in agents across machines (by specialty) |
+| `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | Add same-team agents + their owners into a group you're already in (auto-adds the platform app first if absent) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
 | `botmux schedule add/list/remove/pause/resume/run` | Manage scheduled tasks |

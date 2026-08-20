@@ -43,7 +43,8 @@ session 信息通过祖先进程标记自动推断，agent 直接调：
 | 命令 | 说明 |
 |------|------|
 | `botmux send [content]` | 向当前话题发消息（stdin / heredoc / `--content-file`；`--images`/`--files`/`--videos`/`--card-file`/`--card-json`/`--mention`） |
-| `botmux bots list` | 列出当前群里的机器人（含 open_id） |
+| `botmux bots list` | 列出当前群里的机器人（含 open_id）；`--scope team [--team <id>]` 跨机发现同团队、已 opt-in 的 agent（按专长） |
+| `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | 往「你已在场」的群补入同团队 agent + 各自 owner（平台 app 不在时自动拉进群再补） |
 | `botmux history [--limit N]` | 拉会话历史（JSON） |
 | `botmux quoted <message_id>` | 拉被引用的单条消息（JSON） |
 | `botmux schedule add/list/remove/pause/resume/run` | 管理定时任务 |

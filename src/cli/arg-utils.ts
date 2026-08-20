@@ -18,3 +18,11 @@ export function firstPositional(args: string[], flagsWithValue: string[]): strin
   }
   return undefined;
 }
+
+/** True if `flag` is present in either bare (`--team`) or `=`-value (`--team=t1`)
+ *  form. Use for presence checks on flags that ALSO carry a value via
+ *  argValue/argValues, where a bare `args.includes(flag)` misses the
+ *  `--flag=value` spelling (e.g. team-mode routing on `create-group`). */
+export function hasFlagOrEq(args: string[], flag: string): boolean {
+  return args.some(a => a === flag || a.startsWith(flag + '='));
+}
