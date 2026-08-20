@@ -428,6 +428,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // submit immediately and never spuriously reports a mid-turn send failure.
     supportsTypeAhead: true,
     reliableTurnTerminal: true,
+    // Worker's maybeEmitCodexStructuredRateLimit reads the rollout's
+    // `codex_rate_limited` terminal (isCodexRateLimitEvent) and emits a
+    // structured `limited` state — so codex is the rate-limit authority and the
+    // screen-scan `rate` heuristic is suppressed for it (see
+    // isStructuredRateLimitAuthoritative). Only codex among the codexBridgeQueue
+    // CLIs runs that emit (structuredBridgeIsCodex gate), so the flag stays here.
+    emitsStructuredRateLimit: true,
     altScreen: false,   // --no-alt-screen disables alternate screen
     // Codex has no per-session skill injection like Claude's `--plugin-dir`.
     // Verified empirically on codex 0.136.0 (via `codex debug prompt-input`,

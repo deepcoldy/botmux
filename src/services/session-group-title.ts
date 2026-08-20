@@ -18,7 +18,12 @@ import { redactChildEnv } from '../utils/child-env.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
 import { renameChat } from './groups-store.js';
-import { getSessionGroup, markSessionGroupTitled, touchSessionGroup } from './session-groups-store.js';
+import {
+  getSessionGroup,
+  markSessionGroupTitleFailed,
+  markSessionGroupTitled,
+  touchSessionGroup,
+} from './session-groups-store.js';
 import * as sessionStore from './session-store.js';
 import { updateSessionTitle } from '../core/session-title.js';
 import { localeForBot } from '../i18n/index.js';
@@ -28,6 +33,7 @@ import { logger } from '../utils/logger.js';
 // exceeds 15s); the rename is async so a slow title costs nothing visible.
 const TITLE_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_LEN = 12;
+export const MAX_SESSION_GROUP_TITLE_ROUNDS = 3;
 
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by
  *  `cliPathOverride` when configured. Prompt is appended as the last arg. */
@@ -149,7 +155,15 @@ export function scheduleSessionGroupTitle(opts: {
 }): void {
   const { larkAppId, chatId, userText } = opts;
   if (inFlightTitles.has(chatId)) return;
+  // Bounded healing: a group whose title never lands must not let every later
+  // message spawn another one-shot CLI. Rounds are capped and spaced by the
+  // persisted backoff deadline (survives daemon restarts).
+  const current = getSessionGroup(chatId);
+  if (!current || current.titled) return;
+  if ((current.titleAttempts ?? 0) >= MAX_SESSION_GROUP_TITLE_ROUNDS) return;
+  if ((current.titleRetryAt ?? 0) > Date.now()) return;
   inFlightTitles.add(chatId);
+  let succeeded = false;
   void (async () => {
     try {
       const cfg = getBot(larkAppId).config;
@@ -218,6 +232,7 @@ export function scheduleSessionGroupTitle(opts: {
         return;
       }
       markSessionGroupTitled(chatId);
+      succeeded = true;
       // Best-effort: keep the botmux session title in sync so `botmux list` /
       // dashboard show the same name as the chat (same path as /rename).
       const entry = getSessionGroup(chatId);
@@ -230,6 +245,7 @@ export function scheduleSessionGroupTitle(opts: {
     } catch (err) {
       logger.info(`[session-group] AI title failed for chat=${chatId.substring(0, 12)} (placeholder kept): ${err}`);
     } finally {
+      if (!succeeded) markSessionGroupTitleFailed(chatId);
       inFlightTitles.delete(chatId);
     }
   })();

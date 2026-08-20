@@ -57,6 +57,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_or_run': '点击「恢复会话」继续，或在终端执行：',
   'card.body.click_resume_only': '点击「恢复会话」继续。',
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
+  'card.body.resume_starts_fresh': '点击「恢复会话」可重新激活本话题的消息路由；但 {cliName} 没有可精确恢复的历史会话，下次对话将**新起干净会话**，旧上下文不会带回。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
@@ -247,6 +248,8 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.close.refused': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话可能仍在运行，请稍后重试 /close。',
+  'cmd.close.refused_with_task': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话 id：`{taskId}`。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.insight.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /insight。',
   'cmd.insight.unsupported': 'ℹ️ 该 CLI 暂不支持 insight 分析（目前仅 Claude Code / Codex）。',
   'cmd.insight.no_transcript': 'ℹ️ 还没找到本会话的 transcript，跑几轮后再试。',
@@ -298,8 +301,11 @@ export const messages: Record<string, string> = {
   'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.restart.riff_unsupported': '⚠️ Riff 会话不支持重启。请先用 /close 关闭当前远程会话，再发送新消息创建会话。',
+  'cmd.restart.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持重启：销毁并重建会切断或替换远端 lineage。请先用 /close 关闭当前远程会话，再发送新消息创建会话。',
   'cmd.cd.riff_unsupported': '⚠️ Riff 会话不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
+  'cmd.cd.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
   'cmd.takeover.riff_unsupported': '⚠️ Riff 会话不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
+  'cmd.takeover.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
   'cmd.cd.created_switched': '📁 目录不存在，已自动创建并切换到 {path}，下次发消息时将在新目录下恢复。',
@@ -688,36 +694,25 @@ export const messages: Record<string, string> = {
   'slashlist.col_desc': '说明',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
-  'ai.routing.intro': '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
-  'ai.routing.must_use_botmux': '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
-  'ai.routing.no_visible_output_ok': '重要：`botmux send` 执行成功（退出码 0 / 返回 `{"success":true,...}`）就代表消息已送达用户。因此本轮「终端没有可见文本、直接结束」是完全正常且预期的，不是失败。若之后看到类似「你上一条回复没有可见输出，请继续」这样的提示，那是底层 CLI 的误判，不要因此重发——只有当 `botmux send` 本身报错（非零退出或打印「发送失败」）时才需要重试。',
-  'ai.routing.usage_heading': '使用指南：',
-  'ai.routing.usage_send_when': '- 发给你的消息至少用 `botmux send` 回应一次,别沉默;发什么、发几条由你判断。只有根本不是发给你的消息（指派给别的机器人 / 纯系统噪音）才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
-  'ai.routing.usage_send_text': '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
-  'ai.routing.usage_heredoc': '- 多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
-  'ai.routing.heredoc_example': "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
-  'ai.routing.usage_images': '- 附带图片：`botmux send --images /path/to/img.png "说明文字"`',
-  'ai.routing.usage_files': '- 附带文件：`botmux send --files /path/to/file.pdf "请查收"`',
-  'ai.routing.usage_videos': '- 附带视频预览：`botmux send --videos /path/to/replay.mp4 --video-covers /path/to/cover.png --no-mention "预览"`',
-  'ai.routing.usage_history': '- 需要上下文时用 `botmux history` 读取之前的对话。',
-  'ai.routing.usage_bots_list': '- 查看可协作的机器人：`botmux bots list`',
-  'ai.send.after_success_hint': '本轮如还有要发给用户的内容，继续 `botmux send`；若没有了，让最终回复只输出 BOTMUX_NOTHING_TO_SEND 这一个词（不要再写任何别的文字）。',
+  'ai.routing.intro': '你在飞书话题群中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
+  'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
+  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
+  'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',
+  'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
+  'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
+  'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',
+  'ai.send.after_success_hint': '若还有要发给用户的内容，继续 `botmux send`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(未知)',
-  'ai.identity.routing_intro': '群里可能有多个机器人，消息里用 `@名字` 和 `open_id` 区分接收方。对照上面的 name/open_id 判断本条消息归属：',
-  'ai.identity.rule_own_part': '- 只执行明确分给自己的那部分，别抢别的机器人的活',
-  'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的机器人时，保持沉默不要回复',
-  'ai.identity.rule_no_proactive_pull': '- **默认不主动拉别的 bot 进来**。除非用户明确要求、或某段任务只能由对方做，否则一个人做完自己的部分就行。',
-  'ai.identity.mention_intro': '**和别的机器人协作的硬性物理事实**：飞书话题群里其他 bot **默认收不到** 你 `botmux send` 出去的消息——',
-  'ai.identity.mention_must': '要跟某个 bot 沟通或协作（让它收到你的消息），**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
-  'ai.identity.mention_partners': '- 首轮上下文里的 `<available_bots>` 块会提示当前可协作的 bot（数量少时含 open_id，多时只列名字）；对方 open_id 也可以随时 `botmux bots list` 查',
-  'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；`--mention-back` 可一键 @ 回触发你的那个人/ bot（open_id 自动取，无需手填）',
-  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名指定人/bot）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论、要对方继续看/确认/决策 → 需要 @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。再按收件人是谁选 @ 方式：就是要回触发这轮的那个人/bot → --mention-back；要 @ 的是别人（尤其多人/多 bot 会话里回复对象不一定是触发者）→ --mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰',
-  'ai.identity.mention_when_to': '- 该 --mention 的场景：需要跟对方沟通或协作、用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',
-  'ai.identity.mention_when_not': '- 不必 --mention 的场景：纯状态更新/确认/感谢——尽量合并到下一次有内容的消息里再带上，避免互相 ping 触发空转',
+  'ai.identity.routing_intro': '群里可能有多个 bot，按 @名字 和 open_id 区分归属：',
+  'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
+  'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',
+  'ai.identity.rule_no_proactive_pull': '- 默认不拉别的 bot 进来，除非用户明确要求',
+  'ai.identity.mention_must': '- 跟别的 bot 协作必须 `botmux send --mention <对方 open_id>`，否则对方收不到',
 
-  // ─── AI hints (non-Claude CLIs: BOTMUX_SHELL_HINTS) ──────────────────────
+  // ─── AI hints（非注入式 CLI 的 BOTMUX_SHELL_HINTS；multiline_heredoc /
+  // heredoc_example 同时被 system-prompt 路径复用——两个 locale 保持一致）──
   'ai.shell.intro': '你运行在飞书（Lark）话题群中。用户在飞书阅读回复，看不到你的终端输出。',
   'ai.shell.commands_are_shell': '重要：botmux send / botmux history / botmux quoted / botmux bots 都是 shell 命令（CLI 程序，已安装在 $PATH），不是 MCP 工具。必须通过 Bash 工具执行，不要到 MCP 工具列表里找。',
   'ai.shell.how_to_send': '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`，附带视频预览用 `--videos /path.mp4 --video-covers /cover.png`。',
@@ -799,6 +794,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 已重新启动 {cliName}',
   'card.action.resume_missing_session_id': '⚠️ 缺少 session_id，无法恢复。',
   'card.action.resume_success': '✅ 会话已恢复，发条消息继续与 {cliName} 对话。',
+  'card.action.resume_success_fresh': '✅ 话题路由已重新激活。{cliName} 没有可精确恢复的历史会话，下条消息将**新起干净会话**，旧上下文不会带回。',
   'card.action.resume_not_found': '⚠️ 找不到会话 {short}，可能已被清理。',
   'card.action.resume_not_closed': '会话已是活跃状态，无需恢复。',
   'card.action.resume_anchor_occupied': '⚠️ 当前话题已有新会话{detail}，无法恢复旧会话。',
@@ -832,6 +828,8 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
+  'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
+  'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
@@ -844,10 +842,11 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
-  'worker.riff_close_in_progress': '⏳ Riff 远程会话正在关闭，请等待关闭结果后再发送消息。',
+  'worker.remote_close_in_progress': '⏳ {backend} 远程会话正在关闭，请等待关闭结果后再发送消息。',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
+  'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.input_delivery_failed': '⚠️ Worker 未能接收这条消息。Botmux 已在同一 Worker 上自动重试，但仍未完成接收；为避免跨进程重复执行，没有继续重投。请重发本条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
@@ -862,6 +861,12 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
+  'worker.ordinary_recovery_exhausted': '⚠️ Claude 因暂态模型服务故障中断，Botmux 已自动续跑 2 次但仍未恢复。会话已停止自动续跑，避免重复外部操作；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
+  'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude 因暂态模型服务故障中断，但 Botmux 无法安全提交自动续跑。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_delivery_failed': '⚠️ Claude 因暂态模型服务故障中断，但自动续跑未能送达 Worker。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux 在自动续跑交接期间重启，当前执行状态无法确认。为避免重复外部操作，Botmux 没有重放本次续跑；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_non_retryable': '⚠️ Claude 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
+  'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
@@ -974,6 +979,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.close.title': '确认关闭会话？',
   'card.dashboard.sessions.confirm.close.text': '关闭后会话将无法继续，已有进度可能丢失。会话：{title}',
   'card.dashboard.sessions.close_failed': '⚠️ 关闭失败：{reason}',
+  'card.dashboard.sessions.close_residual': '⚠️ **本地已关闭，但远端会话未取消**：`{taskId}`，需人工清理。',
+  'card.dashboard.sessions.close_residual_local': '⚠️ **本地已关闭，但可能残留带凭证的子进程未确认终止**：{taskId}。远端会话已取消，需人工核查本机进程。',
   'card.dashboard.sessions.session_not_found': '⚠️ 会话不存在或已被清理。',
   'card.dashboard.sessions.close.disabled.alreadyClosed': '会话已关闭',
   'card.dashboard.sessions.close.disabled.starting': '会话启动中，暂不可关闭',
@@ -1113,6 +1120,16 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
   'card.dashboard.overview.goto_groups': '📂 群组',
+  // 「打开工作台」是纯链接按钮（appCenter AppLink），不是 dash_overview_* 回调。
+  'card.dashboard.overview.open_workbench': '打开工作台',
+  // 按钮链接带长期 token、常驻不过期（产品决策，见 core/workbench-link.ts）。这行
+  // 小字承担用户侧的知情权：告诉他这个入口不会过期，也告诉他怀疑泄漏时怎么自己
+  // 作废。卡片里只有按钮、没有明文链接行，所以这里也不写链接本体，只写 rotate。
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 常驻入口，不会过期；怀疑泄漏用 <font color="grey">botmux dashboard rotate</font> 轮换 token 立即作废',
+  // 降级路径：读不到 token 时按钮链接不带凭证，如实说明，别吹「常驻不过期」。
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 暂时读不到 Dashboard 凭证，打开后需在浏览器里登录',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

@@ -1330,8 +1330,13 @@ export async function createOpenPlatformAppWithClient(
   try {
     // 模板应用出生已带 bot + 长连接(重复调用幂等);fallback 的裸自建应用
     // 则必须显式开启——这两步是「一扫即用」的必要条件,在返回凭证前完成。
-    await client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
-    await client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
+    // robot/event switch 都是幂等设值,故对宿主机↔飞书的瞬态网络抖动小步重试:
+    // 一次 undici `fetch failed` 不该让「应用已建成但没启用能力」半途而废
+    // (那会把用户丢进手动读 Secret + CLI 续跑的恢复路径)。
+    await retryIdempotentOnTransientNetworkError(() =>
+      client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true }));
+    await retryIdempotentOnTransientNetworkError(() =>
+      client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
 
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
@@ -1340,6 +1345,9 @@ export async function createOpenPlatformAppWithClient(
     // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
     // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
     // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    // ⚠️ version/create、publish/commit 是非幂等写操作(传输失败即结果未知,
+    // 重放会重复建版/撞版本号),故绝不套 retryIdempotent… 包装,与 fetchRaw
+    // 只对 GET/HEAD 重试同源。
     const versionCreated = await client.postJson(
       `/developers/v1/app_version/create/${appId}`,
       buildAppVersionCreatePayload('1.0.0', [options.creatorUserId]),
@@ -1350,7 +1358,11 @@ export async function createOpenPlatformAppWithClient(
     }
     await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
 
-    const appSecret = await fetchOpenPlatformAppSecret(client, appId);
+    // 读 Secret 是纯只读 POST(getAppSecret 同款,不触碰 reset),幂等可重试:
+    // 应用已建成、已发布,唯独最后一步读 Secret 撞网络抖动而失败最可惜——
+    // 重试让它自愈,而不是把整条链路判死。
+    const appSecret = await retryIdempotentOnTransientNetworkError(() =>
+      fetchOpenPlatformAppSecret(client, appId!));
     return { appId, appSecret };
   } catch (err) {
     throw new CreatedOpenPlatformAppError(appId, err);
@@ -1619,6 +1631,63 @@ function readDefaultScopeManifest(): ScopeManifest {
   throw new Error('找不到 botmux lark-scopes.json');
 }
 
+// 宿主机到飞书的偶发网络抖动（DNS EAI_AGAIN、连接被重置、路由瞬断等）会让
+// undici 把整个请求直接抛成 TypeError('fetch failed')，一次失败就中断 console
+// 自动化链路（dashboard 改名/改头像、VC 事件订阅检查都实测偶发中招）。这类
+// 错误按错误码识别，只对幂等请求小步退避重试。
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+const TRANSIENT_FETCH_RETRY_DELAYS_MS = [300, 900];
+
+function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || !(err instanceof Error)) return false;
+  // 调用方主动 abort / 超时不算网络抖动，重试会违背调用方意图。
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true;
+  if (err instanceof AggregateError && err.errors.some(item => isLikelyTransientNetworkError(item, depth + 1))) {
+    return true;
+  }
+  // undici 网络层失败统一表现为 TypeError('fetch failed', { cause })；cause 缺失
+  // （老版本/被吞）时按瞬态处理——多试两次的代价远小于误报一次给用户。
+  if (err instanceof TypeError && err.message === 'fetch failed') {
+    return err.cause === undefined || isLikelyTransientNetworkError(err.cause, depth + 1);
+  }
+  return isLikelyTransientNetworkError((err as { cause?: unknown }).cause, depth + 1);
+}
+
+// 对「幂等」console 请求复用 fetchRaw 的瞬态退避:传输层抖动(fetch failed /
+// ECONNRESET 等)时小步重试,一次网络毛刺不再中断整条链路。API 层拒绝
+// (OpenPlatformApiError、HTTP 非 2xx、code!=0)无 code / cause,isLikely… 判 false,
+// 只会立刻抛出而不会被重放。
+// ⚠️ 只能包装「重复调用无副作用」的请求。app_version/create、publish/commit 这类
+// 「传输失败即结果未知、重放会重复提交/撞版本号」的非幂等写操作绝不能用本包装
+// (与 fetchRaw 只对 GET/HEAD 重试同源:见其上方注释)。
+async function retryIdempotentOnTransientNetworkError<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+        throw err;
+      }
+      await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 class MutableCookieJar {
   private cookies: StoredCookie[];
 
@@ -1647,6 +1716,10 @@ class MutableCookieJar {
   async fetchRaw(fetcher: typeof fetch, url: string, init: RequestInit = {}, maxHops = 10): Promise<Response> {
     let current = url;
     let referer: string | undefined;
+    // 只有幂等的 GET/HEAD 允许瞬态网络错误重试：POST 全是 console 写操作或登录
+    // 流程，传输错误时服务端可能已 commit（结果未知），重试等于重复提交。
+    const method = (init.method ?? 'GET').toUpperCase();
+    const retryable = method === 'GET' || method === 'HEAD';
     for (let hop = 0; hop <= maxHops; hop += 1) {
       const headers = new Headers(init.headers);
       const cookieHeader = getCookieHeader(this.cookies, current);
@@ -1654,7 +1727,18 @@ class MutableCookieJar {
       headers.set('user-agent', headers.get('user-agent') ?? DEFAULT_BROWSER_USER_AGENT);
       if (referer && !headers.has('referer')) headers.set('referer', referer);
 
-      const response = await fetcher(current, { ...init, headers, redirect: 'manual' });
+      let response: Response;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          response = await fetcher(current, { ...init, headers, redirect: 'manual' });
+          break;
+        } catch (err) {
+          if (!retryable || attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+            throw err;
+          }
+          await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+        }
+      }
       this.loadFromResponse(current, response.headers);
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
@@ -1951,9 +2035,26 @@ function summarizeOpenPlatformPayload(payload: unknown): string {
   return JSON.stringify(summary).slice(0, 500);
 }
 
-function safeErrorMessage(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.replace(/[A-Za-z0-9_=-]{24,}/g, '***');
+export function safeErrorMessage(err: unknown): string {
+  // undici 把网络失败包成 TypeError('fetch failed', { cause })，真实原因
+  // （ECONNRESET / EAI_AGAIN / 具体地址等）全在 cause 链里——不带上它，用户和
+  // 排障方永远只能看到一句 "fetch failed"。
+  const parts: string[] = [];
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof AggregateError && !current.message && current.errors.length > 0) {
+      current = current.errors[0];
+    }
+    const message = current instanceof Error ? current.message : String(current);
+    const code = (current as { code?: unknown }).code;
+    const part = typeof code === 'string' && code && !message.includes(code)
+      ? (message ? `${message} (${code})` : code)
+      : message;
+    if (part && parts[parts.length - 1] !== part) parts.push(part);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  const combined = parts.join(': ') || (err instanceof Error ? err.message : String(err));
+  return combined.replace(/[A-Za-z0-9_=-]{24,}/g, '***');
 }
 
 function markFinalResponseUrl(response: Response, finalUrl: string): void {

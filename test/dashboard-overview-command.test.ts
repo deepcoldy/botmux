@@ -103,6 +103,54 @@ describe('handleDashboardOverview (command path)', () => {
     expect(topicCalls[0][2]).toBeUndefined();
   });
 
+  it('DMs a card carrying the 打开工作台 appCenter entry for this bot', async () => {
+    const deps = makeDeps();
+    const dm = captureDM();
+    const target = 'http://10.0.0.7:7891/?t=tok-abc#/agent-workbench';
+    const resolveWorkbench = vi.fn(() => ({
+      appLink: `https://applink.feishu.cn/client/web_url/open?mode=appCenter&url=${encodeURIComponent(target)}`,
+      webUrl: target,
+    }));
+    const createClient = vi.fn(() => ({
+      request: async () => ({ status: 200, body: defaultSnapshotBody(), raw: '' }),
+    } as any));
+
+    await handleDashboardOverview(
+      makeMessage(), '', 'om_root', 'oc_test', deps, LARK_APP_ID, OWNER,
+      { createClient, sendUserMessage: dm.sendUserMessage, locale: 'zh', resolveWorkbench },
+    );
+
+    // brand/token are per-bot, so the resolver is asked for THIS larkAppId.
+    expect(resolveWorkbench).toHaveBeenCalledWith(LARK_APP_ID);
+    expect(dm.calls[0].content).toContain('打开工作台');
+    expect(dm.calls[0].content).toContain(
+      'https://applink.feishu.cn/client/web_url/open?mode=appCenter'
+      + '&url=http%3A%2F%2F10.0.0.7%3A7891%2F%3Ft%3Dtok-abc%23%2Fagent-workbench',
+    );
+  });
+
+  it('omits the workbench button when no link can be built', async () => {
+    const deps = makeDeps();
+    const dm = captureDM();
+    const createClient = vi.fn(() => ({
+      request: async () => ({ status: 200, body: defaultSnapshotBody(), raw: '' }),
+    } as any));
+
+    await handleDashboardOverview(
+      makeMessage(), '', 'om_root', 'oc_test', deps, LARK_APP_ID, OWNER,
+      {
+        createClient,
+        sendUserMessage: dm.sendUserMessage,
+        locale: 'zh',
+        resolveWorkbench: () => undefined,
+      },
+    );
+
+    expect(dm.calls[0].content).toContain('Dashboard 总览');
+    expect(dm.calls[0].content).not.toContain('打开工作台');
+    expect(dm.calls[0].content).not.toContain('applink');
+  });
+
   it('Route B throws → topic overview_failed, NO DM', async () => {
     const deps = makeDeps();
     const dm = captureDM();

@@ -185,6 +185,257 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows Grok reasoning effort and omits Codex-only max/ultra for grok-4.5', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'grok', model: 'grok-4.5', reasoningEffort: body.reasoningEffort, selectionKey: 'grok' }),
+      } as any;
+    });
+    try {
+      const grokCliState = {
+        options: [
+          { id: 'grok', label: 'Grok' },
+          { id: 'codex', label: 'Codex' },
+        ],
+        ttadkModelDefault: '',
+        ttadkModelSuggestions: [],
+      };
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_grok', cliId: 'grok', model: 'grok-4.5', reasoningEffort: 'high' },
+          sessionFallback: 'grok',
+          cliState: grokCliState,
+          patchBot: () => undefined,
+        }));
+      });
+      const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('high');
+      const options = picker.props.options as Array<{ value: string; label: string }>;
+      expect(options.map(option => option.value)).toEqual(['', 'low', 'medium', 'high']);
+      expect(options[0]?.label).toBe('跟随 Grok 默认值');
+      expect(options.map(option => option.value)).not.toContain('xhigh');
+      expect(options.map(option => option.value)).not.toContain('ultra');
+      act(() => picker.props.onChange('medium'));
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'grok', model: 'grok-4.5', reasoningEffort: 'medium' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  const dshCliState = {
+    options: [
+      { id: 'codex', label: 'Codex' },
+      { id: 'dsh', label: 'dsh' },
+    ],
+    ttadkModelDefault: '',
+    ttadkModelSuggestions: [],
+  };
+
+  function renderDsh(bot: Record<string, any>, patchBot = vi.fn()) {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_dsh', model: '', ...bot },
+        sessionFallback: 'dsh',
+        cliState: dshCliState as any,
+        patchBot,
+      }));
+    });
+    return { renderer, root: renderer.root, patchBot };
+  }
+
+  it('shows the dsh turn timeout in minutes and PUTs it as milliseconds', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      // 1_800_000 ms = 30 min
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      expect(input.props.value).toBe('30');
+      act(() => input.props.onChange({ currentTarget: { value: '45' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      // 45 min → 2_700_000 ms
+      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('clears the dsh turn timeout to the runner default when emptied', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      expect(input.props.value).toBe('30');
+      act(() => input.props.onChange({ currentTarget: { value: '' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      // Empty → '' so the daemon deletes the field (revert to 10-min default).
+      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('omits the turn timeout field for non-dsh CLIs', () => {
+    const { root } = renderDsh({ cliId: 'codex' });
+    expect(root.findAllByProps({ 'data-input': 'agentTurnTimeout' })).toHaveLength(0);
+  });
+
+  it('shows a legal non-whole-minute timeout and preserves it on a model-only save', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        // Daemon preserved the stored ms because the field was absent from the body.
+        json: async () => ({ ok: true, cliId: 'dsh', model: body.model, turnTimeoutMs: 90_001, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      // 90_001 ms is a legal positive integer but not a whole minute.
+      const { root } = renderDsh({ cliId: 'dsh', model: 'm0', turnTimeoutMs: 90_001 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      // Shown as exact decimal minutes (≈ 1.5000166667), never blanked.
+      expect(input.props.value).not.toBe('');
+      expect(Math.round(Number(input.props.value) * 60_000)).toBe(90_001);
+      // Edit only the model, then save. The untouched timeout must be omitted so
+      // the daemon preserves 90_001 instead of clearing it.
+      const modelInput = root.findByProps({ 'data-input': 'agentModel' });
+      act(() => modelInput.props.onChange({ currentTarget: { value: 'm1' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'dsh', model: 'm1', reasoningEffort: '' }]);
+      expect(Object.prototype.hasOwnProperty.call(requests[0], 'turnTimeoutMs')).toBe(false);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('re-saves the displayed non-whole-minute value back to the exact stored ms', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+      } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 90_001 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      const shown = input.props.value; // e.g. "1.5000166667"
+      // Re-enter the exact displayed minutes (a touch) and save: rounding to the
+      // nearest ms must reproduce 90_001, not error on a ~2e-6 float mismatch.
+      act(() => input.props.onChange({ currentTarget: { value: shown } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
+      expect(root.findAllByProps({ 'data-turn-timeout-error': '' })).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('blocks the save and shows an inline error on invalid turn timeout input', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      // 0 is not a clearable blank and not a positive timeout → must error, not clear.
+      act(() => input.props.onChange({ currentTarget: { value: '0' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      // No PUT happened; an inline error is shown.
+      expect(requests).toEqual([]);
+      expect(root.findAllByProps({ 'data-turn-timeout-error': '' }).length).toBeGreaterThan(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('blocks the save when the minutes value exceeds the arm-able millisecond bound', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+    });
+    try {
+      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
+      // 40000 min = 2.4e9 ms > 2_147_483_647 ms → invalid (would overflow setTimeout).
+      act(() => input.props.onChange({ currentTarget: { value: '40000' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([]);
+      expect(root.findAllByProps({ 'data-turn-timeout-error': '' }).length).toBeGreaterThan(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('shows a legacy path as read-only and omits cliRuntime on a model-only save', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
@@ -235,6 +486,189 @@ describe('Codex-compatible runtime editor', () => {
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
+  });
+
+  async function saveAgentWithSweep(body: Record<string, unknown>) {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        cliId: 'codex',
+        cliRuntime: null,
+        cliPathOverride: null,
+        wrapperCli: null,
+        model: '',
+        selectionKey: 'codex',
+        ...body,
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex' });
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const status = root.findByProps({ 'data-agent-status': '' });
+      return { text: status.children.join(''), className: String(status.props.className ?? '') };
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  }
+
+  it('warns about RESIDUAL sessions on their own (remote not cancelled)', async () => {
+    // Proven separately from `failed`: a combined payload would stay green if
+    // only one of the two branches existed.
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 3,
+      closedMismatchedResidual: 2,
+      closedMismatchedFailed: 0,
+    });
+
+    expect(text).toContain('2');
+    // Localised residual copy, not the failure copy.
+    expect(text).toContain('远端会话未取消');
+    expect(text).not.toContain('关闭失败');
+    expect(text).not.toContain('✓');
+    expect(className).toContain('hint-warn-inline');
+    expect(className).not.toContain('hint-ok');
+  });
+
+  it('warns about FAILED closes on their own (rows still active)', async () => {
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 0,
+      closedMismatchedFailed: 4,
+    });
+
+    expect(text).toContain('4');
+    expect(text).toContain('关闭失败');
+    expect(text).not.toContain('远端会话未取消');
+    expect(text).not.toContain('✓');
+    expect(className).toContain('hint-warn-inline');
+    expect(className).not.toContain('hint-ok');
+  });
+
+  it('shows the residual task ids on success, not just a count', async () => {
+    // A count is not actionable; the id is the only handle for manual cleanup.
+    const { text } = await saveAgentWithSweep({
+      closedMismatchedSessions: 2,
+      closedMismatchedResidual: 1,
+      closedMismatchedFailed: 0,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    });
+
+    expect(text).toContain('mojo-parked-9');
+  });
+
+  it('reports an aborted switch with its residual ids, and does not patch the bot', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        ok: false,
+        error: 'agent_switch_close_failed',
+        closedMismatchedSessions: 1,
+        closedMismatchedResidual: 1,
+        closedMismatchedFailed: 1,
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      }),
+    } as any));
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({ cliId: 'codex' }, patchBot);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const text = root.findByProps({ 'data-agent-status': '' }).children.join('');
+      // Not a bare error code: says the switch did NOT happen, plus the counts…
+      expect(text).toContain('Agent 未切换');
+      // …and the surviving remote id.
+      expect(text).toContain('mojo-parked-9');
+      // The config was not committed, so the local bot row must not be patched.
+      expect(patchBot).not.toHaveBeenCalled();
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows unknown (and stays warn) when a residual count arrives with no ids', async () => {
+    // Malformed payload must fail CLOSED: the count alone is evidence a remote
+    // session survived, so it cannot render as a silent success.
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 1,
+      closedMismatchedResidualTaskIds: [],
+    });
+
+    expect(text).toContain('unknown');
+    expect(text).not.toContain('✓');
+    expect(className).toContain('hint-warn-inline');
+  });
+
+  it('drops the green tick when ids arrive with no residual count', async () => {
+    // The mirror case: ids are evidence too. This used to print "manual cleanup
+    // required" AND the green tick at the same time.
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 1,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    });
+
+    expect(text).toContain('mojo-parked-9');
+    expect(text).not.toContain('✓');
+    expect(className).not.toContain('hint-ok');
+  });
+
+  it('reports a commit failure that happened AFTER sessions were closed', async () => {
+    // Third post-close exit: the closes are irreversible, so this response is the
+    // only report of the surviving remote sessions.
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        reason: 'ENOSPC',
+        closedMismatchedSessions: 2,
+        closedMismatchedResidual: 1,
+        closedMismatchedFailed: 0,
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      }),
+    } as any));
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({ cliId: 'codex' }, patchBot);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const text = root.findByProps({ 'data-agent-status': '' }).children.join('');
+      expect(text).toContain('Agent 未切换');
+      expect(text).toContain('mojo-parked-9');
+      expect(patchBot).not.toHaveBeenCalled();
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('keeps the green tick when the sweep was completely clean', async () => {
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 2,
+      closedMismatchedResidual: 0,
+      closedMismatchedFailed: 0,
+    });
+
+    expect(text).toContain('✓');
+    expect(className).toContain('hint-ok');
   });
 
   it('explicitly clears a legacy path and reports sessions closed by the runtime switch', async () => {
@@ -552,6 +986,75 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
     expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
+  });
+});
+
+describe('riff save consumes the agent-switch close summary', () => {
+  function renderRiff(agentBody: any, agentStatus = 200) {
+    const patchBot = vi.fn();
+    (globalThis as any).fetch = async (url: string) => (String(url).endsWith('/agent')
+      ? { ok: agentStatus === 200, status: agentStatus, json: async () => agentBody } as any
+      : { ok: true, status: 200, json: async () => ({ ok: true, riff: JSON.stringify({ baseUrl: 'https://riff.example' }) }) } as any);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_riff_sum', cliId: 'codex', model: '' },
+        sessionFallback: 'codex',
+        cliState: {
+          options: [{ id: 'codex', label: 'Codex' }, { id: 'riff', label: 'Riff' }],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot,
+      }));
+    });
+    act(() => { renderer.root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'); });
+    return { root: renderer.root, patchBot };
+  }
+
+  it('200 + residual: shows the id in the RIFF status and is not green', async () => {
+    // setAgentStatus is rendered in the !isRiff branch, so a residual reported
+    // there while Riff is selected is invisible. It has to land on this section.
+    const { root } = renderRiff({
+      ok: true,
+      cliId: 'riff',
+      wrapperCli: null,
+      model: '',
+      selectionKey: 'riff',
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 1,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    });
+
+    await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+
+    const status = root.findByProps({ 'data-riff-status': '' });
+    expect(status.children.join('')).toContain('mojo-parked-9');
+    expect(status.children.join('')).not.toContain('✓');
+  });
+
+  it('409 aborted switch: shows Agent-not-switched + id, and does not patch cliId', async () => {
+    const { root, patchBot } = renderRiff({
+      ok: false,
+      error: 'agent_switch_close_failed',
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 1,
+      closedMismatchedFailed: 1,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    }, 409);
+
+    await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+
+    const text = root.findByProps({ 'data-riff-status': '' }).children.join('');
+    // Riff-specific truth: the /riff write already succeeded, so it must NOT claim
+    // the config is unchanged — only the Agent selection failed to switch.
+    expect(text).toContain('Riff 配置已保存');
+    expect(text).toContain('Agent 选择未切换');
+    expect(text).toContain('mojo-parked-9');
+    // Exactly one status icon (the key used to carry its own ✗ as well).
+    expect(text.match(/✗/g)?.length ?? 0).toBe(1);
+    // The /riff write succeeded, but cliId must NOT be flipped to riff.
+    expect(patchBot.mock.calls.some(c => (c[1] as any)?.cliId === 'riff')).toBe(false);
   });
 });
 

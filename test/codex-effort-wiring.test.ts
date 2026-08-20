@@ -93,11 +93,15 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
 
   it('freezes the per-Bot default onto a newly created session', () => {
     const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    expect(source).toContain('ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)');
+    expect(source).toContain('ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)');
     expect(source).toContain('? ds.session.reasoningEffort ?? botCfg.reasoningEffort');
     expect(source).toContain(': undefined;');
     const frozenBranch = source.indexOf('if (!ds.session.agentFrozen)');
-    const compatibilityGuard = source.indexOf('codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)');
+    // The capability guard is checked against the model THIS spawn resolves
+    // (`model`, from resolveSessionLaunchModel), not the session's recorded one:
+    // the model is no longer frozen, and a per-trigger override never lands in
+    // the record — judging support by the record would use the wrong model.
+    const compatibilityGuard = source.indexOf('cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)');
     const returnConfig = source.indexOf('return {', frozenBranch);
     expect(compatibilityGuard).toBeGreaterThan(frozenBranch);
     expect(compatibilityGuard).toBeLessThan(returnConfig);

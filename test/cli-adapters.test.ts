@@ -51,13 +51,20 @@ import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
+import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
+import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh'];
+// Derived from the registry's closed Record<CliId,…> instead of re-typed: the
+// hand-written copy this replaced had silently dropped mojo, cursor and relay,
+// so those adapters were never exercised by the loops below.
+// riff/mojo are remote backends whose adapter is a stub, but constructing one is
+// still valid — the assertions below only touch adapter-shape invariants.
+const ALL_CLI_IDS: readonly CliId[] = REGISTRY_ALL_CLI_IDS;
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -81,7 +88,14 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
+    // Remote backends (riff/mojo) never have the worker spawn a local binary —
+    // riff is pure HTTP and MojoBackend shells out per turn from the backend, so
+    // their adapter deliberately reports an empty resolvedBin. Exempting them via
+    // the shared predicate keeps this loop honest for every local CLI.
+    if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
+    // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
+    // the node binary, not the pinned path.
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -229,6 +243,18 @@ describe('claude-code buildArgs', () => {
       expect(prompt).toContain('JSON-escaped text as a positional argument');
       expect(prompt).toContain('literal `\\n` back into newlines');
       expect(prompt).toContain('--content-file');
+    }
+  });
+
+  it('keeps the final-answer feedback hint aligned across both injection paths', () => {
+    // 回归守卫：feedbackResponseKindHint 必须同时出现在 system-prompt 路径
+    // （injectsSessionContext CLI）与 shell-hints 路径，否则启用最终回答反馈时
+    // 两类 CLI 的发送行为会静默分叉。
+    const systemPrompt = buildBotmuxSystemPromptText({ locale: 'en' });
+    const shellHints = buildBotmuxShellHints('en').join('\n');
+    for (const prompt of [systemPrompt, shellHints]) {
+      expect(prompt).toContain('--response-kind final');
+      expect(prompt).toContain('feedback buttons');
     }
   });
 
@@ -586,6 +612,18 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).not.toContain('--model');
   });
 
+  it('forwards a per-bot turn timeout to the runner', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 30 * 60 * 1000 });
+    expect(args).toContain('--turn-timeout-ms');
+    expect(args).toContain(String(30 * 60 * 1000));
+  });
+
+  it('omits --turn-timeout-ms when unset or non-positive', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--turn-timeout-ms');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 0 })).not.toContain('--turn-timeout-ms');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: -5 })).not.toContain('--turn-timeout-ms');
+  });
+
   it('has no portable copy-paste resume command', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
   });
@@ -699,9 +737,14 @@ describe('copilot buildArgs', () => {
     expect(args[idx + 1]).toBe('copilot-sess-abc');
   });
 
-  it('resume without cliSessionId falls back to --continue', () => {
+  it('resume without cliSessionId starts fresh (never --continue)', () => {
+    // --continue would resume the globally most recent Copilot session, which
+    // is shared across every botmux session of this bot — a worker restart
+    // whose cliSessionId was never captured would then load a SIBLING
+    // session's conversation (topic-group context leaking into a private
+    // chat). Start fresh instead, matching reasonix/antigravity.
     const args = adapter.buildArgs({ sessionId: 'sess-cp', resume: true });
-    expect(args).toContain('--continue');
+    expect(args).not.toContain('--continue');
     expect(args).not.toContain('--resume');
   });
 
@@ -727,8 +770,9 @@ describe('copilot buildArgs', () => {
 describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
-  it('fresh session passes force/model flags without resume flags', () => {
+  it('fresh session passes trust/force/model flags without resume flags', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
@@ -743,16 +787,33 @@ describe('cursor buildArgs', () => {
       resume: true,
       resumeSessionId: chatId,
     });
+    expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
     expect(args).not.toContain('--continue');
   });
 
-  it('resume without a persisted chatId falls back to --continue', () => {
+  it('resume without a persisted chatId starts fresh (never --continue)', () => {
+    // --continue (= --resume=-1) would resume the globally most recent Cursor
+    // chat, which is shared across every botmux session of this bot — a worker
+    // restart whose cliSessionId was never captured would then load a SIBLING
+    // session's conversation (topic-group context leaking into a private
+    // chat). Start fresh instead, matching reasonix/antigravity.
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: true });
-    expect(args).toContain('--continue');
+    expect(args).toContain('--trust');
+    expect(args).not.toContain('--continue');
     expect(args).not.toContain('--resume');
+  });
+
+  // The workspace-trust dialog is a startup gate, not an approval flow: a
+  // headless spawn can never answer it, and the injected first prompt would
+  // answer it by accident (`a` trusts, `q` quits). So --trust must survive
+  // disableCliBypass while --force is dropped.
+  it('disableCliBypass drops --force but keeps --trust', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
+    expect(args).toContain('--trust');
+    expect(args).not.toContain('--force');
   });
 });
 
@@ -1436,8 +1497,18 @@ describe('idleToBusyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
   });
 
+  it('pi opts in with the same Working... marker as its busyPattern', () => {
+    // Pi's `Working...` is an ephemeral status line (never part of transcript
+    // history redraws), so idle→busy recovery is safe: a falsely published
+    // ready self-heals when the marker renders again.
+    const adapter = createPiAdapter('/bin/pi');
+    expect(adapter.idleToBusyPattern).toBeDefined();
+    expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
+    expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
+  });
+
   it.each([
-    ['pi', createPiAdapter('/bin/pi')],
     ['genius', createGeniusAdapter('/bin/genius')],
     ['grok', createGrokAdapter('/bin/grok')],
   ])('%s keeps legacy busyPattern semantics and does not opt in', (_name, adapter) => {
@@ -1870,11 +1941,13 @@ describe('buildResumeCommand', () => {
 });
 
 describe('native session rename capability', () => {
-  it('is declared only by the verified Codex and Claude Code adapters', () => {
+  it('is declared only by the verified Codex, Claude Code, and Grok adapters', () => {
     expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
       .toBe('/rename 新的标题');
     expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
+    expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
+      .toBe('/rename 新标题');
 
     expect(createCliAdapterSync('seed', '/bin/true').buildSessionRenameCommand).toBeUndefined();
     expect(createCodexAppAdapter('/bin/codex').buildSessionRenameCommand).toBeUndefined();
@@ -1976,6 +2049,16 @@ describe('grok buildArgs', () => {
     expect(args[args.indexOf('--resume') + 1]).toBe(sid);
   });
 
+  it('starts fresh when resume=true but no sessionId is available (never --continue)', () => {
+    // Defense-in-depth: sessionId is normally the non-empty botmux UUID, but
+    // if it is ever missing, --continue would resume the globally most recent
+    // grok session — shared across botmux sessions of this bot — and leak a
+    // sibling session's context. Start fresh instead.
+    const args = adapter.buildArgs({ sessionId: '', resume: true });
+    expect(args).not.toContain('--continue');
+    expect(args).not.toContain('--resume');
+  });
+
   it('carves out GROK_HOME (directory-level: SQLite under sessions/) and resolves skills/hooks under it', () => {
     expect(adapter.authPaths).toEqual([GROK_TEST_HOME]);
     expect(adapter.skillsDir).toBe(join(GROK_TEST_HOME, 'skills'));
@@ -1983,7 +2066,51 @@ describe('grok buildArgs', () => {
   });
 
   it('surfaces curated model choices for setup', () => {
-    expect(adapter.modelChoices).toContain('grok-4.5');
+    expect(adapter.modelChoices).toEqual(['grok-4.6', 'grok-4.5']);
+  });
+
+  it('passes --reasoning-effort when configured', () => {
+    const args = adapter.buildArgs({
+      sessionId: sid,
+      resume: false,
+      model: 'grok-4.6',
+      reasoningEffort: 'high',
+    });
+    expect(args.slice(0, 8)).toEqual([
+      '--always-approve', '--no-plan',
+      '--model', 'grok-4.6',
+      '--reasoning-effort', 'high',
+      '--session-id', sid,
+    ]);
+  });
+
+  it('forks with --resume, --fork-session, and the child --session-id', () => {
+    const childId = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const args = adapter.buildArgs({
+      sessionId: childId,
+      resume: true,
+      resumeSessionId: sid,
+      forkSession: true,
+      reasoningEffort: 'medium',
+    });
+    expect(args.slice(0, 9)).toEqual([
+      '--always-approve', '--no-plan',
+      '--reasoning-effort', 'medium',
+      '--resume', sid,
+      '--fork-session',
+      '--session-id', childId,
+    ]);
+  });
+
+  it('does not fork a plain resume', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'child',
+      resume: true,
+      resumeSessionId: 'source',
+      forkSession: false,
+    });
+    expect(args.includes('--fork-session')).toBe(false);
+    expect(args.includes('--session-id')).toBe(false);
   });
 
   it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {
@@ -2162,9 +2289,14 @@ describe('kimi buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
 
-  it('resumes latest session when no resumeSessionId is available', () => {
+  it('starts fresh when no resumeSessionId is available (never --continue)', () => {
+    // --continue would resume the most recent Kimi session, which is shared
+    // across every botmux session of this bot — a worker restart whose
+    // cliSessionId was never captured would then load a SIBLING session's
+    // conversation (topic-group context leaking into a private chat). Start
+    // fresh instead, matching reasonix/antigravity.
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true });
-    expect(args).toContain('--continue');
+    expect(args).not.toContain('--continue');
     expect(args).not.toContain('--resume');
   });
 
@@ -2177,6 +2309,82 @@ describe('kimi buildArgs', () => {
 
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('kimi-k2.5');
+  });
+});
+
+// Regression: 话题群会话 A 的上下文偶发串到私聊会话 B。根因是 cursor / copilot /
+// kimi 三个适配器在 resume=true 但 resumeSessionId 缺失（worker 重启时 cliSessionId
+// 从未持久化）时回退到 `--continue`，而 `--continue` 恢复的是「全局最近会话」——
+// 同一 bot 的多个 botmux 会话共享同一个 CLI 配置目录，于是 B 的 worker 可能把 A 的
+// 会话加载进自己的上下文。reasonix / antigravity 已明确拒绝 `--continue`
+//（"most recent is racy when multiple botmux sessions run in parallel"），
+// 这三个适配器必须对齐：缺 id 时宁可新起干净会话，也不串用兄弟会话的上下文。
+describe('resume without cliSessionId — cross-session isolation (cursor / copilot / kimi)', () => {
+  const adapters = [
+    { name: 'cursor', factory: () => createCursorAdapter('/usr/bin/cursor-agent') },
+    { name: 'copilot', factory: () => createCopilotAdapter('/usr/bin/copilot') },
+    { name: 'kimi', factory: () => createKimiAdapter('/usr/bin/kimi') },
+  ] as const;
+
+  for (const { name, factory } of adapters) {
+    it(`${name}: resume=true without resumeSessionId starts a fresh session (no --continue, no --resume)`, () => {
+      const adapter = factory();
+      // Simulates the reported bug: session B (private chat) worker restarts
+      // with resume=true but its cliSessionId was never persisted (crash
+      // before capture / observation failed). The args must NOT contain
+      // --continue, which would resume the globally most recent conversation
+      // — potentially session A's (topic group) context.
+      const args = adapter.buildArgs({ sessionId: 'bm-session-b', resume: true });
+      expect(args).not.toContain('--continue');
+      expect(args).not.toContain('--resume');
+    });
+
+    it(`${name}: resume=true WITH resumeSessionId still resumes the exact session`, () => {
+      const adapter = factory();
+      const args = adapter.buildArgs({
+        sessionId: 'bm-session-b',
+        resume: true,
+        resumeSessionId: 'cli-session-b',
+      });
+      expect(args).toContain('--resume');
+      expect(args[args.indexOf('--resume') + 1]).toBe('cli-session-b');
+      expect(args).not.toContain('--continue');
+    });
+
+    it(`${name}: fresh spawn (resume=false) is unaffected`, () => {
+      const adapter = factory();
+      const args = adapter.buildArgs({ sessionId: 'bm-session-b', resume: false });
+      expect(args).not.toContain('--continue');
+      expect(args).not.toContain('--resume');
+    });
+  }
+});
+
+// Regression: the worker / closed card / resume receipt must be able to tell
+// "resume will restore history" from "resume starts a fresh session" apart.
+// Adapters whose buildArgs can only resume a PRECISE cliSessionId (no
+// --continue/latest fallback) declare `resumeRequiresCliSessionId`; the worker
+// demotes resume-without-id to a fresh launch + user notice, and the card
+// copy stops claiming history is back.
+describe('resumeRequiresCliSessionId capability', () => {
+  it('cursor / copilot / kimi declare the capability (resume without an id starts fresh)', () => {
+    expect(createCursorAdapter('/usr/bin/cursor-agent').resumeRequiresCliSessionId).toBe(true);
+    expect(createCopilotAdapter('/usr/bin/copilot').resumeRequiresCliSessionId).toBe(true);
+    expect(createKimiAdapter('/usr/bin/kimi').resumeRequiresCliSessionId).toBe(true);
+  });
+
+  it('adapters whose botmux sessionId IS the CLI session id do not declare it', () => {
+    // claude-code / grok resume `resumeSessionId ?? sessionId` — a precise id
+    // is always available, so no demotion is needed.
+    expect(createClaudeCodeAdapter('/usr/bin/claude').resumeRequiresCliSessionId).toBeUndefined();
+    expect(createGrokAdapter('/usr/bin/grok').resumeRequiresCliSessionId).toBeUndefined();
+  });
+
+  it('adapters that ignore resume entirely do not declare it', () => {
+    // gemini always starts fresh regardless — but its resume story is "no
+    // resume at all", not "resume requires an id"; keep it out of the demotion
+    // path so its existing card copy is unchanged.
+    expect(createGeminiAdapter('/usr/bin/gemini').resumeRequiresCliSessionId).toBeUndefined();
   });
 });
 

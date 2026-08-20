@@ -213,6 +213,12 @@ describe('Riff worker session environment', () => {
           env: {
             BOTMUX_OWNER_OPEN_ID: 'ou_stale_config_owner',
             __OWNER_OPEN_ID: 'ou_stale_config_owner',
+            // A stale / attacker-shaped backend env trying to flip the workflow
+            // kill-switch OFF in the remote pane. riffCfg.env merges LAST and is
+            // NOT sanitized (unlike per-bot env), so the host must re-freeze the
+            // resolved value after the merge — otherwise this would desync the
+            // pane's CLI-side gate from the daemon's authoritative decision.
+            BOTMUX_WORKFLOW_ENABLED: 'false',
           },
         },
         prompt: 'verify remote session environment',
@@ -246,6 +252,10 @@ describe('Riff worker session environment', () => {
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      // The workflow kill-switch is host-resolved and re-frozen after the merge:
+      // the daemon default (no config / no env override) is ON, so the stale
+      // backendConfig.env `false` must NOT survive into the remote pane.
+      expect(request.config?.env?.BOTMUX_WORKFLOW_ENABLED).toBe('true');
       expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
         enabled: true,
         buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],

@@ -187,9 +187,26 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain("assertLarkTransport(larkAppId, 'downloadMessageResource')");
   });
 
-  it('worker-pool suppresses ALL aux UI for no-transport sessions at managedAuxUiSuppressed', () => {
-    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
-    expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+  it('worker-pool suppresses ALL aux UI for no-transport sessions at auxUiSuppressedFor', () => {
+    // The check moved out of the `managedAuxUiSuppressed` closure into the shared
+    // auxUiSuppressedFor() so the mojo quarantine notice could not drift from this
+    // policy. The closure now just delegates, so lock BOTH: the delegation and the
+    // no-transport gate in its new home.
+    const closure = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
+    expect(closure).toContain('auxUiSuppressedFor(ds, turnId, dispatchAttempt)');
+    const shared = region(workerPoolSource, 'export function auxUiSuppressedFor(', 'isSilentScheduledTurn');
+    expect(shared).toContain('larkTransportEnabled({');
+    expect(shared).toContain('apiOnly: getBot(ds.larkAppId).config.apiOnly,');
+    // Fail CLOSED if the bot is gone. The region above spans BOTH `return true;`
+    // statements (the no-transport path, already locked by the two assertions
+    // above, and the catch), so asserting on that text here guarded nothing:
+    // flipping the catch to `return false` — the exact regression the comment
+    // warns about — left all 43 cases green. Narrowed to the catch block itself.
+    // The real guard is behavioural and lives in
+    // test/mojo-quarantine-notice-policy.test.ts ('fails closed when the bot is
+    // deregistered'), which DOES fail on that flip.
+    const catchBlock = region(workerPoolSource, '    // Bot deregistered — fail closed.', '  if (isSilentScheduledTurn');
+    expect(catchBlock).toContain('return true;');
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
@@ -256,7 +273,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const routes: Array<[string, string, string]> = [
       ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
       ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
-      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'replyMessage('],
+      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'sendSessionOwnerThreadNotification('],
     ];
     for (const [name, start, end] of routes) {
       const body = region(ipcSource, start, end);
@@ -305,16 +322,22 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(fedRoster).toContain('larkTransportEnabled: b.larkTransportEnabled,');
   });
 
-  it('no-transport session FORCES read isolation on fresh/resume/restart; adopt is refused at restore', () => {
-    // fresh-spawn forkWorker (shared by fresh/resume/restart) forces read
-    // isolation for a no-transport session — the fail-closed credential boundary.
+  it('no-transport session read isolation FOLLOWS local sandbox config (no forced isolation); adopt is refused at restore', () => {
+    // fresh-spawn forkWorker (shared by fresh/resume/restart) NO LONGER force-
+    // isolates a no-transport session. readIsolation is opt-in only, driven purely
+    // by explicit per-bot `readIsolation`; a no-transport session with no sandbox
+    // config reads bots.json like a normal chat (accepted trade-off — lateral
+    // sibling-cred protection now depends on the owner enabling sandbox).
     const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    expect(wp).toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })');
+    expect(wp).toContain('readIsolation: botCfg.readIsolation === true,');
+    // The old forced-isolation disjunct is gone: readIsolation must NOT be tied to
+    // transport state anymore.
+    expect(wp).not.toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled(');
     // Adopt does NOT gate via the init field (the observe branch returns before
     // fs-policy is built — an init readIsolation would be a dead no-op). Instead
     // adoptSandboxBlocked refuses a no-transport adopt at daemon restore and
-    // converts it to cold-start, covering "normal adopt session later flipped to
-    // apiOnly then restarted".
+    // converts it to cold-start: adopt attaches to an ALREADY-running external CLI
+    // that could never be wrapped, so a no-transport turn must cold-start instead.
     const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
     expect(gate).toContain('botCfg.apiOnly === true');
     expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");
@@ -439,6 +462,107 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(block).toContain('refusing to start no-transport session');
     // suppressed (dropped) authority allow paths are LOGGED, not silent
     expect(workerSource).toContain('no-transport suppressed');
+  });
+
+  it('persistent-pane guard: state-machine + injectable executor wiring (behavioral tests in read-isolation)', () => {
+    // The reattach guard delegates the DECISION to evaluatePersistentPaneMigration
+    // and the ORDERED, fail-closed side effects to executePersistentPaneMigration.
+    // Behavioral truth table + failure-path ordering live in read-isolation.test.ts
+    // (real behavioral tests, not source-locks). Here we lock the WORKER WIRING.
+    expect(workerSource).toContain('const migration = evaluatePersistentPaneMigration({');
+    expect(workerSource).toContain('executePersistentPaneMigration(migration, migrationEffects)');
+    expect(workerSource).not.toContain('persistentPaneReattachGuardEngaged');
+    // issue #1 + #4: the gate must ENTER without requiring provenance for the
+    // live-pane arms (a NEITHER-file no-transport tmux pane still reaches the
+    // state machine), AND must ALSO enter on ANY session/backend that has stale
+    // provenance on disk — so a dead pane's leftover marker/tombstone is cleared
+    // before cold-spawn even for a transport-enabled chat that turned sandbox OFF
+    // (else re-enabling sandbox warm-reattaches a fresh UNisolated pane as
+    // "isolated" against the stale matching marker).
+    expect(workerSource).toContain(
+      'const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0\n'
+      + '    || (noTransportSession && isolationCapableBackend)\n'
+      + '    || stalePaneMarkerPresent || policyOffTombstonePresent;',
+    );
+    // issue #3: tombstone authorization requires a SECURE read + schema validation,
+    // not a bare lstat "present".
+    expect(workerSource).toContain('policyOffTombstoneValid(readManagedOriginAuthorityFile(policyOffTombstoneFilePath))');
+    // Provenance removal is VERIFIED (unlink → re-probe → throw if still present).
+    const remover = region(workerSource,
+      'const removeProvenanceOrThrow =', 'const staleSessionName = persistentSessionName;');
+    expect(remover).toContain('hostEntryExistsNoFollow(path)');
+    expect(remover).toContain('could not remove stale');
+    // The effects wire the real kill/probe/clear/reselect; the executor enforces
+    // ordering + stop-on-failure (proven behaviorally in read-isolation.test.ts).
+    const effects = region(workerSource,
+      'const migrationEffects: PersistentPaneMigrationEffects = {',
+      'executePersistentPaneMigration(migration, migrationEffects)');
+    expect(effects).toContain('killStalePane:');
+    expect(effects).toContain('confirmPaneGone:');
+    // Tri-state fix: migration teardown fail-closes on ANY non-`missing` post-kill
+    // probe for EVERY backend (kill unconfirmed on `unknown` — tmux swallows kill
+    // errors, zellij ignores its exit — must not publish a new generation). This is
+    // STRICTER than the shared shouldRejectPersistentPostKillProbe (ZMX-only
+    // unknown), which the migration path deliberately no longer uses.
+    expect(effects).toContain("postKillProbe !== 'missing'");
+    expect(effects).not.toContain('shouldRejectPersistentPostKillProbe(');
+    // Tri-state fix: an inconclusive (`unknown`) liveness probe fails closed via a
+    // dedicated effect — never clear provenance / cold-spawn around a possibly-live
+    // confined pane.
+    expect(effects).toContain('refuseInconclusiveProbe:');
+    expect(workerSource).toContain('could not verify existing ${effectiveBackendType} pane');
+    expect(effects).toContain('clearProvenanceVerified:');
+    expect(effects).toContain('reselectBackend:');
+    // Generational-race fix: provenance is written PENDING before spawn (a nonce
+    // record both validators reject) and only rewritten to committed AFTER spawn
+    // confirms a fresh, non-reattached generation.
+    expect(workerSource).toContain('provenancePendingContent(nonce)');
+    expect(workerSource).toContain('let pendingProvenanceCommit: PersistentPaneCommit | null = null;');
+    // The PENDING presence is fed into the state machine as a dominant input.
+    expect(workerSource).toContain('pendingProvenancePresent,');
+    expect(workerSource).toContain('provenancePendingNonce(readManagedOriginAuthorityFile(stalePaneMarkerPath))');
+    // Commit runs AFTER actuallyReattachedPersistent is known, with a generation
+    // fence + compare-before-replace on the pending nonce.
+    const commitBlock = region(workerSource,
+      'if (pendingProvenanceCommit) {', 'finalizeCodexAppControlGeneration(');
+    // Condition #2: a predicted-fresh launch that dynamically reattached a late
+    // pane must tear down + refuse, not silently keep running.
+    expect(commitBlock).toContain('if (actuallyReattachedPersistent) {');
+    expect(commitBlock).toContain('dynamically reattached a late-arriving pane');
+    // Option B: isolation-capable zellij never commits (stays pending → cold-spawn).
+    expect(commitBlock).toContain("effectiveBackendType === 'zellij'");
+    expect(commitBlock).toContain('does not warm-reattach');
+    // Condition #3: fence + compare-before-replace + commit-fail teardown.
+    expect(commitBlock).toContain('spawnGeneration !== cliSpawnGeneration');
+    expect(commitBlock).toContain('provenancePendingNonce(readManagedOriginAuthorityFile(commit.path))');
+    expect(commitBlock).toContain('pending proof nonce mismatch');
+    expect(commitBlock).toContain('replaceManagedOriginCapabilityFile(commit.path, commit.committedContent)');
+    // Teardown = kill the EXACT backend target → confirm authoritative missing →
+    // else keep pending + refuse (never erase evidence of a possibly-live pane).
+    // CRITICAL: must NOT name-only kill — an isolated/MCP herdr agent lives on the
+    // SHARED host session `botmux`, so a name-only killPersistentSession('herdr',
+    // 'botmux') would tear down every bot's agent. Mirror the migration effects:
+    // target helper for herdr's agent scope, frozen-PID path for ZMX identity.
+    const teardown = region(commitBlock,
+      'const teardownTarget = selectedBackend.persistentBackendTarget;', 'Condition #2:');
+    // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
+    expect(teardown).toContain('persistentTeardownKillKind({');
+    expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
+    expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
+    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)');
+    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe');
+    expect(teardown).toContain("postKill !== 'missing'");
+    expect(teardown).toContain('pending proof retained');
+
+    // Blocker #3: the policy-ON PENDING write is a spawn-time ADMISSION
+    // PRECONDITION, not best-effort — a write failure must THROW before spawn (else
+    // a late-flip reattach skips the pendingProvenanceCommit-gated teardown and
+    // runs unattributed). Assert the policy-ON arm fails closed, same as policy-off.
+    const pendingWrite = region(workerSource,
+      "if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {",
+      "} else if (appliedIsolationCapabilities.length === 0");
+    expect(pendingWrite).toContain('could not record pending isolation-marker generation proof');
+    expect(pendingWrite).not.toContain('non-fatal');
   });
 
   it('daemon freezes the actual loaded bots-config path into the worker init message', () => {

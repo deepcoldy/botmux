@@ -65,7 +65,10 @@ describe('worker durable lease expiry ordering', () => {
     const spawn = restart.indexOf('await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });', destroy);
     const release = restart.indexOf('cliRestartInProgress = false;', spawn);
     const riffRawRelease = restart.indexOf(
-      "if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();",
+      // Widened from a riff-only check to every remote backend (riff / mojo):
+      // both mark themselves prompt-ready inside spawnCli(), so both need the
+      // raw-input fence released here rather than at a later markPromptReady().
+      "if (isRemoteBackendType(effectiveBackendType) && isPromptReady) releaseRawInputRestartGate();",
       release,
     );
     const guardedWake = restart.indexOf('if (isPromptReady) void flushPending();', riffRawRelease);

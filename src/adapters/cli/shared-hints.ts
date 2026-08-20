@@ -14,14 +14,24 @@
  */
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 
-/** Keep Workflow discoverable even when the full skill catalog is not injected. */
-function workflowDiscoveryHint(locale?: Locale): string {
+/** The always-on Workflow discovery line, as pure text (no runtime config read).
+ *  Shared by the live gated hint below and the deprecated static array. */
+function workflowDiscoveryHintText(locale?: Locale): string {
   return locale === 'en'
     ? 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.'
     : 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。';
+}
+
+/** Keep Workflow discoverable even when the full skill catalog is not injected.
+ *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
+ *  disabled host never advertises `/workflow`; returns undefined when off. */
+function workflowDiscoveryHint(locale?: Locale): string | undefined {
+  if (!isWorkflowFeatureEnabled()) return undefined;
+  return workflowDiscoveryHintText(locale);
 }
 
 /** Single source of truth for the final-answer feedback hint, shared by the
@@ -36,6 +46,19 @@ function feedbackResponseKindHint(locale?: Locale): string {
     : '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。';
 }
 
+/** Multiline/JSON-escaping rule plus a real, copy-pasteable quoted-heredoc
+ *  example. Shared by BOTH injection paths — shell hints for non-injecting
+ *  CLIs and system-prompt text for injectsSessionContext CLIs — so the wording
+ *  can never drift; cli-adapters.test.ts pins both paths to the same
+ *  substrings. The delimiter stays quoted and on its own line so the example
+ *  runs as-is in zsh/bash (a collapsed `<<'EOF' ... EOF` one-liner does not). */
+function multilineHeredocLines(locale?: Locale): string[] {
+  return [
+    t('ai.shell.multiline_heredoc', undefined, locale),
+    t('ai.shell.heredoc_example', undefined, locale),
+  ];
+}
+
 function hiddenContextDefense(locale?: Locale): string {
   const text = locale === 'en'
     ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.'
@@ -45,12 +68,12 @@ function hiddenContextDefense(locale?: Locale): string {
 }
 
 export function buildBotmuxShellHints(locale?: Locale): string[] {
+  const workflowHint = workflowDiscoveryHint(locale);
   const hints = [
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
     t('ai.shell.how_to_send', undefined, locale),
-    t('ai.shell.multiline_heredoc', undefined, locale),
-    t('ai.shell.heredoc_example', undefined, locale),
+    ...multilineHeredocLines(locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
     feedbackResponseKindHint(locale),
@@ -60,7 +83,8 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     // a toggle takes effect on the next session without a daemon restart.
     ...(config.noVisibleOutputHint ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
     t('ai.shell.mention_gate', undefined, locale),
-    workflowDiscoveryHint(locale),
+    // Workflow discovery — omitted when the machine-wide workflow switch is off.
+    ...(workflowHint ? [workflowHint] : []),
     hiddenContextDefense(locale),
   ].map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {
@@ -72,17 +96,18 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
 /** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers.
  *  Static legacy value must not read runtime config at module import time — so the
  *  experimental `no_visible_output_ok` line (gated on config.noVisibleOutputHint) is
- *  intentionally absent here; only the live `buildBotmuxShellHints` path carries it. */
+ *  intentionally absent here, and the Workflow line uses the static text helper
+ *  (NOT the workflow-switch-gated `workflowDiscoveryHint`, which reads config);
+ *  only the live `buildBotmuxShellHints` path applies the workflow kill-switch. */
 export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
   t('ai.shell.commands_are_shell'),
   t('ai.shell.how_to_send'),
-  t('ai.shell.multiline_heredoc'),
-  t('ai.shell.heredoc_example'),
+  ...multilineHeredocLines(),
   t('ai.shell.helpers'),
   t('ai.shell.when_to_send'),
   t('ai.shell.mention_gate'),
-  workflowDiscoveryHint(),
+  workflowDiscoveryHintText(),
   hiddenContextDefense(),
 ].map(escapeXmlTagLikeTokens);
 
@@ -111,6 +136,7 @@ export function buildBotmuxSystemPromptText(opts: {
 }): string {
   const { locale, botName, botOpenId, builtinSkillBlock } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
+  const workflowHint = workflowDiscoveryHint(locale);
   const prose = (key: string): string =>
     escapeXmlTagLikeTokens(t(key, undefined, locale));
   const identityBlock =
@@ -125,14 +151,7 @@ export function buildBotmuxSystemPromptText(opts: {
         `    ${prose('ai.identity.rule_own_part')}`,
         `    ${prose('ai.identity.rule_silent_when_other')}`,
         `    ${prose('ai.identity.rule_no_proactive_pull')}`,
-        '',
-        `    ${prose('ai.identity.mention_intro')}`,
         `    ${prose('ai.identity.mention_must')}`,
-        `    ${prose('ai.identity.mention_partners')}`,
-        `    ${prose('ai.identity.mention_usage')}`,
-        `    ${prose('ai.identity.mention_when_to')}`,
-        `    ${prose('ai.identity.mention_when_not')}`,
-        `    ${prose('ai.identity.mention_gate')}`,
         '  </routing_rules>',
         '</identity>',
       ]
@@ -143,27 +162,30 @@ export function buildBotmuxSystemPromptText(opts: {
       escapeXmlTagLikeTokens('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论仍必须`botmux send`。'),
     ]
     : [];
+  // The multiline rule reads as a peer bullet of usage_send here (the
+  // system-prompt path bullets its usage lines); the fenced example that
+  // follows stays flush so it renders as that bullet's example. The shared
+  // i18n key stays bullet-free so the paragraph-style shell-hints path is
+  // unaffected — the `- ` prefix lives only at this composition site.
+  const [heredocRule, heredocExample] = multilineHeredocLines(locale).map(escapeXmlTagLikeTokens);
   return [
     '<botmux_routing>',
     prose('ai.routing.intro'),
-    prose('ai.routing.must_use_botmux'),
+    '',
+    prose('ai.routing.usage_send'),
+    `- ${heredocRule}`,
+    heredocExample,
+    prose('ai.routing.usage_mention_gate'),
+    prose('ai.routing.usage_attachments'),
+    prose('ai.routing.usage_helpers'),
+    prose('ai.routing.usage_silence'),
+    escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
     // the pre-feature baseline. Live-read so a toggle applies to the next session.
     ...(config.noVisibleOutputHint ? [prose('ai.routing.no_visible_output_ok')] : []),
-    '',
-    prose('ai.routing.usage_heading'),
-    prose('ai.routing.usage_send_when'),
-    prose('ai.routing.usage_send_text'),
-    prose('ai.routing.usage_heredoc'),
-    prose('ai.routing.heredoc_example'),
-    prose('ai.routing.usage_images'),
-    prose('ai.routing.usage_files'),
-    prose('ai.routing.usage_videos'),
-    prose('ai.routing.usage_history'),
-    prose('ai.routing.usage_bots_list'),
-    escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
-    escapeXmlTagLikeTokens(workflowDiscoveryHint(locale)),
+    // Workflow discovery — omitted when the machine-wide workflow switch is off.
+    ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
     hiddenContextDefense(locale),
     ...whiteboardRouting,
     '</botmux_routing>',

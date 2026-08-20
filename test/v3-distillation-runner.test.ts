@@ -391,12 +391,13 @@ describe('runV3DistillationModel', () => {
     'collapses the PID namespace before cleaning scratch',
     async () => {
     const dirs = fixture();
+    const helperMarker = `distill-helper-${dirs.root.replace(/[^a-z0-9]/gi, '-')}`;
     const executable = join(dirs.root, 'synthetic-model-runner.cjs');
     writeFileSync(executable, `#!/usr/bin/env node
 const { spawn } = require('node:child_process');
 const { writeFileSync } = require('node:fs');
 const { join } = require('node:path');
-const helper = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)", 'distill-helper'], { stdio: 'ignore' });
+const helper = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)", ${JSON.stringify(helperMarker)}], { stdio: 'ignore' });
 writeFileSync(join(process.cwd(), 'helper.pid'), String(helper.pid));
 process.on('SIGTERM', () => process.exit(1));
 setInterval(() => {}, 1000);
@@ -424,11 +425,29 @@ setInterval(() => {}, 1000);
       if (helperPid === 0) await new Promise((resolve) => setTimeout(resolve, 25));
     }
     expect(helperPid).toBeGreaterThan(0);
+    // helper.pid is intentionally namespace-local. Locate the same process by
+    // a unique argv marker so this assertion also works when the whole test
+    // runner is already inside another PID namespace.
+    let visibleHelperPid = 0;
+    for (let attempt = 0; attempt < 40 && visibleHelperPid === 0; attempt++) {
+      for (const entry of readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+          const argv = readFileSync(join('/proc', entry, 'cmdline'), 'utf8').split('\0');
+          if (argv.includes(helperMarker)) {
+            visibleHelperPid = Number(entry);
+            break;
+          }
+        } catch { /* process exited while scanning */ }
+      }
+      if (visibleHelperPid === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(visibleHelperPid).toBeGreaterThan(0);
     const result = await observed;
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatchObject({ code: 'MODEL_FAILED' });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
-    expect(() => process.kill(helperPid, 0)).toThrow();
+    expect(() => process.kill(visibleHelperPid, 0)).toThrow();
     expect(readdirSync(dirs.scratchParent)).toEqual([]);
     },
   );

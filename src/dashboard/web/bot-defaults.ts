@@ -59,6 +59,8 @@ export type BotDefaultsRow = {
   wrapperCli?: string | null;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
+  turnTimeoutMs?: number;
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
@@ -98,6 +100,12 @@ export type BotDefaultsRow = {
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  sessionOwnerReminder?: {
+    enabled: boolean;
+    intervalMinutes: number;
+    text: string;
+    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
+  } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   canTalkDaemonCommands?: string;

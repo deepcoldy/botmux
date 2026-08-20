@@ -126,8 +126,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       sessionId,
       resume,
       resumeSessionId,
+      forkSession,
       workingDir,
       model,
+      reasoningEffort,
       initialPrompt,
       disableCliBypass,
       botName,
@@ -146,11 +148,30 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
+      if (reasoningEffort && reasoningEffort.trim()) {
+        args.push('--reasoning-effort', reasoningEffort.trim());
+      }
 
       if (resume) {
         const sid = resumeSessionId || sessionId;
-        if (sid) args.push('--resume', sid);
-        else args.push('--continue');
+        if (sid) {
+          // `--resume <botmux-sessionId>` is precise: grok's fresh spawn pins
+          // `--session-id <botmux-uuid>` (below), so the botmux id IS the
+          // grok session id.
+          args.push('--resume', sid);
+        }
+        // No --continue fallback (#927): it would resume the globally most
+        // recent grok session, which is shared across every botmux session of
+        // this bot (same GROK_HOME) — a worker restart with no id would then
+        // load a SIBLING session's conversation (topic-group context leaking
+        // into a private chat). Start fresh instead, matching
+        // reasonix/antigravity.
+        // Branch the source transcript into the child's Botmux UUID (#931).
+        // The explicit child id preserves exact ownership on restart.
+        if (forkSession) {
+          args.push('--fork-session');
+          if (sessionId) args.push('--session-id', sessionId);
+        }
       } else if (sessionId && !grokSessionDirExists(sessionId, workingDir)) {
         // Pin grok's id to the botmux UUID so resume can reuse it. Skipped
         // when the dir already exists: grok exits 1 on a reused --session-id
@@ -189,6 +210,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       if (!sid) return null;
       return `grok --resume ${sid}`;
     },
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
 
     checkResumeTargetExists({ sessionId, cliSessionId, workingDir }) {
       const sid = cliSessionId || sessionId;
@@ -331,8 +353,8 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       sessionStartCommand: sessionReadyHookCommand(),
     },
     modelChoices: [
+      'grok-4.6',
       'grok-4.5',
-      'grok-composer-2.5-fast',
     ],
   };
 }

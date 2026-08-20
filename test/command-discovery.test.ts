@@ -78,6 +78,15 @@ describe('discoverSlashCommands', () => {
   it('returns empty when nothing is installed', () => {
     expect(discoverSlashCommands(join(root, 'empty'))).toEqual([]);
   });
+
+  it('ignores indented nested keys in frontmatter (schema-style metadata)', () => {
+    write(
+      join(claudeHome, 'skills', 'schema-skill', 'SKILL.md'),
+      '---\ndescription: top-level\nmetadata:\n  input_schema:\n    properties:\n      repo_dir:\n        description: nested\n---',
+    );
+    const found = discoverSlashCommands(join(root, 'proj'));
+    expect(found.find((c) => c.name === '/schema-skill')?.description).toBe('top-level');
+  });
 });
 
 describe('discoverSlashCommandsForAdapter', () => {

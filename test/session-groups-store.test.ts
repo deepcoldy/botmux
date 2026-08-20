@@ -36,6 +36,7 @@ import {
   getSessionGroup,
   touchSessionGroup,
   markSessionGroupTitled,
+  markSessionGroupTitleFailed,
   removeSessionGroup,
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
@@ -82,6 +83,47 @@ describe('session-groups-store', () => {
     const entry = getSessionGroup('oc_a')!;
     expect(entry.lastSessionId).toBe('sess-1');
     expect(entry.titled).toBe(true);
+  });
+
+  it('persists bounded title retry metadata and clears the retry deadline on success', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-1' });
+    const failed = markSessionGroupTitleFailed('oc_a', 1_000)!;
+    expect(failed.titleAttempts).toBe(1);
+    expect(failed.titleRetryAt).toBe(31_000);
+    initSessionGroups('cli_testapp');
+    expect(getSessionGroup('oc_a')).toMatchObject({ titleAttempts: 1, titleRetryAt: 31_000 });
+    markSessionGroupTitled('oc_a');
+    expect(getSessionGroup('oc_a')).toMatchObject({ titled: true, titleAttempts: 1 });
+    expect(getSessionGroup('oc_a')!.titleRetryAt).toBeUndefined();
+  });
+
+  it('persists the birth authorization provenance (origin quota key / reason / chat)', () => {
+    // 会话群的额度与权限身份来自「出生时那条授权」，不是新群自己。这三个字段就是
+    // dispatcher 后续每条消息据以沿用原计数器/原 reason/原到期的依据，必须活过重启。
+    registerSessionGroup('oc_born', {
+      ownerOpenId: 'ou_grantee',
+      lastSessionId: '',
+      originReason: 'chatGrant',
+      originQuotaKey: 'chat:oc_dm:ou_grantee',
+      originChatId: 'oc_dm',
+    });
+    initSessionGroups('cli_testapp'); // simulate restart: reload from disk
+    expect(getSessionGroup('oc_born')).toMatchObject({
+      ownerOpenId: 'ou_grantee',
+      originReason: 'chatGrant',
+      originQuotaKey: 'chat:oc_dm:ou_grantee',
+      originChatId: 'oc_dm',
+    });
+  });
+
+  it('keeps legacy entries readable: provenance is optional (pre-upgrade groups)', () => {
+    registerSessionGroup('oc_legacy', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    initSessionGroups('cli_testapp');
+    const entry = getSessionGroup('oc_legacy')!;
+    expect(entry.ownerOpenId).toBe('ou_owner');
+    expect(entry.originReason).toBeUndefined();
+    expect(entry.originQuotaKey).toBeUndefined();
+    expect(entry.originChatId).toBeUndefined();
   });
 
   it('is per-appId: another app does not see the entries', () => {

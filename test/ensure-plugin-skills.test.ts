@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ensurePluginSkills, removeGlobalBotmuxSkills } from '../src/skills/installer.js';
-import { BUILTIN_SKILLS, ASK_SKILL_NAME, RETIRED_SKILL_NAMES } from '../src/skills/definitions.js';
+import { BUILTIN_SKILLS, ASK_SKILL_NAME, RETIRED_SKILL_NAMES, WORKFLOW_FEATURE_SKILLS } from '../src/skills/definitions.js';
 
 describe('ensurePluginSkills', () => {
   let dir: string;
@@ -28,7 +28,8 @@ describe('ensurePluginSkills', () => {
   });
 
   it('botmux-goal-ask 文案和 GoalInputs answer 结构一致', () => {
-    const skill = BUILTIN_SKILLS.find((s) => s.name === 'botmux-goal-ask');
+    // goal-ask moved into the feature-gated WORKFLOW_FEATURE_SKILLS group.
+    const skill = WORKFLOW_FEATURE_SKILLS.find((s) => s.name === 'botmux-goal-ask');
     expect(skill?.content).toContain('"from": "human"');
     expect(skill?.content).toContain('"name": "answer"');
     expect(skill?.content).not.toContain('from: "human/answer"');

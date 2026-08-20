@@ -55,6 +55,7 @@ import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
+import { getSessionGroup } from '../../services/session-groups-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
@@ -71,6 +72,7 @@ import {
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
 import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
+import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -719,6 +721,11 @@ function cardActionKey(larkAppId: string, data: any): string {
     // managing bot A in group X doesn't dedupe bot B in group Y.
     chatId: value?.chat_id,
     appId: value?.app_id,
+    // Overload browser-restart buttons all share one action label
+    // (`overload_restart_browser`) but target different browsers; include the
+    // bundleId so rapidly clicking Arc then Chrome isn't collapsed into one
+    // in-flight dedupe key that drops the second click.
+    bundleId: value?.bundleId,
   })}`;
 }
 
@@ -878,15 +885,9 @@ export function __resetChatStatsForTest(): void {
 /** Read the per-bot cross-reference: botName(lowercase) → openId as seen by larkAppId's app */
 export function readBotOpenIdCrossRef(dataDir: string, larkAppId: string): Map<string, string> {
   const map = new Map<string, string>();
-  try {
-    const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
-    if (existsSync(fp)) {
-      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
-      for (const [name, openId] of Object.entries(data)) {
-        map.set(name.toLowerCase(), openId);
-      }
-    }
-  } catch { /* ignore */ }
+  for (const [name, openId] of Object.entries(readPeerCrossRef(dataDir, larkAppId))) {
+    map.set(name.toLowerCase(), openId);
+  }
   return map;
 }
 
@@ -992,11 +993,7 @@ export function updateBotOpenIdCrossRef(
   if (knownBotNames.size === 0) return;
 
   // Read existing cross-reference
-  const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
-  let existing: Record<string, string> = {};
-  try {
-    if (existsSync(fp)) existing = JSON.parse(readFileSync(fp, 'utf-8'));
-  } catch { /* ignore */ }
+  const existing: Record<string, string> = { ...readPeerCrossRef(dataDir, larkAppId) };
 
   // Update with new mentions that match known bot names
   let changed = false;
@@ -1012,8 +1009,7 @@ export function updateBotOpenIdCrossRef(
 
   if (changed) {
     try {
-      if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-      atomicWriteFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
+      writePeerCrossRef(dataDir, larkAppId, existing);
       logger.debug(`Updated bot open_id cross-ref for ${larkAppId}: ${JSON.stringify(existing)}`);
     } catch (err) {
       logger.debug(`Failed to write bot open_id cross-ref: ${err}`);
@@ -1329,6 +1325,12 @@ export interface TalkEvaluation {
    * grantNotExpired 拒发。）
    */
   expiredGrantCleanup?: { scope: 'chat'; chatId: string; openId: string };
+  /**
+   * 仅会话群继承腿会给出：这条 chatGrant **实际所在**的 chat（= 出生前那个私聊），
+   * 与本次判定的 chatId（会话群）不是同一个。额度耗尽后的 revoke 必须落在它上面，
+   * 否则会去删一条会话群上根本不存在的授权 —— 撤销静默失效、硬上限形同虚设。
+   */
+  grantChatId?: string;
 }
 
 export type GrantCommandRestrictionReason = 'chatGrant' | 'globalGrant';
@@ -1357,6 +1359,102 @@ function hasChatGrant(larkAppId: string, chatId: string | undefined, openId: str
 function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean {
   if (!openId || !getBot(larkAppId).config.globalGrants?.includes(openId)) return false;
   return grantNotExpired(larkAppId, 'global', undefined, openId, globalQuotaKey(openId));
+}
+
+/**
+ * oncall 群命中的 talk 判定（chat 维度、与发送者无关）。抽成函数是为了让**会话群**的
+ * 存量条目能原样复用旧语义，见 evaluateSessionGroupTalk 的兜底分支。
+ */
+function oncallTalk(
+  bot: ReturnType<typeof getBot>,
+  larkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+): TalkEvaluation {
+  const def = bot.config.messageQuota?.defaultLimit;
+  if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
+    // 交集处理：同群若还持有显式 chatGrant，额度由授权决定而非 oncall default。
+    // 三态：live 显式授权 → explicitGrantOverride（不兜 default）；已过期 → expiredGrantCleanup
+    //（透传给 consumeQuota，锁内以当前 expiry 为准原子清成员+quota+expiry 并回落 default）；
+    // 非成员 → 无覆盖，正常走 oncall default 懒初始化。
+    const gk = chatQuotaKey(chatId, senderOpenId);
+    const isMember = !!bot.config.chatGrants?.[chatId]?.includes(senderOpenId);
+    const exp = isMember ? getGrantExpiresAt(larkAppId, gk) : undefined;
+    if (isMember && exp !== undefined && Date.now() >= exp) {
+      return {
+        allowed: true, reason: 'oncall', quotaKey: gk,
+        expiredGrantCleanup: { scope: 'chat', chatId, openId: senderOpenId },
+      };
+    }
+    return { allowed: true, reason: 'oncall', quotaKey: gk, explicitGrantOverride: isMember };
+  }
+  return { allowed: true, reason: 'oncall' };
+}
+
+/**
+ * 会话群（p2pMode='group' 出生的一人一 bot 群）的 talk 判定 —— 必须排在 oncall 腿之前。
+ *
+ * 会话群是 bot 为**某一个人的某一次授权**临时开的房间，出生时会顺手写一条 oncall 绑定
+ * 来承载 workingDir。若照常走 oncall 腿，那条纯粹为「解目录」而写的绑定就变成了 talk 来源：
+ *   • oncall 只看 chatId 不看发送者 → 群里**任何人**（被拉进来的同事）都能免授权发言；
+ *   • 未配 messageQuota.defaultLimit → 无 quotaKey → 完全不限额；配了也是**每个新群一份
+ *     全新额度**（key 是 chat:<新群>:<user>，与私聊那把 chat:<dm>:<user> 不共享计数）；
+ *   • reason 从 chatGrant/globalGrant 变成 oncall → restrictGrantCommands 这道闸静默失效。
+ * 一条私聊即可确定性触发，且 oncall 绑定永久留存（onClose 默认 keep）。
+ *
+ * 因此这里改成：**只有群主（出生时那个 DM 用户）**被放行，且沿用出生时持久化下来的原授权
+ * —— 原 quotaKey（同一个计数器）、原 reason（restrictGrantCommands 照旧判定）、原 chat 上的
+ * 到期与撤销（hasChatGrant/hasGlobalGrant 每条消息实时复查，owner 一撤销/一过期立即失效）。
+ * oncall 在会话群里退回它本来的职责：只解析 workingDir。
+ *
+ * 返回 undefined = 本腿不表态，继续按 evaluateTalk 的其余通用腿判定（但**不再回落 oncall**）。
+ */
+function evaluateSessionGroupTalk(
+  bot: ReturnType<typeof getBot>,
+  larkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+  entry: { ownerOpenId: string; originReason?: string; originQuotaKey?: string; originChatId?: string },
+): TalkEvaluation | undefined {
+  // 非群主：这一腿不表态，也不会再落到 oncall —— 被拉进来的人要么自己有授权（用自己的
+  // quotaKey 走 chatGrant/globalGrant 腿），要么发不了言。
+  if (!senderOpenId || senderOpenId !== entry.ownerOpenId) return undefined;
+
+  // 落盘字段按 string 存（避免与 event-dispatcher 形成 import 环），读回来要校验：
+  // 认不出的值一律当「没有 provenance」走下面的存量兜底，绝不据此直接放行。
+  const reason = (TALK_REASONS as readonly string[]).includes(entry.originReason ?? '')
+    ? entry.originReason as TalkReason
+    : undefined;
+  if (reason === 'chatGrant') {
+    // 实时复查来源私聊上的那条授权：撤销 / 到期都在这里生效（grantNotExpired 还会按
+    // **来源 chatId** 排一次条件式清理，不会误删别的 chat 的记录）。
+    const originChatId = entry.originChatId;
+    if (!originChatId || !hasChatGrant(larkAppId, originChatId, senderOpenId)) return undefined;
+    return {
+      allowed: true,
+      reason: 'chatGrant',
+      quotaKey: entry.originQuotaKey ?? chatQuotaKey(originChatId, senderOpenId),
+      grantChatId: originChatId,
+    };
+  }
+  if (reason === 'globalGrant') {
+    if (!hasGlobalGrant(larkAppId, senderOpenId)) return undefined;
+    return {
+      allowed: true,
+      reason: 'globalGrant',
+      quotaKey: entry.originQuotaKey ?? globalQuotaKey(senderOpenId),
+    };
+  }
+  if (reason && reason !== 'none') {
+    // 出生时就不带额度的来源（p2pOpen / open / allowedUser / teamMember …）：沿用原
+    // reason 放行、不挂 quotaKey —— 与这个人在私聊里的待遇一字不差，不新增也不收紧。
+    return { allowed: true, reason };
+  }
+  // 存量会话群：provenance 是本次修复才加的字段，升级前出生的条目没有它。回退到旧的
+  // oncall 语义，但**只对群主**生效（群里其他人的绕过口子照样堵死），以免升级瞬间把已有
+  // 会话群全部打成「无权发言」。这些群仍是每群一份额度，直到重新出生 —— 已知且有界。
+  if (!findOncallChat(larkAppId, chatId)) return undefined;
+  return oncallTalk(bot, larkAppId, chatId, senderOpenId);
 }
 
 const expiryCleanupInFlight = new Set<string>();
@@ -1436,28 +1534,18 @@ export function evaluateTalk(
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
   const allowedUsers = bot.resolvedAllowedUsers;
   if (senderOpenId && allowedUsers.includes(senderOpenId)) return { allowed: true, reason: 'allowedUser' };
-  // Oncall 群命中：默认不限额；仅当 bot 配了 messageQuota.defaultLimit 时，
-  // 才挂 chat:<chatId>:<openId> 这一 quotaKey（与 chatGrant 同键、同计数器，
-  // 便于 owner 后续 /grant @x N 续杯/重置）。
-  if (chatId && findOncallChat(larkAppId, chatId)) {
-    const def = bot.config.messageQuota?.defaultLimit;
-    if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
-      // 交集处理：同群若还持有显式 chatGrant，额度由授权决定而非 oncall default。
-      // 三态：live 显式授权 → explicitGrantOverride（不兜 default）；已过期 → expiredGrantCleanup
-      //（透传给 consumeQuota，锁内以当前 expiry 为准原子清成员+quota+expiry 并回落 default）；
-      // 非成员 → 无覆盖，正常走 oncall default 懒初始化。
-      const gk = chatQuotaKey(chatId, senderOpenId);
-      const isMember = !!bot.config.chatGrants?.[chatId]?.includes(senderOpenId);
-      const exp = isMember ? getGrantExpiresAt(larkAppId, gk) : undefined;
-      if (isMember && exp !== undefined && Date.now() >= exp) {
-        return {
-          allowed: true, reason: 'oncall', quotaKey: gk,
-          expiredGrantCleanup: { scope: 'chat', chatId, openId: senderOpenId },
-        };
-      }
-      return { allowed: true, reason: 'oncall', quotaKey: gk, explicitGrantOverride: isMember };
-    }
-    return { allowed: true, reason: 'oncall' };
+  // 会话群专用腿，**必须排在 oncall 之前**：会话群里的 oncall 绑定只是出生时为了
+  // 承载 workingDir 写下的，不能当作 talk 来源（详见 evaluateSessionGroupTalk）。
+  // 命中会话群时无论表不表态，都不再回落 oncall 腿。
+  const sessionGroup = chatId ? getSessionGroup(chatId) : undefined;
+  if (sessionGroup) {
+    const inherited = evaluateSessionGroupTalk(bot, larkAppId, chatId!, senderOpenId, sessionGroup);
+    if (inherited) return inherited;
+  } else if (chatId && findOncallChat(larkAppId, chatId)) {
+    // Oncall 群命中：默认不限额；仅当 bot 配了 messageQuota.defaultLimit 时，
+    // 才挂 chat:<chatId>:<openId> 这一 quotaKey（与 chatGrant 同键、同计数器，
+    // 便于 owner 后续 /grant @x N 续杯/重置）。
+    return oncallTalk(bot, larkAppId, chatId, senderOpenId);
   }
   if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return { allowed: true, reason: 'peer' };
   // 跨部署团队 peer bot（旧版联邦学来的 union_id / 平台 roster 下发的 union_id）——
@@ -1572,6 +1660,48 @@ export function evaluateAskAnswerTalk(
   return actor?.botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, actor.senderUnionId).allowed
     : evaluateTalk(larkAppId, chatId, senderOpenId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed;
+}
+
+/** 一条 thread reply 被判定为「待答 ask 的文字答复」后，拦截器需要的三个已收窄值。 */
+export interface AskCustomReplyCandidate {
+  senderOpenId: string;
+  chatId: string;
+  text: string;
+}
+
+/**
+ * 这条 thread reply 能不能被待答 ask 当成「自定义回复」吞掉——handleThreadReply
+ * 里那道拦截器的唯一生产判据。
+ *
+ * 命中时该消息会走 submitCustomReply settle 掉 ask，**不再**作为新一轮输入转发给
+ * CLI。因此只有**真正的纯文字答复**才可以被吞：
+ *
+ *  - `resourceCount > 0` 一律不吞。文件 / 图片消息也有非空正文（解析器给的
+ *    `[文件 1: x.pdf]` / `[图片 1]` 占位文本），只看文本非空会让成员在旧操作卡
+ *    有效期内发的新附件被当成旧问题的答案消费掉：新资料不进附件路由，旧 ask 被
+ *    一段占位文本 settle。带资源的消息必须落回正常消息 / 附件路由。
+ *  - workflow grill 触发（`/workflow [new] <目标>`）不吞：grill 分支只改写
+ *    promptContent 后 fall-through，cmdContent 仍是字面量，被吞掉 grill 就永远
+ *    不启动。
+ *  - 没有 senderOpenId / chatId 时不吞：答复权限与 ask 归属都无从判定。
+ *
+ * 抽成导出谓词（而非把条件内联进 daemon）的意义与 {@link evaluateAskAnswerTalk}
+ * 一致：让**判据本身**能被回归测试直接咬住。拦截命中后的鉴权仍在 broker 内由
+ * canTalkChecker 判定，本函数不涉及权限。
+ */
+export function askCustomReplyCandidate(input: {
+  senderOpenId: string | undefined;
+  chatId: string | undefined;
+  cmdContent: string;
+  resourceCount: number;
+  isWorkflowGrillTrigger: boolean;
+}): AskCustomReplyCandidate | undefined {
+  if (!input.senderOpenId || !input.chatId) return undefined;
+  if (input.isWorkflowGrillTrigger) return undefined;
+  if (input.resourceCount > 0) return undefined;
+  const text = input.cmdContent.trim();
+  if (!text) return undefined;
+  return { senderOpenId: input.senderOpenId, chatId: input.chatId, text };
 }
 
 export function canOperate(
@@ -1789,6 +1919,15 @@ export interface RoutingContext {
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
   sessionGroupBirth?: boolean;
+  /** This turn was already AUTHORIZED and CHARGED against the source DM, before
+   * any session-group side effect was allowed (a quota denial must create no
+   * Feishu chat). Set only by the birth flow, immediately after that gate
+   * returned true — so the rewritten group turn must neither charge it twice
+   * NOR re-decide authorization: the new chat cannot yet carry any chat-scoped
+   * grant, so a recheck there only ever produces false negatives, and dropping
+   * an already-charged turn is exactly the "charged, then lost the task"
+   * failure. See enforceMessageQuotaForCliInput's alreadyAuthorizedAndCharged. */
+  sessionGroupQuotaConsumed?: boolean;
   /** Session-group birth only: the in-group intro message id used as the
    *  turn's REPLY anchor (quote target / session rootMessageId), so the first
    *  turn's outputs land in the group. `messageId` stays the ORIGINAL inbound

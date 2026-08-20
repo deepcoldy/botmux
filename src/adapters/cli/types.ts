@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput } from '../../types.js';
+import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -57,6 +57,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
 }
@@ -131,8 +132,13 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
-    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
-     *  Only codex/codex-app adapters honor it; others ignore. */
+    /** Optional per-bot turn timeout in milliseconds for runner-based adapters
+     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  adapters without a runner turn timeout ignore the field. */
+    turnTimeoutMs?: number;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
+     *  grok `--reasoning-effort`). Only adapters with an explicit reasoning
+     *  control honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
@@ -222,6 +228,16 @@ export interface CliAdapter {
     /** CLI-native session id from session.cliSessionId, when available. */
     cliSessionId?: string;
   }): string | null;
+
+  /** True when this adapter's `buildArgs` can only resume a PRECISE
+   *  `resumeSessionId` — a resume without one silently starts a FRESH session
+   *  (no `--continue` / "latest" fallback, which would risk loading a SIBLING
+   *  botmux session's conversation). The worker treats resume-without-id as a
+   *  fresh-demotion (drops resume, emits the existing "历史会话无法恢复" notice
+   *  once) so upper layers never describe a fresh launch as "history restored".
+   *  Adapters that can always resume (botmux sessionId IS the CLI session id,
+   *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
+  readonly resumeRequiresCliSessionId?: boolean;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.
@@ -390,6 +406,21 @@ export interface CliAdapter {
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
 
+  /** The adapter PUBLISHES a structured `limited` screen_update from a machine
+   *  rate-limit signal in its transcript (not from scraping screen text). When
+   *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
+   *  authority and suppresses the screen-scan `rate` heuristic — otherwise the
+   *  model's own output or a dev editing rate-limit code puts "429" / "exceeded
+   *  retry limit" on screen and the scraper false-positives (it cannot tell a
+   *  printed "429" from a request that actually returned 429). The Claude family
+   *  is authoritative via `claudeDataDir` regardless of this flag; Codex sets it
+   *  because the worker's `maybeEmitCodexStructuredRateLimit` reads the rollout's
+   *  `codex_rate_limited` terminal and emits `limited`. Do NOT set it for a
+   *  codexBridgeQueue CLI that has no such emit (grok / traex / pi / hermes /
+   *  mtr / cursor) — suppressing their screen scan would silently drop the real
+   *  429 backoff + Dashboard「需要你」signal. */
+  readonly emitsStructuredRateLimit?: boolean;
+
   /** True when this adapter supports running under per-bot read isolation (its
    *  data root is redirectable into BOT_HOME — CLAUDE_CONFIG_DIR / CODEX_HOME —
    *  and it runs correctly under the worker's whole-process Seatbelt wrapper,
@@ -556,4 +587,4 @@ export interface CliAdapter {
   buildSessionRenameCommand?(title: string): string;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'mojo';

@@ -5,6 +5,7 @@ import { config } from '../../config.js';
 import { formatUrlHost } from '../dashboard-url.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
+import { withPm2FleetMutationLock, withPm2FleetMutationLockSync } from '../../cli/pm2-fleet-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
 import {
   pluginHome,
@@ -71,12 +72,27 @@ function serviceLockTarget(): string {
   return `${pluginsHome()}/service-manager`;
 }
 
+/**
+ * Plugin PM2 shares the God's PM2_HOME with the core fleet, so every plugin
+ * lifecycle mutation must ALSO hold the shared fleet-mutation lock — without
+ * it, a concurrent plugin start could slip between an include-pm2 restart's
+ * plugin stop and its `pm2 kill`. Lock order is fixed everywhere: fleet lock
+ * FIRST, then the plugin service lock (never the reverse). Same-process
+ * nesting (cmdRestart already holds the fleet lock when it stops plugin
+ * services) is handled by the fleet lock's re-entrancy counter.
+ */
 export function withPluginServiceLockSync<T>(fn: () => T): T {
-  return withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 });
+  return withPm2FleetMutationLockSync(
+    () => withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 }),
+    { maxWaitMs: 30_000 },
+  );
 }
 
 export function withPluginServiceLock<T>(fn: () => Promise<T> | T): Promise<T> {
-  return withFileLock(serviceLockTarget(), async () => fn(), { maxWaitMs: 30_000 });
+  return withPm2FleetMutationLock(
+    () => withFileLock(serviceLockTarget(), async () => fn(), { maxWaitMs: 30_000 }),
+    { maxWaitMs: 30_000 },
+  );
 }
 
 function definitionEnv(record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> {
@@ -446,17 +462,24 @@ export async function deletePluginServices(pluginIds?: readonly string[]): Promi
 }
 
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {
-  const reports: PluginServiceReport[] = [];
-  for (const record of selectedRecords()) {
-    try {
-      const definition = await loadPluginServiceDefinition(record);
-      if (!definition) continue;
-      const app = findPm2App(pluginPm2AppName(record.id));
-      const state = writeServiceState(record, definition, app);
-      reports.push(reportFromState(record, 'status', state));
-    } catch (err: any) {
-      reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+  // Also serialized: a "read-only" status probe runs pm2 jlist, and a pm2
+  // client with no live God lazily births one from THIS process's env —
+  // during an include-pm2 restart's kill→start window that would insert a
+  // replacement God. Holding the shared locks parks the probe until the
+  // mutation completes.
+  return withPluginServiceLock(async () => {
+    const reports: PluginServiceReport[] = [];
+    for (const record of selectedRecords()) {
+      try {
+        const definition = await loadPluginServiceDefinition(record);
+        if (!definition) continue;
+        const app = findPm2App(pluginPm2AppName(record.id));
+        const state = writeServiceState(record, definition, app);
+        reports.push(reportFromState(record, 'status', state));
+      } catch (err: any) {
+        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+      }
     }
-  }
-  return reports;
+    return reports;
+  });
 }

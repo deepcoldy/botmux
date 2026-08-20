@@ -85,6 +85,16 @@ function respond(id, result) {
   write({ id, result });
 }
 
+/** Write several JSON-RPC messages in ONE stdout chunk so the runner receives
+ * them in a single read. Adjacent pipe writes coalesce whenever the reader is
+ * scheduled late; this makes that transport condition deterministic for the
+ * completion-race regression repros. */
+function writeBatch(messages) {
+  process.stdout.write(messages
+    .map(message => JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+    .join(''));
+}
+
 function reject(id, code, message) {
   write({ id, error: { code, message } });
 }
@@ -432,6 +442,49 @@ function handle(request) {
       }
       return;
     }
+    if (behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      // The race this repro pins: the turn actually COMPLETED at the exact moment
+      // tryAdmitSteer's steer RPC lands. Emit turn/completed AND a definite steer
+      // rejection in ONE stdout chunk. The runner buffers the completion while
+      // steerInFlight is set, then the rejection catch must settle it —
+      // accepted.length is still 1 here (first steer never appended), so any
+      // inGroupMode-gated resume path would strand it (hang).
+      const { threadId, turnId } = activeTurn;
+      // noncanon: a DIFFERENT native id with NO full items. The rejection branch
+      // must NOT blindly trust it (that would attribute foreign/streamed text);
+      // it must route to bounded-history reconcile and fail closed (no match).
+      const completion = behavior === 'steer-admit-reject-noncanon'
+        ? {
+            method: 'turn/completed',
+            params: { threadId, turn: { id: 'turn-foreign-nc', status: 'completed' } },
+          }
+        : {
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: {
+                id: turnId,
+                status: 'completed',
+                itemsView: 'full',
+                error: null,
+                items: [
+                  { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+                  { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'buffered canonical answer' },
+                ],
+              },
+            },
+          };
+      writeBatch([
+        completion,
+        { id: request.id, error: { code: -32601, message: 'active turn not steerable' } },
+      ]);
+      activeTurn = undefined;
+      return;
+    }
     if (behavior === 'steer-group-mismatch') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
@@ -691,6 +744,201 @@ function handle(request) {
     setTimeout(() => respond(request.id, { turn: { id: 'turn-response-B' } }), 120);
     return;
   }
+  if (behavior === 'pre-response-foreign-completion' && turnAttempt === 1) {
+    // A STALE completion (previous/autonomous turn, NO client items, id unrelated
+    // to this turn) arrives BEFORE the turn/start response. The runner buffers it
+    // (requestAccepted=false). After the response binds the real native id, the
+    // pendingCompletions replay must NOT fail-closed on it: the accepted turn is
+    // still running, so bounded history cannot yet contain its terminal record.
+    // 100ms later the REAL completion arrives and must settle the turn with the
+    // real answer — the stale completion must be ignored, not kill the turn.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    setTimeout(() => {
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: `message-real-${turnAttempt}`,
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer after response',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: `user-${turnAttempt}`, type: 'userMessage', clientId, content: request.params.input },
+            { id: `message-real-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: 'real answer after response' },
+          ],
+        },
+      });
+    }, 100);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-goal-switch' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending exit condition: a STALE foreign completion
+    // (no client items, unrelated id) arrives BEFORE the start response and is
+    // replayed into reconcile with keepPendingWhileActive. 250ms later an
+    // autonomous Goal turn/started flips the GLOBAL nativeActiveTurnId slot;
+    // 1.5s later THIS turn's real completion arrives. The global slot flip is
+    // NOT proof this turn terminated — the runner must keep the turn pending
+    // and settle it with the real answer, not fail-closed on the Goal's
+    // turn/started (which would discard the real completion).
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    setTimeout(() => {
+      notify('turn/started', {
+        threadId,
+        turn: { id: 'turn-goal-auto', status: 'inProgress', itemsView: 'full', items: [] },
+      });
+    }, 250);
+    setTimeout(() => {
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: `message-real-${turnAttempt}`,
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer despite goal switch',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: `user-${turnAttempt}`, type: 'userMessage', clientId, content: request.params.input },
+            { id: `message-real-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: 'real answer despite goal switch' },
+          ],
+        },
+      });
+    }, 1500);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-hang' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending re-scan bound: a STALE foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive,
+    // and the accepted native turn NEVER completes (hang). The re-scan loop must
+    // stop after its wall-clock ceiling and fail-closed (identity conflict +
+    // turn.done settles) — not poll thread/turns/list (~5Hz) forever.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-unbound-id' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending arm guard: the turn/start response SUCCEEDS
+    // but carries NO native id (protocol anomaly: result.turn.id and
+    // result.turnId both absent), and no exact turn/started proved the id first.
+    // The runner binds turn.nativeTurnId = undefined, then arms keep-pending on
+    // the stale foreign completion. handleNotification's progress-reset guard
+    // (notificationTurnId !== turn.nativeTurnId) falls fully open on the unset
+    // id, so a FOREIGN turn's periodic progress would otherwise keep resetting
+    // the deadline forever while acceptedTurnWentTerminal can never fire — an
+    // unbounded hang. The fix refuses to arm keep-pending without a native id,
+    // so the loop fails closed immediately instead of hanging on foreign activity.
+    const threadId = request.params.threadId;
+    // Stale foreign completion BEFORE the response (buffered, requestAccepted=false).
+    notify('turn/completed', { threadId, turn: { id: 'turn-stale-unbound', status: 'completed' } });
+    // Success response with NO native id (anomaly).
+    respond(request.id, {});
+    // A foreign turn emits progress forever; our turn never speaks / goes terminal.
+    setInterval(() => {
+      notify('item/agentMessage/delta', {
+        threadId,
+        turnId: 'turn-foreign-keepalive',
+        itemId: 'message-foreign',
+        delta: '.',
+      });
+    }, 300);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-long-progress' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending ceiling semantics: a STALE foreign
+    // completion before the start response replays into reconcile with
+    // keepPendingWhileActive. The accepted turn then emits periodic progress
+    // (item/agentMessage/delta) for ~5s — LONGER than the test's 3s keep-pending
+    // ceiling — and only then sends its REAL completion. A fixed ceiling would
+    // kill the turn at 3s (identity conflict, real answer discarded); a
+    // progress-resettable ceiling must keep the turn pending and deliver the
+    // real answer.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    // Periodic progress every 1s — each delta resets the keep-pending ceiling.
+    const progressTimer = setInterval(() => {
+      notify('item/agentMessage/delta', {
+        threadId,
+        turnId,
+        itemId: 'message-progress',
+        delta: '.',
+      });
+    }, 1000);
+    // Real completion after 5s — beyond the 3s test ceiling but within the
+    // progress-resettable window (ceiling refreshed at 1s/2s/3s/4s).
+    setTimeout(() => {
+      clearInterval(progressTimer);
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: 'message-final',
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer after long progress',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: 'user-root', type: 'userMessage', clientId, content: request.params.input },
+            { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'real answer after long progress' },
+          ],
+        },
+      });
+    }, 5000);
+    return;
+  }
   if (behavior === 'completion-A-started-B') {
     // R4-B2 crossing 1: exact completion A proves canonical=A; then an exact
     // turn/started B (DIFFERENT id) arrives → first-proof-wins must fence (a later
@@ -780,6 +1028,21 @@ function handle(request) {
     });
     // The original turn/start is answered later — as an explicit RPC error — from
     // the turn/steer handler, after the steer is accepted.
+    return;
+  }
+  if ((behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') && turnAttempt === 1) {
+    // Canonical proven by the START RESPONSE (not an exact turn/started): respond
+    // with the canonical id and emit only a BARE turn/started (no exact-client
+    // items), then HOLD the turn open. identityProof stays 'start_response', so
+    // the tryAdmitSteer rejection catch is the SOLE settle point for the buffered
+    // canonical completion. The follow-up (turnAttempt 2) that falls back after
+    // the rejection completes normally through completeTurn.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    groupClientIds = [request.params.clientUserMessageId ?? null];
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
   completeTurn(request);

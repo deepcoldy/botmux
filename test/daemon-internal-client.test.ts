@@ -101,7 +101,7 @@ describe('secret loading', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-client-secret-'));
     dirs.push(dir);
     const secretPath = join(dir, '.dashboard-secret');
-    writeFileSync(secretPath, '  \n');
+    writeFileSync(secretPath, '  \n', { mode: 0o600 });
 
     expect(() => createDaemonClient({
       appId: 'cli_test',

@@ -1,5 +1,5 @@
 import type { PtyHandle, RunnerSubmissionDisposition } from './types.js';
-import type { CodexAppTurnInput } from '../../types.js';
+import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import { delay } from '../../utils/timing.js';
 
 /**
@@ -46,6 +46,7 @@ export function encodeRunnerInput(
   codexAppInput?: CodexAppTurnInput,
   replyTurnId?: string,
   codexAppSteerable?: boolean,
+  trustedCaller?: TrustedCaller,
 ): string {
   const payload = {
     type: 'message' as const,
@@ -53,6 +54,7 @@ export function encodeRunnerInput(
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
     ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+    ...(trustedCaller ? { trustedCaller } : {}),
   };
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
 }
@@ -95,8 +97,9 @@ export async function writeRunnerInput(
   codexAppInput?: CodexAppTurnInput,
   replyTurnId?: string,
   codexAppSteerable?: boolean,
+  trustedCaller?: TrustedCaller,
 ): Promise<{ submitted: boolean; submissionDisposition: RunnerSubmissionDisposition }> {
-  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput, replyTurnId, codexAppSteerable)}`;
+  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput, replyTurnId, codexAppSteerable, trustedCaller)}`;
 
   // Non-tmux fallback (raw PTY): a single write is fine — there's no send-keys
   // process to time out, and the PTY write isn't bounded the same way.

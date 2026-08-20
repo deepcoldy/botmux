@@ -5,6 +5,7 @@ import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
+import { updateResponseNeedsRestart } from './update-action.js';
 import { ui } from './ui.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
@@ -81,6 +82,7 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
+  workflow: { enabled: boolean };
   remoteAccess: boolean;
   scheduleTimeZone: string;
   hostTimeZone: string;
@@ -117,6 +119,8 @@ interface UpdateStatus {
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
   localDevInstall: boolean;
+  /** Local-dev checkout is a git worktree → self-update via git pull + build. */
+  localDevUpdatable?: boolean;
   updateSupported: boolean;
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
   updateCommand: string | null;
@@ -211,6 +215,7 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
+    workflow: { enabled: s?.workflow?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
@@ -453,6 +458,16 @@ function SettingsPage() {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok || body.ok === false) {
+        // Local-dev drift/absence between run and restart: the built checkout is
+        // gone or moved (e.g. a concurrent `use:here`). Surface an actionable
+        // message and re-read status rather than a raw error code.
+        if (body.error === 'update_target_unavailable' || body.error === 'update_target_drifted') {
+          if (!mountedRef.current) return;
+          setUpBusy(false);
+          setUpMsg({ text: tr(`update.${body.error}`, { dir: String(body.dir ?? '') }), cls: 'hint-warn-inline' });
+          void fetchStatus();
+          return;
+        }
         throw new Error(String(body.detail ?? body.error ?? `HTTP ${response.status}`));
       }
       if (!mountedRef.current) return;
@@ -472,7 +487,10 @@ function SettingsPage() {
       window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
       return;
     }
-    if (!s.updateSupported || !s.updateCommand) {
+    const localDev = s.localDevInstall === true;
+    if (localDev) {
+      if (!s.localDevUpdatable) { window.alert(tr('update.localDev')); return; }
+    } else if (!s.updateSupported || !s.updateCommand) {
       window.alert(tr('update.unsupportedInstall'));
       return;
     }
@@ -480,25 +498,44 @@ function SettingsPage() {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
       if (!window.confirm(tr('update.confirmMultiInstall', { paths }))) return;
     }
-    const confirmMsg = s.latest
-      ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand })
-      : tr('update.confirmUpdateNoVer', { command: s.updateCommand });
+    const confirmMsg = localDev
+      ? tr('update.confirmUpdateLocalDev')
+      : s.latest
+        ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
+        : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
     if (!window.confirm(confirmMsg)) return;
     setUpBusy(true);
-    setUpMsg({ text: tr('update.updating', { command: s.updateCommand }) });
+    setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) return;
       if (!r.ok || body.ok === false) {
+        // Dirty worktree fails closed — surface the file list so the user can act.
+        if (body?.error === 'dirty_worktree') {
+          setUpBusy(false);
+          setUpMsg({ text: tr('update.dirtyWorktree', { detail: String(body.detail ?? '') }), cls: 'hint-warn-inline' });
+          return;
+        }
         const detail = body?.detail ?? body?.error ?? `HTTP ${r.status}`;
         setUpBusy(false);
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
-      if (body.changed) {
+      // A restart is needed when the server says so (local-dev build always
+      // regenerates dist/, even when HEAD didn't move) or when the version
+      // changed (generic npm/pnpm/bun path, which sets no restartRequired).
+      const needsRestart = updateResponseNeedsRestart(body);
+      if (needsRestart) {
         setUpBusy(false);
-        setUpMsg({ text: tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` }), cls: 'hint-ok' });
+        // `changed` reflects whether the source actually advanced; a build-only
+        // local-dev update (HEAD unchanged) still needs a restart to apply.
+        setUpMsg({
+          text: body.changed
+            ? tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` })
+            : tr('update.builtNeedsRestart'),
+          cls: 'hint-ok',
+        });
         if (window.confirm(tr('update.confirmRestart'))) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
@@ -777,6 +814,17 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'whiteboard'}
             onChange={value => {
               void props.onSave('whiteboard', { whiteboard: { enabled: value } }, s => ({ ...s, whiteboard: { enabled: value } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionWorkflow')}>
+          <ToggleRow
+            title={tr('settings.workflowEnable')}
+            help={tr('settings.workflowEnableHelp')}
+            checked={settings.workflow.enabled}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
             }}
           />
         </SettingsBlock>
@@ -1494,7 +1542,12 @@ function UpdateCard(props: {
     inner = <LoadingState label={tr('update.loading')} compact />;
   } else {
     const s = props.status;
-    const updateDisabled = s.localDevInstall || !s.updateSupported || props.busy;
+    // Local-dev: enable the button only when the checkout is a git worktree we
+    // can pull; the generic path still requires a supported package manager.
+    const updateDisabled = props.busy || (s.localDevInstall
+      ? !s.localDevUpdatable
+      : !s.updateSupported);
+    const updateLabel = s.localDevInstall ? tr('update.btnUpdateLocalDev') : tr('update.btnUpdate');
     inner = (
       <>
         <p className="update-version">
@@ -1503,13 +1556,14 @@ function UpdateCard(props: {
         </p>
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
+        {s.localDevInstall ? <p className="hint">{s.localDevUpdatable ? tr('update.localDevUpdatable') : tr('update.localDev')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
           <button type="button" data-up="check" disabled={props.busy} onClick={props.onCheck}>{tr('update.btnCheck')}</button>
           <button type="button" data-up="changelog" disabled={props.busy} onClick={props.onToggleChangelog}>
             {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
           </button>
-          <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
+          <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
@@ -1530,7 +1584,7 @@ function UpdateCard(props: {
       className="settings-update-block"
       title={tr('update.section')}
       titleExtra={props.status?.localDevInstall
-        ? <span className="settings-title-note">{tr('update.localDev')}</span>
+        ? <span className="settings-title-note">{props.status.localDevUpdatable ? tr('update.localDevNote') : tr('update.localDev')}</span>
         : props.status && !props.status.updateSupported
           ? <span className="settings-title-note">{tr('update.unsupportedInstall')}</span>
           : null}
