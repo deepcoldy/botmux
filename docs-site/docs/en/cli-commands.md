@@ -45,6 +45,7 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | Command | Description |
 |------|------|
 | `botmux send [content]` | Send a message to the current topic (stdin / heredoc / `--content-file`; `--images`/`--files`/`--videos`/`--card-file`/`--card-json`/`--mention`) |
+| `botmux card patch --message-id <om_xxx> (--card-file <path> \| --card-json <json>)` | Update a previously sent custom card in place (no new message; the messageId comes from the send output) |
 | `botmux bots list` | List the bots in the current group (including open_id) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
