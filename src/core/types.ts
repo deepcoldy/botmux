@@ -128,6 +128,26 @@ export interface DaemonSession {
   /** Per-session snapshot of the final-answer feedback policy. New config takes
    * effect on the next new/restarted session, matching sandbox send-cred state. */
   feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
+  /** Explicit per-trigger model override (trigger API `options.model`, codex
+   *  family only). Outranks the bot's configured model at spawn; everything
+   *  else resolves the model from the LIVE bot config on every spawn (see
+   *  sessionAgentConfig), so a dashboard edit reaches long sessions.
+   *
+   *  **In-memory only, deliberately.** The public contract is per-trigger /
+   *  fresh-spawn ("ignored when folding into an existing worker"), so it must
+   *  not outlive this daemon's view of the session: persisting it — which is
+   *  what the old `session.model` freeze did — turned a one-shot caller choice
+   *  into a permanent override that a later dashboard change could not undo.
+   *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
+   *  re-fork of the same session launches identically. */
+  spawnModelOverride?: string;
+  /** True while this session's worker sits in the crash-loop park state: its CLI
+   *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
+   *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
+   *  no restart IPC to refresh it. While set, message IPCs carry the freshly
+   *  resolved launch model so that recovery does not relaunch on a stale one.
+   *  Cleared when a worker generation reports ready. In-memory only. */
+  crashDiagnosticParked?: boolean;
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机

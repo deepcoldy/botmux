@@ -17321,6 +17321,14 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
+      // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
+      // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
+      // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
+      // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
+      if (msg.model !== undefined && lastInitConfig) {
+        lastInitConfig.model = msg.model === null ? undefined : msg.model;
+      }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
       // to the backend (see flushPending) — applying at receive time made two
@@ -17547,6 +17555,14 @@ process.on('message', async (raw: unknown) => {
       // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
       if (msg.env !== undefined && lastInitConfig) {
         lastInitConfig.env = msg.env === null ? undefined : msg.env;
+      }
+      // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
+      // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
+      // restart 不 refork，没有 init 重发这条通道——不覆盖的话，改完模型再重启
+      // 起来的还是快照里的旧模型。undefined=不携带（旧 daemon / 取不到）保持快照；
+      // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
+      if (msg.model !== undefined && lastInitConfig) {
+        lastInitConfig.model = msg.model === null ? undefined : msg.model;
       }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、

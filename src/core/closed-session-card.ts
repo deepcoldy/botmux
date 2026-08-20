@@ -5,6 +5,7 @@ import { decorateResumeForWrapper } from '../setup/cli-selection.js';
 import { buildSessionClosedCard } from '../im/lark/card-builder.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { resolveSessionLaunchModel } from './session-model.js';
 import type { Locale } from '../i18n/index.js';
 
 function shellQuote(value: string): string {
@@ -51,8 +52,10 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
   const frozenPath = runtimePathOverride(frozenRuntime);
   const frozenWrapper = ds.session.wrapperCli
     ?? (ds.session.agentFrozen ? undefined : botCfg.wrapperCli);
-  const frozenModel = ds.session.model
-    ?? (ds.session.agentFrozen ? undefined : botCfg.model);
+  // The `-m` in the printed ttadk resume command must match what botmux itself
+  // would launch, and the model is NOT frozen with the rest of the launch
+  // posture — it follows the live bot config on every spawn.
+  const frozenModel = resolveSessionLaunchModel(ds, botCfg);
   // `cliPathOverride` historically changed only the executable, never the
   // product copy. Preserve that contract for legacy snapshots; only an
   // explicitly configured runtime opts into a distinct display identity.

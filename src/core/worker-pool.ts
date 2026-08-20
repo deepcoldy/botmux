@@ -26,6 +26,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
@@ -1146,16 +1147,49 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
   }
 }
 
+/**
+ * Keep `session.model` — the record of what this session was last LAUNCHED with —
+ * in sync with the model just resolved for a (re)spawn.
+ *
+ * The record is never the launch source of truth (see resolveSessionLaunchModel);
+ * it exists so the CLI-mismatch fallback has something to fall back ON after the
+ * bot switches CLI: a session pinned to the old CLI would otherwise lose its
+ * model and drop to the CLI default. Not every entry point that hot-swaps
+ * `bot.config.cliId` (`/botconfig set cli`, the config card) runs the dashboard's
+ * closeCliMismatchedSessionsForBot sweep, so such sessions do survive to respawn.
+ *
+ * MUST be called from every path that resolves a launch model — daemon refork
+ * AND the in-worker respawns (restart IPC / crash-park retry) — or the record
+ * silently keeps an older model and a later CLI switch resurrects it.
+ *
+ * A per-trigger override is deliberately NOT recorded: it is one-shot by
+ * contract, and persisting it is exactly the mistake the frozen model was.
+ */
+function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
+  if (ds.spawnModelOverride) return;
+  if (ds.session.model === model) return;
+  ds.session.model = model;   // undefined clears a stale record
+  sessionStore.updateSession(ds.session);
+}
+
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' },
 ): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } {
-  // Freeze the agent launch config (cli / runtime / cliPath / wrapper / model) onto the
+  // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
   //
+  // `model` is deliberately NOT part of the frozen set (see the return below):
+  // swapping the CLI *distribution* under a live conversation is what this
+  // freeze protects against (a `ttadk codex` wrapper degrading to bare `codex`
+  // loses its gateway), whereas the model is an explicit, human-chosen bot
+  // setting whose whole point is to take effect. Freezing it made a long
+  // session ignore the model configured in the dashboard forever, i.e. an
+  // inherited default silently outranked a later explicit choice.
+  //
   // Gated on `agentFrozen`, NOT on `resume`: a session created before these
-  // fields existed has `cliId` stamped historically but no frozen wrapper/model,
+  // fields existed has `cliId` stamped historically but no frozen wrapper,
   // yet it was launching off the live bot config — so its first post-upgrade
   // resume must back-fill the still-missing fields from botCfg to keep launching
   // identically (e.g. a `ttadk codex` wrapper bot must not silently drop to bare
@@ -1181,7 +1215,6 @@ function sessionAgentConfig(
       ?? runtimePathOverride(runtime)
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
-    ds.session.model = ds.session.model ?? botCfg.model;
     ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
@@ -1215,8 +1248,13 @@ function sessionAgentConfig(
     }
     if (repaired) sessionStore.updateSession(ds.session);
   }
+  // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
+  const model = resolveSessionLaunchModel(ds, botCfg);
+  recordLaunchModel(ds, model);
+  // Effort is frozen per session, but whether it is *supported* depends on the
+  // model this spawn actually uses — which is resolved live above, not frozen.
   if (ds.session.reasoningEffort
-      && !cliModelSupportsReasoningEffort(ds.session.cliId, ds.session.model, ds.session.reasoningEffort)) {
+      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
   }
@@ -1225,7 +1263,7 @@ function sessionAgentConfig(
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
-    model: ds.session.model,
+    model,
     reasoningEffort: ds.session.reasoningEffort,
   };
 }
@@ -2954,7 +2992,7 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
  * ANTHROPIC_BASE_URL/TOKEN）后 /restart 并不会生效（只有 refork 路径生效）。
  * 三分态返回：对象 = 最新 env；null = 明确清空（dashboard 已删）；
  * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
- * 只热更 env 一个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
+ * 只热更 env / model 两个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
  * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
  */
 export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
@@ -3053,6 +3091,29 @@ function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
   }
 }
 
+/**
+ * Live-worker /restart 携带的最新模型（与 env 同一条通道、同一套三分态）。
+ *
+ * model 不进冻结集合、每次 spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），
+ * 但 `/restart`、dashboard 重启、CLI 崩溃自动重启这三条路**不 refork**：worker 收到
+ * restart 后用旧 `lastInitConfig` 原地 respawn。不捎带的话，改完模型再重启起来的还是
+ * 旧模型——正是「改配置对存量会话生效」要修的那件事。
+ * 三分态：字符串 = 用它；null = 明确不传模型（bot 未配 / 已清空）；
+ * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
+ */
+export function latestModelForRespawn(ds: DaemonSession): string | null | undefined {
+  try {
+    const model = resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config);
+    // An in-worker respawn IS a launch, so the rule-3 record must converge here
+    // too — otherwise `/restart` starts B while the record still says A, and a
+    // later CLI hot-switch pulls A back out of the record.
+    recordLaunchModel(ds, model);
+    return model ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Join or start one correlated physical restart for a session. */
 export function requestSessionRestart(
   ds: DaemonSession,
@@ -3065,7 +3126,7 @@ export function requestSessionRestart(
   return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     if (ds.worker && !ds.worker.killed) {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
       return;
     }
     // No live worker but the persistent pane may still be alive (e.g. after a
@@ -6901,12 +6962,19 @@ export async function forkSession(
   //     (bwrap credential seal — bots.json deny / sibling appsecrets /
   //     master.key / network deny — silently dropped). This is a security
   //     escape, so copy the recorded decision and its path lists verbatim.
-  //   • model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
+  //   • reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
   //     without these the child's sessionAgentConfig() sees !agentFrozen and
   //     re-freezes from the CURRENT bot config, silently dropping any per-session
-  //     model or effort override the source carried (reasoningEffort has no
-  //     botCfg fallback at all → drops to undefined). Copying the frozen tuple
-  //     keeps the clone's launch identity == the source's.
+  //     /effort override the source carried (reasoningEffort has no botCfg
+  //     fallback at all → drops to undefined). Copying the frozen tuple keeps
+  //     the clone's launch identity == the source's. `model` is no longer a
+  //     FROZEN value — it resolves from the live bot config at every spawn — but
+  //     the record of what the source last launched with still has to travel:
+  //     when the source is pinned to a CLI the bot no longer runs, that record is
+  //     the only thing keeping either session off the CLI default (rule 3 in
+  //     resolveSessionLaunchModel). Copying it cannot resurrect the old frozen
+  //     bug, because the live bot model outranks it whenever the CLIs match.
+  //     An explicit per-trigger override rides on the runtime childDs below.
   // readIsolation is intentionally NOT copied: it is not a persisted Session
   // field (forkWorker derives it from botCfg at spawn), and the child runs the
   // SAME bot, so it is preserved automatically. persistentBackendTarget is also
@@ -6917,8 +6985,8 @@ export async function forkSession(
   childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
   childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
-  childSession.model = ds.session.model;
   childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.model = ds.session.model;
   childSession.cliRuntime = ds.session.cliRuntime
     ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
     : undefined;
@@ -6951,6 +7019,9 @@ export async function forkSession(
     streamCardNonce: undefined,
     displayMode: ds.displayMode ?? 'hidden',
     suppressRecoveryCard: false,
+    // Explicit per-trigger model override travels with the runtime session, so a
+    // fork of a trigger session launches on the same model the caller asked for.
+    ...(ds.spawnModelOverride ? { spawnModelOverride: ds.spawnModelOverride } : {}),
   };
 
   if (activeSessionsRegistry) {
@@ -7685,6 +7756,12 @@ export function sendWorkerInput(
   const message: Extract<DaemonToWorker, { type: 'message' }> = {
     type: 'message',
     content: normalized.content,
+    // A parked (crash-loop stopped) worker respawns the CLI from INSIDE the
+    // worker when this message arrives, and that path has no restart IPC to
+    // refresh its launch snapshot — so carry the current model on the message
+    // itself. Only while parked: an ordinary turn changes no launch config, and
+    // an unconditional field would be pure noise on every message.
+    ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
@@ -8000,6 +8077,8 @@ export function promoteQueuedActivationTail(
     ds.worker!.send({
       type: 'message',
       content: exactInput.content,
+      // Same parked-worker launch-snapshot refresh as the ordinary send.
+      ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
@@ -9582,6 +9661,10 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // A live CLI is up again: the parked-diagnostic recovery is over, so the
+        // per-message launch-model refresh (see sendWorkerInput) stops here and
+        // ordinary restart/refork paths take over again.
+        ds.crashDiagnosticParked = undefined;
         // Treat `ready` as a full state boundary for the usage refresh: clear
         // any timer inherited from a PRIOR worker generation up front, so the
         // managed/replyAlreadySent/disabled/recovery/sentinel early-breaks below
@@ -10808,6 +10891,11 @@ function setupWorkerHandlers(
             // terminal URL can show the startup failure; the next user message
             // tells that same worker to destroy the diagnostic shell and retry.
             ds.workerReady = false;
+            // The worker now holds a parked diagnostic shell and will respawn the
+            // CLI itself on the next message (no restart IPC in that path), so the
+            // next message must carry the current launch model. Cleared once a
+            // worker generation reports ready again.
+            ds.crashDiagnosticParked = true;
             ds.worker!.send({ type: 'park_diagnostic' } as DaemonToWorker);
             restartCounts.delete(key);
             ds.lastScreenStatus = 'idle';
@@ -10855,7 +10943,7 @@ function setupWorkerHandlers(
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
           ds.workerReady = false;
-          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
         }
         break;
       }
