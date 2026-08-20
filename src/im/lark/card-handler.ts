@@ -104,6 +104,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
+import { handleCommand } from '../../core/command-handler.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
@@ -861,8 +862,12 @@ export async function runAutoWorktreeCommit(deps: {
   operatorOpenId?: string;
   activeSessions: Map<string, DaemonSession>;
   notify: (message: string) => Promise<unknown> | void;
+  force?: boolean;
+  worktreePath?: string;
+  branch?: string;
+  reuseExisting?: boolean;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify } = deps;
+  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify, force, worktreePath, branch, reuseExisting } = deps;
   ds.worktreeCreating = true;
   // Surface the pending row NOW (all three callers funnel through here, so this is
   // the single place that guarantees the session is visible on SSE-only dashboards
@@ -872,7 +877,7 @@ export async function runAutoWorktreeCommit(deps: {
   try {
     const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
-      isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
+      isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify, force, worktreePath, branch, reuseExisting,
     });
     // The pendingRepo placeholder can legitimately be consumed WHILE this
     // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
@@ -1334,6 +1339,42 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
     return resultCardBody;
+  }
+
+
+  if (value?.action === 'close_worktree_confirm') {
+    const rootId = String(value.root_id ?? '');
+    const sessionId = String(value.session_id ?? '');
+    if (!rootId || !sessionId || !larkAppId || !operatorOpenId) {
+      return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+    }
+    const target = activeSessions.get(sessionKey(rootId, larkAppId));
+    if (!target || target.session.sessionId !== sessionId) {
+      return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+    }
+    if (!canOperate(target.larkAppId, target.chatId, operatorOpenId)) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_no_perm', undefined, localeForBot(larkAppId)) } };
+    }
+    const invokerOpenId = String(value.invoker_open_id ?? '');
+    if (invokerOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_not_invoker', undefined, localeForBot(larkAppId)) } };
+    }
+    const confirmationState = String(value.confirmation_state ?? '');
+    await handleCommand('/close', rootId, {
+      messageId: cardMessageId ?? `close-wt-confirm-${sessionId}`,
+      rootId,
+      senderId: operatorOpenId,
+      senderType: 'user',
+      msgType: 'interactive',
+      content: `/close wt --yes${confirmationState ? ` --state=${confirmationState}` : ''}`,
+      createTime: String(Date.now()),
+    }, {
+      activeSessions,
+      sessionReply: deps.sessionReply,
+      lastRepoScan,
+      getActiveCount: () => activeSessions.size,
+    }, larkAppId);
+    return { toast: { type: 'success', content: t('cmd.close.worktree_confirm_received', undefined, localeForBot(larkAppId)) } };
   }
 
   if (isAskCardAction(value?.action)) {

@@ -88,6 +88,9 @@ const mocks = vi.hoisted(() => {
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
+    runAutoWorktreeCommit: vi.fn(async (deps: any) => {
+      deps.ds.worktreeCreating = true;
+    }),
   };
 });
 
@@ -171,6 +174,12 @@ vi.mock('../src/core/session-manager.js', async () => {
 vi.mock('../src/services/project-scanner.js', async () => {
   const actual = await vi.importActual<any>('../src/services/project-scanner.js');
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
+});
+
+
+vi.mock('../src/im/lark/card-handler.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/card-handler.js');
+  return { ...actual, runAutoWorktreeCommit: mocks.runAutoWorktreeCommit };
 });
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
@@ -1277,6 +1286,118 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker.mock.calls[0]?.[0]?.pendingRawInput).toBe(rawOpening);
     expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+
+
+  it('`/t here <content>` reuses the current chat-scope working directory and skips repo selection', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_here', '/t here 检查实现'),
+      makeCtx('om_force_topic_here', 'om_force_topic_here'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_force_topic_here', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.scanMultipleProjects).not.toHaveBeenCalled();
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+  });
+
+
+
+  it('`/tw <content>` creates a topic that starts from a worktree of the current chat working directory', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_worktree', '/tw 检查实现'),
+      makeCtx('om_force_topic_worktree', 'om_force_topic_worktree'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_force_topic_worktree', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.initialStartPending).toBe(false);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      anchor: 'om_force_topic_worktree',
+      baseDir: currentDir,
+      prompt: expect.stringContaining('检查实现'),
+      force: true,
+    }));
+  });
+
+
+
+  it('`/topic here` and `/topic worktree` use the same current-directory variants', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_topic_here', '/topic here 检查实现'),
+      makeCtx('om_topic_here', 'om_topic_here'),
+    );
+    expect(activeSessions.get(sessionKey('om_topic_here', APP))?.workingDir).toBe(currentDir);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+
+    mocks.forkWorker.mockClear();
+    mocks.runAutoWorktreeCommit.mockClear();
+    activeSessions.delete(sessionKey('om_topic_here', APP));
+
+    await handleNewTopic(
+      makeEventData('om_topic_worktree', '/topic worktree 检查实现'),
+      makeCtx('om_topic_worktree', 'om_topic_worktree'),
+    );
+    const ds = activeSessions.get(sessionKey('om_topic_worktree', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      baseDir: currentDir,
+      force: true,
+    }));
   });
 
   it('card-off pinned cwd + `/t <content>` immediately seeds the thread and starts work', async () => {

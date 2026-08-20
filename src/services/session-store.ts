@@ -1158,6 +1158,10 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
   return findActiveSessionsMatching(s => s.chatId === chatId && s.scope === 'chat');
 }
 
+export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
+  return findActiveSessionsMatching(s => s.workingDir === workingDir);
+}
+
 /**
  * Count active sessions across every bot's on-disk session file. A pure disk
  * read (no in-memory state) so it's correct at daemon startup regardless of
