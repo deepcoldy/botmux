@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, appendFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
-import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
@@ -985,24 +985,85 @@ describe('pi buildArgs', () => {
 
 describe('oh-my-pi buildArgs', () => {
   const adapter = createOhMyPiAdapter('/usr/bin/omp');
+  let home: string;
 
-  it('launches omp TUI with tools, approval-mode, and no-title', () => {
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-omp-adapter-'));
+    vi.stubEnv('HOME', home);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('launches an isolated omp TUI with runtime-default tools, approval-mode, and no-title', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, initialPrompt: 'hello omp' });
     expect(adapter.resolvedBin).toBe('/usr/bin/omp');
-    expect(args).toContain('--tools');
-    expect(args).toContain('read,bash,edit,write,browser,web_search,ast_grep,ast_edit,lsp,debug,find,eval,search,task,ask');
+    expect(args).not.toContain('--tools');
+    expect(args.join(' ')).not.toMatch(/browser|ast_grep/);
     expect(args).toContain('--approval-mode');
     expect(args[args.indexOf('--approval-mode') + 1]).toBe('yolo');
     expect(args).toContain('--no-title');
+    expect(args[args.indexOf('--session-dir') + 1]).toBe(ompSessionDir('sess-omp'));
+    expect(args).not.toContain('--resume');
+    expect(args).not.toContain('--continue');
     expect(args).not.toContain('hello omp');
     expect(adapter.passesInitialPromptViaArgs).toBe(false);
     expect(adapter.altScreen).toBe(true);
+    expect(adapter.authPaths).toEqual(['~/.omp/agent']);
   });
 
   it('does not include --session-id (oh-my-pi has none)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false });
     expect(args).not.toContain('--session-id');
-    expect(args).not.toContain('sess-omp');
+  });
+
+  it('rejects path-like session ids instead of escaping the managed OMP root', () => {
+    expect(() => ompSessionDir('../sibling')).toThrow('Invalid Botmux session id for OMP');
+    expect(() => ompSessionDir('nested/session')).toThrow('Invalid Botmux session id for OMP');
+  });
+
+  it('uses the canonical home path when HOME is a symlink', () => {
+    const realHome = join(home, "real'home");
+    const linkedHome = join(home, 'linked-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkedHome, 'dir');
+    vi.stubEnv('HOME', linkedHome);
+
+    const expected = join(realpathSync(realHome), '.omp', 'agent', 'sessions', 'botmux', 'sess-linked');
+    expect(ompSessionDir('sess-linked')).toBe(expected);
+    const args = adapter.buildArgs({ sessionId: 'sess-linked', resume: false });
+    expect(args[args.indexOf('--session-dir') + 1]).toBe(expected);
+  });
+
+  it('resumes the newest top-level JSONL exactly and ignores nested transcripts', () => {
+    const sessionDir = ompSessionDir('sess-omp');
+    const nestedDir = join(sessionDir, 'nested');
+    mkdirSync(nestedDir, { recursive: true });
+    const older = join(sessionDir, 'older.jsonl');
+    const newest = join(sessionDir, 'newest.jsonl');
+    const nested = join(nestedDir, 'not-a-candidate.jsonl');
+    writeFileSync(older, '{}\n');
+    writeFileSync(newest, '{}\n');
+    writeFileSync(nested, '{}\n');
+    utimesSync(older, new Date(1_000), new Date(1_000));
+    utimesSync(newest, new Date(2_000), new Date(2_000));
+    utimesSync(nested, new Date(3_000), new Date(3_000));
+
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: true });
+    expect(args[args.indexOf('--resume') + 1]).toBe(newest);
+    expect(args[args.indexOf('--session-dir') + 1]).toBe(sessionDir);
+    expect(args).not.toContain('--continue');
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'sess-omp' })).toBe(true);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-omp' }))
+      .toBe(`omp --resume '${newest}' --session-dir '${sessionDir}'`);
+  });
+
+  it('fails the resume probe closed when the isolated directory has no transcript', () => {
+    mkdirSync(ompSessionDir('sess-omp'), { recursive: true });
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'sess-omp' })).toBe(false);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-omp' })).toBeNull();
   });
 
   it('omits --approval-mode yolo when disableCliBypass is true', () => {
@@ -1910,10 +1971,10 @@ describe('buildResumeCommand', () => {
       .toBe('pi --session-id bm-pi');
   });
 
-  it('oh-my-pi emits `omp --continue` (best-effort, ignores sessionId)', () => {
+  it('oh-my-pi returns null when its isolated exact transcript is absent', () => {
     const a = createOhMyPiAdapter('/bin/omp');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-omp', cliSessionId: 'ignored' }))
-      .toBe('omp --continue');
+    expect(a.buildResumeCommand?.({ sessionId: randomUUID(), cliSessionId: 'ignored' }))
+      .toBeNull();
   });
 
   it('copilot emits `copilot --resume <cliSessionId>` when known, null otherwise', () => {

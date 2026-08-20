@@ -22,12 +22,13 @@
  * file- vs dir-shaped denies, mode-000 the empty sources, pre-create missing
  * mask mountpoints, then invoke bwrap.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
+import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
 
 const bwrapUsable = process.platform === 'linux'
   && spawnSync('sh', ['-c', 'command -v bwrap'], { stdio: 'ignore' }).status === 0
@@ -222,6 +223,59 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(run(args, `echo x > ${JSON.stringify(join(denied, 'evil'))} && echo WROTE`).out).not.toContain('WROTE');
     expect(existsSync(join(denied, 'evil'))).toBe(false);
     rmSync(denied, { recursive: true, force: true });
+  });
+
+  it('OMP state stays writable while only the current transcript directory is carved through the sessions mask', () => {
+    const realHome = join(S, 'omp-real-home');
+    const linkedHome = join(S, 'omp-linked-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkedHome, 'dir');
+    vi.stubEnv('HOME', linkedHome);
+    try {
+      const agentRoot = join(realpathSync(realHome), '.omp', 'agent');
+      const sessionsRoot = join(agentRoot, 'sessions');
+      const own = ompSessionDir('self');
+      const sibling = join(sessionsRoot, 'botmux/sibling');
+      const terminalSessions = join(agentRoot, 'terminal-sessions');
+      const siblingTranscript = join(sibling, 'secret.jsonl');
+      const breadcrumb = join(terminalSessions, 'pane');
+      expect(own).toBe(join(sessionsRoot, 'botmux/self'));
+      const adapterArgs = createOhMyPiAdapter('/usr/bin/omp').buildArgs({ sessionId: 'self', resume: false });
+      expect(adapterArgs[adapterArgs.indexOf('--session-dir') + 1]).toBe(own);
+
+      mkdirSync(own, { recursive: true });
+      mkdirSync(sibling, { recursive: true });
+      mkdirSync(terminalSessions, { recursive: true });
+      writeFileSync(join(agentRoot, 'agent.db'), 'state');
+      writeFileSync(join(agentRoot, 'agent.db-wal'), 'wal');
+      writeFileSync(join(agentRoot, 'config.yml'), 'config');
+      writeFileSync(siblingTranscript, 'SIBLING_SECRET');
+      writeFileSync(breadcrumb, `${join(S, 'proj')}\n${siblingTranscript}\nfresh\n`);
+
+      const { args } = build({
+        readWrite: [agentRoot, own],
+        deny: [sessionsRoot],
+      });
+      expect(args).toContain(own);
+
+      expect(run(args, `printf updated >> ${JSON.stringify(join(agentRoot, 'agent.db'))}`).status).toBe(0);
+      expect(readFileSync(join(agentRoot, 'agent.db'), 'utf8')).toContain('updated');
+      expect(run(args, `printf own > ${JSON.stringify(join(own, 'new.jsonl'))}`).status).toBe(0);
+      expect(readFileSync(join(own, 'new.jsonl'), 'utf8')).toBe('own');
+
+      const breadcrumbRead = run(args, `cat ${JSON.stringify(breadcrumb)}`);
+      expect(breadcrumbRead.status).toBe(0);
+      expect(breadcrumbRead.out).toContain(siblingTranscript);
+      const siblingRead = run(args, `cat ${JSON.stringify(siblingTranscript)}`);
+      expect(siblingRead.status).not.toBe(0);
+      expect(siblingRead.out).not.toContain('SIBLING_SECRET');
+
+      const other = join(sessionsRoot, 'botmux/other');
+      expect(run(args, `mkdir ${JSON.stringify(other)}`).status).not.toBe(0);
+      expect(existsSync(other)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('deny → allow → deny (4 layers): the DEEPEST deny is masked, secret unreadable+unwritable, middle carve-out still works', () => {
