@@ -58,7 +58,7 @@ vi.mock('../src/services/project-scanner.js', () => ({
 
 const forkWorkerMock = vi.fn();
 const sendWorkerInputMock = vi.fn();
-const closeWorkerSessionMock = vi.fn(async () => ({ ok: true, alreadyClosed: false }));
+const closeWorkerSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
 const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
@@ -70,6 +70,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
     map.set(k, ds);

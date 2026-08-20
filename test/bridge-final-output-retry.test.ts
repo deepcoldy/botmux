@@ -103,9 +103,10 @@ import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
+  setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
@@ -250,6 +251,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   afterEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
+    setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
@@ -1710,6 +1712,43 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     )).toBeUndefined();
   });
 
+  it('delivers a listener-thread result when the receiver uses its dedicated active-session key', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_receiver_fallback');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...listenerFinalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      targetChatId: ds.chatId,
+    })).toEqual(['om_vc_receiver_fallback']);
+  });
+
   it('treats a valid skip decision as a successful no-message outcome', async () => {
     const sessionReply = vi.fn(async () => 'om_forbidden');
     initWorkerPool({
@@ -2041,6 +2080,72 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // Reply-card footer is context-only now; the cumulative token line is not
     // rendered here (it lives on the live streaming card).
     expect(cards[0]).not.toContain('Token ↑');
+  });
+
+  it('keeps a stable Lark uuid across ordinary final_output retries so an ambiguous first attempt cannot duplicate the answer', async () => {
+    // Regression (duplicate-reply incident): the daemon retries final_output
+    // delivery up to 3 times on transient failure. The ordinary (non-VC,
+    // non-Codex-App) path used to carry NO Lark `uuid`, so an ambiguous first
+    // attempt — the server accepted the reply but the client saw a network
+    // error — created a brand-new copy on each retry. With 3 attempts the
+    // user saw the same answer up to 3 times. Every retry must now carry one
+    // stable uuid so the Feishu server (uuid field, 1h idempotent TTL)
+    // collapses retries into the original message.
+    const sessionReply = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('ambiguous: server accepted, response lost'))
+      .mockResolvedValueOnce('om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    // Attempt 1 (delay 0) — ambiguous failure.
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    // Attempt 2 (delay 5000) — success, carrying the SAME uuid as attempt 1.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    const firstOpts = sessionReply.mock.calls[0][5] as { uuid?: string } | undefined;
+    const secondOpts = sessionReply.mock.calls[1][5] as { uuid?: string } | undefined;
+    expect(firstOpts?.uuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondOpts?.uuid).toBe(firstOpts!.uuid);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('derives a distinct Lark uuid per ordinary turn so different answers are never collapsed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    __testOnly_deliverFinalOutput(
+      ds,
+      { ...finalOutputMsg(), lastUuid: 'uuid-2', turnId: 'turn-2' },
+      'tag',
+      0,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const firstUuid = (sessionReply.mock.calls[0][5] as { uuid?: string }).uuid;
+    const secondUuid = (sessionReply.mock.calls[1][5] as { uuid?: string }).uuid;
+    expect(firstUuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondUuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondUuid).not.toBe(firstUuid);
   });
 
   it('reads a sandboxed Claude transcript through the daemon reply-card boundary', async () => {

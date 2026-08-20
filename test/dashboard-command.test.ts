@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   executeDashboardCommand,
   formatDashboardFallbackFailure,
+  formatDashboardSuccessLines,
 } from '../src/cli/dashboard-command.js';
 import type { DashboardEndpoint } from '../src/cli/dashboard-endpoint.js';
 
@@ -249,5 +250,52 @@ describe('formatDashboardFallbackFailure', () => {
       reason: 'http-error',
       detail: '500 upstream error',
     })).toBe('Rotation failed: 500 upstream error');
+  });
+});
+
+describe('formatDashboardSuccessLines', () => {
+  it('prints the bare URL first, then the workbench entry on its own line', () => {
+    const lines = formatDashboardSuccessLines({
+      ok: true,
+      url: 'http://10.0.0.7:7891/?t=tok-abc',
+    });
+
+    expect(lines).toEqual([
+      'http://10.0.0.7:7891/?t=tok-abc',
+      '工作台: http://10.0.0.7:7891/workbench?t=tok-abc',
+    ]);
+  });
+
+  it('keeps line 0 a bare URL — the scripting contract (`botmux dashboard | head -1`)', () => {
+    const lines = formatDashboardSuccessLines({
+      ok: true,
+      url: 'https://m-abc.platform.test/?t=tok-abc',
+      localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    });
+
+    // No label, no prefix, and parseable as-is.
+    expect(lines[0]).toBe('https://m-abc.platform.test/?t=tok-abc');
+    expect(() => new URL(lines[0])).not.toThrow();
+    expect(lines[0]).not.toContain('工作台');
+  });
+
+  it('derives the workbench entry from the SAME origin+token as the primary URL', () => {
+    // Remote-access on: the primary URL is the platform machine subdomain, so
+    // the workbench entry must follow it there rather than leaking host:port.
+    const lines = formatDashboardSuccessLines({
+      ok: true,
+      url: 'https://m-abc.platform.test/?t=tok-abc',
+      localUrl: 'http://10.0.0.7:7891/?t=tok-abc',
+    });
+
+    expect(lines).toEqual([
+      'https://m-abc.platform.test/?t=tok-abc',
+      '工作台: https://m-abc.platform.test/workbench?t=tok-abc',
+      '本地直连(平台异常时可用): http://10.0.0.7:7891/?t=tok-abc',
+    ]);
+  });
+
+  it('omits the workbench line rather than printing a half-built link', () => {
+    expect(formatDashboardSuccessLines({ ok: true, url: 'not-a-url' })).toEqual(['not-a-url']);
   });
 });

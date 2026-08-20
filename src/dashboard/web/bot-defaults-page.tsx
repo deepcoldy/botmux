@@ -21,6 +21,7 @@ import {
   type CliOptionsState,
   type SubstituteTargetResolution,
 } from './bot-defaults.js';
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
@@ -43,7 +44,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
-import { codexReasoningEffortsForModel } from '../../services/codex-reasoning-effort.js';
+import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -287,6 +288,83 @@ export function BdTabGrid(props: { children: ReactNode; className?: string }) {
       {props.children}
     </div>
   );
+}
+
+/**
+ * Normalise an agent-switch close summary out of an (untrusted) JSON body.
+ *
+ * count and ids are read TOGETHER on purpose. Either one alone is evidence that a
+ * remote session survived, and trusting only one is how a malformed payload
+ * fails open:
+ *  - count>0 with missing/empty ids used to print no id at all;
+ *  - ids present with count 0/absent used to print "manual cleanup required" and
+ *    still show the green tick.
+ * So: any evidence at all ⇒ residual, and a declared residual with no usable id
+ * renders as `unknown` rather than vanishing.
+ */
+/** What a Riff-side agent persist reports back to its own visible status. */
+interface CliPersistOutcome {
+  ok: boolean;
+  /** True when a remote session survived (or the switch aborted). */
+  hadProblem: boolean;
+  note: string;
+}
+
+/**
+ * Did this response come AFTER the irreversible agent-switch closes?
+ *
+ * Detected by the presence of the close-summary fields, deliberately NOT by
+ * enumerating error codes. The enumeration was the bug: the server grew a fourth
+ * post-close exit (`reasoning_effort_not_supported_by_model`) that carries the
+ * same summary, but the client only recognised the two it knew, so the surviving
+ * remote task ids were silently dropped and an operator had no handle to clean
+ * them up. Any future post-close exit is now rendered without touching this file.
+ */
+function carriesAgentSwitchCloseSummary(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const record = body as Record<string, unknown>;
+  return 'closedMismatchedSessions' in record
+    || 'closedMismatchedFailed' in record
+    || 'closedMismatchedResidual' in record
+    || 'closedMismatchedResidualTaskIds' in record;
+}
+
+function parseAgentSwitchSummary(body: unknown): {
+  closed: number;
+  failed: number;
+  residual: number;
+  residualIds: string[];
+  hasResidual: boolean;
+} {
+  const record = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const num = (v: unknown): number =>
+    typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0;
+  const closed = num(record.closedMismatchedSessions);
+  const failed = num(record.closedMismatchedFailed);
+  const residualCount = num(record.closedMismatchedResidual);
+  const rawIds = record.closedMismatchedResidualTaskIds;
+  const ids = Array.isArray(rawIds)
+    ? rawIds.map(id => (typeof id === 'string' && id.trim() ? id : 'unknown'))
+    : [];
+  const hasResidual = residualCount > 0 || ids.length > 0;
+  // A declared residual with no usable id must still be visible.
+  const residualIds = hasResidual && ids.length === 0 ? ['unknown'] : ids;
+  return {
+    closed,
+    failed,
+    residual: Math.max(residualCount, residualIds.length),
+    residualIds,
+    hasResidual,
+  };
+}
+
+/** Render residual remote ids; empty only when there is genuinely no residual. */
+function residualIdText(
+  summary: { residualIds: string[] },
+  tr: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (summary.residualIds.length === 0) return '';
+  return tr('botDefaults.agentResidualIds', { ids: summary.residualIds.join(', ') });
 }
 
 function statusClass(status: StatusMessage, extra = ''): string {
@@ -844,9 +922,11 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'advanced'}
         >
           <BdTabGrid>
-            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
-                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' ? (
+            {/* 远端 CLI（riff/mojo）：backendType 与 CLI 选择 1:1 绑定 ——
+                reconcileRiffBackendType 在 spawn 层按 isRemoteBackendId(cliId)
+                无条件改写为同名后端，所以这里手动切 pty/tmux 只是一个会被
+                静默覆盖的假选择。隐藏该区块。 */}
+            {!isRemoteCliId(bot.cliId) ? (
               <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
@@ -859,6 +939,7 @@ function BotDefaultsCard(props: {
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
       </div>
@@ -919,14 +1000,31 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
   }
   return (
     <section className="bd-section" aria-busy={busy}>
-      <h3 className="bd-section-title">最终回答反馈</h3>
-      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help="默认关闭；只对这个 bot 的最终回答生效" onChange={checked => { setOn(checked); void save(checked); }} />
-      <label className="bd-row"><span>高级 JSON</span><textarea value={json} disabled={busy || !on} rows={10} onChange={e => setJson(e.target.value)} /></label>
-      <div className="actions"><button type="button" className="primary" disabled={busy || !on} onClick={() => void save()}>保存反馈配置</button><StatusSpan status={status} /></div>
-      <h4>每聊天覆盖</h4>
-      <label className="bd-row"><span>聊天</span><select value={chatId} onChange={e => setChatId(e.target.value)}><option value="">选择聊天</option>{chats.map(chat => <option key={chat.chatId} value={chat.chatId}>{chat.name || chat.chatId}</option>)}</select></label>
-      <div className="actions"><button type="button" disabled={busy || !chatId.trim()} onClick={() => void saveChat()}>保存聊天覆盖</button><button type="button" disabled={busy} onClick={() => void loadPreview()}>生效预览</button></div>
-      {preview ? <pre className="code-block">{JSON.stringify(preview, null, 2)}</pre> : null}
+      <h3 className="bd-section-title">
+        <FieldTitle help="开启后，最终回答卡片会显示“结论可用 / 有效推进 / 结论有误”等反馈按钮，用于收集回答质量评价。默认关闭；只影响这个 bot 的最终回答，不影响过程消息。">最终回答反馈</FieldTitle>
+      </h3>
+      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+      <StatusSpan status={status} />
+      {on ? (
+        <details className="bd-feedback-advanced">
+          <summary>高级配置（JSON 与聊天覆盖）</summary>
+          <div className="bd-feedback-advanced-body">
+            <label className="bd-row"><FieldTitle help="用于自定义反馈按钮、文案、负向原因和是否允许改选。不了解 JSON 配置时保持默认即可。">高级 JSON</FieldTitle><textarea className="bd-feedback-json" value={json} disabled={busy} rows={6} onChange={e => setJson(e.target.value)} /></label>
+            <div className="actions"><button type="button" className="primary" disabled={busy} onClick={() => void save()}>保存反馈配置</button></div>
+            <div className="bd-feedback-chat-override">
+              <h4><FieldTitle help="让同一个 bot 在不同飞书聊天中使用不同反馈规则；聊天配置优先于 bot 默认配置。只有各群规则不同时才需要设置。">每聊天覆盖</FieldTitle></h4>
+              <p className="hint">仅当这个 bot 在不同聊天中需要不同反馈规则时设置。</p>
+              <label className="bd-row"><span>聊天</span><select value={chatId} onChange={e => { setChatId(e.target.value); setPreview(null); }}><option value="">选择聊天</option>{chats.map(chat => <option key={chat.chatId} value={chat.chatId}>{chat.name || chat.chatId}</option>)}</select></label>
+              {chatId.trim() ? (
+                <>
+                  <div className="actions"><button type="button" disabled={busy} onClick={() => void saveChat()}>保存聊天覆盖</button><button type="button" disabled={busy} onClick={() => void loadPreview()}>生效预览</button></div>
+                  {preview ? <pre className="code-block">{JSON.stringify(preview, null, 2)}</pre> : null}
+                </>
+              ) : null}
+            </div>
+          </div>
+        </details>
+      ) : null}
     </section>
   );
 }
@@ -938,6 +1036,129 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
+    </section>
+  );
+}
+
+type OwnerReminderState = NonNullable<BotDefaultsRow['sessionOwnerReminder']>['states'][number];
+const OWNER_REMINDER_STATE_OPTIONS = [
+  { value: 'idle', labelKey: 'botDefaults.ownerReminderStateIdle' },
+  { value: 'dormant', labelKey: 'botDefaults.ownerReminderStateDormant' },
+  { value: 'pending_repo', labelKey: 'botDefaults.ownerReminderStatePendingRepo' },
+  { value: 'tui_prompt', labelKey: 'botDefaults.ownerReminderStateTuiPrompt' },
+  { value: 'agent_attention', labelKey: 'botDefaults.ownerReminderStateAgentAttention' },
+  { value: 'limited', labelKey: 'botDefaults.ownerReminderStateLimited' },
+] as const;
+
+// Offline/error rows can lack the daemon-provided default payload. Keep this
+// browser fallback aligned with DEFAULT_SESSION_OWNER_REMINDER.
+const DEFAULT_OWNER_REMINDER = {
+  enabled: false,
+  intervalMinutes: 30,
+  text: '该会话已等待处理，请继续跟进。',
+  states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
+};
+
+function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.sessionOwnerReminder ?? DEFAULT_OWNER_REMINDER;
+  const [enabled, setEnabled] = useState(initial.enabled === true);
+  const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
+  const [text, setText] = useState(initial.text);
+  const [states, setStates] = useState<OwnerReminderState[]>([...initial.states]);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.sessionOwnerReminder ?? DEFAULT_OWNER_REMINDER;
+    setEnabled(next.enabled === true);
+    setIntervalValue(String(next.intervalMinutes));
+    setText(next.text);
+    setStates([...next.states]);
+  }, [props.bot.sessionOwnerReminder]);
+
+  function toggleState(state: OwnerReminderState, checked: boolean): void {
+    setStates(current => checked
+      ? (current.includes(state) ? current : [...current, state])
+      : current.filter(item => item !== state));
+  }
+
+  async function save(): Promise<void> {
+    const minutes = Number(interval);
+    const cleanText = text.trim();
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10_080) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderIntervalInvalid')}` });
+      return;
+    }
+    if (!cleanText || Array.from(cleanText).length > 500 || /<\s*at\b/i.test(cleanText)) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderTextInvalid')}` });
+      return;
+    }
+    if (enabled && states.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`,
+        payload,
+      );
+      if (res.ok && res.body.ok) {
+        const next = res.body.sessionOwnerReminder ?? payload;
+        props.patchBot(props.bot.larkAppId, { sessionOwnerReminder: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-owner-reminder">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.ownerReminderHelp')}>{tr('botDefaults.ownerReminderTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-owner-reminder"
+        title={tr('botDefaults.ownerReminderEnabled')}
+        help={tr('botDefaults.ownerReminderEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.ownerReminderInterval')}</span>
+          <input type="number" min={1} max={10080} step={1} data-input="ownerReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.ownerReminderStates')}</h4>
+        <div className="bd-owner-reminder-states">
+          {OWNER_REMINDER_STATE_OPTIONS.map(option => (
+            <label key={option.value}>
+              <input type="checkbox" checked={states.includes(option.value)} disabled={busy} onChange={event => toggleState(option.value, event.currentTarget.checked)} />
+              <span>{tr(option.labelKey)}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.ownerReminderTextHelp')}>{tr('botDefaults.ownerReminderText')}</FieldTitle></span>
+          <textarea rows={3} maxLength={500} data-input="ownerReminderText" value={text} disabled={busy} onChange={event => setText(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-owner-reminder" disabled={busy} onClick={() => void save()}>{tr('botDefaults.ownerReminderSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-owner-reminder-status': '' }} />
+      </div>
     </section>
   );
 }
@@ -1361,6 +1582,13 @@ export function BotAgentSection(props: {
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty = use
+  // the runner default (10 min). `touched` gates whether a save sends the field
+  // at all: an untouched field is omitted so the daemon preserves the exact
+  // stored ms (including legal non-whole-minute values) instead of clearing it.
+  const [turnTimeoutMin, setTurnTimeoutMin] = useState(turnTimeoutMinFromMs(bot.turnTimeoutMs));
+  const [turnTimeoutTouched, setTurnTimeoutTouched] = useState(false);
+  const [turnTimeoutError, setTurnTimeoutError] = useState<string | null>(null);
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1375,6 +1603,9 @@ export function BotAgentSection(props: {
     setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
+    setTurnTimeoutTouched(false);
+    setTurnTimeoutError(null);
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1384,6 +1615,7 @@ export function BotAgentSection(props: {
     bot.larkAppId,
     bot.model,
     bot.reasoningEffort,
+    bot.turnTimeoutMs,
     runtimeConfigKey,
     bot.wrapperCli,
     bot.skillInjection,
@@ -1468,25 +1700,64 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
+    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // so an illegal value surfaces an inline error instead of silently clearing
+    // the config. Untouched → omitted below so the daemon preserves the stored
+    // ms exactly (including legal non-whole-minute values).
+    let turnTimeoutField: number | '' | undefined;
+    if (cliKey === 'dsh' && turnTimeoutTouched) {
+      const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
+      if (parsed === 'invalid') {
+        const text = tr('botDefaults.agentTurnTimeoutInvalid');
+        setTurnTimeoutError(text);
+        setAgentStatus({ text: `✗ ${text}` });
+        return;
+      }
+      setTurnTimeoutError(null);
+      turnTimeoutField = parsed; // number (minutes→ms) or '' (clear)
+    }
     setAgentBusy(true);
     try {
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: (cliKey === 'grok' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        // dsh-only: only send when the user actually edited the field. Omitting
+        // it makes the daemon preserve the current value; non-dsh selections
+        // never send it (the daemon drops any stored value for non-dsh CLIs).
+        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
-        const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
-          ? res.body.closedMismatchedSessions as number
-          : 0;
-        const closedText = closedCount > 0
-          ? tr('botDefaults.agentClosedCount', { count: closedCount })
-          : '';
+        const summary = parseAgentSwitchSummary(res.body);
+        const closedCount = summary.closed;
+        const residualCount = summary.residual;
+        const failedCount = summary.failed;
+        // Localised, not hardcoded: this component is already tr()-driven, so a
+        // raw Chinese string would reach an English dashboard.
+        const notes = [
+          closedCount > 0 ? tr('botDefaults.agentClosedCount', { count: closedCount }) : '',
+          // Closed, but their remote sessions are still running.
+          residualCount > 0 ? tr('botDefaults.agentClosedResidual', { count: residualCount }) : '',
+          // Not closed at all — the rows are still active.
+          failedCount > 0 ? tr('botDefaults.agentCloseFailed', { count: failedCount }) : '',
+          // The ids are the ONLY handle for manual cleanup; a count alone is not
+          // actionable. Malformed/blank entries render as `unknown` rather than
+          // silently disappearing.
+          residualIdText(summary, tr),
+        ].filter(Boolean);
+        const closedText = notes.join(' · ');
+        // `hasResidual` (count OR ids), not the count alone — a payload carrying
+        // only ids must still lose the green tick.
+        const hadProblem = summary.hasResidual || failedCount > 0;
         setAgentStatus(res.body.availabilityWarning
           ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }
-          : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
+          : hadProblem
+            // Never the green tick when a session is still active or a remote
+            // session survived: that is what made this invisible.
+            ? { text: `⚠️ ${closedText}` }
+            : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime === undefined
@@ -1498,8 +1769,16 @@ export function BotAgentSection(props: {
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
+        // Re-sync the minutes input from the authoritative saved ms and clear
+        // the dirty flag so a subsequent unrelated save won't touch the field.
+        setTurnTimeoutMin(turnTimeoutMinFromMs(
+          typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
+        ));
+        setTurnTimeoutTouched(false);
+        setTurnTimeoutError(null);
         setRuntimeTouched(false);
         if (cliRuntime) {
           const probe = res.body.runtimeProbe;
@@ -1516,9 +1795,25 @@ export function BotAgentSection(props: {
           }
         }
       } else {
-        const detail = typeof res.body?.message === 'string' && res.body.message
-          ? res.body.message
-          : responseErrorText(res);
+        // The switch transaction refused: say what actually happened rather than
+        // surfacing a bare error code — the config is unchanged, some rows closed,
+        // and some remote sessions may need manual cleanup.
+        // ANY post-close exit, detected by the summary fields rather than a list of
+        // error codes — see carriesAgentSwitchCloseSummary. Some rows are closed
+        // and their remote ids are only ever reported here.
+        const aborted = carriesAgentSwitchCloseSummary(res.body);
+        const abortSummary = parseAgentSwitchSummary(res.body);
+        const detail = aborted
+          ? [
+            tr('botDefaults.agentSwitchAborted', {
+              closed: abortSummary.closed,
+              failed: abortSummary.failed,
+            }),
+            residualIdText(abortSummary, tr),
+          ].filter(Boolean).join(' · ')
+          : typeof res.body?.message === 'string' && res.body.message
+            ? res.body.message
+            : responseErrorText(res);
         const text = `✗ ${detail}`;
         setAgentStatus({ text });
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
@@ -1539,10 +1834,18 @@ export function BotAgentSection(props: {
    * reach PUT /agent — the bot would stay on its old CLI and backendType
    * would never auto-flip to riff. Returns false when persisting failed.
    */
-  async function persistRiffCliSelection(): Promise<boolean> {
-    if (bot.cliId === 'riff') return true; // already persisted
+  /**
+   * Riff's save reuses PUT /agent, so it inherits the SAME close transaction —
+   * including a residual (rows closed, remote still running) and an aborted
+   * switch. It must return that to the caller instead of a bare boolean:
+   * `setAgentStatus` is rendered in the `!isRiff` branch, so anything written
+   * there while Riff is selected is invisible.
+   */
+  async function persistRiffCliSelection(): Promise<CliPersistOutcome> {
+    if (bot.cliId === 'riff') return { ok: true, hadProblem: false, note: '' };
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
+      const summary = parseAgentSwitchSummary(res.body);
       if (res.ok && res.body.ok) {
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
@@ -1551,13 +1854,27 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
-        return true;
+        const note = [
+          summary.residual > 0 ? tr('botDefaults.agentClosedResidual', { count: summary.residual }) : '',
+          residualIdText(summary, tr),
+        ].filter(Boolean).join(' · ');
+        return { ok: true, hadProblem: summary.hasResidual, note };
       }
-      setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
-      return false;
+      // Aborted switch (close refused, or commit failed after closes ran): the
+      // config did NOT change and some remote sessions may need manual cleanup.
+      const aborted = carriesAgentSwitchCloseSummary(res.body);
+      const note = aborted
+        ? [
+          // Riff-specific wording: by this point the /riff write already
+          // succeeded, so "config unchanged" would be false here — only the
+          // Agent selection failed to switch.
+          tr('botDefaults.riffAgentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
+          residualIdText(summary, tr),
+        ].filter(Boolean).join(' · ')
+        : responseErrorText(res);
+      return { ok: false, hadProblem: true, note };
     } catch (e: any) {
-      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
-      return false;
+      return { ok: false, hadProblem: true, note: caughtErrorText(e) };
     }
   }
 
@@ -1583,7 +1900,13 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
-  const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
+  const isReasoningSelection = isCodexSelection || cliKey === 'grok';
+  // The dsh adapter is the only one that forwards a runner turn timeout.
+  const isDsh = cliKey === 'dsh';
+  const reasoningEffortOptions = useMemo(
+    () => reasoningEffortsForCliModel(cliKey === 'grok' ? 'grok' : isCodexSelection ? 'codex' : undefined, model),
+    [cliKey, isCodexSelection, model],
+  );
 
   useEffect(() => {
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
@@ -1777,7 +2100,32 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isCodexSelection && (
+      {isDsh && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            <input
+              type="number"
+              min={0}
+              // Allow non-whole minutes so a legal non-60000-multiple ms value
+              // (e.g. 90001ms ≈ 1.50002min) can be shown and edited losslessly.
+              step="any"
+              inputMode="decimal"
+              data-input="agentTurnTimeout"
+              placeholder={tr('botDefaults.agentTurnTimeoutPlaceholder')}
+              value={turnTimeoutMin}
+              disabled={agentBusy}
+              onChange={event => {
+                setTurnTimeoutMin(event.currentTarget.value);
+                setTurnTimeoutTouched(true);
+                setTurnTimeoutError(null);
+              }}
+            />
+            {turnTimeoutError ? <small className="hint-warn" data-turn-timeout-error="">{turnTimeoutError}</small> : null}
+          </label>
+        </div>
+      )}
+      {isReasoningSelection && (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.agentReasoningEffortHelp')}>{tr('botDefaults.agentReasoningEffort')}</FieldTitle>
@@ -1787,7 +2135,16 @@ export function BotAgentSection(props: {
               value={reasoningEffort}
               disabled={agentBusy}
               options={[
-                { value: '', label: tr('botDefaults.agentReasoningEffortDefault') },
+                {
+                  value: '',
+                  label: tr(
+                    cliKey === 'grok'
+                      ? 'botDefaults.agentReasoningEffortDefaultGrok'
+                      : isCodexSelection
+                        ? 'botDefaults.agentReasoningEffortDefaultCodex'
+                        : 'botDefaults.agentReasoningEffortDefault',
+                  ),
+                },
                 ...reasoningEffortOptions.map(value => ({
                   value,
                   label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),
@@ -1839,6 +2196,54 @@ export function BotAgentSection(props: {
       )}
     </section>
   );
+}
+
+/**
+ * Node's setTimeout delay caps at a 32-bit signed int of ms; a larger value
+ * wraps to ~1ms. Kept in lockstep with `MAX_TURN_TIMEOUT_MS` in bot-registry
+ * (a browser bundle can't import that Node-side module); a unit test asserts the
+ * two stay equal so this copy can't silently drift.
+ */
+export const DASHBOARD_MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Convert a stored dsh turn timeout (ms) into the minutes string shown in the
+ * input. Absent / non-positive / non-integer / over-bound → empty (the field
+ * then means "use the runner default"). A legal value that is not a whole
+ * number of minutes is shown as its decimal minutes (trimmed of any float
+ * tail) rather than hidden as empty; `parseTurnTimeoutMinInput` re-rounds it to
+ * the nearest whole ms, so the displayed value round-trips back to the same ms.
+ */
+function turnTimeoutMinFromMs(ms: unknown): string {
+  if (typeof ms !== 'number' || !Number.isInteger(ms) || ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return '';
+  const minutes = ms / 60_000;
+  // Trim any floating-point tail; parseTurnTimeoutMinInput re-rounds to ms.
+  return Number.isInteger(minutes) ? String(minutes) : String(Number(minutes.toFixed(10)));
+}
+
+/**
+ * Parse the minutes input for the PUT body. Returns:
+ *  - `''`        → cleared (empty input) → daemon reverts to the runner default,
+ *  - a number    → minutes → ms, rounded to the nearest whole ms, a positive
+ *                  integer within the arm-able bound,
+ *  - `'invalid'` → the operator typed something that is not a clearable blank
+ *                  and not a representable positive timeout (0, negative, NaN,
+ *                  or a minutes value whose nearest ms is ≤0 / over-bound).
+ * Rounding to the nearest whole ms makes the value shown by
+ * `turnTimeoutMinFromMs` (a possibly-decimal minutes figure) round-trip back to
+ * the exact stored ms; invalid input is surfaced inline, never silently cleared.
+ */
+function parseTurnTimeoutMinInput(minutes: string): number | '' | 'invalid' {
+  const trimmed = minutes.trim();
+  if (!trimmed) return '';
+  const asMinutes = Number(trimmed);
+  if (!Number.isFinite(asMinutes) || asMinutes <= 0) return 'invalid';
+  // Round to the nearest whole ms: the minutes field is a lossy display of a
+  // ms value, so snapping back to an integer ms is the safe, non-destructive
+  // interpretation (e.g. 1.5000166667 min → 90001 ms).
+  const ms = Math.round(asMinutes * 60_000);
+  if (ms <= 0 || ms > DASHBOARD_MAX_TURN_TIMEOUT_MS) return 'invalid';
+  return ms;
 }
 
 function skillInjectionResolved(bot: BotDefaultsRow): string {
@@ -3638,17 +4043,18 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
  *  - off：不打标签
  *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
  *  → 本行轮询到 authorized 后徽标变绿。 */
-function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
+export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const lifecycle = useRef({ generation: 0, mounted: true });
 
-  const fetchStatus = async (): Promise<boolean> => {
+  const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
-      if (res.ok && res.body.ok) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation && res.ok && res.body.ok) {
         setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'feed-group') });
         return !!res.body.authorized;
       }
@@ -3656,30 +4062,55 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     return false;
   };
 
-  useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+  useEffect(() => {
+    lifecycle.current.mounted = true;
+    const generation = ++lifecycle.current.generation;
+    // The row instance can survive a bot switch. Clear the previous bot's
+    // in-flight UI state as well as invalidating its polling generation.
+    setStatus(null);
+    setAuthBusy(false);
+    setModeBusy(false);
+    setErr(null);
+    void fetchStatus(generation);
+    return () => {
+      lifecycle.current.mounted = false;
+      lifecycle.current.generation += 1;
+    };
+  }, [props.bot.larkAppId]);
 
   async function saveMode(next: string): Promise<void> {
+    // Capture the row's generation: a bot switch bumps it (see the effect
+    // above), and a slow response for the previous bot must not overwrite the
+    // new bot's row state — drop it silently instead.
+    const generation = lifecycle.current.generation;
     setModeBusy(true);
     setErr(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
         setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
       } else {
         setErr(responseErrorText(res));
       }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setModeBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setModeBusy(false);
     }
   }
 
   async function startAuth(): Promise<void> {
+    const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
     try {
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
+      // A bot switch while the POST was in flight must neither surface the old
+      // bot's error nor open the old bot's authorization page in a new tab.
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (!res.ok || !res.body.ok || !res.body.authUrl) {
         setErr(responseErrorText(res));
         return;
@@ -3688,13 +4119,18 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 3000));
-        if (await fetchStatus()) return;
+        if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+        if (await fetchStatus(generation)) return;
       }
-      setErr(tr('botDefaults.sgTagAuthTimeout'));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(tr('botDefaults.sgTagAuthTimeout'));
+      }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setAuthBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
     }
   }
 
@@ -4074,7 +4510,7 @@ const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
 /** riff task-execute 的 sandboxCluster；缺省行为与服务端一致，回落 BOE。 */
 const RIFF_SANDBOX_CLUSTER_OPTIONS = ['boe', 'cn'] as const;
 
-function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
+function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<CliPersistOutcome> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
@@ -4124,8 +4560,16 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       if (res.ok && res.body.ok) {
         const next = typeof res.body.riff === 'string' && res.body.riff ? JSON.parse(res.body.riff) : null;
         props.patchBot(props.bot.larkAppId, { riff: next });
-        if (props.persistCliSelection && !(await props.persistCliSelection())) {
-          setStatus({ text: `✗ ${tr('botDefaults.riffCliPersistFailed')}` });
+        const persisted = await props.persistCliSelection?.();
+        if (persisted && !persisted.ok) {
+          // Show the transaction's own detail (Agent NOT switched + surviving
+          // remote ids) in THIS section's visible status, not the generic text.
+          setStatus({ text: `✗ ${persisted.note || tr('botDefaults.riffCliPersistFailed')}` });
+          return;
+        }
+        if (persisted?.hadProblem) {
+          // Saved, but a remote session survived — never the green tick.
+          setStatus({ text: `⚠️ ${persisted.note}` });
           return;
         }
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });

@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -36,11 +36,13 @@ import {
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
+import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
   composeSpawnCodexAppContext,
@@ -209,6 +211,38 @@ async function resumeRestoredPendingRepoSetup(
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }
 
+/**
+ * Drop a persisted `previewTarget` that belonged to the previous worker
+ * generation, before this restore pass rebuilds a DaemonSession from the row.
+ *
+ * `previewTarget` is the literal loopback (host, port) an agent registered with
+ * `botmux preview <port>`; it is routing state for the worker that was live at
+ * registration time, not a durable property of the conversation. Restore always
+ * opens a NEW generation — every row here is rebuilt with `worker: null`, and
+ * killStalePids has just reaped the previous run's CLI processes — so whatever
+ * served that port is gone and the OS may hand the number to any unrelated
+ * local service. The preview proxy dials a registered target by host/port
+ * alone, so carrying one across the restart can proxy a user's preview into
+ * someone else's local server. Applies to adopt rows too: a surviving adopted
+ * CLI is no proof that its dev server survived, and re-registering costs one
+ * command inside the session.
+ *
+ * Cleanup only — registration (`POST /api/sessions/:id/preview`, which probes
+ * reachability first) and the proxy are untouched; the session simply
+ * re-registers. A failed save is logged and swallowed: the in-memory row this
+ * pass registers is already clear (so nothing dials the stale target), and the
+ * next successful save converges the file.
+ */
+function clearRestoredPreviewTarget(session: Session): void {
+  // P1-13：与 worker 换代 / suspend / exit / close 走同一个收口（清字段 + 落盘 +
+  // 广播 `preview: null`），restore 只是「代次边界」的又一种形态，不该有第二份实现。
+  if (!clearSessionPreviewTarget(session, 'restore opens a new worker generation')) return;
+  logger.debug(
+    `[${session.sessionId.substring(0, 8)}] Dropped preview target registered by the previous worker `
+    + `generation; the session must re-register with \`botmux preview <port>\``,
+  );
+}
+
 function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
   session.restoreQuarantinedAt ??= new Date().toISOString();
   try {
@@ -295,6 +329,10 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
 type CliMismatchCloseResult =
   | 'not_mismatched'
   | 'closed'
+  /** Closed, but its remote session survived and needs manual cleanup. */
+  | 'closed_with_residual'
+  /** closeSession REFUSED (e.g. remote cancellation unproven). Row stays active. */
+  | 'close_failed'
   | 'teardown_failed'
   | 'transfer_deferred';
 
@@ -374,7 +412,30 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
   } else {
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
-  await closeSession(ds.session.sessionId);
+  const result = await closeSession(ds.session.sessionId);
+  if (!result.ok) {
+    // closeSession models a refused close as a RETURNED {ok:false}, not a throw.
+    // Falling through to 'closed' here counted a still-active row (whose remote
+    // session may still be running) as torn down, and the caller then reported a
+    // green "closed N". The row and its registry owner are deliberately left
+    // intact by closeSession, so the sweep just reports the failure.
+    logger.error(
+      `[${tag}] CLI mismatch close REFUSED (${result.error}); row stays active`,
+    );
+    return 'close_failed';
+  }
+  if (result.outcome === 'closed_with_residual') {
+    // A hot CLI/backend switch can hit an old mojo row carrying either a parked
+    // remote lineage OR a local host subtree that could not be proven terminated.
+    // This path has no interactive surface, so the warning has to be loud in the
+    // log AND counted separately for whatever is showing the sweep total. Kind-
+    // aware so a LOCAL residual is not logged as a phantom `(undefined)` remote id.
+    const r = result.residual;
+    logger.warn(r.taskId
+      ? `[${tag}] CLI mismatch close left an UNCANCELLED remote session (${r.taskId}); manual cleanup required`
+      : `[${tag}] CLI mismatch close left a local host subtree unproven (${r.reason}); manual cleanup required`);
+    return 'closed_with_residual';
+  }
   return 'closed';
 }
 
@@ -388,10 +449,23 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * 豁免口径与 restoreActiveSessions 一致：queued（待办池）会话从没起过 CLI；
  * adopt 会话接管的是用户自己的外部 CLI，其 cliId 与 bot 配置不同是合法状态。
  */
-export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promise<number> {
+/**
+ * 返回值区分三种结果，而不是一个 closed 计数：远端 CLI（mojo / riff）的会话活在
+ * 本机之外，本地行关掉了而远端仍存活是真实可能的结果。
+ *
+ * - `closed`：本地行已关闭，且没有需要人工处理的残留。
+ * - `residual`：本地行已关闭（因此不会再被路由到），但远端会话还在，其 taskId 需要
+ *   上报给运维，否则调用方只看到「closed N」而拿不到清理线索。
+ * - `failed`：关闭被拒绝（例如远端取消无法证明），该行仍然 active。
+ */
+export async function closeCliMismatchedSessionsForBot(
+  larkAppId: string,
+): Promise<{ closed: number; residual: number; failed: number }> {
   const registry = getActiveSessionsRegistry();
-  if (!registry) return 0;
+  if (!registry) return { closed: 0, residual: 0, failed: 0 };
   let closed = 0;
+  let residual = 0;
+  let failed = 0;
   // 先快照再遍历：closeSession 会在迭代途中从 registry 删项。
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
@@ -408,15 +482,20 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     try {
       const result = await closeActiveSessionIfCliMismatch(ds);
       if (result === 'closed') closed++;
+      else if (result === 'closed_with_residual') { closed++; residual++; }
+      else if (result === 'close_failed' || result === 'teardown_failed') failed++;
       else if (result === 'transfer_deferred') armCliMismatchResweep(ds);
     } catch (err) {
+      // A thrown close is a failure too — count it, or the caller reports a clean
+      // sweep while this row is still active.
+      failed++;
       logger.error(
         `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed; continuing sweep: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  return closed;
+  return { closed, residual, failed };
 }
 
 /**
@@ -656,7 +735,7 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 
 /**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
- * (open_id + type + optional name) via `resolveSender(...)` in identity-cache.
+ * (open_id + type + optional name/email) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
@@ -664,6 +743,7 @@ export function renderSenderTag(sender?: ResolvedSender): string {
   if (!sender || !sender.openId) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
+  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -1580,6 +1660,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
+    s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
@@ -1592,6 +1673,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
+  s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
@@ -1768,6 +1850,167 @@ export async function restoreActiveSessions(
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
     }
+    // New worker generation ⇒ no registered preview port. Runs before every
+    // branch below (adopt / queued / ordinary / close / quarantine — including
+    // the mojo journal reconciliation right after, which has its own `continue`
+    // paths) so no rebuilt DaemonSession or announced row, and no row persisted
+    // by a quarantine/recovered close, can carry the old target.
+    clearRestoredPreviewTarget(session);
+    // Freeze the mojo control plane BEFORE this row becomes visible in the active
+    // map. The dispatcher is already live during restore, so a row registered
+    // first could be woken — or `/close`d — while still reading live bot config,
+    // pairing a lineage created on one tenant with another. Idempotent and cheap
+    // for non-mojo rows.
+    //
+    // Attribution must never be guessed. Legacy rows can genuinely lack
+    // larkAppId (session-store keeps them for compatibility), and falling back
+    // to getAllBots()[0] classified such rows against an ARBITRARY bot: if
+    // bot[0] happened to be mojo, an unrelated old riff/remote row was frozen
+    // with bot[0]'s tenant identity and its lineage parked into
+    // mojoQuarantinedLineage — the exact cross-tenant misbinding the freeze
+    // exists to prevent, inverted, and idempotently locked in (an existing
+    // mojoIdentity short-circuits every later boot). A single registered bot is
+    // the one unambiguous fallback; with several, leave the row unfrozen so
+    // `mojoIdentity === undefined` keeps meaning "predates this field".
+    {
+      const allBots = getAllBots();
+      const freezeAppId = session.larkAppId
+        ?? (allBots.length === 1 ? allBots[0]?.config.larkAppId : undefined);
+      if (freezeAppId !== undefined) {
+        freezeMojoIdentityForSession(session, freezeAppId);
+      } else if (session.backendType === 'mojo' || session.cliId === 'mojo') {
+        logger.warn(
+          `[${session.sessionId.substring(0, 8)}] mojo row has no larkAppId and `
+          + `${allBots.length} bots are registered; refusing to guess its tenant — `
+          + 'identity stays unfrozen (no automatic resume or cancel)',
+        );
+      }
+    }
+
+    if (session.mojoCloseJournal
+        && !sessionStore.isValidMojoCloseJournal(session.mojoCloseJournal)) {
+      // Session JSON is a runtime boundary. A forged/truncated `prepared` object
+      // must not become proof that cancellation happened merely because the TS
+      // interface says its fields exist.
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_malformed');
+      continue;
+    }
+    if (session.mojoCloseJournal && session.backendType !== 'mojo') {
+      // A Mojo close proof on another backend is corrupt metadata, not authority
+      // to close that backend's row. Fence it for operator inspection; never let
+      // an untyped JSON field become a cross-backend teardown primitive.
+      session.mojoCloseJournal = {
+        phase: 'uncertain',
+        requestId: session.mojoCloseJournal.requestId,
+        ...(session.mojoCloseJournal.taskId
+          ? { taskId: session.mojoCloseJournal.taskId }
+          : {}),
+        // State the verdict rather than leaving a reader to infer it from the
+        // phase, and rebuild the row from scratch so a stale commit-only marker
+        // cannot survive as false proof of an irreversible teardown.
+        recovery: 'uncertain',
+        admission: 'fenced',
+        updatedAt: new Date().toISOString(),
+      };
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_backend_mismatch');
+      continue;
+    }
+    // ORDER IS LOAD-BEARING: this branch must stay ABOVE the catch-all below,
+    // which rebuilds any remaining journal as `uncertain` + fenced. A commit-only
+    // `prepared` row means the remote teardown already happened and only the local
+    // commit is outstanding; downgrading it to `uncertain` would demand manual
+    // reconciliation for something no retry can resolve, wedging the session open
+    // forever with its device-isolation blocker held. Pinned by
+    // "does NOT downgrade a COMMIT-ONLY prepared close" in
+    // test/restore-zombie-close.test.ts, which goes red if these are reordered.
+    if (session.mojoCloseJournal?.phase === 'prepared') {
+      if (session.mojoQuarantinedLineage) {
+        // The active lineage is proven gone, but an older PARKED lineage still
+        // needs a user-visible manual-cleanup warning. Auto-closing during boot
+        // has no reply surface and would strand the pending notice on a row that
+        // can never accept another turn. Keep the prepared row quarantined until
+        // an explicit close can return closed_with_residual to its caller.
+        quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_has_residual');
+        continue;
+      }
+      // The previous daemon durably recorded irreversible cancellation before it
+      // crashed. Complete only the local close; closeSession recognizes the
+      // prepared journal and never calls Mojo cancellation again.
+      try {
+        const recoveredClose = await closeSession(session.sessionId);
+        if (recoveredClose.ok) {
+          // The device-isolation blocker is held by the durable containment
+          // handle regardless, but the recovered close may carry a LOCAL residual
+          // (the crashed daemon proved the remote gone but not the host subtree).
+          // Surface it distinctly at boot rather than swallowing it into a plain
+          // "recovered" line, so the residual the row still carries is visible.
+          if (recoveredClose.outcome === 'closed_with_residual') {
+            logger.warn(
+              `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close WITH residual `
+              + `(${recoveredClose.residual.reason}); the device-isolation blocker is retained`,
+            );
+          } else {
+            logger.info(
+              `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close without re-cancelling`,
+            );
+          }
+          continue;
+        }
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Prepared Mojo close recovery was refused: `
+          + `${recoveredClose.error}`,
+        );
+      } catch (err) {
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Prepared Mojo close recovery failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_commit_failed');
+      continue;
+    }
+    if (session.mojoCloseJournal
+        && session.mojoCloseJournal.phase === 'preparing'
+        && session.mojoCloseJournal.recovery === 'retryable'
+        && session.mojoCloseJournal.admission === 'restorable') {
+      // P1-2: a prepare that FAILED CLEANLY — nothing irreversible happened, the
+      // worker restored write admission, and the verdict was durably recorded as
+      // retryable/restorable. Downgrading this to `uncertain` made the persisted
+      // `retryable` dead-code and the user-facing "retryable" promise a lie: the
+      // row was quarantined unregistered and every later /close refused. Keep
+      // the journal exactly as persisted and register the row normally — writes
+      // were already legal (admission restorable), and an explicit /close can
+      // re-run the cancel (beginMojoCloseJournal accepts the fresh requestId).
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] restoring row with retryable Mojo close `
+        + `journal (${session.mojoCloseJournal.requestId}); close may be retried`,
+      );
+      // fall through to normal registration below
+    } else if (session.mojoCloseJournal) {
+      // A crash while the worker cancel was in flight cannot be classified as
+      // cancelled or safely resumable without a real remote status oracle. Turn
+      // the durable intent into an explicit uncertainty fence and reserve the
+      // routing anchor; never auto-cancel or launch a replacement generation.
+      // The fence is not a dead end: an explicit /close DRAINS it — the row
+      // closes with its lineage parked as a residual for manual cleanup (see
+      // prepareMojoExplicitClose).
+      session.mojoCloseJournal = {
+        phase: 'uncertain',
+        requestId: session.mojoCloseJournal.requestId,
+        ...(session.mojoCloseJournal.taskId
+          ? { taskId: session.mojoCloseJournal.taskId }
+          : {}),
+        // State the verdict rather than leaving a reader to infer it from the
+        // phase, and rebuild the row from scratch so a stale commit-only marker
+        // cannot survive as false proof of an irreversible teardown.
+        recovery: 'uncertain',
+        admission: 'fenced',
+        updatedAt: new Date().toISOString(),
+      };
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_reconciliation_required');
+      continue;
+    }
+
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1840,6 +2083,7 @@ export async function restoreActiveSessions(
           adoptedFrom: adopted,
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
+          streamCardReplyTargetKey: session.streamCardReplyTargetKey,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -2044,6 +2288,7 @@ export async function restoreActiveSessions(
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
+      streamCardReplyTargetKey: session.streamCardReplyTargetKey,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -2106,8 +2351,17 @@ export async function restoreActiveSessions(
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
       if (mismatchClose !== 'not_mismatched') {
+        // Both failure kinds must quarantine, and neither can rely on the catch
+        // below: a REFUSED close (remote cancellation unproven) is a returned
+        // {ok:false}, not an exception. Without this the row stays active on disk
+        // while never being registered — the exact "active on disk, invisible at
+        // runtime" owner quarantineUnregisteredRestoreSession exists to prevent,
+        // after which a later inbound on the same anchor mints a second session
+        // while the old remote one is still running.
         if (mismatchClose === 'teardown_failed') {
           quarantineUnregisteredRestoreSession(session, 'cli_mismatch_teardown_unverified');
+        } else if (mismatchClose === 'close_failed') {
+          quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
         }
         continue;
       }
@@ -2237,6 +2491,13 @@ export async function restoreActiveSessions(
       );
       continue;
     }
+  }
+
+  // Re-arm persisted semantic-recovery timers only after the whole restore
+  // pass has registered collision winners. A zero-delay overdue backoff must
+  // not wake while a later row is still competing for the same route.
+  for (const ds of restoredByThisInvocation) {
+    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -2683,6 +2944,13 @@ export async function resumeSession(
   if (!reactivated.ok) return reactivated;
   session = reactivated.session;
 
+  // Same reason as in restoreActiveSessions: freeze the mojo control plane BEFORE
+  // this row is registered, so it can never be woken or cancelled while still
+  // resolving against live bot config. This is the second path that re-registers
+  // a legacy row, and startup migration does not cover it (the row may have been
+  // closed then, or created after boot).
+  freezeMojoIdentityForSession(session, larkAppId);
+
   const now = Date.now();
   const ds: DaemonSession = {
     session,
@@ -2701,6 +2969,7 @@ export async function resumeSession(
     ownerOpenId: session.ownerOpenId,
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
+    streamCardReplyTargetKey: session.streamCardReplyTargetKey,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,

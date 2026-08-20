@@ -69,6 +69,7 @@ describe('bot defaults focused layout', () => {
     // 会话后端 stays under 高级; 启动环境(Shell+env) stays under 高级 too.
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');
+    expect(advanced).toContain('<SessionOwnerReminderSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
@@ -76,6 +77,26 @@ describe('bot defaults focused layout', () => {
     const runtimeEnv = page.slice(page.indexOf('function RuntimeEnvironmentSection'), page.indexOf('function RuntimeEnvironmentSection') + 400);
     expect(runtimeEnv).not.toContain('<StartupCommandsSection');
     expect(runtimeEnv).toContain('<LaunchShellSection');
+  });
+
+  it('hides the backend picker for EVERY remote CLI, not just riff', () => {
+    // reconcileRiffBackendType rewrites backendType to the CLI's own name for
+    // any isRemoteBackendId(cliId), so offering pty/tmux to a remote bot renders
+    // a choice the spawn layer silently overwrites. Gate on the shared set so a
+    // third remote CLI cannot reintroduce the phantom control.
+    expect(page).toContain("import { isRemoteCliId } from '../../core/remote-cli-ids.js';");
+    expect(page).toMatch(/\{!isRemoteCliId\(bot\.cliId\) \? \(\s*<section className="bd-tile"><BackendTypeSection/);
+    // No open-coded riff-only gate may guard the backend picker again.
+    expect(page).not.toMatch(/bot\.cliId !== 'riff' \? \(\s*<section className="bd-tile"><BackendTypeSection/);
+  });
+
+  it('keeps the file sandbox visible for mojo while hiding it for riff', () => {
+    // Not symmetric with the backend picker on purpose: riff executes only in a
+    // remote sandbox, but a mojo turn can spawn LOCALLY (cloud optional), so its
+    // file-sandbox settings still bite. Treating "remote" as "no local exec"
+    // here would silently drop isolation.
+    expect(page).toMatch(/bot\.cliId !== 'riff' \? \(\s*<section className="bd-tile"><SandboxSection/);
+    expect(page).not.toMatch(/isRemoteCliId\(bot\.cliId\)[^\n]*<SandboxSection/);
   });
 
   it('ships localized labels for every task category', () => {
@@ -104,5 +125,15 @@ describe('bot defaults focused layout', () => {
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
     expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
+  });
+
+  it('offers granular Session owner reminder controls in advanced settings', () => {
+    expect(page).toContain('function SessionOwnerReminderSection');
+    for (const state of ['idle', 'dormant', 'pending_repo', 'tui_prompt', 'agent_attention', 'limited']) {
+      expect(page).toContain(`value: '${state}'`);
+    }
+    for (const key of ['ownerReminderTitle', 'ownerReminderInterval', 'ownerReminderText', 'ownerReminderStates']) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
   });
 });

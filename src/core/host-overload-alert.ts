@@ -363,6 +363,9 @@ export function formatOverloadAlert(action: OverloadAlertAction, hostLabel?: str
  *  exact literals (typo-proof). */
 export const OVERLOAD_ACTION_CLEAN_STOPPED = 'overload_clean_stopped';
 export const OVERLOAD_ACTION_SUSPEND_IDLE = 'overload_suspend_idle';
+/** Restart a specific browser (bundleId carried on the button value). One action
+ *  literal for all browsers; the per-browser one-shot claim keys on bundleId. */
+export const OVERLOAD_ACTION_RESTART_BROWSER = 'overload_restart_browser';
 /** Fail-safe action on a disabled (already-run) button — clients that don't
  *  suppress disabled callbacks just get a harmless toast, no side effect. */
 export const OVERLOAD_ACTION_NOOP = 'overload_noop';
@@ -395,6 +398,18 @@ export interface OverloadCardState {
   /** result of each action once run; -1 = not run yet. */
   cleanedN: number;
   suspendedN: number;
+  /** Browsers currently running + holding memory on this host, in display order.
+   *  Empty ⇒ no browser buttons (nothing to reclaim). */
+  browsers?: OverloadCardBrowser[];
+  /** bundleIds whose restart button has already been clicked (✓ done). */
+  restartedBrowsers?: string[];
+}
+
+/** A per-browser restart button descriptor carried on the card. */
+export interface OverloadCardBrowser {
+  bundleId: string;
+  label: string;
+  memMB: number;
 }
 
 /** Build the machine-wide summary/metrics line from card state. */
@@ -410,6 +425,7 @@ export function initialOverloadCardState(
   action: OverloadAlertAction,
   counts: { stopped: number; idle: number },
   nonce: string,
+  browsers: OverloadCardBrowser[] = [],
 ): OverloadCardState {
   return {
     nonce,
@@ -422,7 +438,17 @@ export function initialOverloadCardState(
     idle: counts.idle,
     cleanedN: -1,
     suspendedN: -1,
+    ...(browsers.length ? { browsers, restartedBrowsers: [] } : {}),
   };
+}
+
+/** Card button label for a browser restart, e.g. `♻️ 重启 Arc · 6.2 GB`. Inlined
+ *  here (rather than imported from core/browser-restart) so this card module
+ *  stays free of node:child_process and trivially unit-testable. Pure. */
+function browserButtonLabel(label: string, memMB: number): string {
+  if (!Number.isFinite(memMB) || memMB <= 0) return `♻️ 重启 ${label}`;
+  const mem = memMB >= 1024 ? `${(memMB / 1024).toFixed(1)} GB` : `${Math.round(memMB)} MB`;
+  return `♻️ 重启 ${label} · ${mem}`;
 }
 
 /**
@@ -458,16 +484,50 @@ export function buildOverloadAlertCard(st: OverloadCardState, hostLabel?: string
         text: { tag: 'plain_text', content: `💤 挂起闲置会话 (${st.idle})` },
         value: { action: OVERLOAD_ACTION_SUSPEND_IDLE, st: JSON.stringify(st) } };
 
+  // Per-browser restart buttons: one per browser that's running + holding memory
+  // on this host. Each carries its own bundleId so the one-shot claim keys on it
+  // (the owner can bounce Arc AND Chrome on one card, but neither twice). A
+  // clicked browser → disabled ✓; the memory tag reflects what was reclaimed.
+  const browsers = st.browsers ?? [];
+  const restarted = new Set(st.restartedBrowsers ?? []);
+  const browserBtns = browsers.map((b) => restarted.has(b.bundleId)
+    ? { tag: 'button', type: 'default', disabled: true,
+        text: { tag: 'plain_text', content: `✓ 已重启 ${b.label}` },
+        value: { action: OVERLOAD_ACTION_NOOP } }
+    : { tag: 'button', type: 'danger',
+        text: { tag: 'plain_text', content: browserButtonLabel(b.label, b.memMB) },
+        value: { action: OVERLOAD_ACTION_RESTART_BROWSER, bundleId: b.bundleId, st: JSON.stringify(st) } });
+
+  const memList = browsers.length
+    ? '内存占用：' + browsers.map(b => `**${b.label} ${b.memMB >= 1024 ? (b.memMB / 1024).toFixed(1) + 'G' : b.memMB + 'M'}**`).join(' · ')
+    : '';
+
+  const actionRows: unknown[] = [{ tag: 'action', actions: [cleanBtn, suspendBtn] }];
+  // Repo convention: <= 4 buttons per `action` row. With 5+ custom browser
+  // targets we'd otherwise cram them all into one row; chunk into rows of 4.
+  for (let i = 0; i < browserBtns.length; i += 4) {
+    actionRows.push({ tag: 'action', actions: browserBtns.slice(i, i + 4) });
+  }
+
+  const noteLines = [
+    '清僵尸=关闭进程已退出的僵尸会话；挂起闲置=挂起空闲可恢复会话（下条消息冷恢复）。',
+  ];
+  if (browsers.length) noteLines.push('重启浏览器=优雅退出并重开该浏览器（会恢复标签页），用于释放浏览器占用的大块内存。');
+  noteLines.push('仅管理员可操作，每个按钮可点一次。');
+
+  const elements: unknown[] = [
+    { tag: 'div', text: { tag: 'lark_md', content: `**触发维度：**${why}\n${stateMetricsLine(st)}` } },
+    { tag: 'div', text: { tag: 'lark_md', content: `当前可降压：**僵尸会话 ${st.stopped} 个** · **闲置会话 ${st.idle} 个**` } },
+  ];
+  if (memList) elements.push({ tag: 'div', text: { tag: 'lark_md', content: memList } });
+  elements.push({ tag: 'hr' });
+  elements.push(...actionRows);
+  elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: noteLines.join('') }] });
+
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: { template: 'red', title: { tag: 'plain_text', content: `⚠️ 机器过载告警${host}` } },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**触发维度：**${why}\n${stateMetricsLine(st)}` } },
-      { tag: 'div', text: { tag: 'lark_md', content: `当前可降压：**僵尸会话 ${st.stopped} 个** · **闲置会话 ${st.idle} 个**` } },
-      { tag: 'hr' },
-      { tag: 'action', actions: [cleanBtn, suspendBtn] },
-      { tag: 'note', elements: [{ tag: 'lark_md', content: '清僵尸=关闭进程已退出的僵尸会话；挂起闲置=挂起空闲可恢复会话（下条消息冷恢复）。仅管理员可操作，每个按钮可点一次。' }] },
-    ],
+    elements,
   });
 }
 
@@ -491,4 +551,22 @@ export function buildOverloadExpiredCard(detail = ''): string {
     header: { template: 'grey', title: { tag: 'plain_text', content: '⏳ 操作已失效' } },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content: detail || '这张告警卡已过期（daemon 重启或超时）。等待下一次告警即可。' } }],
   });
+}
+
+/**
+ * Failure card for a browser-restart click that could not complete (quit failed,
+ * refused to quit within the window, or quit-but-relaunch-failed). Rendered as a
+ * FULL patchable alert card (not a toast): the browser-restart handler can run up
+ * to ~12s, past the 2.5s card-ACK window, after which a toast-only result is
+ * dropped by the dispatcher — so the failure must ride a card the dispatcher can
+ * patch in. Carries the rebuilt alert `st` so every still-live button (including
+ * this browser's, whose claim was released for retry) stays clickable.
+ */
+export function buildOverloadBrowserFailureCard(st: OverloadCardState, label: string, detail: string, hostLabel?: string): string {
+  const base = JSON.parse(buildOverloadAlertCard(st, hostLabel)) as { elements: unknown[] };
+  base.elements.push({
+    tag: 'note',
+    elements: [{ tag: 'lark_md', content: `⚠️ **${label}**：${detail}` }],
+  });
+  return JSON.stringify(base);
 }

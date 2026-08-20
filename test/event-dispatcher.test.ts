@@ -17,12 +17,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mockExistsSync = vi.fn(() => true);
 const mockReadFileSync = vi.fn(() => '[]');
 const mockWriteFileSync = vi.fn();
+const mockCrossRefStatSync = vi.fn();
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
     existsSync: (...args: any[]) => mockExistsSync(...args),
     readFileSync: (...args: any[]) => mockReadFileSync(...args),
+    statSync: (path: any, ...args: any[]) => String(path).includes('bot-openids-')
+      ? mockCrossRefStatSync(path, ...args)
+      : (actual.statSync as any)(path, ...args),
     writeFileSync: (...args: any[]) => mockWriteFileSync(...args),
     mkdirSync: vi.fn(),
   };
@@ -153,6 +157,7 @@ import {
 import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
+import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -163,6 +168,10 @@ const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
+  __resetPeerCrossRefCacheForTest();
+  mockCrossRefStatSync.mockReset().mockReturnValue({
+    dev: 1, ino: 1, size: 1, mtimeMs: 1, ctimeMs: 1,
+  });
   capturedWsClientOptions = undefined;
   config.daemon.forwardFollowupWaitMs = 0;
   mockReadFileSync.mockReset().mockReturnValue('[]');
@@ -6879,6 +6888,56 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     vi.useRealTimers();
 
     expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_slow_card', JSON.stringify({ type: 'late-card' }));
+  });
+
+  // Regression: browser-restart slow-fail visibility.
+  // the browser-restart handler can run up to ~12s (quit-wait), well past the
+  // 2.5s ACK window. A slow handler that resolves to a CARD body must be patched
+  // into the message in the background (owner sees the failure). Contrast with
+  // the very next test: a slow TOAST-only result is dropped, which is exactly
+  // why the handler now returns a failure CARD instead of a toast.
+  it('patches a slow browser-restart FAILURE card in after ACK (visible failure)', async () => {
+    let release!: () => void;
+    const failureCard = { elements: [{ tag: 'note', elements: [{ tag: 'lark_md', content: '⚠️ **Arc**：已退出但重开失败' }] }] };
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => { release = () => resolve(failureCard); }) as any);
+
+    vi.useFakeTimers();
+    const call = capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'overload_restart_browser', bundleId: 'company.thebrowser.Browser' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_browser_fail' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+    await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+
+    release();
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+
+    // The failure card is wrapped as a raw patch and applied to the message.
+    expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_browser_fail', JSON.stringify(failureCard));
+  });
+
+  it('drops a slow TOAST-only result after ACK (proves why failures must be cards)', async () => {
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => { release = () => resolve({ toast: { type: 'error', content: 'too late' } }); }) as any);
+
+    vi.useFakeTimers();
+    const call = capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'overload_restart_browser', bundleId: 'com.google.Chrome' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_toast_dropped' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+    await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+
+    release();
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+
+    // Toast-only slow result is NOT patched (dropped) — logged instead.
+    expect(mockUpdateMessage).not.toHaveBeenCalledWith(MY_APP_ID, 'om_toast_dropped', expect.anything());
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('slow handler resolved to a toast-only result'));
   });
 
   it('dedupes a repeated card action while the first copy is still running', async () => {

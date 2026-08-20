@@ -157,6 +157,35 @@ describe('TraeX herdr plugin installation', () => {
     });
   });
 
+  it('runs herdr — and the third-party plugin code it invokes — without botmux credentials', async () => {
+    // installTraexPluginNow also runs LIVE inside the dashboard process (the
+    // settings-write handler), and the dashboard is the machine's only holder
+    // of the Feishu H5 login family. `plugin install` clones an
+    // operator-supplied repo and then executes that repo's own install action,
+    // so a raw process.env would hand third-party code the H5 APP_SECRET, the
+    // bot's IM app secret and any GitHub token. P1-9.
+    for (const [key, value] of Object.entries({
+      BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-app-secret',
+      LARK_APP_SECRET: 'legacy-bot-secret',
+      GITHUB_TOKEN: 'ghp_leaked',
+    })) vi.stubEnv(key, value);
+    queueSpawn(LIST_EMPTY, INSTALL_OK, pluginState(), ACTION_OK);
+    const { installTraexPluginNow } = await loadSubject();
+
+    await installTraexPluginNow('trusted/repo', 'reviewed-sha');
+
+    expect(spawn.mock.calls.length).toBeGreaterThan(0);
+    for (const [, , opts] of spawn.mock.calls) {
+      const env = (opts as { env?: NodeJS.ProcessEnv })?.env;
+      expect(env, 'herdr must be spawned with an explicit redacted env').toBeTruthy();
+      for (const key of ['BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET', 'LARK_APP_SECRET', 'GITHUB_TOKEN']) {
+        expect(key in env!, key).toBe(false);
+      }
+      // Still a usable environment for a real CLI.
+      expect(env!.PATH).toBe(process.env.PATH);
+    }
+  });
+
   it('skips install and action only when herdr metadata and the action marker both match', async () => {
     writeMarker('trusted/repo', 'reviewed-sha', 'deadbeef');
     queueSpawn(pluginState());

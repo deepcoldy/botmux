@@ -315,8 +315,8 @@ describe('botmux routing prose XML boundaries', () => {
   });
 
   it.each([
-    ['zh', '&lt;对方 bot 的 open_id&gt;'],
-    ['en', '&lt;other-bot-open-id&gt;'],
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
   ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
     const prompt = buildBotmuxSystemPromptText({
       locale,
@@ -650,6 +650,18 @@ describe('renderSenderTag', () => {
     expect(out).toContain('type="user"');
     expect(out).toContain('open_id="ou_a"');
     expect(out).toContain('name="张三"');
+  });
+
+  it('includes and XML-escapes the optional sender email', () => {
+    const out = renderSenderTag({
+      openId: 'ou_email',
+      type: 'user',
+      name: 'Alice',
+      email: 'alice&ops@example.com',
+    });
+    expect(out).toBe(
+      '<sender type="user" open_id="ou_email" name="Alice" email="alice&amp;ops@example.com" />',
+    );
   });
 
   it('preserves bot type for foreign botmux peers', () => {

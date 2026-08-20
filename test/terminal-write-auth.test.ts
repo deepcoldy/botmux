@@ -14,9 +14,10 @@
 // Independently of the role, a matching private write-link `?token=` is a
 // capability in its own right: the owner explicitly issued that link, so it
 // grants write even when the platform authenticated the viewer as guest.
+import { createHmac } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
+import * as terminalWriteAuth from '../src/core/terminal-write-auth.js';
 import {
-  deriveTerminalViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccess,
   resolveTerminalAccessForRequest,
@@ -28,12 +29,22 @@ import {
 
 const TOK = 'dash-secret-token';
 
+/** The RETIRED stable view derivation (P1-5), reproduced here so tests can
+ *  prove nothing accepts or re-mints it any more. */
+function retiredStableViewToken(secret: string, sessionId: string): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-view-v1\0')
+    .update(sessionId)
+    .digest('base64url');
+}
+
 describe('terminal view capability', () => {
-  it('is stable for one session, domain-bound to the session, and secret-bound', () => {
-    const a = deriveTerminalViewToken('host-secret', 'session-a');
-    expect(a).toBe(deriveTerminalViewToken('host-secret', 'session-a'));
-    expect(a).not.toBe(deriveTerminalViewToken('host-secret', 'session-b'));
-    expect(a).not.toBe(deriveTerminalViewToken('other-secret', 'session-a'));
+  it('P1-5: the stable view derivation is retired — the module no longer exports a view-token minter', () => {
+    // A stable per-session view HMAC could never be revoked (logout/expiry/
+    // worker restart all left it valid). Read capabilities are now either the
+    // worker's per-boot random token or a short-lived signed read grant; no
+    // code path may re-grow a stable derivation under this name.
+    expect((terminalWriteAuth as Record<string, unknown>).deriveTerminalViewToken).toBeUndefined();
   });
 
   it('compares capabilities safely and rejects empty/wrong values', () => {
@@ -83,10 +94,11 @@ describe('terminal write capability', () => {
     expect(a).not.toBe(deriveTerminalWriteToken('other-secret', 'session-a'));
   });
 
-  it('is distinct from the view token for the same session + secret (domain separation)', () => {
-    // Knowing the read-only view token must never yield the write token.
+  it('is distinct from the retired stable view token for the same session + secret (domain separation)', () => {
+    // Knowing a historical read-only view token must never yield the write
+    // token — old view links must stay read-dead, not become operate links.
     expect(deriveTerminalWriteToken('host-secret', 'session-a'))
-      .not.toBe(deriveTerminalViewToken('host-secret', 'session-a'));
+      .not.toBe(retiredStableViewToken('host-secret', 'session-a'));
   });
 });
 

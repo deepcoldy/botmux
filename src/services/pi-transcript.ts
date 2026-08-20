@@ -43,9 +43,12 @@
  *
  * Accepted gap: a custom tool returning `terminate:true` ends the agent right
  * after its toolResult with the last assistant record being `toolUse` (and
- * `terminate` is not persisted), so that turn has NO on-disk boundary. We do not
- * synthesize one; quiescence idle marks the session ready and the next ordinary
- * user turn HOL-drops the unclosed collecting head.
+ * `terminate` is not persisted — re-verified on pi 0.84.2: SessionManager
+ * writes no terminate field, and the newer `pending`/`deferred` StopReasons
+ * are provider-stream states that never reach the session JSONL). We do not
+ * synthesize a boundary; with pi in STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS
+ * such a turn keeps the session projected busy until the next ordinary user
+ * turn HOL-drops the unclosed collecting head (botmux ships no such tool).
  *
  * ## Type-ahead shape
  * Pi's Message Queue is an active-turn STEER (TUI shows "Steering: …" +
@@ -297,9 +300,10 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
     // tool returning terminate:true ends the agent right after its toolResult;
     // the last assistant record is `toolUse` (not a terminal stopReason) and
     // `terminate` is NOT persisted, so that turn has no on-disk end marker. We
-    // deliberately do NOT try to synthesize one — quiescence idle still marks
-    // the session ready, and the next ordinary user turn HOL-drops the
-    // unclosed collecting head. (botmux ships no such tool.)
+    // deliberately do NOT try to synthesize one — with pi lifecycle-blocking
+    // the started turn keeps the session projected busy until the next
+    // ordinary user turn HOL-drops the unclosed collecting head. (botmux
+    // ships no such tool.)
     const isHardTerminal = stopReason === 'error' || stopReason === 'aborted';
     const isTextTerminal = (stopReason === 'stop' || stopReason === 'length')
       && !hasToolCall(obj.message.content);

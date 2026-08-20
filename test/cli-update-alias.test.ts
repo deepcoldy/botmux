@@ -38,8 +38,12 @@ describe('botmux update alias', () => {
     const upgrade = runCli('upgrade');
     const update = runCli('update');
 
+    // Running from this checkout (has .git/src) → the local-dev update branch.
+    // PATH='' makes it abort deterministically at `git status` (ENOENT) right
+    // after the banner, so the test never runs a real pull/build/restart.
     expect(upgrade.status).toBe(1);
-    expect(upgrade.stderr).toContain('无法安全识别当前安装方式');
+    expect(upgrade.stdout).toContain('本地 checkout 更新');
+    // The core contract: `update` is a pure alias of `upgrade`.
     expect(update).toEqual(upgrade);
   });
 

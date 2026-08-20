@@ -12,6 +12,10 @@ function caseRegion(name: 'init' | 'message', next: 'message' | 'raw_input'): st
 }
 
 describe('ordinary IM worker receipt wiring', () => {
+  it('recognizes both real Lark ids and synthetic recovery ids', () => {
+    expect(workerSource).toContain("msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-')");
+  });
+
   it('claims and ACKs init before any slow startup await', () => {
     const init = caseRegion('init', 'message');
     const receipt = init.indexOf('receiveOrdinaryImTurn(ordinaryImTurnId)');

@@ -87,6 +87,51 @@ describe('resolveSender message.get fallback', () => {
     expect(getMessageDetail).toHaveBeenCalledOnce();
   });
 
+  it('resolves and caches a user email from the contact profile', async () => {
+    larkGet.mockResolvedValue({
+      code: 0,
+      data: { user: { name: 'Alice', email: 'alice@example.com' } },
+    });
+    const first = await resolveSender(APP, 'ou_user_email', 'user', { messageId: 'om_email' });
+    expect(first).toMatchObject({
+      openId: 'ou_user_email',
+      type: 'user',
+      name: 'Alice',
+      email: 'alice@example.com',
+    });
+
+    larkGet.mockClear();
+    const second = await resolveSender(APP, 'ou_user_email', 'user', { messageId: 'om_email_2' });
+    expect(second?.email).toBe('alice@example.com');
+    expect(larkGet).not.toHaveBeenCalled();
+  });
+
+  it('contact-enriches a legacy name-only cache once to add email', async () => {
+    getMessageDetail.mockResolvedValue({
+      items: [{ sender: { sender_name: 'Legacy User' } }],
+    });
+    await resolveSender(APP, 'ou_legacy_email', 'app', { messageId: 'om_legacy_seed' });
+
+    larkGet.mockResolvedValue({
+      code: 0,
+      data: { user: { name: 'Legacy User', email: 'legacy@example.com' } },
+    });
+    const enriched = await resolveSender(APP, 'ou_legacy_email', 'user', { messageId: 'om_legacy_user' });
+    expect(enriched).toMatchObject({ name: 'Legacy User', email: 'legacy@example.com' });
+    expect(larkGet).toHaveBeenCalledOnce();
+  });
+
+  it('negatively caches a successful contact response with no email', async () => {
+    larkGet.mockResolvedValue({ code: 0, data: { user: { name: 'No Email' } } });
+    const first = await resolveSender(APP, 'ou_no_email', 'user', { messageId: 'om_no_email' });
+    expect(first).toMatchObject({ name: 'No Email', email: undefined });
+
+    larkGet.mockClear();
+    const second = await resolveSender(APP, 'ou_no_email', 'user', { messageId: 'om_no_email_2' });
+    expect(second?.email).toBeUndefined();
+    expect(larkGet).not.toHaveBeenCalled();
+  });
+
   it('caches the resolved name so a later resolve needs no second fetch', async () => {
     getMessageDetail.mockResolvedValue({
       items: [{ sender: { sender_name: '杨志发' } }],

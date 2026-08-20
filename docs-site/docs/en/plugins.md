@@ -225,6 +225,41 @@ Botmux aggregates the enabled MCP servers for a session through one MCP Gateway.
 The plugin set and credential snapshot are fixed for the lifetime of a CLI
 process, so create a new session after changing bindings or configuration.
 
+#### Trusted caller identity injection
+
+When a turn is triggered by a real IM user, the Gateway injects a
+**host-stamped, model-unforgeable** caller identity into forwarded `tools/call`
+requests, for plugins that need per-user authorization or auditing. The
+contract:
+
+- The identity appears in two places: `_meta.botmuxTrustedCaller` on the MCP
+  request (injected for both `stdio` and `streamable-http`), and, for
+  `streamable-http`, the `x-botmux-trusted-open-id` / `x-botmux-trusted-union-id`
+  / `x-botmux-trusted-app-id` request headers (plus `x-botmux-turn-id` /
+  `x-botmux-dispatch-attempt`). The fields inside `botmuxTrustedCaller` are
+  `requestUserOpenId` / `requestUserUnionId` / `requestLarkAppId`.
+- **Trust only these `botmux`-namespaced keys.** Before injecting, the Gateway
+  **unconditionally strips** any client- (model-) supplied `_meta` key that
+  starts with `botmux`, and any inbound `x-botmux-trusted-*` header — whether or
+  not a host identity exists for the turn. A model therefore cannot impersonate
+  anyone by putting `_meta.botmuxTrustedCaller` in the tool arguments.
+- Conversely, do **not** read bare keys (an un-namespaced `requestUserUnionId`,
+  a custom `trustedCaller`, etc.) as an identity source: those are outside the
+  strip set and can be freely set by the model.
+- Not every turn has a trusted identity: system/recovery turns, and turns whose
+  sender has no `open_id`/`union_id`, inject nothing. Plugins must **fail closed**
+  when `botmuxTrustedCaller` is absent (refuse the identity-bound operation)
+  rather than falling back to any model-reported value.
+- The identity lives only in the host worker's process memory, set per turn, and
+  is never written to a file; do not surface it (or the transport token) to users
+  or logs.
+
+Background and design (Feishu docs): [Botmux Plugin Development and Market
+Registration Guide](https://bytedance.larkoffice.com/docx/FE2mdNdSgoFMVuxWTS7ctqO6nFb)
+and the [Agent Chrome Plugin Guide](https://bytedance.larkoffice.com/docx/RJPfdn0oHoC5zgxVXH1cKMjFnqc)
+(the latter is a full worked example of packaging MCP + Skill + Service into a
+`@botmux-ai/plugin-*` with per-session isolation).
+
 ### Dashboard
 
 `src/dashboard/index.js` default-exports a component:

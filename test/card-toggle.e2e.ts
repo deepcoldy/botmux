@@ -316,12 +316,15 @@ describe('Streaming card toggle_stream', () => {
       expect(patchCalls, 'only one PATCH sent').toHaveLength(1);
       expect(parseDisplayMode(ds.pendingCardJson!), 'latest queued should be screenshot').toBe('screenshot');
 
-      // Resolve first → only ONE queued PATCH flushes (the latest)
+      // Resolve first. The latest queued state is byte-identical to the
+      // successful in-flight PATCH for the same card, so it is an adjacent
+      // duplicate and does not need another Lark call.
       patchCalls[0].resolve();
       await flush();
 
-      expect(patchCalls).toHaveLength(2);
-      expect(parseDisplayMode(patchCalls[1].cardJson), 'flushed PATCH should be the latest state').toBe('screenshot');
+      expect(patchCalls).toHaveLength(1);
+      expect(ds.pendingCardJson).toBeUndefined();
+      expect(ds.cardPatchInFlight).toBe(false);
     });
   });
 });

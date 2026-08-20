@@ -18,6 +18,8 @@ import {
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
   formatUrlHost,
+  workbenchEntryUrl,
+  workbenchSpaUrl,
 } from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import {
@@ -283,5 +285,50 @@ describe('buildV3RunDetailUrl', () => {
     expect(buildV3RunDetailUrl('run-1', { host: '::1', port: 7891 })).toBe(
       'http://[::1]:7891/#/v3/run-1',
     );
+  });
+});
+
+describe('workbench entry URL shapes', () => {
+  // Both derive from an already-built dashboard URL, so they inherit whatever
+  // base buildDashboardUrls picked (local host:port / platform subdomain /
+  // BOTMUX_PUBLIC_URL) with no second copy of that precedence rule.
+  const dashboardUrl = 'http://1.2.3.4:7891/?t=abc';
+
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setBinding(null);
+  });
+
+  it('workbenchSpaUrl keeps the ?t= token and adds the SPA hash route', () => {
+    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench');
+  });
+
+  it('workbenchEntryUrl swaps the path and drops the fragment', () => {
+    expect(workbenchEntryUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/workbench?t=abc');
+    // Already-hashed input normalizes to the same fragment-free entry.
+    expect(workbenchEntryUrl('http://1.2.3.4:7891/?t=abc#/agent-workbench'))
+      .toBe('http://1.2.3.4:7891/workbench?t=abc');
+  });
+
+  it('follows the platform base rather than re-deriving host:port', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    const { url } = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
+    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench');
+    expect(workbenchEntryUrl(url)).toBe('https://m-deadbeef.botmux.example/workbench?t=abc');
+  });
+
+  it('tolerates a token-less dashboard URL (user logs in on arrival)', () => {
+    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench');
+    expect(workbenchEntryUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/workbench');
+  });
+
+  it('returns null for unparseable or non-http input instead of a half link', () => {
+    for (const bad of ['', 'not a url', 'javascript:alert(1)', 'file:///etc/passwd']) {
+      expect(workbenchSpaUrl(bad)).toBeNull();
+      expect(workbenchEntryUrl(bad)).toBeNull();
+    }
   });
 });

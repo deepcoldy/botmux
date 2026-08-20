@@ -499,6 +499,27 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
   });
 
+  it('session owner reminder config round-trips and hot-updates the registered Bot', async () => {
+    const { registry } = await loaded();
+    const reminderStore = await import('../src/services/session-owner-reminder-config-store.js');
+    const value = {
+      enabled: true,
+      intervalMinutes: 30,
+      text: '请继续处理。',
+      states: ['idle', 'tui_prompt'],
+    };
+    const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
+    expect(saved).toEqual({ ok: true, config: value });
+    expect(readConfig().sessionOwnerReminder).toEqual(value);
+    expect(registry.getBot('app_default').config.sessionOwnerReminder).toEqual(value);
+
+    expect(await reminderStore.updateSessionOwnerReminderConfig('app_default', {
+      ...value,
+      text: '<at user_id="ou_other"></at>',
+    })).toEqual({ ok: false, reason: 'invalid_session_owner_reminder' });
+    expect(readConfig().sessionOwnerReminder).toEqual(value);
+  });
+
   it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {
     const { store } = await loaded();
     const spec = store.findConfigField('maxLiveWorkers')!;

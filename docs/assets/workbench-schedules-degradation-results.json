@@ -1,0 +1,36 @@
+{
+  "ok": true,
+  "subject": "P1-14 workbench bootstrap tolerates a schedules 401",
+  "bundle": "production entry src/dashboard/web/app.tsx (same esbuild config as pnpm dashboard:bundle)",
+  "browser": "local executable",
+  "screenshots": [
+    "docs/assets/workbench-schedules-401-h5.png",
+    "docs/assets/workbench-schedules-401-h5-overview.png",
+    "docs/assets/workbench-schedules-401-owner.png",
+    "docs/assets/workbench-schedules-401-owner-overview.png"
+  ],
+  "workbenchOnly": {
+    "bootstrapError": null,
+    "sessionRows": 2,
+    "sessionTitles": [
+      "●\nsess-alpha\n小明 · botmux\n—\n终端",
+      "●\nsess-beta\n小红 · botmux\n—\n终端"
+    ],
+    "scheduleRequests": 0,
+    "overviewScheduleRows": 0,
+    "overviewSchedulePanelPresent": false,
+    "authOverlayVisible": false
+  },
+  "legacyOwner": {
+    "bootstrapError": null,
+    "sessionRows": 2,
+    "sessionTitles": [
+      "●\nsess-alpha\n小明 · botmux\n—\n终端\n接管",
+      "●\nsess-beta\n小红 · botmux\n—\n终端\n接管"
+    ],
+    "scheduleRequests": 4,
+    "overviewScheduleRows": 1,
+    "overviewSchedulePanelPresent": true,
+    "authOverlayVisible": false
+  }
+}

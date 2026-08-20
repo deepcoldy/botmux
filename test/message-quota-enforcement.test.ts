@@ -16,6 +16,10 @@ const mocks = vi.hoisted(() => ({
   buildQuotaExhaustedCard: vi.fn(),
   replyMessage: vi.fn(),
   sendMessage: vi.fn(),
+  // 路由级用例（p2pMode='group' 建群前扣费点）用：建群这一外部副作用换成 spy，
+  // 既能断言「扣费在建群之前」，又不把整条新会话链路拖进这个配额单测。
+  maybeBirthSessionGroup: vi.fn(),
+  resolveSender: vi.fn(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -64,6 +68,20 @@ vi.mock('../src/im/lark/client.js', async () => {
   };
 });
 
+// 建群副作用替身。斜杠命令判定谓词
+// （declinesSessionGroupBirthAsSlashCommand）保持真身——它正是被测对象之一：
+// daemon 与 birth 必须用同一个谓词，才不会一边扣费一边拒绝建群。
+vi.mock('../src/core/session-group-birth.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/session-group-birth.js');
+  return { ...actual, maybeBirthSessionGroup: (...args: any[]) => mocks.maybeBirthSessionGroup(...args) };
+});
+
+// 私聊路径会解析发送者显示名；这里不做联系人 API 调用。
+vi.mock('../src/im/lark/identity-cache.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
+  return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
+});
+
 // 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 标成拉群，其余不变。
 vi.mock('../src/services/team-groups-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/team-groups-store.js');
@@ -72,7 +90,14 @@ vi.mock('../src/services/team-groups-store.js', async () => {
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
-import { enforceMessageQuotaForCliInput, grantRestrictedCommandText, grantRestrictedSlashCommandText } from '../src/daemon.js';
+import {
+  enforceMessageQuotaForCliInput,
+  grantRestrictedCommandText,
+  grantRestrictedSlashCommandText,
+  __testOnly_activeSessions as activeSessions,
+  __testOnly_handleNewTopic as handleNewTopic,
+} from '../src/daemon.js';
+import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 function registerQuotaBot() {
   const bot = registerBot({
@@ -410,5 +435,125 @@ describe('message quota enforcement', () => {
     expect(mocks.consumeQuota).toHaveBeenCalledTimes(2);
     expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_retry');
     expect(mocks.commitCharge).toHaveBeenCalledWith('quota_app', 'om_retry');
+  });
+});
+
+/**
+ * 路由级回归：p2pMode='group' 的「建群前扣费点」必须在**识别斜杠命令之后**才扣。
+ *
+ * 这个扣费点的存在理由是「扣费被拒必须零外部副作用」——所以它刻意排在
+ * createGroupWithBots 之前，也就远在路由自己的 parseSlashCommandInvocation 之前。
+ * 于是私聊 group 模式下 /help、/login、/close 这类**根本不进 CLI**的 daemon 命令
+ * 会被白扣一次额度；额度耗尽时更糟：这道闸直接 return，命令连执行都执行不到
+ * （p2pMode='thread' 默认模式没有这个问题，它的扣费点本来就在命令分支之后）。
+ *
+ * 修法是把 birth 自己的「斜杠命令不建群」判定提到扣费之前（同一个谓词，
+ * declinesSessionGroupBirthAsSlashCommand），命令因此既不扣费也不受额度拦截；
+ * 真正会注入 CLI 的消息扣费行为一字不变。
+ */
+describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", () => {
+  const APP = 'quota_p2p_group_app';
+  const DM_CHAT = 'oc_dm_quota';
+  const GRANTEE = 'ou_grantee';
+
+  function dmEvent(text: string, messageId: string): any {
+    return {
+      sender: { sender_id: { open_id: GRANTEE }, sender_type: 'user' },
+      message: {
+        message_id: messageId,
+        chat_id: DM_CHAT,
+        chat_type: 'p2p',
+        message_type: 'text',
+        content: JSON.stringify({ text }),
+        create_time: String(Date.now()),
+      },
+    };
+  }
+
+  /** 建群种子形状：顶层新私聊消息（thread scope 且 anchor === messageId、无 thread_id）。 */
+  function dmCtx(messageId: string): RoutingContext {
+    return {
+      chatId: DM_CHAT,
+      messageId,
+      chatType: 'p2p',
+      scope: 'thread',
+      anchor: messageId,
+      larkAppId: APP,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.beginCharge.mockReturnValue('fresh');
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true, exhausted: false, used: 1, limit: 3 });
+    mocks.getGrantExpiresAt.mockReturnValue(undefined);
+    mocks.buildQuotaExhaustedCard.mockReturnValue('quota-card');
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_send');
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      p2pMode: 'group',
+    } as any);
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    // 全局对话授权 → 有 quotaKey（allowedUsers 是免额度的，测不到扣费）。
+    bot.config.globalGrants = [GRANTEE];
+    // 把 /help 降到 canTalk，否则 grant-only 用户会先被 canRunDaemonCommand 拦掉，
+    // 「额度耗尽仍能执行命令」这一半就测不出来。
+    bot.config.canTalkDaemonCommands = ['/help'];
+    activeSessions.clear();
+    mocks.maybeBirthSessionGroup.mockResolvedValue(null);
+    mocks.resolveSender.mockImplementation(async (_appId: string, openId?: string) => (
+      openId ? { openId, type: 'user' as const } : undefined
+    ));
+  });
+
+  it('/help 不扣额度、也不触发建群（命令本来不进 CLI）', async () => {
+    await handleNewTopic(dmEvent('/help', 'om_help'), dmCtx('om_help'));
+
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    expect(mocks.maybeBirthSessionGroup).not.toHaveBeenCalled();
+    // 命令确实被执行了（回了帮助文本），不是被静默吞掉。
+    expect(mocks.replyMessage).toHaveBeenCalled();
+  });
+
+  it('额度耗尽时 /help 依然可执行，不被这道闸拦掉', async () => {
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, exhausted: true, used: 3, limit: 3 });
+
+    await handleNewTopic(dmEvent('/help', 'om_help_exhausted'), dmCtx('om_help_exhausted'));
+
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    // 没有弹「额度已用完」卡 → 说明命令没被当成 CLI 输入拦下。
+    expect(mocks.buildQuotaExhaustedCard).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalled();
+  });
+
+  it('普通消息照常扣费，且扣费仍排在建群这个外部副作用之前', async () => {
+    // 建群之后是整条新会话链路（repo 卡 / spawn），不是本用例的被测对象：
+    // 让替身在扣费点之后立刻断流，用例只盯「扣了费、且扣在建群前」。
+    mocks.maybeBirthSessionGroup.mockRejectedValue(new Error('stop-after-charge'));
+
+    await expect(handleNewTopic(dmEvent('帮我看下这个报错', 'om_plain'), dmCtx('om_plain')))
+      .rejects.toThrow('stop-after-charge');
+
+    expect(mocks.beginCharge).toHaveBeenCalledTimes(1);
+    expect(mocks.consumeQuota).toHaveBeenCalledTimes(1);
+    expect(mocks.consumeQuota.mock.calls[0][1]).toBe(`global:${GRANTEE}`);
+    expect(mocks.maybeBirthSessionGroup).toHaveBeenCalledTimes(1);
+    expect(mocks.consumeQuota.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.maybeBirthSessionGroup.mock.invocationCallOrder[0]);
+  });
+
+  it('普通消息额度耗尽 → 拦下且不建群（扣费被拒零外部副作用）', async () => {
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, exhausted: true, used: 3, limit: 3 });
+
+    await handleNewTopic(dmEvent('继续', 'om_plain_exhausted'), dmCtx('om_plain_exhausted'));
+
+    expect(mocks.consumeQuota).toHaveBeenCalledTimes(1);
+    expect(mocks.maybeBirthSessionGroup).not.toHaveBeenCalled();
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenCalled();
   });
 });

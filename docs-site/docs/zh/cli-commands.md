@@ -7,7 +7,7 @@
 | `botmux setup` | 交互式配置（首次 / 添加 / 编辑 / 删除机器人） |
 | `botmux start` | 启动 daemon（PM2 管理） |
 | `botmux stop` | 停止 daemon |
-| `botmux restart [--include-pm2]` | 重启 daemon（自动恢复活跃会话）；`--include-pm2` 会同时重启 botmux 专用 PM2 God daemon |
+| `botmux restart [--include-pm2]` | 重启 daemon（自动恢复活跃会话）；`--include-pm2` 会在 fleet 安全关停并验证后同时退役 botmux 专用 PM2 God daemon，让整棵进程树以当前 shell 的干净环境全新启动（插件 service 会先优雅停止，auto 的重启后自动恢复） |
 | `botmux logs [--lines N]` | 查看日志 |
 | `botmux status` | 查看 daemon 状态 |
 | `botmux upgrade` | 升级到最新版本 |

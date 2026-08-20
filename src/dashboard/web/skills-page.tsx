@@ -1349,8 +1349,10 @@ export function SkillsPage() {
     setRemovalError(null);
     setInstalledStatus({ text: tr('skills.removingCount', { count: names.length }), ok: true });
     try {
-      const body = await jsonRequest('/api/skills', {
-        method: 'DELETE',
+      // POST, not DELETE: the platform dashboard proxy drops DELETE request
+      // bodies (hangs the machine-side read until the gateway 504s).
+      const body = await jsonRequest('/api/skills/remove', {
+        method: 'POST',
         body: JSON.stringify({ names, force }),
       });
       if (!mountedRef.current) return;

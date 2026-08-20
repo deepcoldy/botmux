@@ -9,22 +9,24 @@
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
  *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services;
- *     --include-pm2 is a zero-live-God admission fence, not authority to signal an existing PM2 God
+ *     --include-pm2 additionally retires the PM2 God after the fleet is verified retired
+ *     (socket-addressed `pm2 kill`, never a PID signal) so the whole tree restarts from a fresh env
  *   botmux restart --bootstrap-shutdown-protocol --yes — operator-approved one-time retirement
  *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
- *   botmux upgrade|update — upgrade to latest version
+ *   botmux upgrade|update — upgrade to latest version (本地 checkout 则 git pull --ff-only + rebuild + restart)
  *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
+ *   botmux preview <port> — register this session's loopback Web preview
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
@@ -34,6 +36,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
+import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
   findAncestorSessionContext as findLiveAncestorSessionContext,
   resolveSessionContext,
@@ -95,7 +98,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { pm2CallerEnv } from './cli/pm2-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -106,6 +109,12 @@ import {
   type SessionPickerLayout,
 } from './cli/session-picker-layout.js';
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
+import {
+  canWakeDormantBackendForAttach,
+  type SessionListWakeRequestContext,
+  wakeDormantBackendForAttach,
+} from './cli/session-list-wake.js';
+import { SESSION_WAKE_DEADLINE_HEADER } from './core/session-wake-deadline.js';
 import { terminalCellWidth } from './cli/terminal-width.js';
 import {
   attachFrozenManagedZmxSession,
@@ -142,7 +151,19 @@ import {
 import { assertLinuxPm2GodExecutableUsable } from './cli/pm2-preflight.js';
 import { assertNoUnregisteredLiveDaemonDescriptorsIn } from './cli/pm2-descriptor-guard.js';
 import { assertPm2DaemonShutdownCapabilitiesIn } from './cli/pm2-shutdown-capability.js';
-import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
+import {
+  recordAndNotifyRestartBootstrapFailure,
+  restartFailurePathIn,
+} from './cli/restart-failure-notification.js';
+import { resolveRestartFailureOwner } from './cli/restart-failure-owner.js';
+import {
+  assertNoReplacementPm2God,
+  assertPm2RegistryQuiescentForGodRetirement,
+  retireSoleLivePm2God,
+} from './cli/pm2-god-retirement.js';
+import { pm2FleetMutationLockTarget, withPm2FleetMutationLock } from './cli/pm2-fleet-lock.js';
+import { LogFileFollower, type LogTailSource } from './cli/log-tail.js';
 import {
   requestAttestedDaemonShutdown,
   requestAttestedDaemonShutdownBatch,
@@ -161,13 +182,22 @@ import {
   DASHBOARD_COMMAND_USAGE,
   executeDashboardCommand,
   formatDashboardFallbackFailure,
+  formatDashboardSuccessLines,
 } from './cli/dashboard-command.js';
-import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
+import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
+import { isLocalDevInstall, botmuxCliEntryAt } from './utils/install-info.js';
+import {
+  resolveLocalDevCheckoutDir,
+  isGitWorktree,
+  gitPorcelainStatus,
+  localDevUpdateSteps,
+  describeSpawnFailure,
+} from './utils/local-dev-update.js';
 import { cliAuthBind, loadDashboardSecret, signCliAuth } from './dashboard/auth.js';
 import {
   postWorkflowDaemonMutation,
@@ -197,8 +227,10 @@ import {
 } from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
+  collaborationHelp,
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
+  type BotCollaborationFactsByAppId,
 } from './cli/bots-list-output.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
 import {
@@ -224,6 +256,7 @@ import {
 import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
   bindRestartLeaseTo,
@@ -306,8 +339,12 @@ const PM2_NAME = 'botmux';
  * when those external pm2 installations get moved or removed.
  */
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
-const PM2_FLEET_MUTATION_LOCK_TARGET = join(CONFIG_DIR, 'pm2-fleet-mutation');
+// Shared with plugin service-manager (src/cli/pm2-fleet-lock.ts): one lock
+// serializes every botmux-internal mutation of the shared PM2_HOME.
+const PM2_FLEET_MUTATION_LOCK_TARGET = pm2FleetMutationLockTarget();
 const PM2_START_COMMAND_TIMEOUT_MS = 30_000;
+// `pm2 kill` with an already-empty fleet only tears down the God + socket.
+const PM2_GOD_KILL_COMMAND_TIMEOUT_MS = 30_000;
 const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;
 const PM2_START_VERIFY_PER_PROCESS_MS = 2_000;
 const PM2_START_LATE_PUBLICATION_SETTLE_MS = 10_000;
@@ -348,28 +385,12 @@ function pm2Bin(): string {
   return 'pm2';
 }
 
-/** Env for pm2 invocations with an isolated PM2_HOME. */
+/** Env for pm2 invocations with an isolated PM2_HOME. The scrub set (session
+ *  CLI homes, Claude/workflow markers, Dashboard H5 credentials, invoker
+ *  terminal fingerprints, turn-scoped session identity — plus the TERM
+ *  re-pin) lives in cli/pm2-env.ts so it stays assertable in a test. */
 function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, PM2_HOME: home };
-  // pm2 persists the caller's env into every managed app (and into dump.pm2
-  // for resurrect), so a `botmux start/restart` invoked from ANY process that
-  // carries a session-level CLI home pointer — most commonly a bot's own
-  // session during self-upgrade, whose env holds its injected
-  // CLAUDE_CONFIG_DIR — would poison ALL workers, making every non-isolated
-  // bot read/write a sibling bot's home. Strip at this boundary so the daemon
-  // stays session-agnostic; daemon/worker boot scrub the same keys against
-  // stale dumps (see SESSION_CLI_HOME_ENV_KEYS for the full story, including
-  // why GROK_HOME is exempt and why deleting beats pinning a default).
-  scrubSessionCliHomeEnv(env);
-  // Claude session markers ride the same pm2 env-persistence vector; baked in
-  // they eventually flip transcript saving off fleet-wide once the tmux server
-  // respawns from a poisoned daemon (see CLAUDE_SESSION_MARKER_ENV_KEYS).
-  scrubClaudeSessionMarkerEnv(env);
-  // Workflow/goal markers identify one short-lived node worker. Persisting
-  // them in PM2 would make every daemon — and then every ordinary chat worker
-  // it forks — run in workflow mode after a restart initiated from that node.
-  scrubWorkflowWorkerEnv(env);
-  return env;
+  return pm2CallerEnv(process.env, home);
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
@@ -579,6 +600,60 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+/**
+/**
+ * Resolve one DM target inside the SAME bot application that will send it,
+ * registering that app in this fresh CLI process's bot registry first. See
+ * cli/restart-failure-owner.ts for why registration must happen on both the
+ * ownerOpenId and allowedUsers paths.
+ */
+async function resolveRestartFailureOwnerInProcess(bot: any): Promise<string | undefined> {
+  const { registerBot } = await import('./bot-registry.js');
+  const { resolveAllowedUsers } = await import('./im/lark/client.js');
+  return resolveRestartFailureOwner(bot, { registerBot, resolveAllowedUsers });
+}
+
+async function persistAndNotifyRestartBootstrapFailure(
+  dataDir: string,
+  bots: any[],
+  stagedRestartIntent: RestartIntent | null,
+  unsafeDaemonNames: string[],
+  detail: string,
+): Promise<void> {
+  // Persistence + delivery are best-effort telemetry around a failure that is
+  // ALSO surfaced by the throw below. If anything here throws (file write,
+  // dynamic import, SDK), never let it mask the clear bootstrap-required error
+  // the caller is about to raise — degrade to a logged warning instead.
+  try {
+    const { sendUserMessage } = await import('./im/lark/client.js');
+    const outcome = await recordAndNotifyRestartBootstrapFailure({
+      dataDir,
+      bots,
+      unsafeDaemonNames,
+      detail,
+      restartIntent: stagedRestartIntent,
+      resolveOwner: resolveRestartFailureOwnerInProcess,
+      sendText: ({ larkAppId, ownerOpenId }, text) => (
+        sendUserMessage(larkAppId, ownerOpenId, text)
+      ),
+    });
+    const status = outcome.notification.status;
+    const destination = outcome.notification.larkAppId
+      ? ` via app ${outcome.notification.larkAppId}`
+      : '';
+    console.error(
+      `[restart] bootstrap-required failure persisted at ${restartFailurePathIn(dataDir)}; `
+      + `owner notification=${status}${destination}`,
+    );
+  } catch (error) {
+    console.error(
+      `[restart] bootstrap-required failure notification could not be persisted/sent `
+      + `(${error instanceof Error ? error.message : String(error)}); `
+      + 'the terminal error below remains authoritative',
+    );
+  }
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
@@ -847,7 +922,11 @@ function ecosystemConfig(
 
   apps.push({
     name: 'botmux-dashboard',
-    script: join(PKG_ROOT, 'dist', 'dashboard.js'),
+    // index-dashboard.ts, NOT dashboard.js: the entry dotenv-loads
+    // ~/.botmux/.env before dynamically importing the dashboard, which is how
+    // the Feishu H5 credential family reaches the dashboard WITHOUT being baked
+    // into this file's shared env block (see DAEMON_ENV_KEYS).
+    script: join(PKG_ROOT, 'dist', 'index-dashboard.js'),
     interpreter,
     cwd: PKG_ROOT,
     autorestart: true,
@@ -874,7 +953,19 @@ function ecosystemConfig(
 
   const cfg = { apps };
   const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
-  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2));
+  // Owner-only, same as bots.json — kept as defense in depth. The Dashboard
+  // Feishu H5 app secret is no longer baked into the env block (the dashboard
+  // dotenv-loads it via index-dashboard.ts; DAEMON_ENV_KEYS excludes the
+  // family), but this file still bakes operator-configured hosts/ports/paths,
+  // an older install's copy may still carry the secret until overwritten, and
+  // 0600 keeps any future env-block regression from becoming world-readable.
+  // writeFileSync's `mode` applies only when the file is CREATED — chmod as
+  // well, or an install that already wrote it 0644 keeps the world-readable
+  // mode forever.
+  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try { chmodSync(tmpFile, 0o600); } catch { /* best-effort: exotic FS / mounted noperm */ }
+  }
   return tmpFile;
 }
 
@@ -2720,7 +2811,7 @@ async function cmdStart(): Promise<void> {
     }
   }
 
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+  await withPm2FleetMutationLock(async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
       const lockedBots = loadBotsJson();
       if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
@@ -3531,7 +3622,7 @@ async function cmdStop(): Promise<void> {
     );
   }
   ensureConfigDir();
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+  await withPm2FleetMutationLock(async () => {
     assertNoDuplicatePm2GodDaemons();
     cleanupLegacyPm2(bootstrapShutdownProtocol ? 'stop' : undefined);
     if (bootstrapShutdownProtocol) {
@@ -3634,7 +3725,7 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+  await withPm2FleetMutationLock(async () => {
     const includePm2 = process.argv.includes('--include-pm2');
     const includePluginServices = process.argv.includes('--with-plugin');
     const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
@@ -3647,9 +3738,6 @@ async function cmdRestart(): Promise<void> {
     if (bootstrapShutdownProtocol && includePm2) {
       throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
     }
-    if (includePm2) {
-      assertIncludePm2RestartAdmission(listPm2GodDaemonPids());
-    }
 
     const restartIntentDir = resolveDataDir();
     let stagedRestartIntent: RestartIntent | null = null;
@@ -3661,9 +3749,54 @@ async function cmdRestart(): Promise<void> {
     preflightNodeSanity();
     await ensureSystemDependencies();
     cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
-    if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
-    else deleteAllBotmuxProcesses();
-    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    if (bootstrapShutdownProtocol) {
+      bootstrapDeleteAllBotmuxProcesses('restart');
+    } else {
+      // This process is the newly installed code generation even when the
+      // Dashboard that spawned it is still the old in-memory generation. Do
+      // the policy probe here, before the generic retirement path throws, so
+      // the first-upgrade failure becomes durable and reaches the owner.
+      // --include-pm2 takes this path too: the probe's lazy jlist may start a
+      // PM2 God, which is harmless now — God retirement below runs after the
+      // fleet is verified retired, against whichever God owns the home.
+      const preflight = evaluateRestartShutdownPreflight();
+      if (preflight.bootstrapRequired) {
+        const detail = 'current daemon PM2 policy requires the one-time shutdown-protocol bootstrap';
+        await persistAndNotifyRestartBootstrapFailure(
+          restartIntentDir,
+          loadBotsJson(),
+          stagedRestartIntent,
+          preflight.unsafeDaemonNames,
+          detail,
+        );
+        throw new Error(
+          `[restart] daemon PM2 policy requires one-time bootstrap; unsafe: `
+          + `${preflight.unsafeDaemonNames.join(', ') || 'unknown'}. `
+          + 'After confirming every Session/Riff workload is idle, run: '
+          + 'botmux restart --bootstrap-shutdown-protocol --yes',
+        );
+      }
+      deleteAllBotmuxProcesses();
+    }
+    // --include-pm2 tears down the whole PM2_HOME, so ALL plugin services get
+    // a graceful stop first instead of dying with the God; auto ones are
+    // re-ensured after the restart, manually-started ones stay down. Stop
+    // errors are collected into reports rather than thrown (service-manager
+    // contract), so this path re-checks them: a service that failed to stop
+    // must block the God retirement below, not die with the God.
+    if (includePm2) {
+      const pluginStopReports = await stopPluginServicesForCli(undefined, {});
+      const failedStops = pluginStopReports.filter(report => report.action === 'failed');
+      if (failedStops.length > 0) {
+        throw new Error(
+          `[restart --include-pm2] plugin service(s) failed to stop gracefully: `
+          + `${failedStops.map(report => report.pluginId).join(', ')}; `
+          + 'the PM2 God and every remaining process were left untouched — fix or delete these services, then rerun',
+        );
+      }
+    } else if (includePluginServices) {
+      await stopPluginServicesForCli(undefined, { autoOnly: true });
+    }
     cleanupStaleDaemonDescriptors();
 
     const retiredProjection = readVerifiedBotmuxPm2Projection('restart-start');
@@ -3673,6 +3806,33 @@ async function cmdRestart(): Promise<void> {
         `[restart-start] new PM2 core row(s) appeared after verified retirement: `
         + retiredProjection.map(entry => `${entry.name}:${entry.pid}`).join(', '),
       );
+    }
+
+    // Only now — with the core fleet verified retired and plugin services
+    // stopped — is the God a stateless supervisor of nothing, safe to retire
+    // via its own control socket. The fresh `pm2 start` below then births a
+    // new God from this CLI's (pm2Env-scrubbed) environment, which is what
+    // makes --include-pm2 a genuinely complete restart.
+    if (includePm2) {
+      // Independent whole-registry proof, not just the core projection above:
+      // every row still known to the God (a plugin stop that failed, an
+      // orphaned row from an uninstalled plugin) blocks the kill fail-closed.
+      assertPm2RegistryQuiescentForGodRetirement(
+        parsePm2JlistOutputStrict(pm2Capture(['jlist'])).map(row => ({
+          name: typeof row?.name === 'string' && row.name ? row.name : 'unknown',
+          status: typeof row?.pm2_env?.status === 'string' ? row.pm2_env.status : undefined,
+          pid: parsePm2Integer(row?.pid, { nonNegative: true }),
+        })),
+      );
+      const retired = await retireSoleLivePm2God({
+        listGodPids: () => listPm2GodDaemonPids(),
+        readStartIdentity: pid => readSupervisorProcessStartIdentity(pid),
+        isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+        pm2Kill: () => runPm2(['kill'], true, PM2_HOME, PM2_GOD_KILL_COMMAND_TIMEOUT_MS),
+        sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        now: () => Date.now(),
+      });
+      if (retired) console.log(`已退役 PM2 God (pid ${retired.pid})，fleet 将以当前干净环境全新启动`);
     }
 
     await withFileLock(BOTS_JSON_FILE, async () => {
@@ -3702,6 +3862,10 @@ async function cmdRestart(): Promise<void> {
             start: timeoutMs => {
               assertBotsConfigSnapshotUnchanged('restart-start', restartBots);
               assertNoDuplicatePm2GodDaemons();
+              // After retiring the God this start must be the one to birth
+              // its successor; a God that appeared in between came from some
+              // other client's environment and is refused.
+              if (includePm2) assertNoReplacementPm2God(listPm2GodDaemonPids());
               preflightNodeSanity();
               runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
             },
@@ -3785,7 +3949,7 @@ async function ensureBotDaemonStopped(
 ): Promise<StopBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+    return await withPm2FleetMutationLock(async () => (
       withFileLock(BOTS_JSON_FILE, async () => {
         assertNoDuplicatePm2GodDaemons();
         preflightNodeSanity();
@@ -3854,7 +4018,7 @@ async function ensureBotDaemonStarted(
 ): Promise<StartBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+    return await withPm2FleetMutationLock(async () => (
       withFileLock(BOTS_JSON_FILE, async () => {
         assertNoDuplicatePm2GodDaemons();
         preflightNodeSanity();
@@ -4159,18 +4323,32 @@ function warnIfLegacyBotmuxAlive(): void {
   let legacyPid = 0;
   try { legacyPid = parseInt(readFileSync(legacyPidFile, 'utf-8').trim(), 10); } catch { return; }
   if (!legacyPid) return;
-  try { process.kill(legacyPid, 0); } catch { return; }
+  // Deliberately NO PM2 client here: this helper runs at the top of read-only
+  // commands (status/logs), and a pm2 jlist against the legacy home would
+  // lazily REVIVE a legacy God the moment the recorded one exits between the
+  // kill(0) probe and the client's connect — a read command must never create
+  // one. The process-table marker scan also closes the stale-pid-file hole:
+  // kill(pid, 0) alone would accept an unrelated process that reused the pid.
   try {
-    const output = pm2Capture(['jlist'], legacyHome);
-    const apps = parsePm2JlistOutput(output);
-    const hasBotmux = apps.some(a => a.name === PM2_NAME || a.name.startsWith(`${PM2_NAME}-`));
-    if (hasBotmux) {
+    if (!listPm2GodDaemonPids(legacyHome).includes(legacyPid)) return;
+  } catch { return; }
+  // "Still has botmux processes" from PM2's own pid files, not from a client:
+  // the legacy God maintains <name>-<id>.pid under <home>/pids while an app
+  // process runs.
+  try {
+    for (const entry of readdirSync(join(legacyHome, 'pids'))) {
+      if (!entry.startsWith(PM2_NAME) || !entry.endsWith('.pid')) continue;
+      let appPid = 0;
+      try { appPid = parseInt(readFileSync(join(legacyHome, 'pids', entry), 'utf-8').trim(), 10); } catch { continue; }
+      if (!appPid) continue;
+      try { process.kill(appPid, 0); } catch { continue; }
       console.warn('⚠️  检测到旧版 PM2_HOME (~/.pm2) 下仍有 botmux 进程,运行 `botmux restart` 完成迁移。\n');
+      return;
     }
-  } catch { /* ignore */ }
+  } catch { /* no pids dir */ }
 }
 
-function cmdLogs(): void {
+async function cmdLogs(): Promise<void> {
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
@@ -4182,7 +4360,16 @@ function cmdLogs(): void {
     ? process.argv[process.argv.indexOf('--bot') + 1]
     : undefined;
 
-  let target: string;
+  // No PM2 client at all: `pm2 logs` lazily births a God when none is alive
+  // (Client.start → pingDaemon false → launchDaemon), which made this read
+  // command a check/use race against `restart --include-pm2` — a God observed
+  // under the fleet lock could be retired before the spawned client connected,
+  // and the connecting client would then create a replacement God inside the
+  // kill→start window. Tailing the log files pm2 itself writes (the exact
+  // out_file/error_file paths ecosystemConfig pins) removes the raced resource
+  // entirely: no interleaving of `botmux logs` can create a God, no fleet lock
+  // is needed, and logs keep working while the fleet is stopped.
+  let sources: LogTailSource[];
   if (botIdx !== undefined) {
     const numericIdx = /^\d+$/.test(botIdx) ? Number(botIdx) : undefined;
     const selectedIdx = numericIdx === undefined
@@ -4190,33 +4377,96 @@ function cmdLogs(): void {
       : numericIdx >= 0 && numericIdx < bots.length
         ? numericIdx
         : undefined;
-    target = selectedIdx !== undefined
-      ? botProcessName(bots[selectedIdx], selectedIdx, PM2_NAME)
-      : numericIdx !== undefined
-        ? `${PM2_NAME}-${botIdx}`
-        : botIdx;
+    if (selectedIdx !== undefined) {
+      sources = coreBotLogSources(bots, selectedIdx);
+    } else {
+      const wanted = numericIdx !== undefined ? `${PM2_NAME}-${botIdx}` : botIdx;
+      sources = allBotmuxLogSources(bots).filter(source => source.label === wanted);
+      if (sources.length === 0) {
+        console.error(`✗ 未找到 ${wanted} 的日志文件（可用：不带 --bot 查看全部，或用 0-based index / pm2 名 / appId）`);
+        process.exitCode = 1;
+        return;
+      }
+    }
   } else {
-    // Show all botmux logs via pm2 regex match
-    target = `/^${PM2_NAME}/`;
+    sources = allBotmuxLogSources(bots);
   }
 
-  // Use spawn for streaming output. Windows cannot spawn a .js CLI script
-  // directly, so run the bundled pm2 script through the current node.exe.
-  const pm2 = buildPm2SpawnCommand(pm2Bin(), ['logs', target, '--lines', lines]);
-  const child = spawn(pm2.command, pm2.args, {
-    stdio: 'inherit',
-    env: pm2Env(),
-    shell: pm2.shell ?? false,
-  });
-  child.on('exit', code => process.exit(code ?? 0));
+  // Not `|| 50`: an explicit --lines 0 (follow-only) must stay 0.
+  const rawLines = Number.parseInt(lines, 10);
+  const parsedLines = Number.isSafeInteger(rawLines) && rawLines >= 0 ? rawLines : 50;
+  console.log(`跟踪 ${sources.length} 个日志文件（Ctrl+C 退出；fleet 停止时也能查看历史并等待新日志）`);
+  const follower = new LogFileFollower({ sources, writeLine: line => console.log(line) });
+  follower.printInitialTail(parsedLines);
+  follower.start();
 }
 
-function cmdStatus(): void {
+/** Log files of one core bot daemon — the exact paths ecosystemConfig pins. */
+function coreBotLogSources(bots: any[], index: number): LogTailSource[] {
+  const label = botProcessName(bots[index], index, PM2_NAME);
+  return [
+    { label, stream: 'out', file: join(LOG_DIR, `daemon-${index}-out.log`) },
+    { label, stream: 'err', file: join(LOG_DIR, `daemon-${index}-error.log`) },
+  ];
+}
+
+/** Every botmux log file: core daemons + dashboard (ecosystemConfig paths)
+ *  plus plugin services (PM2 default logs dir under the shared PM2_HOME). */
+function allBotmuxLogSources(bots: any[]): LogTailSource[] {
+  const sources = bots.flatMap((_bot: any, i: number) => coreBotLogSources(bots, i));
+  sources.push(
+    { label: 'botmux-dashboard', stream: 'out', file: join(LOG_DIR, 'dashboard-out.log') },
+    { label: 'botmux-dashboard', stream: 'err', file: join(LOG_DIR, 'dashboard-error.log') },
+  );
+  const pluginLogsDir = join(PM2_HOME, 'logs');
+  try {
+    for (const entry of readdirSync(pluginLogsDir)) {
+      const match = entry.match(/^(botmux-plugin-.+?)-(out|error)(?:-\d+)?\.log$/);
+      if (!match) continue;
+      sources.push({
+        label: match[1],
+        stream: match[2] === 'error' ? 'err' : 'out',
+        file: join(pluginLogsDir, entry),
+      });
+    }
+  } catch { /* no plugin logs yet */ }
+  return sources;
+}
+
+async function cmdStatus(): Promise<void> {
   warnIfLegacyBotmuxAlive();
-  runPm2(['status']);
+  // A pm2 client with no live God lazily births one from this process's env.
+  // During an include-pm2 restart's kill→start window that replacement God
+  // would abort the restart with the whole fleet offline, and in a normally
+  // stopped state it would silently resurrect a God nobody asked for — so a
+  // read-only status must check for a God under the fleet lock and never
+  // create one.
+  let entered = false;
+  try {
+    await withPm2FleetMutationLock(async () => {
+      entered = true;
+      if (listPm2GodDaemonPids().length === 0) {
+        console.log('PM2 God 未运行：fleet 已停止（status 不会隐式启动它；需要时运行 botmux start）。');
+        return;
+      }
+      runPm2(['status']);
+    }, { maxWaitMs: 3_000 });
+  } catch (err) {
+    if (entered) throw err;
+    // Non-zero so automation doesn't mistake "couldn't observe" for success.
+    console.log('fleet 停启操作进行中（fleet mutation 锁被占用），请稍后重试 botmux status。');
+    process.exitCode = 1;
+  }
 }
 
 function cmdUpgrade(): void {
+  // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
+  // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
+  // install-info.ts 的 isLocalDevInstall 说明）。
+  if (isLocalDevInstall()) {
+    cmdUpgradeLocalDev();
+    return;
+  }
   try {
     const plan = resolveGlobalInstallPlan();
     console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
@@ -4228,6 +4478,82 @@ function cmdUpgrade(): void {
     } else {
       console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
     }
+    process.exit(1);
+  }
+}
+
+/** 在 checkout 目录里同步跑一条命令，stdio 直通；失败抛错。 */
+function runInCheckout(cwd: string, command: string, args: string[]): void {
+  const result = spawnSync(command, args, {
+    cwd,
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(describeSpawnFailure(command, args, result));
+  }
+}
+
+/**
+ * 本地 checkout 的更新流程：git 干净检查 → git pull --ff-only → pnpm build →
+ * 从本 checkout 的 dist/cli.js restart。dist/ 被 gitignore，只 pull 不 build
+ * 重启后跑的还是旧代码，故 build 步不可省。定位/干净检查/命令定义与 dashboard
+ * 共用 src/utils/local-dev-update.ts，避免两边逻辑漂移。
+ */
+function cmdUpgradeLocalDev(): void {
+  const dir = resolveLocalDevCheckoutDir();
+  if (!isGitWorktree(dir)) {
+    console.error(`❌ ${dir} 不是 git 工作树，无法用 git pull 更新。请手动更新或改用全局安装。`);
+    process.exit(1);
+  }
+  console.log(`🔄 本地 checkout 更新：${dir}`);
+
+  // git 干净检查 + pull + build 全程握同一把跨进程 update 锁（与 dashboard 的
+  // /api/update/run 用的是同一个 target），避免 CLI 与 dashboard 同时对同一
+  // checkout 交错跑 pnpm build 而互相清理/覆盖 dist。restart 不在锁内——它有
+  // 自己的 restart lease。
+  try {
+    const lockTarget = globalInstallUpdateLockTarget();
+    // daemon 正常会建好 dataDir；但 CLI 可能在 daemon 尚未起过的机器上先跑
+    // update，锁文件父目录不存在会让 withFileLockSync 报 ENOENT 而盖掉真实错误。
+    mkdirSync(dirname(lockTarget), { recursive: true });
+    withFileLockSync(lockTarget, () => {
+      // 1) fail closed：有未提交改动就中止（不偷偷 stash），让用户自己决定。
+      let status: string;
+      try {
+        status = gitPorcelainStatus(dir);
+      } catch (error) {
+        throw new Error(`读取 git 状态失败：${error instanceof Error ? error.message : error}`);
+      }
+      if (status) {
+        const err = new Error('dirty') as Error & { dirtyStatus?: string };
+        err.dirtyStatus = status;
+        throw err;
+      }
+      // 2~3) git pull --ff-only（分叉/冲突直接报错停下，不自动 merge）+ pnpm build。
+      for (const { command, args } of localDevUpdateSteps()) {
+        console.log(`→ ${command} ${args.join(' ')}`);
+        runInCheckout(dir, command, args);
+      }
+    }, { maxWaitMs: 2_000 });
+  } catch (error) {
+    const dirty = (error as { dirtyStatus?: string }).dirtyStatus;
+    if (dirty) {
+      console.error('❌ 工作区有未提交改动，已中止更新（不会自动 stash）。请先提交或清理：');
+      console.error(dirty);
+    } else {
+      console.error(`❌ 更新失败：${error instanceof Error ? error.message : error}`);
+    }
+    process.exit(1);
+  }
+
+  // 4) 用本 checkout 的 cli.js 重启 daemon（不走 PATH，避免被更靠前的全局 botmux 抢先）。
+  try {
+    console.log('→ restart daemon');
+    runInCheckout(dir, process.execPath, [botmuxCliEntryAt(dir), 'restart']);
+    console.log('\n✅ 本地更新完成，daemon 已从最新代码重启。');
+  } catch (error) {
+    console.error(`❌ 重启失败：${error instanceof Error ? error.message : error}`);
     process.exit(1);
   }
 }
@@ -4303,9 +4629,9 @@ async function cmdDashboard(args: string[]): Promise<void> {
 
   const { action, result: r } = execution;
   if (r.ok) {
-    // 首行保持纯 URL（脚本/复制取第一行即可）；走中心化平台时再补一行本地直连兜底。
-    console.log(r.url);
-    if (r.localUrl) console.log(`本地直连(平台异常时可用): ${r.localUrl}`);
+    // 首行保持纯 URL（脚本/复制取第一行即可）；随后依次是工作台直达入口、以及走
+    // 中心化平台时的本地直连兜底。行顺序与首行契约见 formatDashboardSuccessLines。
+    for (const line of formatDashboardSuccessLines(r)) console.log(line);
     return;
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');
@@ -4411,6 +4737,12 @@ interface SessionData {
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
   persistentBackendTarget?: PersistentBackendTarget;
+  /** Live loopback (host, port) registered via `botmux preview <port>` for the
+   * CURRENT worker generation — routing state, not conversation data. Offline
+   * close must drop it like services/session-store.ts closeSession() does:
+   * a closed session owns no port, and a retained value could proxy a later
+   * reader into an unrelated local server that re-acquired the port. */
+  previewTarget?: import('./core/session-preview.js').SessionPreviewTarget;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -4571,6 +4903,7 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
     delete latest.queuedActivationPending;
     delete latest.queuedActivationTail;
     delete latest.pendingRepoSetup;
+    delete latest.previewTarget;
     applied = true;
     return true;
   });
@@ -4589,6 +4922,7 @@ function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
     current.closedAt = new Date().toISOString();
     delete current.codexAppDispatchLedger;
     delete current.codexAppGenerationCommits;
+    delete current.previewTarget;
     pruned = true;
     return true;
   });
@@ -4634,8 +4968,16 @@ async function postOwningDaemonSessionMutation(
   return 'applied';
 }
 
+/**
+ * A remote session the daemon closed LOCALLY but could not cancel.
+ *
+ * Carried all the way to the CLI/TUI: collapsing it into a plain success is the
+ * same lie the daemon-side result matrix exists to prevent, just one process
+ * boundary further out. JSON is `any` at this seam, so nothing but an explicit
+ * read keeps it — the discriminant cannot help here.
+ */
 type AuthoritativeAbandonResult =
-  | { ok: true; mode: 'daemon' }
+  | { ok: true; mode: 'daemon'; residual?: ParsedCloseResidual }
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
@@ -4662,7 +5004,15 @@ async function abandonSessionAuthoritatively(
         // stays fail-closed at the daemon's sessionCliIpcAuth check.
         const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
         const body = await res.json().catch(() => ({} as Record<string, unknown>));
-        if (res.ok && (body as { ok?: unknown }).ok) return { ok: true, mode: 'daemon' };
+        if (res.ok && (body as { ok?: unknown }).ok) {
+          // Shared parser: a body that DECLARES a residual must warn even when the
+          // `residual` object is missing/malformed, or a bad payload silently
+          // becomes an ordinary success again.
+          const residual = parseCloseResidual(body);
+          return residual
+            ? { ok: true, mode: 'daemon', residual }
+            : { ok: true, mode: 'daemon' };
+        }
         // Surface the daemon's own rejection reason (e.g. origin_unproven) and
         // never fall back to a partial local kill: a fresh descriptor means the
         // daemon may still hold authoritative in-memory state.
@@ -5021,14 +5371,19 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  if (s.backendType === 'riff') {
-    // Riff runs the CLI on a remote sandbox, not a local multiplexer pane: there
-    // is nothing to probe, attach to, or name as a PersistentBackendTarget
-    // (sessionPersistentTarget returns undefined for it, by design). Surface a
-    // stable label and report the nonexistent local backing as missing — exactly
-    // like pty — so it never slips into the legacy tmux branch and dereferences an
-    // undefined target.
-    return { backendType: 'riff', probe: 'missing', label: 'riff' };
+  if (s.backendType === 'riff' || s.backendType === 'mojo') {
+    // A remote backend (riff / mojo) runs its agent off-box, not in a local
+    // multiplexer pane: there is nothing to probe, attach to, or name as a
+    // PersistentBackendTarget (sessionPersistentTarget returns undefined for it, by
+    // design). Surface a stable label and report the nonexistent local backing as
+    // missing — exactly like pty — so it never slips into the legacy tmux branch
+    // and dereferences an undefined target.
+    //
+    // Listed literally, not via isRemoteBackendType(): a boolean helper does not
+    // narrow the union, and the exhaustiveness guard at the end of this function
+    // depends on that narrowing. Adding a remote backend therefore fails to
+    // compile here until it is listed — which is how mojo was caught.
+    return { backendType: s.backendType, probe: 'missing', label: s.backendType };
   }
   if (s.backendType === undefined) {
     // Legacy rows predate backend stamping. Only tmux was externally attachable,
@@ -5073,6 +5428,41 @@ function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSna
   return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
+async function requestDormantSessionWake(
+  session: SessionData,
+  context: SessionListWakeRequestContext,
+): Promise<
+  | { ok: true }
+  | { ok: false; error: string }
+> {
+  const online = listOnlineDaemons();
+  const daemon = session.larkAppId
+    ? online.find(d => d.larkAppId === session.larkAppId)
+    : online.length === 1 ? online[0] : undefined;
+  if (!daemon) {
+    return {
+      ok: false,
+      error: session.larkAppId || online.length === 0
+        ? '所属 daemon 不在线，请先运行 botmux status'
+        : '历史会话缺少 bot 归属，多 daemon 环境下无法安全唤醒',
+    };
+  }
+
+  try {
+    const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/wake`;
+    const response = await fetchDaemonIpc(daemon.ipcPort, path, {
+      method: 'POST',
+      signal: context.signal,
+      headers: { [SESSION_WAKE_DEADLINE_HEADER]: String(context.deadlineMs) },
+    });
+    const body: any = await response.json().catch(() => ({}));
+    if (response.ok && body?.ok) return { ok: true };
+    return { ok: false, error: body?.error ?? `HTTP ${response.status}` };
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
 /** Shorten path for display: replace $HOME with ~. */
 function shortenPath(p: string): string {
   const home = homedir();
@@ -5102,6 +5492,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     isAdopt: boolean;
     targetLabel: string;
     canAttach: boolean;
+    canWake: boolean;
   }> {
     return active.map(s => {
       const isAdopt = isAdoptedSession(s);
@@ -5144,6 +5535,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           && backing.probe === 'exists'
           && !!('attachBackend' in backing && backing.attachBackend)
           && !!('target' in backing && backing.target),
+        canWake: canWakeDormantBackendForAttach({
+          isAdopt,
+          probe: backing.probe,
+          realManagedSession: isRealManagedSession(s),
+          attachBackend: 'attachBackend' in backing ? backing.attachBackend : undefined,
+          target: 'target' in backing ? backing.target : undefined,
+        }),
       };
     });
   }
@@ -5301,6 +5699,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       footerLine = `${styledFooter('warn', selected.targetLabel, labelWidth)}\x1b[2m${fitLine(suffix, width)}\x1b[0m`;
     } else if (selected.canAttach) {
       footerLine = styledFooter('success', `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`, width);
+    } else if (selected.canWake) {
+      footerLine = styledFooter('warn', `${selected.targetLabel}（Enter 恢复并连接）`, width);
     } else {
       footerLine = styledFooter('dim', `${selected.targetLabel}（不可连接）`, width);
     }
@@ -5318,7 +5718,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     }
 
     // Keybinding hints
-    const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
+    const enterAction = selected?.canAttach ? '连接' : selected?.canWake ? '恢复' : '不可连接';
+    const fullHints = `↑/↓ 选择  ⏎ ${enterAction}  d 删除  q 退出`;
     const compactHints = '↑/↓ 选择  ⏎  d  q';
     const hints = displayWidth(fullHints) <= width ? fullHints : compactHints;
     process.stdout.write(`\n${footerPrefix()}${styledFooter('dim', hints, width)}\n`);
@@ -5342,15 +5743,23 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     };
     process.stdout.on('resize', onResize);
 
+    let deleteInFlight = false;
+    let wakeInFlight = false;
+    let wakeAbortController: AbortController | null = null;
+    let pickerClosed = false;
+
     function cleanup(): void {
+      if (pickerClosed) return;
+      pickerClosed = true;
+      wakeAbortController?.abort();
+      wakeAbortController = null;
+      process.stdin.off('data', onInput);
       process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
-
-    let deleteInFlight = false;
 
     async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
@@ -5378,12 +5787,28 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       // abandonSessionAuthoritatively is `mode` (see its return type ~3573),
       // NOT master's `via` — that belongs to a different helper.
       flash = result.mode === 'daemon'
-        ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
+        ? (result.residual
+          // Local row closed, remote session still running: never the green
+          // "deleted" text, or the operator walks away from a live agent that
+          // still holds the injected credential.
+          ? {
+            style: 'warn',
+            text: `⚠ 本地已删除 ${s.sessionId.substring(0, 8)}，但${closeResidualClause(result.residual)}`,
+          }
+          : { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` })
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
-    process.stdin.on('data', async (key: string) => {
-      if (deleteInFlight) return;
+    async function onInput(key: string): Promise<void> {
+      // Exit always wins, including while the wake HTTP or backend probe is
+      // pending. cleanup aborts the shared deadline signal before restoring
+      // the terminal, so Ctrl-C/q/Esc can never be swallowed by in-flight work.
+      if (key === '\x03' || key === 'q' || key === '\x1b') {
+        cleanup();
+        resolve();
+        return;
+      }
+      if (deleteInFlight || wakeInFlight) return;
       // Delete confirmation mode
       if (confirmDelete) {
         confirmDelete = false;
@@ -5394,18 +5819,11 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           flash = { style: 'dim', text: '取消删除' };
         }
-        render();
+        if (!pickerClosed) render();
         return;
       }
 
       flash = null;
-
-      // Ctrl-C or q or Esc
-      if (key === '\x03' || key === 'q' || key === '\x1b') {
-        cleanup();
-        resolve();
-        return;
-      }
 
       if (rows.length === 0) {
         // No sessions left, only q works
@@ -5442,10 +5860,37 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           render();
           return;
         }
-        if (!selected.canAttach) {
+        if (!selected.canAttach && !selected.canWake) {
           flash = { style: 'warn', text: '该会话没有可连接的持久后端' };
           render();
           return;
+        }
+        if (selected.canWake) {
+          const target = selected.backendTarget;
+          if (!target) {
+            flash = { style: 'error', text: '恢复目标缺失' };
+            render();
+            return;
+          }
+          wakeInFlight = true;
+          const wakeController = new AbortController();
+          wakeAbortController = wakeController;
+          flash = { style: 'warn', text: `正在恢复 ${target.backendType}: ${persistentTargetDisplay(target)}…` };
+          render();
+          const recovered = await wakeDormantBackendForAttach({
+            target,
+            wake: context => requestDormantSessionWake(selected.session, context),
+            probe: probePersistentBackendTarget,
+            signal: wakeController.signal,
+          });
+          if (wakeAbortController === wakeController) wakeAbortController = null;
+          wakeInFlight = false;
+          if (pickerClosed) return;
+          if (!recovered.ok) {
+            flash = { style: 'error', text: `恢复失败: ${recovered.error}` };
+            render();
+            return;
+          }
         }
         if (selected.attachBackend === 'zmx') {
           const target = selected.backendTarget;
@@ -5490,7 +5935,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         resolve();
         return;
       }
-    });
+    }
+
+    process.stdin.on('data', onInput);
   });
 }
 
@@ -5678,6 +6125,7 @@ async function cmdDelete(): Promise<void> {
   let closed = 0;
   let offline = 0;
   let failed = 0;
+  let residual = 0;
   for (const s of toDelete) {
     // Explicit abandon boundary: route through the owning daemon so the ledger
     // FIFO is cleared atomically with close; offline fallback rereads the row
@@ -5693,9 +6141,18 @@ async function cmdDelete(): Promise<void> {
       offline++;
       if (result.cleanedBacking) console.log(`  killed ${result.cleanedBacking}`);
     }
+    if (result.mode === 'daemon' && result.residual) {
+      // Local row closed, remote session NOT cancelled. Reported per session AND
+      // counted in the summary, so a bulk delete cannot bury it.
+      residual++;
+      console.warn(
+        `⚠ ${s.sessionId.substring(0, 8)} ${s.title}：本地已关闭，但${closeResidualClause(result.residual)}`,
+      );
+      continue;
+    }
     console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.mode === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
   }
-  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
+  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}${residual ? `，${residual} 个有残留需人工清理` : ''}`);
   if (failed > 0) process.exitCode = 1;
 }
 
@@ -5885,14 +6342,14 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-/** 会话级 CLI IPC（slash/cd/close）的 POST：与 postAsk 同款双路径——能读 host secret
+/** 会话级 CLI IPC（slash/cd/close/preview）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'chat-rename',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5922,6 +6379,82 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+/** `botmux preview <port>` registers a reachable loopback Web service for the
+ * exact current session. There is intentionally no `--session` escape hatch:
+ * ancestry/env resolution plus the rotating session capability prove which
+ * agent is volunteering the port. The daemon performs the authoritative port
+ * validation/probe and persists the result. */
+async function cmdPreview(rest: string[]): Promise<void> {
+  if (rest.length !== 1 || !/^\d+$/.test(rest[0])) {
+    console.error('用法: botmux preview <port>');
+    process.exit(1);
+  }
+  const port = Number(rest[0]);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    console.error('✗ 端口必须是 1-65535 的整数');
+    process.exit(1);
+  }
+  const ctx = findAncestorSessionContext();
+  if (!ctx?.sessionId) {
+    console.error('✗ 无法定位当前会话；preview 只能在 botmux 会话内注册');
+    process.exit(1);
+  }
+
+  let discoveredPort: number | undefined;
+  try {
+    discoveredPort = findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort;
+  } catch {
+    // Sandboxed/read-isolated sessions cannot enumerate daemon descriptors.
+  }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('✗ 无法定位当前会话的 daemon；请确认 daemon 正在运行');
+    process.exit(1);
+  }
+
+  let response: Response;
+  try {
+    response = await postSessionCliIpc(ipcPort, ctx.sessionId, 'preview', { port });
+  } catch {
+    console.error('✗ 无法连接当前会话的 daemon');
+    process.exit(1);
+  }
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    preview?: { path?: string };
+  };
+  if (response.ok && body.ok && typeof body.preview?.path === 'string') {
+    console.log(`✓ Web 预览已注册: ${body.preview.path}`);
+    return;
+  }
+  const error = body.error ?? `HTTP ${response.status}`;
+  if (error === 'preview_unreachable') {
+    console.error('✗ 端口不可达；请先让 Web 服务监听本机 loopback/0.0.0.0 后再注册');
+  } else if (error === 'preview_owner_unverified') {
+    // P1-12：端口上确实有人在监听，但证明不了那是本会话起的进程。宁可没有预览，
+    // 也不把 Dashboard 用户代理进一个来路不明的本机服务。
+    console.error(
+      '✗ 无法确认该端口由本会话的进程持有；请在会话内直接启动 Web 服务后再注册'
+      + '（不要用 setsid/nohup 脱离进程树，也不要注册别的程序占用的端口）',
+    );
+  } else if (error === 'preview_unsupported') {
+    console.error('✗ 当前会话后端（远端 sandbox）的 Web 服务不在本机，Dashboard 预览不支持');
+  } else if (error === 'preview_generation_changed') {
+    console.error('✗ 注册期间会话已换代或已关闭；请在新一轮里重新注册');
+  } else if (error === 'preview_target_changed') {
+    // P1-3：并发注册（例如同时注册两个端口）时，后到的一方不再无声覆盖先落地的那个。
+    console.error('✗ 注册期间本会话的预览目标已被另一次注册改写；同一时刻只能有一个预览目标，请确认后重试');
+  } else if (error === 'remote_host_forbidden') {
+    console.error('✗ 只允许注册本机 loopback 服务');
+  } else if (error === 'origin_unproven' || error === 'managed_action_required') {
+    console.error('✗ 当前会话归属校验失败');
+  } else {
+    console.error(`✗ 预览注册失败: ${error}`);
+  }
+  process.exit(1);
 }
 
 async function cmdChat(argv: string[]): Promise<void> {
@@ -6745,7 +7278,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
-              --include-pm2 仅允许“入场时没有 live PM2 God”的干净启动；若已有 live God，整条命令会在 fleet/breadcrumb 零改动处拒绝，且不会信号或重启现存 God
+              --include-pm2 在 fleet 安全退役并验证后，经 PM2_HOME socket 退役 PM2 God（绝不按 PID 发信号），再以当前干净环境全新启动——彻底重启整棵进程树；会先优雅停止全部插件 service（auto 的启动后自动恢复）
               首次升级若旧 daemon 缺少 shutdown protocol：先独立确认所有 Session/Riff 工作均 idle，再一次性运行
               botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
@@ -6757,6 +7290,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  mojo-containment list|revoke
+              查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
+              blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -6774,6 +7310,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
                    单个活跃会话可省略 id
+  preview <port>   （会话内）注册当前会话已启动的本机 Web 服务；Dashboard 登录后通过
+                   同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token。
+                   端口必须由本会话的进程持有（在会话内直接启动，别 setsid/nohup
+                   脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -7854,7 +8394,7 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -7914,6 +8454,7 @@ async function relaySend(
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
     ? prepareCardMarkdown(extractCardText(content), process.cwd(), 'filesystem')
     : undefined;
@@ -8995,6 +9536,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
+  // Keep memory attribution in the model's rollout, but never render the
+  // complete internal suffix into Lark or count it in send markers.
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
 
   const managedPayloadError = managedVcSendPayloadError({
@@ -9727,8 +10271,8 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   try {
     // A file-sandbox relay supplies a host-private copy normalized inside the
-    // sandbox namespace. Voice/doc-comment paths returned above and therefore
-    // continue using the untouched raw content.
+    // sandbox namespace. Voice/doc-comment paths returned above use the same
+    // already-sanitized outbound content, without card-markdown preparation.
     let text = extractCardText(content);
     const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
     if (preparedContentFile) {
@@ -10681,6 +11225,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
     console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');
@@ -12015,6 +12560,25 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   let botEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
+  const collaborationFactsFor = (appIds: string[]): BotCollaborationFactsByAppId => {
+    const facts: Record<string, BotCollaborationFactsByAppId[string]> = Object.create(null);
+    const wanted = new Set(appIds.filter(Boolean));
+    try {
+      for (const cfg of loadBotConfigs()) {
+        if (!wanted.has(cfg.larkAppId)) continue;
+        facts[cfg.larkAppId] = {
+          workspaceSource: cfg.oncallChats?.some(c => c.chatId === s.chatId)
+            ? 'oncall'
+            : effectiveDefaultWorkingDir(cfg) ? 'default' : 'unknown',
+          mentionMode: cfg.regularGroupMentionMode ?? 'always',
+          replyMode: cfg.chatReplyModes?.[s.chatId] ?? cfg.regularGroupReplyMode ?? 'chat-topic',
+          transport: cfg.apiOnly !== true,
+        };
+      }
+    } catch { /* config unreadable under isolation: all facts stay unknown */ }
+    return facts;
+  };
+
   try {
     const { listChatBotMembers } = await import('./im/lark/client.js');
     const chatBots = await listChatBotMembers(appId, s.chatId);
@@ -12022,12 +12586,12 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     // botmux daemon on this host). 'introduce' = discovered via /introduce
     // collaboration command (external bot, possibly other-tenant). isSelf is
     // retained (not filtered) so the model can still identify itself when needed.
-    const result = formatChatBotsForCli(chatBots, appId);
-    console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
+    const result = formatChatBotsForCli(chatBots, appId, collaborationFactsFor(chatBots.map(bot => bot.larkAppId)));
+    console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length, collaborationHelp }, null, 2));
   } catch (err: any) {
     // Fallback to bots-info.json
-    const result = formatBotInfoEntriesForCli(botEntries, appId);
-    console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
+    const result = formatBotInfoEntriesForCli(botEntries, appId, collaborationFactsFor(botEntries.map(bot => bot.larkAppId)));
+    console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, collaborationHelp, note: `chat query failed: ${err.message}` }, null, 2));
   }
 }
 
@@ -12370,6 +12934,9 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'bots',
     'skill',
     'hook',
+    // Local-only, session-capability-bound preview registration. It has no chat,
+    // workflow, deployment, or external messaging effect.
+    'preview',
     'session-ready',
     'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
@@ -12573,13 +13140,14 @@ async function reconcilePluginServicesForCli(
 async function stopPluginServicesForCli(
   pluginIds?: string[],
   options: { autoOnly?: boolean } = {},
-): Promise<void> {
+): Promise<import('./core/plugins/service-manager.js').PluginServiceReport[]> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
   const reports = await stopPluginServices(pluginIds, options);
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
   }
+  return reports;
 }
 
 function requirePluginId(raw: string | undefined): string {
@@ -13146,8 +13714,8 @@ switch (command) {
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;
   case 'restart': await cmdRestart(); break;
-  case 'logs':    cmdLogs(); break;
-  case 'status':  cmdStatus(); break;
+  case 'logs':    await cmdLogs(); break;
+  case 'status':  await cmdStatus(); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
@@ -13160,6 +13728,13 @@ switch (command) {
   case 'device': {
     const { runDeviceCommand } = await import('./platform/device-command.js');
     process.exitCode = await runDeviceCommand(process.argv.slice(3));
+    break;
+  }
+  case 'mojo-containment': {
+    // The auditable operator exit for fail-closed containment blockers that can
+    // never self-release (weak handles on non-cgroup hosts, unprovable handles).
+    const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
+    process.exitCode = await runMojoContainmentCommand(process.argv.slice(3));
     break;
   }
   case 'list':
@@ -13192,6 +13767,7 @@ switch (command) {
     break;
   }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
+  case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]

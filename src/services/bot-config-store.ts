@@ -8,6 +8,7 @@
  * 聊天通道会被 IM 侧记录，引导新 bot / 换密钥仍走本机 `botmux setup`。授权额度
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
+import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -98,8 +99,9 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
-  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务；选 riff 时需配置 riff 字段；unset 回 pty' },
+  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）；选 riff 时需配置 riff 字段，mojo 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
+  { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -136,9 +138,11 @@ function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
     const keys = obj ? Object.keys(obj) : [];
     return keys.length ? keys.map(k => `${k}=••••`).join(', ') : '∅';
   }
-  // riff 配置可含 secret（jwt / env 值）。聊天可见渲染（/config get、配置卡）
+  // riff / mojo 配置可含 secret（jwt / env 值）。聊天可见渲染（/config get、配置卡）
   // 与 applyConfigField 的变更日志都走本函数——结构可见、值打码。
-  if (spec.configKey === 'riff') {
+  // ⚠️ 漏掉任一个都会让它落进下面的通用 json 分支被 JSON.stringify 原样输出，
+  // 即把 jwt 明文发到聊天里。新增带 secret 的后端配置块时必须同步加进来。
+  if (spec.configKey === 'riff' || spec.configKey === 'mojo') {
     const obj = value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>) : null;
     if (!obj || Object.keys(obj).length === 0) return '∅';
@@ -374,7 +378,9 @@ export async function setBotAllowedUsers(
 
 export type CoerceResult =
   | { ok: true; value: unknown }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' };
+  // A few reasons carry detail (e.g. which keys were rejected), so this is a
+  // union of literals plus those prefixed forms rather than a closed literal set.
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -437,6 +443,16 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           if (reserved.length > 0) return { ok: false, reason: 'reserved_env' };
           const sanitized = sanitizePerBotEnv(parsed);
           return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
+        }
+        if (spec.configKey === 'mojo') {
+          // Same SHARED normalizer as the bots.json parser, so the two config
+          // doors cannot drift: unknown keys, internal launch-identity keys and
+          // wrong types are all rejected, and the reason is surfaced verbatim.
+          const normalized = normalizeMojoConfig(parsed);
+          if (!normalized.ok) {
+            return { ok: false, reason: `invalid_mojo_config: ${normalized.errors.join('; ')}` };
+          }
+          return { ok: true, value: normalized.value };
         }
         return { ok: true, value: parsed };
       } catch {

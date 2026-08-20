@@ -12,7 +12,7 @@ import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import {
-  closeSession,
+  closeSessionForBackgroundCleanup,
   forkWorker,
   getCurrentCliVersion,
   getDaemonBootId,
@@ -34,7 +34,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -389,7 +389,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
         // writing failed and before closing → always re-quarantine and re-attempt
         // close, so restore never re-attaches a session the caller already saw failed.
         quarantined.add(record.sessionId);
-        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        if (getSession(record.sessionId)) await closeSessionForBackgroundCleanup(record.sessionId, 'trigger-session cleanup');
         continue;
       }
       if (record.state === 'attempting') {
@@ -397,7 +397,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
         // quarantine + close. Quarantine happens regardless of close success.
         terminalizeAttempting(record);
         quarantined.add(record.sessionId);
-        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        if (getSession(record.sessionId)) await closeSessionForBackgroundCleanup(record.sessionId, 'trigger-session cleanup');
         continue;
       }
       // reserved: provably never dispatched → CAS-remove by path (only if the
@@ -439,7 +439,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
           if (cur.state === 'attempting') {
             terminalizeAttempting(cur);
             quarantined.add(cur.sessionId);
-            if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+            if (getSession(cur.sessionId)) await closeSessionForBackgroundCleanup(cur.sessionId, 'trigger-session cleanup');
             continue;
           }
           throw new Error(`reserved lease advanced to an unexpected state under reconcile CAS (rev ${cur.revision} state ${cur.state} boot ${cur.ownerBootId}); cannot prove convergence`);
@@ -450,7 +450,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
         // an empty session).
         logger.warn(`[idempotency] reconcile: reserved snapshot for ${record.sessionId} was replaced by a different winner (session=${cur.sessionId} boot=${cur.ownerBootId} state=${cur.state}); converging our orphan + classifying the winner on the spot`);
         quarantined.add(record.sessionId);
-        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        if (getSession(record.sessionId)) await closeSessionForBackgroundCleanup(record.sessionId, 'trigger-session cleanup');
         // Then classify the WINNER on the spot — it will never be re-scanned.
         if (cur.ownerBootId === currentBootId) continue; // in flight this boot → leave it
         const liveWinner = !!getSession(cur.sessionId); // session row present → may be restored/live
@@ -458,7 +458,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
           // Old-boot crossed fence with no live owner → durable failed + quarantine.
           terminalizeAttempting(cur);
           quarantined.add(cur.sessionId);
-          if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+          if (getSession(cur.sessionId)) await closeSessionForBackgroundCleanup(cur.sessionId, 'trigger-session cleanup');
           continue;
         }
         // Old-boot reserved winner: provably pre-dispatch → fenced remove against
@@ -472,11 +472,11 @@ export async function reconcileIdempotencyLeasesOnBoot(
           throw new Error(`different-identity winner ${cur.sessionId} changed again under reconcile CAS (rev ${winnerRm.current.revision} state ${winnerRm.current.state}); cannot prove convergence`);
         }
         quarantined.add(cur.sessionId);
-        if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+        if (getSession(cur.sessionId)) await closeSessionForBackgroundCleanup(cur.sessionId, 'trigger-session cleanup');
         continue;
       }
       quarantined.add(record.sessionId);
-      if (getSession(record.sessionId)) await closeSession(record.sessionId);
+      if (getSession(record.sessionId)) await closeSessionForBackgroundCleanup(record.sessionId, 'trigger-session cleanup');
     } catch (err) {
       // This lease could not be converged (strict-failed write threw, CAS-remove
       // threw on EIO/corruption, changed-under-us, or close threw). Do NOT
@@ -1548,17 +1548,17 @@ async function triggerSessionTurnAdmitted(
   }
 
   const bot = getBot(larkAppId);
-  const isCodexFamily = isCodexReasoningCliId(bot.config.cliId);
+  const hasReasoningControl = isConfigurableReasoningCliId(bot.config.cliId);
   const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
-  if (isCodexFamily && effectiveReasoningEffort
-      && !codexModelSupportsReasoningEffort(effectiveModel, effectiveReasoningEffort)) {
+  if (hasReasoningControl && effectiveReasoningEffort
+      && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,
       errorCode: 'bad_request',
-      error: `模型 ${effectiveModel || '（Codex 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
+      error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
     };
   }
   const chatMode: ChatMode = httpVirtual
@@ -1606,19 +1606,25 @@ async function triggerSessionTurnAdmitted(
     session.lastMessageAt = new Date(now).toISOString();
     session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
-    // Per-turn model / reasoning-effort override — scoped to codex-family bots
-    // (the documented B-mode target) and to a freshly-created trigger session.
+    // Per-turn model / reasoning-effort override — scoped to CLIs with an
+    // explicit reasoning control and to a freshly-created trigger session.
     // Gating on cliId keeps the contract honest and bounded: it never silently
     // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
-    // worker never reaches here. reasoningEffort is codex-only regardless (other
-    // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
-    if (isCodexFamily) {
-      if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-        session.model = req.options.model.trim();
-      }
-      if (req.options?.reasoningEffort) {
-        session.reasoningEffort = req.options.reasoningEffort;
-      }
+    // worker never reaches here. Model is gated here so it cannot leak to
+    // other CLIs whose adapters do not implement this contract.
+    //
+    // The model override lands on the in-memory DaemonSession below, NOT on the
+    // persisted session record: the documented semantics are per-trigger, and a
+    // persisted copy used to survive every later resume and outrank the bot's
+    // configured model forever (see sessionAgentConfig). reasoningEffort stays
+    // persisted with the session (unchanged by that PR).
+    const triggerModelOverride = hasReasoningControl
+      && typeof req.options?.model === 'string'
+      && req.options.model.trim()
+      ? req.options.model.trim()
+      : undefined;
+    if (hasReasoningControl && req.options?.reasoningEffort) {
+      session.reasoningEffort = req.options.reasoningEffort;
     }
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
@@ -1637,6 +1643,7 @@ async function triggerSessionTurnAdmitted(
       lastMessageAt: now,
       hasHistory: false,
       workingDir: wd.workingDir,
+      ...(triggerModelOverride ? { spawnModelOverride: triggerModelOverride } : {}),
     };
     // Retain the complete opening input until a worker or repo workflow has
     // synchronously accepted it. This is both the route reservation and the
@@ -1786,7 +1793,7 @@ async function triggerSessionTurnAdmitted(
     // down our just-created session and resolve from the winner's terminal
     // evidence (via resolveIdempotencyHit → async-store), never dispatching.
     const reuseExistingWinner = async (winner: idempotencyStore.IdempotencyRecord): Promise<TriggerResponse> => {
-      await closeSession(session.sessionId);
+      await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
       const decision = resolveIdempotencyHit(winner, ownerBootId, deps.activeSessions);
       const winnerChatId = (decision.kind !== 'takeover' && decision.chatId) ? decision.chatId : chatId;
       if (decision.kind === 'terminal') {
@@ -1817,10 +1824,10 @@ async function triggerSessionTurnAdmitted(
       idempotencyLease = res.record;
     } catch (err) {
       if (err instanceof idempotencyStore.IdempotencyConflictError) {
-        await closeSession(session.sessionId);
+        await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
         return { ok: false, errorCode: 'idempotency_conflict', error: 'idempotencyKey already used with a different request payload', idempotencyKey };
       }
-      await closeSession(session.sessionId);
+      await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
       return { ok: false, errorCode: 'trigger_failed', error: `idempotency claim failed: ${(err as Error).message}` };
     }
   }
@@ -1912,7 +1919,7 @@ async function triggerSessionTurnAdmitted(
           logger.error(`[idempotency] barrier-fail release could not converge the lease (${(e as Error).message}); left for reconcile`);
         }
       }
-      await closeSession(session.sessionId);
+      await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
       if (terminalizedCrossedFence) {
         // Observable terminal: the caller can poll this sessionId and get `failed`.
         return {
@@ -1986,7 +1993,7 @@ async function triggerSessionTurnAdmitted(
           logger.error(`[idempotency] dispatch threw AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
         }
       }
-      try { await closeSession(session.sessionId); } catch { /* best-effort; terminal already durable if terminalDurable */ }
+      try { await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup'); } catch { /* best-effort; terminal already durable if terminalDurable */ }
       if (idempotencyKey && !terminalDurable) {
         return {
           ok: false, errorCode: 'trigger_failed',

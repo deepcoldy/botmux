@@ -30,11 +30,26 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
+import { isWorkflowFeatureEnabled } from '../global-config.js';
 import {
   BUILTIN_SKILLS,
+  WORKFLOW_FEATURE_SKILLS,
   ASK_SKILL, ASK_SKILL_NAME,
   WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME,
 } from './definitions.js';
+
+/** The unconditional built-ins with the v3 Workflow family spliced back in at
+ *  their historical position (right after `botmux-handoff`) when the machine-wide
+ *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
+ *  catalog byte-for-byte identical to before the family was factored out; when
+ *  the switch is OFF the family is simply absent. `botmux-orchestrate` is part of
+ *  BUILTIN_SKILLS and is never gated here. */
+function baseBuiltinSkills(workflowEnabled: boolean): typeof BUILTIN_SKILLS {
+  if (!workflowEnabled) return [...BUILTIN_SKILLS];
+  const anchor = BUILTIN_SKILLS.findIndex((s) => s.name === 'botmux-handoff');
+  const at = anchor >= 0 ? anchor + 1 : BUILTIN_SKILLS.length;
+  return [...BUILTIN_SKILLS.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...BUILTIN_SKILLS.slice(at)];
+}
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
 
@@ -154,8 +169,13 @@ export function builtinSkillEntries(opts: {
    *  Send remains as an on-demand complex-delivery skill. Set for the prompt-mode
    *  catalog; leave off for `botmux skill list`, which surfaces everything. */
   excludeRoutingCovered?: boolean;
+  /** Machine-wide v3 Workflow switch. Defaults to the live accessor
+   *  (`isWorkflowFeatureEnabled`); when off, the botmux-workflow family is not
+   *  advertised. Explicit for tests. */
+  workflowEnabled?: boolean;
 }): BuiltinSkillEntry[] {
-  let defs = [...BUILTIN_SKILLS];
+  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
+  let defs = baseBuiltinSkills(workflowEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.excludeRoutingCovered) defs = defs.filter((d) => !FULLY_ROUTING_COVERED_SKILLS.has(d.name));
@@ -164,9 +184,15 @@ export function builtinSkillEntries(opts: {
 
 /** Full SKILL.md body for a built-in skill name — backs `botmux skill show`
  *  on-demand reads in `prompt` mode (independent of the per-CLI toggles above,
- *  so a name that made it into the catalog always resolves). */
+ *  so a name that made it into the catalog always resolves). The v3 Workflow
+ *  family resolves only while the feature is enabled, so a disabled host can't
+ *  pull a skill it never advertised. */
 export function builtinSkillContent(name: string): string | undefined {
-  const all = [...BUILTIN_SKILLS, { name: ASK_SKILL_NAME, content: ASK_SKILL }, { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL }];
+  const all = [
+    ...baseBuiltinSkills(isWorkflowFeatureEnabled()),
+    { name: ASK_SKILL_NAME, content: ASK_SKILL },
+    { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
+  ];
   return all.find((d) => d.name === name)?.content;
 }
 
@@ -180,12 +206,23 @@ export function builtinSkillContent(name: string): string | undefined {
  * Contract: only the outer wrapper is structural. The intro and catalog lines
  * are prose (including dynamic skill descriptions), so escape them here.
  */
-export function buildBuiltinSkillCatalogBlock(entries: BuiltinSkillEntry[], locale?: Locale): string {
+export function buildBuiltinSkillCatalogBlock(
+  entries: BuiltinSkillEntry[],
+  locale?: Locale,
+  opts: { hasRoutingBlock?: boolean } = {},
+): string {
   if (entries.length === 0) return '';
   const en = locale === 'en';
-  const intro = en
-    ? '<botmux_routing> covers basic communication only. These supplementary botmux skills are available in this session. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
-    : '<botmux_routing> 只覆盖基础通信用法。当前 botmux 会话还有下面这些可按需读取的内置技能。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。';
+  // Without a routing block the catalog must NOT claim one exists, and it is the
+  // only place the agent learns about send/history/quoted/bots at all.
+  const hasRouting = opts.hasRoutingBlock !== false;
+  const intro = hasRouting
+    ? (en
+      ? '<botmux_routing> covers basic communication only. These supplementary botmux skills are available in this session. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
+      : '<botmux_routing> 只覆盖基础通信用法。当前 botmux 会话还有下面这些可按需读取的内置技能。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。')
+    : (en
+      ? 'These botmux skills are available in this session, and they are the ONLY documentation for them. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
+      : '当前 botmux 会话有下面这些内置技能，且这里是它们唯一的说明来源。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。');
   const lines = entries.map((e) => escapeXmlText(`- ${e.name}: ${promptCatalogDescription(e, locale)}`));
   // Distinct tag from the user-registered skill catalog (`<botmux_skills
   // mode=...>`, injected only in the worker via prepareSessionSkillPrompt) so
@@ -197,10 +234,23 @@ export function buildBuiltinSkillCatalogBlock(entries: BuiltinSkillEntry[], loca
  *  Returned as an XML block (same `<botmux_builtin_skills>` tag as the catalog)
  *  so it's consistently wrapped rather than a bare line in the prompt. Its
  *  inner help line follows the same text-only contract as the catalog body. */
-export function builtinSkillHelpPointer(locale?: Locale): string {
-  const inner = locale === 'en'
-    ? 'Beyond the commands in <botmux_routing>, more botmux capabilities (ask / schedule / workflow / …) are shell subcommands — run `botmux --help`, and `botmux <cmd> --help` for a specific one, to discover them.'
-    : '除了 <botmux_routing> 里的命令，botmux 还有更多能力（ask / schedule / workflow 等），都是 shell 子命令——用 `botmux --help` 查全部，`botmux <子命令> --help` 查单个用法。';
+export function builtinSkillHelpPointer(
+  locale?: Locale,
+  opts: { hasRoutingBlock?: boolean; workflowEnabled?: boolean } = {},
+): string {
+  const en = locale === 'en';
+  const hasRouting = opts.hasRoutingBlock !== false;
+  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
+  // Only list `workflow` among the discoverable capabilities when the feature is
+  // on — a disabled host must not point the model at a subcommand that refuses.
+  const wf = (zh: string, enText: string) => (workflowEnabled ? (en ? enText : zh) : '');
+  const inner = hasRouting
+    ? (en
+      ? `Beyond the commands in <botmux_routing>, more botmux capabilities (ask / schedule${wf(' / workflow', ' / workflow')} / …) are shell subcommands — run \`botmux --help\`, and \`botmux <cmd> --help\` for a specific one, to discover them.`
+      : `除了 <botmux_routing> 里的命令，botmux 还有更多能力（ask / schedule${wf(' / workflow', '')} 等），都是 shell 子命令——用 \`botmux --help\` 查全部，\`botmux <子命令> --help\` 查单个用法。`)
+    : (en
+      ? `botmux capabilities (send / history / quoted / bots / ask / schedule${wf(' / workflow', ' / workflow')} / …) are shell subcommands — run \`botmux --help\`, and \`botmux <cmd> --help\` for a specific one, to discover them.`
+      : `botmux 的能力（send / history / quoted / bots / ask / schedule${wf(' / workflow', '')} 等）都是 shell 子命令——用 \`botmux --help\` 查全部，\`botmux <子命令> --help\` 查单个用法。`);
   return `<botmux_builtin_skills>\n${escapeXmlText(inner)}\n</botmux_builtin_skills>`;
 }
 
@@ -215,23 +265,35 @@ export function builtinSkillHelpPointer(locale?: Locale): string {
  *   - `prompt` → compact catalog (on-demand `botmux skill show`)
  *   - `off`    → help pointer only
  *   - `global` → empty (files already on disk via ensureCliSkills)
+ *
+ * `hasRoutingBlock` (default true) states whether the caller ALSO emits a
+ * `<botmux_routing>` block. genius/grok do, via buildBotmuxSystemPromptText.
+ * mojo does not — it is `injectsSessionContext` yet builds its own prompt with no
+ * routing at all — and passing `false` matters twice:
+ *   - history/quoted/bots must stay IN the catalog. They are filtered out only
+ *     because routing is assumed to teach them; with no routing they would be
+ *     documented nowhere.
+ *   - the prose must not reference a `<botmux_routing>` block that isn't there.
  */
 export function builtinSkillBlockForInjectsSessionContext(
   larkAppId: string | undefined,
   locale: Locale | undefined,
-  opts: { asksViaHook?: boolean; whiteboardEnabled?: boolean } = {},
+  opts: { asksViaHook?: boolean; whiteboardEnabled?: boolean; hasRoutingBlock?: boolean } = {},
 ): string {
   const mode = resolveSkillInjectionModeForApp(larkAppId);
+  const hasRoutingBlock = opts.hasRoutingBlock !== false;
   if (mode === 'prompt') {
     return buildBuiltinSkillCatalogBlock(
       builtinSkillEntries({
         asksViaHook: opts.asksViaHook === true,
         whiteboardEnabled: opts.whiteboardEnabled === true,
-        excludeRoutingCovered: true,
+        // Only safe to drop the routing-covered skills when routing is present.
+        excludeRoutingCovered: hasRoutingBlock,
       }),
       locale,
+      { hasRoutingBlock },
     );
   }
-  if (mode === 'off') return builtinSkillHelpPointer(locale);
+  if (mode === 'off') return builtinSkillHelpPointer(locale, { hasRoutingBlock });
   return '';
 }
