@@ -1274,7 +1274,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
     if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
       return jsonRes(res, 409, { ok: false, error: 'adopt_wake_unsupported' });
     }
-    if (isRiffBackendSession(ds)) {
+    if (persistentBackend.isRiffBackendSession(ds)) {
       return jsonRes(res, 409, { ok: false, error: 'riff_wake_unsupported' });
     }
     if (rejectProtectedSessionMutation(res, [ds])) return;
