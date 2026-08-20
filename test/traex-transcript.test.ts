@@ -39,6 +39,24 @@ function user(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
   };
 }
 
+function itemCompleted(
+  item: { type: string; id: string; content: Array<{ type: string; text: string }> },
+  turnId = '00000000-0000-7000-8000-000000000010',
+  timestamp = '2000-01-01T00:00:01.000Z',
+) {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'item_completed',
+      thread_id: SID,
+      turn_id: turnId,
+      item,
+      completed_at_ms: Date.parse(timestamp),
+    },
+  };
+}
+
 function userResponseItem(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
   return {
     timestamp,
@@ -232,6 +250,129 @@ describe('drainTraexRollout', () => {
         text: 'durable final answer',
         sourceSessionId: SID,
       }),
+    ]);
+  });
+
+  it('closes a TraeX 0.201.4 item_completed user turn in adopt mode', () => {
+    // Production change that must fail this test: stop accepting the explicit
+    // UserMessage item_completed shape emitted by TraeX 0.201.4.
+    const turnId = '00000000-0000-7000-8000-000000000111';
+    writeFileSync(path, [
+      line({
+        timestamp: '2000-01-01T00:00:00.999Z',
+        type: 'history_mutation',
+        payload: {
+          turn_id: turnId,
+          operation: 'append',
+          items: [{
+            type: 'message',
+            id: 'msg-user',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'probe from adopted terminal' }],
+          }],
+        },
+      }),
+      line(itemCompleted({
+        type: 'UserMessage',
+        id: 'msg-user',
+        content: [{ type: 'text', text: 'probe from adopted terminal' }],
+      }, turnId)),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'Text', text: 'tool progress must not start a turn' }],
+      }, turnId, '2000-01-01T00:00:02.000Z')),
+      line({
+        timestamp: '2000-01-01T00:00:03.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: turnId,
+          last_agent_message: 'delivered final',
+        },
+      }),
+    ].join(''));
+
+    const queue = new CodexBridgeQueue();
+    queue.setLocalTurns(true, 0);
+    queue.ingest(drainTraexRollout(path, 0, { adoptMode: true }).events);
+
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({
+        isLocal: true,
+        userText: 'probe from adopted terminal',
+        finalText: 'delivered final',
+      }),
+    ]);
+  });
+
+  it('does not double-count mixed user_message and item_completed dialects for one turn', () => {
+    const turnId = '00000000-0000-7000-8000-000000000112';
+    writeFileSync(path, [
+      line({
+        timestamp: '2000-01-01T00:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', turn_id: turnId, message: 'same turn' },
+      }),
+      line(itemCompleted({
+        type: 'UserMessage',
+        id: 'msg-user',
+        content: [{ type: 'text', text: 'same turn' }],
+      }, turnId, '2000-01-01T00:00:01.001Z')),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toHaveLength(1);
+  });
+
+  it('does not double-count a legacy user_message without turn_id before its item_completed mirror', () => {
+    const turnId = '00000000-0000-7000-8000-000000000116';
+    writeFileSync(path, [
+      line({
+        timestamp: '2000-01-01T00:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'legacy mirror has no turn id' },
+      }),
+      line(itemCompleted({
+        type: 'UserMessage',
+        id: 'msg-user',
+        content: [{ type: 'text', text: 'legacy mirror has no turn id' }],
+      }, turnId, '2000-01-01T00:00:01.001Z')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toHaveLength(1);
+  });
+
+  it('keeps identical item_completed prompts from separate turns', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000113';
+    const secondTurnId = '00000000-0000-7000-8000-000000000114';
+    writeFileSync(path, [
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-first', content: [{ type: 'text', text: 'repeat prompt' }],
+      }, firstTurnId)),
+      line(itemCompleted({
+        type: 'UserMessage', id: 'msg-second', content: [{ type: 'text', text: 'repeat prompt' }],
+      }, secondTurnId, '2000-01-01T00:00:02.000Z')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user'))
+      .toEqual([
+        expect.objectContaining({ text: 'repeat prompt' }),
+        expect.objectContaining({ text: 'repeat prompt' }),
+      ]);
+  });
+
+  it('does not let an item_completed submit probe consume the production user event', () => {
+    const turnId = '00000000-0000-7000-8000-000000000115';
+    writeFileSync(path, line(itemCompleted({
+      type: 'UserMessage',
+      id: 'msg-user',
+      content: [{ type: 'text', text: 'probe must stay read-only' }],
+    }, turnId)));
+
+    expect(traexRolloutHasUserInputSince(path, 0, 'probe must stay read-only')).toBe(true);
+    expect(drainTraexRollout(path, 0).events).toEqual([
+      expect.objectContaining({ kind: 'user', text: 'probe must stay read-only' }),
     ]);
   });
 
