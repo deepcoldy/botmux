@@ -35,6 +35,8 @@ import {
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
+  classifyClaudeTerminalEvent,
+  type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
 
@@ -57,6 +59,13 @@ export interface BridgePendingTurn {
    * never settle from screen-idle alone; worker terminal emission requires
    * this bit (or an explicit failure/exit path outside the queue). */
   terminalObserved?: boolean;
+  /** Structured execution result. This is independent from whether transcript
+   * fallback text is visible or suppressed by a prior `botmux send`. */
+  terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
+  /** Structured 429 observed for this turn. It remains owned by the existing
+   * limited/reset path and must not be converted into ordinary ambiguity when
+   * the following turn_duration closes the transcript boundary. */
+  rateLimited?: boolean;
   /** Set when this turn was synthesised from a local-terminal user event
    *  (no matching Lark fingerprint). Causes the worker emit path to format
    *  the Lark message with both user text and assistant text under a
@@ -284,11 +293,21 @@ export class BridgeTurnQueue {
         // here: a rate-limited turn produced no real answer, so let the normal
         // terminal marker (or retry) close it.
         //
-        // Other API errors (server_error / authentication_failed / the
-        // terms-acceptance 400 / …) are NOT suppressed: they have no `limited`
-        // surface, so forwarding their text is the user's only signal that the
-        // request failed — matching pre-existing behavior.
-        if (isTranscriptRateLimitEvent(ev)) continue;
+        // Every API-error record is execution metadata, never a model answer.
+        // Its structured terminal outcome is retained below; user visibility
+        // and bounded retry are owned by the worker/daemon, respectively.
+        if (isTranscriptRateLimitEvent(ev)) {
+          if (this.collecting) this.collecting.rateLimited = true;
+          continue;
+        }
+        const terminalOutcome = classifyClaudeTerminalEvent(ev);
+        if (ev.isApiErrorMessage === true) {
+          if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
+            this.collecting.terminalOutcome = terminalOutcome;
+            this.collecting.terminalObserved = true;
+          }
+          continue;
+        }
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
           // Headless local turn: an assistant boundary arrived without any
@@ -317,12 +336,23 @@ export class BridgeTurnQueue {
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
+          if (terminalOutcome?.status !== 'rate_limited') {
+            this.collecting.terminalOutcome ??= terminalOutcome;
+          }
         }
       } else if (isClaudeTurnTerminalEvent(ev)) {
         // Claude normally writes this as `system/turn_duration` immediately
-        // after the final assistant line. It is a second marker for the same
-        // logical boundary; setting a bit is naturally idempotent.
-        if (this.collecting) this.collecting.terminalObserved = true;
+        // after the final assistant line. A local transcript can legitimately
+        // contain visible text with `stop_reason:null`; the duration marker is
+        // still authoritative proof that the turn completed. Keep a previously
+        // classified API failure, but otherwise use the same completed default
+        // as the next-turn-start compatibility boundary below.
+        if (this.collecting) {
+          this.collecting.terminalObserved = true;
+          if (!this.collecting.rateLimited) {
+            this.collecting.terminalOutcome ??= { status: 'completed' };
+          }
+        }
       }
     }
   }

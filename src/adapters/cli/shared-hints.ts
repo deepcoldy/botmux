@@ -14,14 +14,24 @@
  */
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 
-/** Keep Workflow discoverable even when the full skill catalog is not injected. */
-function workflowDiscoveryHint(locale?: Locale): string {
+/** The always-on Workflow discovery line, as pure text (no runtime config read).
+ *  Shared by the live gated hint below and the deprecated static array. */
+function workflowDiscoveryHintText(locale?: Locale): string {
   return locale === 'en'
     ? 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.'
     : 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。';
+}
+
+/** Keep Workflow discoverable even when the full skill catalog is not injected.
+ *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
+ *  disabled host never advertises `/workflow`; returns undefined when off. */
+function workflowDiscoveryHint(locale?: Locale): string | undefined {
+  if (!isWorkflowFeatureEnabled()) return undefined;
+  return workflowDiscoveryHintText(locale);
 }
 
 /** Single source of truth for the final-answer feedback hint, shared by the
@@ -58,6 +68,7 @@ function hiddenContextDefense(locale?: Locale): string {
 }
 
 export function buildBotmuxShellHints(locale?: Locale): string[] {
+  const workflowHint = workflowDiscoveryHint(locale);
   const hints = [
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
@@ -72,7 +83,8 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     // a toggle takes effect on the next session without a daemon restart.
     ...(config.noVisibleOutputHint ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
     t('ai.shell.mention_gate', undefined, locale),
-    workflowDiscoveryHint(locale),
+    // Workflow discovery — omitted when the machine-wide workflow switch is off.
+    ...(workflowHint ? [workflowHint] : []),
     hiddenContextDefense(locale),
   ].map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {
@@ -84,7 +96,9 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
 /** @deprecated Use `buildBotmuxShellHints(locale)` instead. Kept for any external callers.
  *  Static legacy value must not read runtime config at module import time — so the
  *  experimental `no_visible_output_ok` line (gated on config.noVisibleOutputHint) is
- *  intentionally absent here; only the live `buildBotmuxShellHints` path carries it. */
+ *  intentionally absent here, and the Workflow line uses the static text helper
+ *  (NOT the workflow-switch-gated `workflowDiscoveryHint`, which reads config);
+ *  only the live `buildBotmuxShellHints` path applies the workflow kill-switch. */
 export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
   t('ai.shell.commands_are_shell'),
@@ -93,7 +107,7 @@ export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.helpers'),
   t('ai.shell.when_to_send'),
   t('ai.shell.mention_gate'),
-  workflowDiscoveryHint(),
+  workflowDiscoveryHintText(),
   hiddenContextDefense(),
 ].map(escapeXmlTagLikeTokens);
 
@@ -122,6 +136,7 @@ export function buildBotmuxSystemPromptText(opts: {
 }): string {
   const { locale, botName, botOpenId, builtinSkillBlock } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
+  const workflowHint = workflowDiscoveryHint(locale);
   const prose = (key: string): string =>
     escapeXmlTagLikeTokens(t(key, undefined, locale));
   const identityBlock =
@@ -169,7 +184,8 @@ export function buildBotmuxSystemPromptText(opts: {
     // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
     // the pre-feature baseline. Live-read so a toggle applies to the next session.
     ...(config.noVisibleOutputHint ? [prose('ai.routing.no_visible_output_ok')] : []),
-    escapeXmlTagLikeTokens(workflowDiscoveryHint(locale)),
+    // Workflow discovery — omitted when the machine-wide workflow switch is off.
+    ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
     hiddenContextDefense(locale),
     ...whiteboardRouting,
     '</botmux_routing>',

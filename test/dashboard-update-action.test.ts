@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { updateAndRestartBotmux } from '../src/dashboard/web/update-action.js';
+import { updateAndRestartBotmux, updateResponseNeedsRestart } from '../src/dashboard/web/update-action.js';
 
 function json(status: number, body: unknown): Response {
   return Response.json(body, { status });
@@ -148,5 +148,22 @@ describe('dashboard update and restart action', () => {
 
     await expect(updateAndRestartBotmux(fetchImpl)).rejects.toThrow('Invalid update response');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('updateResponseNeedsRestart', () => {
+  it('requires a restart when the version changed (generic npm/pnpm/bun path)', () => {
+    expect(updateResponseNeedsRestart({ changed: true })).toBe(true);
+  });
+
+  it('requires a restart when restartRequired is set even if changed is false', () => {
+    // The core local-dev regression: a build-only update (HEAD unchanged →
+    // changed:false) still regenerated dist/ and MUST restart to apply it.
+    expect(updateResponseNeedsRestart({ changed: false, restartRequired: true })).toBe(true);
+  });
+
+  it('does not restart when nothing changed and no restart is required', () => {
+    expect(updateResponseNeedsRestart({ changed: false })).toBe(false);
+    expect(updateResponseNeedsRestart({})).toBe(false);
   });
 });

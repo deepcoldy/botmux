@@ -1612,13 +1612,19 @@ async function triggerSessionTurnAdmitted(
     // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
     // worker never reaches here. Model is gated here so it cannot leak to
     // other CLIs whose adapters do not implement this contract.
-    if (hasReasoningControl) {
-      if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-        session.model = req.options.model.trim();
-      }
-      if (req.options?.reasoningEffort) {
-        session.reasoningEffort = req.options.reasoningEffort;
-      }
+    //
+    // The model override lands on the in-memory DaemonSession below, NOT on the
+    // persisted session record: the documented semantics are per-trigger, and a
+    // persisted copy used to survive every later resume and outrank the bot's
+    // configured model forever (see sessionAgentConfig). reasoningEffort stays
+    // persisted with the session (unchanged by that PR).
+    const triggerModelOverride = hasReasoningControl
+      && typeof req.options?.model === 'string'
+      && req.options.model.trim()
+      ? req.options.model.trim()
+      : undefined;
+    if (hasReasoningControl && req.options?.reasoningEffort) {
+      session.reasoningEffort = req.options.reasoningEffort;
     }
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
@@ -1637,6 +1643,7 @@ async function triggerSessionTurnAdmitted(
       lastMessageAt: now,
       hasHistory: false,
       workingDir: wd.workingDir,
+      ...(triggerModelOverride ? { spawnModelOverride: triggerModelOverride } : {}),
     };
     // Retain the complete opening input until a worker or repo workflow has
     // synchronously accepted it. This is both the route reservation and the

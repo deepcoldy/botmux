@@ -406,6 +406,21 @@ export interface CliAdapter {
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
 
+  /** The adapter PUBLISHES a structured `limited` screen_update from a machine
+   *  rate-limit signal in its transcript (not from scraping screen text). When
+   *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
+   *  authority and suppresses the screen-scan `rate` heuristic — otherwise the
+   *  model's own output or a dev editing rate-limit code puts "429" / "exceeded
+   *  retry limit" on screen and the scraper false-positives (it cannot tell a
+   *  printed "429" from a request that actually returned 429). The Claude family
+   *  is authoritative via `claudeDataDir` regardless of this flag; Codex sets it
+   *  because the worker's `maybeEmitCodexStructuredRateLimit` reads the rollout's
+   *  `codex_rate_limited` terminal and emits `limited`. Do NOT set it for a
+   *  codexBridgeQueue CLI that has no such emit (grok / traex / pi / hermes /
+   *  mtr / cursor) — suppressing their screen scan would silently drop the real
+   *  429 backoff + Dashboard「需要你」signal. */
+  readonly emitsStructuredRateLimit?: boolean;
+
   /** True when this adapter supports running under per-bot read isolation (its
    *  data root is redirectable into BOT_HOME — CLAUDE_CONFIG_DIR / CODEX_HOME —
    *  and it runs correctly under the worker's whole-process Seatbelt wrapper,

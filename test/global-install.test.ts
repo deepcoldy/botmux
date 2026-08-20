@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
@@ -84,6 +84,109 @@ describe('resolveGlobalInstallPlan', () => {
 
       expect(plan.activePackageRoot).toBe(join(stableDir, 'node_modules', 'botmux'));
     } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('recognises the pnpm 11 store realpath behind a global symlink', () => {
+    const root = '/home/bot/.local/share/pnpm/store/v11/links/@/botmux/3.11.0/hash/node_modules/botmux';
+    expect(detectGlobalInstallManager(root, 'linux')).toBe('pnpm');
+  });
+
+  it('uses pnpm root -g for a custom global-dir and fails closed without its stable link', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-custom-global-'));
+    const previousPath = process.env.PATH;
+    try {
+      const pnpmHome = join(tempRoot, 'pnpm');
+      const storeRoot = join(pnpmHome, 'store', 'v11', 'links', '@', 'botmux', '3.11.0', 'hash');
+      const packageRoot = join(storeRoot, 'node_modules', 'botmux');
+      const customGlobal = join(tempRoot, 'custom-global');
+      const globalRoot = join(customGlobal, 'v11');
+      const fakePnpm = join(tempRoot, 'bin', 'pnpm');
+      mkdirSync(packageRoot, { recursive: true });
+      mkdirSync(join(tempRoot, 'bin'), { recursive: true });
+      writeFileSync(fakePnpm, `#!/bin/sh\nprintf '%s\\n' '[{"path":"${globalRoot}"}]'\n`);
+      chmodSync(fakePnpm, 0o755);
+      process.env.PATH = `${join(tempRoot, 'bin')}:${previousPath ?? ''}`;
+
+      expect(tryResolveGlobalInstallPlan(packageRoot, 'linux')).toBeNull();
+
+      const runtimeRoot = join(globalRoot, 'runtime');
+      const stableDir = join(globalRoot, 'stable-hash');
+      mkdirSync(join(runtimeRoot, 'node_modules'), { recursive: true });
+      symlinkSync(packageRoot, join(runtimeRoot, 'node_modules', 'botmux'), 'dir');
+      symlinkSync(runtimeRoot, stableDir, 'dir');
+
+      const plan = resolveGlobalInstallPlan(packageRoot, 'linux');
+      expect(plan.args).toEqual([
+        'add', '-g', '--global-dir', customGlobal, 'botmux@latest',
+      ]);
+      expect(plan.activePackageRoot).toBe(join(stableDir, 'node_modules', 'botmux'));
+    } finally {
+      process.env.PATH = previousPath;
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when the pnpm global probe hangs', { timeout: 20_000 }, () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-hang-'));
+    const previousPath = process.env.PATH;
+    try {
+      const storeRoot = join(tempRoot, 'pnpm', 'store', 'v11', 'links', '@', 'botmux', '3.11.0', 'hash');
+      const packageRoot = join(storeRoot, 'node_modules', 'botmux');
+      const fakePnpm = join(tempRoot, 'bin', 'pnpm');
+      mkdirSync(packageRoot, { recursive: true });
+      mkdirSync(join(tempRoot, 'bin'), { recursive: true });
+      writeFileSync(fakePnpm, '#!/bin/sh\nsleep 60\n');
+      chmodSync(fakePnpm, 0o755);
+      process.env.PATH = `${join(tempRoot, 'bin')}:${previousPath ?? ''}`;
+
+      const startedAt = Date.now();
+      expect(tryResolveGlobalInstallPlan(packageRoot, 'linux')).toBeNull();
+      const elapsed = Date.now() - startedAt;
+      // The probe must have been killed by its 5s hard timeout, not waited
+      // out (sleep 60) and not failed instantly for an unrelated reason
+      // (e.g. ENOENT would return in ~0s and pass the upper bound vacuously).
+      expect(elapsed).toBeGreaterThanOrEqual(4_000);
+      expect(elapsed).toBeLessThan(15_000);
+    } finally {
+      process.env.PATH = previousPath;
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('runs the pnpm global probe through the shell for a Windows store realpath', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-win32-'));
+    const previousPath = process.env.PATH;
+    try {
+      const pnpmHome = join(tempRoot, 'pnpm');
+      const storeRoot = join(pnpmHome, 'store', 'v11', 'links', '@', 'botmux', '3.11.0', 'hash');
+      const packageRoot = join(storeRoot, 'node_modules', 'botmux');
+      const customGlobal = join(tempRoot, 'custom-global');
+      const globalRoot = join(customGlobal, 'v11');
+      // On win32 the probe spawns `pnpm.cmd` via the shell; a shebang script
+      // named pnpm.cmd is executable by sh, so the same spawn path is covered.
+      // The marker records the exact argv the probe passed, proving it ran
+      // AND with the expected arguments (a spawn failure or wrong args would
+      // leave the marker absent and fail closed for the wrong reason).
+      const probeMarker = join(tempRoot, 'probe-argv');
+      const fakePnpm = join(tempRoot, 'bin', 'pnpm.cmd');
+      mkdirSync(packageRoot, { recursive: true });
+      mkdirSync(join(tempRoot, 'bin'), { recursive: true });
+      writeFileSync(
+        fakePnpm,
+        `#!/bin/sh\nprintf '%s\\n' "$@" > '${probeMarker}'\nprintf '%s\\n' '[{"path":"${globalRoot}"}]'\n`,
+      );
+      chmodSync(fakePnpm, 0o755);
+      process.env.PATH = `${join(tempRoot, 'bin')}:${previousPath ?? ''}`;
+
+      // Probe runs but no stable link resolves: must fail closed, not throw.
+      expect(tryResolveGlobalInstallPlan(packageRoot, 'win32')).toBeNull();
+      expect(readFileSync(probeMarker, 'utf8').split('\n').filter(Boolean)).toEqual([
+        'list', '-g', '--depth', '0', '--json',
+      ]);
+    } finally {
+      process.env.PATH = previousPath;
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });

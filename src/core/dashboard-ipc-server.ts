@@ -86,7 +86,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
@@ -124,7 +124,11 @@ import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-
 import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
-import { withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { tryWithBotTurnMutation, withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import {
+  SESSION_WAKE_DEADLINE_HEADER,
+  sessionWakeAcquireTimeoutMs,
+} from './session-wake-deadline.js';
 import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
@@ -1230,7 +1234,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
     // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
     try {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: String(err) });
     }
@@ -1246,6 +1250,57 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
   });
+});
+
+/** Materialize a dormant active session for a local `botmux list` attach.
+ * Unlike restart, this is idempotent when a live worker already exists: a Lark
+ * message may race the local picker, and that race must never restart an active
+ * turn. Empty input re-attaches/cold-resumes without creating a model turn. */
+ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
+  const initial = findActiveBySessionId(params.sessionId);
+  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const acquireTimeoutMs = sessionWakeAcquireTimeoutMs(
+    req.headers[SESSION_WAKE_DEADLINE_HEADER],
+  );
+  const mutation = await tryWithBotTurnMutation(initial.larkAppId, acquireTimeoutMs, () => {
+    // A picker that exits aborts its fetch. If the request was queued behind an
+    // admitted turn, never materialize the session after that caller is gone.
+    if (req.aborted || res.destroyed) return;
+    const ds = findActiveBySessionId(params.sessionId);
+    if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    if (isSessionTransferring(ds)) {
+      return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+    }
+    if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+      return jsonRes(res, 409, { ok: false, error: 'adopt_wake_unsupported' });
+    }
+    // Every REMOTE backend (riff / mojo) owns a remote lineage that a local
+    // forkWorker cold-boot would sever or replace — the same reason /restart
+    // rejects them. A dormant remote session cold-resumes from its own lineage
+    // on the next message, never from a picker-driven local wake.
+    if (isRemoteBackendSession(ds)) {
+      return jsonRes(res, 409, { ok: false, error: 'remote_wake_unsupported' });
+    }
+    if (rejectProtectedSessionMutation(res, [ds])) return;
+
+    const cliId = ds.session.cliId ?? 'unknown';
+    if (ds.worker && !ds.worker.killed) {
+      return jsonRes(res, 200, {
+        ok: true,
+        sessionId: params.sessionId,
+        cliId,
+        woke: false,
+        reason: 'already_running',
+      });
+    }
+    if (!forkWorker(ds, '', ds.hasHistory)) {
+      return jsonRes(res, 409, { ok: false, error: 'wake_refused' });
+    }
+    jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, woke: true });
+  });
+  if (!mutation.acquired && !res.destroyed) {
+    jsonRes(res, 409, { ok: false, error: 'wake_mutation_timeout' });
+  }
 });
 
 /** Manually suspend one active session: kill the worker + CLI/pane, session
@@ -1769,7 +1824,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
     try {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
@@ -1915,7 +1970,15 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     sessionId,
     liveActive: !!ds,
     chatId: ds?.chatId ?? stored?.chatId,
-    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt, usage: memResult.usage } : undefined,
+    memResult: memResult ? {
+      status: memResult.status,
+      content: memResult.content,
+      completedAt: memResult.completedAt,
+      failedAt: memResult.failedAt,
+      errorCode: memResult.errorCode,
+      terminalErrorCode: memResult.terminalErrorCode,
+      usage: memResult.usage,
+    } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
     persisted,
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,

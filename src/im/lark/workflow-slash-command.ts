@@ -41,3 +41,12 @@ export function isLegacyTemplateCommand(content: string): boolean {
 export const LEGACY_TEMPLATE_RETIRED_MESSAGE =
   'v2 workflow 已下线，`/template` 不再执行。请先运行 `botmux template migrate-v3` 迁移定义，' +
   '然后使用 `/workflow run <名称>`；历史运行仅可通过离线归档审计。';
+
+/** Shown when a user tries to start / author a workflow while the machine-wide
+ *  workflow feature is turned off (global config `workflow.enabled=false` or
+ *  `BOTMUX_WORKFLOW_ENABLED` set falsy). In-flight run management (cancel /
+ *  retry / grant) is intentionally NOT gated, so a run started before the flip
+ *  can still be wound down. */
+export const WORKFLOW_DISABLED_MESSAGE =
+  '⛔ 本机已关闭「工作流(Workflow)」功能，`/workflow` 即兴编排与 Saved Workflow 的运行/保存均不可用。' +
+  '如需开启，请在 Dashboard 设置页打开「工作流功能」开关，或联系管理员。';

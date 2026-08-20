@@ -35,6 +35,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: () => ({}),
+  isWorkflowFeatureEnabled: () => true,
   config: {},
 }));
 vi.mock('../src/services/whiteboard-store.js', () => ({ whiteboardEnabled: () => false }));

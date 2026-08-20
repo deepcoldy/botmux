@@ -1330,8 +1330,13 @@ export async function createOpenPlatformAppWithClient(
   try {
     // 模板应用出生已带 bot + 长连接(重复调用幂等);fallback 的裸自建应用
     // 则必须显式开启——这两步是「一扫即用」的必要条件,在返回凭证前完成。
-    await client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
-    await client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
+    // robot/event switch 都是幂等设值,故对宿主机↔飞书的瞬态网络抖动小步重试:
+    // 一次 undici `fetch failed` 不该让「应用已建成但没启用能力」半途而废
+    // (那会把用户丢进手动读 Secret + CLI 续跑的恢复路径)。
+    await retryIdempotentOnTransientNetworkError(() =>
+      client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true }));
+    await retryIdempotentOnTransientNetworkError(() =>
+      client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
 
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
@@ -1340,6 +1345,9 @@ export async function createOpenPlatformAppWithClient(
     // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
     // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
     // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    // ⚠️ version/create、publish/commit 是非幂等写操作(传输失败即结果未知,
+    // 重放会重复建版/撞版本号),故绝不套 retryIdempotent… 包装,与 fetchRaw
+    // 只对 GET/HEAD 重试同源。
     const versionCreated = await client.postJson(
       `/developers/v1/app_version/create/${appId}`,
       buildAppVersionCreatePayload('1.0.0', [options.creatorUserId]),
@@ -1350,7 +1358,11 @@ export async function createOpenPlatformAppWithClient(
     }
     await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
 
-    const appSecret = await fetchOpenPlatformAppSecret(client, appId);
+    // 读 Secret 是纯只读 POST(getAppSecret 同款,不触碰 reset),幂等可重试:
+    // 应用已建成、已发布,唯独最后一步读 Secret 撞网络抖动而失败最可惜——
+    // 重试让它自愈,而不是把整条链路判死。
+    const appSecret = await retryIdempotentOnTransientNetworkError(() =>
+      fetchOpenPlatformAppSecret(client, appId!));
     return { appId, appSecret };
   } catch (err) {
     throw new CreatedOpenPlatformAppError(appId, err);
@@ -1654,6 +1666,26 @@ function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
     return err.cause === undefined || isLikelyTransientNetworkError(err.cause, depth + 1);
   }
   return isLikelyTransientNetworkError((err as { cause?: unknown }).cause, depth + 1);
+}
+
+// 对「幂等」console 请求复用 fetchRaw 的瞬态退避:传输层抖动(fetch failed /
+// ECONNRESET 等)时小步重试,一次网络毛刺不再中断整条链路。API 层拒绝
+// (OpenPlatformApiError、HTTP 非 2xx、code!=0)无 code / cause,isLikely… 判 false,
+// 只会立刻抛出而不会被重放。
+// ⚠️ 只能包装「重复调用无副作用」的请求。app_version/create、publish/commit 这类
+// 「传输失败即结果未知、重放会重复提交/撞版本号」的非幂等写操作绝不能用本包装
+// (与 fetchRaw 只对 GET/HEAD 重试同源:见其上方注释)。
+async function retryIdempotentOnTransientNetworkError<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+        throw err;
+      }
+      await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+    }
+  }
 }
 
 class MutableCookieJar {

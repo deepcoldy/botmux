@@ -100,6 +100,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
@@ -274,6 +275,7 @@ import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import {
   closeSession,
+  ensureOrdinaryTurnRecoveryAttached,
   forkAdoptWorker,
   forkWorker,
   setActiveSessionSafe,
@@ -302,6 +304,7 @@ beforeEach(() => {
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
+  vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(announceSessionRow).mockClear();
   vi.mocked(ZmxBackend.probeSessions).mockClear();
   vi.mocked(ZmxBackend.killManagedSession).mockReset();

@@ -1537,11 +1537,32 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
+  { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
+];
+
+/** The v3 Workflow skill family, gated by the machine-wide workflow kill-switch
+ *  (`workflow.enabled` / `BOTMUX_WORKFLOW_ENABLED`, see
+ *  global-config.ts `isWorkflowFeatureEnabled`). Kept OUT of {@link BUILTIN_SKILLS}
+ *  — which is installed/advertised unconditionally — so that when the feature is
+ *  disabled these skills are neither written to a CLI's skills dir nor listed in
+ *  the prompt catalog (mirrors how the whiteboard skill is conditional).
+ *
+ *  `botmux-orchestrate` is deliberately NOT here: it is a separate multi-bot
+ *  long-running-orchestration capability, not a v3 workflow, and stays available
+ *  regardless of the workflow switch.
+ *
+ *  Order matches their historical position in the catalog (right after
+ *  `botmux-handoff`) so the ENABLED path renders byte-for-byte as before. */
+export const WORKFLOW_FEATURE_SKILLS: SkillDef[] = [
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-workflow', content: WORKFLOW_V3_SKILL },
   { name: 'botmux-goal-ask', content: GOAL_ASK_SKILL },
-  { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
 ];
+
+/** Names in {@link WORKFLOW_FEATURE_SKILLS}, for install cleanup + catalog
+ *  filtering when the workflow feature is off. */
+export const WORKFLOW_FEATURE_SKILL_NAMES: string[] =
+  WORKFLOW_FEATURE_SKILLS.map((s) => s.name);
 
 /** Skills that earlier botmux versions installed but no longer ship. The
  *  installer cleans these up so renamed skills don't linger as duplicates

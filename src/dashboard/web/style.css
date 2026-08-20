@@ -12979,6 +12979,34 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--fg);
   font: 12px/1.5 var(--mono);
 }
+
+.bd-feedback-advanced {
+  margin-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 10px;
+}
+.bd-feedback-advanced > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+.bd-feedback-advanced > summary:hover { color: var(--fg); }
+.bd-feedback-advanced-body { padding-top: 4px; }
+.bd-tile textarea.bd-feedback-json {
+  min-height: 112px;
+  max-height: 320px;
+  resize: vertical;
+}
+.bd-feedback-chat-override {
+  margin-top: 16px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 14px;
+}
+.bd-feedback-chat-override > h4 { margin: 0 0 4px; }
+.bd-feedback-chat-override > .hint { margin: 0; }
 :root[data-theme="dark"] .bd-tile textarea,
 :root[data-theme="dark"] .bd-tile input[type=text],
 :root[data-theme="dark"] .bd-tile input[type=number] {

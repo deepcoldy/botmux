@@ -131,7 +131,7 @@ import {
   resolveUsageDisplay,
   type BotConfig,
 } from './bot-registry.js';
-import { readGlobalConfig } from './global-config.js';
+import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
 import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
@@ -3886,26 +3886,30 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
 
 /**
  * True when this CLI has an authoritative STRUCTURED rate-limit signal that is
- * actually PUBLISHED as a `limited` screen_update — i.e. the Claude family,
- * whose `bridgeIngest → maybeEmitStructuredRateLimit()` reads the transcript's
- * `error:"rate_limit"` record. For those CLIs the screen-text `rate` heuristic
- * is not just redundant but harmful: the model's own output or a dev editing
- * rate-limit code/tests puts phrases like "429 Too Many Requests" / "exceeded
- * retry limit" on screen, which the scraper cannot distinguish from a real
- * limit. So we suppress the screen-scan `rate` verdict and let the structured
- * path be the sole authority. `usage` (quota "hit your limit …") has no
- * structured equivalent yet, so it still comes from the screen.
+ * actually PUBLISHED as a `limited` screen_update. Two families qualify: the
+ * Claude family, whose `bridgeIngest → maybeEmitStructuredRateLimit()` reads the
+ * transcript's `error:"rate_limit"` record; and codex, whose
+ * `maybeEmitCodexStructuredRateLimit()` reads the rollout's `codex_rate_limited`
+ * terminal (`isCodexRateLimitEvent`). For those CLIs the screen-text `rate`
+ * heuristic is not just redundant but harmful: the model's own output or a dev
+ * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
+ * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
+ * real limit. So we suppress the screen-scan `rate` verdict and let the
+ * structured path be the sole authority. `usage` (quota "hit your limit …") has
+ * no structured equivalent yet, so it still comes from the screen.
  *
- * Gate on `claudeDataDir` (the Claude-family marker: claude-code / seed /
- * genius), NOT on `reliableTurnTerminal`. Both are "transcript-backed", but the
- * structured rate-limit EMIT only exists on the Claude bridge (`bridgeJsonlPath`
- * path). The codexBridgeQueue CLIs (codex / grok / traex / pi) map an `error`
- * terminal to a failed/ambiguous receipt but publish NO `limited` state — so
- * suppressing their screen `rate` verdict would silently drop the Dashboard
- * 「需要你」signal + backoff on a real 429. Pi joining reliableTurnTerminal made
- * that latent over-suppression concrete; scoping to claudeDataDir fixes it for
- * every codexBridgeQueue CLI at once. (A future structured rate-limit emit for
- * those CLIs can widen this predicate.)
+ * Gate on the two capability fields (`claudeDataDir` for the Claude family;
+ * `emitsStructuredRateLimit` for codex), NOT on `reliableTurnTerminal`. The
+ * structured rate-limit EMIT only exists where those fields are set: codex's
+ * emit runs under the `structuredBridgeIsCodex()` gate, so among the
+ * codexBridgeQueue CLIs only codex carries the flag. The rest (grok / traex /
+ * pi / hermes / mtr / cursor) map an `error` terminal to a failed/ambiguous
+ * receipt but publish NO `limited` state — suppressing their screen `rate`
+ * verdict would silently drop the Dashboard「需要你」signal + backoff on a real
+ * 429. Most set `reliableTurnTerminal`, so gating on that flag would wrongly
+ * suppress them; gating on the explicit capability fields keeps the split
+ * exact. (A future structured rate-limit emit for another CLI just sets its
+ * `emitsStructuredRateLimit`.)
  */
 function structuredRateLimitAuthoritative(): boolean {
   return isStructuredRateLimitAuthoritative(cliAdapter);
@@ -5103,7 +5107,8 @@ function bridgeIngest(): void {
  *  session surfaces in Dashboard「需要你」with a retry countdown — identical
  *  wire shape to the screen-text detector's classify() output, so the daemon /
  *  card / persistence paths need no change. Claude-only (bridgeQueue is the
- *  Claude bridge; Codex uses codexBridgeQueue and has no structured 429). */
+ *  Claude bridge; Codex has its own structured 429 via
+ *  maybeEmitCodexStructuredRateLimit on the codexBridgeQueue path). */
 function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void {
   for (const ev of events) {
     if (!ev.uuid || emittedRateLimitUuids.has(ev.uuid)) continue;
@@ -5360,6 +5365,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    // Claude API-error text is execution metadata, not a model answer. The
+    // structured terminal below owns retry/attention; never leak the raw
+    // provider error through transcript fallback (regardless of send markers).
+    if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
@@ -5465,7 +5474,18 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
-  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt, nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined);
+  for (const turn of ready) {
+    if (turn.rateLimited) continue;
+    const outcome = turn.terminalOutcome;
+    emitTurnTerminal(
+      turn.turnId,
+      outcome?.status ?? 'completed',
+      outcome && outcome.status !== 'completed' ? outcome.errorCode : undefined,
+      turn.dispatchAttempt,
+      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      outcome && outcome.status !== 'completed' ? outcome.retryable : undefined,
+    );
+  }
 }
 
 /** Drain `path` from `fromOffset` and feed the events to the bridge queue
@@ -12132,12 +12152,22 @@ async function spawnCli(
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
     // Per-bot env (bots.json `env`) takes precedence over session context;
-    // explicit riff config.env takes precedence over both.
+    // explicit riff config.env takes precedence over both. The workflow
+    // kill-switch is a host-resolved snapshot and is re-frozen AFTER this merge
+    // (see below), so it is intentionally NOT set in sessionEnv here.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...riffCfg.env };
     // The effective policy is a host-resolved snapshot, not a user-overridable
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
     else delete mergedEnv.BOTMUX_FEEDBACK_POLICY;
+    // The workflow kill-switch is likewise a host-resolved snapshot. Re-freeze it
+    // AFTER the merge: unlike per-bot `env` (sanitizePerBotEnv strips the BOTMUX*
+    // prefix), `riffCfg.env` merges LAST and is NOT sanitized, so a stale or
+    // user-shaped backendConfig.env could otherwise flip the pane's
+    // BOTMUX_WORKFLOW_ENABLED and desync the remote CLI-side gate from the
+    // daemon's authoritative decision. The daemon-side gate is unaffected either
+    // way; this keeps the in-pane defense-in-depth honest on the riff path too.
+    mergedEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -13298,6 +13328,10 @@ async function spawnCli(
   const chatBotDiscovery = resolveChatBotDiscoveryConfig();
   childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
   childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+  // Inject the resolved workflow kill-switch so a pane's `botmux workflow …`
+  // subcommand agrees with the daemon that spawned it, independent of stale
+  // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
+  childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
@@ -16901,6 +16935,7 @@ function emitTurnTerminal(
   errorCode?: string,
   dispatchAttempt?: number,
   outputDisposition?: 'nothing_to_send',
+  retryable?: boolean,
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -16921,6 +16956,7 @@ function emitTurnTerminal(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
     ...(outputDisposition ? { outputDisposition } : {}),
+    ...(retryable !== undefined ? { retryable } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -17102,7 +17138,7 @@ process.on('message', async (raw: unknown) => {
       const ordinaryImTurnId = !msg.adoptMode
         && msg.dispatchAttempt === undefined
         && !!msg.prompt
-        && msg.turnId?.startsWith('om_')
+        && (msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-'))
         ? msg.turnId
         : undefined;
       if (lastInitConfig) {
@@ -17435,6 +17471,14 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
+      // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
+      // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
+      // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
+      // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
+      if (msg.model !== undefined && lastInitConfig) {
+        lastInitConfig.model = msg.model === null ? undefined : msg.model;
+      }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
       // to the backend (see flushPending) — applying at receive time made two
@@ -17442,7 +17486,7 @@ process.on('message', async (raw: unknown) => {
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
       const ordinaryImTurnId = !messageAdoptMode
         && msg.dispatchAttempt === undefined
-        && msg.turnId?.startsWith('om_')
+        && (msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-'))
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {
@@ -17661,6 +17705,14 @@ process.on('message', async (raw: unknown) => {
       // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
       if (msg.env !== undefined && lastInitConfig) {
         lastInitConfig.env = msg.env === null ? undefined : msg.env;
+      }
+      // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
+      // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
+      // restart 不 refork，没有 init 重发这条通道——不覆盖的话，改完模型再重启
+      // 起来的还是快照里的旧模型。undefined=不携带（旧 daemon / 取不到）保持快照；
+      // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
+      if (msg.model !== undefined && lastInitConfig) {
+        lastInitConfig.model = msg.model === null ? undefined : msg.model;
       }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、

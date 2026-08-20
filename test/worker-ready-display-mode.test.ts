@@ -350,6 +350,83 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(logs).not.toContain('view_cap');
   });
 
+  it('ready POST keeps the dispatch-time topic when currentReplyTarget changes while awaiting Lark', async () => {
+    let resolvePost!: (messageId: string) => void;
+    sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {
+      resolvePost = resolve;
+    }));
+    const now = new Date().toISOString();
+    const targetA = { rootMessageId: 'om_topic_a', turnId: 'om_turn_a', updatedAt: now };
+    const targetB = { rootMessageId: 'om_topic_b', turnId: 'om_turn_b', updatedAt: now };
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      currentReplyTarget: targetA,
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        currentReplyTarget: targetA,
+        replyTargets: { om_turn_a: targetA, om_turn_b: targetB },
+      },
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_a');
+    ds.currentReplyTarget = targetB;
+    ds.session.currentReplyTarget = targetB;
+    resolvePost('om_new_card');
+    await flush();
+
+    expect(ds.streamCardReplyTargetKey).toBe('thread:om_topic_a');
+  });
+
+  it('screen_update POST keeps the dispatch-time topic when currentReplyTarget changes while awaiting Lark', async () => {
+    let resolvePost!: (messageId: string) => void;
+    sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {
+      resolvePost = resolve;
+    }));
+    const now = new Date().toISOString();
+    const targetA = { rootMessageId: 'om_topic_a', turnId: 'om_turn_a', updatedAt: now };
+    const targetB = { rootMessageId: 'om_topic_b', turnId: 'om_turn_b', updatedAt: now };
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      currentReplyTarget: targetA,
+      session: {
+        ...makeDs().session,
+        scope: 'chat',
+        currentReplyTarget: targetA,
+        replyTargets: { om_turn_a: targetA, om_turn_b: targetB },
+      },
+      streamCardPending: true,
+      streamCardId: undefined,
+      workerReady: true,
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'working in topic A',
+      status: 'working',
+    });
+    await flush();
+
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_a');
+    ds.currentReplyTarget = targetB;
+    ds.session.currentReplyTarget = targetB;
+    resolvePost('om_new_card');
+    await flush();
+
+    expect(ds.streamCardReplyTargetKey).toBe('thread:om_topic_a');
+  });
+
   it('treats port=0 as ready without Web Terminal and keeps screen/screenshot state flowing', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({

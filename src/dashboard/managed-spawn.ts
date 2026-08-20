@@ -1,6 +1,7 @@
 // Child processes the dashboard forks on the HOST: `botmux start-bot/stop-bot`
-// (onboarding brings a bot online without a fleet restart) and the global
-// npm/pnpm/bun install behind the update button.
+// (onboarding brings a bot online without a fleet restart), the global
+// npm/pnpm/bun install behind the update button, and — for a local-dev
+// checkout — the `git pull` / `pnpm build` steps behind the local update button.
 //
 // One shared rule, and the reason this lives in its own module: every one of
 // them runs with `redactChildEnv(process.env)`, never raw process.env. The
@@ -129,6 +130,40 @@ export function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
       clearTimeout(timer);
       if (code === 0) resolve();
       else reject(new Error(`${plan.manager} exited ${code}: ${tail.trim().slice(-500)}`));
+    });
+  });
+}
+
+/**
+ * Run one local-dev update step (`git pull --ff-only` / `pnpm build`) in `dir`,
+ * capturing output so a failure surfaces an actionable tail rather than a bare
+ * exit code. Like the other host children this runs on `redactChildEnv` — the
+ * git/pnpm child (and any lifecycle/hook it spawns) must not inherit the
+ * dashboard's Feishu H5 credentials; the denylist still keeps PATH/HOME/etc. so
+ * the tools resolve normally. 300s timeout (a cold `pnpm build` is slower than a
+ * package install). No shell interpolation of untrusted input.
+ */
+export function runLocalDevStep(dir: string, command: string, args: string[]): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: dir,
+      env: redactChildEnv(process.env),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32', // resolve git / pnpm .cmd shims on win32
+    });
+    let tail = '';
+    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-4000); };
+    child.stdout?.on('data', capture);
+    child.stderr?.on('data', capture);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`\`${command} ${args.join(' ')}\` timed out after 300s`));
+    }, 300_000);
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`\`${command} ${args.join(' ')}\` exited ${code}: ${tail.trim().slice(-800)}`));
     });
   });
 }

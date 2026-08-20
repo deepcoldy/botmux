@@ -15,7 +15,7 @@
  *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
- *   botmux upgrade|update — upgrade to latest version
+ *   botmux upgrade|update — upgrade to latest version (本地 checkout 则 git pull --ff-only + rebuild + restart)
  *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
@@ -109,6 +109,12 @@ import {
   type SessionPickerLayout,
 } from './cli/session-picker-layout.js';
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
+import {
+  canWakeDormantBackendForAttach,
+  type SessionListWakeRequestContext,
+  wakeDormantBackendForAttach,
+} from './cli/session-list-wake.js';
+import { SESSION_WAKE_DEADLINE_HEADER } from './core/session-wake-deadline.js';
 import { terminalCellWidth } from './cli/terminal-width.js';
 import {
   attachFrozenManagedZmxSession,
@@ -178,12 +184,20 @@ import {
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
 } from './cli/dashboard-command.js';
-import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
+import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
   UnsupportedGlobalInstallError,
 } from './utils/global-install.js';
+import { isLocalDevInstall, botmuxCliEntryAt } from './utils/install-info.js';
+import {
+  resolveLocalDevCheckoutDir,
+  isGitWorktree,
+  gitPorcelainStatus,
+  localDevUpdateSteps,
+  describeSpawnFailure,
+} from './utils/local-dev-update.js';
 import { cliAuthBind, loadDashboardSecret, signCliAuth } from './dashboard/auth.js';
 import {
   postWorkflowDaemonMutation,
@@ -4446,6 +4460,13 @@ async function cmdStatus(): Promise<void> {
 }
 
 function cmdUpgrade(): void {
+  // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
+  // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
+  // install-info.ts 的 isLocalDevInstall 说明）。
+  if (isLocalDevInstall()) {
+    cmdUpgradeLocalDev();
+    return;
+  }
   try {
     const plan = resolveGlobalInstallPlan();
     console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
@@ -4457,6 +4478,82 @@ function cmdUpgrade(): void {
     } else {
       console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
     }
+    process.exit(1);
+  }
+}
+
+/** 在 checkout 目录里同步跑一条命令，stdio 直通；失败抛错。 */
+function runInCheckout(cwd: string, command: string, args: string[]): void {
+  const result = spawnSync(command, args, {
+    cwd,
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(describeSpawnFailure(command, args, result));
+  }
+}
+
+/**
+ * 本地 checkout 的更新流程：git 干净检查 → git pull --ff-only → pnpm build →
+ * 从本 checkout 的 dist/cli.js restart。dist/ 被 gitignore，只 pull 不 build
+ * 重启后跑的还是旧代码，故 build 步不可省。定位/干净检查/命令定义与 dashboard
+ * 共用 src/utils/local-dev-update.ts，避免两边逻辑漂移。
+ */
+function cmdUpgradeLocalDev(): void {
+  const dir = resolveLocalDevCheckoutDir();
+  if (!isGitWorktree(dir)) {
+    console.error(`❌ ${dir} 不是 git 工作树，无法用 git pull 更新。请手动更新或改用全局安装。`);
+    process.exit(1);
+  }
+  console.log(`🔄 本地 checkout 更新：${dir}`);
+
+  // git 干净检查 + pull + build 全程握同一把跨进程 update 锁（与 dashboard 的
+  // /api/update/run 用的是同一个 target），避免 CLI 与 dashboard 同时对同一
+  // checkout 交错跑 pnpm build 而互相清理/覆盖 dist。restart 不在锁内——它有
+  // 自己的 restart lease。
+  try {
+    const lockTarget = globalInstallUpdateLockTarget();
+    // daemon 正常会建好 dataDir；但 CLI 可能在 daemon 尚未起过的机器上先跑
+    // update，锁文件父目录不存在会让 withFileLockSync 报 ENOENT 而盖掉真实错误。
+    mkdirSync(dirname(lockTarget), { recursive: true });
+    withFileLockSync(lockTarget, () => {
+      // 1) fail closed：有未提交改动就中止（不偷偷 stash），让用户自己决定。
+      let status: string;
+      try {
+        status = gitPorcelainStatus(dir);
+      } catch (error) {
+        throw new Error(`读取 git 状态失败：${error instanceof Error ? error.message : error}`);
+      }
+      if (status) {
+        const err = new Error('dirty') as Error & { dirtyStatus?: string };
+        err.dirtyStatus = status;
+        throw err;
+      }
+      // 2~3) git pull --ff-only（分叉/冲突直接报错停下，不自动 merge）+ pnpm build。
+      for (const { command, args } of localDevUpdateSteps()) {
+        console.log(`→ ${command} ${args.join(' ')}`);
+        runInCheckout(dir, command, args);
+      }
+    }, { maxWaitMs: 2_000 });
+  } catch (error) {
+    const dirty = (error as { dirtyStatus?: string }).dirtyStatus;
+    if (dirty) {
+      console.error('❌ 工作区有未提交改动，已中止更新（不会自动 stash）。请先提交或清理：');
+      console.error(dirty);
+    } else {
+      console.error(`❌ 更新失败：${error instanceof Error ? error.message : error}`);
+    }
+    process.exit(1);
+  }
+
+  // 4) 用本 checkout 的 cli.js 重启 daemon（不走 PATH，避免被更靠前的全局 botmux 抢先）。
+  try {
+    console.log('→ restart daemon');
+    runInCheckout(dir, process.execPath, [botmuxCliEntryAt(dir), 'restart']);
+    console.log('\n✅ 本地更新完成，daemon 已从最新代码重启。');
+  } catch (error) {
+    console.error(`❌ 重启失败：${error instanceof Error ? error.message : error}`);
     process.exit(1);
   }
 }
@@ -5331,6 +5428,41 @@ function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSna
   return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
+async function requestDormantSessionWake(
+  session: SessionData,
+  context: SessionListWakeRequestContext,
+): Promise<
+  | { ok: true }
+  | { ok: false; error: string }
+> {
+  const online = listOnlineDaemons();
+  const daemon = session.larkAppId
+    ? online.find(d => d.larkAppId === session.larkAppId)
+    : online.length === 1 ? online[0] : undefined;
+  if (!daemon) {
+    return {
+      ok: false,
+      error: session.larkAppId || online.length === 0
+        ? '所属 daemon 不在线，请先运行 botmux status'
+        : '历史会话缺少 bot 归属，多 daemon 环境下无法安全唤醒',
+    };
+  }
+
+  try {
+    const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/wake`;
+    const response = await fetchDaemonIpc(daemon.ipcPort, path, {
+      method: 'POST',
+      signal: context.signal,
+      headers: { [SESSION_WAKE_DEADLINE_HEADER]: String(context.deadlineMs) },
+    });
+    const body: any = await response.json().catch(() => ({}));
+    if (response.ok && body?.ok) return { ok: true };
+    return { ok: false, error: body?.error ?? `HTTP ${response.status}` };
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
 /** Shorten path for display: replace $HOME with ~. */
 function shortenPath(p: string): string {
   const home = homedir();
@@ -5360,6 +5492,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     isAdopt: boolean;
     targetLabel: string;
     canAttach: boolean;
+    canWake: boolean;
   }> {
     return active.map(s => {
       const isAdopt = isAdoptedSession(s);
@@ -5402,6 +5535,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           && backing.probe === 'exists'
           && !!('attachBackend' in backing && backing.attachBackend)
           && !!('target' in backing && backing.target),
+        canWake: canWakeDormantBackendForAttach({
+          isAdopt,
+          probe: backing.probe,
+          realManagedSession: isRealManagedSession(s),
+          attachBackend: 'attachBackend' in backing ? backing.attachBackend : undefined,
+          target: 'target' in backing ? backing.target : undefined,
+        }),
       };
     });
   }
@@ -5559,6 +5699,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       footerLine = `${styledFooter('warn', selected.targetLabel, labelWidth)}\x1b[2m${fitLine(suffix, width)}\x1b[0m`;
     } else if (selected.canAttach) {
       footerLine = styledFooter('success', `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`, width);
+    } else if (selected.canWake) {
+      footerLine = styledFooter('warn', `${selected.targetLabel}（Enter 恢复并连接）`, width);
     } else {
       footerLine = styledFooter('dim', `${selected.targetLabel}（不可连接）`, width);
     }
@@ -5576,7 +5718,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     }
 
     // Keybinding hints
-    const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
+    const enterAction = selected?.canAttach ? '连接' : selected?.canWake ? '恢复' : '不可连接';
+    const fullHints = `↑/↓ 选择  ⏎ ${enterAction}  d 删除  q 退出`;
     const compactHints = '↑/↓ 选择  ⏎  d  q';
     const hints = displayWidth(fullHints) <= width ? fullHints : compactHints;
     process.stdout.write(`\n${footerPrefix()}${styledFooter('dim', hints, width)}\n`);
@@ -5600,15 +5743,23 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     };
     process.stdout.on('resize', onResize);
 
+    let deleteInFlight = false;
+    let wakeInFlight = false;
+    let wakeAbortController: AbortController | null = null;
+    let pickerClosed = false;
+
     function cleanup(): void {
+      if (pickerClosed) return;
+      pickerClosed = true;
+      wakeAbortController?.abort();
+      wakeAbortController = null;
+      process.stdin.off('data', onInput);
       process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
-
-    let deleteInFlight = false;
 
     async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
@@ -5648,8 +5799,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
-    process.stdin.on('data', async (key: string) => {
-      if (deleteInFlight) return;
+    async function onInput(key: string): Promise<void> {
+      // Exit always wins, including while the wake HTTP or backend probe is
+      // pending. cleanup aborts the shared deadline signal before restoring
+      // the terminal, so Ctrl-C/q/Esc can never be swallowed by in-flight work.
+      if (key === '\x03' || key === 'q' || key === '\x1b') {
+        cleanup();
+        resolve();
+        return;
+      }
+      if (deleteInFlight || wakeInFlight) return;
       // Delete confirmation mode
       if (confirmDelete) {
         confirmDelete = false;
@@ -5660,18 +5819,11 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           flash = { style: 'dim', text: '取消删除' };
         }
-        render();
+        if (!pickerClosed) render();
         return;
       }
 
       flash = null;
-
-      // Ctrl-C or q or Esc
-      if (key === '\x03' || key === 'q' || key === '\x1b') {
-        cleanup();
-        resolve();
-        return;
-      }
 
       if (rows.length === 0) {
         // No sessions left, only q works
@@ -5708,10 +5860,37 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           render();
           return;
         }
-        if (!selected.canAttach) {
+        if (!selected.canAttach && !selected.canWake) {
           flash = { style: 'warn', text: '该会话没有可连接的持久后端' };
           render();
           return;
+        }
+        if (selected.canWake) {
+          const target = selected.backendTarget;
+          if (!target) {
+            flash = { style: 'error', text: '恢复目标缺失' };
+            render();
+            return;
+          }
+          wakeInFlight = true;
+          const wakeController = new AbortController();
+          wakeAbortController = wakeController;
+          flash = { style: 'warn', text: `正在恢复 ${target.backendType}: ${persistentTargetDisplay(target)}…` };
+          render();
+          const recovered = await wakeDormantBackendForAttach({
+            target,
+            wake: context => requestDormantSessionWake(selected.session, context),
+            probe: probePersistentBackendTarget,
+            signal: wakeController.signal,
+          });
+          if (wakeAbortController === wakeController) wakeAbortController = null;
+          wakeInFlight = false;
+          if (pickerClosed) return;
+          if (!recovered.ok) {
+            flash = { style: 'error', text: `恢复失败: ${recovered.error}` };
+            render();
+            return;
+          }
         }
         if (selected.attachBackend === 'zmx') {
           const target = selected.backendTarget;
@@ -5756,7 +5935,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         resolve();
         return;
       }
-    });
+    }
+
+    process.stdin.on('data', onInput);
   });
 }
 

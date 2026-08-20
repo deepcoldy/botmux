@@ -148,8 +148,8 @@ import { parseCloseResidual, type ParsedCloseResidual } from './core/close-resid
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxInstallRoot } from './utils/install-info.js';
-import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot } from './utils/install-info.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
   fetchReleasesSince,
@@ -163,6 +163,14 @@ import {
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
 import { spawnDetachedRestart, globalInstallUpdateLockTarget } from './core/maintenance.js';
+import {
+  resolveLocalDevCheckoutDir,
+  resolveLocalDevRestartTarget,
+  isGitWorktree,
+  gitPorcelainStatus,
+  gitHeadSha,
+  localDevUpdateSteps,
+} from './utils/local-dev-update.js';
 import {
   detectGlobalInstallManager,
   formatGlobalInstallCommand,
@@ -190,7 +198,7 @@ import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflig
 // Host children the dashboard forks (start/stop-bot, global install). They live
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
-import { runGlobalInstall, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
+import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -889,6 +897,10 @@ interface ResolvedDashboardSettings {
   autoUpdateSupported: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
+  /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
+   *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
+   *  family, and the CLI authoring/run subcommands host-wide. */
+  workflow: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1494,6 +1506,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
+    workflow: { enabled: global.workflow?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
@@ -1580,6 +1593,15 @@ let updateInFlight = false;
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 
+// Local-dev counterpart: the checkout a successful /api/update/run built, and
+// its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
+// build's target — not a wrapper that a concurrent `pnpm use:here` in another
+// worktree may have re-pointed between the two requests (run builds B, wrapper
+// flips to C, restart would otherwise restart C or fall back to A). Cleared
+// once consumed by a restart. A plain "restart" (no preceding run) still
+// resolves the wrapper live.
+let pendingLocalDevRestart: { dir: string; head: string } | undefined;
+
 // Cache the upstream version/changelog lookups so the nav-badge check + the
 // Settings card don't hammer the npm registry / GitHub on every page load.
 // GitHub's unauthenticated API is only 60 req/h per IP, so caching the changelog
@@ -1655,6 +1677,42 @@ function currentInstalledVersion(): string {
   if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
   const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
   return version === '0.0.0' ? resolveCurrentVersion() : version;
+}
+
+/**
+ * Local-dev update: git-clean check (fail closed) → git pull --ff-only →
+ * pnpm build, all in the checkout the global wrapper points at. Mirrors the CLI
+ * `cmdUpgradeLocalDev` via the shared local-dev-update helpers. Returns the
+ * checkout dir, its version before/after, and whether HEAD advanced; the caller
+ * applies the restart through the existing lease/intent path. A successful
+ * build always requires a restart to take effect (dist/ is regenerated), which
+ * the caller signals independently of `changed`. Rejects with a stable `code`
+ * on the recoverable, UI-actionable failures.
+ */
+async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string }> {
+  const dir = resolveLocalDevCheckoutDir();
+  if (!isGitWorktree(dir)) {
+    throw Object.assign(new Error(`${dir} is not a git worktree`), { code: 'not_a_worktree', dir });
+  }
+  let status: string;
+  try {
+    status = gitPorcelainStatus(dir);
+  } catch (e) {
+    throw Object.assign(new Error(e instanceof Error ? e.message : String(e)), { code: 'git_status_failed', dir });
+  }
+  if (status) {
+    throw Object.assign(new Error('working tree has uncommitted changes'), {
+      code: 'dirty_worktree', dir, status,
+    });
+  }
+  const before = gitHeadSha(dir);
+  const oldVersion = resolveCurrentVersionAt(dir);
+  for (const { command, args } of localDevUpdateSteps()) {
+    await runLocalDevStep(dir, command, args);
+  }
+  const after = gitHeadSha(dir);
+  const newVersion = resolveCurrentVersionAt(dir);
+  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after };
 }
 
 /**
@@ -3934,6 +3992,7 @@ const server = createServer(async (req, res) => {
         ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
         lastCheckedAt: entry.lastCheckedAt,
       }));
+      const localDev = isLocalDevInstall();
       return jsonRes(res, 200, {
         current,
         latest,
@@ -3941,7 +4000,11 @@ const server = createServer(async (req, res) => {
         behind: !!latest && isNewerVersion(latest, current),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
-        localDevInstall: isLocalDevInstall(),
+        localDevInstall: localDev,
+        // Local-dev can self-update via git pull + build only when the checkout
+        // the wrapper points at is a real git worktree; otherwise the button
+        // stays disabled (there is nothing to pull).
+        localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
         updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
@@ -3970,7 +4033,60 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
-      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      // 本地 checkout：走 git pull --ff-only + pnpm build（与 CLI cmdUpgradeLocalDev
+      // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
+      // /api/update/restart 的 lease/intent 路径。
+      if (isLocalDevInstall()) {
+        const node = checkNode();
+        if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let result: { dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string } | undefined;
+        try {
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            result = await runLocalDevUpdate();
+          }, { maxWaitMs: 2_000 });
+        } catch (e) {
+          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          const code = (e as { code?: string }).code;
+          if (code === 'dirty_worktree') {
+            return jsonRes(res, 409, {
+              ok: false, error: 'dirty_worktree',
+              detail: (e as { status?: string }).status ?? '',
+              dir: (e as { dir?: string }).dir ?? '',
+            });
+          }
+          if (code === 'not_a_worktree') {
+            return jsonRes(res, 400, { ok: false, error: 'not_a_worktree', dir: (e as { dir?: string }).dir ?? '' });
+          }
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+        } finally {
+          updateInFlight = false;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        // Pin THIS build's checkout + HEAD so the follow-up restart applies it,
+        // even if the wrapper is re-pointed by a concurrent `use:here` before the
+        // user confirms the restart. Consumed (and re-verified) in /api/update/restart.
+        if (result) pendingLocalDevRestart = { dir: result.dir, head: result.head };
+        return jsonRes(res, 200, {
+          ok: true,
+          // Versions of the checkout we actually updated (may differ from the
+          // running process's install root when wrapper→B, dashboard runs A).
+          oldVersion: result?.oldVersion ?? '',
+          newVersion: result?.newVersion ?? '',
+          // changed = HEAD advanced (or version string changed) — for display.
+          changed: result?.changed === true || result?.oldVersion !== result?.newVersion,
+          // A successful build regenerates dist/, so a restart is ALWAYS needed
+          // to apply it — independent of whether HEAD moved (the checkout may
+          // have been pulled already and only needed a build).
+          restartRequired: true,
+          localDev: true,
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
         const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
@@ -4214,6 +4330,30 @@ const server = createServer(async (req, res) => {
         if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
       } catch { /* empty / bad body → plain restart */ }
       const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
+      // Resolve the local-dev restart target BEFORE claiming the lease so a
+      // fail-closed drift check can't leave a dangling lease. Prefer the plan a
+      // preceding /api/update/run pinned (dir + post-build HEAD); a plain manual
+      // restart (no pending plan) resolves the wrapper live. Verify the target's
+      // dist/cli.js exists and — for a pinned plan — that HEAD hasn't moved since
+      // the build; on drift/absence fail closed rather than restart the wrong tree.
+      let localDevRestartError: { status: number; body: Record<string, unknown> } | undefined;
+      let localDevTarget: string | undefined;
+      if (isLocalDevInstall()) {
+        const pinned = pendingLocalDevRestart;
+        pendingLocalDevRestart = undefined; // consume regardless of outcome
+        const decision = resolveLocalDevRestartTarget(pinned, resolveLocalDevCheckoutDir(), {
+          cliEntryExists: (dir) => existsSync(botmuxCliEntryAt(dir)),
+          headOf: (dir) => gitHeadSha(dir),
+        });
+        if (decision.action === 'fail') {
+          localDevRestartError = { status: 409, body: { ok: false, error: decision.reason, dir: decision.dir } };
+        } else if (decision.action === 'restart') {
+          localDevTarget = decision.dir;
+        } else {
+          localDevTarget = undefined; // fallback-running-root
+        }
+      }
+      if (localDevRestartError) return jsonRes(res, localDevRestartError.status, localDevRestartError.body);
       let acquired = false;
       let leaseId: string | null = null;
       let activePackageRoot: string | undefined;
@@ -4243,7 +4383,14 @@ const server = createServer(async (req, res) => {
             });
             return;
           }
-          activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          // Local-dev restarts from the target resolved above (pinned build's
+          // checkout, verified present + at the built HEAD); undefined falls back
+          // to this dashboard process's own cli.js via spawnDetachedRestart.
+          if (isLocalDevInstall()) {
+            activePackageRoot = localDevTarget;
+          } else {
+            activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          }
           // Send acknowledgement while holding the lock, then release immediately.
           // The lease itself prevents concurrent restarts — no need to hold the
           // lock across the network round-trip waiting for res.finish.

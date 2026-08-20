@@ -98,6 +98,19 @@ export interface VcMeetingAgentGlobalConfig {
   listenerBotAppId?: string;
 }
 
+export interface WorkflowFeatureGlobalConfig {
+  /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== false`
+   *  preserves the legacy behavior (feature ON). Set false to turn the whole
+   *  workflow feature off on this host: the `/workflow` grill + Saved-Workflow
+   *  run/save entries are refused, the `botmux-workflow` family of skills stops
+   *  being advertised/installed, and the CLI authoring/run subcommands refuse.
+   *  In-flight run management (cancel / retry / grant) stays available so a run
+   *  started before the flip can still be wound down. The multi-bot
+   *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
+   *  separate long-running-orchestration capability, not a v3 workflow. */
+  enabled?: boolean;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -128,6 +141,10 @@ export interface GlobalConfig {
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
   vcMeetingAgent?: VcMeetingAgentGlobalConfig;
+  /** Machine-wide v3 Workflow kill-switch. Missing / enabled !== false keeps
+   *  the feature ON (legacy behavior); set false to disable it host-wide. The
+   *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
+  workflow?: WorkflowFeatureGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
@@ -500,6 +517,14 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WorkflowFeatureGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   return join(homedir(), '.botmux', 'config.json');
 }
@@ -566,6 +591,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
+  const workflow = readWorkflowFeature(raw.workflow);
+  if (workflow) out.workflow = workflow;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
@@ -642,6 +669,28 @@ export function globalVcMeetingAgentListenerBotAppId(): string | undefined {
  *  URLs are emitted (see buildTerminalUrl / publicWebhookUrl). */
 export function isRemoteAccessEnabled(): boolean {
   return readGlobalConfig().remoteAccess === true;
+}
+
+/** Machine-wide v3 Workflow feature kill-switch.
+ *
+ * Missing / `workflow.enabled !== false` means ON (backwards compatible — the
+ * feature has always been on). An explicit `false` in `~/.botmux/config.json`
+ * disables it. The `BOTMUX_WORKFLOW_ENABLED` env var, when set to a non-empty
+ * value, OVERRIDES the config file either way (`true`/`1`/`yes`/`on` ⇒ enabled,
+ * anything else ⇒ disabled) — it is both the escape hatch if the config gate
+ * misfires and the channel the worker injects into CLI panes so a pane's
+ * `botmux workflow …` subcommand agrees with the daemon that spawned it.
+ *
+ * Read live off the short-TTL config cache so a dashboard toggle takes effect on
+ * the next session/turn without a daemon restart (mirrors whiteboardEnabled /
+ * isGlobalVcMeetingAgentEnabled). */
+export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_WORKFLOW_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().workflow?.enabled !== false;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

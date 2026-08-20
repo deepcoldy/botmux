@@ -94,7 +94,7 @@ import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeS
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
-import { fallbackTurnId } from '../../core/reply-target.js';
+import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -773,6 +773,7 @@ export async function commitRepoSelection(
         }
         current.streamCardId = undefined;
         current.streamCardNonce = undefined;
+        rehomeReplyTargetState(current);
         current.streamCardPending = undefined;
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;

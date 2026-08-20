@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -1660,6 +1660,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
+    s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
@@ -1672,6 +1673,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
+  s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
@@ -2081,6 +2083,7 @@ export async function restoreActiveSessions(
           adoptedFrom: adopted,
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
+          streamCardReplyTargetKey: session.streamCardReplyTargetKey,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -2285,6 +2288,7 @@ export async function restoreActiveSessions(
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
+      streamCardReplyTargetKey: session.streamCardReplyTargetKey,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -2487,6 +2491,13 @@ export async function restoreActiveSessions(
       );
       continue;
     }
+  }
+
+  // Re-arm persisted semantic-recovery timers only after the whole restore
+  // pass has registered collision winners. A zero-delay overdue backoff must
+  // not wake while a later row is still competing for the same route.
+  for (const ds of restoredByThisInvocation) {
+    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -2958,6 +2969,7 @@ export async function resumeSession(
     ownerOpenId: session.ownerOpenId,
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
+    streamCardReplyTargetKey: session.streamCardReplyTargetKey,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,

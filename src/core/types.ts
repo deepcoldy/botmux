@@ -17,6 +17,10 @@ import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
   messageId: string;      // Lark message_id for PATCHing
+  /** Stable visible destination of this card (`plain:oc_*`, `thread:om_*`, or
+   *  `quote:om_*`). Chat-scope sessions can move between multiple Lark topics;
+   *  cleanup must only withdraw predecessors from the same destination. */
+  replyTargetKey?: string;
   content: string;        // frozen text snapshot — kept so "导出文字" still works on historical cards
   title: string;          // turn title at freeze time
   /** Legacy boolean expand/collapse — kept for migrating old persisted cards. */
@@ -124,6 +128,26 @@ export interface DaemonSession {
   /** Per-session snapshot of the final-answer feedback policy. New config takes
    * effect on the next new/restarted session, matching sandbox send-cred state. */
   feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
+  /** Explicit per-trigger model override (trigger API `options.model`, codex
+   *  family only). Outranks the bot's configured model at spawn; everything
+   *  else resolves the model from the LIVE bot config on every spawn (see
+   *  sessionAgentConfig), so a dashboard edit reaches long sessions.
+   *
+   *  **In-memory only, deliberately.** The public contract is per-trigger /
+   *  fresh-spawn ("ignored when folding into an existing worker"), so it must
+   *  not outlive this daemon's view of the session: persisting it — which is
+   *  what the old `session.model` freeze did — turned a one-shot caller choice
+   *  into a permanent override that a later dashboard change could not undo.
+   *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
+   *  re-fork of the same session launches identically. */
+  spawnModelOverride?: string;
+  /** True while this session's worker sits in the crash-loop park state: its CLI
+   *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
+   *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
+   *  no restart IPC to refresh it. While set, message IPCs carry the freshly
+   *  resolved launch model so that recovery does not relaunch on a stale one.
+   *  Cleared when a worker generation reports ready. In-memory only. */
+  crashDiagnosticParked?: boolean;
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
@@ -253,6 +277,10 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
+  /** Visible Lark destination of the live streaming card. Unlike
+   * currentReplyTarget this remains bound to the card after a newer turn is
+   * accepted, so parking cannot attribute the predecessor to the new topic. */
+  streamCardReplyTargetKey?: string;
   streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
   /** Incremented for every worker status observation, including same-value
    *  edges. A screen update can land while the Feishu starting-card POST is
@@ -383,10 +411,13 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed';
+    status: 'pending' | 'completed' | 'failed';
     createdAt: number;
     completedAt?: number;
+    failedAt?: number;
     content?: string;
+    errorCode?: 'trigger_failed';
+    terminalErrorCode?: string;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;

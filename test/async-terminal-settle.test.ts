@@ -82,9 +82,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // Spy the durable store so we assert persistence intent without touching disk.
 const recordCompletedMock = vi.fn();
+const recordTerminalFailureStrictMock = vi.fn(() => 'written_failed');
 vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/services/async-trigger-store.js')>();
-  return { ...actual, recordCompleted: (...args: any[]) => recordCompletedMock(...args) };
+  return {
+    ...actual,
+    recordCompleted: (...args: any[]) => recordCompletedMock(...args),
+    recordTerminalFailureStrict: (...args: any[]) => recordTerminalFailureStrictMock(...args),
+  };
 });
 
 import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
@@ -111,7 +116,7 @@ function makeDs(): DaemonSession {
       updatedAt: Date.now(),
       pid: null,
       chatType: 'group',
-      cliId: 'codex',
+      cliId: 'claude-code',
     },
     worker: fakeWorker,
     workerPort: 0,
@@ -143,6 +148,8 @@ function terminalMsg(
 describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
   beforeEach(() => {
     recordCompletedMock.mockClear();
+    recordTerminalFailureStrictMock.mockClear();
+    recordTerminalFailureStrictMock.mockReturnValue('written_failed');
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
       getSessionWorkingDir: () => '/tmp',
@@ -190,18 +197,54 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(ds.idempotentAsyncTurns!.get('turn-bare')).toBeDefined(); // convergence entry intact
   });
 
-  it('does NOT settle on a failed terminal even if flagged (guard is status===completed)', async () => {
+  it('settles a failed terminal immediately and persists its provider code', async () => {
     const ds = makeDs();
     ds.asyncTriggerResults = new Map([['turn-failed', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([[
+      'turn-failed',
+      { ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1 } as any,
+    ]]);
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', terminalMsg('turn-failed', {
-      status: 'failed', errorCode: 'boom', outputDisposition: 'nothing_to_send',
+      status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true,
     }));
 
-    await new Promise(r => setTimeout(r, 20));
-    expect(ds.asyncTriggerResults!.get('turn-failed')!.status).toBe('pending');
+    await vi.waitFor(() => {
+      expect(ds.asyncTriggerResults!.get('turn-failed')).toMatchObject({
+        status: 'failed',
+        errorCode: 'trigger_failed',
+        terminalErrorCode: 'provider_unexpected_eof',
+      });
+    });
     expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(
+      'sid-async-settle',
+      'turn-failed',
+      expect.any(Number),
+      'app_test',
+      'provider_unexpected_eof',
+    );
+    expect(ds.idempotentAsyncTurns!.has('turn-failed')).toBe(false);
+  });
+
+  it('rejects an HTTP wait immediately with the structured provider failure', async () => {
+    const ds = makeDs();
+    ds.chatId = 'http_wait_fixture';
+    const resolve = vi.fn();
+    const reject = vi.fn();
+    ds.pendingWaitPromises = new Map([['turn-wait', { resolve, reject }]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-wait', {
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    }));
+
+    await vi.waitFor(() => expect(reject).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Claude turn failed: provider_server_error' }),
+    ));
+    expect(resolve).not.toHaveBeenCalled();
+    expect(ds.pendingWaitPromises.has('turn-wait')).toBe(false);
   });
 
   it('does NOT clobber a final_output-completed result (pending-only guard)', async () => {
@@ -218,6 +261,26 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(r.status).toBe('completed');
     expect(r.content).toBe('real answer');       // NOT overwritten with ''
     expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps final_output completion stronger than a later failed terminal', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([[
+      'turn-output-won',
+      { status: 'completed', content: 'real answer', completedAt: Date.now() } as any,
+    ]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-output-won', {
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    }));
+
+    await new Promise(r => setTimeout(r, 20));
+    expect(ds.asyncTriggerResults.get('turn-output-won')).toMatchObject({
+      status: 'completed',
+      content: 'real answer',
+    });
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
   });
 
   it('is a no-op for a Feishu turn (no asyncTriggerResults entry)', async () => {

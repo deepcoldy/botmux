@@ -678,6 +678,113 @@ describe('createFeishuOpenPlatformApp', () => {
     expect(result).toMatchObject({ ok: false, reason: 'session_changed' });
     expect(post).not.toHaveBeenCalled();
   });
+
+  // 应用已建成后,启用能力/发版/读 Secret 这几步撞宿主机↔飞书的瞬态网络抖动
+  // (undici `fetch failed`),此前一次失败就把整条链路判死,用户被丢进「应用已创建
+  // 但配置尚未完成」的手动恢复。幂等步骤(robot/switch、读 Secret)现在小步重试自愈,
+  // 非幂等写(app_version/create、publish/commit)保持一次即抛,不重复提交。
+  const transientCreateError = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+
+  // 复用第一条 happy-path 的建应用流程,允许对指定 path 的前 N 次调用注入瞬态错误。
+  function createAppFetchImpl(
+    calls: string[],
+    inject: (path: string, attempt: number) => void = () => {},
+  ): typeof fetch {
+    const attempts = new Map<string, number>();
+    return (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      calls.push(path);
+      const attempt = (attempts.get(path) ?? 0) + 1;
+      attempts.set(path, attempt);
+      inject(path, attempt); // 可 throw 瞬态错误
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 0, data: { clientID: 'cli_created' } });
+      }
+      if (path === '/developers/v1/app_version/create/cli_created') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
+      if (path === '/developers/v1/secret/cli_created') {
+        return Response.json({ code: 0, data: { secret: 'created-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+  }
+
+  it('建成后读 Secret 撞一次瞬态网络错误能自愈,不再把用户丢进手动恢复', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-secret-retry-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const fetchImpl = createAppFetchImpl(calls, (path, attempt) => {
+      if (path === '/developers/v1/secret/cli_created' && attempt === 1) throw transientCreateError();
+    });
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-secret-retry',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+      onQrCode: () => {},
+    });
+
+    expect(result).toMatchObject({ ok: true, appId: 'cli_created', appSecret: 'created-secret' });
+    // secret 读取重试了一次(首次 + 重试);version/create 只发一次(未受影响)
+    expect(calls.filter(p => p === '/developers/v1/secret/cli_created')).toHaveLength(2);
+    expect(calls.filter(p => p === '/developers/v1/app_version/create/cli_created')).toHaveLength(1);
+  });
+
+  it('建成后启用机器人能力(robot/switch)撞一次瞬态网络错误能自愈', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-robot-retry-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const fetchImpl = createAppFetchImpl(calls, (path, attempt) => {
+      if (path === '/developers/v1/robot/switch/cli_created' && attempt === 1) throw transientCreateError();
+    });
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-robot-retry',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+      onQrCode: () => {},
+    });
+
+    expect(result).toMatchObject({ ok: true, appId: 'cli_created', appSecret: 'created-secret' });
+    expect(calls.filter(p => p === '/developers/v1/robot/switch/cli_created')).toHaveLength(2);
+  });
+
+  it('非幂等的上架发版(app_version/create)传输错误一次即抛,绝不重试重复建版', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-version-noretry-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const fetchImpl = createAppFetchImpl(calls, (path) => {
+      // 每次都抛:若被误当幂等重试,calls 里会出现多次
+      if (path === '/developers/v1/app_version/create/cli_created') throw transientCreateError();
+    });
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-version-noretry',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+      onQrCode: () => {},
+    });
+
+    // 应用已建成但发版失败:带 appId 供调用方兜底/提示(手动恢复路径)
+    expect(result).toMatchObject({ ok: false, reason: 'api_error', appId: 'cli_created' });
+    expect(calls.filter(p => p === '/developers/v1/app_version/create/cli_created')).toHaveLength(1);
+  });
 });
 
 describe('automateOpenPlatformSetup', () => {
