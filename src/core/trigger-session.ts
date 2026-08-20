@@ -687,8 +687,8 @@ function buildExistingSessionContent(
   const botCfg = getBot(larkAppId).config;
   return buildFollowUpCliInput(prompt, ds.session.sessionId, {
     isAdoptMode: false,
-    cliId: ds.session.cliId ?? botCfg.cliId,
-    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     locale: localeForBot(larkAppId),
     larkAppId,
     chatId,
@@ -1730,8 +1730,8 @@ async function triggerSessionTurnAdmitted(
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
-    bot.config.cliId,
-    bot.config.cliPathOverride,
+    session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+    session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
     undefined,
     undefined,
     availableBots,

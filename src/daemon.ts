@@ -16389,8 +16389,8 @@ function buildReservedInitialInput(
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
-    ds.session.cliId ?? botCfg.cliId,
-    ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     ds.pendingAttachments,
     ds.pendingMentions,
     availableBots,
@@ -16524,7 +16524,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
   const buffered = [...(ds.pendingFollowUps ?? [])];
   if (buffered.length > 0) {
     const bot = getBot(ds.larkAppId);
-    const cliId = ds.session.cliId ?? bot.config.cliId;
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
     const rawCodexText = (ds.pendingCodexAppFollowUps ?? []).join('\n\n');
     const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
     const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
@@ -16535,7 +16535,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
       ds.session.sessionId,
       {
         cliId,
-        cliPathOverride: ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
         locale: localeForBot(ds.larkAppId),
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
@@ -17170,10 +17170,14 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
   const noticeKey = ctx.ingressAdmission?.admitted
     ? 'daemon.ordinary_ingress_admitted_reply_failed'
     : 'daemon.ordinary_ingress_failed';
+  const cliSelectionRejected = err instanceof Error && err.message.startsWith('CLI selection rejected:');
+  const notice = cliSelectionRejected
+    ? `⚠️ ${err.message}\n\n可直接发给当前 agent：\n请帮我修复 botmux 的 CLI 选择配置：检查当前 bot 的 env、Riff 和 codexRpcInput 设置，移除与会话级 /cli <cliId> 选择冲突的配置；不要修改代码，完成后告诉我具体改了什么。`
+    : tr(noticeKey, undefined, localeForBot(ctx.larkAppId));
   try {
     await sessionReply(
       replyAnchor,
-      tr(noticeKey, undefined, localeForBot(ctx.larkAppId)),
+      notice,
       'text',
       ctx.larkAppId,
     );
@@ -18952,7 +18956,9 @@ async function handleThreadReplyAdmitted(
     // config. Route passthrough capability from that frozen runtime so changing
     // `/botconfig cli` cannot make an old Codex App session receive raw_input
     // (or make an old interactive TUI lose its native slash commands).
-    const passthroughCliId = existingDs?.session.cliId ?? getBot(larkAppId).config.cliId;
+    const passthroughCliId = existingDs?.session.cliLaunchSnapshot?.cliId
+      ?? existingDs?.session.cliId
+      ?? getBot(larkAppId).config.cliId;
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
@@ -19356,8 +19362,8 @@ async function handleThreadReplyAdmitted(
         attachments,
         mentions: parsed.mentions,
         isAdoptMode: false,
-        cliId: ds.session.cliId ?? botCfg.cliId,
-        cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
         sender: await getThreadSender(),
         larkAppId,
         chatId: ds.session.chatId,
@@ -19496,7 +19502,7 @@ async function handleThreadReplyAdmitted(
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliId ?? botCfg.cliId,
+          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
           cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
           sender: followUpSender,
           larkAppId,
@@ -19848,7 +19854,7 @@ async function handleThreadReplyAdmitted(
     const isBridge = !!ds.adoptedFrom;
     const selfBot = getBot(ds.larkAppId);
     if (!isBridge) ensureSessionWhiteboard(ds);
-    const effectiveCliId = ds.session.cliId ?? dsBotCfgForMsg.cliId;
+    const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForMsg.cliId;
     // Empty-started session (repo select/skip/switch booted the CLI with no
     // turn): a LIVE worker is not proof the CLI ever saw botmux's opening
     // context — only `buildNewTopicCliInput` emits <botmux_routing> /
@@ -19988,7 +19994,7 @@ async function handleThreadReplyAdmitted(
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
+          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
           cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
           sender: await getThreadSender(),
           larkAppId,
@@ -20130,8 +20136,8 @@ async function handleThreadReplyAdmitted(
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
-        ds.session.cliId ?? dsBotCfgForFork.cliId,
-        ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         attachments,
         parsed.mentions,
         openingBots,
@@ -20153,8 +20159,8 @@ async function handleThreadReplyAdmitted(
       const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
         attachments: queuedHasDurableTail ? undefined : attachments,
         mentions: queuedHasDurableTail ? undefined : parsed.mentions,
-        cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
-        cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         sender: queuedHasDurableTail ? undefined : reforkSender,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
