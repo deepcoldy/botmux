@@ -1274,8 +1274,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
     if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
       return jsonRes(res, 409, { ok: false, error: 'adopt_wake_unsupported' });
     }
-    if (isRiffBackendSession(ds)) {
-      return jsonRes(res, 409, { ok: false, error: 'riff_wake_unsupported' });
+    if (isRemoteBackendSession(ds)) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'remote_wake_unsupported',
+        message: t('cmd.wake.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
+      });
     }
     if (rejectProtectedSessionMutation(res, [ds])) return;
 

@@ -1939,6 +1939,34 @@ describe('POST /api/sessions/:sessionId/wake', () => {
     }
   });
 
+  it('refuses to wake a remote-backend (riff/mojo) session — the lineage is not a local pane to fork-resume', async () => {
+    // Regression guard for the generalized remote predicate: a remote session's
+    // worker-less row must NOT be fork-resumed by `botmux ls` wake (a riff-only
+    // guard here would let a mojo session slip through — the exact class the
+    // remote-retirement guards were hardened against).
+    const ds = {
+      session: { sessionId: 's-list-wake-remote', cliId: 'riff', backendType: 'riff' },
+      initConfig: { backendType: 'riff' },
+      worker: null,
+      adoptedFrom: undefined,
+      hasHistory: true,
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockReturnValue(true);
+
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-list-wake-remote/wake`, { method: 'POST' });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'remote_wake_unsupported' });
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  });
+
   it('does not restart a live worker when a Lark wake races the local picker', async () => {
     const send = vi.fn();
     const ds = {

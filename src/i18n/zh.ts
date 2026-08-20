@@ -306,6 +306,7 @@ export const messages: Record<string, string> = {
   'cmd.cd.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
   'cmd.takeover.riff_unsupported': '⚠️ Riff 会话不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
   'cmd.takeover.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
+  'cmd.wake.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持从 `botmux ls` 唤醒：远端 lineage 不在本地 pane 中，无法本地 fork 恢复。请直接向该会话发送新消息以继续。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
   'cmd.cd.created_switched': '📁 目录不存在，已自动创建并切换到 {path}，下次发消息时将在新目录下恢复。',

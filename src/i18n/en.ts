@@ -305,6 +305,7 @@ export const messages: Record<string, string> = {
   'cmd.cd.remote_unsupported': '⚠️ Remote-backend sessions (Riff / Mojo) cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
   'cmd.takeover.riff_unsupported': '⚠️ Riff sessions cannot adopt or import another session in place. Use /close to safely close the current remote session, then create or import a session.',
   'cmd.takeover.remote_unsupported': '⚠️ Remote-backend sessions (Riff / Mojo) cannot adopt or import another session in place. Use /close to safely close the current remote session, then create or import a session.',
+  'cmd.wake.remote_unsupported': '⚠️ Remote-backend sessions (Riff / Mojo) cannot be woken from `botmux ls`: the remote lineage is not held in a local pane, so it cannot be fork-resumed locally. Send a new message to that session to continue it.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',
   'cmd.cd.created_switched': '📁 Directory did not exist — created it and switched to {path}. It will resume there on your next message.',
