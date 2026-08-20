@@ -103,6 +103,22 @@ afterEach(() => {
 });
 
 describe('card-handler resume receipt', () => {
+  // The resume flow reposts the live streaming card FIRST (sessionReply with an
+  // interactive card body) and then sends the "会话已恢复 / 新起干净会话" text
+  // receipt from a background task. So the receipt is no longer sessionReply
+  // call[0] — it is the TEXT call among the sessionReply calls. Extract it by
+  // content-type/shape rather than position, after letting the background task
+  // (a fire-and-forget async IIFE) flush.
+  const flushBackground = () => new Promise(resolve => setTimeout(resolve, 50));
+  const textReceipt = (sessionReply: ReturnType<typeof vi.fn>): string => {
+    const textCalls = sessionReply.mock.calls
+      .map(c => String(c[1] ?? ''))
+      .filter(body => !body.trimStart().startsWith('{')); // drop the card JSON repost
+    return textCalls.join('\n');
+  };
+  const repostedCardCount = (sessionReply: ReturnType<typeof vi.fn>): number =>
+    sessionReply.mock.calls.filter(c => String(c[1] ?? '').trimStart().startsWith('{')).length;
+
   it('copilot session without a cliSessionId: receipt says the next message starts a fresh session', async () => {
     const { handler, resumeSession: mockedResume } = await fresh();
     mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot') });
@@ -110,9 +126,12 @@ describe('card-handler resume receipt', () => {
     const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await flushBackground();
 
     expect(mockedResume).toHaveBeenCalledWith('sess-resume-1', deps.activeSessions);
-    const receipt = sessionReply.mock.calls[0]?.[1] as string;
+    // The live streaming card is reposted before the text receipt.
+    expect(repostedCardCount(sessionReply)).toBe(1);
+    const receipt = textReceipt(sessionReply);
     expect(receipt).toContain('话题路由已重新激活');
     expect(receipt).toContain('新起干净会话');
     // Must NOT claim the history session is back.
@@ -126,8 +145,10 @@ describe('card-handler resume receipt', () => {
     const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await flushBackground();
 
-    const receipt = sessionReply.mock.calls[0]?.[1] as string;
+    expect(repostedCardCount(sessionReply)).toBe(1);
+    const receipt = textReceipt(sessionReply);
     expect(receipt).toContain('会话已恢复');
     expect(receipt).not.toContain('新起干净会话');
   });
@@ -139,8 +160,10 @@ describe('card-handler resume receipt', () => {
     const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await flushBackground();
 
-    const receipt = sessionReply.mock.calls[0]?.[1] as string;
+    expect(repostedCardCount(sessionReply)).toBe(1);
+    const receipt = textReceipt(sessionReply);
     expect(receipt).toContain('会话已恢复');
     expect(receipt).not.toContain('新起干净会话');
   });
