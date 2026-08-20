@@ -13,6 +13,9 @@
 
 Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
+> ⚠️ **前置条件：这台机器要先做过「lark-cli 按 bot 拆配置」** —— 见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。
+> 白名单 deny 掉了共享的 `~/.lark-cli` 与 macOS keystore，只放行本 bot 的 `~/.lark-cli-bots/<自己appId>`；没配过的机器上，沙盒内所有 `lark-cli` 命令会以 `not configured` / `operation not permitted` 失败。
+
 ## 工作原理
 
 ```
