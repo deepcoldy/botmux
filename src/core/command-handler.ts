@@ -3,17 +3,18 @@
  * Extracted from daemon.ts for modularity.
  */
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
-import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
-import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
@@ -94,6 +95,7 @@ import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
+import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -338,11 +340,182 @@ export function resolveRepoSelection(
  * Returns null for anything else, so callers can fall through to the regular
  * `parseSlashCommandInvocation` / message-handling path.
  */
-export function parseForceTopicInvocation(content: string): { prompt: string } | null {
+
+function resolveCurrentChatWorkingDirForRepo(ds: DaemonSession | undefined, loc: ReturnType<typeof localeForBot>): string | undefined {
+  const current = ds?.workingDir ? validateWorkingDir(ds.workingDir, loc) : undefined;
+  if (current?.ok) return current.resolvedPath;
+  const oncall = ds ? findOncallChat(ds.larkAppId, ds.chatId)?.workingDir : undefined;
+  const resolvedOncall = oncall ? validateWorkingDir(oncall, loc) : undefined;
+  if (resolvedOncall?.ok) return resolvedOncall.resolvedPath;
+  if (!ds) return undefined;
+  const peers = sessionStore.findActiveChatScopeSessionsByChat(ds.chatId);
+  for (const peer of peers) {
+    if (!peer.workingDir) continue;
+    const resolved = validateWorkingDir(peer.workingDir, loc);
+    if (resolved.ok) return resolved.resolvedPath;
+  }
+  return undefined;
+}
+
+
+/** One row per session for the confirm-card table. Reuses botDisplayName so the
+ *  peer-name fallback (own config → bots-info.json → appId) still applies; the
+ *  current session is tagged so the user can tell it apart. */
+function closeWorktreeSessionRow(
+  s: import('../types.js').Session,
+  isCurrent: boolean,
+  loc: Locale,
+): { bot: string; task: string } {
+  const botName = s.larkAppId ? botDisplayName(s.larkAppId) : t('cmd.close.worktree_bot_unknown', undefined, loc);
+  const preview = (s.currentTurnTitle || s.lastUserPrompt || s.title || s.sessionId || '—')
+    .replace(/\s*\n+\s*/g, ' ')
+    .slice(0, 60) || '—';
+  return {
+    bot: isCurrent ? `${botName} ${t('cmd.close.worktree_current_tag', undefined, loc)}` : botName,
+    task: preview,
+  };
+}
+
+/** Compact inline detail cell for dirty files / unpushed commits (backticked,
+ *  space-separated, clipped). Only rendered when the list is non-empty. */
+function closeWorktreeInlineDetail(items: string[], limit = 6): string {
+  const visible = items.slice(0, limit).map(item => `\`${item}\``);
+  if (items.length > limit) visible.push(`… +${items.length - limit}`);
+  return `　${visible.join('　')}`;
+}
+
+function closeWorktreeConfirmationState(args: {
+  sessionId: string;
+  worktreeDir: string;
+  siblingSessionIds: string[];
+  safetyFingerprint: string;
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      sessionId: args.sessionId,
+      worktreeDir: resolve(args.worktreeDir),
+      siblingSessionIds: [...args.siblingSessionIds].sort(),
+      safetyFingerprint: args.safetyFingerprint,
+    }))
+    .digest('hex');
+}
+
+function buildCloseWorktreeConfirmCard(args: {
+  rootId: string;
+  sessionId: string;
+  worktreeDir: string;
+  sessions: import('../types.js').Session[];
+  dirty: boolean;
+  dirtyFiles: string[];
+  ahead: number;
+  unpushedCommits: string[];
+  invokerOpenId: string;
+  confirmationState: string;
+  loc: Locale;
+}): string {
+  const { loc } = args;
+  const hasRisk = args.dirty || args.ahead > 0;
+
+  const rows = args.sessions.map((s, i) => closeWorktreeSessionRow(s, i === 0, loc));
+
+  // Safety checks: one compact line each; a detail line follows only when the
+  // corresponding list is non-empty, so a clean worktree never prints "none\nnone".
+  const checkLines: string[] = [
+    args.dirty
+      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyFiles.length) }, loc)
+      : t('cmd.close.worktree_check_dirty_ok', undefined, loc),
+  ];
+  if (args.dirty && args.dirtyFiles.length) checkLines.push(closeWorktreeInlineDetail(args.dirtyFiles));
+  checkLines.push(
+    args.ahead > 0
+      ? t('cmd.close.worktree_check_ahead_warn', { n: String(args.ahead) }, loc)
+      : t('cmd.close.worktree_check_ahead_ok', undefined, loc),
+  );
+  if (args.ahead > 0 && args.unpushedCommits.length) checkLines.push(closeWorktreeInlineDetail(args.unpushedCommits));
+
+  const elements = [
+    {
+      tag: 'markdown',
+      content: `**🗂️ ${t('cmd.close.worktree_confirm_path_label', undefined, loc)}**\n\`${args.worktreeDir}\``,
+    },
+    {
+      tag: 'markdown',
+      content: `**💬 ${t('cmd.close.worktree_confirm_sessions', { count: String(args.sessions.length) }, loc)}**`,
+    },
+    {
+      tag: 'table',
+      page_size: 10,
+      row_height: 'low',
+      header_style: {
+        text_align: 'left', text_size: 'normal', background_style: 'grey',
+        text_color: 'default', bold: true, lines: 1,
+      },
+      columns: [
+        { name: 'bot', display_name: t('cmd.close.worktree_col_bot', undefined, loc), data_type: 'text', width: '140px' },
+        { name: 'task', display_name: t('cmd.close.worktree_col_task', undefined, loc), data_type: 'text', width: 'auto' },
+      ],
+      rows,
+    },
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content: `**🔎 ${t('cmd.close.worktree_checks_label', undefined, loc)}**\n${checkLines.join('\n')}`,
+    },
+    {
+      tag: 'markdown',
+      content: `<font color='grey'>${t(hasRisk ? 'cmd.close.worktree_confirm_effect' : 'cmd.close.worktree_effect_safe', undefined, loc)}</font>`,
+    },
+    {
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
+        type: 'danger',
+        value: {
+          action: 'close_worktree_confirm',
+          root_id: args.rootId,
+          session_id: args.sessionId,
+          invoker_open_id: args.invokerOpenId,
+          confirmation_state: args.confirmationState,
+        },
+      }],
+    },
+  ];
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true, wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `⚠️ ${t('cmd.close.worktree_confirm_title', undefined, loc)}` },
+      template: hasRisk ? 'red' : 'orange',
+    },
+    body: { direction: 'vertical', elements },
+  });
+}
+
+export type ForceTopicMode = 'default' | 'here' | 'worktree';
+
+export function parseForceTopicInvocation(content: string): { prompt: string; mode: ForceTopicMode } | null {
   const trimmed = content.replace(/^\s+/, '');
+  const aliasMatch = /^\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  if (aliasMatch) {
+    return {
+      prompt: (aliasMatch[2] ?? '').trim(),
+      mode: aliasMatch[1].toLowerCase() === 'tw' ? 'worktree' : 'here',
+    };
+  }
+
   const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
   if (!match) return null;
-  return { prompt: (match[2] ?? '').trim() };
+  const rawPrompt = (match[2] ?? '').trim();
+  const variant = /^(here|worktree)(?:\s+([\s\S]*))?$/i.exec(rawPrompt);
+  if (variant) {
+    return {
+      prompt: (variant[2] ?? '').trim(),
+      mode: variant[1].toLowerCase() === 'worktree' ? 'worktree' : 'here',
+    };
+  }
+  return { prompt: rawPrompt, mode: 'default' };
 }
 
 /** Parse a user-authored slash command after leading @mentions have already
@@ -408,6 +581,14 @@ function botDisplayName(larkAppId: string): string {
     const bot = getBot(larkAppId);
     return bot.botName ?? getCliDisplayName(bot.config.cliId) ?? larkAppId;
   } catch {
+    try {
+      const p = join(config.session.dataDir, 'bots-info.json');
+      if (existsSync(p)) {
+        const entries: Array<{ larkAppId?: string; botName?: string | null; cliId?: string | null }> = JSON.parse(readFileSync(p, 'utf-8'));
+        const found = entries.find(e => e.larkAppId === larkAppId);
+        return found?.botName || found?.cliId || larkAppId;
+      }
+    } catch { /* fall through */ }
     return larkAppId;
   }
 }
@@ -1345,7 +1526,68 @@ export async function handleCommand(
   try {
     switch (cmd) {
       case '/close': {
+        const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
+        const closeTokens = closeArg.split(/\s+/).filter(Boolean);
+        const removeWorktree = /^(wt|worktree)$/i.test(closeTokens[0] ?? '');
+        const confirmedWorktreeCleanup = removeWorktree && closeTokens.includes('--yes');
+        const expectedWorktreeState = closeTokens.find(token => token.startsWith('--state='))?.slice('--state='.length);
         if (ds) {
+          const worktreeDir = ds.workingDir ?? ds.session.workingDir;
+          let worktreeMain: string | undefined;
+          let siblingSessions: import('../types.js').Session[] = [];
+          if (removeWorktree) {
+            if (ds.scope !== 'thread') {
+              await sessionReply(rootId, t('cmd.close.worktree_thread_only', undefined, loc));
+              break;
+            }
+            if (!worktreeDir || !(await isLinkedWorktree(worktreeDir))) {
+              await sessionReply(rootId, t('cmd.close.worktree_not_linked', undefined, loc));
+              break;
+            }
+            worktreeMain = await mainWorktreeFor(worktreeDir);
+            siblingSessions = sessionStore.findActiveSessionsByWorkingDir(worktreeDir)
+              .filter(s => s.sessionId !== ds.session.sessionId);
+            const safety = await worktreeSafetyStatus(worktreeDir);
+            const confirmationState = closeWorktreeConfirmationState({
+              sessionId: ds.session.sessionId,
+              worktreeDir,
+              siblingSessionIds: siblingSessions.map(s => s.sessionId),
+              safetyFingerprint: safety.fingerprint,
+            });
+            if (confirmedWorktreeCleanup && expectedWorktreeState && expectedWorktreeState !== confirmationState) {
+              await sessionReply(rootId, t('cmd.close.worktree_state_changed', undefined, loc));
+              await sessionReply(rootId, buildCloseWorktreeConfirmCard({
+                rootId,
+                sessionId: ds.session.sessionId,
+                worktreeDir,
+                sessions: [ds.session, ...siblingSessions],
+                dirty: safety.dirty,
+                dirtyFiles: safety.dirtyFiles,
+                ahead: safety.ahead,
+                unpushedCommits: safety.unpushedCommits,
+                invokerOpenId: message.senderId,
+                confirmationState,
+                loc,
+              }), 'interactive');
+              break;
+            }
+            if ((siblingSessions.length > 0 || safety.dirty || safety.ahead > 0) && !confirmedWorktreeCleanup) {
+              await sessionReply(rootId, buildCloseWorktreeConfirmCard({
+                rootId,
+                sessionId: ds.session.sessionId,
+                worktreeDir,
+                sessions: [ds.session, ...siblingSessions],
+                dirty: safety.dirty,
+                dirtyFiles: safety.dirtyFiles,
+                ahead: safety.ahead,
+                unpushedCommits: safety.unpushedCommits,
+                invokerOpenId: message.senderId,
+                confirmationState,
+                loc,
+              }), 'interactive');
+              break;
+            }
+          }
           const targetSessionId = ds.session.sessionId;
           const closed = await withBotTurnMutation(ds.larkAppId, async () => {
             // Re-resolve the exact session after all peer admissions drain. A
@@ -1450,7 +1692,58 @@ export async function handleCommand(
             () => sessionReply(rootId, closed.card, 'interactive'),
             deps.invocationReplyTarget,
           );
-          logger.info(`[${logTag}] Session closed by /close command`);
+          if (removeWorktree && worktreeMain && worktreeDir) {
+            let closedSiblings = 0;
+            const siblingCloseFailures: string[] = [];
+            for (const sibling of siblingSessions) {
+              if (!sibling.larkAppId) continue;
+              if (sibling.larkAppId === ds.larkAppId) {
+                try {
+                  const result = await closeWorkerPoolSession(sibling.sessionId);
+                  if (result.ok && result.outcome === 'closed') closedSiblings++;
+                  else siblingCloseFailures.push(sibling.sessionId);
+                } catch (err) {
+                  logger.warn(`[${logTag}] failed to close sibling session ${sibling.sessionId}: ${err instanceof Error ? err.message : err}`);
+                  siblingCloseFailures.push(sibling.sessionId);
+                }
+                continue;
+              }
+              const daemon = findOnlineDaemon(sibling.larkAppId);
+              if (!daemon) {
+                logger.warn(`[${logTag}] sibling session ${sibling.sessionId} owner daemon offline (app=${sibling.larkAppId})`);
+                siblingCloseFailures.push(sibling.sessionId);
+                continue;
+              }
+              try {
+                const res = await fetchDaemonIpc(daemon.ipcPort, `/api/sessions/${encodeURIComponent(sibling.sessionId)}/close`, { method: 'POST' });
+                const body = await res.json().catch(() => undefined);
+                const residual = res.ok ? parseCloseResidual(body) : undefined;
+                if (res.ok && !residual) closedSiblings++;
+                else {
+                  const reason = residual ? `residual=${describeCloseResidual(residual)}` : `http_${res.status}`;
+                  logger.warn(`[${logTag}] sibling close ${sibling.sessionId} not fully closed: ${reason}`);
+                  siblingCloseFailures.push(sibling.sessionId);
+                }
+              } catch (err) {
+                logger.warn(`[${logTag}] sibling close ${sibling.sessionId} threw: ${err instanceof Error ? err.message : err}`);
+                siblingCloseFailures.push(sibling.sessionId);
+              }
+            }
+            if (siblingCloseFailures.length > 0) {
+              await sessionReply(rootId, t('cmd.close.worktree_sibling_close_failed', {
+                path: worktreeDir,
+                count: String(siblingCloseFailures.length),
+              }, loc));
+              break;
+            }
+            try {
+              await removeRepoWorktree(worktreeMain, worktreeDir);
+              await sessionReply(rootId, t('cmd.close.worktree_removed', { path: worktreeDir, count: closedSiblings }, loc));
+            } catch (err) {
+              await sessionReply(rootId, t('cmd.close.worktree_remove_failed', { path: worktreeDir, error: err instanceof Error ? err.message : String(err) }, loc));
+            }
+          }
+          logger.info(`[${logTag}] Session closed by /close command${removeWorktree ? ' with worktree cleanup' : ''}`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
@@ -2143,6 +2436,16 @@ export async function handleCommand(
         // harmless, so it stays open.)
         if ((ds?.worktreeCreating || ds?.pendingRepoCommitInFlight) && (repoArg || ds?.pendingRepo)) {
           await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
+          break;
+        }
+
+        if (repoArg && /^here$/i.test(repoArg)) {
+          const currentDir = resolveCurrentChatWorkingDirForRepo(ds, loc);
+          if (!currentDir) {
+            await sessionReply(rootId, t('cmd.repo.here_missing', undefined, loc));
+            break;
+          }
+          await commitRepoSelection(currentDir, basename(currentDir), '/repo here');
           break;
         }
 

@@ -157,6 +157,8 @@ vi.mock('../src/services/session-store.js', () => ({
   })),
   updateSession: vi.fn(),
   getSession: vi.fn(() => undefined),
+  findActiveChatScopeSessionsByChat: vi.fn(() => []),
+  findActiveSessionsByWorkingDir: vi.fn(() => []),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
 
@@ -186,6 +188,10 @@ vi.mock('../src/services/project-scanner.js', () => ({
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
   pushWorktreeBranch: vi.fn(async () => {}),
+  isLinkedWorktree: vi.fn(async () => false),
+  mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
+  removeRepoWorktree: vi.fn(async () => {}),
+  worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -519,7 +525,7 @@ import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
-import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
@@ -1281,29 +1287,39 @@ describe('parseSlashCommandInvocation', () => {
 
 describe('parseForceTopicInvocation', () => {
   it('parses /t with prompt', () => {
-    expect(parseForceTopicInvocation('/t 帮我看看 X')).toEqual({ prompt: '帮我看看 X' });
+    expect(parseForceTopicInvocation('/t 帮我看看 X')).toEqual({ prompt: '帮我看看 X', mode: 'default' });
   });
 
   it('parses /topic with prompt', () => {
-    expect(parseForceTopicInvocation('/topic 帮我看看 Y')).toEqual({ prompt: '帮我看看 Y' });
+    expect(parseForceTopicInvocation('/topic 帮我看看 Y')).toEqual({ prompt: '帮我看看 Y', mode: 'default' });
   });
 
   it('parses bare /t (no args) with empty prompt', () => {
-    expect(parseForceTopicInvocation('/t')).toEqual({ prompt: '' });
+    expect(parseForceTopicInvocation('/t')).toEqual({ prompt: '', mode: 'default' });
   });
 
   it('parses bare /topic (no args) with empty prompt', () => {
-    expect(parseForceTopicInvocation('/topic')).toEqual({ prompt: '' });
+    expect(parseForceTopicInvocation('/topic')).toEqual({ prompt: '', mode: 'default' });
   });
 
   it('is case-insensitive on the command itself', () => {
-    expect(parseForceTopicInvocation('/T hello')).toEqual({ prompt: 'hello' });
-    expect(parseForceTopicInvocation('/Topic hello')).toEqual({ prompt: 'hello' });
+    expect(parseForceTopicInvocation('/T hello')).toEqual({ prompt: 'hello', mode: 'default' });
+    expect(parseForceTopicInvocation('/Topic hello')).toEqual({ prompt: 'hello', mode: 'default' });
   });
 
   it('preserves multiline prompt content verbatim after the prefix', () => {
     const content = '/t line1\nline2\nline3';
-    expect(parseForceTopicInvocation(content)).toEqual({ prompt: 'line1\nline2\nline3' });
+    expect(parseForceTopicInvocation(content)).toEqual({ prompt: 'line1\nline2\nline3', mode: 'default' });
+  });
+
+
+
+  it('parses cwd and worktree variants', () => {
+    expect(parseForceTopicInvocation('/t here 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
+    expect(parseForceTopicInvocation('/topic worktree 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
+    expect(parseForceTopicInvocation('/th 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
+    expect(parseForceTopicInvocation('/tw 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
+    expect(parseForceTopicInvocation('/T Worktree')).toEqual({ prompt: '', mode: 'worktree' });
   });
 
   it('does not match similar prefixes', () => {
@@ -1314,7 +1330,7 @@ describe('parseForceTopicInvocation', () => {
 
   it('only matches at the very start of content', () => {
     expect(parseForceTopicInvocation('hello /t world')).toBeNull();
-    expect(parseForceTopicInvocation('  /t hello')).toEqual({ prompt: 'hello' }); // tolerate leading whitespace
+    expect(parseForceTopicInvocation('  /t hello')).toEqual({ prompt: 'hello', mode: 'default' }); // tolerate leading whitespace
   });
 
   it('returns null for non-slash text', () => {
@@ -1911,6 +1927,205 @@ describe('handleCommand', () => {
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');
+    });
+
+
+
+    it('`/close wt` closes the session and removes a linked worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('额外关闭 0 个同 worktree 会话');
+    });
+
+
+
+    it('`/close wt` asks for confirmation when other sessions share the worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDir).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('确认关闭话题并删除 worktree'),
+        'interactive',
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('`/close wt --yes` closes sibling sessions before removing the shared worktree', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDir).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(closeSession).toHaveBeenCalledWith('sibling-1');
+      expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('额外关闭 1 个同 worktree 会话');
+    });
+
+    it('rejects a stale worktree confirmation card and returns a fresh card', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: true,
+        dirtyFiles: ['src/new-change.ts'],
+        ahead: 0,
+        unpushedCommits: [],
+        fingerprint: 'new-state',
+      });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes --state=stale-state'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('状态在确认卡生成后发生变化');
+      expect(replies).toContain('confirmation_state');
+      expect(replies).toContain('src/new-change.ts');
+    });
+
+    it('`/close wt --yes` preserves the worktree when a sibling close is refused', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDir).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-1', larkAppId: LARK_APP_ID }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+      vi.mocked(closeSession)
+        .mockResolvedValueOnce({ ok: true, outcome: 'closed', alreadyClosed: false, known: true })
+        .mockResolvedValueOnce({ ok: false, alreadyClosed: false, error: 'remote_close_failed', retryable: true });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sibling-1');
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('其他 1 个会话未能关闭');
+      expect(replies).toContain('worktree 未删除');
+    });
+
+    it('`/close wt --yes` preserves the worktree when a cross-daemon sibling leaves a residual', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(sessionStore.findActiveSessionsByWorkingDir).mockReturnValueOnce([
+        ds.session,
+        { ...makeSession({ sessionId: 'sibling-remote', larkAppId: 'app-2' }), workingDir: '/home/testuser/project-wt-task' } as any,
+      ]);
+      const dd = await import('../src/utils/daemon-discovery.js');
+      vi.mocked(dd.findOnlineDaemon).mockReturnValueOnce({ larkAppId: 'app-2', ipcPort: 9999 });
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'remote_cancel_unverified', taskId: 'remote-task-1' },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })));
+
+      try {
+        await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt --yes'), deps, LARK_APP_ID);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('其他 1 个会话未能关闭');
+      expect(replies).toContain('worktree 未删除');
+    });
+
+
+
+
+
+    it('`/close wt` asks for confirmation when the worktree has dirty or unpushed changes', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({ dirty: true, dirtyFiles: ['src/a.ts', 'README.md'], ahead: 2, unpushedCommits: ['abc123 fix close wt', 'def456 add tests'], fingerprint: 'risky-state' });
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('⚠️ 未提交改动：2 个文件'),
+        'interactive',
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(replies).toContain('⚠️ 未 push 提交：2 个');
+      expect(replies).toContain('src/a.ts');
+      expect(replies).toContain('abc123 fix close wt');
+      expect(replies).toContain('删除后：');
+    });
+
+    it('`/close wt` refuses in a top-level chat-scope session', async () => {
+      const ds = makeDaemonSession({ scope: 'chat', workingDir: '/home/testuser/project-wt-task' });
+      ds.session.scope = 'chat';
+      ds.session.workingDir = '/home/testuser/project-wt-task';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('只用于 `/tw` 创建的子话题');
+    });
+
+    it('`/close wt` refuses to delete a normal checkout', async () => {
+      const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project' });
+      ds.session.workingDir = '/home/testuser/project';
+      const deps = makeDeps(ds);
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(false);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+      expect(replies).toContain('不是 linked worktree');
     });
 
     it('keeps the active session and reports a visible failure when teardown is refused', async () => {
@@ -3131,6 +3346,67 @@ describe('handleCommand', () => {
       expect(sessionStore.createSession).not.toHaveBeenCalled(); // pending path, not a switch
       expect(ds.pendingRepo).toBe(false);
       expect(ds.session.initialUserTurnPending).toBe(true);
+    });
+
+
+
+    it('`/repo here` starts a pending session in its already-pinned current directory', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        worker: null,
+        workingDir: '/home/testuser/current-chat-repo',
+      });
+      ds.session.workingDir = '/home/testuser/current-chat-repo';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo here'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/current-chat-repo');
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('current-chat-repo');
+    });
+
+
+
+    it('`/repo here` can inherit a sibling chat-scope session directory for a fresh topic', async () => {
+      vi.mocked(sessionStore.findActiveChatScopeSessionsByChat).mockReturnValueOnce([{
+        sessionId: 'peer-chat-session',
+        chatId: CHAT_ID,
+        rootMessageId: CHAT_ID,
+        title: 'peer',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: 'app-2',
+        scope: 'chat',
+        chatType: 'group',
+        workingDir: '/home/testuser/current-chat-repo',
+      } as any]);
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo here'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/current-chat-repo');
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
+    });
+
+    it('`/repo here` reports a clear error when no current directory is pinned', async () => {
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo here'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('当前群聊还没有可复用的工作目录');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
     });
 
     it('should reply path_not_found when the arg resolves to nothing', async () => {

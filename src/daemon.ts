@@ -5,7 +5,7 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -3740,6 +3740,51 @@ async function replyGrantRestrictionIfNeeded(
 
 function forceTopicCommandLabel(content: string): '/t' | '/topic' {
   return /^\/topic(?:\s|$)/i.test(content.trimStart()) ? '/topic' : '/t';
+}
+
+
+function forceTopicWorktreeTarget(baseDir: string, anchor: string): { worktreePath: string; branch: string } {
+  const short = createHash('sha1').update(anchor).digest('hex').slice(0, 12);
+  const branch = `wt/botmux-${short}`;
+  return {
+    branch,
+    worktreePath: join(dirname(baseDir), `${basename(baseDir)}-wt-botmux-${short}`),
+  };
+}
+
+function validateExplicitForceTopicWorkingDir(dir: string | undefined, loc: ReturnType<typeof localeForBot>): string | undefined {
+  if (!dir) return undefined;
+  const validation = validateWorkingDir(dir, loc);
+  if (!validation.ok) return undefined;
+  return validation.resolvedPath;
+}
+
+function resolveForceTopicCurrentWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  larkAppId: string;
+  currentSession?: DaemonSession;
+}): string | undefined {
+  const loc = localeForBot(ctx.larkAppId);
+  const current = validateExplicitForceTopicWorkingDir(ctx.currentSession?.workingDir, loc);
+  if (current) return current;
+
+  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
+  if (oncall) return oncall;
+
+  const peers = ctx.scope === 'chat'
+    ? sessionStore.findActiveChatScopeSessionsByChat(ctx.chatId)
+    : [
+        ...sessionStore.findActiveSessionsByRoot(ctx.anchor),
+        ...sessionStore.findActiveChatScopeSessionsByChat(ctx.chatId),
+      ];
+  for (const peer of peers) {
+    if (!peer.workingDir) continue;
+    const resolved = validateExplicitForceTopicWorkingDir(peer.workingDir, loc);
+    if (resolved) return resolved;
+  }
+  return undefined;
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -16363,11 +16408,13 @@ function willAutoWorktree(larkAppId: string, pinnedWorkingDir: string | undefine
  * (build fails / user /closes) — an early ✋ would be orphaned. The pending dashboard
  * row is announced inside runAutoWorktreeCommit (one place for all callers). */
 function startAutoWorktreePending(ds: DaemonSession, args: {
-  anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string;
+  anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string; force?: boolean;
+  worktreePath?: string; branch?: string; reuseExisting?: boolean;
 }): void {
   void runAutoWorktreeCommit({
     ds, anchor: args.anchor, larkAppId: ds.larkAppId, baseDir: args.baseDir,
-    title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId,
+    title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId, force: args.force,
+    worktreePath: args.worktreePath, branch: args.branch, reuseExisting: args.reuseExisting,
     activeSessions,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
   });
@@ -17696,7 +17743,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // CLI input, but it creates no AI turn and therefore must not consume a
   // message-quota unit. `buildQuoteHint` distinguishes a real user quote from
   // parent_id values that merely point at the current thread root.
-  const isBareForceTopic = forceTopic?.prompt === ''
+  const isBareForceTopic = forceTopic?.mode === 'default'
+    && forceTopic.prompt === ''
     && content === ''
     && resources.length === 0
     && buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) === ''
@@ -17774,14 +17822,39 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
-    scope,
-    anchor,
-    chatId,
-    chatType,
-    larkAppId,
-    listenerWorkingDir: messageListener?.workingDir,
-  });
+  const resolvedWorkingDir = forceTopic && forceTopic.mode !== 'default'
+    ? {
+        pinnedWorkingDir: resolveForceTopicCurrentWorkingDir({
+          scope,
+          anchor,
+          chatId,
+          larkAppId,
+          currentSession: activeSessions.get(sessionKey(chatId, larkAppId))
+            ?? activeSessions.get(sessionKey(anchor, larkAppId)),
+        }),
+        oncallEntry: undefined,
+        inheritedFrom: null,
+        pinnedFromBotDefault: false,
+      }
+    : await resolvePinnedWorkingDir({
+        scope,
+        anchor,
+        chatId,
+        chatType,
+        larkAppId,
+        listenerWorkingDir: messageListener?.workingDir,
+      });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = resolvedWorkingDir;
+  if (forceTopic && forceTopic.mode !== 'default' && !pinnedWorkingDir) {
+    await sessionReply(
+      anchor,
+      tr('daemon.force_topic_current_dir_missing', undefined, localeForBot(larkAppId)),
+      'text',
+      larkAppId,
+    );
+    logger.warn(`[/t:${forceTopic.mode}] no current workingDir available for chat ${chatId}`);
+    return;
+  }
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -17831,7 +17904,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
-  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+  const autoWt = forceTopic?.mode === 'worktree'
+    ? !!pinnedWorkingDir
+    : willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
 
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
@@ -18013,7 +18088,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
-    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId });
+    const sharedWorktree = forceTopic?.mode === 'worktree'
+      ? forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
+      : undefined;
+    startAutoWorktreePending(ds, {
+      anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
+      force: forceTopic?.mode === 'worktree',
+      ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
+    });
     return;
   }
 
