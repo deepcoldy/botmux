@@ -4,6 +4,7 @@ import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } f
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
+import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -17206,29 +17207,32 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
  * (handleNewTopicAdmitted + handleThreadReplyAdmitted), so a plain-human turn is
  * authorized identically whether it opens a new topic or continues one (R6/R7-B1).
  *
- * FAIL-CLOSED by construction (R7-B1): authorization requires a POSITIVE
- * `humanSender` (senderType === 'user' AND not a known peer bot) AND the absence
- * of every control-rewrite / dedicated-receiver signal. Excluding a list of
- * known non-human sources is NOT enough — an exclude-list is never complete, so
- * any un-enumerated non-user source would fail OPEN. The positive humanSender
- * gate makes the default deny: anything that is not provably a real human turn
- * with no special semantics stays forced-serial.
+ * FAIL-CLOSED by construction (R7-B1): authorization requires either a POSITIVE
+ * `humanSender` (senderType === 'user' AND not a known peer bot), or a known peer
+ * bot carrying the explicit `@steer` directive. Both lanes must also have no
+ * control-rewrite / dedicated-receiver signal. Anything not positively matched
+ * by one of those lanes stays forced-serial.
  */
 function computeCodexAppSteerable(facts: {
   humanSender: boolean;
   adopted: boolean;
   isForeignBot: boolean;
   isBotSenderType: boolean;
+  explicitBotSteer: boolean;
   substituteTrigger: boolean;
   controlRewrite: boolean;
   messageListener: boolean;
   vcMeetingReceiver: boolean;
   vcMeetingImTurnOrigin: boolean;
 }): boolean {
-  return facts.humanSender
-    && !facts.adopted
+  const plainHuman = facts.humanSender
     && !facts.isForeignBot
-    && !facts.isBotSenderType
+    && !facts.isBotSenderType;
+  const explicitBotSteer = facts.explicitBotSteer
+    && facts.isForeignBot;
+
+  return (plainHuman || explicitBotSteer)
+    && !facts.adopted
     && !facts.substituteTrigger
     && !facts.controlRewrite
     && !facts.messageListener
@@ -17360,6 +17364,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
 
+  const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
+  const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
+  const isForeignBotSender = isBotSenderType
+    || (!!senderOpenId && senderOpenId !== getBot(larkAppId).botOpenId
+        && isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId));
+  // `@steer` is a generic bot-to-bot transport directive, not model content.
+  // Consume it only from a positively classified bot sender; a human writing
+  // the same text keeps the literal body (human turns are already steerable).
+  const botSteerDirective = isForeignBotSender
+    ? parseBotSteerDirective(parsed.content)
+    : { requested: false, content: parsed.content };
+  if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
+
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
@@ -17372,7 +17389,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // (already thread-scope) it's just a prefix strip — no routing change.
   // Empty prompt is allowed: later setup chooses either a repo picker or a
   // visible thread that waits for the first real task, without an empty worker.
-  const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const forceTopic = parseForceTopicInvocation(cmdContent);
   if (forceTopic) {
     if (await replyGrantRestrictionIfNeeded(
@@ -17408,7 +17424,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 飞书盖章的 bot 发送方。既锁 union 信任腿（下面的 teamTrustUnionId），也决定
   // talk 复查走哪个谓词（evaluateBotTalk vs evaluateTalk）——两者必须同源，见
   // enforceMessageQuotaForCliInput 的 botSender 说明。
-  const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
   const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
   // A bot-sent new topic (e.g. a message-listener match on a third-party alert
   // bot's card) must NOT make that bot the session owner: daemon-generated
@@ -17417,9 +17432,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // surfaces (restart/report/cards) to it. Mirror the handleThreadReply +
   // auto-create paths (isForeignBot → ownerOpenId/ownerUnionId undefined); keep
   // creatorOpenId + quoteTarget* so botmux report / first-turn quote still work.
-  const isForeignBotSender = isBotSenderType
-    || (!!senderOpenId && senderOpenId !== getBot(larkAppId).botOpenId
-        && isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId));
   const ownerOpenIdForSession = isForeignBotSender ? undefined : senderOpenId;
   const ownerUnionIdForSession = isForeignBotSender ? undefined : senderUnionId;
   const botCfg = getBot(larkAppId).config;
@@ -17926,8 +17938,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingSubstituteTrigger: substituteTrigger,
     pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
-    // R6-B1: freeze the plain-human steer authorization into the NEW-TOPIC opening
-    // metadata from inbound source facts (the same helper the follow-up twin uses).
+    // Freeze steer authorization into the NEW-TOPIC opening metadata from
+    // inbound source facts (the same helper the follow-up twin uses). The two
+    // allowed lanes are a plain human turn and a foreign bot carrying the
+    // explicit, language-neutral `@steer` directive; ordinary bot traffic is serial.
     // A brand-new session has no VC receiver yet; foreign-bot maps to the bot-sender
     // fact here. buildReservedInitialInput COPIES this onto the opening payload;
     // forkReservedInitialSession never infers it.
@@ -17943,6 +17957,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       isForeignBot: isBotSenderType
         || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId),
       isBotSenderType,
+      explicitBotSteer: botSteerDirective.requested,
       substituteTrigger: !!substituteTrigger,
       controlRewrite: !!newTopicGrill,
       messageListener: !!messageListener,
@@ -18750,6 +18765,10 @@ async function handleThreadReplyAdmitted(
     senderOpenIdForPrefix !== selfBotOpenId &&
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
+  const botSteerDirective = isForeignBot
+    ? parseBotSteerDirective(parsed.content)
+    : { requested: false, content: parsed.content };
+  if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId) : undefined;
   const botSenderPrefix = isForeignBot
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
@@ -19322,14 +19341,15 @@ async function handleThreadReplyAdmitted(
   // opening path — would silently drop it. When a claim token IS held (a
   // concurrent first turn owns the opening) or a queued-activation ACK is
   // pending, a live worker MUST keep buffering to preserve FIFO submission order.
-  // Codex App steer authorization (Blocking 1, decision A) — computed ONCE here,
+  // Codex App steer authorization — computed ONCE here,
   // BEFORE every admission/fork branch below (R5-B1-1): the earliest tail-admit
   // (initialStartPending follower), pending-repo follower, worker-null refork,
   // and new-topic auto-create paths all need the same frozen value, and several
   // of them return before the later existing-owner branch. Explicit positive
-  // ONLY for a plain-human-interactive turn (real human sender; none of
-  // foreign-bot / bot-sender / substitute-rewrite / v3-grill / message-listener /
-  // VC receiver / VC origin / adopt). Never inferred from the delivery sink;
+  // only for a plain-human-interactive turn or a foreign bot carrying an
+  // explicit `@steer` directive. Plain @mentions, reports, other bot traffic,
+  // substitute-rewrite, v3-grill, message-listener, VC and adopt stay serial.
+  // Never inferred from the delivery sink;
   // ignored by acceptCodexAppDispatch for non-codex-app CLIs. A new-topic root
   // must FREEZE this into its opening payload — forkReservedInitialSession is
   // shared by bot-added / scheduler / system bootstrap and only COPIES an
@@ -19341,6 +19361,7 @@ async function handleThreadReplyAdmitted(
     adopted: !!ds?.adoptedFrom,
     isForeignBot,
     isBotSenderType,
+    explicitBotSteer: botSteerDirective.requested,
     substituteTrigger: !!substituteTrigger,
     controlRewrite: !!threadGrill,
     messageListener: !!ctx.messageListener,
