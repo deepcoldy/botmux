@@ -108,11 +108,11 @@ function checkSchedule(
   const s = input.trim();
   if (!s) return { ok: false, error: tr('schedules.form.errEmpty') };
 
-  // 5 字段 cron：croner 全量校验 + 下次执行预览
+  // 5 字段 cron：croner 全量校验 + 下次执行预览（在调度器时区计算，避免浏览器时区偏差）
   const parts = s.split(/\s+/);
   if (parts.length === 5 && parts.every(p => /^[\d*\-,/]+$/.test(p))) {
     try {
-      const next = new Cron(s).nextRun();
+      const next = new Cron(s, timeZone ? { timezone: timeZone } : undefined).nextRun();
       if (!next) return { ok: false, error: tr('schedules.form.errCron') };
       return { ok: true, preview: fmtScheduleDate(next.toISOString(), timeZone) };
     } catch {
@@ -139,8 +139,8 @@ function checkSchedule(
     }
   }
 
-  // 中文自然语言（对齐服务端 parseChineseSchedule 的前缀族）
-  if (/^(每日|每周[一二三四五六日天]?|每月|每\d*小时|每\d+分钟|每小时|每分钟|\d+\s*分钟后|\d+\s*小时后|明天)/.test(s)) {
+  // 中文自然语言（对齐服务端 parseChineseSchedule 的前缀族，含工作日变体）
+  if (/^(每日|每周[一二三四五六日天]?|每月|每\d*小时|每\d+分钟|每小时|每分钟|\d+\s*分钟后|\d+\s*小时后|明天|每个?工作日|工作日每[天日])/.test(s)) {
     return { ok: true };
   }
 
@@ -253,6 +253,8 @@ function SchedulesPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ScheduleRow | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  // 每次打开表单时递增，强制 ScheduleFormModal 重挂载以重置全部表单状态
+  const [formNonce, setFormNonce] = useState(0);
   const [bots, setBots] = useState<Array<{ larkAppId: string; botName?: string }>>([]);
   const [, setNameMapsVersion] = useState(0);
 
@@ -320,12 +322,14 @@ function SchedulesPage() {
   function openCreate(): void {
     setEditing(null);
     setFormError(null);
+    setFormNonce(n => n + 1);
     setFormOpen(true);
   }
 
   function openEdit(s: ScheduleRow): void {
     setEditing(s);
     setFormError(null);
+    setFormNonce(n => n + 1);
     setFormOpen(true);
   }
 
@@ -481,7 +485,7 @@ function SchedulesPage() {
         </div>
       </section>
       <ScheduleFormModal
-        key={editing?.id ?? 'new'}
+        key={`${editing?.id ?? 'new'}-${formNonce}`}
         open={formOpen}
         editing={editing}
         error={formError}
@@ -641,9 +645,15 @@ function ScheduleFormModal(props: {
     [schedule, tr, scheduleTimeZone],
   );
 
+  // 只列出选中 bot 已在群的群（memberBots 有 inChat 记录时才过滤；
+  // 成员信息缺失时 fail-open 显示全部，避免阻塞创建）
   const groupOptions = useMemo(() => {
+    const hasMembership = groups.some(g => g.memberBots?.length > 0);
+    const filtered = hasMembership && larkAppId
+      ? groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))
+      : groups;
     // 有名群按名称排序，无名群（仅 oc_ ID）排最后
-    return [...groups].sort((a, b) => {
+    return [...filtered].sort((a, b) => {
       const an = a.name ?? '';
       const bn = b.name ?? '';
       if (!an && !bn) return 0;
@@ -651,7 +661,13 @@ function ScheduleFormModal(props: {
       if (!bn) return -1;
       return an.localeCompare(bn, 'zh-CN');
     });
-  }, [groups]);
+  }, [groups, larkAppId]);
+
+  // bot 变更时，若当前 chatId 不在新 bot 的群列表中则清除，避免给不在群的 bot 投递
+  useEffect(() => {
+    if (!chatId || !larkAppId || groupOptions.length === 0) return;
+    if (!groupOptions.some(g => g.chatId === chatId)) setChatId('');
+  }, [larkAppId, groupOptions, chatId]);
 
   const showGroupSelect = !editing && !localDelivery && !chatManual && groupOptions.length > 0;
   const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
