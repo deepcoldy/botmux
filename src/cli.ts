@@ -12905,6 +12905,15 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgrade', 'update']);
+if (
+  ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')
+  && process.argv.slice(3).some(arg => arg === '--help' || arg === '-h')
+) {
+  showHelp();
+  process.exit(0);
+}
+
 // Workflow safety gate (Slice C0): a CLI invoked inside a workflow
 // subagent worker (BOTMUX_WORKFLOW=1, set by v3/ephemeral-pool) must not
 // trigger chat-facing effects, schedule mutations, or recursively authorize /
