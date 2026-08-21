@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { scanMultipleProjectsAsync } from '../src/services/project-scanner-async.js';
+import { scanMultipleProjectsAsync, resolveRepoSelectionAsync } from '../src/services/project-scanner-async.js';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
 
 function isProcessAlive(pid: number): boolean {
@@ -156,5 +156,72 @@ describe('scanMultipleProjectsAsync', () => {
     const expected = scanMultipleProjects([tempRoot]);
     const actual = await scanMultipleProjectsAsync([tempRoot]);
     expect(actual).toEqual(expected);
+  });
+
+  it('resolves /repo without waiting behind an in-flight (slow) scan', async () => {
+    // The scan-failure recovery text points users to `/repo <path>` as the
+    // immediate escape hatch. If resolve were serialized behind the scan queue,
+    // it would block for the ENTIRE slow scan — exactly when the user needs to
+    // bypass it. A branching child: `scan` requests hang forever, `resolve`
+    // requests answer immediately. With resolve unqueued, the resolve must
+    // return promptly even while a scan is wedged.
+    const branchChild = join(tempRoot, 'branch-child.mjs');
+    writeFileSync(
+      branchChild,
+      "process.once('message', (req) => {\n"
+      + "  if (req && req.kind === 'resolve') {\n"
+      + "    process.send({ ok: true, resolved: { path: '/abs/x', displayName: 'x (main)' } }, () => process.disconnect());\n"
+      + "    return;\n"
+      + "  }\n"
+      + "  setInterval(() => {}, 1 << 30); // scan: hang forever, never reply\n"
+      + "});\n",
+    );
+    process.env.BOTMUX_REPO_SCANNER_CHILD = branchChild;
+    process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS = '30000'; // long, so the scan is genuinely in-flight
+    try {
+      // Kick off a scan that will hang for the whole (long) timeout.
+      const scanPromise = scanMultipleProjectsAsync([tempRoot]).catch(() => 'scan-failed');
+      // Concurrently resolve — must NOT wait for the wedged scan.
+      const started = Date.now();
+      const resolved = await resolveRepoSelectionAsync('/abs/x', [tempRoot]);
+      const elapsed = Date.now() - started;
+
+      expect(resolved).toEqual({ path: '/abs/x', displayName: 'x (main)' });
+      expect(elapsed).toBeLessThan(5000); // did not block on the 30s scan
+      void scanPromise; // leave the scan wedged; its child is reaped on timeout/teardown
+    } finally {
+      delete process.env.BOTMUX_REPO_SCANNER_CHILD;
+      delete process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS;
+    }
+  });
+
+  it('runs concurrent /repo resolves in parallel, not serialized behind each other', async () => {
+    // Two resolves from different topics must not block one another. A child
+    // that sleeps ~800ms before answering a resolve: run two concurrently and
+    // assert total wall-clock is far below 2× (proving parallel, not queued).
+    const slowResolveChild = join(tempRoot, 'slow-resolve-child.mjs');
+    writeFileSync(
+      slowResolveChild,
+      "process.once('message', () => {\n"
+      + "  setTimeout(() => {\n"
+      + "    process.send({ ok: true, resolved: { path: '/abs/y', displayName: 'y (main)' } }, () => process.disconnect());\n"
+      + "  }, 800);\n"
+      + "});\n",
+    );
+    process.env.BOTMUX_REPO_SCANNER_CHILD = slowResolveChild;
+    try {
+      const started = Date.now();
+      const [a, b] = await Promise.all([
+        resolveRepoSelectionAsync('/abs/y', ['/root/topic-a']),
+        resolveRepoSelectionAsync('/abs/y', ['/root/topic-b']),
+      ]);
+      const elapsed = Date.now() - started;
+      expect(a).toEqual({ path: '/abs/y', displayName: 'y (main)' });
+      expect(b).toEqual({ path: '/abs/y', displayName: 'y (main)' });
+      // Serialized would be ~1600ms; parallel ~800ms. Allow generous slack.
+      expect(elapsed).toBeLessThan(1400);
+    } finally {
+      delete process.env.BOTMUX_REPO_SCANNER_CHILD;
+    }
   });
 });

@@ -213,6 +213,14 @@ export async function scanMultipleProjectsAsyncDetailed(
  * recursive basename scan all run off the daemon event loop. This closes the
  * gap where the direct-candidate fast-path still touched (possibly hung) fs/git
  * synchronously on the main loop.
+ *
+ * Crucially this runs its OWN child immediately — it does NOT wait on the shared
+ * scanQueue. `/repo <path>` is the explicit escape hatch the scan-failure
+ * recovery text points users to; if it queued behind an in-flight repo scan it
+ * would block for the entire (up to multi-minute) scan exactly when the user
+ * most needs to bypass it, and a slow scan in one chat would stall `/repo`
+ * resolution across every bot/topic. Each resolve is bounded by the same
+ * per-child timeout/SIGKILL watchdog, so an unqueued resolve still can't wedge.
  */
 export async function resolveRepoSelectionAsync(
   repoArg: string,
@@ -223,6 +231,6 @@ export async function resolveRepoSelectionAsync(
     repoArg,
     scanDirs: [...scanDirs],
   };
-  const response = await enqueueChild(request);
+  const response = await runChild(request);
   return 'resolved' in response ? response.resolved : null;
 }
