@@ -42,20 +42,23 @@ interface TerminalControlLease {
   grant: string;
   grantId: string;
   /**
-   * Browser-safe marker of the LAST acquisition of this lease. Rotates on every
+   * The acquisition this lease is currently on: an id the CLIENT minted BEFORE
+   * it sent the takeover, which this process merely binds. Rotates on every
    * successful takeover, reuse included, and carries no authority of its own —
    * it is a plain equality nonce, unlike `grantId` (a segment of the signed
    * grant, which must never leave this process).
    *
-   * It exists for compare-and-swap release: a caller that acquired the lease and
-   * then lost track of its UI (pane unmounted before the receipt arrived) can
-   * name the acquisition it is compensating for. If somebody else has taken the
-   * lease over since — under the SAME login, which reuses this very lease and so
-   * is invisible to any session-level check — the marker no longer matches and
-   * the release is refused instead of silently stripping write from the pane the
-   * user is actually looking at.
+   * Why the client mints it and not the server: the hard case is "the server
+   * committed, the response never arrived". A server-minted marker only ever
+   * travels back on a successful response, so exactly the caller that needs it
+   * most never receives one — and asking for the CURRENT marker afterwards
+   * returns whatever acquisition is live NOW, which after a cross-tab takeover
+   * is somebody else's. Compensating with that value deletes the lease the user
+   * is actively typing into. A client-minted id is known before the request
+   * leaves, so a lost response changes nothing about the caller's ability to
+   * name precisely its own acquisition.
    */
-  opMarker: string;
+  acquisitionId: string;
   issuedAt: number;
   expiresAt: number;
   timer?: ReturnType<typeof setTimeout>;
@@ -68,11 +71,18 @@ export type TerminalControlTakeoverResult =
     mode: 'controlled';
     expiresAt: number;
     reused: boolean;
-    /** This acquisition's CAS marker; absent for the leaseless platform-owner
-     *  role, which has nothing to compare or release. */
-    marker?: string;
+    /** The acquisition this lease is now on; absent for the leaseless
+     *  platform-owner role, which has nothing to compare or release. */
+    acquisition?: string;
   }
-  | { ok: false; error: 'authentication_expired' | 'control_busy' | 'terminal_operation_forbidden' };
+  | {
+    ok: false;
+    error: 'authentication_expired' | 'control_busy' | 'terminal_operation_forbidden'
+      /** The caller sent an acquisition id this process refuses to bind. Failing
+       *  closed matters: silently minting one instead would hand back a lease
+       *  whose CAS id the caller does not know, i.e. an uncompensatable lease. */
+      | 'invalid_acquisition';
+  };
 
 export type TerminalControlReleaseResult =
   | { ok: true; mode: 'readonly'; released: boolean }
@@ -86,12 +96,21 @@ export type TerminalControlReleaseResult =
       | 'control_lease_superseded';
   };
 
-/** Internal central-proxy material. The browser receives neither the signed
- * token nor the lease marker; both stay on the loopback hop. */
+/** Internal central-proxy material. The signed token never leaves the loopback
+ * hop; `acquisition` is the CAS id this grant was minted against, so socket
+ * registration and disconnect can both be scoped to that exact acquisition
+ * rather than to "whatever lease this login happens to hold now". */
 export interface TerminalProxyGrant {
   token: string;
   scope: 'read' | 'write';
-  leaseMarker?: string;
+  acquisition?: string;
+}
+
+/** Bounds for a client-minted acquisition id. Opaque to this process — it only
+ * ever gets compared for equality and echoed back to its own minter — so the
+ * charset is kept URL-safe and the length bounded, nothing more. */
+export function isTerminalAcquisitionId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(value);
 }
 
 export interface TerminalControlManagerOptions {
@@ -102,8 +121,9 @@ export interface TerminalControlManagerOptions {
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
   grantId?: () => string;
-  /** Injectable CAS marker source; production uses a random nonce. */
-  opMarker?: () => string;
+  /** Fallback acquisition id for callers that do not mint one (legacy/tokenless
+   *  entry points). Production uses a random nonce. */
+  acquisitionId?: () => string;
 }
 
 function validControlTtl(value: number): boolean {
@@ -127,7 +147,7 @@ export class TerminalControlManager {
   private readonly schedule: typeof setTimeout;
   private readonly cancel: typeof clearTimeout;
   private readonly nextGrantId?: () => string;
-  private readonly nextOpMarker: () => string;
+  private readonly nextAcquisitionId: () => string;
 
   constructor(opts: TerminalControlManagerOptions) {
     if (!opts.secret) throw new Error('terminal control secret is required');
@@ -139,13 +159,28 @@ export class TerminalControlManager {
     this.schedule = opts.setTimer ?? setTimeout;
     this.cancel = opts.clearTimer ?? clearTimeout;
     this.nextGrantId = opts.grantId;
-    this.nextOpMarker = opts.opMarker ?? (() => randomBytes(12).toString('base64url'));
+    this.nextAcquisitionId = opts.acquisitionId ?? (() => randomBytes(12).toString('base64url'));
   }
 
-  takeover(actor: TerminalDashboardActor, sessionId: string): TerminalControlTakeoverResult {
+  /**
+   * Acquire (or re-acquire) the write lease.
+   *
+   * `acquisitionId` is minted by the CALLER before the request goes out; this
+   * process only binds it. See `TerminalControlLease.acquisitionId` for why the
+   * direction matters. Omitting it keeps the historical behavior for entry
+   * points that have no compensation path of their own.
+   */
+  takeover(
+    actor: TerminalDashboardActor,
+    sessionId: string,
+    acquisitionId?: string,
+  ): TerminalControlTakeoverResult {
     const now = this.now();
     if (actor.terminalCapability === 'readonly') {
       return { ok: false, error: 'terminal_operation_forbidden' };
+    }
+    if (acquisitionId !== undefined && !isTerminalAcquisitionId(acquisitionId)) {
+      return { ok: false, error: 'invalid_acquisition' };
     }
     if (actor.terminalCapability === 'owner') {
       return {
@@ -167,9 +202,16 @@ export class TerminalControlManager {
       this.audit.append(controlAuditRecord(actor.userId, sessionId, 'terminal.takeover_reused', { now: new Date(now) }));
       // Reuse is still an acquisition: whoever asked for it now owns the lease,
       // and any earlier holder's pending compensation must stop applying to it.
-      current.opMarker = this.nextOpMarker();
+      // Sockets bridged under the previous acquisition keep streaming — they
+      // belong to the same login — but their close no longer tears this lease
+      // down, because `disconnect` is scoped to the CURRENT acquisition.
+      current.acquisitionId = acquisitionId ?? this.nextAcquisitionId();
       return {
-        ok: true, mode: 'controlled', expiresAt: current.expiresAt, reused: true, marker: current.opMarker,
+        ok: true,
+        mode: 'controlled',
+        expiresAt: current.expiresAt,
+        reused: true,
+        acquisition: current.acquisitionId,
       };
     }
 
@@ -196,7 +238,7 @@ export class TerminalControlManager {
       // Internal equality marker; never serialized or logged. Using the signed
       // payload avoids retaining an additional secret value.
       grantId: verifiedGrantId,
-      opMarker: this.nextOpMarker(),
+      acquisitionId: acquisitionId ?? this.nextAcquisitionId(),
       issuedAt: now,
       expiresAt,
       sockets: new Set(),
@@ -204,22 +246,24 @@ export class TerminalControlManager {
     lease.timer = this.schedule(() => this.invalidate(sessionId, lease, 'expired'), expiresAt - now);
     lease.timer.unref?.();
     this.leases.set(sessionId, lease);
-    return { ok: true, mode: 'controlled', expiresAt, reused: false, marker: lease.opMarker };
+    return { ok: true, mode: 'controlled', expiresAt, reused: false, acquisition: lease.acquisitionId };
   }
 
   /**
-   * Give up the lease. `expectedMarker` makes it a compare-and-swap: the release
-   * only applies while the lease is still the acquisition the caller named.
+   * Give up the lease. `expectedAcquisition` makes it a compare-and-swap: the
+   * release only applies while the lease is still the acquisition the caller
+   * named.
    *
-   * Compensation paths (a takeover whose receipt outlived its pane) MUST pass it.
-   * Without it, "release whatever this login holds on this session" also releases
-   * a lease that a newer pane of the same login has since taken over — same auth
-   * session, same lease object, so no identity check can tell the two apart.
+   * Compensation paths (a takeover whose receipt outlived its pane; a pane that
+   * closed before its socket ever registered) MUST pass it. Without it, "release
+   * whatever this login holds on this session" also releases a lease that a newer
+   * pane of the same login has since taken over — same auth session, same lease
+   * object, so no identity check can tell the two apart.
    */
   release(
     actor: TerminalDashboardActor,
     sessionId: string,
-    expectedMarker?: string,
+    expectedAcquisition?: string,
   ): TerminalControlReleaseResult {
     if (actor.terminalCapability === 'readonly' || actor.terminalCapability === 'owner') {
       return { ok: false, error: 'terminal_operation_forbidden' };
@@ -231,7 +275,7 @@ export class TerminalControlManager {
     if (lease.authSessionId !== actor.authSessionId || lease.userId !== actor.userId) {
       return { ok: false, error: 'control_owned_by_another_session' };
     }
-    if (expectedMarker !== undefined && lease.opMarker !== expectedMarker) {
+    if (expectedAcquisition !== undefined && lease.acquisitionId !== expectedAcquisition) {
       return { ok: false, error: 'control_lease_superseded' };
     }
     this.invalidate(sessionId, lease, 'release', now);
@@ -243,7 +287,7 @@ export class TerminalControlManager {
     owned: boolean;
     expiresAt?: number;
     fixed?: boolean;
-    marker?: string;
+    acquisition?: string;
   } {
     const now = this.now();
     if (actor.terminalCapability === 'readonly') return { mode: 'readonly', owned: false };
@@ -258,15 +302,17 @@ export class TerminalControlManager {
       mode: 'controlled',
       owned,
       expiresAt: lease.expiresAt,
-      // Only the holder learns which acquisition the lease is currently on — it
-      // is what lets a compensation decide "still mine" vs "someone took over".
-      ...(owned ? { marker: lease.opMarker } : {}),
+      // Only the holder learns which acquisition the lease is currently on. A
+      // pane compares it against the id IT minted: equal means "still mine",
+      // different means somebody (possibly this same login in another tab) has
+      // taken over since, and this pane must keep its hands off the lease.
+      ...(owned ? { acquisition: lease.acquisitionId } : {}),
     };
   }
 
-  /** Internal-only grant selection for the central terminal proxy. The marker
-   * lets the proxy prove that a write lease is still the exact same lease after
-   * the asynchronous worker WebSocket handshake completes. */
+  /** Internal-only grant selection for the central terminal proxy. The
+   * acquisition id lets the proxy prove that a write lease is still on the exact
+   * same acquisition after the asynchronous worker WebSocket handshake. */
   grantForProxy(actor: TerminalDashboardActor, sessionId: string): TerminalProxyGrant {
     const now = this.now();
     if (actor.terminalCapability === 'owner') {
@@ -286,7 +332,7 @@ export class TerminalControlManager {
     this.expireSessionIfDue(sessionId, now);
     const lease = actor.terminalCapability === 'readonly' ? undefined : this.leases.get(sessionId);
     if (lease && lease.authSessionId === actor.authSessionId && lease.userId === actor.userId) {
-      return { token: lease.grant, scope: 'write', leaseMarker: lease.grantId };
+      return { token: lease.grant, scope: 'write', acquisition: lease.acquisitionId };
     }
     const expiresAt = Math.min(actor.expiresAt, now + READ_GRANT_TTL_MS);
     if (expiresAt <= now) return { token: '', scope: 'read' };
@@ -312,24 +358,34 @@ export class TerminalControlManager {
     actor: TerminalDashboardActor,
     sessionId: string,
     socket: TerminalControlSocket,
-    expectedLeaseMarker?: string,
-  ): { registered: boolean; leaseMarker?: string } {
+    expectedAcquisition?: string,
+  ): { registered: boolean; acquisition?: string } {
     const now = this.now();
     this.expireSessionIfDue(sessionId, now);
     const lease = this.leases.get(sessionId);
     if (!lease || lease.authSessionId !== actor.authSessionId || lease.userId !== actor.userId) {
       return { registered: false };
     }
-    if (socket.destroyed || (expectedLeaseMarker !== undefined && lease.grantId !== expectedLeaseMarker)) {
+    if (socket.destroyed || (expectedAcquisition !== undefined && lease.acquisitionId !== expectedAcquisition)) {
       return { registered: false };
     }
     lease.sockets.add(socket);
-    return { registered: true, leaseMarker: lease.grantId };
+    return { registered: true, acquisition: lease.acquisitionId };
   }
 
-  disconnect(actor: TerminalDashboardActor, sessionId: string, leaseMarker: string | undefined): boolean {
+  /**
+   * A writable bridge for `acquisition` went away — give that acquisition's lease
+   * up.
+   *
+   * Scoped to the CURRENT acquisition on purpose. A same-login takeover reuses
+   * this very lease object without reissuing the signed grant, so an older pane's
+   * socket closing used to tear down the lease the NEWER pane had just acquired
+   * (its own socket may not even have bridged yet). Once the acquisition has
+   * rotated, the old socket's close is simply not about this lease any more.
+   */
+  disconnect(actor: TerminalDashboardActor, sessionId: string, acquisition: string | undefined): boolean {
     const lease = this.leases.get(sessionId);
-    if (!lease || !leaseMarker || lease.grantId !== leaseMarker
+    if (!lease || !acquisition || lease.acquisitionId !== acquisition
       || lease.authSessionId !== actor.authSessionId || lease.userId !== actor.userId) {
       return false;
     }

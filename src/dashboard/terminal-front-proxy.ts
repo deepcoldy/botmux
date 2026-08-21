@@ -333,24 +333,27 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         return;
       }
 
-      let leaseMarker: string | undefined;
-      if (prepared.actor && prepared.proxyGrant?.scope === 'write' && prepared.proxyGrant.leaseMarker) {
+      let acquisition: string | undefined;
+      if (prepared.actor && prepared.proxyGrant?.scope === 'write' && prepared.proxyGrant.acquisition) {
         const registered = options.control.registerWritableSocket(
           prepared.actor,
           prepared.sessionId,
           clientSocket,
-          prepared.proxyGrant.leaseMarker,
+          prepared.proxyGrant.acquisition,
         );
-        leaseMarker = registered.leaseMarker;
+        acquisition = registered.acquisition;
         if (!registered.registered) {
           // The worker may have accepted a grant that was valid when the dial
           // began but was released/expired/replaced during its async handshake.
           // Never relay that 101: revoke the matching old lease (if any) and
           // make the browser reconnect through the now-read-only path.
+          // `disconnect` is acquisition-scoped, so if the reason we could not
+          // register is that a NEWER acquisition took the lease over, this call
+          // is a no-op instead of collateral damage.
           options.control.disconnect(
             prepared.actor,
             prepared.sessionId,
-            prepared.proxyGrant.leaseMarker,
+            prepared.proxyGrant.acquisition,
           );
           upstreamSocket.destroy();
           socketError(clientSocket, 409, 'terminal control expired');
@@ -365,7 +368,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       // owner's fixed write grant, which has no lease behind it) is indexed
       // here — otherwise the liveness re-check above would only have moved the
       // leak one tick later instead of closing it.
-      const deregisterBridgeSocket = authSessionId !== undefined && !leaseMarker
+      const deregisterBridgeSocket = authSessionId !== undefined && !acquisition
         ? options.control.registerReadSocket(authSessionId, clientSocket)
         : undefined;
 
@@ -382,8 +385,8 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         if (disconnected) return;
         disconnected = true;
         deregisterBridgeSocket?.();
-        if (prepared.actor && leaseMarker) {
-          options.control.disconnect(prepared.actor, prepared.sessionId, leaseMarker);
+        if (prepared.actor && acquisition) {
+          options.control.disconnect(prepared.actor, prepared.sessionId, acquisition);
         }
       };
 
