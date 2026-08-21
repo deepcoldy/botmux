@@ -447,7 +447,13 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
       return json(res, result.ok ? 200 : 409, result.ok ? { ...result, owned: true } : { ok: false, error: result.error });
     }
     if (method === 'POST' && action === 'release') {
-      const result = terminalControl.release(identity, sessionId);
+      // `?expect=` 是卸载补偿带来的 CAS 条件：只还「我这次接管拿到的那一把」，
+      // 别把同一登录里新面板刚接过去的租约顺手收掉。缺省仍是无条件释放。
+      const result = terminalControl.release(
+        identity,
+        sessionId,
+        url.searchParams.get('expect') ?? undefined,
+      );
       return json(res, result.ok ? 200 : 403, result.ok ? { ...result, owned: false } : { ok: false, error: result.error });
     }
     return json(res, 405, { ok: false, error: 'method_not_allowed' });
