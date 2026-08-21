@@ -727,6 +727,11 @@ aggregator.on(sessionPresentation.onEvent);
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
   getActiveToken: currentDashboardToken,
+  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
+  // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
+  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把裸 shell
+  // 开放给平台上的任何人。
+  isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -6802,7 +6807,7 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
       ].join('\r\n'));
       return;
     }
-    // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
+    // 调试终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
     if (upgradeRoute.route === 'debug-terminal') {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }

@@ -10,9 +10,13 @@
 //    评估）。调试终端只是一个裸 shell，独立成模块 → 改动面收敛在本文件 + 少量挂载。
 //  - dashboard 是 aggregator 前门，本身就跑 HTTP + upgrade，node-pty / ws 依赖都在。
 //
-// 安全边界（与 write-link 同级）：这是一个**可写 shell**，能任意执行命令、落在真实
-// 文件系统。所有入口都要求 dashboard 管理 token（owner / 平台属主）——HTTP 路由挂在
-// auth gate 之后，WS upgrade 在本模块内显式校验 cookie。匿名 / 只读视图一律拒绝。
+// 安全边界（比 write-link 更高一档）：这是一个**可写 shell**，能任意执行命令、落在
+// 真实文件系统，所以准入只认**本机 legacy 管理身份**——HTTP 路由挂在 auth gate 之后
+// 并额外要求 `legacyAuthed`，WS upgrade 在本模块内显式校验「管理 cookie **且** legacy
+// 管理身份」。匿名、只读视图、以及经中心化平台隧道进来的平台身份（含平台 owner）
+// 一律拒绝：平台隧道注入的正是本机活跃 cookie，只比 cookie 等于给平台上的任何人一台
+// 宿主 shell。WS 的可信 Origin 也比会话终端窄一档（不认平台分享用的 `t-` 子域，见
+// dashboard/control-csrf.ts 的 classifyManagementUpgrade）。
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -51,7 +55,7 @@ const SCROLLBACK_MAX = 2000; // 行
 export interface DebugTerminalManager {
   /** 处理 HTTP 请求；返回 true 表示已接管（调用方 return）。假定调用方已过 auth gate。 */
   handleHttp: (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
-  /** 处理 WS upgrade；返回 true 表示已接管。本模块内部自校验 token。 */
+  /** 处理 WS upgrade；返回 true 表示已接管。本模块内部自校验 token + 管理身份。 */
   handleUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
   /** 关掉所有终端（dashboard 退出时）。 */
   shutdown: () => void;
@@ -60,6 +64,18 @@ export interface DebugTerminalManager {
 export interface DebugTerminalDeps {
   /** 返回当前有效的管理 token，用于 WS upgrade 的 cookie 校验。 */
   getActiveToken: () => string | null;
+  /**
+   * 本请求是否解析成 **legacy-dashboard 管理身份**——与 `/api/debug-terminal` 的
+   * HTTP 门禁（dashboard.ts 的 `legacyAuthed`）同一条口径。
+   *
+   * 为什么只比 cookie 不够：中心化平台的隧道会**剥掉浏览器自己的 Cookie 头、注入本机
+   * 活跃 cookie** 来证明「我是这台机器的跳板」，真实用户权限另外放在 `X-Botmux-Role`
+   * 里。所以「cookie == 活跃 token」只说明请求经过了平台隧道，**不说明发起人是本机
+   * owner**——平台上的 teammate / guest（甚至平台 owner 这种本不该有宿主 shell 的身份）
+   * 都能满足它。而这条 WS 的另一头是可任意执行命令的裸 bash，必须与 HTTP 入口同档。
+   * 必填（不给默认值）：漏接线会在类型层就报错，而不是静默 fail-open。
+   */
+  isLegacyManagementRequest: (req: IncomingMessage) => boolean;
   /** 默认工作目录候选（bot 配置的工作目录等）；取第一个存在的，否则 homedir。 */
   defaultWorkingDirs?: () => string[];
 }
@@ -170,7 +186,16 @@ export function createDebugTerminalManager(deps: DebugTerminalDeps): DebugTermin
     if (req.headers.origin === 'null') return false;
     // Same credential as the management dashboard: cookie set by the `?t=` gate.
     const cookieTok = parseCookie(req.headers.cookie);
-    return !!cookieTok && cookieTok === active;
+    if (!cookieTok || cookieTok !== active) return false;
+    // 但 cookie 只是**必要**条件：平台隧道注入的也是这枚活跃 cookie。裸 shell 的准入
+    // 必须和 `/api/debug-terminal` 的 HTTP 门禁一致——解析出 legacy 管理身份才放行，
+    // 平台注入身份（X-Botmux-Role owner/teammate/guest）一律拒。
+    if (!deps.isLegacyManagementRequest(req)) {
+      logger.warn('[debug-terminal] 拒绝非本机管理身份的 WS 升级'
+        + '（cookie 有效但不是 legacy-dashboard 身份，例如经中心平台隧道注入的角色）');
+      return false;
+    }
+    return true;
   }
 
   // ── HTTP ──────────────────────────────────────────────────────────────────
