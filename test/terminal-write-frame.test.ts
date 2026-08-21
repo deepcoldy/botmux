@@ -84,6 +84,17 @@ describe('worker 终端页的跨文件接缝', () => {
     expect(worker).toContain('_wbSetWsWrite(null)');
   });
 
+  it('ws.onclose 当下就把写权限退回未知并上抛（重连中不再停留在旧判定）', () => {
+    // 关闭那一刻就 reset，不能等 2 秒后的 connect() 才退回未知：否则断线到重连的
+    // 空窗里，终端页仍以上一条连接的 wsHasWrite 放行输入，父页也还显示旧的可写判定。
+    const at = worker.indexOf('ws.onclose=function(){');
+    expect(at, 'worker.ts 里应有 ws.onclose 处理器').toBeGreaterThan(-1);
+    const body = worker.slice(at, worker.indexOf('}', at) + 1);
+    expect(body).toContain('_wbSetWsWrite(null)');
+    // 且必须等新连接的新首帧才恢复——onclose 先把首帧标志复位。
+    expect(body).toContain('_wbFirstFrame=true');
+  });
+
   it('页面仍然导出 wsHasWrite 全局并按同一个消息类型上抛', () => {
     expect(worker).toContain('var wsHasWrite=null');
     expect(worker).toContain("'botmux:wb-terminal-write'");

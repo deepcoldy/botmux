@@ -1048,6 +1048,97 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     }
   });
 
+  /** 与 renderTouchWsPane 同构，但：① 用**恒可写身份**(fixed)——只有它那条 viewToken 通道
+   *  可能真可写，「未知」才会如实呈现成未知（非 owner 通道必只读，未知会塌成只读，看不出
+   *  这条回归）；② 这块假 iframe 一挂上就自报 wsHasWrite=可写，好让父页的**轮询**通道在
+   *  挂载那一拍就锁存成 writable —— 专门复现「重连时轮询那份过期的 writable 把带外回报的
+   *  write:null 吃掉」这条回归。frameWindow 可变，方便逐步改读数。 */
+  async function renderTouchWsPaneLatchedWritable(): Promise<{
+    renderer: TestRenderer.ReactTestRenderer;
+    frameWindow: { hasToken: boolean; wsHasWrite: boolean | null };
+    post(data: unknown, source: unknown): void;
+    restore(): void;
+  }> {
+    const listeners: Array<(event: unknown) => void> = [];
+    const previousWindow = (globalThis as Record<string, unknown>).window;
+    const frameWindow: { hasToken: boolean; wsHasWrite: boolean | null } = { hasToken: false, wsHasWrite: true };
+    (globalThis as Record<string, unknown>).window = {
+      matchMedia: (query: string) => ({
+        matches: query === '(hover: none)',
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+      addEventListener: (type: string, handler: (event: unknown) => void) => {
+        if (type === 'message') listeners.push(handler);
+      },
+      removeEventListener: (type: string, handler: (event: unknown) => void) => {
+        const index = listeners.indexOf(handler);
+        if (index >= 0) listeners.splice(index, 1);
+      },
+    };
+    const lease = leaseApi({ fixed: true });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: PAIR()[0],
+        api: {
+          ...lease.api,
+          getTerminalViewLink: async () => ({ url: '/s/session-a?viewToken=cap', expiresAt: null }),
+        },
+        authenticated: true,
+        capabilities: FULL_CAPABILITIES,
+        now: NOW,
+        location: LOCATION,
+      }), {
+        createNodeMock: (element: { props: Record<string, unknown> }) => (
+          String((element.props as { className?: string }).className ?? '').includes('wb-pane-frame')
+            ? { contentWindow: frameWindow }
+            : null
+        ),
+      });
+    });
+    await settle();
+    return {
+      renderer,
+      frameWindow,
+      post(data, source) { for (const handler of [...listeners]) handler({ data, source }); },
+      restore() {
+        if (previousWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+        else (globalThis as Record<string, unknown>).window = previousWindow;
+      },
+    };
+  }
+
+  it('重连：带外回报 write:null 必须回到未知，绝不被轮询那份过期 writable 吃掉（第 17 点）', async () => {
+    const touch = await renderTouchWsPaneLatchedWritable();
+    try {
+      // ① 首帧确认可写：带外回报可写、同源轮询也读到可写，面板说「可输入」。
+      await act(async () => {
+        touch.post({ type: 'botmux:wb-terminal-write', write: true }, touch.frameWindow);
+      });
+      expect(paneMode(touch.renderer)).toBe('controlled');
+
+      // ② ws close（重连中）：终端页先把本连接的 wsHasWrite 退回 null 并上抛 write:null。
+      //    父页此刻**必须**回到未知。回归的形状：带外回报已是 unknown，父页却回退到轮询
+      //    在①锁存的那份 writable，于是对着一条未确认的连接继续显示「可输入」。
+      touch.frameWindow.wsHasWrite = null;
+      await act(async () => {
+        touch.post({ type: 'botmux:wb-terminal-write', write: null }, touch.frameWindow);
+      });
+      expect(paneMode(touch.renderer)).toBe('unknown');
+
+      // ③ 新连接的新首帧判只读：这时才如实翻成只读（等到新首帧才恢复结论）。
+      touch.frameWindow.wsHasWrite = false;
+      await act(async () => {
+        touch.post({ type: 'botmux:wb-terminal-write', write: false }, touch.frameWindow);
+      });
+      expect(paneMode(touch.renderer)).toBe('readonly');
+    } finally {
+      act(() => touch.renderer.unmount());
+      touch.restore();
+    }
+  });
+
   it('跨文件契约：终端页落下 wsHasWrite 并按同一个消息类型上抛', () => {
     // 面板认的是这两样东西：同源读的 `wsHasWrite` 全局，和 postMessage 的类型串。
     // worker 那边改了名而这里不改，面板会静默退回「读不出来」，触屏文案又悄悄回到

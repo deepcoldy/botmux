@@ -16832,7 +16832,15 @@ if(typeof ResizeObserver!=='undefined'){
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
     term.write(data,_settleInitialBottom);
   };
-  ws.onclose=function(){ws_=null;el.textContent='disconnected';el.className='err';setTimeout(connect,2000)};
+  ws.onclose=function(){
+    ws_=null;el.textContent='disconnected';el.className='err';
+    // 关闭当下就把这条连接的写权限退回未知：先复位首帧标志（重连后要等新首帧才恢复
+    // 结论），再 _wbSetWsWrite(null) —— 它同时收起输入（term.onData/toolbar/_fwdScroll
+    // 的门禁都以 wsHasWrite===true 为准）并向嵌入方上抛 write:null。不这样做的话，断线
+    // 到 2 秒后重连的空窗里，页面仍以上一条连接的旧判定放行输入、父页也还显示旧的可写。
+    _wbFirstFrame=true;_wbSetWsWrite(null);
+    setTimeout(connect,2000);
+  };
   ws.onerror=function(){ws.close()};
 })();
 
@@ -16903,6 +16911,12 @@ function _cellAt(clientX,clientY){
 }
 function _fwdScroll(px,coord){
   if((!hasToken&&!readOnlyRemoteScroll)||!ws_||ws_.readyState!==1||!px)return;
+  // 写链路(hasToken)转发的是 type:'input'，与 term.onData / toolbar 同一条判据：只有已
+  // 建立的 WS 明确回报可写(wsHasWrite===true)才放行；null（未确认，含重连中）与 false
+  // （这条连接只读）一律不发——照抄 hasToken 会在 WS 不带 Cookie 时把输入打进一个原地
+  // 丢字的终端（第 17 点）。只读远程滚动(hasToken=false)发的是 type:'scroll'，不是输入，
+  // 不受这道门约束（服务端另有校验）。
+  if(hasToken&&wsHasWrite!==true)return;
   coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
   var dir=px<0?-1:1;
   if(_scrollBurstDir&&dir!==_scrollBurstDir){_scrollAccum=0;_scrollBurstTicks=0;}

@@ -229,37 +229,44 @@ function useTerminalFrameWrite(params: {
 }
 
 /**
- * 收终端页在 WS 建立后主动上抛的写权限。
+ * 收终端页在 WS 建立后主动上抛的写权限，并附带「这条上抛通道到底通没通」(`live`)。
  *
  * 只认这块 iframe 自己的 `contentWindow` 发来的消息（与外观桥同一套来源校验）：这
  * 页面会被跨 origin 嵌入，别的窗口发来的同名消息一律不作数。换一块 iframe 就把结论
- * 清空——上一块的判定套不到新的连接上。
+ * 与 `live` 一起清空——上一块的判定套不到新的连接上。
+ *
+ * `live` 一旦为真，就说明 postMessage 通道有效、终端页的回报是这条 frame 的**权威**：
+ * 此后哪怕它回报 `unknown`（重连时先发的 `write:null`），父页也一律以它为准，绝不再
+ * 回退到轮询那份可能已经过期的 writable（见下方合并处注释）。首帧确认前、或页面根本
+ * 没上抛（取不到父页 origin 时它会放弃 postMessage），`live` 为假，此时才交给轮询兜底。
  */
 function useTerminalFrameWriteReport(params: {
   enabled: boolean;
   frameKey: string;
   frame(): { contentWindow?: unknown } | null;
-}): TerminalFrameWrite {
+}): { write: TerminalFrameWrite; live: boolean } {
   const { enabled, frameKey } = params;
-  const [write, setWrite] = useState<TerminalFrameWrite>('unknown');
+  const [state, setState] = useState<{ write: TerminalFrameWrite; live: boolean }>(
+    { write: 'unknown', live: false },
+  );
   const frameRef = useRef(params.frame);
   useEffect(() => { frameRef.current = params.frame; });
 
   useEffect(() => {
-    setWrite('unknown');
+    setState({ write: 'unknown', live: false });
     if (!enabled || typeof window === 'undefined' || !window.addEventListener) return undefined;
     const onMessage = (event: { data?: unknown; source?: unknown }) => {
       const source = frameRef.current()?.contentWindow;
       if (!source || event.source !== source) return;
       const reported = readTerminalWriteReport(event.data);
       if (reported === null) return;
-      setWrite(reported);
+      setState({ write: reported, live: true });
     };
     window.addEventListener('message', onMessage as EventListener);
     return () => window.removeEventListener('message', onMessage as EventListener);
   }, [enabled, frameKey]);
 
-  return enabled ? write : 'unknown';
+  return enabled ? state : { write: 'unknown', live: false };
 }
 
 function browserHref(): string | undefined {
@@ -689,7 +696,12 @@ export function TerminalPane(props: PaneCommonProps & {
     frameKey,
     frame: () => frameRef.current,
   });
-  const frameWrite = reportedFrameWrite !== 'unknown' ? reportedFrameWrite : polledFrameWrite;
+  // 上抛通道一旦通过(`live`)，它就是这条 frame 的权威判据：哪怕它此刻回报 `unknown`
+  // （重连时终端页先发的 `write:null`），也一律以它为准，**绝不**回退到轮询那份可能已
+  // 经过期的 writable —— 本连接在自己的新首帧确认前一律「未知」（换链/重连都算未确认）。
+  // 只有上抛通道还没通（首帧前、或页面取不到父页 origin 放弃了 postMessage）才交给轮询
+  // 兜底；轮询本身也只认 wsHasWrite，读不到同样是「未知」，不会拿 HTTP hasToken 顶替。
+  const frameWrite = reportedFrameWrite.live ? reportedFrameWrite.write : polledFrameWrite;
 
   // 终端渲染风格：容器 class 管几何（行距 / 内边距），xterm 的配色住在跨文档的
   // 终端页里，父页换 class 它收不到 —— 必须把 theme 推过去，否则会出现「工作台
