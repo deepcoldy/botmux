@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import type { WorkerConfig } from '../global-config.js';
 
@@ -20,8 +20,36 @@ export interface SessionScopeProbeOptions {
   readFile?: (path: string) => string;
 }
 
-function defaultRun(command: string, args: readonly string[]): ReturnType<RunSync> {
-  return spawnSync(command, [...args], { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'] });
+export function userSystemdBusEnv(options: {
+  platform?: NodeJS.Platform;
+  uid?: number;
+  isSocket?: (path: string) => boolean;
+} = {}): Record<string, string> | undefined {
+  if ((options.platform ?? process.platform) !== 'linux') return undefined;
+  const uid = options.uid ?? process.getuid?.();
+  if (uid === undefined || !Number.isSafeInteger(uid) || uid < 0) return undefined;
+  const runtimeDir = `/run/user/${uid}`;
+  const busPath = `${runtimeDir}/bus`;
+  const isSocket = options.isSocket ?? (path => {
+    try { return statSync(path).isSocket(); } catch { return false; }
+  });
+  if (!isSocket(busPath)) return undefined;
+  return {
+    XDG_RUNTIME_DIR: runtimeDir,
+    DBUS_SESSION_BUS_ADDRESS: `unix:path=${busPath}`,
+  };
+}
+
+function defaultRun(
+  command: string,
+  args: readonly string[],
+): ReturnType<RunSync> {
+  return spawnSync(command, [...args], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...userSystemdBusEnv() },
+  });
 }
 
 function controllerDelegated(
@@ -150,6 +178,7 @@ export function wrapCommandInSessionScope(
   args: readonly string[],
   workerConfig?: WorkerConfig,
   capabilities = sessionScopeCapabilities(),
+  systemdEnv = userSystemdBusEnv(),
 ): ScopedCommand {
   if (!capabilities.cleanupSupported) return { bin, args: [...args], capabilities };
   const unitName = sessionScopeUnitName(sessionId);
@@ -165,7 +194,18 @@ export function wrapCommandInSessionScope(
     scopeArgs.push(`--property=MemoryMax=${workerConfig.sessionMemoryMaxBytes}`);
   }
   scopeArgs.push('--', bin, ...args);
-  return { bin: 'systemd-run', args: scopeArgs, unitName, capabilities };
+  const envArgs = systemdEnv
+    ? Object.entries(systemdEnv).map(([key, value]) => `${key}=${value}`)
+    : [];
+  return {
+    // Put the bus address on the pane argv boundary. Persistent backends do not
+    // all forward arbitrary caller env keys, and a long-lived tmux server may
+    // have started before the login bus existed.
+    bin: '/usr/bin/env',
+    args: [...envArgs, 'systemd-run', ...scopeArgs],
+    unitName,
+    capabilities,
+  };
 }
 
 export function stopSessionScope(

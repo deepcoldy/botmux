@@ -3,6 +3,7 @@ import {
   probeSessionScopeCapabilities,
   sessionScopeUnitName,
   stopSessionScope,
+  userSystemdBusEnv,
   wrapCommandInSessionScope,
 } from '../src/core/session-scope.js';
 
@@ -11,6 +12,17 @@ function result(status: number, stdout = '', stderr = ''): any {
 }
 
 describe('owned session systemd scope', () => {
+  it('derives the canonical user bus environment from a verified socket', () => {
+    const isSocket = vi.fn((path: string) => path === '/run/user/1001/bus');
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket })).toEqual({
+      XDG_RUNTIME_DIR: '/run/user/1001',
+      DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus',
+    });
+    expect(isSocket).toHaveBeenCalledWith('/run/user/1001/bus');
+    expect(userSystemdBusEnv({ platform: 'darwin', uid: 1001, isSocket })).toBeUndefined();
+    expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket: () => false })).toBeUndefined();
+  });
+
   it('fails open on unsupported platforms', () => {
     expect(probeSessionScopeCapabilities({ platform: 'darwin' })).toMatchObject({
       cleanupSupported: false,
@@ -57,8 +69,17 @@ describe('owned session systemd scope', () => {
       ['cli.js'],
       { sessionMemoryMaxBytes: 5_000_000 },
       capabilities,
+      {
+        XDG_RUNTIME_DIR: '/run/user/1001',
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1001/bus',
+      },
     );
-    expect(wrapped.bin).toBe('systemd-run');
+    expect(wrapped.bin).toBe('/usr/bin/env');
+    expect(wrapped.args.slice(0, 3)).toEqual([
+      'XDG_RUNTIME_DIR=/run/user/1001',
+      'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus',
+      'systemd-run',
+    ]);
     expect(wrapped.args).toContain('--property=MemoryMax=5000000');
     expect(wrapped.args.slice(-3)).toEqual(['--', '/usr/bin/node', 'cli.js']);
     expect(wrapped.unitName).toBe('botmux-session-abc-123.scope');
