@@ -93,13 +93,34 @@ describe('costCny on records', () => {
     expect(read!.costCny).toBeCloseTo(2.16, 6);
 
     // cacheWrite $3.75/1M → 1e6 * 3.75/1M * 7.2 = ¥27
+    // 必须单调累计：cacheRead 缩量会触发 shrink 守卫返回 null
     const write = recordSessionUsage({
       ...baseArgs(),
       ledgerDir: dir,
-      usage: cumulative(0, 0, 0, 1_000_000),
+      usage: cumulative(0, 0, 1_000_000, 1_000_000),
       pricing: { usdCny: 7.2 },
     });
     expect(write!.costCny).toBeCloseTo(27, 6);
+  });
+
+  it('prices each record by delta, not cumulative snapshot', () => {
+    // 第一条：(1e6*$3 + 5e5*$15)/1M = $10.5 → ¥75.6
+    recordSessionUsage({
+      ...baseArgs(),
+      ledgerDir: dir,
+      usage: cumulative(1_000_000, 500_000),
+      pricing: { usdCny: 7.2 },
+    });
+    // 第二条累计 (2e6, 6e5)，delta 为 (1e6, 1e5)：
+    // (1e6*$3 + 1e5*$15)/1M = $4.5 → ¥32.4（而非累计口径的 ¥108）
+    const second = recordSessionUsage({
+      ...baseArgs(),
+      ledgerDir: dir,
+      usage: cumulative(2_000_000, 600_000),
+      pricing: { usdCny: 7.2 },
+    });
+    expect(second!.costCny).toBeCloseTo(32.4, 6);
+    expect(ledgerLines(dir)[1].costCny).toBeCloseTo(32.4, 6);
   });
 
   it('omits costCny without pricing or resolver', () => {

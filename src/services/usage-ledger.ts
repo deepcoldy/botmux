@@ -378,7 +378,20 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     // 金额估算：显式 args.pricing 优先，否则问进程级 resolver（daemon 按
     // bot 接线）。未定价模型 / 无 pricing → null（fail-closed，绝不猜价）。
     const pricing = args.pricing ?? pricingResolver?.(args.larkAppId);
-    const costCny = pricing ? estimateCostCny(cur, pricing) : null;
+    // delta 口径计价：record 本身记的是区间增量，budget-tracker 逐条累加，
+    // 用累计快照 cur 会随记录数线性虚增金额。
+    const costCny = pricing
+      ? estimateCostCny(
+          {
+            inputTokens: deltaInput,
+            outputTokens: deltaOutput,
+            cacheReadTokens: deltaCacheRead,
+            cacheCreateTokens: deltaCacheCreate,
+            model: cur.model,
+          },
+          pricing,
+        )
+      : null;
 
     const record: UsageLedgerRecord = {
       v: 2,

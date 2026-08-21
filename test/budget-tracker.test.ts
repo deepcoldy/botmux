@@ -116,7 +116,7 @@ describe('trackBudgetSpend', () => {
     const alert = trackBudgetSpend('cli_a', 95, { now: AUG, ledgerDir: dir, budget: cfg });
     expect(alert).toMatchObject({ threshold: 90, percent: 95 });
     // All crossed thresholds are marked, so none can re-fire later.
-    expect(readState(dir).alertedThresholds.sort()).toEqual([50, 80, 90]);
+    expect(readState(dir).alertedThresholds.sort((a, b) => a - b)).toEqual([50, 80, 90]);
 
     expect(trackBudgetSpend('cli_a', 1, { now: AUG, ledgerDir: dir, budget: cfg })).toBeNull();
   });
@@ -125,7 +125,7 @@ describe('trackBudgetSpend', () => {
     const cfg = budget({ monthlyCny: 100, alertThresholdPercent: [80], hardStop: true });
     const alert = trackBudgetSpend('cli_a', 100, { now: AUG, ledgerDir: dir, budget: cfg });
     expect(alert).toMatchObject({ threshold: 100, hardStop: true, percent: 100 });
-    expect(readState(dir).alertedThresholds.sort()).toEqual([80, 100]);
+    expect(readState(dir).alertedThresholds.sort((a, b) => a - b)).toEqual([80, 100]);
   });
 
   it('rolls over lazily when the month changes', () => {
@@ -214,6 +214,8 @@ describe('isBudgetHardStopped', () => {
     const cfg = budget({ monthlyCny: 100, hardStop: true });
     trackBudgetSpend('cli_a', 150, { now: AUG, ledgerDir: dir, budget: cfg });
     writeFileSync(stateFile(dir), '{not json');
+    // 模拟新进程读盘：清掉内存缓存，避免同 mtime tick 命中陈旧状态
+    _resetBudgetTrackerForTest();
     expect(isBudgetHardStopped('cli_a', { now: AUG, ledgerDir: dir, budget: cfg })).toBe(false);
   });
 
