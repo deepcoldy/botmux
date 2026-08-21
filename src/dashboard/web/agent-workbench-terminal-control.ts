@@ -16,6 +16,12 @@
  *     判成过期丢掉，界面停在只读，服务端却已经把写租约发出去了。→ 观察 epoch 与
  *     写 epoch 彻底分开：写只被**更新的写**作废，轮询作废不了它；反过来，有在途写
  *     时轮询读数一律丢弃（它描述的是写之前的世界）。
+ *   - **只看「有没有在途写」拦不住旧读数**：takeover 发起**之前**就出门的那发轮询，
+ *     若在接管回执结算之后才回来，此刻 pending 已经清空，于是这份写之前的读数被当
+ *     成权威，界面从 controlled 倒写成 readonly（release 方向对称：把已经还掉的租约
+ *     倒写回「可输入」）。→ 读数按**发出时刻**盖写：观察发出时记下当时已结算的写
+ *     epoch，回来时早于最新的已结算写 epoch 就丢掉。复核 GET 不受影响——它发出时写
+ *     已经不在途，快照与当前相等，照旧能把 unknown 收敛掉。
  *   - **把「还不知道」当成只读**：首屏 GET 没回来时对外说 readonly，用户第二次点
  *     「终端」就被判成「模式没变 → 重挂」而不是关闭。→ `loading` 是一个显式状态，
  *     没有权威读数时同一个按钮再点一次一律按关闭处理。
@@ -56,8 +62,15 @@ export interface TerminalControlModel {
   authoritative: TerminalControlState | null;
   /** 观察 epoch（首屏 / 轮询 / 复核）。只作废观察，作废不了写。 */
   observeEpoch: number;
+  /** 当前这发观察**发出时**，已经结算过的最新那次写的 epoch。读数描述的是「发出那
+   *  一刻的世界」，所以它是否过期只能拿发出时刻去比，不能拿回来时的 pending 去比。 */
+  observeIssueEpoch: number;
   /** 写 epoch（takeover / release）。只被更新的写作废，轮询碰不到它。 */
   writeEpoch: number;
+  /** 最近一次**结算成功**（拿到权威回执）的写 epoch。发出时刻早于它的读数一律作废。
+   *  写**失败**不算：失败没有产生任何权威读数，随后的复核 GET 正是要靠它收敛
+   *  unknown，把失败也计进来就等于把复核自己挡在门外。 */
+  settledWriteEpoch: number;
   /** 在途写。非空期间轮询读数一律丢弃。 */
   pending: { action: TerminalWriteAction; epoch: number } | null;
   /** 这块 iframe **可能**仍然可写（拿过租约，或有过一次可能已经生效的接管）。
@@ -88,7 +101,9 @@ export function initialTerminalControlModel(): TerminalControlModel {
     phase: 'loading',
     authoritative: null,
     observeEpoch: 0,
+    observeIssueEpoch: 0,
     writeEpoch: 0,
+    settledWriteEpoch: 0,
     pending: null,
     mayWrite: false,
     error: null,
@@ -145,6 +160,10 @@ export function terminalControlReducer(
       return {
         ...state,
         observeEpoch: event.epoch,
+        // 盖写判据的快照：这一刻的世界已经含进了哪些写。回来时拿它跟最新的
+        // settledWriteEpoch 比，才拦得住「写发起之前发出、写结算之后才回来」的旧
+        // poll——那种读数回来时 pending 已经清空，光看 pending 是拦不住的。
+        observeIssueEpoch: state.settledWriteEpoch,
         // 首屏才把画面压回 loading；轮询和复核是背景动作，不该让已经settle 的
         // 徽标闪一下，复核更要把 unknown 保持到 GET 真的回来为止。
         phase: event.source === 'load' && !state.pending ? 'loading' : state.phase,
@@ -153,6 +172,11 @@ export function terminalControlReducer(
     case 'observe-settled': {
       // 过期观察；或有在途写——它描述的是写之前的世界，写的回执才是新的权威。
       if (event.epoch !== state.observeEpoch || state.pending) return state;
+      // 发出之后又有写结算过：这份读数描述的是那次写**之前**的世界，接受它就是把
+      // takeover 刚拿到的 controlled 倒写成 readonly（release 方向则是反过来，把已经
+      // 还掉的租约倒写成「可输入」）。复核 GET 不在此列——它发出时写已经不在途了，
+      // 快照与当前 settledWriteEpoch 相等，照旧放行去收敛 unknown。
+      if (state.observeIssueEpoch < state.settledWriteEpoch) return state;
       const downgraded = ownsWrite(state.authoritative) && !ownsWrite(event.control);
       return {
         ...state,
@@ -168,6 +192,9 @@ export function terminalControlReducer(
 
     case 'observe-failed': {
       if (event.epoch !== state.observeEpoch || state.pending) return state;
+      // 同一条判据：写结算之后才失败回来的旧观察说的是上一个世界，连它的错误文案都
+      // 不该盖掉刚落地的写回执（首屏失败时两边都是 0，照旧放行）。
+      if (state.observeIssueEpoch < state.settledWriteEpoch) return state;
       const error = { text: event.error, from: 'observe' as const };
       // 从来没读到过权威状态（首屏就失败，daemon 离线是典型）：这块面板还没碰过写，
       // 落在「只读 + 说明原因」是最贴近事实的说法，也不会给一个没有租约的终端糊上
@@ -220,6 +247,8 @@ export function terminalControlReducer(
         phase: settledPhase(event.control),
         authoritative: event.control,
         pending: null,
+        // 这一刻之前发出的观察全部作废：它们描述的是这次写之前的世界。
+        settledWriteEpoch: event.epoch,
         mayWrite: ownsWrite(event.control),
         error: null,
         // 写成功一律换 iframe：新的 grant 只在新的一次加载里生效。

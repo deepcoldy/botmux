@@ -177,6 +177,24 @@ async function openAndTakeOver(
   await clickPaneControl(renderer, '接管输入');
 }
 
+/** 直接挂一块终端面板（不经过工作台外壳）：要拨 15 秒轮询的表时，外壳里的其它
+ *  定时器只会添乱。挂完先把首屏 GET 走完，返回时面板已经有权威读数。 */
+async function renderPane(api: WorkbenchApi): Promise<TestRenderer.ReactTestRenderer> {
+  let renderer!: TestRenderer.ReactTestRenderer;
+  await act(async () => {
+    renderer = TestRenderer.create(React.createElement(TerminalPane, {
+      session: PAIR()[0],
+      api,
+      authenticated: true,
+      capabilities: FULL_CAPABILITIES,
+      now: NOW,
+      location: LOCATION,
+    }));
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  return renderer;
+}
+
 async function clickRow(renderer: TestRenderer.ReactTestRenderer, title: string): Promise<void> {
   const node = renderer.root.find(node => node.props.role === 'option'
     && String(node.props['aria-label'] ?? '').startsWith(`${title}.`));
@@ -258,8 +276,12 @@ function leaseApi(options: {
       ...baseApi,
       getTerminalControl: async () => {
         calls.push('get');
+        // 读数在**服务端受理这一刻**就定形了，下面那道闸只是把回执按住不发。
+        // 这样才造得出「写之前受理、写结算之后才回来」的旧 poll——把 snapshot() 挪到
+        // 闸后面，旧 poll 会凭空读到写之后的世界，那条竞态就永远复现不了。
+        const answer = snapshot();
         if (gatePromise) await gatePromise.promise;
-        return snapshot();
+        return answer;
       },
       takeoverTerminal: async (sessionId: string) => {
         calls.push(`takeover:${sessionId}`);
@@ -561,6 +583,112 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
     expect(pane(renderer)).toBeNull();
     lease.gate.open();
     await settle();
+    act(() => renderer.unmount());
+  });
+});
+
+// ─── ②' 写结算之后才回来的旧 poll：读数按**发出时刻**的写世代裁决 ─────────────
+describe('写结算之后才回来的旧 poll 不许倒写控制权', () => {
+  it('takeover 发起**之前**发出的 poll 在接管结算之后才回来 → 仍是「可输入」，不倒写只读', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = leaseApi();
+    const renderer = await renderPane(lease.api);
+    expect(paneMode(renderer)).toBe('readonly');
+
+    // 旧 poll：服务端在**接管之前**就受理了它，读数是「写之前的世界」= 只读。
+    // 回执被闸门按住，等接管结算之后再放回来。
+    lease.gate.hold();
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_100); });
+
+    // 接管在这发 poll 之后发起，并且先结算：租约确实到手了。
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(lease.serverControlled()).toBe(true);
+
+    // 旧 poll 现在才回来。回归的形状：此刻已经没有在途写了，reducer 光看「有没有
+    // pending」就把这份陈年读数当成权威，界面倒写成只读——服务端的写租约还在手上，
+    // 用户对着一个写着「只读」的终端照样能打字。
+    await act(async () => {
+      lease.gate.open();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(lease.serverControlled()).toBe(true);
+    act(() => renderer.unmount());
+  });
+
+  it('release 结算之后才回来的旧 poll 不许把只读倒写回「可输入」（对称方向）', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = leaseApi();
+    const renderer = await renderPane(lease.api);
+
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+
+    // 旧 poll 在释放之前被受理，读到的是「还握着租约」。
+    lease.gate.hold();
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_100); });
+
+    await act(async () => {
+      paneControl(renderer, '释放输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(lease.serverControlled()).toBe(false);
+
+    // 倒写回「可输入」= 给一块租约已经还掉的终端亮起输入口，比倒写成只读更糟。
+    await act(async () => {
+      lease.gate.open();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(lease.serverControlled()).toBe(false);
+    act(() => renderer.unmount());
+  });
+
+  it('写失败后的复核 GET 不被这条判据误伤：unknown 照旧收敛回权威读数', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = leaseApi({ hold: 'release' });
+    const renderer = await renderPane(lease.api);
+
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+
+    // 一发旧 poll 先按住，随后释放失败 → unknown + 立刻复核，复核 GET 被同一道闸按住。
+    lease.gate.hold();
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_100); });
+    await act(async () => {
+      paneControl(renderer, '释放输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      lease.held.reject(new WorkbenchApiError(500, 'terminal_unavailable'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(maskShown(renderer)).toBe(true);
+
+    // 一起放行。复核读**不是**旧 poll：它发出时写世代已经推进过了，判据必须放它过去，
+    // 否则 unknown 再也收敛不了、遮罩永远挂着。释放确实没成，所以收敛回「可输入」。
+    await act(async () => {
+      lease.gate.open();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(maskShown(renderer)).toBe(false);
+    expect(lease.serverControlled()).toBe(true);
     act(() => renderer.unmount());
   });
 });
