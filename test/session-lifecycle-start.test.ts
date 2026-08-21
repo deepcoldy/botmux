@@ -2,10 +2,11 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
-const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({
+const { emitHookEventMock, forkMock, execSyncMock, checkWorkerAdmissionMock } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
   execSyncMock: vi.fn(),
+  checkWorkerAdmissionMock: vi.fn(),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -19,6 +20,11 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+}));
+
+vi.mock('../src/core/worker-budget.js', () => ({
+  checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
+  formatMemoryBytes: (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`,
 }));
 
 vi.mock('../src/im/lark/client.js', () => {
@@ -222,11 +228,65 @@ beforeEach(() => {
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
   forkMock.mockImplementation(() => makeFakeWorker());
+  checkWorkerAdmissionMock.mockReturnValue({
+    allowed: true,
+    reasons: [],
+    pressure: { totalMemoryBytes: 32 * 1024 ** 3, warnings: [] },
+    policy: {
+      minAvailableMemoryBytes: 8 * 1024 ** 3,
+      maxMemoryFullAvg10: 20,
+      minAvailableMemorySource: 'default',
+      maxMemoryFullAvg10Source: 'default',
+    },
+  });
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
     getSessionWorkingDir: () => '/repo',
     getActiveCount: () => 1,
     closeSession: vi.fn(),
+  });
+});
+
+describe('host memory pressure worker admission', () => {
+  it('blocks a fresh/resumed fork before child creation and posts retry guidance', async () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValue({
+      allowed: false,
+      reasons: ['MemAvailable 1.0 GiB is below the reserved 8.0 GiB'],
+      pressure: {
+        totalMemoryBytes: 32 * 1024 ** 3,
+        availableMemoryBytes: 1024 ** 3,
+        memoryFullAvg10: 25,
+        warnings: [],
+      },
+      policy: {
+        minAvailableMemoryBytes: 8 * 1024 ** 3,
+        maxMemoryFullAvg10: 20,
+        minAvailableMemorySource: 'default',
+        maxMemoryFullAvg10Source: 'default',
+      },
+    });
+    const ds = makeDs({ hasHistory: true });
+
+    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_retry' })).toBe(true);
+    await Promise.resolve();
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/memory pressure.*retry/i),
+      'text',
+      'app_test',
+      'om_retry',
+      undefined,
+    );
   });
 });
 

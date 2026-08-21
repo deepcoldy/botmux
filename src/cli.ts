@@ -243,7 +243,10 @@ import {
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
-import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import { clearWorkerConfig, mergeDashboardConfig, mergeGlobalConfig, mergeWorkerConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
+import { evaluateWorkerAdmission, formatMemoryBytes, readHostMemoryPressure } from './core/worker-budget.js';
+import { sessionScopeCapabilities } from './core/session-scope.js';
+import { DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   createWhiteboard,
   ensureDefaultWhiteboard,
@@ -7317,7 +7320,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
-       unset             清除 worker 预算覆盖，恢复按机器 CPU/内存自动推导
+  worker-budget status 查看主机内存准入阈值与 session scope 能力
+       set             设置 --min-available-mib / --max-memory-full-avg10 / --session-memory-max-mib
+       unset           清除主机 worker 内存策略覆盖
   lang [zh|en]         切换 UI 语言（无参 = 查看当前设置）
        --bot N         仅改 bots.json 中第 N 个 bot 的 lang
        --unset         清除（global 或 --bot N 配合）
@@ -7515,6 +7520,85 @@ function argValue(args: string[], ...flags: string[]): string | undefined {
     }
   }
   return undefined;
+}
+
+function positiveNumber(value: string | undefined, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${label} must be a positive number`);
+  return parsed;
+}
+
+function cmdWorkerBudget(args: string[]): void {
+  const sub = (args[0] ?? 'status').toLowerCase();
+  if (sub === 'status') {
+    const pressure = readHostMemoryPressure();
+    const decision = evaluateWorkerAdmission(pressure, readGlobalConfig().worker);
+    const scope = sessionScopeCapabilities();
+    const bots = loadBotsJson();
+    console.log('Worker host protection');
+    console.log(`  resident ceiling policy: unchanged (per-bot maxLiveWorkers; default ${DEFAULT_MAX_LIVE_WORKERS})`);
+    if (bots.length === 0) {
+      console.log(`  effective resident ceiling: ${DEFAULT_MAX_LIVE_WORKERS} (default; no configured bots)`);
+    } else {
+      bots.forEach((bot, index) => {
+        const configured = typeof bot?.maxLiveWorkers === 'number'
+          && Number.isInteger(bot.maxLiveWorkers)
+          && bot.maxLiveWorkers > 0
+          ? bot.maxLiveWorkers
+          : undefined;
+        const label = typeof bot?.botName === 'string' && bot.botName.trim()
+          ? bot.botName.trim()
+          : typeof bot?.larkAppId === 'string' && bot.larkAppId
+            ? bot.larkAppId
+            : `bot-${index}`;
+        console.log(
+          `  effective resident ceiling [${label}]: ${configured ?? DEFAULT_MAX_LIVE_WORKERS} `
+          + `(${configured === undefined ? 'default' : 'config'})`,
+        );
+      });
+    }
+    console.log(`  MemAvailable: ${pressure.availableMemoryBytes === undefined ? 'unavailable' : formatMemoryBytes(pressure.availableMemoryBytes)}`);
+    console.log(`  reserve: ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)} (${decision.policy.minAvailableMemorySource})`);
+    console.log(`  memory full PSI avg10: ${pressure.memoryFullAvg10 === undefined ? 'unavailable' : `${pressure.memoryFullAvg10.toFixed(2)}%`}`);
+    console.log(`  PSI limit: ${decision.policy.maxMemoryFullAvg10.toFixed(2)}% (${decision.policy.maxMemoryFullAvg10Source})`);
+    console.log(`  admission: ${decision.allowed ? 'allowed' : `blocked — ${decision.reasons.join('; ')}`}`);
+    console.log(`  session scope cleanup: ${scope.cleanupSupported ? 'supported' : 'unsupported'}`);
+    console.log(`  MemoryMax enforceable: ${scope.memoryControllerSupported ? 'yes' : 'no'}`);
+    console.log(`  configured session MemoryMax: ${decision.policy.sessionMemoryMaxBytes === undefined ? 'unset' : formatMemoryBytes(decision.policy.sessionMemoryMaxBytes)}`);
+    if (scope.reason) console.log(`  scope note: ${scope.reason}`);
+    for (const warning of pressure.warnings) console.log(`  pressure note: ${warning} (fail-open)`);
+    console.log(`  Config file: ${globalConfigPath()}`);
+    return;
+  }
+  if (sub === 'set') {
+    const rest = args.slice(1);
+    const minMib = argValue(rest, '--min-available-mib');
+    const psi = argValue(rest, '--max-memory-full-avg10');
+    const memoryMaxMib = argValue(rest, '--session-memory-max-mib');
+    if (minMib === undefined && psi === undefined && memoryMaxMib === undefined) {
+      throw new Error('worker-budget set requires at least one policy flag');
+    }
+    const patch: WorkerConfig = {};
+    if (minMib !== undefined) patch.minAvailableMemoryBytes = Math.round(positiveNumber(minMib, '--min-available-mib') * 1024 ** 2);
+    if (psi !== undefined) {
+      const value = positiveNumber(psi, '--max-memory-full-avg10');
+      if (value > 100) throw new Error('--max-memory-full-avg10 must be <= 100');
+      patch.maxMemoryFullAvg10 = value;
+    }
+    if (memoryMaxMib !== undefined) patch.sessionMemoryMaxBytes = Math.round(positiveNumber(memoryMaxMib, '--session-memory-max-mib') * 1024 ** 2);
+    const resolved = mergeWorkerConfig(patch);
+    console.log('Updated worker host protection policy.');
+    console.log(JSON.stringify(resolved, null, 2));
+    console.log('New worker admissions use this policy without changing resident-session ceilings.');
+    return;
+  }
+  if (sub === 'unset' || sub === 'clear') {
+    clearWorkerConfig();
+    console.log('Cleared worker host protection overrides; defaults apply.');
+    return;
+  }
+  console.error('Usage: botmux worker-budget [status|set|unset]');
+  process.exitCode = 1;
 }
 
 function argFlag(args: string[], flag: string): boolean {
@@ -13968,6 +14052,14 @@ switch (command) {
     else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
     else if (sub === 'status') autostartStatus(opts);
     else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    break;
+  }
+  case 'worker-budget': {
+    try { cmdWorkerBudget(process.argv.slice(3)); }
+    catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
     break;
   }
   default:

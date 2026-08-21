@@ -18,6 +18,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
+import { checkWorkerAdmission, formatMemoryBytes } from './worker-budget.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import {
@@ -99,6 +100,7 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../serv
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
+const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
@@ -8407,6 +8409,32 @@ export function forkWorker(
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  const admission = checkWorkerAdmission(readGlobalConfig().worker);
+  for (const warning of admission.pressure.warnings) {
+    if (hostPressureWarningsLogged.has(warning)) continue;
+    hostPressureWarningsLogged.add(warning);
+    logger.warn(`[${tag(ds)}] Host memory pressure check degraded (fail-open): ${warning}`);
+  }
+  if (!admission.allowed) {
+    const reason = admission.reasons.join('; ');
+    logger.warn(`[${tag(ds)}] Worker admission blocked by host memory pressure: ${reason}`);
+    const retry = `Host memory pressure is critical: ${reason}. `
+      + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
+      + `(reserve ${formatMemoryBytes(admission.policy.minAvailableMemoryBytes)}, `
+      + `PSI limit ${admission.policy.maxMemoryFullAvg10.toFixed(2)}%).`;
+    void cb.sessionReply(
+      sessionAnchorId(ds),
+      retry,
+      'text',
+      ds.larkAppId,
+      fallbackTurnId(ds, initTurnId),
+      ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+    ).catch(error => logger.error(
+      `[${tag(ds)}] Failed to report blocked worker admission: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    ));
+    return true;
+  }
   // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
   // model turn. Starting its CLI with an empty prompt must not mint a queued
   // activation token: the worker has nothing to submit and could never ACK it.

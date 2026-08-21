@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  clearWorkerConfig,
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
@@ -10,6 +11,7 @@ import {
   invalidateGlobalConfigCache,
   mergeDashboardConfig,
   mergeGlobalConfig,
+  mergeWorkerConfig,
   readGlobalConfig,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
@@ -157,6 +159,31 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
     expect(raw).not.toHaveProperty('groupNamePrefix');
     expect(raw.futureSetting).toBe('keep-me');
+  });
+
+  it('validates worker memory policy and preserves future sibling keys on update', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      worker: {
+        minAvailableMemoryBytes: 4 * 1024 ** 3,
+        maxMemoryFullAvg10: 15.5,
+        sessionMemoryMaxBytes: 8 * 1024 ** 3,
+        futurePolicy: { version: 2 },
+      },
+    }));
+    expect(readGlobalConfig().worker).toEqual({
+      minAvailableMemoryBytes: 4 * 1024 ** 3,
+      maxMemoryFullAvg10: 15.5,
+      sessionMemoryMaxBytes: 8 * 1024 ** 3,
+    });
+    mergeWorkerConfig({ maxMemoryFullAvg10: 25 });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(raw.worker.futurePolicy).toEqual({ version: 2 });
+    expect(readGlobalConfig().worker?.maxMemoryFullAvg10).toBe(25);
+
+    clearWorkerConfig();
+    const cleared = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(cleared.worker).toEqual({ futurePolicy: { version: 2 } });
+    expect(readGlobalConfig().worker).toBeUndefined();
   });
 
   it('drops invalid repoPickerMode values', () => {

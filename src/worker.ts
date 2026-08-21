@@ -133,6 +133,10 @@ import {
 } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
+  stopSessionScope,
+  wrapCommandInSessionScope,
+} from './core/session-scope.js';
+import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
@@ -14280,6 +14284,33 @@ async function spawnCli(
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
     }
+    if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
+      // Wrap the command executed INSIDE the pane, not `tmux new-session`.
+      // The shared tmux server keeps its own cgroup while the owned CLI and all
+      // of its command descendants enter this per-session scope.
+      // If a prior worker crashed after its pane vanished, retire any detached
+      // descendant still held by this exact logical session's old scope before
+      // reusing the deterministic unit name.
+      stopSessionScope(cfg.sessionId);
+      const scoped = wrapCommandInSessionScope(
+        cfg.sessionId,
+        spawnBin,
+        spawnArgs,
+        readGlobalConfig().worker,
+      );
+      spawnBin = scoped.bin;
+      spawnArgs = scoped.args;
+      if (scoped.unitName) {
+        log(
+          `Launching owned CLI in ${scoped.unitName}`
+          + (scoped.capabilities.memoryControllerSupported
+            ? ' (memory controller verified)'
+            : ' (scope cleanup only; MemoryMax not enforceable)'),
+        );
+      } else if (scoped.capabilities.reason) {
+        log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
+      }
+    }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
       cols: PTY_COLS,
@@ -15329,6 +15360,19 @@ function killCli(opts: {
   appRunnerControlDecoder.reset();
 }
 
+function stopOwnedSessionScope(reason: string): void {
+  const cfg = lastInitConfig;
+  if (!cfg || cfg.adoptMode || isRemoteBackendType(effectiveBackendType)) return;
+  try {
+    const stopped = stopSessionScope(cfg.sessionId);
+    log(stopped
+      ? `Stopped owned session scope (${reason})`
+      : `Owned session scope was absent or could not be stopped (${reason})`);
+  } catch (error) {
+    log(`Failed to stop owned session scope (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
@@ -15415,6 +15459,7 @@ async function restartCliProcess(
         ));
         return;
       }
+      stopOwnedSessionScope('restart');
       killCli({ preservePending: opts.preservePending });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
@@ -18164,6 +18209,7 @@ process.on('message', async (raw: unknown) => {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
       }
+      stopOwnedSessionScope('close');
       killCli();
       // Bridge marker file outlives a single CLI process (we keep it across
       // restarts so a mid-flight send is still credited), but a real close
@@ -18434,6 +18480,7 @@ process.on('message', async (raw: unknown) => {
         if (isRemoteBackendType(effectiveBackendType)) backend?.kill();
         else (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
+      stopOwnedSessionScope('suspend');
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the

@@ -98,6 +98,15 @@ export interface VcMeetingAgentGlobalConfig {
   listenerBotAppId?: string;
 }
 
+export interface WorkerConfig {
+  /** Refuse a fresh/resumed worker while MemAvailable is below this value. */
+  minAvailableMemoryBytes?: number;
+  /** Refuse a fresh/resumed worker while memory full PSI avg10 reaches this percentage. */
+  maxMemoryFullAvg10?: number;
+  /** Optional per-session hard limit. Applied only after cgroup-v2 placement is verified. */
+  sessionMemoryMaxBytes?: number;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -115,6 +124,8 @@ export interface GlobalConfig {
    *  services/voice/types.ts. Presence (with usable creds) gates the
    *  "🔊 语音总结" button. */
   voice?: VoiceConfig;
+  /** Machine-wide worker admission and containment policy. */
+  worker?: WorkerConfig;
   /** Machine-wide auto-update / auto-restart schedule. Off unless explicitly
    *  enabled. Only the primary daemon (bot-0) acts on it — see core/maintenance.ts. */
   maintenance?: MaintenanceConfig;
@@ -400,6 +411,27 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readPositiveInteger(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined;
+}
+
+function readWorker(raw: unknown): WorkerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: WorkerConfig = {};
+  const minAvailableMemoryBytes = readPositiveInteger(value.minAvailableMemoryBytes);
+  const sessionMemoryMaxBytes = readPositiveInteger(value.sessionMemoryMaxBytes);
+  if (minAvailableMemoryBytes !== undefined) out.minAvailableMemoryBytes = minAvailableMemoryBytes;
+  if (sessionMemoryMaxBytes !== undefined) out.sessionMemoryMaxBytes = sessionMemoryMaxBytes;
+  if (typeof value.maxMemoryFullAvg10 === 'number'
+    && Number.isFinite(value.maxMemoryFullAvg10)
+    && value.maxMemoryFullAvg10 > 0
+    && value.maxMemoryFullAvg10 <= 100) {
+    out.maxMemoryFullAvg10 = value.maxMemoryFullAvg10;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function readGlobalSkills(raw: unknown): GlobalSkillConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
@@ -556,6 +588,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
   if (voice) out.voice = voice;
+  const worker = readWorker(raw.worker);
+  if (worker) out.worker = worker;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
   const whiteboard = readWhiteboard(raw.whiteboard);
@@ -689,6 +723,31 @@ export function mergeDashboardConfig(patch: DashboardGlobalConfig): DashboardGlo
     : {};
   mergeGlobalConfig({ dashboard: { ...existing, ...patch } as DashboardGlobalConfig });
   return readGlobalConfig().dashboard ?? {};
+}
+
+/** Merge worker policy without deleting future keys written by a newer client. */
+export function mergeWorkerConfig(patch: WorkerConfig): WorkerConfig {
+  const raw = readRawConfig();
+  const existing = raw.worker && typeof raw.worker === 'object' && !Array.isArray(raw.worker)
+    ? raw.worker as Record<string, unknown>
+    : {};
+  mergeGlobalConfig({ worker: { ...existing, ...patch } as WorkerConfig });
+  return readGlobalConfig().worker ?? {};
+}
+
+/** Clear the worker keys this version owns without deleting future policy keys. */
+export function clearWorkerConfig(): WorkerConfig {
+  const raw = readRawConfig();
+  if (!raw.worker || typeof raw.worker !== 'object' || Array.isArray(raw.worker)) {
+    mergeGlobalConfig({ worker: null });
+    return {};
+  }
+  const remaining = { ...raw.worker as Record<string, unknown> };
+  delete remaining.minAvailableMemoryBytes;
+  delete remaining.maxMemoryFullAvg10;
+  delete remaining.sessionMemoryMaxBytes;
+  mergeGlobalConfig({ worker: Object.keys(remaining).length > 0 ? remaining as WorkerConfig : null });
+  return readGlobalConfig().worker ?? {};
 }
 
 /** 写入 notifier 的完整已知配置，同时保留配置块内的未来字段。 */
