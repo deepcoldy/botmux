@@ -18296,9 +18296,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       return;
     }
 
-    // The pending session and visible progress reply are now stable. Detach the
-    // expensive scan so the per-anchor serializer can release immediately;
-    // follow-ups and `/repo`/`/close` may then consume the same pending buffer.
+    // The pending session and visible progress reply are now stable. The turn
+    // is durably accepted (pendingRepo + buffered in the queue), so mark ingress
+    // admitted BEFORE detaching: any later failure (scan error, picker-card send
+    // failure handled inside the IIFE) must degrade to `/repo` recovery, never
+    // advise a resend — the message is already retained.
+    markIngressAdmitted(ctx);
+    // Detach the expensive scan so the per-anchor serializer can release
+    // immediately; follow-ups and `/repo`/`/close` may then consume the same
+    // pending buffer.
     void (async () => {
       try {
         let projects: import('./services/project-scanner.js').ProjectInfo[];
