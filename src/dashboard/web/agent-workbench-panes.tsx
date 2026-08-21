@@ -498,9 +498,18 @@ export function TerminalPane(props: PaneCommonProps & {
     ? (touchWrite === 'writable' ? 'controlled' : touchWrite === 'readonly' ? 'readonly' : 'unknown')
     : terminalControlMode(model);
   const controlled = paneMode === 'controlled';
-  const status = controlled ? '可输入' : paneMode === 'unknown' ? '未知' : '只读';
-  const chipClass = controlled ? 'is-controlled' : paneMode === 'unknown' ? 'is-unknown' : 'is-readonly';
-  const chipGlyph = controlled ? '◆' : paneMode === 'unknown' ? '◇' : '◌';
+  // 徽标只说有依据的话。首屏 GET 还在飞时说「只读」是最容易被信以为真的一句假话：
+  // 同一个登录留下的写租约会让这块 iframe 真的可以打字（详见状态机文件里 loading
+  // 那条注释），所以 loading 有自己的说法，不借用只读。
+  const status = controlled ? '可输入'
+    : paneMode === 'unknown' ? '未知'
+      : paneMode === 'loading' ? '检查中' : '只读';
+  const chipClass = controlled ? 'is-controlled'
+    : paneMode === 'unknown' ? 'is-unknown'
+      : paneMode === 'loading' ? 'is-checking' : 'is-readonly';
+  const chipGlyph = controlled ? '◆'
+    : paneMode === 'unknown' ? '◇'
+      : paneMode === 'loading' ? '⋯' : '◌';
   // 未知且这块 iframe 可能仍然可写 → 盖住它。这一刻既不能说「已接管」也不能说
   // 「只读」，而盲输入会真的打进终端（P1-3）。复核 GET 回来后遮罩自动撤掉。
   const masked = !touch && terminalControlNeedsMask(model);

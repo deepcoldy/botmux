@@ -38,7 +38,7 @@ import type { TerminalControlState } from './agent-workbench-api.js';
 
 /**
  * 面板此刻的控制权阶段。
- *   loading      首屏 GET 还没回来，什么都不知道（≠ 只读）。
+ *   loading      首屏 GET 还没回来，什么都不知道（≠ 只读，徽标也不许写「只读」）。
  *   readonly     权威读数：没有可写租约。
  *   controlled   权威读数：这个浏览器握着写租约（平台所有者的恒可写身份也算）。
  *   taking-over  写在途：POST takeover 还没回执。
@@ -196,17 +196,15 @@ export function terminalControlReducer(
       // 不该盖掉刚落地的写回执（首屏失败时两边都是 0，照旧放行）。
       if (state.observeIssueEpoch < state.settledWriteEpoch) return state;
       const error = { text: event.error, from: 'observe' as const };
-      // 从来没读到过权威状态（首屏就失败，daemon 离线是典型）：这块面板还没碰过写，
-      // 落在「只读 + 说明原因」是最贴近事实的说法，也不会给一个没有租约的终端糊上
-      // 遮罩。
+      // 从来没读到过权威状态（首屏就失败，daemon 抖一下是典型）。这里**不能**落只读：
+      // 租约挂在（会话 × 登录）上，不挂在这块面板上——同一个登录里上一块面板接管过、
+      // 这块面板刚挂上来时，服务端那把写租约仍在，前置代理照旧会给这个 iframe 补
+      // WRITE grant，也就是说它**真的能打字**。此时说一句「只读」既是没有依据的结论，
+      // 又顺手把遮罩取消了（mayWrite=false），等于给可写终端盖了个只读的章。
+      // 照实说未知：mayWrite 保持为真，遮罩挡住盲输入，等下一拍轮询或用户手动重试
+      // 把它收敛掉。
       if (!state.authoritative) {
-        return {
-          ...state,
-          phase: 'readonly',
-          authoritative: { mode: 'readonly', owned: false },
-          mayWrite: false,
-          error,
-        };
+        return { ...state, phase: 'unknown', mayWrite: true, error };
       }
       // 已经有过权威读数：一次读失败推翻不了它——尤其不该把「我正握着写租约」改口
       // 成只读。保留原判，把错误说出来，等下一拍轮询自己收敛。

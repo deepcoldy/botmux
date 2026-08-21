@@ -231,6 +231,13 @@ function paneMode(
   return 'readonly';
 }
 
+/** 徽标上写给用户看的那几个字（「只读 / 可输入 / 未知 / 检查中」）。 */
+function chipText(renderer: TestRenderer.ReactTestRenderer): string {
+  const chips = renderer.root.findAll(node =>
+    typeof node.props.className === 'string' && node.props.className.startsWith('wb-mode-chip'));
+  return chips.length === 0 ? '' : textOf(chips[0]);
+}
+
 function feedback(renderer: TestRenderer.ReactTestRenderer): string {
   const nodes = renderer.root.findAll(node => node.props.className === 'wb-pane-feedback');
   return nodes.length === 0 ? '' : textOf(nodes[0]);
@@ -866,6 +873,71 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     expect(worker).toContain('var hasToken=${hasWrite}');
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('{ hasToken?: unknown }');
+  });
+});
+
+// ─── ② 首屏 / loading：没有权威读数时不许乐观说只读 ──────────────────────────
+describe('首屏控制权 GET 失败不许落成「只读」', () => {
+  /**
+   * 为什么「读不到 → 只读」是错的：租约挂在（sessionId × 登录会话）上，不挂在这块
+   * 面板上。同一个登录里前一块面板接管过、这块面板重新挂上来时，服务端那把写租约
+   * 还在，前置代理照旧会给这个 iframe 补 WRITE grant —— 也就是说 iframe **真的能
+   * 打字**。此时 GET 失败（daemon 抖一下、网络断一拍）却把界面落成「只读 +
+   * mayWrite=false」，就等于给一块可写终端盖了个只读的章，还顺手取消了遮罩。
+   */
+  it('从来没读到过权威状态就失败 → 未知 + 遮罩，而不是只读', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const offline: WorkbenchApi = {
+      ...baseApi,
+      getTerminalControl: async () => { throw new WorkbenchApiError(503, 'daemon_offline'); },
+    };
+    const renderer = await renderPane(offline);
+    await settle();
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(chipText(renderer)).toContain('未知');
+    expect(maskShown(renderer)).toBe(true);
+    // 失败原因照说，但结论不能是「只读」。
+    expect(feedback(renderer)).toContain('所属 daemon 已离线');
+    act(() => renderer.unmount());
+  });
+
+  it('读通之后再失败照旧保留权威读数（这条既有行为不许被上面那条改坏）', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    let fail = false;
+    const flaky = leaseApi();
+    const renderer = await renderPane({
+      ...flaky.api,
+      getTerminalControl: async (sessionId: string, signal?: AbortSignal) => {
+        if (fail) throw new WorkbenchApiError(503, 'daemon_offline');
+        return flaky.api.getTerminalControl(sessionId, signal);
+      },
+    });
+    expect(paneMode(renderer)).toBe('readonly');
+    fail = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    // 一次读失败推翻不了已经拿到的权威读数：它照旧是只读，只是多一句原因。
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(maskShown(renderer)).toBe(false);
+    act(() => renderer.unmount());
+  });
+
+  it('loading 阶段徽标说「检查中」，不冒充只读', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = leaseApi();
+    lease.gate.hold();
+    const renderer = await renderPane(lease.api);
+    // 首屏 GET 还在飞：这一刻我们**不知道**这块 iframe 能不能写，说「只读」就是
+    // 在没有依据的时候给结论。
+    expect(chipText(renderer)).toContain('检查中');
+    expect(chipText(renderer)).not.toContain('只读');
+    expect(feedback(renderer)).toContain('正在检查终端权限');
+    lease.gate.open();
+    await settle();
+    expect(chipText(renderer)).toContain('只读');
+    act(() => renderer.unmount());
   });
 });
 

@@ -28483,6 +28483,9 @@ button.skills-issue-badge:hover {
    能说已接管也不能说只读。用中性灰把它和两个确定态区分开，别借用 warn 的黄色—
    那会让人以为界面已经给出了只读这个结论。 */
 .wb-mode-chip.is-unknown { color: var(--text-2); background: var(--bg-l3); }
+/* 「检查中」= 首屏权威读数还没回来。和「未知」同属「没有结论」，但它是**正在收敛**
+   的一拍，不是失败态，所以用同一套中性色、不另起一种视觉语言。 */
+.wb-mode-chip.is-checking { color: var(--text-3); background: var(--bg-l3); }
 .wb-lease-time { color: var(--text-3); font-size: 11px; white-space: nowrap; }
 .wb-pane-feedback {
   overflow: hidden;
