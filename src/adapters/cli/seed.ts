@@ -48,6 +48,12 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
   const dataDir = deriveSeedDataDir(bin);
   return createClaudeFamilyAdapter({
     id: 'seed',
+    // Seed 是 Relay 的旧发行名，同一个 Claude Code fork 血统，落盘 transcript
+    // 与 Claude Code 同构（per-project JSONL 带权威 `stop_reason:end_turn` 终态 +
+    // system 回合标记）。turn-terminal 契约随 CLII 二进制血统一致（已在 relay 3.x
+    // 真实 transcript 上核实，seed 共享同一 JSONL 格式），opt-in 让 seed 系 bot 也
+    // 能当会议 agent。
+    reliableTurnTerminal: true,
     // Seed's SuperRelay apiKey lives in `<dataDir>/byted-cloud-auth.json` (NOT
     // under bytedcli); keep it + the bytedcli SSO dir real + writable in the file
     // sandbox so token refresh / login persist (a path not bound real wouldn't

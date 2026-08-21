@@ -57,6 +57,8 @@ import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createRelayAdapter } from '../src/adapters/cli/relay.js';
+import { createSeedAdapter } from '../src/adapters/cli/seed.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -640,6 +642,11 @@ describe('reliableTurnTerminal capability', () => {
     expect(createCodexAdapter('/bin/codex').reliableTurnTerminal).toBe(true);
     expect(createTraexAdapter('/bin/traex').reliableTurnTerminal).toBe(true);
     expect(createGrokAdapter('/bin/grok').reliableTurnTerminal).toBe(true);
+    // Relay/Seed 是 Claude Code 的 fork，落盘 JSONL 与 Claude Code 同构（同样的
+    // `stop_reason:end_turn` + system 回合标记），兑现同一份 turn-terminal 契约，
+    // 故与 claude-code 一样 opt-in——让 relay/seed 系 bot 能当会议 agent。
+    expect(createRelayAdapter('/bin/relay').reliableTurnTerminal).toBe(true);
+    expect(createSeedAdapter('/bin/seed').reliableTurnTerminal).toBe(true);
     expect(createCocoAdapter('/bin/coco').reliableTurnTerminal).toBeUndefined();
     // Pi supports type-ahead but NOT reliableTurnTerminal: it holds no session
     // fd (append short open/close) and a custom-terminate turn has no on-disk

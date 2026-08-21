@@ -25,6 +25,7 @@ import {
   mapManifestScopesToOpenPlatformIds,
   parseSetupOpenPlatformAutoFlag,
   prepareFeishuWebSession,
+  probeVcMeetingEventSubscription,
   readStoredCookiesFromSessionFile,
   safeErrorMessage,
   type StoredCookie,
@@ -784,6 +785,78 @@ describe('createFeishuOpenPlatformApp', () => {
     // 应用已建成但发版失败:带 appId 供调用方兜底/提示(手动恢复路径)
     expect(result).toMatchObject({ ok: false, reason: 'api_error', appId: 'cli_created' });
     expect(calls.filter(p => p === '/developers/v1/app_version/create/cli_created')).toHaveLength(1);
+  });
+});
+
+describe('probeVcMeetingEventSubscription — read-only VC event check', () => {
+  // Serve the console page (CSRF) + the read-only event-state endpoint. The
+  // probe must NEVER hit any /update or /create endpoint — it only reads.
+  function makeFetch(subscribedEvents: string[], eventMode = 4): { fetchImpl: typeof fetch; mutatingCalls: string[] } {
+    const mutatingCalls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      // Cached-session validation probe (prepareFeishuWebSession → validateFeishuWebSession):
+      // non-login content marks the cookie jar valid so disableQrLogin reuses it.
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app') || href.endsWith('/app/')) {
+        return new Response('<script>window.csrfToken="csrf_probe"</script>', { status: 200 });
+      }
+      if (href.includes('/developers/v1/event/') && !href.includes('/update')) {
+        return Response.json({ code: 0, data: { eventMode, appEvents: subscribedEvents, userEvents: subscribedEvents } });
+      }
+      // Anything that would mutate (event/update, app_version/create, publish/commit)
+      if (href.includes('/update') || href.includes('/create') || href.includes('/publish')) {
+        mutatingCalls.push(href);
+        return Response.json({ code: 0, data: {} });
+      }
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+    return { fetchImpl, mutatingCalls };
+  }
+
+  it('reports zero missing when all VC events are subscribed and never mutates', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-vc-probe-ok-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const all = ['vc.bot.meeting_invited_v1', 'vc.bot.meeting_activity_v1', 'vc.bot.meeting_ended_v1', 'vc.meeting.participant_meeting_joined_v1'];
+    const { fetchImpl, mutatingCalls } = makeFetch(all);
+    const result = await probeVcMeetingEventSubscription('cli_probe', { sessionFilePath: sessionFile, fetchImpl });
+    expect(result).toMatchObject({ ok: true, missingVcEvents: [], eventModeReady: true });
+    expect(mutatingCalls).toEqual([]); // read-only: proves no publish/subscribe side effects
+  });
+
+  it('lists the missing VC events when only some are subscribed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-vc-probe-missing-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const { fetchImpl } = makeFetch(['vc.bot.meeting_invited_v1']); // 3 of 4 missing
+    const result = await probeVcMeetingEventSubscription('cli_probe', { sessionFilePath: sessionFile, fetchImpl });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.missingVcEvents).toEqual([
+        'vc.bot.meeting_activity_v1', 'vc.bot.meeting_ended_v1', 'vc.meeting.participant_meeting_joined_v1',
+      ]);
+    }
+  });
+
+  it('flags eventModeReady=false when not on long-connection mode', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-vc-probe-mode-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const all = ['vc.bot.meeting_invited_v1', 'vc.bot.meeting_activity_v1', 'vc.bot.meeting_ended_v1', 'vc.meeting.participant_meeting_joined_v1'];
+    const { fetchImpl } = makeFetch(all, /* eventMode */ 0);
+    const result = await probeVcMeetingEventSubscription('cli_probe', { sessionFilePath: sessionFile, fetchImpl });
+    expect(result).toMatchObject({ ok: true, missingVcEvents: [], eventModeReady: false });
+  });
+
+  it('fails cleanly (no QR, no throw) when there is no cached web session', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-vc-probe-nosession-'));
+    const sessionFile = join(dir, 'feishu-session.json'); // never written
+    let qrShown = false;
+    const fetchImpl = (async () => { qrShown = true; throw new Error('should not fetch without a session'); }) as typeof fetch;
+    const result = await probeVcMeetingEventSubscription('cli_probe', { sessionFilePath: sessionFile, fetchImpl });
+    expect(result.ok).toBe(false);
+    expect(qrShown).toBe(false); // disableQrLogin: no network / no QR when the cache is gone
   });
 });
 

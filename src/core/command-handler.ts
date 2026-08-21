@@ -1236,7 +1236,9 @@ export async function handleCardCommand(
     }
     ds.streamingCardForced = true;
     const posted = await postFreshStreamingCard(ds, deps.sessionReply);
-    if (!posted) await reply(t('cmd.card.not_ready', undefined, loc));
+    if (!posted) {
+      await reply(t('cmd.card.not_ready', undefined, loc));
+    }
     return;
   }
 

@@ -278,10 +278,11 @@ export async function foldableChatSessionAppIds(input: {
       || session.scope !== 'chat'
       || !session.larkAppId
       || session.chatId !== input.targetChatId
-      // These chat-scoped sessions deliberately use isolated routing keys and
-      // can never be reached through the ordinary (chatId, appId) slot.
-      || session.deferredScheduleRun
-      || session.vcMeetingReceiver) continue;
+      // A deferred scheduled run deliberately uses an isolated routing key and
+      // can never be reached through the ordinary (chatId, appId) slot. (A VC
+      // meeting agent is now an ordinary chat-scope session — Plan B — so it IS
+      // foldable and is intentionally NOT excluded here.)
+      || session.deferredScheduleRun) continue;
     candidates.add(session.larkAppId);
   }
 

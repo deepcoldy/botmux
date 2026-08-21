@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type RepoPickerMode = 'all' | 'repos';
@@ -88,14 +89,33 @@ export interface HostOverloadBrowserTargetConfig {
   enabled?: boolean;
 }
 
+/**
+ * 共享会议角色预设条目。刻意不带 `agentAppId`：执行方永远是「被拉进这场会议的
+ * 那个 bot」，在合并进 per-bot 配置时才绑定。历史上预设把 `agentAppId` 写死，
+ * 结果拉 A 进会却把 B 拉进监听群——共享目录从类型上就消灭了这条路径。
+ */
+export type VcMeetingSharedConsumerProfile =
+  Omit<VcMeetingConsumerProfileConfig, 'agentAppId'>;
+
+/** 全 fleet 共享的会议角色预设目录。任何没有自己 `consumerProfiles` 的 bot
+ *  都继承这份目录。 */
+export interface VcMeetingSharedConsumerCatalog {
+  profiles: VcMeetingSharedConsumerProfile[];
+  defaultMode: 'listenOnly' | 'agents';
+  defaultConsumerIds: string[];
+}
+
 export interface VcMeetingAgentGlobalConfig {
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
    *  whether a given bot responds to meetings. */
   enabled?: boolean;
-  /** Optional bot app id that is allowed to own new VC meeting listeners. When
-   *  unset, legacy per-bot vcMeetingAgent.enabled routing is preserved. */
+  /** DEPRECATED (2026-08): the single-listener pin is retired — every bot with
+   *  VC active handles the meeting events it receives. Kept only so an existing
+   *  config round-trips without data loss; readers must ignore it. */
   listenerBotAppId?: string;
+  /** 共享角色预设目录，见 {@link VcMeetingSharedConsumerCatalog}。 */
+  consumerCatalog?: VcMeetingSharedConsumerCatalog;
 }
 
 export interface WorkflowFeatureGlobalConfig {
@@ -482,6 +502,31 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * 只做结构层解析（是不是数组 / defaultMode 枚举 / id 是不是非空串），字段级
+ * 权威校验留给 bot-registry 的严格 normalizer——它在目录被合进某个 bot 时运行，
+ * 且失败只降级这一个 bot，不会让一份坏的全局目录把整个 fleet 的配置解析炸掉。
+ */
+function readVcMeetingConsumerCatalog(raw: unknown): VcMeetingSharedConsumerCatalog | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  if (!Array.isArray(v.profiles)) return undefined;
+  const profiles = v.profiles.filter(
+    (entry): entry is VcMeetingSharedConsumerProfile =>
+      !!entry && typeof entry === 'object' && !Array.isArray(entry)
+      && typeof (entry as Record<string, unknown>).id === 'string'
+      && (entry as Record<string, unknown>).id !== '',
+  );
+  const defaultConsumerIds = Array.isArray(v.defaultConsumerIds)
+    ? v.defaultConsumerIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+    : [];
+  return {
+    profiles,
+    defaultMode: v.defaultMode === 'agents' && defaultConsumerIds.length > 0 ? 'agents' : 'listenOnly',
+    defaultConsumerIds,
+  };
+}
+
 /** Parse the `browserRestartTargets` array from config. Keep only entries with a
  *  non-blank string bundleId; coerce the optional fields defensively so a
  *  hand-edited config can't inject non-strings. Returns undefined when there's
@@ -514,6 +559,8 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
   }
+  const catalog = readVcMeetingConsumerCatalog(v.consumerCatalog);
+  if (catalog) out.consumerCatalog = catalog;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -651,9 +698,47 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
   const config: VcMeetingAgentGlobalConfig = {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
+    ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
   };
   vcMeetingAgentLiveCache = { path, mtimeMs, config };
   return config;
+}
+
+/** 共享角色预设目录（live 读，随 mtime 失效）。undefined = 还没配置过。 */
+export function globalVcMeetingSharedConsumerCatalog(): VcMeetingSharedConsumerCatalog | undefined {
+  return globalVcMeetingAgentConfigLive().consumerCatalog;
+}
+
+/**
+ * 未经归一化的共享目录原始值（可能是 undefined / 任意形状）。写路径用它算乐观
+ * 并发 revision——手改配置即使被 forgiving 读路径归一化掉，也必须让 revision 变。
+ */
+export function rawGlobalVcMeetingSharedConsumerCatalog(): unknown {
+  const vcAgent = readRawConfig().vcMeetingAgent;
+  if (!vcAgent || typeof vcAgent !== 'object' || Array.isArray(vcAgent)) return undefined;
+  return (vcAgent as Record<string, unknown>).consumerCatalog;
+}
+
+/**
+ * 写共享角色预设目录。`null` 清空目录（所有 bot 回到「无预设」）。
+ *
+ * `mergeGlobalConfig` 只做顶层 key 合并，所以这里先读出现有 `vcMeetingAgent`
+ * 对象再整体写回——否则会把同一层的 `enabled` 抹掉。未知字段原样保留。
+ */
+export function writeGlobalVcMeetingSharedConsumerCatalog(
+  catalog: VcMeetingSharedConsumerCatalog | null,
+): void {
+  const raw = readRawConfig();
+  const current = raw.vcMeetingAgent && typeof raw.vcMeetingAgent === 'object' && !Array.isArray(raw.vcMeetingAgent)
+    ? { ...(raw.vcMeetingAgent as Record<string, unknown>) }
+    : {};
+  if (catalog === null) delete current.consumerCatalog;
+  else current.consumerCatalog = catalog;
+  mergeGlobalConfig({
+    vcMeetingAgent: (Object.keys(current).length > 0
+      ? current
+      : undefined) as GlobalConfig['vcMeetingAgent'],
+  });
 }
 
 export function isGlobalVcMeetingAgentEnabled(): boolean {

@@ -212,9 +212,15 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     // For every other session, process residency is authoritative: suspension
     // clears ds.worker but intentionally preserves the logical active session.
     // Never let a stale pre-suspend status make it look resident after hydrate.
+    // No screen status yet + worker init complete = the CLI is executing its
+    // first turn (screen updates are suppressed until the first idle prompt).
+    // Long first turns — e.g. meeting agents fed a transcript delivery right at
+    // spawn — previously sat in「启动中」for minutes; project them as working.
     status: ds.session.queued
       ? 'idle'
-      : (!ds.worker || ds.worker.killed ? 'dormant' : (ds.lastScreenStatus ?? 'starting')),
+      : (!ds.worker || ds.worker.killed
+          ? 'dormant'
+          : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'))),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,

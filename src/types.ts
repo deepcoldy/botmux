@@ -103,6 +103,16 @@ export interface VcMeetingConsumerConfig {
   defaultAgentAppId?: string;
   /** Default profile ids used by defaultMode=agents. */
   defaultConsumerIds?: string[];
+  /**
+   * Per-bot default role picked from the fleet-shared consumer catalog. When a
+   * bot inherits the shared catalog (no own `consumerProfiles`), this single id
+   * overrides the catalog's global default for THIS bot — "not chosen = follow
+   * the global default". Unlike `defaultConsumerIds`, this field is independent
+   * of `consumerProfiles` (the bot doesn't own profiles; it inherits them), so
+   * it is normalized unconditionally and never triggers the legacy
+   * "consumerProfiles required" resolver gate.
+   */
+  catalogDefaultConsumerId?: string;
   /** Presence of this property opts into profile mode, including an explicit empty array. */
   consumerProfiles?: VcMeetingConsumerProfileConfig[];
   /** Generator provenance; never grants runtime authority. */
@@ -117,6 +127,30 @@ export interface VcMeetingConsumerConfig {
   minBatchItems?: number;
   /** Maximum time to hold a non-empty meeting delta before injecting to the agent. Defaults in daemon. */
   maxInjectIntervalMs?: number;
+  /**
+   * In-meeting TEXT output policy for the selected agent. `allow` sends managed
+   * text into the meeting without per-message human approval; `approval` (the
+   * pre-2026-08 behavior) requires the operator to approve each send via card;
+   * `deny` blocks it. Defaults to `allow` when unset. Voice stays gated on
+   * realtimeVoice regardless of this field.
+   */
+  textOutputPolicy?: 'deny' | 'approval' | 'allow';
+  /**
+   * In-meeting VOICE output policy. Only takes effect when realtime voice is
+   * enabled — and realtime voice is now ON BY DEFAULT (unset ⇒ enabled; only an
+   * explicit `realtimeVoice.enabled: false` disables it). `allow` (the default
+   * when unset) speaks WITHOUT per-utterance approval; `approval` reviews each
+   * utterance via card; `deny` blocks voice even while realtime voice is on.
+   *
+   * ⚠ Combined default: realtime-voice-on + voice policy defaulting to `allow`
+   * means a bot pulled into a meeting can, by default, speak aloud without the
+   * operator approving each utterance. Tighten per-bot to `approval`/`deny` via
+   * meetingConsumer.voiceOutputPolicy (dashboard-editable) when that is not
+   * wanted. (Voice is still gated behind the managed request-output/action gate
+   * + capability + realtime-voice enablement; `allow` only removes the per-send
+   * human approval step, not the authorization path.)
+   */
+  voiceOutputPolicy?: 'deny' | 'approval' | 'allow';
   /** Legacy allowlist. Omitted or [] dynamically shows usable online bots. */
   agentCandidates?: VcMeetingConsumerAgentConfig[];
 }

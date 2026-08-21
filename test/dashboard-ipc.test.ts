@@ -2507,7 +2507,7 @@ describe('PUT /api/bot-read-isolation', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
-  it('rejects a managed VC receiver without reactivating or waking it', async () => {
+  it('Plan B: resumes a closed meeting-agent session as an ordinary chat session (wake=1)', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
     const prevConfigDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
@@ -2522,6 +2522,9 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       session.scope = 'chat';
       session.cliId = 'codex' as any;
       session.workingDir = process.cwd();
+      // The vcMeetingReceiver marker is now pure delivery metadata; it no longer
+      // blocks resume. A closed meeting-agent session reactivates into its
+      // ordinary (chatId, appId) chat slot like any chat session.
       session.vcMeetingReceiver = {
         listenerAppId: 'listener-app',
         meetingId: 'meeting-42',
@@ -2537,14 +2540,12 @@ describe('POST /api/sessions/:sessionId/resume', () => {
         { method: 'POST' },
       );
 
-      expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({
-        ok: false,
-        error: 'vc_receiver_managed',
-      });
-      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
-      expect(registry.size).toBe(0);
-      expect(forkSpy).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, sessionId: session.sessionId, wake: true });
+      // Reactivated at the ordinary chat slot and forked.
+      expect(registry.get(sessionKey('oc_listener', ''))?.session.sessionId).toBe(session.sessionId);
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('active');
+      expect(forkSpy).toHaveBeenCalled();
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());

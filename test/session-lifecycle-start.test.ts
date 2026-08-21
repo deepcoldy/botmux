@@ -3399,16 +3399,38 @@ describe('worker startup failure delivery', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('keeps a VC receiver IM-turn fork error out of auxiliary Lark UI', async () => {
+  it('Plan B: a plain user IM-turn fork error on a meeting-agent session DOES surface to the user', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
       meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
     };
-    // A listener-group @agent IM turn has no durable dispatchAttempt, but a
-    // startup diagnostic is not the exact authorized reply action.
+    // A plain listener-group user turn has NO durable dispatchAttempt and NO
+    // stamped meeting @mention origin → it is not meeting-driven, so its worker
+    // fork failure must reach the user like any ordinary session (the whole point
+    // of Plan B: the user's own turns are answered, not silently swallowed).
     forkWorker(ds, 'deliver', { turnId: 'im-turn' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('error', new Error('spawn ENOENT'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalled();
+  });
+
+  it('Plan B: a durable meeting-delivery fork error stays fenced (not surfaced out-of-band)', async () => {
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
+      meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
+    };
+    // A durable transcript delivery (dispatchAttempt set) IS meeting-driven, so a
+    // fork error is fenced to the receipt/lease chain and must never leak
+    // out-of-band (it could post on a silent delivery).
+    forkWorker(ds, 'deliver', { turnId: 'vc-delivery', dispatchAttempt: 3 });
     const worker = forkMock.mock.results.at(-1)!.value;
 
     worker.emit('error', new Error('spawn ENOENT'));

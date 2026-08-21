@@ -73,8 +73,6 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     isAutoUpdateSupportedInstall: vi.fn(() => true),
     resolveDashboardSettings: vi.fn(() => settingsView),
     isLocale: ((v: unknown): v is 'zh' | 'en' => v === 'zh' || v === 'en'),
-    syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
-    validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: true as const })),
     validateCodexNotifierTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
     validateHostOverloadAlertTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
     installCodexNotifierHook: vi.fn(),
@@ -267,27 +265,28 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: false } });
   });
 
-  it('validates then syncs vcMeetingAgent.listenerBotAppId before writing the selected bot', async () => {
+  // 全局「会议事件接收 Bot」pin 已退役：daemon 侧每个 VC-active 的 bot 各自处理收到
+  // 的会议事件，没人再读 listenerBotAppId。写路径必须把历史残留擦掉，别在配置里留一
+  // 个谁都不读、看着却像还生效的字段。
+  it('erases a stale vcMeetingAgent.listenerBotAppId on the next write', async () => {
     const deps = makeDeps({
       readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_old' } })),
     });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: ' cli_listener ' } }, deps);
+    const r = await applySettingsWrite({ vcMeetingAgent: { enabled: true } }, deps);
     expect(r.ok).toBe(true);
-    expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_listener');
-    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_listener', 'cli_old');
-    expect(vi.mocked(deps.validateVcMeetingListenerBotAppId).mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(deps.syncVcMeetingListenerBotConfig).mock.invocationCallOrder[0]);
-    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
   });
 
-  it('clears vcMeetingAgent.listenerBotAppId without validating', async () => {
+  it('never resurrects the retired listener pin from a client-supplied patch', async () => {
     const deps = makeDeps({
-      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } })),
+      readGlobalConfig: vi.fn(() => ({ vcMeetingAgent: { enabled: true } })),
     });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: null } }, deps);
+    // 老前端（或手搓 POST）还在提交这个字段时，也不能把 pin 写回去。
+    const r = await applySettingsWrite(
+      { vcMeetingAgent: { enabled: true, listenerBotAppId: 'cli_listener' } as any },
+      deps,
+    );
     expect(r.ok).toBe(true);
-    expect(deps.validateVcMeetingListenerBotAppId).not.toHaveBeenCalled();
-    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith(null, 'cli_listener');
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ vcMeetingAgent: { enabled: true } });
   });
 
@@ -551,37 +550,14 @@ describe('applySettingsWrite — validation errors', () => {
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
-  it('rejects invalid vcMeetingAgent.listenerBotAppId', async () => {
+  // listenerBotAppId 退役后不再是可写字段：只带它的 patch 等于什么都没改，必须被
+  // 当作空 patch 拒绝，而不是靠它触发一次全局写。
+  it('rejects a vcMeetingAgent patch that carries only the retired listener pin', async () => {
     const deps = makeDeps();
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 123 } }, deps);
+    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_listener' } as any }, deps);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
-    expect(r.error).toBe('invalid_vcMeetingAgent_listenerBotAppId');
-    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
-  });
-
-  it('rejects vcMeetingAgent.listenerBotAppId when validation fails', async () => {
-    const deps = makeDeps({
-      validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write' })),
-    });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_bad' } }, deps);
-    expect(r.ok).toBe(false);
-    if (r.ok) throw new Error('unreachable');
-    expect(r.error).toBe('vcMeetingAgent_listenerBot_missing_scopes: vc:meeting.bot.join:write');
-    expect(deps.syncVcMeetingListenerBotConfig).not.toHaveBeenCalled();
-    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
-  });
-
-  it('rejects vcMeetingAgent.listenerBotAppId when per-bot defaults cannot be written', async () => {
-    const deps = makeDeps({
-      syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: false as const, error: 'vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config' })),
-    });
-    const r = await applySettingsWrite({ vcMeetingAgent: { listenerBotAppId: 'cli_missing' } }, deps);
-    expect(r.ok).toBe(false);
-    if (r.ok) throw new Error('unreachable');
-    expect(r.error).toBe('vcMeetingAgent_listenerBot_config_write_failed: bot_not_in_config');
-    expect(deps.validateVcMeetingListenerBotAppId).toHaveBeenCalledWith('cli_missing');
-    expect(deps.syncVcMeetingListenerBotConfig).toHaveBeenCalledWith('cli_missing', null);
+    expect(r.error).toBe('invalid_vcMeetingAgent_enabled');
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 

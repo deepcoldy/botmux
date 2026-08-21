@@ -1370,6 +1370,50 @@ export async function createOpenPlatformAppWithClient(
 }
 
 /**
+ * Read-only probe: are this app's VC meeting events (vc.bot.meeting_* +
+ * participant_meeting_joined) subscribed, and is event mode the long connection?
+ * Uses ONLY the cached Feishu Web session (disableQrLogin) and never publishes a
+ * version — so it is safe to call at daemon startup. The caller decides whether
+ * to run the full (publishing) automateOpenPlatformSetup based on the result:
+ * only when events are actually missing / mode is wrong.
+ */
+export type VcMeetingEventProbeResult =
+  | { ok: true; missingVcEvents: string[]; eventModeReady: boolean; sessionFile?: string }
+  | { ok: false; reason: string; message: string; sessionFile?: string };
+
+export async function probeVcMeetingEventSubscription(
+  appId: string,
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<VcMeetingEventProbeResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) {
+    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile };
+  }
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile };
+  }
+  try {
+    const eventState = extractOpenPlatformEventState(
+      await clientResult.client.postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }),
+    );
+    const has = (name: string) => eventState.events.includes(name);
+    return {
+      ok: true,
+      missingVcEvents: VC_MEETING_BOT_EVENTS.filter(name => !has(name)),
+      eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
+      sessionFile: prepared.sessionFile,
+    };
+  } catch (err: any) {
+    return { ok: false, reason: 'api_error', message: `读取事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile };
+  }
+}
+
+/**
  * 单次飞书 Web 扫码完成应用创建。session 会写入 ~/.botmux，后续
  * automateOpenPlatformSetup 会直接复用，因此权限/redirect/发版不再二次扫码。
  */

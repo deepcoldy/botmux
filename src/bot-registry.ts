@@ -315,7 +315,11 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingAgentConfig = {};
+  // VC 默认对每个连着飞书的 bot 生效(vcMeetingAgentConfigActive:enabled!==false),
+  // 所以 enabled:false 是**显式退出**,必须原样保留——只留 true 会把 false round-trip
+  // 成 undefined(=默认开),让"关掉这个 bot 的会议"重载即失效。
   if (entry.enabled === true) out.enabled = true;
+  else if (entry.enabled === false) out.enabled = false;
   const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
   const listenerChatId = normalizeNonEmptyString(entry.listenerChatId);
   const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
@@ -355,6 +359,18 @@ function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig
   if (minBatchChars !== undefined) out.minBatchChars = minBatchChars;
   if (minBatchItems !== undefined) out.minBatchItems = minBatchItems;
   if (maxInjectIntervalMs !== undefined) out.maxInjectIntervalMs = maxInjectIntervalMs;
+  if (entry.textOutputPolicy === 'allow' || entry.textOutputPolicy === 'approval' || entry.textOutputPolicy === 'deny') {
+    out.textOutputPolicy = entry.textOutputPolicy;
+  }
+  if (entry.voiceOutputPolicy === 'allow' || entry.voiceOutputPolicy === 'approval' || entry.voiceOutputPolicy === 'deny') {
+    out.voiceOutputPolicy = entry.voiceOutputPolicy;
+  }
+
+  // per-bot 从共享目录挑的默认角色。与 consumerProfiles 无关(bot 继承目录、不拥有
+  // 预设),故无条件归一化,不触发 legacy "consumerProfiles required" resolver 门。
+  // 空串/空白 = 「跟随全局默认」,等同没配。
+  const catalogDefaultConsumerId = normalizeNonEmptyString(entry.catalogDefaultConsumerId);
+  if (catalogDefaultConsumerId) out.catalogDefaultConsumerId = catalogDefaultConsumerId;
 
   if (Object.prototype.hasOwnProperty.call(entry, 'defaultProfileBootstrap')) {
     const marker = entry.defaultProfileBootstrap;
@@ -551,7 +567,7 @@ function normalizeVcMeetingListenerDelivery(
   return { placement: entry.placement as 'auto' | 'chat' | 'topic' };
 }
 
-function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
+export function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
   const path = 'vcMeetingAgent.meetingConsumer.consumerProfiles';
   if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
   return raw.map((value, index) => {
@@ -788,7 +804,10 @@ function normalizeVcMeetingRealtimeVoiceConfig(raw: unknown): VcMeetingRealtimeV
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingRealtimeVoiceConfig = {};
+  // 实时语音默认开启(vcMeetingRealtimeVoiceEnabled:enabled!==false),enabled:false 是
+  // 显式关闭,必须保留——只留 true 会让"关掉实时语音"round-trip 成 undefined(=默认开)。
   if (entry.enabled === true) out.enabled = true;
+  else if (entry.enabled === false) out.enabled = false;
   const sampleRate = normalizePositiveInt(entry.sampleRate);
   const channels = normalizePositiveInt(entry.channels);
   const frameMs = normalizePositiveInt(entry.frameMs);
@@ -1966,8 +1985,18 @@ export function vcMeetingAgentConfigActive(
   cfg: Pick<BotConfig, 'apiOnly' | 'vcMeetingAgent'> | undefined,
 ): VcMeetingAgentConfig | undefined {
   if (!cfg) return undefined;
+  // apiOnly (core-only) bots have no Feishu transport — a VC listener drives
+  // `lark-cli vc +meeting-events --as bot`, which breaks the zero-Feishu-network
+  // contract. This fail-close is the load-bearing invariant and must stay first.
   if (cfg.apiOnly === true) return undefined;
-  return cfg.vcMeetingAgent?.enabled === true ? cfg.vcMeetingAgent : undefined;
+  // Bot-agnostic join (2026-08): any invited bot should join, so VC is active by
+  // default for every Feishu-connected bot. `vcMeetingAgent.enabled: false` is
+  // the explicit per-bot opt-out; unset/absent now means active. A bot with no
+  // vcMeetingAgent block at all gets an empty effective config so downstream
+  // reads (listenerChatId auto-create, profile provision, consumer defaults)
+  // work off their own fallbacks. Fleet-wide off remains the global switch.
+  if (cfg.vcMeetingAgent?.enabled === false) return undefined;
+  return cfg.vcMeetingAgent ?? {};
 }
 
 export function registerBot(cfg: BotConfig): BotState {

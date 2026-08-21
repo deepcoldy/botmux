@@ -3039,18 +3039,10 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
       error: `request target botId ${valid.request.target.botId} does not match daemon ${cachedLarkAppId}`,
     });
   }
-  if (valid.request.target.kind === 'turn' && valid.request.target.sessionId) {
-    const receiverTarget = [...activeSessions.values()].find(
-      (candidate) => candidate.session.sessionId === valid.request.target.sessionId,
-    );
-    if (receiverTarget?.session.vcMeetingReceiver) {
-      return jsonRes(res, 403, {
-        ok: false,
-        errorCode: 'managed_receiver_requires_delivery_endpoint',
-        error: 'dedicated meeting receiver sessions accept only fenced delivery or explicit IM routing',
-      });
-    }
-  }
+  // Plan B: a VC meeting agent is an ordinary chat-scope session, so the generic
+  // trigger endpoint may address it like any session (botmux send / dashboard).
+  // Meeting transcript deliveries still flow through their own fenced delivery
+  // path — this endpoint only ever carries ordinary user-initiated turns.
   try {
     if (valid.request.target.kind === 'workflow') {
       return jsonRes(res, 410, {

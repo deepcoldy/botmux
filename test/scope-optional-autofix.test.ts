@@ -88,3 +88,57 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
     expect(adminIdx).toBeGreaterThan(silentIdx);
   });
 });
+
+describe('ensureVcMeetingEventsSubscribed — startup VC-event check-then-configure', () => {
+  const region = fnRegion('export async function ensureVcMeetingEventsSubscribed(', 3200);
+
+  it('skips non-feishu, apiOnly, and VC-inactive bots (active-config gate)', () => {
+    expect(region).toContain("if (brand !== 'feishu') return;");
+    // vcMeetingAgentConfigActive fail-closes apiOnly AND enabled:false, so this
+    // one guard covers both "no Feishu VC" cases.
+    expect(region).toContain('if (!vcMeetingAgentConfigActive(bot.config)) return;');
+  });
+
+  it('probes read-only FIRST, then only auto-subscribes when events are missing', () => {
+    const probeIdx = region.indexOf('await probeVcMeetingEventSubscription(larkAppId)');
+    const gateIdx = region.indexOf('probe.missingVcEvents.length === 0 && probe.eventModeReady');
+    const automationIdx = region.indexOf('await automateOpenPlatformSetup(');
+    expect(probeIdx).toBeGreaterThanOrEqual(0);
+    // the "already subscribed → return" gate sits BETWEEN the probe and the
+    // publishing automation, so a satisfied bot never republishes.
+    expect(gateIdx).toBeGreaterThan(probeIdx);
+    expect(automationIdx).toBeGreaterThan(gateIdx);
+  });
+
+  it('never pops a QR at boot (disableQrLogin into the publishing automation)', () => {
+    expect(region).toContain('disableQrLogin: true,');
+  });
+
+  it('degrades gracefully when the probe fails (log, no throw, no QR)', () => {
+    // probe.ok === false → info log + early return BEFORE any automation call
+    const probeFailIdx = region.indexOf('if (!probe.ok) {');
+    const automationIdx = region.indexOf('await automateOpenPlatformSetup(');
+    expect(probeFailIdx).toBeGreaterThanOrEqual(0);
+    expect(probeFailIdx).toBeLessThan(automationIdx);
+    expect(region).toContain('botmux setup');
+  });
+
+  it('DMs the admin only when the auto-subscribe actually fails', () => {
+    const failIdx = region.indexOf('VC event auto-subscribe failed');
+    const dmIdx = region.indexOf('await dmAdmin(');
+    expect(failIdx).toBeGreaterThanOrEqual(0);
+    expect(dmIdx).toBeGreaterThan(failIdx);
+  });
+});
+
+describe('daemon startup wires the VC-event check behind !cfg.apiOnly', () => {
+  const daemonSrc = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
+
+  it('calls ensureVcMeetingEventsSubscribed non-blocking inside the !cfg.apiOnly block', () => {
+    const guardIdx = daemonSrc.indexOf('checkRequiredScopes(cfg.larkAppId).catch');
+    const vcIdx = daemonSrc.indexOf('ensureVcMeetingEventsSubscribed(cfg.larkAppId).catch');
+    expect(guardIdx).toBeGreaterThanOrEqual(0);
+    // sits right after the scope check, sharing the same !cfg.apiOnly gate
+    expect(vcIdx).toBeGreaterThan(guardIdx);
+  });
+});

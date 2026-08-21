@@ -651,15 +651,13 @@ export function storedSessionAnchorId(
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
-/** Storage key for the daemon-owned activeSessions map. A VC receiver is a
- * dedicated conversation even though its visible output route is a chat, so
- * key it by its immutable session id instead of collapsing it into the normal
- * `(chatId, appId)` chat-scope slot. */
+/** Storage key for the daemon-owned activeSessions map. A VC meeting agent is
+ * now an ordinary chat-scope session in its listener group (Plan B): it is keyed
+ * by the normal `(chatId, appId)` slot so plain IM and meeting transcripts both
+ * fold into the one session. The `vcMeetingReceiver` marker is retained as pure
+ * delivery/meeting-output metadata and no longer affects routing. */
 export function activeSessionKey(ds: DaemonSession): string {
-  const anchor = ds.session.vcMeetingReceiver
-    ? `vc-receiver:${ds.session.sessionId}`
-    : sessionAnchorId(ds);
-  return sessionKey(anchor, ds.larkAppId);
+  return sessionKey(sessionAnchorId(ds), ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

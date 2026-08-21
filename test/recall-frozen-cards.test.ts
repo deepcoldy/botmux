@@ -428,11 +428,14 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(persistStreamCardStateMock).toHaveBeenCalledWith(ds);
   });
 
-  it('updates receiver retry state without patching a Lark card', () => {
+  it('Plan B: a meeting-agent session patches its Lark card on retry-ready like a normal session', () => {
     const now = new Date('2026-05-22T10:00:00Z').getTime();
     vi.useFakeTimers();
     vi.setSystemTime(now);
     const ds = makeDs();
+    // The vcMeetingReceiver marker is now pure delivery metadata — it no longer
+    // suppresses the streaming card, so a meeting agent's usage-limit card patch
+    // proceeds exactly like any ordinary chat-scope session.
     ds.session.vcMeetingReceiver = {
       listenerAppId: 'listener-app', meetingId: 'meeting-1',
       memberId: 'member-1', memberEpoch: 1,
@@ -452,24 +455,28 @@ describe('restoreUsageLimitRuntimeState', () => {
 
     expect(ds.usageLimit.retryReady).toBe(true);
     expect(persistStreamCardStateMock).toHaveBeenCalledWith(ds);
-    expect(buildStreamingCard).not.toHaveBeenCalled();
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    // Card patch now proceeds (no VC suppression): the retry-ready state reaches
+    // the live card the same way it does for a normal session.
+    expect(updateMessageMock).toHaveBeenCalled();
   });
 });
 
-describe('receiver streaming card boundary', () => {
-  it('refuses a fresh group-visible streaming card for a dedicated receiver', async () => {
+describe('meeting-agent streaming card (Plan B)', () => {
+  it('posts a fresh group-visible streaming card for a meeting-agent session', async () => {
     const ds = makeDs();
+    // Under Plan B the meeting agent is an ordinary chat-scope session, so its
+    // streaming card surfaces like any group session (the "看不到流式卡片" fix).
     ds.session.vcMeetingReceiver = {
       listenerAppId: 'listener-app', meetingId: 'meeting-1',
       memberId: 'member-1', memberEpoch: 1,
     };
     ds.workerPort = 4567;
-    const sessionReply = vi.fn(async () => 'om_forbidden');
+    ds.workerReady = true;
+    const sessionReply = vi.fn(async () => 'om_card');
 
-    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(false);
-    expect(sessionReply).not.toHaveBeenCalled();
-    expect(buildStreamingCard).not.toHaveBeenCalled();
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(true);
+    expect(sessionReply).toHaveBeenCalled();
+    expect(buildStreamingCard).toHaveBeenCalled();
   });
 });
 

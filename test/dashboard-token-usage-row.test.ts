@@ -44,6 +44,34 @@ function makeDs(): DaemonSession {
   } as DaemonSession;
 }
 
+describe('dashboard SessionRow status projection', () => {
+  it('projects working (not starting) during a long first turn once the worker initialized', () => {
+    // Regression: meeting-agent sessions are fed a transcript delivery right at
+    // spawn, so the CLI runs a minutes-long first turn before its first idle
+    // prompt — screen updates are suppressed until then (awaitingFirstPrompt),
+    // leaving lastScreenStatus unset. These sessions used to sit in「启动中」the
+    // whole time even though the CLI was actively working.
+    const ds = makeDs();
+    (ds as { worker: unknown }).worker = { killed: false };
+    (ds as { workerReady?: boolean }).workerReady = true;
+    expect(composeRowFromActive(ds).status).toBe('working');
+  });
+
+  it('keeps starting while the worker has not finished init', () => {
+    const ds = makeDs();
+    (ds as { worker: unknown }).worker = { killed: false };
+    expect(composeRowFromActive(ds).status).toBe('starting');
+  });
+
+  it('screen status still wins once reported', () => {
+    const ds = makeDs();
+    (ds as { worker: unknown }).worker = { killed: false };
+    (ds as { workerReady?: boolean }).workerReady = true;
+    (ds as { lastScreenStatus?: string }).lastScreenStatus = 'idle';
+    expect(composeRowFromActive(ds).status).toBe('idle');
+  });
+});
+
 describe('dashboard SessionRow token usage', () => {
   it('carries native token in/out totals for the sessions table', () => {
     const row = composeRowFromActive(makeDs());

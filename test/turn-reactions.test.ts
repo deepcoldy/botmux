@@ -93,11 +93,14 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
-  it('dedicated VC receivers never add or finish progress reactions', async () => {
+  it('Plan B: a meeting-agent session reacts to plain user turns like any card-off session', async () => {
     registerWith(true);
     const ds = makeDs({
       pendingAckReactions: [{ messageId: 'om_old', reactionId: 'rid_old' }],
     });
+    // The vcMeetingReceiver marker is now pure delivery metadata. A plain user
+    // message (no stamped meeting @mention origin) is an ordinary turn, so it
+    // gets the ✋ on receipt and its pending ✋ settle to ✅ on idle.
     ds.session.vcMeetingReceiver = {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
@@ -108,8 +111,9 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_new');
     await finishTurnReactions(ds);
 
-    expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    // ✋ added on the new user message; the stale + new pending entries settle.
+    expect(mocks.addReaction).toHaveBeenCalled();
+    expect(mocks.removeReaction).toHaveBeenCalled();
     expect(ds.pendingAckReactions).toEqual([]);
   });
 

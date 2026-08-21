@@ -429,7 +429,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -529,7 +529,7 @@ import {
   computeVcMeetingConsumerProfileHash,
   normalizeVcMeetingProfileInstructions,
 } from './services/vc-meeting-profile-instructions.js';
-import { bootstrapVcMeetingDefaultConsumerProfile } from './services/vc-meeting-consumer-profile-bootstrap.js';
+import { bindVcMeetingConsumerCatalogToBot } from './services/vc-meeting-shared-consumer-catalog.js';
 import {
   getVcMeetingPreparation,
   normalizeVcMeetingNumber,
@@ -601,6 +601,7 @@ import { VcMeetingTerminalReconciler } from './services/vc-meeting-terminal-reco
 import {
   resolveVcMeetingImTurnOrigin,
   verifyVcMeetingManagedOriginClaim,
+  evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import {
   ensureVcMeetingListenerTopicRoot,
@@ -1969,16 +1970,38 @@ const vcMeetingClosingConsumerSessions = new Map<string, {
 }>();
 let vcMeetingAgentGlobalEnabledOverrideForTest: boolean | undefined;
 let vcMeetingAgentGlobalListenerBotAppIdOverrideForTest: string | undefined | null;
+let vcMeetingListenerPinDeprecationWarned = false;
 
 function vcMeetingAgentGlobalEnabled(): boolean {
   return vcMeetingAgentGlobalEnabledOverrideForTest ?? isVcMeetingAgentGloballyEnabled();
 }
 
+/**
+ * RETIRED (2026-08): the global VC listener pin is gone — every bot with
+ * `vcMeetingAgent.enabled` now handles the meeting events IT receives, so a
+ * meeting can run multiple bots (each with its own presets) instead of routing
+ * everything through one designated listener. Always returns undefined so the
+ * `listenerAppId &&` guards at every call site short-circuit to the
+ * every-bot-handles-its-own behaviour (which was already the semantics when
+ * `listenerBotAppId` was unset). A legacy `vcMeetingAgent.listenerBotAppId`
+ * still in config is ignored with a one-time warning.
+ *
+ * The test override is retained ONLY so the test harness can still call the
+ * setter without a signature change; it no longer re-pins routing.
+ */
 function vcMeetingAgentGlobalListenerAppId(): string | undefined {
-  if (vcMeetingAgentGlobalListenerBotAppIdOverrideForTest !== undefined) {
-    return vcMeetingAgentGlobalListenerBotAppIdOverrideForTest ?? undefined;
+  const legacyPin = vcMeetingAgentGlobalListenerBotAppIdOverrideForTest !== undefined
+    ? (vcMeetingAgentGlobalListenerBotAppIdOverrideForTest ?? undefined)
+    : vcMeetingAgentGlobalListenerBotAppId();
+  if (legacyPin && !vcMeetingListenerPinDeprecationWarned) {
+    vcMeetingListenerPinDeprecationWarned = true;
+    logger.warn(
+      `[vc-agent] vcMeetingAgent.listenerBotAppId=${legacyPin} is deprecated and ignored: `
+      + 'every bot with vcMeetingAgent.enabled now handles its own meeting invites. '
+      + 'Remove this field from the global config.',
+    );
   }
-  return vcMeetingAgentGlobalListenerBotAppId();
+  return undefined;
 }
 
 function vcMeetingPushIsTrackedLifecycleEvent(ctx: VcMeetingPushContext): boolean {
@@ -1996,7 +2019,11 @@ const DEFAULT_VC_MEETING_FLUSH_INTERVAL_MS = 30_000;
 const DEFAULT_VC_MEETING_TIME_ZONE = 'Asia/Shanghai';
 const DEFAULT_VC_MEETING_CONSUMER_SELECTION_TIMEOUT_MS = 20_000;
 const DEFAULT_VC_MEETING_CONSUMER_INJECT_INTERVAL_MS = 30_000;
-const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_CHARS = 400;
+// Effectively no char-accumulation gate: with minBatchItems=1 a single
+// finalized transcript segment already qualifies, and the operator explicitly
+// asked for no "wait until enough text piles up" behavior (esp. at meeting
+// start). Kept as a config knob for bots that want to raise it.
+const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_CHARS = 1;
 const VC_MEETING_CONSUMER_DELIVERY_MAX_ITEMS = 100;
 const VC_MEETING_CONSUMER_DELIVERY_MAX_RENDERED_CHARS = 20_000;
 // By default, keep the selected agent as fresh as the listener group: one new
@@ -2216,12 +2243,41 @@ function vcMeetingConsumerMaxInjectIntervalMs(cfg: VcMeetingAgentConfig): number
   return cfg.meetingConsumer?.maxInjectIntervalMs ?? DEFAULT_VC_MEETING_CONSUMER_MAX_INJECT_INTERVAL_MS;
 }
 
-function defaultVcMeetingTextOutputPolicy(): VcMeetingOutputPolicy {
-  return 'approval';
+function defaultVcMeetingTextOutputPolicy(cfg?: VcMeetingAgentConfig): VcMeetingOutputPolicy {
+  // In-meeting text now sends without per-message approval by default; an
+  // operator can restore the review gate per-bot via
+  // meetingConsumer.textOutputPolicy = 'approval' (or 'deny').
+  const configured = cfg?.meetingConsumer?.textOutputPolicy;
+  if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
+  return 'allow';
 }
 
 function defaultVcMeetingVoiceOutputPolicy(cfg: VcMeetingAgentConfig): VcMeetingOutputPolicy {
-  return cfg.realtimeVoice?.enabled === true ? 'approval' : 'deny';
+  // Voice is denied only when realtime voice is explicitly OFF. Realtime voice is
+  // now ON BY DEFAULT (vcMeetingRealtimeVoiceEnabled: unset ⇒ enabled), so unless
+  // an operator set realtimeVoice.enabled:false, voice falls through to the
+  // default below. ⚠ That default is 'allow' — matching text — meaning a bot
+  // pulled into a meeting speaks aloud WITHOUT per-utterance approval by default.
+  // Tighten per-bot to 'approval'/'deny' via meetingConsumer.voiceOutputPolicy
+  // (dashboard-editable). 'allow' only drops the per-send approval step; the
+  // managed request-output/action gate + capability check still apply.
+  if (!vcMeetingRealtimeVoiceEnabled(cfg)) return 'deny';
+  const configured = cfg.meetingConsumer?.voiceOutputPolicy;
+  if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
+  return 'allow';
+}
+
+/**
+ * 实时语音能力现在**默认开启**：`realtimeVoice.enabled` 未配 = 视为开,只有显式
+ * `false` 才关。scope 已 fleet 级预授(实测含 vc:meeting.bot.realtime:write),所以
+ * 语音关着只是保守默认、不是权限卡。
+ *
+ * 注意「能力开」不等于「入会即建连」:语音 WebSocket 只在这个 bot 真要发言时
+ * (deliverVcMeetingVoiceOutput → ensureVcMeetingRealtimeVoiceSession)按需建立,
+ * 纯监听 / 从不发言的 bot 不会挂空闲连接。见 maybeStartVcMeetingRealtimeVoice。
+ */
+function vcMeetingRealtimeVoiceEnabled(cfg: VcMeetingAgentConfig | undefined): boolean {
+  return cfg?.realtimeVoice?.enabled !== false;
 }
 
 function vcMeetingOutputReviewTimeoutMs(channel: VcMeetingOutputChannel): number {
@@ -2554,38 +2610,31 @@ async function ensureVcMeetingReceiverSession(
         `registered receiver session is not active or lacks managed side-effect isolation: ${existingSessionId}`,
       );
     }
+    // Plan B: the meeting agent is an ordinary chat-scope session, so a chat can
+    // legitimately host several meeting projections in one transcript. The old
+    // strict "one session ⇔ one exact meeting/member/epoch" identity check no
+    // longer holds. Only require that the resolved session is the right listener
+    // chat under the right agent app (verified via the resolver binding above)
+    // and stamp/refresh the delivery-identity metadata for this member epoch so
+    // later meeting-directed output (Stage 6) can find it. The marker is pure
+    // metadata now — it does not affect routing.
     const ds = [...activeSessions.values()].find(candidate =>
       candidate.session.sessionId === existingSessionId) ?? findActiveBySessionId(existingSessionId);
-    const identity = ds?.session.vcMeetingReceiver;
-    if (!identity
-      || identity.listenerAppId !== request.meeting.listenerAppId
-      || identity.meetingId !== request.meeting.meetingId
-      || identity.memberId !== request.member.memberId
-      || identity.memberEpoch !== request.member.epoch) {
-      throw new Error('registered receiver session is not dedicated to this meeting member epoch');
+    if (ds && ds.chatId === request.outputRoute.chatId) {
+      stampVcMeetingBinding(ds, request);
     }
     return existing;
   }
 
-  // A receiver session is a dedicated conversation. It deliberately shares
-  // the listener chat only as an output route; its activeSessions key is based
-  // on sessionId (activeSessionKey), so an ordinary chat-scope session or a
-  // second meeting/member cannot collapse into the same CLI transcript.
+  // Plan B core cut: a meeting agent is a normal chat-scope session in its
+  // listener group, keyed by the ordinary `(chatId, appId)` slot. Plain IM and
+  // meeting transcripts therefore fold into the SAME session (transcripts are
+  // delivered by target.sessionId; IM is routed by the chat anchor). Reuse an
+  // existing chat-scope session at that slot if present (whether it was opened
+  // by IM or by an earlier meeting), else create a cold `worker:null` session
+  // shaped exactly like an auto-created IM session so triggerSessionTurn's
+  // cold-fork path spawns it on first delivery.
   const chatId = request.outputRoute.chatId;
-  const matching = [...activeSessions.values()].find((candidate) => {
-    const identity = candidate.session.vcMeetingReceiver;
-    return candidate.larkAppId === selfAppId
-      && identity?.listenerAppId === request.meeting.listenerAppId
-      && identity.meetingId === request.meeting.meetingId
-      && identity.memberId === request.member.memberId
-      && identity.memberEpoch === request.member.epoch;
-  });
-  if (matching) {
-    const binding = resolveVcMeetingReceiverSession(matching.session.sessionId);
-    if (!binding) throw new Error('existing dedicated receiver session has an unsupported CLI adapter');
-    return binding;
-  }
-
   const bot = getBot(selfAppId);
   const isolation = vcMeetingConsumerIsolationForBot(bot.config);
   if (!isolation.decision.ok) {
@@ -2599,61 +2648,96 @@ async function ensureVcMeetingReceiverSession(
   // whose environment/working dir was never set up for bwrap, and the CLI would
   // fail to spawn or be unable to work (the "joined but never replies" bug).
   const receiverSandboxed = isolation.decision.isolated;
-  const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
-    ?? effectiveDefaultWorkingDir(bot.config)
-    ?? bot.config.workingDir
-    ?? '~';
-  const workingDir = validateWorkingDir(rawWorkingDir, localeForBot(selfAppId));
-  if (!workingDir.ok) throw new Error(workingDir.error);
 
-  const session = sessionStore.createSession(
-    chatId,
-    chatId,
-    `[Meeting] ${request.meeting.meetingId}`.slice(0, 50),
-    'group',
-  );
-  const now = Date.now();
-  session.larkAppId = selfAppId;
-  session.scope = 'chat';
-  session.vcMeetingReceiver = {
+  const key = sessionKey(chatId, selfAppId);
+  const bound = await withActiveSessionKeyLock(activeSessions, key, () => {
+    const current = activeSessions.get(key);
+    if (current) {
+      // A chat-scope session already occupies this slot. Adopt it as the meeting
+      // agent by stamping the delivery-identity metadata; do NOT create a second
+      // universe. The session keeps whatever launch/sandbox decision it already
+      // froze — we never retroactively weaken or strengthen a live session here.
+      stampVcMeetingBinding(current, request);
+      return current;
+    }
+
+    const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
+      ?? effectiveDefaultWorkingDir(bot.config)
+      ?? bot.config.workingDir
+      ?? '~';
+    const workingDir = validateWorkingDir(rawWorkingDir, localeForBot(selfAppId));
+    if (!workingDir.ok) throw new Error(workingDir.error);
+
+    const session = sessionStore.createSession(
+      chatId,
+      chatId,
+      `[Meeting] ${request.meeting.meetingId}`.slice(0, 50),
+      'group',
+    );
+    const now = Date.now();
+    session.larkAppId = selfAppId;
+    session.scope = 'chat';
+    session.vcMeetingReceiver = {
+      listenerAppId: request.meeting.listenerAppId,
+      meetingId: request.meeting.meetingId,
+      memberId: request.member.memberId,
+      memberEpoch: request.member.epoch,
+    };
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = workingDir.resolvedPath;
+    session.cliId = bot.config.cliId;
+    // Freeze the security-critical launch decision at creation.  A later live
+    // Bot-config edit must neither weaken this session nor make an old
+    // unisolated session appear eligible retroactively. Under plan B the frozen
+    // value follows the bot's opt-in, not a hardcoded true.
+    session.sandbox = receiverSandboxed;
+    session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
+    session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
+    session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
+    session.backendType = isolation.backendType;
+    sessionStore.updateSession(session);
+
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: selfAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: workingDir.resolvedPath,
+    };
+    activeSessions.set(key, ds);
+    return ds;
+  });
+
+  const binding = resolveVcMeetingReceiverSession(bound.session.sessionId);
+  if (!binding) throw new Error('meeting agent session has an unsupported CLI adapter');
+  return binding;
+}
+
+/** Stamp/refresh the VC meeting delivery-identity metadata onto an ordinary
+ * chat-scope session (Plan B). This binds the session as the delivery + future
+ * meeting-output target for this member epoch WITHOUT changing routing: the
+ * session is still keyed by its normal chat slot. The most-recent meeting/member
+ * epoch wins when one chat hosts several meetings, matching the transcript
+ * delivery model (targets pick the session by id, not by this marker). */
+function stampVcMeetingBinding(
+  ds: DaemonSession,
+  request: Parameters<VcMeetingDeliveryReceiverDeps['ensureMemberSession']>[0],
+): void {
+  ds.session.vcMeetingReceiver = {
     listenerAppId: request.meeting.listenerAppId,
     meetingId: request.meeting.meetingId,
     memberId: request.member.memberId,
     memberEpoch: request.member.epoch,
   };
-  session.lastMessageAt = new Date(now).toISOString();
-  session.workingDir = workingDir.resolvedPath;
-  session.cliId = bot.config.cliId;
-  // Freeze the security-critical launch decision at receiver creation.  A
-  // later live Bot-config edit must neither weaken this session nor make an
-  // old unisolated receiver appear eligible retroactively. Under plan B the
-  // frozen value follows the bot's opt-in, not a hardcoded true.
-  session.sandbox = receiverSandboxed;
-  session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
-  session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
-  session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
-  session.backendType = isolation.backendType;
-  sessionStore.updateSession(session);
-
-  const ds: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId: selfAppId,
-    chatId,
-    chatType: 'group',
-    scope: 'chat',
-    spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: getCurrentCliVersion(),
-    lastMessageAt: now,
-    hasHistory: false,
-    workingDir: workingDir.resolvedPath,
-  };
-  activeSessions.set(activeSessionKey(ds), ds);
-  const binding = resolveVcMeetingReceiverSession(session.sessionId);
-  if (!binding) throw new Error('created receiver session has an unsupported CLI adapter');
-  return binding;
+  sessionStore.updateSession(ds.session);
 }
 
 function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliveryReceiverDeps {
@@ -2669,6 +2753,18 @@ function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliver
     dispatchTurn: (request, context) => {
       const target = findActiveBySessionId(request.target.sessionId ?? '');
       if (target) target.vcMeetingImTurnOrigin = undefined;
+      // VC transcript delivery turns dispatch straight through triggerSessionTurn,
+      // which (unlike the ordinary IM path) never calls beginNewTurn — so without
+      // this the meeting agent's streaming-card lifecycle would never arm and no
+      // live card would post for a transcript-driven turn. Under Plan B the
+      // meeting agent is an ordinary chat-scope session whose card should surface
+      // like any group session (the "看不到流式卡片" report), so arm it for every
+      // delivery turn. A silent-responseMode turn still suppresses only its final
+      // output (managedFinalOutputSuppressed), not the live card.
+      if (target?.session.vcMeetingReceiver && context.stableTurnId) {
+        const title = target.currentTurnTitle || target.session.title || '会议监听';
+        beginNewTurn(target, title, context.stableTurnId);
+      }
       return triggerSessionTurn(
         request,
         { larkAppId: selfAppId, activeSessions },
@@ -2922,7 +3018,13 @@ async function maybeCatchUpVcMeetingConsumerBeforeTurn(
       + `agent=${ctx.larkAppId} status=${caughtUp.catchUpStatus} error=${caughtUp.catchUpError ?? '-'}`,
     );
   }
-  return { anchorOverride: `vc-receiver:${caughtUp.candidate.receiverSessionId}` };
+  // Plan B: the meeting agent is an ordinary chat-scope session keyed by the
+  // normal `(chatId, appId)` slot, so the natural chat anchor already resolves
+  // it — no `vc-receiver:` anchor override is needed (or correct) anymore. This
+  // hook now only (a) blocks on ambiguous/undeliverable meeting context and
+  // (b) stamps vcMeetingImTurnOrigin so an @mention follow-up carries the
+  // meeting delivery identity for catch-up/echo purposes.
+  return;
 }
 
 async function pinVcMeetingConsumerChatReplyMode(
@@ -3319,7 +3421,14 @@ export async function noteTurnReceived(
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
-  if (ds.session.vcMeetingReceiver) return;
+  // Plan B: a meeting agent is an ordinary chat-scope session that hosts plain
+  // user turns. A plain user message should get the ✋→✅ progress reaction like
+  // any card-off session. Only a stamped meeting @mention follow-up stays
+  // reaction-free (it is meeting-driven and routes through the audited listener
+  // action, not the ordinary progress-reaction channel). Transcript deliveries
+  // never reach this inbound-message acceptance point at all.
+  if (ds.session.vcMeetingReceiver
+    && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
   // not to whichever turn most recently overwrote currentReplyTarget.
   if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
@@ -6648,7 +6757,67 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
     claimedDispatchAttempt: claimedAttempt,
   });
-  if (!verified.ok) return jsonRes(res, 403, verified);
+  // Plan B: the meeting agent is an ordinary chat-scope session that interleaves
+  // plain user IM turns with meeting deliveries and reaches idle between them.
+  // The in-memory managedTurnOrigin is cleared at each delivery turn's terminal
+  // edge, so a request-output the model runs AFTER the delivery turn goes idle
+  // (or after an intervening IM turn) finds no live origin and would fail
+  // `origin_unproven` — even though the durable delivery receipt still fully
+  // authorizes it. Fall back to the DURABLE receipt for a claimed delivery origin
+  // (turnId + dispatchAttempt): evaluateVcMeetingManagedSend re-derives authority
+  // from the on-disk receipt exactly as the final-output path does — receipt must
+  // exist for THIS receiver session, the attempt must match, its status must be
+  // dispatched/completed, the projection must still be active, and a silent
+  // delivery is refused. This never authorizes anything the receipt itself
+  // wouldn't, so it does not weaken the boundary; it only survives the idle gap.
+  //
+  // The fallback intentionally does NOT require the live origin to be absent:
+  // live verification proves origin via the rotating worker capability only,
+  // and non-sandboxed sessions have no origin-channel transport for that
+  // capability (managedOriginChannelRequired is darwin-isolate/credential-only
+  // bwrap), so their live check ALWAYS fails — including while the delivery
+  // turn is still executing. Gating the fallback on "live origin cleared"
+  // hard-bricked exactly that case (in-turn speech from a non-sandboxed
+  // meeting agent). The durable receipt check is the same strength either way,
+  // so the fallback runs whenever live verification failed.
+  let effectiveVerified = verified;
+  if (!verified.ok
+    && typeof body.originTurnId === 'string'
+    && body.originTurnId.trim()
+    && claimedAttempt !== undefined) {
+    const claimedDeliveryTurnId = body.originTurnId.trim();
+    const durable = evaluateVcMeetingManagedSend(config.session.dataDir, {
+      receiverSessionId,
+      receiverSession: true,
+      turnId: claimedDeliveryTurnId,
+      dispatchAttempt: claimedAttempt,
+      allowTerminalReceipt: true,
+      // In-meeting output channel: silent responseMode gates only listener-group
+      // auto-post, not in-meeting speech (the hub applies capability +
+      // textOutputPolicy/voiceOutputPolicy). Prove receipt identity/liveness here
+      // but do not apply the silent veto.
+      forInMeetingOutput: true,
+    });
+    if (durable.ok && durable.kind === 'listener_thread') {
+      logger.info(
+        `[vc-agent] request-output authorized via durable receipt fallback `
+        + `(live origin ${ds.managedTurnOrigin ? 'present but unverifiable — no capability transport' : 'cleared at turn terminal'}) `
+        + `session=${receiverSessionId.slice(0, 8)} `
+        + `turn=${claimedDeliveryTurnId.slice(0, 12)} attempt=${claimedAttempt}`,
+      );
+      effectiveVerified = {
+        ok: true,
+        origin: {
+          receiverSessionId,
+          turnId: claimedDeliveryTurnId,
+          dispatchAttempt: claimedAttempt,
+          currentImTurnId: undefined,
+          currentImTurnOrigin: undefined,
+        },
+      };
+    }
+  }
+  if (!effectiveVerified.ok) return jsonRes(res, 403, effectiveVerified);
   const channel = body.channel === 'text' || body.channel === 'voice' ? body.channel : undefined;
   const content = sanitizeVcMeetingOutputContent(body.content, 'content');
   const reason = sanitizeVcMeetingOutputContent(body.reason, 'reason');
@@ -6660,13 +6829,13 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     ? body.expectedListenerAppId.trim()
     : '';
   const expectedMeetingId = typeof body.expectedMeetingId === 'string' ? body.expectedMeetingId.trim() : '';
-  if (verified.origin.dispatchAttempt === undefined) {
-    const imOrigin = resolveVcMeetingImTurnOrigin(ds.session, verified.origin.turnId);
-    if (!verified.origin.turnId
-      || verified.origin.currentImTurnId !== verified.origin.turnId
+  if (effectiveVerified.origin.dispatchAttempt === undefined) {
+    const imOrigin = resolveVcMeetingImTurnOrigin(ds.session, effectiveVerified.origin.turnId);
+    if (!effectiveVerified.origin.turnId
+      || effectiveVerified.origin.currentImTurnId !== effectiveVerified.origin.turnId
       || !imOrigin
       || imOrigin.receiverSessionId !== receiverSessionId
-      || imOrigin.larkMessageId !== verified.origin.turnId) {
+      || imOrigin.larkMessageId !== effectiveVerified.origin.turnId) {
       return jsonRes(res, 409, {
         ok: false,
         errorCode: 'im_turn_origin_mismatch',
@@ -6699,14 +6868,14 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     );
     return jsonRes(res, upstream.status, upstream.body);
   }
-  if (!verified.origin.turnId) {
+  if (!effectiveVerified.origin.turnId) {
     return jsonRes(res, 409, {
       ok: false,
       errorCode: 'delivery_origin_mismatch',
       error: 'durable delivery action has no stable turn id',
     });
   }
-  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, verified.origin.turnId, {
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, effectiveVerified.origin.turnId, {
     receiverSessionId,
   });
   if (!lookup) {
@@ -6740,8 +6909,8 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
       body: JSON.stringify({
         agentAppId: ds.larkAppId,
         receiverSessionId,
-        stableTurnId: verified.origin.turnId,
-        dispatchAttempt: verified.origin.dispatchAttempt,
+        stableTurnId: effectiveVerified.origin.turnId,
+        dispatchAttempt: effectiveVerified.origin.dispatchAttempt,
         channel,
         content,
         ...(reason ? { reason } : {}),
@@ -6900,7 +7069,49 @@ function effectiveVcMeetingAgentConfig(larkAppId: string): VcMeetingAgentConfig 
   // `restoreVcMeetingRuntimeSessionsForBot`, whose call site sits OUTSIDE the
   // `!cfg.apiOnly` boot block — so a migrated bots.json (normal VC bot flipped to
   // apiOnly, stale runtime record on disk) can no longer re-spawn lark-cli at boot.
-  return vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
+  //
+  // 这是 daemon 侧唯一一处产出 VcMeetingAgentConfig 的地方，所以角色预设的绑定也在
+  // 这里做：没有自己 consumerProfiles 的 bot 继承 fleet 共享目录，且**所有**预设的
+  // 执行方一律重绑为 larkAppId 本人——「拉 A 进会却拉 B 进群」在这一层被彻底切断，
+  // 历史配置里写歪的 agentAppId 也在读路径上被纠正，不需要迁移写盘。
+  const cfg = vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
+  if (!cfg) return cfg;
+  return withDefaultVcMeetingJoinProfile(larkAppId, bindVcMeetingConsumerCatalogToBot(larkAppId, cfg));
+}
+
+/**
+ * 没配 `larkCliProfile` 的 bot，入会身份默认用它**自己的 appId** 作为 lark-cli
+ * profile 名。
+ *
+ * 背景：入会门禁 {@link ensureVcMeetingJoinProfile} 要求 `larkCliProfile` 非空，
+ * 否则以 `no_profile` 拒绝入会。而这个字段过去只有 Dashboard 的「配置权限」按钮
+ * 会落盘（见 preflightVcMeetingBot），于是 fleet 里绝大多数从没点过那颗按钮的 bot
+ * 被拉进会一律被拒——正是「拉别的 bot 进会还是不行」。
+ *
+ * 把默认值放在**读路径**而不是要求人工点按钮，是因为这个默认值是纯确定性的：
+ *   - 就是 bot **自己的 appId**，既不是跨 app 身份、也不含任何 secret，app-scoped，
+ *     不触碰 owner 身份边界；
+ *   - profile 一旦有名字，{@link ensureLarkCliBotProfile} 会用该 bot **自己**保存的
+ *     appSecret 走 `--app-secret-stdin`（不进 argv、只落 lark-cli 加密库、只在受信
+ *     daemon 里）自动注册它——PR #392 当年之所以 fail-closed（“no faked profile”），
+ *     是因为那时没有自动注册、写个名字会 ringing；PR #782 补上自动注册后这个顾虑
+ *     已消除。
+ *
+ * 真正需要人在场的是**开放平台权限开通 / 事件订阅**（可能要扫码登录），那部分仍留在
+ * 「配置权限」按钮里；权限/secret 真缺时，入会会在后面以 `missing_secret` /
+ * `add_failed` / scope 校验等**可操作**错误失败，而不是这里这条造出来的 `no_profile`。
+ *
+ * apiOnly bot 在 {@link vcMeetingAgentConfigActive} 已返回 undefined，走不到这里，
+ * 所以默认只加给结构上真能入会的 bot。纯函数，不改入参、不写盘。
+ */
+function withDefaultVcMeetingJoinProfile(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+): VcMeetingAgentConfig {
+  if (cfg.larkCliProfile?.trim()) return cfg;
+  const appId = larkAppId.trim();
+  if (!appId) return cfg;
+  return { ...cfg, larkCliProfile: appId };
 }
 
 function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | undefined {
@@ -7035,7 +7246,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.selectedAgentLabel = migratePreparedConsumer ? undefined : record.selectedAgentLabel;
     session.consumerPaused = migratePreparedConsumer ? false : record.consumerPaused;
     if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
-    session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy();
+    session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
     session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
     session.syncIntervalMs = record.syncIntervalMs;
     session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
@@ -7261,28 +7472,31 @@ async function maybeStartVcMeetingRealtimeVoice(
   cfg: VcMeetingAgentConfig,
 ): Promise<void> {
   const voiceCfg = cfg.realtimeVoice;
-  if (voiceCfg?.enabled !== true) return;
+  if (!vcMeetingRealtimeVoiceEnabled(cfg)) return;
+  // 按需建连:实时语音能力默认开,但入会时**不**急着开语音 WS——真正要发言时
+  // deliverVcMeetingVoiceOutput 会按需 ensureVcMeetingRealtimeVoiceSession 建连,
+  // 纯监听 / 从不发言的 bot 不挂空闲连接。唯一在入会时就预热的情况是显式配了
+  // testSpeakOnStartText 的 dogfood 场景(要在入会瞬间说一句自检话)。
+  if (!voiceCfg?.testSpeakOnStartText || session.realtimeVoiceTestUtteranceSent) return;
   try {
     const voice = await ensureVcMeetingRealtimeVoiceSession(larkAppId, session, cfg);
-    if (voiceCfg.testSpeakOnStartText && !session.realtimeVoiceTestUtteranceSent) {
-      session.realtimeVoiceTestUtteranceSent = true;
-      void (async () => {
-        let sent = false;
-        try {
-          const r = await voice.speak(voiceCfg.testSpeakOnStartText!);
-          sent = true;
-          logger.info(`[vc-agent] realtime voice test utterance sent meeting=${session.state.meeting.id} frames=${r.frames} durationMs=${r.durationMs}`);
-          await delay(DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS);
-        } catch (err) {
-          logger.warn(`[vc-agent] realtime voice test utterance failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
-        } finally {
-          await voice.stop(sent ? 'test-speak-finished' : 'test-speak-failed').catch((err) => {
-            logger.warn(`[vc-agent] realtime voice test utterance stop failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
-          });
-          if (session.realtimeVoice === voice) session.realtimeVoice = undefined;
-        }
-      })();
-    }
+    session.realtimeVoiceTestUtteranceSent = true;
+    void (async () => {
+      let sent = false;
+      try {
+        const r = await voice.speak(voiceCfg.testSpeakOnStartText!);
+        sent = true;
+        logger.info(`[vc-agent] realtime voice test utterance sent meeting=${session.state.meeting.id} frames=${r.frames} durationMs=${r.durationMs}`);
+        await delay(DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS);
+      } catch (err) {
+        logger.warn(`[vc-agent] realtime voice test utterance failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        await voice.stop(sent ? 'test-speak-finished' : 'test-speak-failed').catch((err) => {
+          logger.warn(`[vc-agent] realtime voice test utterance stop failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        if (session.realtimeVoice === voice) session.realtimeVoice = undefined;
+      }
+    })();
   } catch (err) {
     await session.realtimeVoice?.stop('start-failed').catch(() => { /* ignore cleanup errors */ });
     session.realtimeVoice = undefined;
@@ -7295,8 +7509,8 @@ async function ensureVcMeetingRealtimeVoiceSession(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
 ): Promise<RealtimeVoiceSession> {
+  if (!vcMeetingRealtimeVoiceEnabled(cfg)) throw new Error('realtime voice is disabled');
   const voiceCfg = cfg.realtimeVoice;
-  if (voiceCfg?.enabled !== true) throw new Error('realtime voice is disabled');
   if (session.realtimeVoice && (session.realtimeVoice.status === 'failed' || session.realtimeVoice.status === 'stopped')) {
     await session.realtimeVoice.stop('rebuild-stale-session').catch((err) => {
       logger.warn(`[vc-agent] stale realtime voice cleanup failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
@@ -7313,9 +7527,9 @@ async function ensureVcMeetingRealtimeVoiceSession(
       protocol: createProtoRealtimeVoiceProtocol(),
       transport,
       audioFormat: {
-        ...(voiceCfg.sampleRate !== undefined ? { sampleRate: voiceCfg.sampleRate } : {}),
-        ...(voiceCfg.channels !== undefined ? { channels: voiceCfg.channels } : {}),
-        ...(voiceCfg.frameMs !== undefined ? { frameMs: voiceCfg.frameMs } : {}),
+        ...(voiceCfg?.sampleRate !== undefined ? { sampleRate: voiceCfg.sampleRate } : {}),
+        ...(voiceCfg?.channels !== undefined ? { channels: voiceCfg.channels } : {}),
+        ...(voiceCfg?.frameMs !== undefined ? { frameMs: voiceCfg.frameMs } : {}),
       },
     });
   }
@@ -7465,7 +7679,7 @@ function getOrCreateVcMeetingDaemonSession(
       monitoringStarted: false,
       ...(listenerChatId ? { listenerChatId } : {}),
       pendingItems: [],
-      textOutputPolicy: defaultVcMeetingTextOutputPolicy(),
+      textOutputPolicy: defaultVcMeetingTextOutputPolicy(cfg),
       voiceOutputPolicy: defaultVcMeetingVoiceOutputPolicy(cfg),
       pendingOutputRequests: {},
       consumerPendingItems: [],
@@ -7493,7 +7707,7 @@ function getOrCreateVcMeetingDaemonSession(
       session.listenerChatId = listenerChatId;
       session.state.notificationChatId = listenerChatId;
     }
-    session.textOutputPolicy ??= defaultVcMeetingTextOutputPolicy();
+    session.textOutputPolicy ??= defaultVcMeetingTextOutputPolicy(cfg);
     session.voiceOutputPolicy ??= defaultVcMeetingVoiceOutputPolicy(cfg);
     session.pendingOutputRequests ??= {};
     session.consumerPendingItems ??= [];
@@ -10259,7 +10473,11 @@ function vcMeetingConsumerHasFastSignal(
       : item.type === 'transcript_received'
         ? item.speaker
         : undefined;
-    if (isInstructionSource(actor) && /[?？]/.test(text)) return true;
+    // Any speech/chat from an instruction source (the authorizing user) is a
+    // fast signal — not only questions. Waiting out the regular flush tick on
+    // the operator's own words made the agent feel unresponsive in-meeting;
+    // other participants still batch on the normal cadence.
+    if (isInstructionSource(actor)) return true;
   }
   return false;
 }
@@ -14167,6 +14385,50 @@ async function restoreVcMeetingMonitoringAfterObservedJoin(
   logger.info(`[vc-agent] listener monitoring restored from own join event meeting=${session.state.meeting.id}`);
 }
 
+/**
+ * 入会即预热会议 agent 的 CLI 会话——复用「进群自动开工」(handleBotAdded)而不是走
+ * VC delivery 冷 fork,把 bot 刚进监听群时就把会话冷起来待命,首条字幕/弹幕来了秒回
+ * (否则要等选择卡默认生效 + 首次投递,实测 ~28s)。
+ *
+ * 为什么安全复用 handleBotAdded:
+ *  - Plan B 下会议 agent 本就是这个监听群的普通 chat-scope 会话,key = sessionKey(
+ *    chatId, appId);handleBotAdded 普通群 chat-scope 会话同 key。预热出来的正是后面
+ *    VC 投递 `ensureVcMeetingReceiverSession` 会 adopt 的那个(它见已有会话只 stamp
+ *    binding、不另建),零重复会话、零 delivery 机制改动。
+ *  - forcePrompt='' 绕过 autoStartOnGroupJoin 开关(入会预热是我们主动的),D7(群里
+ *    要有 allowedUser)照跑——监听群有 owner,天然过。空 prompt = 模型自己读群上下文
+ *    (与场景① D8 一致),不塞合成指令。
+ *
+ * **只在会落到 chat-scope 时预热**:若这个 bot 的普通群回复模式是 new-topic,
+ * handleBotAdded 会给监听群开一个话题(thread-scope,锚点漂移),就和 VC 固定的
+ * chat key 岔开、可能双开会话。这种情况跳过预热,退回老的懒启动(无回归)。
+ * best-effort:任何失败只 warn,会话仍会在首次投递时冷 fork。
+ */
+async function warmSpawnVcMeetingAgentSession(
+  larkAppId: string,
+  listenerChatId: string,
+  meeting: VcMeetingPushContext['meeting'],
+): Promise<void> {
+  try {
+    // 监听群是新建的普通群(createGroupWithBots),mode='group';只有当这个 bot 的普通群
+    // 回复模式是 new-topic 时 handleBotAdded 才会开话题,那时跳过以免与 VC chat key 岔开。
+    const regularGroupMode = resolveRegularGroupMode(larkAppId, listenerChatId);
+    if (externalEventOpensOwnTopic('group', regularGroupMode)) {
+      logger.info(
+        `[vc-agent] skip warm-spawn for meeting=${meeting.id} chat=${listenerChatId}: `
+        + `bot reply mode opens a topic (would diverge from the chat-scope meeting key)`,
+      );
+      return;
+    }
+    await handleBotAdded(listenerChatId, undefined, larkAppId, { forcePrompt: '' });
+  } catch (err) {
+    logger.warn(
+      `[vc-agent] warm-spawn on join failed meeting=${meeting.id} chat=${listenerChatId}: `
+      + `${err instanceof Error ? err.message : String(err)} (falling back to lazy spawn on first delivery)`,
+    );
+  }
+}
+
 async function startVcMeetingMonitoring(input: {
   larkAppId: string;
   key: string;
@@ -14275,6 +14537,13 @@ async function startVcMeetingMonitoring(input: {
       persistVcMeetingRuntimeSession(session, input.cfg);
       scheduleVcMeetingListenerFlush(currentKey, input.cfg);
       void maybeStartVcMeetingRealtimeVoice(input.larkAppId, session, input.cfg);
+      // 入会即预热 CLI：监听群一建好就把这个 bot 的会话冷起来待命,而不是等第一条
+      // 字幕/弹幕投递才冷 fork(实测那要 ~28s)。复用「进群自动开工」的 handleBotAdded
+      // ——不碰 VC delivery/attribution 机制,且 Plan B 下会议 agent 本就是这个监听群的
+      // 普通 chat-scope 会话(sessionKey(chatId,appId)),与 handleBotAdded 普通群 chat
+      // 会话同 key:预热出来的正是后面 VC 投递会 adopt 的那个,零重复会话。best-effort,
+      // 失败只 warn(会话仍会在首次投递时按老路径冷 fork)。
+      void warmSpawnVcMeetingAgentSession(input.larkAppId, listenerChatId, meeting);
       await sendMessage(
         input.larkAppId,
         listenerChatId,
@@ -16091,6 +16360,8 @@ export const __vcMeetingAgentTest = {
     const cfg = effectiveVcMeetingAgentConfig(larkAppId);
     if (cfg) restoreVcMeetingRuntimeSessionsForBot(larkAppId, cfg);
   },
+  /** 测试用：读某个 bot 的有效 VC 配置（含共享目录绑定 + larkCliProfile 默认值）。 */
+  effectiveConfig: (larkAppId: string) => effectiveVcMeetingAgentConfig(larkAppId),
   reset: () => {
     for (const session of vcMeetingSessions.values()) {
       if (session.flushTimer) clearInterval(session.flushTimer);
@@ -21053,26 +21324,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     botConfigs = loadBotConfigs();
     cfg = loadBotConfigAtIndex(idx);
   }
-  // One-time, lock-protected catalog bootstrap. This runs only after the
-  // complete bots.json has parsed successfully, and the helper re-reads the
-  // latest file under its lock before deciding. Explicit [] and legacy agent
-  // policy are durable opt-outs. Reload the selected config after a write so
-  // this daemon exposes the seeded selection card immediately on the same boot.
+  // 这里曾经有一次「给本 bot 播种默认会议角色预设」的启动写盘。已退役：角色预设
+  // 改成全 fleet 共享目录 + 读路径内置默认（services/vc-meeting-shared-consumer-
+  // catalog.ts），没有任何 bot 还需要自己那份 per-bot 拷贝。退役的两个理由：
+  //   1. 播种出来的 per-bot `consumerProfiles` 会永久遮蔽共享目录——操作者在
+  //      Dashboard 改共享预设，被播种过的 bot 完全不跟随；
+  //   2. 那次写盘还会把「另一个 bot」的 appId 焊进预设（旧的换人兜底），正是
+  //      「拉 A 进会却把 B 拉进监听群」的源头。
+  // 现在启动路径对 VC 预设零写盘，fleet 里几十个 daemon 同时启动也不再有写竞争。
   const selectedAppId = cfg.larkAppId;
-  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(selectedAppId);
-  if (profileBootstrap.ok) {
-    if (profileBootstrap.seeded) {
-      logger.info(
-        `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
-        + `agent=${profileBootstrap.agentAppId}`,
-      );
-    }
-  } else if (!profileBootstrap.ok) {
-    logger.warn(
-      `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
-      + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
-    );
-  }
   // A bootstrap failure is not authority to keep an earlier in-memory config.
   // Every explicit PM2 daemon must prove its same raw slot and App identity
   // immediately before registerBot, regardless of the bootstrap result.
@@ -21883,6 +22143,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!cfg.apiOnly) {
       checkRequiredScopes(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+      });
+      // Ensure VC meeting events are subscribed so ANY invited bot can receive
+      // meeting invites (bot-agnostic auto-join). Check-first + best-effort: a
+      // read-only probe over the cached web session, auto-subscribing only when
+      // events are missing. Never blocks boot; the fn itself skips VC-inactive
+      // bots via vcMeetingAgentConfigActive.
+      ensureVcMeetingEventsSubscribed(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] VC event subscription check failed: ${err?.message ?? err}`);
       });
     }
 

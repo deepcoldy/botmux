@@ -480,7 +480,7 @@ describe('send-target reachability helpers', () => {
     })).toEqual(new Set());
   });
 
-  it('excludes isolated deferred and VC chat sessions from the ordinary routing slot', async () => {
+  it('excludes isolated deferred schedule-run chat sessions from the ordinary routing slot', async () => {
     expect(await foldableChatSessionAppIds({
       sessions: [
         {
@@ -491,6 +491,21 @@ describe('send-target reachability helpers', () => {
           larkAppId: 'cli_deferred',
           deferredScheduleRun: { routingAnchor: 'schedule-run:1' },
         },
+      ],
+      targetChatId: 'oc_main',
+      outboundMode: 'plain',
+      resolveMode: () => 'chat',
+      resolveChatMode: async () => 'group',
+    })).toEqual(new Set());
+  });
+
+  it('Plan B: a VC meeting-agent chat session IS foldable via the ordinary slot', async () => {
+    // Under Plan B the meeting agent is an ordinary chat-scope session, so a
+    // mention in its listener group must fold back into it like any other
+    // chat-scope peer — the vcMeetingReceiver marker is delivery metadata and
+    // no longer excludes the session from the foldable set.
+    expect(await foldableChatSessionAppIds({
+      sessions: [
         {
           status: 'active',
           scope: 'chat',
@@ -504,7 +519,7 @@ describe('send-target reachability helpers', () => {
       outboundMode: 'plain',
       resolveMode: () => 'chat',
       resolveChatMode: async () => 'group',
-    })).toEqual(new Set());
+    })).toEqual(new Set(['cli_vc']));
   });
 
   it('fails closed after a regular group becomes a topic chat', async () => {

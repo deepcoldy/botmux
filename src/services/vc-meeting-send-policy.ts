@@ -36,6 +36,17 @@ export interface VcMeetingManagedSendOrigin {
   /** Worker UI may need to patch/freeze an already-created card after terminal;
    * new botmux send/ask effects must leave this false. */
   allowTerminalReceipt?: boolean;
+  /** In-meeting managed output (request-output → managed-action) is a DIFFERENT
+   * channel from listener-group auto-post. `responseMode: silent` governs only
+   * whether the agent auto-posts to the listener group; it must NOT gate
+   * in-meeting speech, which is authorized downstream at the hub by
+   * capability + textOutputPolicy/voiceOutputPolicy (see vc-meeting-action-gate).
+   * Set true ONLY on the in-meeting-output authorization path so this evaluator
+   * still proves receipt identity/liveness (existence, attempt match, active
+   * projection, dispatched/completed status) but skips the silent veto. Listener
+   * auto-post callers (final_output / botmux send) leave it false so silent keeps
+   * suppressing group posts. */
+  forInMeetingOutput?: boolean;
 }
 
 export type VcMeetingManagedSendDecision =
@@ -173,7 +184,16 @@ export function isCurrentVcMeetingImTurnOrigin(
 
 /** Resolve a managed output decision from the durable receipt, not mutable
  * process-global "current turn" state. Missing origin evidence on a dedicated
- * receiver fails closed; ordinary sessions stay unchanged. */
+ * receiver fails closed; ordinary sessions stay unchanged.
+ *
+ * Plan B: the receiver marker (`vcMeetingReceiver`) is pure metadata — a
+ * stamped session whose projection never activated (registration failed) or
+ * was removed/paused is effectively an ordinary chat-scope session. Only an
+ * ACTIVE projection keeps the receiver fenced to attributable origins; with
+ * none, the session falls back to `ordinary` so it is not bricked by the
+ * managed-output gate (e.g. a Pi adapter that cannot claim
+ * `reliableTurnTerminal` leaves the auto-start session stamped but unable to
+ * reply to any human message). */
 export function evaluateVcMeetingManagedSend(
   dataDir: string,
   origin: VcMeetingManagedSendOrigin,
@@ -197,6 +217,19 @@ export function evaluateVcMeetingManagedSend(
             memberEpoch: imOrigin.memberEpoch,
           },
         };
+      }
+      // Plan B: no attributable durable/IM origin. If the stamped session has
+      // NO active projection (registration failed, or the projection was
+      // removed/paused/expired), it is an ordinary chat-scope session and must
+      // not be bricked — fall back to `ordinary`. An active projection keeps
+      // the fail-closed gate so a live receiver still cannot emit unattributed
+      // output into the listener group.
+      const activeProjections = listVcMeetingActiveProjectionsForReceiverSession(
+        dataDir,
+        origin.receiverSessionId,
+      );
+      if (activeProjections.length === 0) {
+        return { ok: true, kind: 'ordinary' };
       }
       return {
         ok: false,
@@ -241,7 +274,16 @@ export function evaluateVcMeetingManagedSend(
   // The policy is frozen on the receipt. Reading the current projection here
   // would let a later silent→listener_thread update retroactively authorize an
   // old silent attempt. Missing mode is an old WIP record and fails closed.
-  if ((lookup.receipt.responseMode ?? 'silent') === 'silent') {
+  //
+  // `responseMode: silent` governs ONLY the listener-group auto-post channel. The
+  // in-meeting managed-output channel (request-output → hub managed-action) is a
+  // separate channel authorized by capability + textOutputPolicy/voiceOutputPolicy
+  // at the hub, and must not be blocked by silent — a "silent in the listener
+  // group" facilitator still speaks in the meeting. So skip this veto when the
+  // caller is the in-meeting-output path (forInMeetingOutput); every other caller
+  // (final_output / botmux send to the listener group) keeps the suppression.
+  if (!origin.forInMeetingOutput
+    && (lookup.receipt.responseMode ?? 'silent') === 'silent') {
     return { ok: false, errorCode: 'silent_delivery', error: 'managed output is disabled for this silent delivery' };
   }
   return {

@@ -19,7 +19,7 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -154,7 +154,10 @@ describe('a real process with the guard survives an unhandled rejection', () => 
 
 describe('daemon wiring', () => {
   const daemonSrc = (): string =>
-    execFileSync('cat', [join(import.meta.dirname, '../src/daemon.ts')], { encoding: 'utf-8' });
+    // readFileSync, not `execFileSync('cat', …)`: daemon.ts crossed 1MB, and
+    // execFileSync's default maxBuffer (1MB) then throws ENOBUFS. Reading the
+    // file directly has no buffer cap and no subprocess.
+    readFileSync(join(import.meta.dirname, '../src/daemon.ts'), 'utf-8');
 
   it('installs the guard inside startDaemon, not only in one entry file', () => {
     // startDaemon has TWO callers (index-daemon.ts and index-core-only.ts), so

@@ -14,6 +14,7 @@ import {
   getVcMeetingDeliveryReceipt,
   getVcMeetingMemberProjection,
   getVcMeetingReceiverStream,
+  latestVcMeetingDeliveryForSession,
   listActiveVcMeetingDeliveriesForSession,
   listVcMeetingActiveProjectionsForReceiverSession,
   listVcMeetingMemberProjections,
@@ -1090,6 +1091,47 @@ describe('vc meeting delivery store', () => {
 
       expect(listActiveVcMeetingDeliveriesForSession(dir, 'sess-1').map((entry) => entry.receipt.deliveryKey))
         .toEqual(['dk-1']);
+    });
+  });
+
+  describe('latestVcMeetingDeliveryForSession', () => {
+    beforeEach(() => {
+      applyVcMeetingMemberProjection(dir, projection());
+      applyVcMeetingMemberProjection(dir, projection({ meetingId: 'meeting-2' }));
+      acceptVcMeetingDelivery(dir, delivery());
+      acceptVcMeetingDelivery(dir, delivery({ meetingId: 'meeting-2', deliveryKey: 'dk-2' }));
+    });
+
+    it('returns a just-COMPLETED receipt (the idle-gap case listActive skips)', () => {
+      // The whole point: after the delivery turn goes idle the receipt is
+      // `completed` (terminal). listActive returns [] for it; the in-meeting
+      // output CLI needs THIS so it can still supply an authorizable origin.
+      const rk = { ...KEY, meetingId: 'meeting-2', deliveryKey: 'dk-2' };
+      markVcMeetingDeliveryDispatched(dir, rk, { receiverBootId: 'boot-rx-1', workerGeneration: 3 });
+      completeVcMeetingDelivery(dir, rk, { workerGeneration: 3, dispatchAttempt: 1 });
+
+      const latest = latestVcMeetingDeliveryForSession(dir, 'sess-1');
+      expect(latest).toMatchObject({
+        receiverSessionId: 'sess-1',
+        receipt: { deliveryKey: 'dk-2', status: 'completed', dispatchAttempt: 1 },
+      });
+      // listActive skips it (terminal) — this is exactly the gap this helper fills.
+      expect(listActiveVcMeetingDeliveriesForSession(dir, 'sess-1').map(e => e.receipt.deliveryKey))
+        .toEqual(['dk-1']);
+    });
+
+    it('prefers the most-recent authorizable receipt and never returns failed/abandoned', () => {
+      // dk-1 dispatched (authorizable). dk-2 abandoned (not). Latest authorizable
+      // is dk-1.
+      markVcMeetingDeliveryDispatched(dir, { ...KEY, deliveryKey: 'dk-1' }, { receiverBootId: 'boot-rx-1', workerGeneration: 1 });
+      abandonVcMeetingDeliveryStream(dir, { listenerAppId: LISTENER, meetingId: 'meeting-2', memberId: MEMBER, memberEpoch: 1 });
+      const latest = latestVcMeetingDeliveryForSession(dir, 'sess-1');
+      expect(latest?.receipt.deliveryKey).toBe('dk-1');
+      expect(latest?.receipt.status).toBe('dispatched');
+    });
+
+    it('returns undefined for an unknown session', () => {
+      expect(latestVcMeetingDeliveryForSession(dir, 'no-such-session')).toBeUndefined();
     });
   });
 

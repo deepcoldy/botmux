@@ -27696,6 +27696,32 @@ button.skills-issue-badge:hover {
 .feedback-more { margin-top: 12px; }
 @media (max-width: 1100px) { .feedback-kpis { grid-template-columns: repeat(3, 1fr); } .feedback-deliveries > div { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .feedback-kpis, .feedback-grid { grid-template-columns: 1fr; } }
+
+/* ── VC per-bot in-meeting output policy table ─────────────────────────── */
+.vc-bot-policy-table { display: flex; flex-direction: column; gap: 2px; }
+.vc-bot-policy-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 6px 8px; border-radius: 6px;
+}
+.vc-bot-policy-row:nth-child(odd) { background: color-mix(in srgb, currentColor 4%, transparent); }
+.vc-bot-policy-name {
+  flex: 1 1 160px; min-width: 140px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; font-weight: 500;
+}
+.vc-bot-policy-cell { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; opacity: .92; }
+.vc-bot-policy-select { font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+.vc-bot-policy-rtv input { accent-color: var(--accent, #4c8dff); }
+.vc-bot-policy-effective { font-size: 11px; white-space: nowrap; }
+.vc-bot-policy-warn { font-style: normal; margin-left: 6px; cursor: help; opacity: .85; }
+/* ⚠ 用 InfoTip(hover 可靠、body 传送门)而非原生 title——原生 title 小元素上常
+   触发不了/延迟长。tip 包裹层内联不撑行,弹层多行分条列出。 */
+.vc-bot-policy-warn-tip { display: inline-flex; align-items: center; }
+.vc-bot-policy-warn-pop { display: flex; flex-direction: column; gap: 2px; text-align: left; }
+.vc-bot-policy-search {
+  font-size: 12px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border, #d0d5dd); min-width: 180px; max-width: 260px;
+}
+.vc-bot-policy-empty { padding: 12px; text-align: center; }
 /* Agent Workbench — reader-flavoured terminal surface: no gradients, no decorative
    rules, and independent from the Dashboard card/aurora vocabulary.
    段内三条硬约束，改之前先读：

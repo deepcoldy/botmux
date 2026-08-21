@@ -330,6 +330,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // /term payload. Default to the in-chat visible-to-you channel; tests override
   // per-scenario (dm / failed / not_ready).
   deliverWritableTerminalCardTo: vi.fn(async () => 'ephemeral'),
+  // /card show path. postFreshStreamingCard returns false for sessions that
+  // structurally can't post a live card (VC meeting-receiver among them); the
+  // handler then picks an accurate reason. Default false so /card show tests
+  // exercise the not-ready / vc-receiver branch; override per-scenario.
+  postFreshStreamingCard: vi.fn(async () => false),
+  postPrivateSnapshotCard: vi.fn(async () => ({ notReady: false, sent: 1, total: 1 })),
+  resolvePrivateCardAudience: vi.fn(() => ['ou_owner']),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -498,7 +505,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -6173,6 +6180,25 @@ describe('/card — operator / canOperate gate', () => {
     expect(setCardMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
+  });
+
+  it('Plan B: /card on a VC meeting-agent session gets the ordinary not-ready notice (no special-casing)', async () => {
+    // Under Plan B a meeting agent is an ordinary chat-scope session, so /card
+    // behaves exactly like any other session — postFreshStreamingCard no longer
+    // structurally refuses it, and there is no meeting-receiver-specific reason.
+    // When a post genuinely can't happen yet, the operator sees the same generic
+    // not-ready text as every other session.
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
+    })) as any);
+    vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
+    const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: true }) });
+    const deps = makeDeps(ds);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('终端尚未就绪');
+    expect(reply).not.toContain('会议接收会话');
   });
 });
 

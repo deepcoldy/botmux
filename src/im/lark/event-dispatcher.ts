@@ -8,7 +8,7 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -35,7 +35,7 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, probeVcMeetingEventSubscription } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
@@ -455,10 +455,15 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       const globalVcListenerAppId = vcMeetingAgentGlobalListenerBotAppId();
       if (
         isVcMeetingAgentGloballyEnabled()
-        && bot.config.vcMeetingAgent?.enabled === true
+        // VC 现在默认对每个连着飞书的 bot 生效（enabled:false 才是显式退出），所以
+        // 就绪自检也要跟着走 vcMeetingAgentConfigActive，而不是只认显式 enabled:true——
+        // 否则「默认开」的绝大多数 bot 在启动时永远不做权限体检。
+        && !!vcMeetingAgentConfigActive(bot.config)
         && (!globalVcListenerAppId || globalVcListenerAppId === larkAppId)
       ) {
-        const requiredVcScopes = bot.config.vcMeetingAgent.realtimeVoice?.enabled === true
+        // 实时语音也默认开启（未配=开），所以 VC 权限体检默认把实时语音 scope 纳入
+        // 必需项；只有显式 realtimeVoice.enabled=false 才不查它。
+        const requiredVcScopes = bot.config.vcMeetingAgent?.realtimeVoice?.enabled !== false
           ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
           : VC_MEETING_FEATURE_SCOPES;
         const missingVc = requiredVcScopes.filter(s => !grantedScopes.has(s.name));
@@ -552,6 +557,75 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     await dmAdmin(larkAppId, adminOpenId, dm, `missing scopes: ${missingCritical.map(s => s.name).join(',')}`);
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
+  }
+}
+
+/**
+ * Startup: ensure this bot is subscribed to the VC meeting events
+ * (`vc.bot.meeting_*` + participant_meeting_joined) so ANY invited bot can
+ * receive meeting invites — the physical prerequisite for bot-agnostic
+ * auto-join. Check-first: a read-only probe over the cached Feishu web session
+ * (no QR at boot); only when events are missing / event mode is wrong do we run
+ * the full open-platform automation (which subscribes them AND publishes a
+ * version). This mirrors checkRequiredScopes ("fix only when something's
+ * missing") so a bot with events already subscribed makes zero mutating calls
+ * and never republishes. Best-effort: never throws into boot; apiOnly and
+ * VC-disabled bots are skipped by the caller / the active-config gate.
+ */
+export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  const brand = normalizeBrand(bot.config.brand);
+  // Open-platform automation only supports feishu.cn tenants. Skip apiOnly and
+  // VC-inactive bots — vcMeetingAgentConfigActive fail-closes both.
+  if (brand !== 'feishu') return;
+  if (!vcMeetingAgentConfigActive(bot.config)) return;
+  try {
+    const probe = await probeVcMeetingEventSubscription(larkAppId);
+    if (!probe.ok) {
+      // No cached web session / expired / network — degrade gracefully. Do NOT
+      // pop a QR at boot. Surface once to the admin so they can `botmux setup`.
+      logger.info(
+        `[${larkAppId}] VC event subscription check skipped (${probe.reason}): ${probe.message}. ` +
+        `被邀请进会需先订阅 vc.bot.meeting_* 事件；如该 bot 从未订阅，请运行 \`botmux setup\` 刷新开放平台登录态后重启。`,
+      );
+      return;
+    }
+    if (probe.missingVcEvents.length === 0 && probe.eventModeReady) {
+      logger.info(`[${larkAppId}] VC meeting events already subscribed (long-connection mode)`);
+      return;
+    }
+    logger.info(
+      `[${larkAppId}] VC events missing (${probe.missingVcEvents.join('、') || '事件模式非长连接'}); auto-subscribing via Open Platform...`,
+    );
+    const result = await automateOpenPlatformSetup({
+      appId: bot.config.larkAppId,
+      brand,
+      maxWaitMs: 60_000,
+      disableQrLogin: true,
+      onStatus: (msg) => logger.info(`[${larkAppId}] vc-event-autoconfig: ${msg}`),
+      onQrCode: () => {
+        logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
+      },
+    });
+    if (result.ok) {
+      logger.info(`[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.versionId ?? 'n/a'} published`);
+      return;
+    }
+    // Automation failed (session expired mid-run / api error). Log; DM the admin
+    // once so a bot that genuinely lacks the subscription gets a human nudge.
+    logger.warn(`[${larkAppId}] VC event auto-subscribe failed (${result.reason}): ${result.message}`);
+    const adminOpenId = getAdminOpenId(bot);
+    if (adminOpenId) {
+      await dmAdmin(
+        larkAppId,
+        adminOpenId,
+        `⚠️ botmux 想在启动时自动为机器人 "${bot.botName ?? larkAppId}" 订阅视频会议事件（vc.bot.meeting_*），以便它被拉进会时能自动进会，但自动配置失败：${result.message}\n\n` +
+        `请运行 \`botmux setup\` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。`,
+        'vc event auto-subscribe failed',
+      );
+    }
+  } catch (err: any) {
+    logger.debug(`[${larkAppId}] VC event subscription check errored: ${err?.message ?? err}`);
   }
 }
 
