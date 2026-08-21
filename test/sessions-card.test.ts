@@ -1154,7 +1154,7 @@ describe('handleSessionsCardAction', () => {
           return { status: 200, body: { sessions }, raw: '' };
         }
         if (req.method === 'POST' && req.path.startsWith('/__daemon/sessions/')) {
-          return closePostResp ?? { status: 200, body: { ok: true, alreadyClosed: false }, raw: '' };
+          return closePostResp ?? { status: 200, body: { ok: true, outcome: 'closed', alreadyClosed: false }, raw: '' };
         }
         throw new Error('unexpected: ' + JSON.stringify(req));
       });
@@ -1166,6 +1166,31 @@ describe('handleSessionsCardAction', () => {
         requestSpy,
       };
     }
+
+    it('surfaces an uncancelled remote session on the closed card', async () => {
+      // dashboard IPC already forwards the residual; this card was the last
+      // consumer flattening it, rendering the ordinary closed detail as if the
+      // remote session were gone too.
+      const deps = makeCloseDeps('sess_a', {
+        status: 200,
+        body: {
+          ok: true,
+          outcome: 'closed_with_residual',
+          residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+          alreadyClosed: false,
+        },
+      });
+
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        deps,
+      );
+
+      const rendered = JSON.stringify((r as { card: { data: unknown } }).card.data);
+      expect(rendered).toContain('mojo-parked-9');
+      expect(rendered).toContain('远端会话未取消');
+    });
 
     it('happy: GET once + POST once + synthesizes closed detail (no 2nd GET, no toast)', async () => {
       const deps = makeCloseDeps('sess_a');

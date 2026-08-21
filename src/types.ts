@@ -1,5 +1,10 @@
 import type { BackendType, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
+// The IPC carries the USER-facing MojoConfig. EffectiveMojoConfig exists only
+// AFTER buildEffectiveMojoConfig() runs in the worker, so declaring it here
+// misrepresented the boundary — and structural typing let the subset assignment
+// through without complaint.
+import type { MojoConfig, MojoLivePatch, MojoSessionIdentity } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
@@ -36,6 +41,12 @@ export interface VcMeetingImTurnOrigin {
   larkMessageId: string;
   /** Agent-app-scoped sender used only for this turn's reply footer. */
   replyTargetSenderOpenId?: string;
+}
+
+export interface TrustedCaller {
+  requestUserOpenId?: string;
+  requestUserUnionId?: string;
+  requestLarkAppId?: string;
 }
 
 export interface VcMeetingConsumerProfileFilter {
@@ -212,6 +223,9 @@ export interface Session {
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
   titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
+  /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
+   * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
+  ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
   kanbanColumn?: string;
@@ -300,9 +314,68 @@ export interface Session {
   pid?: number;
   workingDir?: string;
   webPort?: number;
+  /** Agent-registered local Web preview for this session. The daemon accepts
+   * only a reachable literal loopback target through the session-scoped CLI
+   * capability. Browser APIs/SSE replace this internal target with a
+   * same-origin path and never expose its host/port. */
+  previewTarget?: import('./core/session-preview.js').SessionPreviewTarget;
   /** riff：最近一个任务 id（follow-up 血缘锚点）。持久化后 daemon 重启的下一条
    *  消息仍走 task-follow-up 延续沙箱与上下文，而非冷启新任务。 */
   riffParentTaskId?: string;
+  /**
+   * Crash journal for an explicit Mojo remote close.
+   *
+   * `preparing` is persisted BEFORE the worker is asked to cancel, so a daemon
+   * crash can never make an in-flight/possibly-completed cancellation look like
+   * an ordinary resumable session. `prepared` means the worker proved the remote
+   * session gone and a restart may finish only the durable local close. An
+   * interrupted `preparing` journal is treated as `uncertain` on restore and
+   * stays fenced pending explicit reconciliation; it is never auto-cancelled.
+   *
+   * No credential or control-plane secret is stored here.
+   */
+  mojoCloseJournal?: {
+    phase: 'preparing' | 'prepared' | 'uncertain';
+    requestId: string;
+    taskId?: string;
+    updatedAt: string;
+    /**
+     * LOCAL subtree residual reported by the prepare that proved the remote side
+     * gone (see MojoLocalCloseResidual). Durable ON PURPOSE: the residual is part
+     * of the close outcome, and a prepared journal replayed after a daemon
+     * restart (or after a failed runtime commit) must still publish
+     * `closed_with_residual` — dropping it here is how the close came to lie
+     * with a plain `closed` while the containment handle stayed behind.
+     */
+    localResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+    /**
+     * The EXACT verdict the worker returned for a failed prepare.
+     *
+     * Without it the journal collapsed two different states into one row: an
+     * `uncertain` prepare (a remote session may exist and must be reconciled)
+     * and an `irreversible` one (the remote side is provably gone, only the
+     * local commit is outstanding). A restart then could not tell whether
+     * re-cancelling was required, forbidden, or merely useless.
+     */
+    recovery?: 'retryable' | 'uncertain' | 'irreversible';
+    /**
+     * May a new write be admitted? Stored SEPARATELY from `recovery` on purpose.
+     *
+     * The two answers legitimately disagree: an unproven local child termination
+     * is `retryable` (the irreversible remote cancel never ran, so the close may
+     * be retried) while a credentialed process may still be alive, so writes must
+     * stay fenced. Collapsing them into one durable field is exactly how a
+     * `fenced` state got re-derived as `retryable` on restore and re-opened
+     * admission on a live orphan.
+     */
+    admission?: 'restorable' | 'fenced';
+    /**
+     * Irreversible: the remote teardown already happened. A retry may only
+     * re-run the LOCAL commit — issuing another cancel, or an abort that
+     * re-opens admission on a dead lineage, is forbidden.
+     */
+    commitOnly?: boolean;
+  };
   /** riff 多仓 stamp：多仓 worktree 流按用户选择顺序创建的 worktree 目录列表。
    *  仅该 stamp 存在时 riff 才做多仓推导（首仓=primary）；普通非 git 工作目录
    *  绝不扫描子目录乱带仓库。任何其它选仓路径都会清除本 stamp。 */
@@ -419,6 +492,8 @@ export interface Session {
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
   streamCardNonce?: string;
+  /** Stable visible destination of the persisted live streaming card. */
+  streamCardReplyTargetKey?: string;
   /** Legacy field kept for migrating sessions persisted before displayMode was added. */
   streamExpanded?: boolean;
   /** Card body display mode — 'hidden' | 'screenshot'. */
@@ -484,13 +559,23 @@ export interface Session {
   cliPathOverride?: string;
   /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
   wrapperCli?: string;
-  /** Optional model frozen at creation so historical sessions resume with their original model. */
+  /**
+   * The model this session was last LAUNCHED with — a record, not the launch
+   * source of truth. Sessions used to freeze the bot's model here at creation,
+   * which made a long-running session ignore the model configured in the
+   * dashboard forever; the model is now resolved from the live bot config on
+   * every spawn (see resolveSessionLaunchModel) and stamped back here.
+   *
+   * Only ever READ when the session is pinned to a CLI the bot no longer runs
+   * (rule 3), where the live model belongs to a different CLI — never while the
+   * live config applies, which is what keeps a config change effective.
+   */
   model?: string;
   /** Optional codex reasoning effort frozen at creation (per-turn API override).
    *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
-   * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
+   * True once `cliId`/`cliPathOverride`/`wrapperCli` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
    * exactly once — on a fresh start, or on the first resume of a session created
    * before these fields existed (back-filling the still-missing ones from the live
@@ -499,6 +584,76 @@ export interface Session {
    * bot gains later.
    */
   agentFrozen?: boolean;
+  /**
+   * mojo backend only. The control-plane identity frozen at session creation:
+   * where it executes (cloud vs host), which endpoint / PPE profile, and which
+   * workspace / agent it is routed to. See MOJO_IDENTITY_KEYS.
+   *
+   * Frozen for the same reason as `cliId`/`wrapperCli`: a live bot edit must not
+   * retroactively move an EXISTING session between execution modes or tenants. A
+   * cold resume would otherwise continue — or a `/close` would cancel — against a
+   * different endpoint than the one that created the remote session.
+   *
+   * Credentials are deliberately excluded so a rotated JWT still takes effect and
+   * no plaintext token is persisted here; only the endpoint/tenant/profile shape
+   * is pinned.
+   */
+  mojoIdentity?: MojoSessionIdentity;
+  /**
+   * mojo backend only. Marks an identity frozen by a build whose double-unset
+   * default is HOST execution. An identity without this flag and without an
+   * explicit `localDaemon` key was frozen when double-unset still meant the
+   * cloud sandbox — resuming it under the new default would silently flip the
+   * session cloud→host, the exact transition the freeze exists to prevent, so
+   * sessionMojoConfig pins those legacy rows to `localDaemon: false` instead.
+   */
+  mojoIdentityHostDefault?: boolean;
+  /**
+   * mojo backend only. Queues the user-visible "this session is pinned to the
+   * legacy sandbox behaviour — close and reopen" notice (see the localDaemon
+   * pin in sessionMojoConfig). Same tri-state protocol as
+   * mojoQuarantineNoticePending: `true` = queued, `false` = delivered,
+   * `undefined` = never queued.
+   */
+  mojoLegacyPinNoticePending?: boolean;
+  /**
+   * mojo backend only. A remote session id that can no longer be trusted: it was
+   * created before `mojoIdentity` existed, so nothing records WHICH control plane
+   * holds it.
+   *
+   * Preserved rather than deleted so the id survives for manual inspection and
+   * cleanup, and so the user can be told their context was parked instead of
+   * silently losing it. While set, the session must never auto-resume or
+   * auto-cancel this id — cancelling through today's config could hit a different
+   * tenant than the one that created it.
+   */
+  mojoQuarantinedLineage?: string;
+  /**
+   * A LOCAL-subtree residual parked on the row at close time, so an idempotent
+   * re-close of an already-closed row still reports `closed_with_residual`
+   * instead of a false all-clear. Distinct from `mojoQuarantinedLineage` (which
+   * names a surviving REMOTE session): this names a host subtree whose
+   * containment handle is still held, and its cleanup is local.
+   *
+   * DERIVED DISPLAY STATE — never cleared, and that is deliberate. The handle
+   * ledger is the source of truth: the paths that discharge a handle (boot
+   * reconciliation, operator revoke) operate on the one global ledger and do not
+   * — must not — chase per-bot session rows. Consumers therefore report this
+   * field only while `hasUnprovenContainment(sessionId)` still holds a handle
+   * (see `liveLocalResidual` in worker-pool); with the handle gone the field is
+   * stale and reads as nothing, and an unreadable ledger keeps it reported
+   * (fail-closed).
+   */
+  mojoLocalResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+  /**
+   * Set alongside `mojoQuarantinedLineage` and cleared once the user has been told.
+   *
+   * The parking itself is irreversible for that lineage, so a log line is not
+   * enough: without a visible notice the user silently loses their context, does
+   * not know the next message starts a new session, and never learns that a remote
+   * id needs manual cleanup.
+   */
+  mojoQuarantineNoticePending?: boolean;
   /**
    * Session backend resolved AT SPAWN TIME (tmux/herdr/zellij/zmx/pty). Stamped on
    * fork so restore can resolve the backend authoritatively from the session
@@ -812,6 +967,7 @@ export interface CodexAppGenerationCommit {
 export interface CliTurnPayload {
   content: string;
   codexAppInput?: CodexAppTurnInput;
+  trustedCaller?: TrustedCaller;
   /** Frozen steer authorization (codex-app ordered pre-final steer). Computed
    * ONCE by the daemon at admission (real human interactive turn only) and COPIED
    * verbatim into every opening/queued/fork/restore path — never re-inferred
@@ -850,16 +1006,21 @@ export interface PendingRepoSetup {
 }
 
 /** Messages sent from Daemon to Worker */
-export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; atMostOnce?: true }
+type DaemonToWorkerBase =
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  /** `model` rides along on every turn for the SAME reason the restart IPC carries
+   *  it: the crash-loop park recovery respawns the CLI from inside the worker on
+   *  the next message, with no restart IPC to refresh the snapshot. Same
+   *  three-state contract (undefined = not carried → keep snapshot; null = launch
+   *  with no model). It never affects the CLI already running. */
+  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string }
+  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -868,12 +1029,12 @@ export type DaemonToWorker =
   | { type: 'close'; requestId?: string }
   | { type: 'close_commit'; requestId: string }
   | { type: 'close_abort'; requestId: string }
-  /** Fence new Riff writes, drain accepted writes, and report exact lineage. */
-  | { type: 'riff_shutdown_prepare'; requestId: string }
+  /** Fence new remote writes, drain accepted writes, and report exact lineage. */
+  | { type: 'remote_shutdown_prepare'; requestId: string }
   /** Final lineage is durable; detach the worker generation. */
-  | { type: 'riff_shutdown_commit'; requestId: string }
-  /** Shutdown could not commit; restore Riff write admission. */
-  | { type: 'riff_shutdown_abort'; requestId: string }
+  | { type: 'remote_shutdown_commit'; requestId: string }
+  /** Shutdown could not commit; restore remote write admission. */
+  | { type: 'remote_shutdown_abort'; requestId: string }
   /** Retire only this worker/observer during a routing transfer. Persistent
    * backends and Riff keep their owned CLI/task alive for the replacement
   * worker to reattach; PTY keeps its historical cold-resume behavior. */
@@ -889,7 +1050,7 @@ export type DaemonToWorker =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null }
+  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; mojoLivePatch?: MojoLivePatch; model?: string | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -938,6 +1099,12 @@ export type DaemonToWorker =
   // source = SessionStart 的 startup/resume/… 。
   | { type: 'session_ready'; source?: string; requestId?: string };
 
+export type DaemonToWorker = DaemonToWorkerBase extends infer Message
+  ? Message extends { type: 'init' }
+    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy }
+    : Message
+  : never;
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | {
@@ -946,6 +1113,9 @@ export type WorkerToDaemon =
        * backend intentionally has no raw-terminal Web UI capability. */
       port: number;
       token: string;
+      /** PER-BOOT random read capability (P1-5): card links minted from it die
+       * with this worker generation, and the dashboard view-link API replaces
+       * it with a short-lived auth-bound grant instead of handing it out. */
       viewToken?: string;
       spawnCommand?: string;
       replyAlreadySent?: boolean;
@@ -985,7 +1155,7 @@ export type WorkerToDaemon =
     }
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   /** Executor-observed active runtime. Unlike the frozen Session launch config,
-   * these fields follow in-session `/model` and `/effort` switches. */
+   * these fields follow in-session model and effort changes reported by the CLI. */
   | {
       type: 'active_runtime';
       model: string | null;
@@ -1118,6 +1288,9 @@ export type WorkerToDaemon =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** Provider-neutral recovery hint. Only an explicit true authorizes the
+       * daemon's bounded ordinary-turn continuation policy. */
+      retryable?: boolean;
       /** Positive silence evidence. Only set to 'nothing_to_send' when the
        *  worker's bridge gate deliberately suppressed this turn as genuine
        *  silence (the model terminated with a bare nothing-to-send sentinel and
@@ -1133,7 +1306,7 @@ export type WorkerToDaemon =
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'riff_task_id'; taskId: string | null }
   | {
-      type: 'riff_shutdown_result';
+      type: 'remote_shutdown_result';
       requestId: string;
       phase: 'prepare' | 'abort';
       ok: boolean;
@@ -1144,6 +1317,19 @@ export type WorkerToDaemon =
       type: 'close_abort_result';
       requestId: string;
       ok: boolean;
+      /**
+       * Did the backend ACTUALLY restore write admission?
+       *
+       * Distinct from `ok` on purpose. A rollback can be handled successfully and
+       * still be REFUSED, because the backend holds a latched fence (an unproven
+       * local subtree, an unnamed remote session): "the close was abandoned" is not
+       * evidence that the survivor died. The daemon inferred restoration from `ok`
+       * alone, so a refused rollback was journalled as `admissionRestored: true`
+       * while write() kept returning false. Absent means `ok` (legacy behaviour).
+       */
+      admissionRestored?: boolean;
+      /** Why admission is still fenced, for logs and the durable journal. */
+      fenceReason?: string;
       error?: string;
     }
   | {
@@ -1152,4 +1338,32 @@ export type WorkerToDaemon =
       ok: boolean;
       taskId?: string;
       error?: string;
+      /**
+       * The LOCAL subtree could not be proven gone, even though the close itself
+       * succeeded. Distinct from a remote lineage residual: that one names a
+       * surviving remote task id, this one names a still-unproven process tree on
+       * THIS host whose containment handle was deliberately not released.
+       *
+       * On the wire because the daemon cannot re-derive it. Without it an ok:true
+       * close arrived as a bare success and was published as an ordinary closed
+       * row, contradicting the retained device-isolation blocker.
+       */
+      residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+      /**
+       * May the daemon roll this failed prepare back?
+       *
+       * Without it on the wire the tri-state existed only inside the worker: the
+       * daemon saw a bare ok:false and sent close_abort unconditionally, which
+       * laundered `uncertain` back into `retryable`. See SessionDestroyResult.
+       */
+      recovery?: 'retryable' | 'uncertain' | 'irreversible';
+      /**
+       * May write admission be restored? SEPARATE from `recovery`, which answers
+       * whether the CLOSE may be retried. They disagree on a real state: an
+       * unproven local child termination is retryable (nothing irreversible ran)
+       * while a process holding the injected credential may still be alive.
+       * Deriving one from the other is what re-opened writes onto a live orphan.
+       * Absent is derived from `recovery`. See SessionDestroyResult.
+       */
+      admission?: 'restorable' | 'fenced';
     };

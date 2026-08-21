@@ -73,7 +73,7 @@ export interface TriggerRequest {
     model?: string;
     /** Per-turn reasoning effort (codex `model_reasoning_effort`). Same
      *  fresh-spawn-only semantics as `model`. */
-    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   };
 }
 
@@ -247,8 +247,8 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (options.model !== undefined && (typeof options.model !== 'string' || options.model.length > 200)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.model must be a string (<=200 chars)' } };
   }
-  if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(options.reasoningEffort as string)) {
-    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh' } };
+  if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(options.reasoningEffort as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh|max|ultra' } };
   }
   // Mutual exclusion FIRST, before either key's scope-lock: the two keys have
   // different scopes (fresh-session vs follow-up) with opposite target shapes, so

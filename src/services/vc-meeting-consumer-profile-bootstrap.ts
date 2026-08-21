@@ -15,13 +15,34 @@ export interface VcMeetingConsumerBootstrapAgent {
   appId: string;
   workingDirReady: boolean;
   reliableTurnTerminal: boolean;
-  managedSideEffectIsolation: boolean;
+  /** May this bot act as a meeting consumer at all? Plan B: true unless an
+   *  explicit sandbox request is undeliverable (macOS/riff/herdr/zellij). */
+  managedSideEffectEligible: boolean;
+  /** Is the managed sandbox boundary actually in force (credential masked +
+   *  outbox relay)? false = unsandboxed, credential exposed to meeting input. */
+  sandboxIsolated: boolean;
 }
 
 export interface VcMeetingConsumerBootstrapAgentDeps {
   workingDirReady(bot: BotConfig): boolean;
   reliableTurnTerminal(bot: BotConfig): boolean;
-  managedSideEffectIsolation(bot: BotConfig): boolean;
+  managedSideEffectEligible(bot: BotConfig): boolean;
+  sandboxIsolated(bot: BotConfig): boolean;
+}
+
+function evaluateBotConsumerIsolation(bot: BotConfig) {
+  const cliId = bot.cliId ?? config.daemon.cliId;
+  const backendType = resolvePairedSpawnBackendType(
+    cliId,
+    undefined,
+    bot.backendType,
+    config.daemon.backendType,
+  );
+  return evaluateVcMeetingConsumerIsolation({
+    sandbox: bot.sandbox,
+    platform: process.platform,
+    backendType,
+  });
 }
 
 const defaultAgentDeps: VcMeetingConsumerBootstrapAgentDeps = {
@@ -40,19 +61,12 @@ const defaultAgentDeps: VcMeetingConsumerBootstrapAgentDeps = {
       return false;
     }
   },
-  managedSideEffectIsolation(bot) {
-    const cliId = bot.cliId ?? config.daemon.cliId;
-    const backendType = resolvePairedSpawnBackendType(
-      cliId,
-      undefined,
-      bot.backendType,
-      config.daemon.backendType,
-    );
-    return evaluateVcMeetingConsumerIsolation({
-      sandbox: bot.sandbox,
-      platform: process.platform,
-      backendType,
-    }).ok;
+  managedSideEffectEligible(bot) {
+    return evaluateBotConsumerIsolation(bot).ok;
+  },
+  sandboxIsolated(bot) {
+    const decision = evaluateBotConsumerIsolation(bot);
+    return decision.ok && decision.isolated;
   },
 };
 
@@ -64,7 +78,8 @@ export function buildVcMeetingConsumerBootstrapAgents(
     appId: bot.larkAppId,
     workingDirReady: deps.workingDirReady(bot),
     reliableTurnTerminal: deps.reliableTurnTerminal(bot),
-    managedSideEffectIsolation: deps.managedSideEffectIsolation(bot),
+    managedSideEffectEligible: deps.managedSideEffectEligible(bot),
+    sandboxIsolated: deps.sandboxIsolated(bot),
   })).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
 }
 
@@ -82,7 +97,7 @@ export function selectVcMeetingDefaultConsumerAgent(
   const eligible = agents
     .filter(agent => agent.workingDirReady
       && agent.reliableTurnTerminal
-      && agent.managedSideEffectIsolation)
+      && agent.managedSideEffectEligible)
     .sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
   for (const appId of preferredAgentAppIds) {
     const preferred = eligible.find(agent => agent.appId === appId);

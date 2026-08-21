@@ -117,10 +117,10 @@ botmux launches the session inside tmux via `<$SHELL> -i -c '… start the CLI'`
 
 Since v2.95.0 botmux detects this "the session never really started" state and posts a diagnostic card instead of typing the message into the bare shell. Two ways to fix it:
 
-- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`).
+- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`, or `~/.config/fish/config.fish` for fish, which is supported as a first-class launch shell).
 - **Fix the startup file**: guard the switch so it only fires for a real interactive terminal: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh` (put PATH / nvm exports before it).
 
-Then `botmux restart` and resend a message. Only the `tmux` / `zellij` backends are affected; the `pty` backend launches the CLI directly and is immune.
+Then `botmux restart` and resend a message. This affects shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); the `pty` backend launches the CLI directly and is immune.
 
 ## Can a bot added to a new group see the earlier chat history?
 

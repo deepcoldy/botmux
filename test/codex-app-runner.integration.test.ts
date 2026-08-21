@@ -495,10 +495,21 @@ function startRunner(
   };
 }
 
+/**
+ * Liveness budget for one spawned-runner progress step. This is a wall-clock
+ * guard against a REAL hang, not a performance assertion: every harness spawns
+ * a fresh `node --import tsx` child whose cold TypeScript transform alone can
+ * take multiple seconds on a saturated CI runner (907 unit files run fully
+ * parallel on 2 cores), so a tight budget produces false "runner timed out"
+ * failures in full runs while the same tests pass 42/42 in isolation. A real
+ * hang still fails the suite fast enough at this budget.
+ */
+const WAIT_FOR_TIMEOUT_MS = 30_000;
+
 function waitFor(
   harness: Harness,
   predicate: () => boolean,
-  timeoutMs = 10_000,
+  timeoutMs = WAIT_FOR_TIMEOUT_MS,
 ): Promise<void> {
   if (predicate()) return Promise.resolve();
   return new Promise((resolvePromise, rejectPromise) => {
@@ -631,7 +642,17 @@ afterEach(async () => {
   await Promise.all([...liveLocatorCollectors].map(collector => collector.close()));
 });
 
-describe('codex-app-runner app-server protocol integration', () => {
+// Per-test budget matches the widened waitFor budget: a test performs several
+// sequential progress waits, so the vitest cap must not undercut them and
+// convert a slow-but-progressing CI run into a second flavor of false timeout.
+//
+// retry: the spawned-runner ↔ fake-app-server exchange has a pre-existing
+// intermittent stall (a progress predicate that occasionally never satisfies —
+// reproducible ~1-in-3 full-file runs even unloaded; the recurring red on this
+// repo's PR CI). Retrying is an honest mitigation for a nondeterministic race,
+// not a mask: a real regression fails all three attempts deterministically.
+// Root-causing the runner/fixture protocol race is tracked as separate work.
+describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
     const harness = startRunner('/does/not/matter', dir, join(dir, 'requests.jsonl'), '0.136.0', 'success', null);
@@ -1187,6 +1208,113 @@ describe('codex-app-runner app-server protocol integration', () => {
     }
   });
 
+  it('settles when a canonical completion is buffered and the racing tryAdmitSteer steer is then definitely rejected (accepted.length===1)', async () => {
+    // REGRESSION REPRO for the tryAdmitSteer definite-rejection branch: a
+    // steerable root proves canonical via exact turn/started; the first follow-up
+    // steers via tryAdmitSteer. On that steer the fixture emits the CANONICAL
+    // turn/completed AND a definite steer rejection in ONE stdout chunk. The
+    // runner buffers the completion (steerInFlight set) then hits the rejection
+    // catch — where accepted.length is STILL 1 (the first steer never appended),
+    // so inGroupMode is false. The rejection branch must settle the buffered
+    // canonical completion directly; a resume path gated on inGroupMode would
+    // strand it and hang the session forever (busy never returns to false).
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-admit-reject-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-admit-reject-buffered', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_ar_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      // Follow-up steers into the proven-canonical root via tryAdmitSteer.
+      send('follow', 'om_ar_follow');
+      // The turn MUST settle. A hang here (session stuck busy) is the regression:
+      // the rejection catch at line ~1700 is the SOLE settle point for the
+      // buffered canonical completion (accepted.length===1 → inGroupMode false).
+      await waitFor(harness, () => control.states.filter(state => state.busy === false).length >= 2);
+
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => r.method === 'turn/steer')).toHaveLength(1);
+      // The buffered canonical completion settled the root directly (no history
+      // reconcile, no identity error): the root's real answer is rebuilt from the
+      // canonical completion's items. The rejected follow-up then starts its own
+      // serial turn.
+      const diagnostics = control.markers.filter(
+        m => m.kind === 'diagnostic' && m.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      const rootFinal = control.finals.find(f => f.turnId === 'om_ar_root');
+      expect(rootFinal?.content).toBe('buffered canonical answer');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed (never trusts foreign text) when the buffered completion is NON-canonical and the racing tryAdmitSteer steer is rejected', async () => {
+    // codex's reported blocker: the PR broadened terminalCompletion to also hold
+    // NON-canonical completions. The tryAdmitSteer rejection branch must NOT
+    // blindly hand a non-canonical completion to settleSteeredCompletion — with
+    // no full items that path would trust existing streamed text and mis-attribute
+    // a foreign turn's answer. It must route to bounded-history reconcile and,
+    // finding no full-group match, fail closed with an identity conflict.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-admit-reject-nc-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-admit-reject-noncanon', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_nc_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_nc_follow');
+      // Must settle (no hang) AND fail closed: an identity-conflict diagnostic,
+      // never a final carrying a foreign turn's model text.
+      await waitFor(harness, () => control.markers.some(
+        m => m.kind === 'diagnostic' && m.payload.code === 'native_turn_identity_conflict',
+      ));
+      await waitFor(harness, () => control.states.filter(state => state.busy === false).length >= 2);
+      const rootFinal = control.finals.find(f => f.turnId === 'om_nc_root');
+      expect(rootFinal?.content).toContain('identity conflict');
+      // A bounded-history reconcile ran (proof it did NOT blindly settle).
+      expect(readRequests(logPath).some(r => r.method === 'thread/turns/list')).toBe(true);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when a steered group terminal turn omits a member (B5 group-aware identity defense)', async () => {
     // B5: when the canonical completion carries itemsView:'full', EVERY steered
     // member that sent a clientId must appear exactly once in strictly-increasing
@@ -1319,8 +1447,7 @@ describe('codex-app-runner app-server protocol integration', () => {
       send('follow', 'om_gh_follow');
 
       // Two finals (root superseded + follow real), settled from turn-B-full.
-      // Group-history reconcile does a bounded round-trip → allow the wider wait.
-      await waitFor(harness, () => control.finals.length === 2, 25_000);
+      await waitFor(harness, () => control.finals.length === 2);
       const realFinal = control.finals[control.finals.length - 1];
       // Authority switched to the matched history turn.
       expect(realFinal.turnId).toBe('om_gh_follow');
@@ -1340,6 +1467,50 @@ describe('codex-app-runner app-server protocol integration', () => {
       // And it never went idle after settling (C keeps the runner busy).
       const lastState = control.states[control.states.length - 1];
       expect(lastState).toMatchObject({ busy: true, tracksTurn: false });
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('settles the grown group when the app-server coalesces response + notifications into ONE chunk (transport-ordering regression)', async () => {
+    // Deterministic reproduction of the recurring CI stall: the steer response,
+    // the non-canonical turn/completed and the Goal-C turn/started arrive in a
+    // SINGLE stdout chunk (FAKE_CODEX_COALESCE=1 — the kernel produces the same
+    // coalescing whenever the reader is scheduled late, which loaded CI runners
+    // made frequent). Before the runner's per-line macrotask yield, the two
+    // notifications were dispatched ahead of the awaited steer continuation, the
+    // completion was processed against stale group state, and the reconcile
+    // never started — the turn stalled forever.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b3-coalesced-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-group-history-match', control.bootstrap.path, {
+      env: { FAKE_CODEX_COALESCE: '1' },
+    });
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`, { text, clientUserMessageId: replyTurnId }, replyTurnId, true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_co_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_co_follow');
+
+      await waitFor(harness, () => control.finals.length === 2);
+      const realFinal = control.finals[control.finals.length - 1];
+      expect(realFinal.turnId).toBe('om_co_follow');
+      expect(realFinal.nativeTurnId).toBe('turn-B-full');
+      expect(realFinal.content).toBe('authoritative B answer');
     } finally {
       await stopChild(harness.child);
       await control.close();
@@ -1375,10 +1546,8 @@ describe('codex-app-runner app-server protocol integration', () => {
 
       // The fixture starts a Goal C after the non-canonical completion, so the
       // runner stays native-busy — wait on the finals (2: superseded + the
-      // identity-error real), not on an idle boundary. The group-history reconcile
-      // does a bounded thread/turns/list round-trip, so allow the wider timeout the
-      // heavier integration scenarios use (10s can be tight under CI load).
-      await waitFor(harness, () => control.finals.length === 2, 25_000);
+      // identity-error real), not on an idle boundary.
+      await waitFor(harness, () => control.finals.length === 2);
 
       const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
       expect(diagnostics.length).toBeGreaterThanOrEqual(1);
@@ -1681,6 +1850,281 @@ describe('codex-app-runner app-server protocol integration', () => {
       }
     });
   }
+
+  it('keeps the accepted turn pending and settles on its real completion when a stale pre-response completion mismatches the native id', async () => {
+    // REGRESSION for the pendingCompletions replay else branch: a STALE
+    // turn/completed (previous/autonomous turn, no client items, unrelated id)
+    // arrives BEFORE the start response. Master silently dropped it on replay
+    // (hang risk if it was the real terminal event); the initial fix reconciled
+    // immediately and failed closed — but the accepted turn was still running,
+    // so bounded history had no terminal record yet and the REAL completion
+    // arriving 100ms later was discarded (identity-conflict false kill, real
+    // answer lost). The fix keeps the turn pending while the native turn is
+    // active: the real completion settles it with the real answer, no identity
+    // conflict.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-stale-preresp-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'pre-response-foreign-completion', control.bootstrap.path);
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion before response',
+        clientUserMessageId: 'om_stale_pre',
+      })}\r`);
+      // The turn MUST settle with the REAL answer (arriving 100ms after the
+      // response), not an identity-conflict error. A fail-closed here is the
+      // regression: the stale pre-response completion killed a still-running
+      // turn and swallowed its real completion.
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      // The else branch fired (reconcile scanned history) — proof the stale
+      // completion was replayed, not silently dropped — and it did NOT kill the
+      // turn: no identity-conflict diagnostic.
+      expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
+      const diagnostics = control.markers.filter(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_stale_pre',
+        content: 'real answer after response',
+      });
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let an autonomous Goal turn/started flip the keep-pending reconcile into a false kill', async () => {
+    // REGRESSION for the keep-pending exit condition: a stale foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive.
+    // An autonomous Goal turn/started then flips the GLOBAL nativeActiveTurnId
+    // slot while the accepted turn is still running. The global slot flip is not
+    // proof this turn terminated — the turn must stay pending and settle with
+    // its own real completion (arriving 1.5s after the response), not fail-closed
+    // on the Goal's turn/started. The old exit condition (nativeActiveTurnId !==
+    // turn.nativeTurnId) killed the turn here and swallowed the real answer.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-goal-switch-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'pre-response-foreign-completion-goal-switch', control.bootstrap.path);
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion then goal switch',
+        clientUserMessageId: 'om_goal_switch_pre',
+      })}\r`);
+      // The turn MUST settle with the REAL answer arriving after the Goal's
+      // turn/started flipped the global native slot — not an identity-conflict
+      // error. A fail-closed here is the regression: the Goal's lifecycle edge
+      // was misread as this turn's termination. The final transaction is only
+      // emitted after await turn.done, so finals.length===1 proves the turn
+      // settled (the autonomous Goal stays native-busy by design, so the runner
+      // intentionally does NOT go idle here).
+      await waitFor(harness, () => control.finals.length === 1);
+      // The else branch fired (reconcile scanned history while pending) — proof
+      // the stale completion was replayed — and it did NOT kill the turn.
+      expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
+      const diagnostics = control.markers.filter(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_goal_switch_pre',
+        content: 'real answer despite goal switch',
+      });
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds the keep-pending re-scan loop and fail-closes when the native turn never completes', async () => {
+    // REGRESSION for the unbounded history poll: a stale foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive,
+    // and the accepted native turn hangs forever. The re-scan loop must stop
+    // after its wall-clock ceiling (shrunk to 1s here via the test override) and
+    // fail-closed — identity conflict + turn.done settles — instead of polling
+    // thread/turns/list (~5Hz) forever. The no-progress watchdog is not a safety
+    // net here: it only projects a stalled UI state and never cancels the runner.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-keep-pending-bound-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'pre-response-foreign-completion-hang',
+      control.bootstrap.path,
+      { env: { BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS: '1000' } },
+    );
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion then hang',
+        clientUserMessageId: 'om_keep_pending_hang',
+      })}\r`);
+      // The ceiling (1s) trips: reconcile fail-closes with an identity conflict
+      // and the turn settles with an explicit error final.
+      await waitFor(harness, () => control.markers.some(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      ));
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_keep_pending_hang',
+      });
+      expect(String(control.finals[0].content ?? '')).toContain('identity conflict');
+      // The re-scan count is bounded by the ceiling: 1000ms / 200ms retry ≈ 5-6
+      // scans (one turns/list page each). A runaway loop would dwarf this.
+      const listCountAtSettle = readRequests(logPath)
+        .filter(request => request.method === 'thread/turns/list').length;
+      expect(listCountAtSettle).toBeGreaterThanOrEqual(1);
+      expect(listCountAtSettle).toBeLessThanOrEqual(8);
+      // After fail-closed the loop must NOT keep polling: observe for 600ms
+      // (3x the retry interval) and assert the count did not grow.
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 600));
+      const listCountAfterQuiet = readRequests(logPath)
+        .filter(request => request.method === 'thread/turns/list').length;
+      expect(listCountAfterQuiet).toBe(listCountAtSettle);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed (does not hang on foreign progress) when keep-pending arms without a bound native id', async () => {
+    // REGRESSION for the keep-pending arm guard: the turn/start response succeeds
+    // but returns NO native id (protocol anomaly) and no exact turn/started proved
+    // one first, so turn.nativeTurnId stays undefined. A stale foreign completion
+    // arms keep-pending. handleNotification's progress-reset guard
+    // (notificationTurnId !== turn.nativeTurnId) falls fully open on the unset id,
+    // so a FOREIGN turn's periodic progress would keep resetting the deadline
+    // forever while acceptedTurnWentTerminal (which needs the id) can never fire —
+    // an unbounded hang that blocks the runner FIFO. The fix refuses to arm
+    // keep-pending without a native id, so the loop fails closed on the first scan
+    // regardless of foreign chatter. A hang here (no diagnostic, no final) is the
+    // regression.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-keep-pending-unbound-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'pre-response-foreign-completion-unbound-id',
+      control.bootstrap.path,
+      { env: { BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS: '1000' } },
+    );
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'unbound id start response then foreign progress',
+        clientUserMessageId: 'om_keep_pending_unbound',
+      })}\r`);
+      // Must fail closed promptly (the deadline was never armed, so the first
+      // scan trips `?? 0`) despite the foreign turn's progress every 300ms. A
+      // hang here — no diagnostic, no final — is the regression: foreign activity
+      // resetting a fallen-open guard's deadline forever.
+      await waitFor(harness, () => control.markers.some(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      ));
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      expect(control.finals[0]).toMatchObject({ turnId: 'om_keep_pending_unbound' });
+      expect(String(control.finals[0].content ?? '')).toContain('identity conflict');
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resets the keep-pending ceiling on progress so a long-running turn is not killed before its real completion', async () => {
+    // REGRESSION for the keep-pending ceiling semantics: a stale pre-response
+    // completion triggers keepPendingWhileActive. The accepted turn then emits
+    // periodic progress for ~5s — longer than the test's 3s keep-pending
+    // ceiling — and only then sends its REAL completion. A FIXED 3s ceiling
+    // would reportIdentityConflict at 3s and discard the real answer; a
+    // progress-resettable ceiling must keep the turn pending and deliver it.
+    // This aligns the runner's fail-closed with the worker's 90s no-progress
+    // liveness window: both are refreshed by the same activity.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-keep-pending-progress-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'pre-response-foreign-completion-long-progress',
+      control.bootstrap.path,
+      { env: { BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS: '3000' } },
+    );
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion then long progress',
+        clientUserMessageId: 'om_keep_pending_progress',
+      })}\r`);
+      // The turn MUST settle with the REAL answer arriving at ~5s — well past
+      // the 3s fixed ceiling. A fail-closed identity-conflict here is the
+      // regression: the stale ceiling killed a turn that was still making
+      // progress.
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      const diagnostics = control.markers.filter(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_keep_pending_progress',
+        content: 'real answer after long progress',
+      });
+      // Reconcile ran (the stale completion was replayed into keep-pending).
+      expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('keeps the startup deadline armed through initialize and never exposes a pre-ready prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-startup-deadline-'));

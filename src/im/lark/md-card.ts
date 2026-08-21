@@ -30,6 +30,8 @@ import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
 } from './reply-card-footer-signature.js';
+import { buildFeedbackElement } from './skill-feedback-card.js';
+import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -959,6 +961,32 @@ export function buildMarkdownCard(
   });
 }
 
+/** Build the canonical final-answer card. Streaming/progress/session cards
+ * must keep using their existing builders and never call this helper. */
+export function buildCanonicalFinalReplyCard(opts: {
+  markdown: string;
+  feedback?: { policy: FeedbackPolicy };
+  recipientOpenId?: string;
+  brand?: string;
+  locale?: Locale;
+  workingDir?: string;
+  localHomeLinkMode?: LocalHomeLinkMode;
+  usage?: CardUsageSnapshot;
+}): string {
+  const elements = opts.markdown
+    ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
+    : [];
+  if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
+  const footer = buildReplyCardFooter({
+    brand: opts.brand,
+    recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
+    usage: opts.usage,
+    locale: opts.locale,
+  });
+  if (footer) elements.push({ tag: 'hr' }, footer.element);
+  return JSON.stringify({ schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements } });
+}
+
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
  *  blockquote even when the body contains blank lines. Empty lines become a
  *  bare `>` to keep the quote block contiguous. */
@@ -994,6 +1022,7 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
     title,
@@ -1033,6 +1062,8 @@ export function buildContextualReplyCard(opts: {
     ? buildCardBodyElements(assistantText, workingDir, localHomeLinkMode)
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
+
+  if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
 
   const footer = buildReplyCardFooter({
     brand,

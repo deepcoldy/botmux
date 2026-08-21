@@ -3,10 +3,12 @@
  * 跨进程文件锁 + bots.json 原子写，外加内存 registry 同步，让 daemon 的
  * 路由 / grant 处理不必重启即可生效。
  *
- * 四个独立设置：
+ * 五个独立设置：
  *   • restrictGrantCommands     — owner 开关：被授权人只能纯对话，拦截一切 slash 命令
  *   • autoGrantRequestCards     — 未授权者/外部 bot @ 本 bot 但被权限闸挡住时，是否自动发
  *                                 /grant 申请卡给 owner（默认开启；false 显式关闭）
+ *   • p2pOpen                   — 私聊对话全开：任何人都能私聊本 bot（talk-only），免逐个
+ *                                 加 globalGrants。只放行 canTalk，管理操作仍只认 allowedUsers。
  *   • messageQuota.defaultLimit — 消息额度覆盖值。缺省时授权卡使用内置 3 条、Oncall
  *                                 不限额；正整数同时覆盖授权卡默认值并限制 Oncall。
  *                                 显式 `/grant @x N` 恒生效，与此无关。
@@ -23,6 +25,8 @@ export interface BotGrantPrefs {
   restrictGrantCommands: boolean;
   /** 未授权 @ 被挡住时是否自动发 grant 申请卡。默认 true。 */
   autoGrantRequestCards: boolean;
+  /** 私聊对话全开（talk-only，不授管理权）。默认 false。 */
+  p2pOpen: boolean;
   /** 消息额度覆盖值：null = 授权卡内置 3 条、Oncall 不限；正整数 = 两者共同使用。 */
   messageQuotaDefaultLimit: number | null;
   /** 新授权默认有效期：null = 产品默认 1 小时；number = 卡片支持的有限时长（毫秒）。 */
@@ -42,6 +46,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
     return {
       restrictGrantCommands: c.restrictGrantCommands === true,
       autoGrantRequestCards: c.autoGrantRequestCards !== false,
+      p2pOpen: c.p2pOpen === true,
       messageQuotaDefaultLimit: readQuotaLimit(c),
       grantDefaultDurationMs: isGrantDurationOption(c.grantDefaultDurationMs)
         ? c.grantDefaultDurationMs
@@ -51,6 +56,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
     return {
       restrictGrantCommands: false,
       autoGrantRequestCards: true,
+      p2pOpen: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
     };
@@ -61,6 +67,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
  * 持久化一次 grant-prefs 局部修改。只动 patch 里出现的 key。
  *   • restrictGrantCommands=false → 删 key（bots.json 保持干净，缺省即默认）
  *   • autoGrantRequestCards=true  → 删 key（默认开启）；false → 显式写 false
+ *   • p2pOpen=false → 删 key（缺省即关闭）；true → 显式写 true
  *   • messageQuotaDefaultLimit=null → 删整个 messageQuota（恢复授权卡内置 3 条、Oncall 不限；不动 quotaState）
  *   • messageQuotaDefaultLimit=1–1000 的整数 → 写入；其它值直接拒绝，返回 bad_quota
  *   • grantDefaultDurationMs=null → 删 key（恢复产品默认 1 小时）；合法有限时长 → 写入
@@ -95,6 +102,11 @@ export async function updateBotGrantPrefs(
       if (patch.autoGrantRequestCards === false) entry.autoGrantRequestCards = false;
       else delete entry.autoGrantRequestCards;
     }
+    if (patch.p2pOpen !== undefined) {
+      // 与 parseBotConfigsFromText 一致：只落显式 true，关闭时删 key（bots.json 保持干净）。
+      if (patch.p2pOpen) entry.p2pOpen = true;
+      else delete entry.p2pOpen;
+    }
     if (patch.messageQuotaDefaultLimit !== undefined) {
       if (patch.messageQuotaDefaultLimit === null) {
         // 恢复内置策略只删 messageQuota.defaultLimit，保留已有 quotaState 计数。
@@ -112,6 +124,7 @@ export async function updateBotGrantPrefs(
       result: {
         restrictGrantCommands: entry.restrictGrantCommands === true,
         autoGrantRequestCards: entry.autoGrantRequestCards !== false,
+        p2pOpen: entry.p2pOpen === true,
         messageQuotaDefaultLimit: readQuotaLimit(entry),
         grantDefaultDurationMs: isGrantDurationOption(entry.grantDefaultDurationMs)
           ? entry.grantDefaultDurationMs
@@ -128,6 +141,23 @@ export async function updateBotGrantPrefs(
   if (patch.autoGrantRequestCards !== undefined) {
     bot.config.autoGrantRequestCards = patch.autoGrantRequestCards === false ? false : undefined;
   }
+  if (patch.p2pOpen !== undefined) {
+    bot.config.p2pOpen = patch.p2pOpen || undefined;
+    // 与 bot-registry 加载期同款告警：只开 p2pOpen 而没有管理员 = 谁都能私聊，
+    // 但没人能执行需要 canOperate 的管理操作（p2pOpen 只授 canTalk）。⚠️ 唯一例外是
+    // canTalkDaemonCommands 里被显式降级到 canTalk 的命令——那份名单非空时，私聊者
+    // 也能执行它列出的命令，所以两个开关要一起权衡。
+    if (patch.p2pOpen && (bot.config.allowedUsers?.length ?? 0) === 0) {
+      const downgraded = bot.config.canTalkDaemonCommands ?? [];
+      logger.warn(
+        `[grant-prefs:${larkAppId}] p2pOpen 已开启但未配 allowedUsers：`
+        + '任何人都能私聊，但没有人能执行 /restart、/cd、卡片按钮等管理操作。请补上 allowedUsers。'
+        + (downgraded.length
+          ? ` 另注意 canTalkDaemonCommands=[${downgraded.join(' ')}] 已被降级到「能对话即可用」，私聊者可执行。`
+          : ''),
+      );
+    }
+  }
   if (patch.messageQuotaDefaultLimit !== undefined) {
     bot.config.messageQuota = patch.messageQuotaDefaultLimit === null
       ? undefined
@@ -139,6 +169,7 @@ export async function updateBotGrantPrefs(
   logger.info(
     `[grant-prefs:${larkAppId}] restrictGrantCommands=${r.result.restrictGrantCommands} ` +
     `autoGrantRequestCards=${r.result.autoGrantRequestCards} ` +
+    `p2pOpen=${r.result.p2pOpen} ` +
     `messageQuotaDefaultLimit=${r.result.messageQuotaDefaultLimit ?? 'built-in'} ` +
     `grantDefaultDurationMs=${r.result.grantDefaultDurationMs ?? 'default'}`,
   );

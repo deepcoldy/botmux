@@ -51,10 +51,17 @@ describe('structured-bridge-clis', () => {
     expect(isStructuredBridgeAdoptCli('cursor')).toBe(true);
   });
 
-  it('enables the strong status gate only for Codex with a complete terminal contract', () => {
-    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex']);
+  it('enables the strong status gate only for drivers with a complete terminal contract', () => {
+    // codex: final_answer + explicit turn_aborted. pi: drainPiTranscript closes
+    // on stop/length-without-toolcall plus hard error/aborted edges, so a
+    // started Pi turn may suppress the screen-ready heuristic (the custom-tool
+    // terminate:true gap is accepted — next user turn HOL-drops the head).
+    // grok: user_message_chunk → turn_completed with normalized stop reasons.
+    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'pi', 'grok']);
     expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
-    for (const id of ['traex', 'coco', 'hermes', 'mtr', 'pi', 'grok', 'cursor']) {
+    expect(isStructuredBridgeLifecycleBlockingCli('pi')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('grok')).toBe(true);
+    for (const id of ['traex', 'coco', 'hermes', 'mtr', 'cursor']) {
       expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
     }
   });

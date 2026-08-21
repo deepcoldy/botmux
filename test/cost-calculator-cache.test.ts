@@ -638,13 +638,7 @@ describe('readSessionTokenUsageFile caching', () => {
     })).toMatchObject({ tokens: { in: 100, out: 10, model: 'gpt-5-codex' } });
 
     // >4MiB non-snapshot burst then a new token_count with NO model line.
-    let appended = 0;
-    let i = 0;
-    while (appended < CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 8192) {
-      const line = `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', text: `t${i++}` } })}\n`;
-      appendFileSync(p, line);
-      appended += Buffer.byteLength(line);
-    }
+    appendFileSync(p, Buffer.alloc(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 8192, 0x20));
     appendFileSync(p, `${codexCountLine(500, 60, 200, { used: 240, window: 1_000 })}\n`);
     now += 20_000;
 
@@ -682,13 +676,7 @@ describe('readSessionTokenUsageFile caching', () => {
     })).toMatchObject({ tokens: { in: 100, out: 10, model: 'old-model' } });
 
     appendFileSync(p, `${codexModelLine('new-model')}\n`);
-    let appended = 0;
-    let i = 0;
-    while (appended < CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 8192) {
-      const line = `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', text: `t${i++}` } })}\n`;
-      appendFileSync(p, line);
-      appended += Buffer.byteLength(line);
-    }
+    appendFileSync(p, Buffer.alloc(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 8192, 0x20));
     appendFileSync(p, `${codexCountLine(500, 60, 200, { used: 240, window: 1_000 })}\n`);
     now += 20_000;
 
@@ -757,13 +745,7 @@ describe('readSessionTokenUsageFile caching', () => {
       fresh: true,
     })).toMatchObject({ tokens: { in: 555, out: 55 } });
 
-    let appended = 0;
-    let i = 0;
-    while (appended < CODEX_USAGE_MAX_BACKSCAN_BYTES + 8 * 1024 * 1024) {
-      const line = `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', text: `t${i++}` } })}\n`;
-      appendFileSync(p, line);
-      appended += Buffer.byteLength(line);
-    }
+    appendFileSync(p, Buffer.alloc(CODEX_USAGE_MAX_BACKSCAN_BYTES + 8 * 1024 * 1024, 0x20));
     now += 20_000;
 
     expect(getSessionUsageSnapshot({

@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellLaunchArgv } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
@@ -298,25 +298,18 @@ export function kdlString(s: string): string {
  * / mise shims load from rcfiles). Command + args go in via execvp semantics —
  * no shell-quoting needed (KDL strings carry spaces/quotes), only KDL escaping.
  *
- *   pane command="<shell>" close_on_exit=true {
- *       args "<flag>"… "-c" "<script>" "_" "<cwd>" "KEY=VAL"… "<bin>" "<arg>"…
- *   }
+ * POSIX shell layouts keep the `-c <script> _ <cwd>...` contract; fish
+ * layouts omit the `_` sentinel because fish exposes post-script args as $argv.
  */
 export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
   const shellSpec = resolveUserShell(process.env, opts.launchShell);
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
-  // shellLaunchArgv() returns ['/usr/bin/env', 'DISABLE_AUTO_UPDATE=true',
-  // shell, ...flags] — the env(1) prefix sets the startup-only override BEFORE
-  // rcfile load so oh-my-zsh update prompts don't block shell startup. The
-  // wrapper removes it before execing the CLI. The first element is the pane
-  // command; the rest are leading args before the wrapper script flags.
-  const [cmd, ...launchArgs] = shellLaunchArgv(shellSpec.shell, shellSpec.flags);
-  const paneArgs = [
-    ...launchArgs, '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
+  const kind = shellKindForPath(shellSpec.shell);
+  const [cmd, ...paneArgs] = shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
     opts.cwd,
     ...envAssignments,
     bin, ...args,
-  ];
+  ]);
   const argsKdl = paneArgs.map(kdlString).join(' ');
   return [
     'layout {',

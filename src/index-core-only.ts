@@ -105,6 +105,8 @@ async function main() {
     const { setDefaultLocale } = await import('./i18n/index.js');
     const cfg = readGlobalConfig();
     if (cfg.lang) setDefaultLocale(cfg.lang);
+    const { registerPromptOverrideResolver } = await import('./skills/effective-builtins.js');
+    registerPromptOverrideResolver();
   }
 
   const { startDaemon } = await import('./daemon.js');

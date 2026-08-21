@@ -7,10 +7,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const calls: string[][] = [];
 let listPanesResult: () => string = () => JSON.stringify([{ id: 2, is_plugin: false }]);
 let failActions = false;
+let failWriteChars = false;
 vi.mock('node:child_process', () => ({
   execFileSync: (bin: string, args: string[]) => {
     calls.push([bin, ...args]);
     if (failActions && args.includes('action')) throw new Error('pane unavailable');
+    if (failWriteChars && args.includes('write-chars')) throw new Error('body unavailable');
     if (args.includes('dump-screen')) return 'line one\nline two\nline three\n';
     if (args.includes('list-panes')) return listPanesResult();
     return '';
@@ -29,6 +31,7 @@ describe('ZellijObserveBackend input encoding', () => {
   beforeEach(() => {
     calls.length = 0;
     failActions = false;
+    failWriteChars = false;
     be = new ZellijObserveBackend(S, P, { cliPid: 999 });
   });
 
@@ -54,7 +57,7 @@ describe('ZellijObserveBackend input encoding', () => {
   });
 
   it('pasteText wraps text in bracketed-paste markers', () => {
-    be.pasteText('x');
+    expect(be.pasteText('x')).toBe(true);
     // captured call = ['zellij','--session',S,'action','write','--pane-id',P,...bytes]
     // \e[200~  = 27 91 50 48 48 126 ; \e[201~ = 27 91 50 48 49 126
     const writes = calls.filter(c => c[4] === 'write').map(c => c.slice(7));
@@ -62,6 +65,28 @@ describe('ZellijObserveBackend input encoding', () => {
     expect(writes[0]).toEqual(['27', '91', '50', '48', '48', '126']); // open bracket
     expect(chars[0]).toEqual(['--', 'x']);
     expect(writes[1]).toEqual(['27', '91', '50', '48', '49', '126']); // close bracket
+  });
+
+  it('pasteText returns false when any bracketed-paste segment is rejected', () => {
+    failActions = true;
+
+    expect(be.pasteText('x')).toBe(false);
+  });
+
+  it('pasteText attempts the close marker when body writing fails after the open marker', () => {
+    // Given: the open marker can be written, but the body write is rejected.
+    failWriteChars = true;
+
+    // When: bracketed paste sends a body into the observed pane.
+    const accepted = be.pasteText('x');
+
+    // Then: the operation fails closed and still attempts the closing marker.
+    expect(accepted).toBe(false);
+    const writes = calls.filter(c => c[4] === 'write').map(c => c.slice(7));
+    expect(writes).toEqual([
+      ['27', '91', '50', '48', '48', '126'],
+      ['27', '91', '50', '48', '49', '126'],
+    ]);
   });
 
   it('getChildPid returns the adopted cli pid', () => {

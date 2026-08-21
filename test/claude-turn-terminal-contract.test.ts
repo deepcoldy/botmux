@@ -8,7 +8,7 @@ import {
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 
 type TerminalStatus = 'completed' | 'failed' | 'ambiguous';
-type Terminal = { turnId: string; dispatchAttempt: number; status: TerminalStatus; errorCode?: string };
+type Terminal = { turnId: string; dispatchAttempt: number; status: TerminalStatus; errorCode?: string; retryable?: boolean };
 
 function user(uuid: string, content: string): TranscriptEvent {
   return { type: 'user', uuid, message: { role: 'user', content } };
@@ -51,7 +51,15 @@ class ContractHarness {
   ingest(events: TranscriptEvent[]): void {
     this.queue.ingest(events, '/tmp/claude-session.jsonl');
     for (const turn of this.queue.drainEmittable({ explicitTerminalOnly: true })) {
-      this.emit(turn.turnId, turn.dispatchAttempt!, 'completed');
+      if (turn.rateLimited) continue;
+      const outcome = turn.terminalOutcome;
+      this.emit(
+        turn.turnId,
+        turn.dispatchAttempt!,
+        outcome?.status ?? 'completed',
+        outcome?.errorCode,
+        outcome?.retryable,
+      );
     }
   }
 
@@ -68,9 +76,16 @@ class ContractHarness {
     dispatchAttempt: number,
     status: TerminalStatus,
     errorCode?: string,
+    retryable?: boolean,
   ): void {
     if (!this.deduper.claim('receiver-session', turnId, dispatchAttempt)) return;
-    this.emitted.push({ turnId, dispatchAttempt, status, ...(errorCode ? { errorCode } : {}) });
+    this.emitted.push({
+      turnId,
+      dispatchAttempt,
+      status,
+      ...(errorCode ? { errorCode } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+    });
   }
 }
 
@@ -106,6 +121,50 @@ describe('Claude durable turn terminal contract', () => {
       { turnId: 'delivery-1', dispatchAttempt: 1, status: 'completed' },
       { turnId: 'delivery-2', dispatchAttempt: 1, status: 'completed' },
     ]);
+  });
+
+  it('maps the observed EOF fixture to retryable failed and ignores the later duration marker', () => {
+    const h = new ContractHarness();
+    h.mark('delivery-eof', 'continue the task', 1);
+    h.ingest([
+      user('u-eof', 'continue the task'),
+      {
+        type: 'assistant',
+        uuid: 'fixture-error',
+        isApiErrorMessage: true,
+        error: 'unknown',
+        message: {
+          role: 'assistant',
+          stop_reason: 'stop_sequence',
+          content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+        },
+      },
+      turnDuration('fixture-duration'),
+    ]);
+
+    expect(h.emitted).toEqual([{
+      turnId: 'delivery-eof',
+      dispatchAttempt: 1,
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    }]);
+  });
+
+  it('does not emit an ordinary terminal for a structured 429 boundary', () => {
+    const h = new ContractHarness();
+    h.mark('limited-turn', 'limited request', 1);
+    h.ingest([
+      user('u-limit', 'limited request'),
+      {
+        type: 'assistant', uuid: 'rl-contract', isApiErrorMessage: true,
+        error: 'rate_limit', apiErrorStatus: 429,
+        message: { role: 'assistant', content: [], stop_reason: 'stop_sequence' },
+      },
+      turnDuration('duration-limit'),
+    ]);
+
+    expect(h.emitted).toEqual([]);
   });
 
   it('settles an empty/silent final without fabricating visible assistant text', () => {

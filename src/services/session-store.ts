@@ -6,11 +6,26 @@ import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
+import { removePromptContextDir } from './prompt-context-store.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+let loadFailure: Error | undefined;
+
+/**
+ * The compatibility reader deliberately exposes an empty projection after a
+ * read/parse failure. Destructive callers must use the strict API below so an
+ * unreadable store cannot be mistaken for "there are no durable sessions".
+ */
+export class SessionStoreUnavailableError extends Error {
+  override readonly name = 'SessionStoreUnavailableError';
+
+  constructor(readonly loadError: Error) {
+    super(`session store is unavailable: ${loadError.message}`);
+  }
+}
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
 // no longer exist on Session and nothing reads them, but sessions persisted
@@ -22,37 +37,37 @@ export function stripLegacyPendingCardFields(session: Record<string, unknown>): 
 }
 
 /** The active row no longer has the lineage/ownership sampled by the caller. */
-export class RiffLineageOwnershipError extends Error {
-  override readonly name = 'RiffLineageOwnershipError';
+export class RemoteLineageOwnershipError extends Error {
+  override readonly name = 'RemoteLineageOwnershipError';
 }
 
-export type RiffDurableOwner = {
+export type RemoteDurableOwner = {
   pid: number | null;
   larkAppId: string | null;
   backendType: string | null;
 };
 
-export type ActiveRiffShutdownSnapshot = {
+export type ActiveRemoteShutdownSnapshot = {
   sessionId: string;
   taskId: string | null;
-  owner: RiffDurableOwner;
+  owner: RemoteDurableOwner;
 };
 
-export type ActiveRiffLineageBatchUpdate = ActiveRiffShutdownSnapshot & {
+export type ActiveRemoteLineageBatchUpdate = ActiveRemoteShutdownSnapshot & {
   targetTaskId: string | null;
   expectedCurrentTaskIds: readonly (string | null)[];
 };
 
-export type RiffLineageBatchFailureStage =
+export type RemoteLineageBatchFailureStage =
   | 'prewrite_ownership'
   | 'prewrite_io'
   | 'postrename_ambiguity';
 
-export class RiffLineageBatchError extends Error {
-  override readonly name = 'RiffLineageBatchError';
+export class RemoteLineageBatchError extends Error {
+  override readonly name = 'RemoteLineageBatchError';
 
   constructor(
-    readonly stage: RiffLineageBatchFailureStage,
+    readonly stage: RemoteLineageBatchFailureStage,
     readonly sessionIds: readonly string[],
     message: string,
   ) {
@@ -60,7 +75,7 @@ export class RiffLineageBatchError extends Error {
   }
 }
 
-function riffDurableOwner(session: Session): RiffDurableOwner {
+function remoteDurableOwner(session: Session): RemoteDurableOwner {
   return {
     pid: session.pid ?? null,
     larkAppId: session.larkAppId ?? null,
@@ -68,15 +83,15 @@ function riffDurableOwner(session: Session): RiffDurableOwner {
   };
 }
 
-function riffOwnersEqual(left: RiffDurableOwner, right: RiffDurableOwner): boolean {
+function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner): boolean {
   return left.pid === right.pid
     && left.larkAppId === right.larkAppId
     && left.backendType === right.backendType;
 }
 
-let testOnlyAfterRiffBatchRename: (() => void) | undefined;
-export function __testOnly_setAfterRiffBatchRename(hook: (() => void) | undefined): void {
-  testOnlyAfterRiffBatchRename = hook;
+let testOnlyAfterRemoteBatchRename: (() => void) | undefined;
+export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefined): void {
+  testOnlyAfterRemoteBatchRename = hook;
 }
 
 /**
@@ -88,6 +103,7 @@ export function init(appId?: string): void {
   currentAppId = appId;
   loaded = false;
   sessions = new Map();
+  loadFailure = undefined;
 }
 
 function getFilePath(): string {
@@ -132,6 +148,14 @@ function repairMissingChatScopes(): number {
   return repaired;
 }
 
+function parseSessionsProjectionStrict(raw: string, fp: string): Record<string, Session> {
+  const value = JSON.parse(raw) as unknown;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`invalid sessions projection at ${fp}`);
+  }
+  return value as Record<string, Session>;
+}
+
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
@@ -140,7 +164,7 @@ function load(): void {
   withFileLockSync(fp, () => {
     if (existsSync(fp)) {
       try {
-        const data = JSON.parse(readFileSync(fp, 'utf-8'));
+        const data = parseSessionsProjectionStrict(readFileSync(fp, 'utf-8'), fp);
         sessions = new Map(Object.entries(data));
         const repaired = repairMissingChatScopes();
         if (repaired > 0) {
@@ -158,6 +182,7 @@ function load(): void {
         logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
       } catch (err) {
         logger.error(`Failed to load sessions: ${err}`);
+        loadFailure = err instanceof Error ? err : new Error(String(err));
         sessions = new Map();
       }
     } else if (currentAppId) {
@@ -166,7 +191,7 @@ function load(): void {
       const legacyFp = join(config.session.dataDir, 'sessions.json');
       if (existsSync(legacyFp)) {
         try {
-          const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+          const data = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
           sessions = new Map();
           for (const [k, v] of Object.entries(data)) {
             if (v.larkAppId === currentAppId) sessions.set(k, v);
@@ -184,12 +209,25 @@ function load(): void {
           }
         } catch (err) {
           logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+          loadFailure = err instanceof Error ? err : new Error(String(err));
           sessions = new Map();
         }
       }
     }
   });
   loaded = true;
+}
+
+/**
+ * Mutations must never proceed from the compatibility reader's empty
+ * projection after a load failure. In particular, serialising that empty
+ * cache would replace the unreadable durable file and destroy the only copy
+ * of its rows. Keep the failure sticky until init() explicitly reloads the
+ * selected store, matching listSessionsStrict().
+ */
+function loadForWrite(): void {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
 }
 
 function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record<string, Session> } {
@@ -205,11 +243,7 @@ function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record
 function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record<string, Session> } {
   if (!existsSync(fp)) return { raw: '', parsed: {} };
   const raw = readFileSync(fp, 'utf-8');
-  const value = JSON.parse(raw) as unknown;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`invalid sessions projection at ${fp}`);
-  }
-  return { raw, parsed: value as Record<string, Session> };
+  return { raw, parsed: parseSessionsProjectionStrict(raw, fp) };
 }
 
 function duplicateIds(ids: readonly string[]): string[] {
@@ -223,20 +257,20 @@ function duplicateIds(ids: readonly string[]): string[] {
 }
 
 /**
- * Sample every active Riff participant from one fresh sessions projection.
+ * Sample every active remote participant from one fresh sessions projection.
  * Fleet shutdown takes this snapshot before fencing any worker.
  */
-export function getActiveRiffShutdownSnapshotsBatch(
+export function getActiveRemoteShutdownSnapshotsBatch(
   sessionIds: readonly string[],
   options: { maxWaitMs?: number } = {},
-): ActiveRiffShutdownSnapshot[] {
+): ActiveRemoteShutdownSnapshot[] {
   if (sessionIds.length === 0) return [];
   const duplicates = duplicateIds(sessionIds);
   if (duplicates.length > 0) {
-    throw new RiffLineageBatchError(
+    throw new RemoteLineageBatchError(
       'prewrite_ownership',
       duplicates,
-      `duplicate Riff shutdown session ids: ${duplicates.join(', ')}`,
+      `duplicate remote shutdown session ids: ${duplicates.join(', ')}`,
     );
   }
 
@@ -250,10 +284,10 @@ export function getActiveRiffShutdownSnapshotsBatch(
         return !session || session.status !== 'active';
       });
       if (invalid.length > 0) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           'prewrite_ownership',
           invalid,
-          `cannot snapshot non-active Riff sessions: ${invalid.join(', ')}`,
+          `cannot snapshot non-active remote sessions: ${invalid.join(', ')}`,
         );
       }
       return sessionIds.map((sessionId) => {
@@ -261,40 +295,41 @@ export function getActiveRiffShutdownSnapshotsBatch(
         return {
           sessionId,
           taskId: session.riffParentTaskId ?? null,
-          owner: riffDurableOwner(session),
+          owner: remoteDurableOwner(session),
         };
       });
     }, { maxWaitMs: options.maxWaitMs });
   } catch (error) {
-    if (error instanceof RiffLineageBatchError) throw error;
-    throw new RiffLineageBatchError(
+    if (error instanceof RemoteLineageBatchError) throw error;
+    throw new RemoteLineageBatchError(
       'prewrite_io',
       [...sessionIds],
-      `failed to snapshot active Riff sessions: ${String(error)}`,
+      `failed to snapshot active remote sessions: ${String(error)}`,
     );
   }
 }
 
 /**
- * Commit every prepared Riff lineage as one compare-and-set transaction.
+ * Commit every prepared remote lineage as one compare-and-set transaction.
  * The published projection is read back under the same lock before workers
  * are allowed to exit.
  */
-export function persistActiveRiffLineagesExactBatch(
-  updates: readonly ActiveRiffLineageBatchUpdate[],
+export function persistActiveRemoteLineagesExactBatch(
+  updates: readonly ActiveRemoteLineageBatchUpdate[],
   options: { maxWaitMs?: number } = {},
-): ActiveRiffShutdownSnapshot[] {
+): ActiveRemoteShutdownSnapshot[] {
   if (updates.length === 0) return [];
   const sessionIds = updates.map(update => update.sessionId);
   const duplicates = duplicateIds(sessionIds);
   if (duplicates.length > 0) {
-    throw new RiffLineageBatchError(
+    throw new RemoteLineageBatchError(
       'prewrite_ownership',
       duplicates,
-      `duplicate Riff lineage batch session ids: ${duplicates.join(', ')}`,
+      `duplicate remote lineage batch session ids: ${duplicates.join(', ')}`,
     );
   }
 
+  loadForWrite();
   ensureDir();
   const fp = getFilePath();
   let published = false;
@@ -309,15 +344,15 @@ export function persistActiveRiffLineagesExactBatch(
         if (!durable
             || durable.status !== 'active'
             || !update.expectedCurrentTaskIds.some(candidate => candidate === durableTaskId)
-            || !riffOwnersEqual(riffDurableOwner(durable), update.owner)) {
+            || !remoteOwnersEqual(remoteDurableOwner(durable), update.owner)) {
           conflicts.push(update.sessionId);
         }
       }
       if (conflicts.length > 0) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           'prewrite_ownership',
           conflicts,
-          `Riff lineage batch compare-and-set failed for: ${conflicts.join(', ')}`,
+          `Remote lineage batch compare-and-set failed for: ${conflicts.join(', ')}`,
         );
       }
 
@@ -338,17 +373,17 @@ export function persistActiveRiffLineagesExactBatch(
         renameSync(tmpFp, fp);
         tmpFp = undefined;
         published = true;
-        testOnlyAfterRiffBatchRename?.();
+        testOnlyAfterRemoteBatchRename?.();
       }
 
       let verifiedProjection: Record<string, Session>;
       try {
         verifiedProjection = readSessionsProjectionStrict(fp).parsed;
       } catch (error) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           published ? 'postrename_ambiguity' : 'prewrite_io',
           [...sessionIds],
-          `failed to read back Riff lineage batch: ${String(error)}`,
+          `failed to read back Remote lineage batch: ${String(error)}`,
         );
       }
 
@@ -357,20 +392,20 @@ export function persistActiveRiffLineagesExactBatch(
         return !durable
           || durable.status !== 'active'
           || (durable.riffParentTaskId ?? null) !== update.targetTaskId
-          || !riffOwnersEqual(riffDurableOwner(durable), update.owner);
+          || !remoteOwnersEqual(remoteDurableOwner(durable), update.owner);
       }).map(update => update.sessionId);
       if (ambiguous.length > 0) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           published ? 'postrename_ambiguity' : 'prewrite_ownership',
           ambiguous,
-          `Riff lineage batch readback mismatch for: ${ambiguous.join(', ')}`,
+          `Remote lineage batch readback mismatch for: ${ambiguous.join(', ')}`,
         );
       }
 
       const verified = updates.map((update) => ({
         sessionId: update.sessionId,
         taskId: update.targetTaskId,
-        owner: riffDurableOwner(verifiedProjection[update.sessionId]!),
+        owner: remoteDurableOwner(verifiedProjection[update.sessionId]!),
       }));
       if (loaded) {
         for (const update of updates) {
@@ -381,11 +416,11 @@ export function persistActiveRiffLineagesExactBatch(
       return verified;
     }, { maxWaitMs: options.maxWaitMs });
   } catch (error) {
-    if (error instanceof RiffLineageBatchError) throw error;
-    throw new RiffLineageBatchError(
+    if (error instanceof RemoteLineageBatchError) throw error;
+    throw new RemoteLineageBatchError(
       published ? 'postrename_ambiguity' : 'prewrite_io',
       [...sessionIds],
-      `failed to persist Riff lineage batch: ${String(error)}`,
+      `failed to persist Remote lineage batch: ${String(error)}`,
     );
   } finally {
     if (tmpFp) {
@@ -395,6 +430,7 @@ export function persistActiveRiffLineagesExactBatch(
 }
 
 function save(): void {
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   ensureDir();
   const fp = getFilePath();
   withFileLockSync(fp, () => {
@@ -423,7 +459,7 @@ export function createSession(
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
 ): Session {
-  load();
+  loadForWrite();
   const session: Session = {
     sessionId: randomUUID(),
     chatId,
@@ -532,11 +568,317 @@ export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
   cleanupSessionBridgeSendMarkersNow(sessionId);
 }
 
+export function isValidMojoCloseJournal(
+  value: unknown,
+): value is NonNullable<Session['mojoCloseJournal']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const journal = value as Record<string, unknown>;
+  if (journal.phase !== 'preparing'
+      && journal.phase !== 'prepared'
+      && journal.phase !== 'uncertain') return false;
+  if (typeof journal.requestId !== 'string' || !journal.requestId.trim()) return false;
+  if (typeof journal.updatedAt !== 'string' || !journal.updatedAt.trim()) return false;
+  if (journal.recovery !== undefined
+      && journal.recovery !== 'retryable'
+      && journal.recovery !== 'uncertain'
+      && journal.recovery !== 'irreversible') return false;
+  if (journal.admission !== undefined
+      && journal.admission !== 'restorable'
+      && journal.admission !== 'fenced') return false;
+  if (journal.commitOnly !== undefined && typeof journal.commitOnly !== 'boolean') return false;
+  if (journal.localResidual !== undefined
+      && journal.localResidual !== 'local_subtree_unprovable_on_platform'
+      && journal.localResidual !== 'local_subtree_boundary_unproven') return false;
+  // A retryable verdict never proves an irreversible teardown, so it must not
+  // arrive wearing the marker that suppresses further cancellation.
+  if (journal.recovery === 'retryable' && journal.commitOnly === true) return false;
+  // An irreversible verdict is only ever legal as a commit-only `prepared` row:
+  // the remote side is gone, so nothing may cancel or abort it again.
+  if (journal.recovery === 'irreversible'
+      && (journal.phase !== 'prepared' || journal.commitOnly !== true)) return false;
+  if (journal.commitOnly === true && journal.phase !== 'prepared') return false;
+  return journal.taskId === undefined
+    || (typeof journal.taskId === 'string' && !!journal.taskId.trim());
+}
+
+function mutateMojoCloseJournal(
+  sessionId: string,
+  mutate: (session: Session) => void,
+): Session {
+  loadForWrite();
+  const session = sessions.get(sessionId);
+  if (!session || session.status !== 'active') {
+    throw new Error(`cannot mutate Mojo close journal for non-active session ${sessionId}`);
+  }
+  if (session.backendType !== 'mojo') {
+    throw new Error(`cannot mutate Mojo close journal for non-Mojo session ${sessionId}`);
+  }
+  const priorJournal = session.mojoCloseJournal
+    ? { ...session.mojoCloseJournal }
+    : undefined;
+  const priorTaskId = session.riffParentTaskId;
+  if (session.mojoCloseJournal && !isValidMojoCloseJournal(session.mojoCloseJournal)) {
+    throw new Error(`cannot mutate malformed Mojo close journal for ${sessionId}`);
+  }
+  mutate(session);
+  try {
+    save();
+  } catch (error) {
+    session.mojoCloseJournal = priorJournal;
+    session.riffParentTaskId = priorTaskId;
+    throw error;
+  }
+  return session;
+}
+
+/** Persist the admission fence before any authoritative Mojo cancel begins. */
+export function beginMojoCloseJournal(
+  sessionId: string,
+  requestId: string,
+  expectedTaskId?: string,
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    if (session.riffParentTaskId !== expectedTaskId) {
+      throw new Error(`Mojo close lineage changed before prepare for ${sessionId}`);
+    }
+    const existing = session.mojoCloseJournal;
+    if (existing) {
+      if (existing.commitOnly) {
+        // The remote teardown already completed irreversibly; only the local
+        // commit may be retried. Starting a second cancel here is exactly the
+        // double teardown this journal exists to prevent.
+        throw new Error(`cannot re-cancel commit-only Mojo close journal for ${sessionId}`);
+      }
+      if (existing.phase !== 'preparing' && existing.phase !== 'uncertain') {
+        throw new Error(`cannot restart ${existing.phase} Mojo close journal for ${sessionId}`);
+      }
+      if (existing.taskId !== expectedTaskId) {
+        throw new Error(`Mojo close journal lineage changed before retry for ${sessionId}`);
+      }
+      if (existing.requestId !== requestId) {
+        if (existing.phase !== 'uncertain' && existing.recovery !== 'retryable') {
+          throw new Error(`another Mojo close journal already owns ${sessionId}`);
+        }
+        // Two journal shapes accept a fresh attempt under a NEW requestId:
+        //   * `retryable` — the failed prepare durably recorded that retrying
+        //     the cancel is legitimate. Refusing every fresh requestId here is
+        //     what made `retryable` dead-code and the row a permanent brick
+        //     (P1-1/P1-2).
+        //   * `uncertain` — an explicit close IS the manual reconciliation the
+        //     fence demanded. Only a live worker's prepare/commit reaches this
+        //     takeover (ownerless uncertain rows DRAIN instead — see
+        //     prepareMojoExplicitClose), and re-running the cancel is the
+        //     fail-safe direction: the frozen identity pins the tenant, and an
+        //     already-terminal remote session is classified as gone, not as a
+        //     second teardown. Without the takeover the live-worker case had no
+        //     exit at all (P0-new).
+        // commitOnly / `prepared` journals were rejected above and stay
+        // non-restartable: those record an IRREVERSIBLE teardown. The row is
+        // rebuilt from scratch so the stale recovery/admission verdict cannot
+        // survive into the new attempt; lineage equality was asserted above, so
+        // the retry still addresses the same remote session.
+        session.mojoCloseJournal = {
+          phase: 'preparing',
+          requestId,
+          ...(expectedTaskId ? { taskId: expectedTaskId } : {}),
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      return;
+    }
+    session.mojoCloseJournal = {
+      phase: 'preparing',
+      requestId,
+      ...(expectedTaskId ? { taskId: expectedTaskId } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/** Publish irreversible remote-cancel proof before the local close commit. */
+export function markMojoClosePrepared(
+  sessionId: string,
+  requestId: string,
+  taskId?: string,
+  localResidual?: NonNullable<Session['mojoCloseJournal']>['localResidual'],
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    const existing = session.mojoCloseJournal;
+    if (existing && existing.requestId !== requestId) {
+      throw new Error(`stale Mojo close prepare for ${sessionId}`);
+    }
+    if (existing?.phase === 'uncertain') {
+      throw new Error(`cannot promote uncertain Mojo close journal for ${sessionId}`);
+    }
+    if (existing?.taskId && taskId && existing.taskId !== taskId) {
+      throw new Error(`Mojo close proof changed journal lineage for ${sessionId}`);
+    }
+    const provenTaskId = taskId ?? existing?.taskId;
+    if (provenTaskId && session.riffParentTaskId
+        && session.riffParentTaskId !== provenTaskId) {
+      throw new Error(`Mojo close result lineage changed for ${sessionId}`);
+    }
+    if (provenTaskId) session.riffParentTaskId = provenTaskId;
+    // The residual is part of the PROOF being published: a replay of this
+    // prepared journal (runtime commit retry, or a daemon restart) must publish
+    // the same residual close it describes. A repeat prepare without one keeps
+    // the recorded residual — the evidence grade of the original close does not
+    // improve by being replayed.
+    const provenResidual = localResidual ?? existing?.localResidual;
+    session.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId,
+      ...(provenTaskId ? { taskId: provenTaskId } : {}),
+      ...(provenResidual ? { localResidual: provenResidual } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/**
+ * Finish a failed prepare after worker admission restore. If restore was not
+ * proven, keep a durable uncertain fence; either way retain a newly discovered
+ * pre-init lineage for later reconciliation.
+ */
+export function finishMojoCloseAbort(
+  sessionId: string,
+  requestId: string,
+  options: { admissionRestored: boolean; taskId?: string },
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    const existing = session.mojoCloseJournal;
+    if (!existing || existing.requestId !== requestId) {
+      throw new Error(`stale Mojo close abort for ${sessionId}`);
+    }
+    if (existing.commitOnly || existing.recovery === 'irreversible') {
+      // Checked BEFORE the generic prepared guard so the refusal names the reason:
+      // rolling this back would re-open write admission on a lineage whose remote
+      // side is already gone, leaving a session that looks writable and can never
+      // continue.
+      throw new Error(`cannot abort irreversible Mojo close journal for ${sessionId}`);
+    }
+    if (existing.phase === 'prepared') {
+      throw new Error(`cannot abort prepared Mojo close proof for ${sessionId}`);
+    }
+    if (existing.taskId && options.taskId && existing.taskId !== options.taskId) {
+      throw new Error(`Mojo close abort changed journal lineage for ${sessionId}`);
+    }
+    const retainedTaskId = options.taskId ?? existing.taskId;
+    if (retainedTaskId && session.riffParentTaskId
+        && session.riffParentTaskId !== retainedTaskId) {
+      throw new Error(`Mojo close abort lineage changed for ${sessionId}`);
+    }
+    if (retainedTaskId) session.riffParentTaskId = retainedTaskId;
+    if (options.admissionRestored) {
+      session.mojoCloseJournal = undefined;
+      return;
+    }
+    session.mojoCloseJournal = {
+      phase: 'uncertain',
+      requestId,
+      ...(retainedTaskId ? { taskId: retainedTaskId } : {}),
+      recovery: 'uncertain',
+      admission: 'fenced',
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/**
+ * Persist a FAILED prepare that must NOT be rolled back, with its exact verdict.
+ *
+ * Such a prepare previously left the journal at `preparing` carrying the
+ * PRE-prepare task id: a restart could not tell "reconcile me" apart from "only
+ * the local commit is left", the lineage the worker actually reported was
+ * dropped, and nothing recorded that write admission was never re-opened.
+ *
+ * `irreversible` is stored as a commit-only `prepared` row on purpose - every
+ * existing recovery path (restore, retry, abort) then treats it as
+ * un-cancellable and finishes only the local close.
+ */
+export function markMojoCloseUnresolved(
+  sessionId: string,
+  requestId: string,
+  options: {
+    /**
+     * Whether the CLOSE may be retried. `retryable` is a legitimate value here:
+     * a close that keeps writes fenced is not automatically un-retryable, and
+     * forcing it into `uncertain` would forbid the retry that can still succeed.
+     */
+    recovery: 'retryable' | 'uncertain' | 'irreversible';
+    taskId?: string;
+    /** Whether a new WRITE may be admitted. Recorded verbatim, never derived. */
+    admission: 'restorable' | 'fenced';
+  },
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    const existing = session.mojoCloseJournal;
+    if (existing && existing.requestId !== requestId) {
+      throw new Error(`stale Mojo close verdict for ${sessionId}`);
+    }
+    if (existing?.commitOnly && options.recovery !== 'irreversible') {
+      // Never downgrade a recorded irreversible teardown into something a later
+      // caller may cancel or abort again.
+      throw new Error(`cannot downgrade commit-only Mojo close journal for ${sessionId}`);
+    }
+    if (existing?.taskId && options.taskId && existing.taskId !== options.taskId) {
+      throw new Error(`Mojo close verdict changed journal lineage for ${sessionId}`);
+    }
+    const exactTaskId = options.taskId ?? existing?.taskId;
+    if (exactTaskId && session.riffParentTaskId
+        && session.riffParentTaskId !== exactTaskId) {
+      throw new Error(`Mojo close verdict lineage changed for ${sessionId}`);
+    }
+    // The worker may have learned the lineage only DURING the prepare (the
+    // pre-init window), so persist that exact id: a retry or a manual
+    // reconciliation must address the real remote session, not the stale guess.
+    if (exactTaskId) session.riffParentTaskId = exactTaskId;
+    const irreversible = options.recovery === 'irreversible';
+    // A still-retryable close keeps its `preparing` intent: a retry SHOULD re-run
+    // the cancel. Promoting it to `uncertain` would demand manual reconciliation
+    // for a failure the retry can clear on its own -- while `admission: 'fenced'`
+    // independently keeps writes out.
+    const phase = irreversible
+      ? 'prepared'
+      : options.recovery === 'retryable' ? 'preparing' : 'uncertain';
+    session.mojoCloseJournal = {
+      phase,
+      requestId,
+      ...(exactTaskId ? { taskId: exactTaskId } : {}),
+      recovery: options.recovery,
+      admission: options.admission,
+      ...(irreversible ? { commitOnly: true } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
 export function closeSession(
   sessionId: string,
-  opts: { cleanupBridgeMarkers?: boolean; clearRiffParentTaskId?: boolean } = {},
+  opts: {
+    cleanupBridgeMarkers?: boolean;
+    clearRiffParentTaskId?: boolean;
+    /**
+     * Park an uncancellable mojo lineage as PART of this transaction.
+     *
+     * The caller must not pre-write this onto its own Session object: the runtime
+     * object is not always the authoritative row (and when it is, a failed save
+     * would leave a parked id the rollback below does not know about). Merging it
+     * here — against the store's own row, snapshotted and rolled back with
+     * everything else — is what makes "closed + parked" actually atomic.
+     */
+    parkMojoLineage?: string;
+    /**
+     * Park a LOCAL-subtree residual as PART of this transaction, so an idempotent
+     * re-close of the already-closed row still reports `closed_with_residual`.
+     * The journal (the residual's other home) is wiped on commit below, and a
+     * client that lost the first response and retries would otherwise get a false
+     * all-clear while the containment handle and blocker are still held.
+     */
+    parkLocalResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+  } = {},
 ): void {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     const priorStatus = session.status;
@@ -544,10 +886,41 @@ export function closeSession(
     const priorRiffParentTaskId = session.riffParentTaskId;
     const priorDashboardAttachments = session.dashboardAttachments;
     const priorQueuedAttachments = session.queuedAttachments;
+    const priorPreviewTarget = session.previewTarget;
+    const priorQuarantinedLineage = session.mojoQuarantinedLineage;
+    const priorQuarantineNoticePending = session.mojoQuarantineNoticePending;
+    const priorLocalResidual = session.mojoLocalResidual;
+    const priorMojoCloseJournal = session.mojoCloseJournal
+      ? { ...session.mojoCloseJournal }
+      : undefined;
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     session.dashboardAttachments = undefined;
     session.queuedAttachments = undefined;
+    // `previewTarget` is a live loopback (host, port) the session's agent
+    // registered with `botmux preview <port>` for its CURRENT worker
+    // generation — routing state, not a durable property of the conversation.
+    // A closed session owns no port any more, and the OS is free to hand that
+    // number to an unrelated local server; the preview proxy dials a target by
+    // host/port alone, so a retained value would let a later reader (resume,
+    // an offline row copy, a dashboard snapshot) proxy the user into someone
+    // else's service. Drop it in the same atomic save as status='closed'.
+    // Cleanup only: registration and proxying are untouched, and a resumed
+    // session simply re-runs `botmux preview <port>`.
+    session.previewTarget = undefined;
+    session.mojoCloseJournal = undefined;
+    // Survives close on purpose — the containment handle is still in the durable
+    // store, so the row must keep reporting the residual until the handle clears.
+    if (opts.parkLocalResidual) session.mojoLocalResidual = opts.parkLocalResidual;
+    if (opts.parkMojoLineage) {
+      // Keep both ids when a different one was already parked: each is the only
+      // handle left for manual cleanup of its remote session.
+      const already = session.mojoQuarantinedLineage;
+      session.mojoQuarantinedLineage = already && already !== opts.parkMojoLineage
+        ? `${already},${opts.parkMojoLineage}`
+        : opts.parkMojoLineage;
+      session.mojoQuarantineNoticePending = true;
+    }
     // Riff cancellation has already completed before this durable transition.
     // Clear its retry handle in the same atomic save as status='closed'.
     if (opts.clearRiffParentTaskId) session.riffParentTaskId = undefined;
@@ -559,6 +932,14 @@ export function closeSession(
       session.riffParentTaskId = priorRiffParentTaskId;
       session.dashboardAttachments = priorDashboardAttachments;
       session.queuedAttachments = priorQueuedAttachments;
+      session.previewTarget = priorPreviewTarget;
+      // Without these two the row keeps a parked lineage after a FAILED close, so
+      // the next turn treats a still-live remote session as quarantined and starts
+      // a new one — i.e. the "close failed, retry unchanged" guarantee is broken.
+      session.mojoQuarantinedLineage = priorQuarantinedLineage;
+      session.mojoQuarantineNoticePending = priorQuarantineNoticePending;
+      session.mojoLocalResidual = priorLocalResidual;
+      session.mojoCloseJournal = priorMojoCloseJournal;
       throw err;
     }
     if (session.larkAppId && priorDashboardAttachments?.length) {
@@ -573,6 +954,9 @@ export function closeSession(
     // user-visible, so workerless/forced closes must apply the same cleanup;
     // otherwise closed sessions retain private reply text indefinitely.
     if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
+    // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
+    // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
+    removePromptContextDir(sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
@@ -584,12 +968,16 @@ export function closeSession(
  * since 2026-07, but older closed rows can still contain prepared input.  A
  * generic resume is an explicit new lifecycle and must never revive that
  * abandoned FIFO.
+ *
+ * `previewTarget` is cleared here for the same reason: closeSession() now drops
+ * it, but rows closed by an older build still carry one on disk, and resume
+ * starts a new worker generation that has not registered any port.
  */
 export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
 | { ok: false; error: 'not_found' | 'not_closed' } {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -613,6 +1001,8 @@ export function reactivateClosedSession(
     queuedActivationTail: session.queuedActivationTail,
     queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
     pendingRepoSetup: session.pendingRepoSetup,
+    previewTarget: session.previewTarget,
+    mojoCloseJournal: session.mojoCloseJournal,
   };
 
   session.status = 'active';
@@ -633,6 +1023,8 @@ export function reactivateClosedSession(
   session.queuedActivationTail = undefined;
   session.queuedActivationTailNextOrder = undefined;
   session.pendingRepoSetup = undefined;
+  session.previewTarget = undefined;
+  session.mojoCloseJournal = undefined;
 
   try {
     save();
@@ -644,7 +1036,7 @@ export function reactivateClosedSession(
 }
 
 export function updateSessionPid(sessionId: string, pid: number | null): void {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     session.pid = pid ?? undefined;
@@ -653,46 +1045,46 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
 }
 
 export function updateSession(session: Session): void {
-  load();
+  loadForWrite();
   sessions.set(session.sessionId, session);
   save();
 }
 
 /**
- * Persist one exact Riff follow-up lineage for an active durable owner.
+ * Persist one exact remote follow-up lineage for an active durable owner.
  * The process cache changes only after the atomic file replacement succeeds.
  */
-export function persistActiveRiffLineageExact(
+export function persistActiveRemoteLineageExact(
   sessionId: string,
   taskId: string | null,
   options: {
     expectedCurrentTaskIds?: readonly (string | null)[];
-    expectedOwner?: RiffDurableOwner;
+    expectedOwner?: RemoteDurableOwner;
   } = {},
 ): Session {
-  load();
+  loadForWrite();
   ensureDir();
   const fp = getFilePath();
   return withFileLockSync(fp, () => {
     const { raw, parsed } = readExistingSessionsFromDisk(fp);
     const durable = parsed[sessionId];
     if (!durable || durable.status !== 'active') {
-      throw new RiffLineageOwnershipError(
-        `cannot persist Riff lineage for non-active session ${sessionId}`,
+      throw new RemoteLineageOwnershipError(
+        `cannot persist remote lineage for non-active session ${sessionId}`,
       );
     }
     const durableTaskId = durable.riffParentTaskId ?? null;
     const expected = options.expectedCurrentTaskIds;
     if (expected && !expected.some(candidate => candidate === durableTaskId)) {
-      throw new RiffLineageOwnershipError(
-        `Riff lineage compare-and-set failed for ${sessionId} `
+      throw new RemoteLineageOwnershipError(
+        `Remote lineage compare-and-set failed for ${sessionId} `
         + `(current=${durableTaskId ?? 'none'}, expected=${expected.map(id => id ?? 'none').join('|')})`,
       );
     }
-    if (options.expectedOwner && !riffOwnersEqual(riffDurableOwner(durable), options.expectedOwner)) {
-      throw new RiffLineageOwnershipError(
-        `Riff owner compare-and-set failed for ${sessionId} `
-        + `(current=${JSON.stringify(riffDurableOwner(durable))}, `
+    if (options.expectedOwner && !remoteOwnersEqual(remoteDurableOwner(durable), options.expectedOwner)) {
+      throw new RemoteLineageOwnershipError(
+        `Remote owner compare-and-set failed for ${sessionId} `
+        + `(current=${JSON.stringify(remoteDurableOwner(durable))}, `
         + `expected=${JSON.stringify(options.expectedOwner)})`,
       );
     }
@@ -722,6 +1114,19 @@ export function persistActiveRiffLineageExact(
 
 export function listSessions(): Session[] {
   load();
+  return [...sessions.values()];
+}
+
+/**
+ * Return the current projection only when its backing file was loaded safely.
+ * Use this for decisions that delete, retire, or reconfigure resources: the
+ * legacy empty-on-error behaviour of listSessions() is unsafe at those gates.
+ * A failed load remains unhealthy until init() explicitly selects/reloads a
+ * store, avoiding a silent mid-transaction recovery against a different view.
+ */
+export function listSessionsStrict(): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   return [...sessions.values()];
 }
 
@@ -805,6 +1210,178 @@ export function collectBotmuxSessionIdentities(dataDir: string = config.session.
     }
   } catch { /* missing dir → in-memory only */ }
   return ids;
+}
+
+// ─── Cross-process offline access ───────────────────────────────────────────
+// The only sanctioned ways to touch session rows from OUTSIDE the owning
+// daemon process (agent-facing CLI subcommands, caller-identity proofs). Until
+// 2026-08 the CLI kept its own parallel copies of these (loadSessions /
+// saveSession / mutateSessionOffline in cli.ts) — one of which wrote the whole
+// file WITHOUT the lock; they were absorbed here so persistence mechanics
+// (file layout, lock, tmp+rename, legacy-field strip) stay private to this
+// module.
+
+/**
+ * Read-only snapshot of every session row across the legacy `sessions.json`
+ * and all per-bot `sessions-<appId>.json` files. Per-bot rows win duplicate
+ * sessionIds and get `larkAppId` stamped from their filename so a later
+ * offline mutation resolves the owning file. Deliberately lock-free: atomic
+ * tmp+rename publication keeps each file self-consistent, and snapshot
+ * composition must stay a pure reader (an older CLI opportunistically migrated
+ * legacy rows here, which made even `botmux list` a whole-file writer able to
+ * race a daemon save).
+ */
+export function loadAllSessionsSnapshot(options: {
+  dataDir?: string;
+  /** Per-bot fallback when the data dir cannot be enumerated (the CLI file
+   *  sandbox exposes sessions-<self>.json but NOT a listing of data/). */
+  fallbackAppId?: string;
+} = {}): Map<string, Session> {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const out = new Map<string, Session>();
+  const readInto = (file: string, stampAppId?: string): void => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+    } catch { return; /* missing or corrupt file → skip */ }
+    // Arrays are deliberately tolerated (Object.values yields their rows):
+    // the historical CLI loader accepted array-shaped files and existing
+    // fixtures/tools rely on that.
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      const session = value as Session;
+      if (!session || typeof session !== 'object' || !session.sessionId) continue;
+      repairMissingChatScope(session);
+      if (stampAppId && !session.larkAppId) session.larkAppId = stampAppId;
+      out.set(session.sessionId, session);
+    }
+  };
+  readInto('sessions.json');
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (file.startsWith('sessions-') && file.endsWith('.json')) {
+        readInto(file, file.slice('sessions-'.length, -'.json'.length));
+      }
+    }
+  } catch {
+    if (options.fallbackAppId) {
+      readInto(`sessions-${options.fallbackAppId}.json`, options.fallbackAppId);
+    }
+  }
+  return out;
+}
+
+/**
+ * Unlocked point-read of one row straight from disk, bypassing this process's
+ * in-memory cache: the owning per-bot file first, then the legacy
+ * `sessions.json`. Atomic tmp+rename publication keeps each file
+ * self-consistent, so this never blocks on (or throws from) the store lock —
+ * safe on hot paths that only need a freshness hint.
+ */
+export function readSessionRowFromDisk(
+  sessionId: string,
+  larkAppId?: string,
+  dataDir: string = config.session.dataDir,
+): Session | undefined {
+  const files = larkAppId
+    ? [`sessions-${larkAppId}.json`, 'sessions.json']
+    : ['sessions.json'];
+  for (const file of files) {
+    const fp = join(dataDir, file);
+    if (!existsSync(fp)) continue;
+    try {
+      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+      if (data[sessionId]) return data[sessionId];
+    } catch { /* ignore corrupt/racing session file */ }
+  }
+  return undefined;
+}
+
+/**
+ * Fail-closed identity scan: every file's copy of one session row across the
+ * legacy and all per-bot files — one entry per file that holds the id. An
+ * unlistable data dir THROWS: a caller proving "this row resolves exactly
+ * once" must not mistake an unreadable store for an empty one. A corrupt
+ * individual file is skipped: an unrelated bot's bad file must neither block
+ * nor impersonate a valid record; the target row still has to resolve from a
+ * readable file.
+ */
+export function readSessionRowCopiesAcrossStores(
+  sessionId: string,
+  dataDir: string = config.session.dataDir,
+): Session[] {
+  const files = readdirSync(dataDir).filter((name) => (
+    name === 'sessions.json'
+    || (name.startsWith('sessions-') && name.endsWith('.json'))
+  ));
+  const matches: Session[] = [];
+  for (const file of files) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8')) as unknown;
+    } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const keyed = (parsed as Record<string, unknown>)[sessionId];
+    if (!keyed || typeof keyed !== 'object' || Array.isArray(keyed)) continue;
+    const session = keyed as Session;
+    if (session.sessionId !== sessionId) continue;
+    matches.push(session);
+  }
+  return matches;
+}
+
+/**
+ * Locked offline mutation of one exact row in its owning file (per-bot when
+ * the caller-observed row carries `larkAppId`, legacy `sessions.json`
+ * otherwise). Re-reads the row under the SAME lock the owning daemon uses for
+ * every save and hands the FRESH copy to `mutate` — never publishing the
+ * caller's possibly-stale snapshot — then republishes with the daemon's own
+ * tmp+rename / mismatched-key cleanup / legacy-field strip.
+ *
+ * `abortIf` is evaluated under the lock at entry and re-evaluated immediately
+ * before publication; returning true abandons the mutation with `undefined`
+ * (callers pass a daemon-liveness probe so an owning daemon that appears
+ * mid-flight stays authoritative and the file is left untouched).
+ *
+ * Returns the fresh row — mutated when `mutate` returned true, otherwise
+ * unmodified (so `() => false` is a locked fresh read) — or undefined when
+ * the row is absent or `abortIf` aborted.
+ */
+export function mutateSessionRowOffline(
+  target: { sessionId: string; larkAppId?: string },
+  mutate: (current: Session) => boolean,
+  options: { dataDir?: string; abortIf?: () => boolean } = {},
+): Session | undefined {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const fileName = target.larkAppId ? `sessions-${target.larkAppId}.json` : 'sessions.json';
+  const fp = join(dataDir, fileName);
+  return withFileLockSync(fp, () => {
+    if (options.abortIf?.()) return undefined;
+    let data: Record<string, Session> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[target.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[target.sessionId] = current;
+
+    // Clean up entries where the file key doesn't match the entry's sessionId
+    // (data corruption), and strip removed placeholder-card fields — the same
+    // convergence the daemon's save() applies.
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
+
+    if (options.abortIf?.()) return undefined;
+    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
 }
 
 function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {

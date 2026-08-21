@@ -64,15 +64,15 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   }, 20_000);
 
-  it('forwards model + reasoningEffort (xhigh verbatim) into thread/start config', async () => {
+  it('forwards model + reasoningEffort (ultra verbatim) into thread/start config', async () => {
     // Guards the PR-A consumption gap codex caught: the engine must actually put
-    // model + model_reasoning_effort on thread/start config, and xhigh must NOT
-    // be downgraded (codex 0.145 accepts it).
+    // model + model_reasoning_effort on thread/start config, and the new highest
+    // menu value must not be downgraded.
     const cfgFile = join(tmpdir(), `fake-thread-cfg-${Math.round(performance.now())}.json`);
     const engine = makeEngine({
       sessionId: 'effort-wiring',
       model: 'gpt-5.6-terra',
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'ultra',
       env: { ...process.env, FAKE_THREAD_CONFIG_FILE: cfgFile },
     });
     await engine.start();
@@ -81,7 +81,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const params = JSON.parse(readFileSync(cfgFile, 'utf8'));
     rmSync(cfgFile, { force: true });
     expect(params.config?.model).toBe('gpt-5.6-terra');
-    expect(params.config?.model_reasoning_effort).toBe('xhigh');
+    expect(params.config?.model_reasoning_effort).toBe('ultra');
   }, 20_000);
 
   it('SUPPRESSES model + reasoningEffort on thread/resume (start keeps both) — no resume drift', async () => {

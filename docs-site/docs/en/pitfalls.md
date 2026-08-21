@@ -13,8 +13,8 @@
 
 ## Lost environment variables (high frequency)
 
-- **bash users who put variables in `.bash_profile` don't get them**: A new worker starts with `bash -i`, and `bash -i` only reads `.bashrc`. → In `.bashrc`, run `source ~/.bash_profile`, or just put the variables directly in `.bashrc` (zsh users use `.zshrc`). This is a common root cause of `API Error 403` / gateway token errors.
-- **Claude refuses `--dangerously-skip-permissions` under root**: It reports "cannot be used with root/sudo privileges". → `export IS_SANDBOX=1` (zsh in `.zshrc`, bash in `.bashrc`; for PM2 / systemd / Docker scenarios, configure it in the corresponding startup environment). Newer versions already inject this automatically for the root scenario.
+- **bash users who put variables in `.bash_profile` don't get them**: A new worker starts with `bash -i`, and `bash -i` only reads `.bashrc`. → In `.bashrc`, run `source ~/.bash_profile`, or just put the variables directly in `.bashrc` (zsh users use `.zshrc`; fish users put them in `~/.config/fish/config.fish`). This is a common root cause of `API Error 403` / gateway token errors.
+- **Claude refuses `--dangerously-skip-permissions` under root**: It reports "cannot be used with root/sudo privileges". → `export IS_SANDBOX=1` (zsh in `.zshrc`, bash in `.bashrc`, fish in `~/.config/fish/config.fish`; for PM2 / systemd / Docker scenarios, configure it in the corresponding startup environment). Newer versions already inject this automatically for the root scenario.
 
 ## Custom wrapper / gateway integration
 

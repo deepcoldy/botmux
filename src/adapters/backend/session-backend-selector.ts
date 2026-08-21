@@ -4,6 +4,10 @@ import { resolve } from 'node:path';
 
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
+import { MojoBackend } from './mojo-backend.js';
+import { isMojoFullyRemote } from './sandbox.js';
+import { mojoRemoteProofFailureReason } from './mojo-types.js';
+import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
@@ -192,6 +196,18 @@ export function backendSandboxCompatibilityError(opts: {
    * isolation. The worker passes false because its unified sandbox request
    * already folds in the legacy readIsolation flag on every host. */
   effectiveReadIsolationRequested: boolean;
+  /**
+   * mojo only: proof-of-remote inputs. `env` / `jwtEnv` are part of the proof, not
+   * decoration — the launcher env decides which binary actually runs (see
+   * mojoUnprovableEnvKeys), so leaving them out let a redirected launcher pass.
+   */
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
 }): string | undefined {
   const isolationRequested =
     opts.fileSandboxRequested || opts.effectiveReadIsolationRequested;
@@ -201,6 +217,25 @@ export function backendSandboxCompatibilityError(opts: {
     || opts.backendType === 'tmux'
     || opts.backendType === 'riff'
   ) return undefined;
+  if (opts.backendType === 'mojo') {
+    // A fully-remote mojo session (cloud on, localDaemon off) executes nothing
+    // locally, so there is nothing for botmux's local sandbox to confine —
+    // same rationale as riff, and blocking it would brick sandbox-enabled bots.
+    //
+    // But mojo spawns its binary locally every turn, so with cloud off (or
+    // localDaemon on) the tools DO touch this host. MojoBackend does not launch
+    // that child under the sandbox wrapper, so honouring `sandbox: true` here is
+    // impossible — fail CLOSED with an actionable message rather than running
+    // unisolated while the user believes they are sandboxed.
+    if (isMojoFullyRemote(opts.mojoConfig)) return undefined;
+    // Explanation comes from the shared helper, NOT from a copy local to this gate:
+    // the mandatory device-isolation path refuses the same sessions and used to
+    // give different (and, for an env blocker, unusable) advice. See
+    // mojoRemoteProofFailureReason.
+    return 'backend "mojo" cannot prove it runs nothing locally, so the local '
+      + `sandbox must stay engaged: ${mojoRemoteProofFailureReason(opts.mojoConfig)} `
+      + 'Otherwise disable sandbox for this bot';
+  }
   return `backend "${opts.backendType}" does not support file/read isolation; `
     + 'use tmux/pty or disable sandbox for this bot';
 }
@@ -233,7 +268,7 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig;
+  backendConfig?: RiffBackendConfig | EffectiveMojoConfig;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
   herdrOwnershipScope?: string;
@@ -244,12 +279,26 @@ export function selectSessionBackend(opts: {
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
+  if (opts.backendType === 'mojo') {
+    // Unlike riff, an absent config is FINE: every mojo field is optional and
+    // the bare `mojo` binary on PATH with an ambient login is a valid setup.
+    return {
+      backend: new MojoBackend(
+        (opts.backendConfig ?? {}) as EffectiveMojoConfig,
+        opts.sessionId,
+      ),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
     }
     return {
-      backend: new RiffBackend(opts.backendConfig, opts.sessionId),
+      backend: new RiffBackend(opts.backendConfig as RiffBackendConfig, opts.sessionId),
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: false,
@@ -362,16 +411,59 @@ export function selectSessionBackend(opts: {
           + 'close it explicitly before enabling isolation or MCP',
         );
       }
-    } else if (HerdrBackend.hasSession(ownedSessionName)) {
-      return {
-        backend: new HerdrBackend(ownedSessionName, { isReattach: true }),
-        isTmuxMode: false,
-        isPipeMode: true,
-        isZellijMode: false,
-        persistentSessionName: ownedSessionName,
-        persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
-        isReattach: true,
-      };
+    } else {
+      // Owned isolation/MCP host. The reattach decision must be AGENT-precise, not
+      // session-level: herdr can keep a live host session whose `botmux` agent row
+      // has disappeared (killSession's own comment records that session dir, agent
+      // metadata and process state diverge). Predicting reattach from the SESSION
+      // alone would, when the agent is gone, make HerdrBackend.spawn's frozen
+      // reattach guard throw every launch (kill-loop) — and the worker would have
+      // skipped the cold-path setup (PENDING proof + credential-only wrapper, gated
+      // on !willReattachPersistent), so a silent fresh-start would run UNWRAPPED.
+      //
+      // Use TRI-STATE probes (never `hasSession && hasAgent` — those collapse
+      // `unknown` to false and re-introduce fail-open). Table:
+      //   host unknown                     → refuse (no kill, no spawn)
+      //   host missing                     → fall through to the shared-host cold path
+      //   host exists, agent unknown       → refuse
+      //   host exists, agent exists        → reattach the same owned host
+      //   host exists, agent missing       → COLD start IN the same owned host
+      //                                      (isReattach:false → worker writes
+      //                                      PENDING + assembles the wrapper, then
+      //                                      Herdr `agent start`s a new generation);
+      //                                      no teardown of the still-live host.
+      const ownedAgentName = HerdrBackend.defaultAgentName();
+      const hostProbe = HerdrBackend.probeSession(ownedSessionName);
+      if (hostProbe === 'unknown') {
+        throw new Error(
+          `owned herdr session ${ownedSessionName} probe inconclusive; `
+          + 'refusing isolation/MCP reattach-vs-fresh decision',
+        );
+      }
+      if (hostProbe === 'exists') {
+        const agentProbe = HerdrBackend.probeAgent(ownedSessionName, ownedAgentName);
+        if (agentProbe === 'unknown') {
+          throw new Error(
+            `owned herdr agent ${ownedAgentName} in ${ownedSessionName} probe inconclusive; `
+            + 'refusing isolation/MCP reattach-vs-fresh decision',
+          );
+        }
+        const agentLive = agentProbe === 'exists';
+        return {
+          backend: new HerdrBackend(ownedSessionName, {
+            // agent missing on a live host → in-place cold start (create the agent,
+            // NOT the session, which already exists).
+            isReattach: agentLive,
+          }),
+          isTmuxMode: false,
+          isPipeMode: true,
+          isZellijMode: false,
+          persistentSessionName: ownedSessionName,
+          persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
+          isReattach: agentLive,
+        };
+      }
+      // host missing → fall through to the shared-host cold path below.
     }
 
     // Every fresh agent actively launched by this machine's Botmux shares the

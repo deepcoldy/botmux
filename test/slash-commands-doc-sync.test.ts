@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../src/core/passthrough-commands.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 import { messages as en } from '../src/i18n/en.js';
 import { messages as zh } from '../src/i18n/zh.js';
@@ -33,7 +34,10 @@ const ALIAS_EXEMPT = new Set(['/g', '/slash', '/disconnect']);
  * 传 mock 路径避免 eager probe(见 cli-adapters.test.ts 同款用法)。这样新 adapter
  * 加默认命令、或改了 /goal,guard 自动跟着变红,不靠手抄。
  */
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
+// This block's own docstring promised "不靠手抄", but the list right below WAS
+// hand-copied and had gone stale (missing mojo and reasonix, still carrying a
+// retired entry). Derive it from the registry so the promise actually holds.
+const ALL_CLI_IDS: readonly CliId[] = REGISTRY_ALL_CLI_IDS;
 function adapterDefaultPassthrough(): Set<string> {
   const out = new Set<string>();
   for (const id of ALL_CLI_IDS) {

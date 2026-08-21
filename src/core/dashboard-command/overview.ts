@@ -26,12 +26,19 @@ import type { DashboardSettingsInput } from '../../dashboard/settings-card-model
 import type { ScheduleCardTaskInput } from '../../dashboard/schedule-card-model.js';
 import type { SessionRow } from '../dashboard-rows.js';
 import type { CommandHandlerDeps } from '../command-handler.js';
+import {
+  resolveWorkbenchButtonLinks,
+  type WorkbenchButtonLinks,
+} from '../workbench-link.js';
 
 /** Optional injection seam for tests. */
 export interface DashboardOverviewCommandDeps {
   createClient?: (larkAppId: string) => DaemonClient;
   sendUserMessage?: (larkAppId: string, openId: string, content: string, msgType?: string) => Promise<string>;
   locale?: Locale;
+  /** Override the workbench link resolution (production reads the dashboard
+   *  port/token off disk). Tests inject a fixed value. */
+  resolveWorkbench?: (larkAppId: string) => WorkbenchButtonLinks | undefined;
 }
 
 interface OverviewSnapshotBody {
@@ -88,13 +95,20 @@ export async function handleDashboardOverview(
     return;
   }
 
+  // 「打开工作台」入口是一条带长期 Dashboard token 的**常驻链接**（产品决策见
+  // core/workbench-link.ts：自部署 owner 要能收藏，泄漏由 rotate 兜底）。正因为
+  // 它是常驻凭证，只在这里解析——即 admin gate（handleDashboardCommand →
+  // ensureDashboardOwner）已经放行之后，且卡片是私信给发起人本人的。任何绕过
+  // gate 的路径都不得渲染它。
+  const workbench = (testDeps.resolveWorkbench ?? resolveWorkbenchButtonLinks)(larkAppId);
+
   const cardJson = buildOverviewCard(
     {
       sessions: body.sessions ?? [],
       schedules: body.schedules ?? [],
       settings: body.settings,
     },
-    { invokerOpenId: adminOpenId, locale },
+    { invokerOpenId: adminOpenId, locale, workbench },
   );
 
   const sendUserMessage = testDeps.sendUserMessage ?? defaultSendUserMessage;

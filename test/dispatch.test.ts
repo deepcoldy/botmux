@@ -158,8 +158,9 @@ describe('dispatch completion switch wiring', () => {
     const end = source.indexOf('\nasync function ', start + 1);
     const report = source.slice(start, end);
 
-    expect(report).toContain("fetchDaemonIpc(daemon.ipcPort, '/api/trigger'");
-    expect(report).not.toContain('fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`');
+    expect(report).toContain('postCurrentSessionDaemonRoute({');
+    expect(report).toContain('path: REPORT_SESSION_RELAY_ROUTE');
+    expect(report).not.toContain("orchestrate-dispatch.json");
   });
 
   it('renders dispatch save feedback inside its own dashboard setting row', () => {

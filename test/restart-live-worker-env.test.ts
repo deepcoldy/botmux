@@ -38,7 +38,9 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
 }));
 
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   latestPerBotEnvForRestart,
   requestSessionRestart,
@@ -51,12 +53,30 @@ const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-serve
 
 let sessionCounter = 0;
 
-function makeDs(envWorker?: { killed?: boolean }) {
+// The mojo case below persists a quarantine record; keep it out of the real data
+// dir (config.session.dataDir is driven by SESSION_DATA_DIR).
+let quarantineDir: string;
+let previousDataDir: string | undefined;
+beforeEach(() => {
+  quarantineDir = mkdtempSync(join(tmpdir(), 'restart-env-quarantine-'));
+  previousDataDir = process.env.SESSION_DATA_DIR;
+  process.env.SESSION_DATA_DIR = quarantineDir;
+});
+afterEach(() => {
+  if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+  else process.env.SESSION_DATA_DIR = previousDataDir;
+  rmSync(quarantineDir, { recursive: true, force: true });
+});
+
+function makeDs(envWorker?: { killed?: boolean }, backendType = 'pty') {
   const send = vi.fn();
   const ds: any = {
     session: {
       sessionId: `env-restart-${++sessionCounter}`,
-      backendType: 'pty',
+      // Load-bearing for the launcher-env ledger, which is mojo-only: a local
+      // backend must never be recorded as a mojo quarantine (cross-backend
+      // contamination). Default stays pty so existing cases assert that.
+      backendType,
     },
     larkAppId: 'cli_app1',
     hasHistory: true,
@@ -86,6 +106,41 @@ describe('latestPerBotEnvForRestart (daemon-side env snapshot carrier)', () => {
     const { ds } = makeDs();
     expect(latestPerBotEnvForRestart(ds)).toEqual({ ANTHROPIC_BASE_URL: 'https://glm' });
     expect(getBotMock).toHaveBeenCalledWith('cli_app1');
+  });
+
+  it('records unprovable keys onto the generation ledger as a side effect (mojo only)', () => {
+    // Same choke point for all four restart senders, so recording here cannot be
+    // bypassed by a new caller. Without this the device-isolation proof forgets
+    // the env a live /restart actually handed to the running child: clean start →
+    // add LD_PRELOAD + restart → clear config without restarting leaves BOTH the
+    // spawn snapshot and the live config clean while the child stays hooked.
+    getBotMock.mockReturnValue({ config: { env: { LD_PRELOAD: '/tmp/hook.so' } } });
+    const { ds } = makeDs(undefined, 'mojo');
+    latestPerBotEnvForRestart(ds);
+    expect(ds.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
+
+    // Clearing the config afterwards must NOT erase it: the restart carrying the
+    // clean env can still fail or be coalesced, leaving the hooked child alive.
+    getBotMock.mockReturnValue({ config: { env: {} } });
+    expect(latestPerBotEnvForRestart(ds)).toEqual({});
+    expect(ds.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
+  });
+
+  it('does NOT record for a non-mojo backend', () => {
+    // The ledger answers "could a hooked MOJO client still run"; recording a
+    // tmux/codex session there is cross-backend contamination and would make it
+    // permanently unprovable.
+    getBotMock.mockReturnValue({ config: { env: { LD_PRELOAD: '/tmp/hook.so' } } });
+    const { ds } = makeDs();   // pty
+    latestPerBotEnvForRestart(ds);
+    expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
+  });
+
+  it('leaves the ledger untouched for a harmless or credential-only env', () => {
+    getBotMock.mockReturnValue({ config: { env: { X_JWT_TOKEN: 'a.b.c' } } });
+    const { ds } = makeDs();
+    latestPerBotEnvForRestart(ds);
+    expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
   });
 
   it('returns null when the config has no env (worker must clear its snapshot)', () => {

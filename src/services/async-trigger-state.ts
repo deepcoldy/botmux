@@ -76,7 +76,15 @@ export interface AsyncStateInputs {
   /** chatId from the live session or the stored record, if known. */
   chatId?: string;
   /** In-memory async result for the resolved trigger, if the session is live. */
-  memResult?: { status: 'pending' | 'completed'; content?: string; completedAt?: number; usage?: TurnUsageBuckets };
+  memResult?: {
+    status: 'pending' | 'completed' | 'failed';
+    content?: string;
+    completedAt?: number;
+    failedAt?: number;
+    errorCode?: 'trigger_failed';
+    terminalErrorCode?: string;
+    usage?: TurnUsageBuckets;
+  };
   /** triggerId the in-memory result is keyed under (latest or explicit). */
   memTriggerId?: string;
   /** Durable persisted result (survives restart), if any. */
@@ -90,8 +98,9 @@ export interface AsyncStateInputs {
       /** Present when status==='failed' — the authoritative dispatch outcome
        *  (e.g. `dispatch_unknown` for an at-most-once ambiguous crash). */
       failedAt?: number;
-      errorCode?: 'no_output';
-      reason?: 'dispatch_unknown';
+      errorCode?: 'no_output' | 'trigger_failed';
+      reason?: 'dispatch_unknown' | 'turn_terminal';
+      terminalErrorCode?: string;
     };
   };
   /** On-disk session record status: 'open' (active), 'closed', or absent. */
@@ -148,6 +157,35 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       finishedAt,
       async: { status: 'completed', sessionId, completedAt: finishedAt },
       message: 'async trigger completed',
+    };
+  }
+
+  const explicitFailure = inp.memResult?.status === 'failed' && inp.memTriggerId
+    ? {
+        triggerId: inp.memTriggerId,
+        failedAt: inp.memResult.failedAt,
+        terminalErrorCode: inp.memResult.terminalErrorCode,
+      }
+    : inp.persisted?.result.status === 'failed'
+      && inp.persisted.result.reason === 'turn_terminal'
+      ? {
+          triggerId: inp.persisted.triggerId,
+          failedAt: inp.persisted.result.failedAt,
+          terminalErrorCode: inp.persisted.result.terminalErrorCode,
+        }
+      : undefined;
+  if (explicitFailure) {
+    return {
+      ok: true,
+      state: 'failed',
+      triggerId: explicitFailure.triggerId,
+      target: { kind: 'turn', sessionId, chatId },
+      errorCode: 'trigger_failed',
+      error: `worker reported terminal failure: ${explicitFailure.terminalErrorCode ?? 'unknown'}`,
+      finishedAt: explicitFailure.failedAt
+        ? new Date(explicitFailure.failedAt).toISOString()
+        : undefined,
+      message: 'async trigger failed (worker terminal)',
     };
   }
 

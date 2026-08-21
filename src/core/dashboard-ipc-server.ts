@@ -5,9 +5,12 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
-import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
+import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
+import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
+import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import {
@@ -18,6 +21,11 @@ import {
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import {
+  cliModelSupportsReasoningEffort,
+  isConfigurableReasoningCliId,
+  isCodexReasoningEffort,
+} from '../services/codex-reasoning-effort.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -33,6 +41,7 @@ import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
+import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
@@ -63,7 +72,8 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
-import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
@@ -76,18 +86,22 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
-import { isSuspendableBackendType } from './persistent-backend.js';
+import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
+import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
+import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -110,7 +124,11 @@ import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-
 import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
-import { withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { tryWithBotTurnMutation, withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import {
+  SESSION_WAKE_DEADLINE_HEADER,
+  sessionWakeAcquireTimeoutMs,
+} from './session-wake-deadline.js';
 import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
@@ -185,7 +203,9 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -193,12 +213,21 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import {
+  isPreviewLoopbackHost,
+  isPreviewPort,
+  previewBackendSupported,
+  probeSessionPreviewTarget,
+  sessionPreviewDescriptor,
+} from './session-preview.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
-import { isRiffBackendSession } from './persistent-backend.js';
+import { isRemoteBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 import {
   commitDeviceIsolationActivation,
   DEVICE_ISOLATION_COMMIT_PATH,
@@ -561,10 +590,40 @@ function closeUntrustedRequestAfterResponse(req: IncomingMessage, res: ServerRes
 let injectedIpcSecret: string | null = null;
 /** Test seam: override the secret used to verify token-route HMAC. */
 export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
+let loggedUnsafeIpcSecretAt = 0;
+/**
+ * Load the machine-local dashboard secret used to verify token-route HMAC.
+ *
+ * Goes through {@link loadDashboardSecret} — the same strict host-authority
+ * reader the dashboard and daemon startup use — instead of a bare
+ * `readFileSync`: the leaf must be a regular 0600 file owned by the current
+ * user and must NOT be a symlink, and `~/.botmux` must not be
+ * group/other-writable. This is a per-request verifier on ~96 daemon IPC routes,
+ * so an attacker who can plant a symlink or loose-perms `.dashboard-secret` after
+ * boot must not have that content trusted as the HMAC key here (the dashboard
+ * caches its secret once at startup; this path re-reads every request, so it is
+ * the more exposed reader).
+ *
+ * Fail-closed either way: an unsafe shape returns `null` (→ nobody can sign →
+ * 401) rather than being followed. We log it — throttled, since this runs per
+ * request — so a planted/misconfigured credential is diagnosable instead of
+ * looking identical to "no secret on disk".
+ */
 function ipcAuthSecret(): string | null {
   if (injectedIpcSecret) return injectedIpcSecret;
-  try { return readFileSync(dashboardSecretPath(), 'utf8').trim() || null; }
-  catch { return null; }
+  try {
+    return loadDashboardSecret(dashboardSecretPath());
+  } catch (err) {
+    if (err instanceof UnsafeHostAuthorityFileError) {
+      const now = Date.now();
+      if (now - loggedUnsafeIpcSecretAt > 60_000) {
+        loggedUnsafeIpcSecretAt = now;
+        logger.error(`[dashboard-ipc] 拒绝使用不安全的 .dashboard-secret：${err.message}（IPC 鉴权 fail-closed）`);
+      }
+      return null;
+    }
+    return null;
+  }
 }
 /** Authenticate legacy terminal-token routes with the machine-local dashboard
  * secret. Workflow v3 mutations intentionally use their separate, full-request
@@ -630,9 +689,18 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename)$/.test(pathname)) return true;
+  // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
+  // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
+  // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/prompt-ctx\/claim$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // A sandboxed report cannot read the host HMAC secret. This narrow route
+  // validates the current session's rotating capability, binds the dispatch
+  // root server-side, then lets the trusted daemon relay to the orchestrator.
+  if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -1028,11 +1096,60 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     // never clear a stale pre-drain snapshot while a turn is still preparing.
     const current = findSessionRecord(params.sessionId);
     if (current && current.status === 'closed') {
-      return jsonRes(res, 200, { ok: true, alreadyClosed: true });
+      // A closed row can still carry an UNCANCELLED remote session (a quarantined
+      // lineage is parked, not cancelled). Short-circuiting to a bare success here
+      // meant a retry — or any client that lost the first response — could never
+      // learn about it, so replay the same outcome the close itself would report.
+      const residual = mojoCloseResidualForRow(current);
+      return jsonRes(res, 200, residual
+        ? { ok: true, outcome: 'closed_with_residual', residual, alreadyClosed: true }
+        : { ok: true, outcome: 'closed', alreadyClosed: true });
     }
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
   });
+});
+
+/**
+ * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
+ *
+ * 沙箱内的 `botmux user-prompt-hook` 不能在 read-only 的 `prompt-ctx/<sid>` 里
+ * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1：某轮漏 claim 会串轮到
+ * 后续轮）。hook 把 (session 凭据 + fingerprint) 提交到这里，宿主按
+ * **managedTurnOrigin.turnId 权威 turn 绑定**精确取该轮的 envelope，先删再返回。
+ * 漏 claim 只孤儿化自己那条，不污染后续轮；上一轮的 stale sidecar 永远不会被返回。
+ *
+ * 鉴权与 /close、/slash 同构：trusted-host HMAC，或本会话 rotating per-turn
+ * capability（沙箱内读 host secret 失败时的回退）。任何未命中/失败 → 404/403，
+ * hook 端空输出 exit 0（fail-open：reminder 丢失 < 卡住 prompt）。
+ */
+ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, params) => {
+  const body = await readJsonBody<{
+    fingerprint?: unknown;
+    prefix?: unknown;
+  } & Record<string, unknown>>(req).catch(() => ({}) as {
+    fingerprint?: unknown;
+    prefix?: unknown;
+  } & Record<string, unknown>);
+  const ds = findActiveBySessionId(params.sessionId);
+  // claim 只读 daemon 自有本轮非凭证上下文（reminder/whiteboard），receiver 会话
+  // 也允许（allowReceiver: true）；close/slash/cd 等 managed action 仍默认拒绝。
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const fingerprint = typeof body?.fingerprint === 'string' ? body.fingerprint : '';
+  if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_fingerprint' });
+  }
+  // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
+  // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
+  const turnId = ds?.managedTurnOrigin?.turnId;
+  if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
+  const prefix = typeof body?.prefix === 'string' && body.prefix.length > 0
+    ? body.prefix.slice(0, 64)
+    : undefined;
+  const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
+  if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, envelope });
 });
 
 // `botmux list` zombie pruning is maintenance, not explicit abandon. Serialize
@@ -1098,14 +1215,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
   }
-  // Riff owns a remote task lineage. Its worker deliberately refuses restart
-  // because destroy + respawn would sever or replace that lineage. Reject at
-  // the daemon boundary so the dashboard never reports HTTP 200 for a no-op.
-  if (isRiffBackendSession(ds)) {
+  // Every REMOTE backend owns a remote lineage that destroy + respawn would
+  // sever or replace (for mojo the worker restart actively cancels the remote
+  // session and cold-boots a context-less replacement). Reject at the daemon
+  // boundary so the dashboard never reports HTTP 200 for a lineage-destroying
+  // restart.
+  if (isRemoteBackendSession(ds)) {
     return jsonRes(res, 409, {
       ok: false,
-      error: 'riff_restart_unsupported',
-      message: t('cmd.restart.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+      error: 'remote_restart_unsupported',
+      message: t('cmd.restart.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
   if (rejectProtectedSessionMutation(res, [ds])) return;
@@ -1115,7 +1234,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
     // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
     try {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: String(err) });
     }
@@ -1131,6 +1250,57 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
   });
+});
+
+/** Materialize a dormant active session for a local `botmux list` attach.
+ * Unlike restart, this is idempotent when a live worker already exists: a Lark
+ * message may race the local picker, and that race must never restart an active
+ * turn. Empty input re-attaches/cold-resumes without creating a model turn. */
+ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
+  const initial = findActiveBySessionId(params.sessionId);
+  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const acquireTimeoutMs = sessionWakeAcquireTimeoutMs(
+    req.headers[SESSION_WAKE_DEADLINE_HEADER],
+  );
+  const mutation = await tryWithBotTurnMutation(initial.larkAppId, acquireTimeoutMs, () => {
+    // A picker that exits aborts its fetch. If the request was queued behind an
+    // admitted turn, never materialize the session after that caller is gone.
+    if (req.aborted || res.destroyed) return;
+    const ds = findActiveBySessionId(params.sessionId);
+    if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    if (isSessionTransferring(ds)) {
+      return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+    }
+    if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
+      return jsonRes(res, 409, { ok: false, error: 'adopt_wake_unsupported' });
+    }
+    // Every REMOTE backend (riff / mojo) owns a remote lineage that a local
+    // forkWorker cold-boot would sever or replace — the same reason /restart
+    // rejects them. A dormant remote session cold-resumes from its own lineage
+    // on the next message, never from a picker-driven local wake.
+    if (isRemoteBackendSession(ds)) {
+      return jsonRes(res, 409, { ok: false, error: 'remote_wake_unsupported' });
+    }
+    if (rejectProtectedSessionMutation(res, [ds])) return;
+
+    const cliId = ds.session.cliId ?? 'unknown';
+    if (ds.worker && !ds.worker.killed) {
+      return jsonRes(res, 200, {
+        ok: true,
+        sessionId: params.sessionId,
+        cliId,
+        woke: false,
+        reason: 'already_running',
+      });
+    }
+    if (!forkWorker(ds, '', ds.hasHistory)) {
+      return jsonRes(res, 409, { ok: false, error: 'wake_refused' });
+    }
+    jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, woke: true });
+  });
+  if (!mutation.acquired && !res.destroyed) {
+    jsonRes(res, 409, { ok: false, error: 'wake_mutation_timeout' });
+  }
 });
 
 /** Manually suspend one active session: kill the worker + CLI/pane, session
@@ -1157,6 +1327,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     // Worker already gone (idle-suspended / crash-stopped) — the goal state is
     // already reached, so report idempotent success without a live kill.
     return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
+  }
+  // Producing a reply — killing the worker now would drop this turn. Queue
+  // instead; worker-pool's runPendingSuspendIfSettled cashes it in on the
+  // idle/limited edge. Ordering matters: the idempotent no-worker branch above
+  // must win, so "worker was already gone" never reports as deferred.
+  //
+  // The suspendability check is part of the queueing condition, not a new guard
+  // ahead of it: a non-suspendable (pty) backend must keep falling through to
+  // suspendWorker's existing 409 rather than get a `deferred` that could only
+  // fail silently at fulfillment time.
+  if (
+    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing')
+    && isSuspendableBackendType(ds.initConfig?.backendType)
+  ) {
+    ds.pendingSuspendReason = 'manual_suspend';
+    // Bind the claim to the generation that is producing right now: it must not
+    // outlive that worker (see clearPendingSuspendClaim).
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    return jsonRes(res, 200, {
+      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
+    });
   }
   if (!suspendWorker(ds, 'manual_suspend')) {
     // Live worker but a non-suspendable (pty) backend: killing it would drop the
@@ -1255,6 +1446,7 @@ function sessionCliIpcAuth(
   ds: DaemonSession | undefined,
   sessionId: string,
   body: Record<string, unknown> | undefined,
+  opts: { allowReceiver?: boolean } = {},
 ): { ok: true } | { ok: false; error: string } {
   const claimedAttempt = typeof body?.originDispatchAttempt === 'number'
     && Number.isSafeInteger(body.originDispatchAttempt)
@@ -1265,7 +1457,9 @@ function sessionCliIpcAuth(
     trustedHost: isTrustedHostIpcRequest(req),
     sessionExists: !!ds,
     receiverSession: !!ds?.session.vcMeetingReceiver,
-    allowReceiver: false,
+    // close/slash/cd 是 managed action，默认拒绝 receiver；claim 只读 daemon 自有
+    // 本轮非凭证上下文（reminder/whiteboard），读自己本轮 reminder 非提权，单独放开。
+    allowReceiver: opts.allowReceiver === true,
     sessionId,
     liveOrigin: ds?.managedTurnOrigin,
     claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
@@ -1274,6 +1468,173 @@ function sessionCliIpcAuth(
   });
   return decision.ok ? { ok: true } : { ok: false, error: decision.error };
 }
+
+/**
+ * P1-12：会话血缘的根 pid——「谁有资格持有预览端口」的起点。
+ *
+ * worker fork 出来的进程树覆盖 pty 后端；tmux / zellij / herdr 这类后端的 CLI 是复用
+ * 器服务端的子进程、不在 worker 树下，所以 worker 通过私有 IPC 上报的 cliPid（以及
+ * adopt 会话接管的那个 CLI pid）必须单独作根，否则这些后端会被误判成「来路不明」。
+ */
+function previewOwnerPids(ds: DaemonSession): Array<number | undefined> {
+  return [
+    ds.worker?.pid,
+    ds.localProcessAttestation?.cliPid,
+    ds.session.pid,
+    ds.adoptedFrom?.originalCliPid,
+  ];
+}
+
+/** 当前权威代次。CAS 与 target 落盘都以它为准。 */
+function previewWorkerGeneration(ds: DaemonSession): number {
+  return ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+}
+
+/** Register one reachable loopback Web service for the exact calling session.
+ * This is the only route that can create preview routing state. An isolated CLI
+ * enters through the narrow capability aperture; a trusted host call is still
+ * path/port-bound by the outer daemon HMAC. The requested host is never DNS —
+ * only literal IPv4/IPv6 loopback is accepted, and the daemon connects before
+ * persisting the target. */
+ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req, 4_096);
+  } catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' },
+    );
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Riff 矩阵：远端 sandbox 的 Web 服务跑在远程主机上，daemon 这侧的 loopback 上
+  // 永远不会有它的监听。明确回 `preview_unsupported`，不要让它落进
+  // `preview_unreachable` 冒充「偶发故障」让 agent 反复重试。
+  if (!previewBackendSupported(ds.initConfig?.backendType ?? ds.session.backendType)) {
+    return jsonRes(res, 501, { ok: false, error: 'preview_unsupported' });
+  }
+  if (!isPreviewPort(body.port)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_port' });
+  }
+  if (body.host !== undefined && !isPreviewLoopbackHost(body.host)) {
+    return jsonRes(res, 403, { ok: false, error: 'remote_host_forbidden' });
+  }
+  // P1-13：probe 是一次 await。鉴权发生在 await **之前**，而 await 期间这个会话可能
+  // 已经被 close、被 refork、切了 CLI——那些路径都会推进代次并清掉 previewTarget。
+  // 捕获本次请求看到的对象与代次，回填前做 CAS 复核，不一致就整条丢弃：否则一个属于
+  // 上一代 CLI 的注册会被写进新一代（甚至已关闭）的会话里。
+  const generationAtEntry = previewWorkerGeneration(ds);
+  const workerAtEntry = ds.worker;
+  // P1-3：previewTarget 自己也得进 CAS 锚点。上面那四件只覆盖「跨代次/跨生命周期」，
+  // **同代次内的并发注册**不在它们的射程里：这条路由没有 per-session 串行化，agent
+  // 完全可以 `botmux preview 3000 & botmux preview 4000 &`，或者在 stale 清理在途时
+  // 重注册。而谁先落地由 probe 耗时决定，不是由请求先后决定——单 host 超时 750ms，
+  // 不带 host 时 127.0.0.1 与 ::1 串行试，「A 慢一秒、B 快一毫秒」是常规而非极端。
+  // 没有这一条，后 settle 的旧请求会无条件盖掉先落地的新值，两条 CLI 都打印
+  // 「✓ Web 预览已注册」，实际生效的却是哪一个不确定。
+  const previewAtEntry = ds.session.previewTarget;
+  const probe = await probeSessionPreviewTarget({
+    port: body.port,
+    ...(isPreviewLoopbackHost(body.host) ? { host: body.host } : {}),
+    ownerPids: previewOwnerPids(ds),
+    workerGeneration: generationAtEntry,
+  });
+  if (!probe.ok) {
+    if (probe.error === 'invalid_port') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_port' });
+    }
+    if (probe.error === 'preview_owner_unverified') {
+      // fail closed：有人在监听，但证明不了是本会话的进程（血缘外、procfs 不可读、
+      // 非 Linux 平台）。宁可没有预览，也不给出一条指向不明进程的代理路由。
+      return jsonRes(res, 422, {
+        ok: false,
+        error: 'preview_owner_unverified',
+        ...(probe.reason ? { reason: probe.reason } : {}),
+      });
+    }
+    return jsonRes(res, 422, { ok: false, error: 'preview_unreachable' });
+  }
+  const target = probe.target;
+  const current = findActiveBySessionId(params.sessionId);
+  const recheck = sessionCliIpcAuth(req, current, params.sessionId, body);
+  if (
+    current !== ds
+    || ds.session.status === 'closed'
+    || previewWorkerGeneration(ds) !== generationAtEntry
+    || ds.worker !== workerAtEntry
+    || !recheck.ok
+  ) {
+    return jsonRes(res, 409, { ok: false, error: 'preview_generation_changed' });
+  }
+  // 引用比较即「我 await 期间有没有别人写过这个字段」：注册整体替换对象，清理写
+  // undefined，两者都会改变引用。
+  if (ds.session.previewTarget !== previewAtEntry) {
+    return jsonRes(res, 409, { ok: false, error: 'preview_target_changed' });
+  }
+
+  const previous = ds.session.previewTarget;
+  ds.session.previewTarget = target;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch {
+    ds.session.previewTarget = previous;
+    return jsonRes(res, 500, { ok: false, error: 'preview_persist_failed' });
+  }
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { previewTarget: target } },
+  });
+  return jsonRes(res, 200, {
+    ok: true,
+    preview: sessionPreviewDescriptor(params.sessionId, target),
+  });
+});
+
+/**
+ * P1-12/P1-13：作废一个会话的预览目标。
+ *
+ * 由中央 Dashboard 在**代理落地前**发现归属已变（端口换了进程持有）时调用：代理侧
+ * 只有本机 procfs 的只读视角，改不了会话行，必须由持有会话的 daemon 来清字段 + 落盘
+ * + 广播 `preview: null`。仅 trusted host / HMAC 可用；幂等——本来就没有目标时回 200。
+ *
+ * P1-3：`?expectedRegisteredAt=` 指名要作废的是哪一次注册。判定失效发生在代理进程，
+ * 这条 DELETE 落地在 daemon 进程，中间隔着一次跨进程往返；那段窗口里会话完全可以合法
+ * 地重注册一个新目标，无条件清空会把它一起抹掉（fail-closed 方向没错，但 agent 刚拿到
+ * 的「✓ 已注册」会莫名其妙失效）。revision 不匹配时整条 no-op，回 `cleared: false`，
+ * 幂等语义不变。不带参数时保持原来的无条件语义。
+ */
+ipcRoute('DELETE', '/api/sessions/:sessionId/preview', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const expectedRegisteredAt = new URL(req.url ?? '/', 'http://localhost')
+    .searchParams.get('expectedRegisteredAt') ?? undefined;
+  const cleared = clearSessionPreviewTarget(
+    ds.session,
+    'listener ownership changed',
+    expectedRegisteredAt,
+  );
+  return jsonRes(res, 200, { ok: true, cleared });
+});
+
+/** Host-only daemon read API. It intentionally returns the browser-safe
+ * descriptor, not the literal loopback host/port used inside daemon SSE. */
+ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const preview = sessionPreviewDescriptor(params.sessionId, ds.session.previewTarget);
+  if (!preview) return jsonRes(res, 404, { ok: false, error: 'preview_not_registered' });
+  return jsonRes(res, 200, { ok: true, preview });
+});
 
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
@@ -1289,6 +1650,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
   // 会与人的输入交错。与 /suspend、/restart 同款排除。
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_inject_unsupported' });
+  }
+  // Remote backends (riff / mojo) have no TUI to inject a slash line into. For mojo
+  // the injection does not no-op either: MojoBackend.write() starts a REAL remote
+  // turn, and this IPC carries no credential snapshot (unlike message / raw_input),
+  // so an allowlisted slash sent after a JWT rotation or clear would run the turn
+  // on the worker's stale token. Refused rather than wired up: this is a TUI-only
+  // channel, and the same reasoning already hides the PTY quick-action keys for
+  // these backends.
+  const injectFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (injectFrozenType && isRemoteBackendType(injectFrozenType)) {
+    return jsonRes(res, 409, { ok: false, error: 'remote_backend_inject_unsupported' });
   }
   if ((!ds.worker || ds.worker.killed) && !isSessionTransferring(ds)) {
     return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
@@ -1409,14 +1781,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
   }
-  // Riff restart/kill is intentionally refused to preserve remote task
-  // lineage. Reject before validation/repin so the persisted cwd cannot drift
-  // from the still-running sandbox.
-  if (isRiffBackendSession(ds)) {
+  // Remote retirement (Riff AND Mojo) is intentionally refused without
+  // prepare/commit, so a cold restart cannot follow a repin here. Reject
+  // before validation/repin so the persisted cwd cannot drift from the
+  // still-running remote lineage — mojo used to slip past the riff-only
+  // guard, repin, and then killWorker's refusal left the live worker on the
+  // old cwd while the route reported cold-restart (P1-a split brain).
+  if (isRemoteBackendSession(ds)) {
     return jsonRes(res, 409, {
       ok: false,
-      error: 'riff_cd_unsupported',
-      message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+      error: 'remote_cd_unsupported',
+      message: t('cmd.cd.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
@@ -1449,7 +1824,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
     try {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
@@ -1595,7 +1970,15 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     sessionId,
     liveActive: !!ds,
     chatId: ds?.chatId ?? stored?.chatId,
-    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt, usage: memResult.usage } : undefined,
+    memResult: memResult ? {
+      status: memResult.status,
+      content: memResult.content,
+      completedAt: memResult.completedAt,
+      failedAt: memResult.failedAt,
+      errorCode: memResult.errorCode,
+      terminalErrorCode: memResult.terminalErrorCode,
+      usage: memResult.usage,
+    } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
     persisted,
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
@@ -2052,6 +2435,31 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 });
 
 /**
+ * Read-only twin of write-link: the base capability URL the Feishu card's
+ * 「打开 Web 终端」button also hands out (viewToken, never the write token).
+ * The viewToken here is the worker's PER-BOOT card token — it dies with the
+ * worker generation and is deliberately not bound to any dashboard auth
+ * session. The central dashboard therefore REPLACES it with a short-lived
+ * signed read grant bound to the requesting identity before answering its own
+ * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
+ * browser directly. That grant is also PINNED to the boot generation derived
+ * from this very token, so the value must be present and current — a live port
+ * left over from a previous boot (persisted `session.webPort` outliving the
+ * worker) is not enough. Same guard shape as write-link.
+ *
+ * Knowing any view capability never grants terminal input, so the link stays
+ * read-only by construction rather than by UI convention.
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port || !ds.workerViewToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
+});
+
+/**
  * Dashboard「复现命令」：返回该 active session 本次冷启的**近似**可复现 CLI 调用
  * （bin + argv + cwd + 权威注入 env），供用户粘到调试终端改参数复现。命令原样保留
  * （含 write token / --append-system-prompt / 凭证 env），与 write-link 同一把
@@ -2349,13 +2757,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
     return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   }
   try {
-    const messageId = await replyMessage(
-      ctx.larkAppId,
-      ctx.rootMessageId,
-      `<at user_id="${ctx.ownerOpenId}"></at>`,
-      'text',
-      true,
-    );
+    const messageId = await sendSessionOwnerThreadNotification({
+      larkAppId: ctx.larkAppId,
+      rootMessageId: ctx.rootMessageId,
+      ownerOpenId: ctx.ownerOpenId,
+    });
     jsonRes(res, 200, { ok: true, messageId });
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: String(err) });
@@ -2781,7 +3187,17 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const observedBotNames = observedBotsStore
         .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
         .map(b => b.name);
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, hasMessageListener, observedBotNames };
+      return {
+        ...c,
+        oncallChat: oncall ?? null,
+        firstSeenAt: seenMap.get(c.chatId) ?? null,
+        hasRole,
+        hasMessageListener,
+        observedBotNames,
+        // 会话群分型（p2pMode=group 自动创建）：dashboard 群面板据此把它们
+        // 收进独立折叠区，避免淹没需要人工管理的常驻群。
+        ...(isSessionGroup(c.chatId) ? { sessionGroup: true } : {}),
+      };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {
@@ -3070,6 +3486,7 @@ async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
   }
   return { ok: true, listener, limit: normalizeMessageListenerPreviewLimit(raw.limit) };
 }
+
 
 async function collectMessageListenerPreviewMatches(
   larkAppId: string,
@@ -3400,8 +3817,13 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
   const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
-  let p2pMode: 'thread' | 'chat' = 'chat';
-  try { if (getBot(cachedLarkAppId).config.p2pMode === 'thread') p2pMode = 'thread'; } catch { /* default chat */ }
+  let p2pMode: 'thread' | 'chat' | 'group' = 'chat';
+  try {
+    const configured = getBot(cachedLarkAppId).config.p2pMode;
+    if (configured === 'thread' || configured === 'group') p2pMode = configured;
+  } catch { /* default chat */ }
+  let envelopeInjection: 'auto' | 'off' = 'off';
+  try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -3419,6 +3841,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
   let model: string | null = null;
+  let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
+  // so the dashboard can render the dsh-only field with its current value.
+  let turnTimeoutMs: number | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3433,12 +3859,20 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
+    reasoningEffort = cfg.reasoningEffort ?? null;
+    turnTimeoutMs = typeof cfg.turnTimeoutMs === 'number'
+      && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
+      ? cfg.turnTimeoutMs
+      : null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
+  let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
   try {
-    const m = getBot(cachedLarkAppId).config.maxLiveWorkers;
+    const botConfig = getBot(cachedLarkAppId).config;
+    const m = botConfig.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+    sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
   let residentSessionCount = 0;
@@ -3507,6 +3941,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliPathOverride,
     wrapperCli,
     model,
+    reasoningEffort,
+    turnTimeoutMs,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -3538,18 +3974,22 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
+    feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
+    p2pOpen: grantPrefs.p2pOpen,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
+    envelopeInjection,
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    sessionOwnerReminder,
     logicalSessionCount,
     residentSessionCount,
     dormantSessionCount,
@@ -3699,6 +4139,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
+//   • p2pOpen: boolean                     — 私聊对话全开（talk-only；管理权仍只认 allowedUsers）
 //   • messageQuotaDefaultLimit: number|null — 卡片/Oncall 额度覆盖（null = 卡片内置 3 条、Oncall 不限）
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
@@ -3713,6 +4154,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   const body = raw as {
     restrictGrantCommands?: unknown;
     autoGrantRequestCards?: unknown;
+    p2pOpen?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
   };
@@ -3720,11 +4162,13 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   const patch: {
     restrictGrantCommands?: boolean;
     autoGrantRequestCards?: boolean;
+    p2pOpen?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
+  if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
@@ -3841,8 +4285,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -3854,7 +4298,29 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const reasoningEffortFieldPresent = Object.prototype.hasOwnProperty.call(body, 'reasoningEffort');
+  const reasoningEffort = isCodexReasoningEffort(body.reasoningEffort) ? body.reasoningEffort : null;
+  if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
+  }
   const currentBotConfig = getBot(larkAppId).config;
+  const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
+  // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
+  // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
+  // field is optional in the body, so distinguish absent (preserve) from
+  // present-but-empty (clear → runner default) like reasoningEffort does.
+  const supportsTurnTimeout = selected.cliId === 'dsh';
+  const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
+  let nextTurnTimeoutMs: number | undefined;
+  if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {
+    const n = Number(body.turnTimeoutMs);
+    // Positive integer within the arm-able bound; reject anything else so an
+    // over-bound value can't wrap to ~1ms in the runner's setTimeout.
+    if (!Number.isInteger(n) || n <= 0 || n > MAX_TURN_TIMEOUT_MS) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_turn_timeout_ms' });
+    }
+    nextTurnTimeoutMs = n;
+  }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
@@ -3947,7 +4413,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
-    const r = await rmwBotEntry(larkAppId, (entry) => {
+    const r = await rmwBotEntry<{
+      error?: 'reasoning_effort_not_supported_by_model';
+      nextReasoningEffort?: typeof reasoningEffort;
+    }>(larkAppId, (entry) => {
+    const nextReasoningEffort = supportsReasoningEffort
+      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+      : undefined;
+    if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
+      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
+    }
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
@@ -3965,23 +4440,44 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     }
     if (model) entry.model = model;
     else delete entry.model;
+    if (!supportsReasoningEffort) delete entry.reasoningEffort;
+    else if (reasoningEffortFieldPresent) {
+      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+      else delete entry.reasoningEffort;
+    }
+    // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
+    // field value writes/clears it, absence preserves the current value.
+    if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
+    else if (turnTimeoutFieldPresent) {
+      if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
+      else delete entry.turnTimeoutMs;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
       readIsolationCleared = true;
     }
-    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
-    if (selected.cliId === 'riff') {
-      entry.backendType = 'riff';
-    } else if (entry.backendType === 'riff') {
-      // 从 riff 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在 RiffBackend 上（PTY 分块输入被当成一串 riff
-      // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
+    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
+    // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
+    // 硬编码 riff。
+    if (isRemoteCliId(selected.cliId)) {
+      entry.backendType = selected.cliId as typeof entry.backendType;
+    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
       delete entry.backendType;
     }
-    return { write: true, result: null };
+    return { write: true, result: { nextReasoningEffort } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (r.result.error) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: r.result.error,
+        message: `模型 ${model || '（Agent 默认模型）'} 不支持当前思考强度`,
+      });
+    }
 
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
@@ -3990,10 +4486,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
+    if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
+    else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    // Mirror the entry write: non-dsh clears it, dsh with an explicit field
+    // takes the parsed value, dsh without the field preserves the existing one.
+    if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
+    else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
     if (readIsolationCleared) bot.config.readIsolation = false;
-    if (selected.cliId === 'riff') {
-      bot.config.backendType = 'riff';
-    } else if (bot.config.backendType === 'riff') {
+    if (isRemoteCliId(selected.cliId)) {
+      bot.config.backendType = selected.cliId as typeof bot.config.backendType;
+    } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
       bot.config.backendType = undefined;
     }
 
@@ -4009,8 +4511,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
+      reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       selectionKey,
-      closedMismatchedSessions,
+      // Number kept for compatibility with an older dashboard bundle; the residual
+      // count rides alongside so a hot CLI switch cannot silently strand a remote
+      // session behind a plain "closed N". (mojo/riff sessions live off-box, so a
+      // local row can close while the remote one survives.)
+      closedMismatchedSessions: closedMismatchedSessions.closed,
+      closedMismatchedResidual: closedMismatchedSessions.residual,
+      closedMismatchedFailed: closedMismatchedSessions.failed,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.
@@ -4025,9 +4535,90 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   });
 });
 
-// Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' }`:
+// ─── 会话群标签授权（feed-group OAuth，Dashboard 一站式流程）────────────────
+// POST /api/oauth-callback {url} — dashboard 的 /oauth/callback 接收页把回调
+// URL 广播给各 daemon；state 在本进程 pendingLogins 里的那个完成 code→token
+// 交换，其它 daemon 返回 matched:false 让 dashboard 继续尝试下一个。
+ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
+  let body: { url?: unknown };
+  try { body = await readJsonBody<{ url?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.url !== 'string' || !body.url.trim()) {
+    return jsonRes(res, 400, { ok: false, error: 'url_required' });
+  }
+  const result = await tryHandleCallbackUrl(body.url.trim());
+  if (!result) return jsonRes(res, 200, { ok: false, matched: false, message: 'not a callback url' });
+  jsonRes(res, 200, { ok: result.ok, matched: result.matched, message: result.message });
+});
+
+// POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。
+// state 存本 daemon 进程内存，回调必须经由上面的 /api/oauth-callback 回到
+// 同一进程完成，故链接生成与回调处理都放 IPC 侧。
+ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const { authUrl } = generateAuthUrl(
+      cfg.larkAppId,
+      cfg.larkAppSecret,
+      normalizeBrand(cfg.brand),
+      FEED_GROUP_OAUTH_SCOPES,
+    );
+    jsonRes(res, 200, { ok: true, authUrl });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）。
+ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group' });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
+// selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
+// 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
+// 'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）|
+// 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更内存注册表，与
+// /botconfig 同一持久化通道。
+ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { mode?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body.mode === 'chat-tag' || body.mode === 'feed-group' || body.mode === 'off'
+    ? body.mode : undefined;
+  if (!mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
+      if (!entry.sessionGroup || typeof entry.sessionGroup !== 'object') entry.sessionGroup = {};
+      if (!entry.sessionGroup.tag || typeof entry.sessionGroup.tag !== 'object') entry.sessionGroup.tag = {};
+      entry.sessionGroup.tag.mode = mode;
+      return { write: true, result: mode };
+    });
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    bot.config.sessionGroup = {
+      ...(bot.config.sessionGroup ?? {}),
+      tag: { ...(bot.config.sessionGroup?.tag ?? {}), mode },
+    };
+    jsonRes(res, 200, { ok: true, tagMode: mode });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' | 'group' }`:
 //   • 'chat'（默认）    → 私聊走扁平连续 chat-scope 会话
 //   • 'thread'          → 显式回到每条 DM 独立 thread-scope 会话
+//   • 'group'           → 每条顶层 DM 自动建专属会话群并把会话落进去
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），保证一致。
 ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -4037,11 +4628,30 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
 
   const spec = findConfigField('p2pMode');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
-  // 只有 'thread' 有意义；其它（含 'chat'，新默认)一律清回默认，bots.json 保持干净。
-  const value = body.p2pMode === 'thread' ? 'thread' : null;
+  // 只有 'thread' / 'group' 有意义；其它（含 'chat'，新默认)一律清回默认，bots.json 保持干净。
+  const value = body.p2pMode === 'thread' ? 'thread' : body.p2pMode === 'group' ? 'group' : null;
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, p2pMode: value ?? 'chat' });
+});
+
+// Per-bot 每轮上下文注入方式 envelopeInjection（#794）。Body `{ envelopeInjection: 'auto'|'off'|'' }`:
+//   • 'auto' → 支持的 CLI（claude-code）把 reminder/whiteboard 经 UserPromptSubmit
+//     hook 注入为 system-reminder，user turn 只留消息本身；不支持的自动回退内联
+//   • 'off'/其它 → 内联 envelope（历史行为，默认）
+// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），下一个 follow-up turn 生效。
+ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { envelopeInjection?: unknown };
+  try { body = await readJsonBody<{ envelopeInjection?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('envelopeInjection');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const value = body.envelopeInjection === 'auto' ? 'auto' : null;
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
 });
 
 // Per-bot 内置技能注入模式 skillInjection。Body `{ skillInjection: 'global'|'prompt'|'off'|'' }`:
@@ -4167,6 +4777,44 @@ ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
   jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
 });
 
+ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { feedback?: unknown };
+  try { body = await readJsonBody<{ feedback?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('feedback');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.feedback === 'string' ? body.feedback : '';
+  let value: unknown = null;
+  if (raw.trim()) {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, feedback: value });
+});
+
+ipcRoute('PUT', '/api/chat-feedback/:chatId', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { feedback?: unknown };
+  try { body = await readJsonBody<{ feedback?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const feedback = body.feedback === null || body.feedback === undefined ? null : body.feedback;
+  const result = await setChatFeedbackPolicy(cachedLarkAppId, decodeURIComponent(params.chatId), feedback as any);
+  if (!result.ok) return jsonRes(res, result.reason === 'bot_not_registered' ? 404 : 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, feedback });
+});
+
+ipcRoute('GET', '/api/feedback-effective', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const chatId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('chatId') || undefined;
+  jsonRes(res, 200, { ok: true, trace: traceFeedbackPolicyForDelivery({
+    dataDir: config.session.dataDir, larkAppId: cachedLarkAppId, chatId, bot: getBot(cachedLarkAppId).config,
+  }) });
+});
+
 // Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如
 // `{"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"}` 让本 bot 走 GLM/第三方
 // 服务商）：空白 → 清除；否则按 json kind 解析 + sanitizePerBotEnv 过滤后落盘。
@@ -4277,6 +4925,16 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+ipcRoute('PUT', '/api/bot-session-owner-reminder', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const result = await updateSessionOwnerReminderConfig(cachedLarkAppId, raw);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  return jsonRes(res, 200, { ok: true, sessionOwnerReminder: result.config });
 });
 
 // Per-bot skill policy. Dashboard uses this for attach/detach; JSON policy

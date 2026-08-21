@@ -4,7 +4,13 @@
  * Run: pnpm vitest run test/builtin-skills.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { ASK_SKILL, BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from '../src/skills/definitions.js';
+import { ASK_SKILL, BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME, WORKFLOW_FEATURE_SKILLS } from '../src/skills/definitions.js';
+
+/** The v3 Workflow skill family is factored out of BUILTIN_SKILLS into a
+ *  feature-gated group (WORKFLOW_FEATURE_SKILLS); these content assertions look
+ *  across both so they keep pinning the SKILL.md text regardless of which array
+ *  a skill lives in. */
+const ALL_DEFINED_SKILLS = [...BUILTIN_SKILLS, ...WORKFLOW_FEATURE_SKILLS];
 
 describe('built-in botmux-send skill', () => {
   it('teaches safe multiline sends across Unix and Windows shells', () => {
@@ -65,7 +71,7 @@ describe('built-in botmux-quoted skill', () => {
 
 describe('built-in botmux-workflow-create skill', () => {
   it('is retained only for read-only v2 migration and never teaches execution', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');
+    const skill = ALL_DEFINED_SKILLS.find(s => s.name === 'botmux-workflow-create');
     expect(skill).toBeDefined();
     const frontmatter = skill!.content.split('---')[1] ?? '';
     expect(frontmatter).toContain('v2 已下线');
@@ -114,7 +120,7 @@ describe('built-in botmux-workflow-create skill', () => {
 
 describe('built-in botmux-workflow skill (v3 ad-hoc + Saved Workflow)', () => {
   it('统一即兴和复用入口，并教全套 host 命令序 + spec 契约', () => {
-    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow');
+    const skill = ALL_DEFINED_SKILLS.find(s => s.name === 'botmux-workflow');
     expect(skill).toBeDefined();
     // Saved Workflow 与自然语言等价入口
     expect(skill!.content).toContain('botmux workflow save last');
@@ -148,7 +154,7 @@ describe('built-in botmux-workflow skill (v3 ad-hoc + Saved Workflow)', () => {
   });
 
   it('定义稳定的 workflow 边界，不绑定长期多 bot 方案名称', () => {
-    const workflow = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow')!.content;
+    const workflow = ALL_DEFINED_SKILLS.find(s => s.name === 'botmux-workflow')!.content;
     const orchestrate = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate')!.content;
     for (const phrase of ['有界 DAG', '跑完即散', '一个交付物']) {
       expect(workflow).toContain(phrase);
@@ -170,6 +176,34 @@ describe('built-in botmux-bots skill (collaboration roster)', () => {
     expect(skill!.content).toContain('hasTeamRole');
     expect(skill!.content).toContain('/introduce');
     expect(skill!.content).toContain('botmux-handoff');
+  });
+
+  it('documents the dispatch/collaboration decision fields and the inline help', () => {
+    // Guards against doc drift: the CLI output carries dispatch/collaboration
+    // blocks + a top-level collaborationHelp. An agent that reads this skill
+    // (not just the injected inline help) must learn those fields exist and
+    // that `unknown` means "no evidence", not "offline".
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
+    expect(skill!.content).toContain('dispatch');
+    expect(skill!.content).toContain('collaboration');
+    expect(skill!.content).toContain('collaborationHelp');
+    expect(skill!.content).toContain('operate');
+    expect(skill!.content).toContain('unknown');
+  });
+
+  it('documents team-scope discovery + cross-machine group creation and their opt-in gate', () => {
+    // Team维度 Agent 互查: --scope team discovery + create-group --team, plus the
+    // opt-in (team.bots) gate and the boundary vs the Feishu /invite slash.
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
+    expect(skill!.content).toContain('--scope team');
+    expect(skill!.content).toContain('create-group --team');
+    expect(skill!.content).toContain('bots invite');
+    expect(skill!.content).toContain('--agent');
+    expect(skill!.content).toContain('specialties');
+    expect(skill!.content).toContain('opt-in');
+    // Self-reported → not a trusted credential; CLI does no authorization.
+    expect(skill!.content).toContain('不是可信凭据');
+    expect(skill!.content).toContain('/invite');
   });
 });
 

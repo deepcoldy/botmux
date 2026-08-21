@@ -6,6 +6,7 @@ import {
   ui,
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 
@@ -470,7 +471,10 @@ export function restartConfirmMessage(s: any): string {
 }
 
 export function canRestartSession(s: any): boolean {
-  return s.status !== 'closed' && !s.adopt && !s.pendingRepo && s.cliId !== 'riff';
+  // No restart for ANY remote CLI, matching the Feishu card render surface and
+  // the server's 409 (remote_restart_unsupported): a riff worker refuses the
+  // IPC, and a mojo worker executes it — cancelling the remote session.
+  return s.status !== 'closed' && !s.adopt && !s.pendingRepo && !isRemoteCliId(s.cliId);
 }
 
 export interface PickerBot { larkAppId: string; botName: string; }

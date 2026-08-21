@@ -46,6 +46,40 @@ export function findStdinAliasAttachment(paths: readonly string[]): string | nul
   return null;
 }
 
+export type SlashSendValidation =
+  | { ok: true; command: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate the body of a `botmux send --slash "<cmd>"`.
+ *
+ * `--slash` exists so one bot can hand another a NATIVE slash command that the
+ * receiving daemon relays into the CLI verbatim (passthrough: /clear, /model,
+ * …) or routes as a daemon command (/close, …). The ordinary `send` path wraps
+ * every message in an interactive card whose body picks up a `[🔊 语音总结]`
+ * footer line, so the receiver sees a MULTI-LINE message and
+ * `parseSlashCommandInvocation` (which only treats /schedule|/role|/fork as
+ * multi-line commands) drops it to an ordinary prompt — the command never
+ * reaches the passthrough/daemon router. A `--slash` send therefore MUST go out
+ * as a single-line plain-`text` message.
+ *
+ * Fail LOUD rather than silently sending junk: the content has to be exactly one
+ * line and start with `/`. Leading/trailing whitespace is trimmed (a trailing
+ * newline from a heredoc is the common case); an interior newline is rejected so
+ * the caller notices instead of the daemon quietly treating it as prose.
+ */
+export function validateSlashSend(raw: string): SlashSendValidation {
+  const command = raw.trim();
+  if (!command) return { ok: false, error: '--slash 需要一条斜杠命令，例如 --slash "/clear"' };
+  if (/[\r\n]/.test(command)) {
+    return { ok: false, error: '--slash 只能发送单行斜杠命令（收到含换行的多行内容）' };
+  }
+  if (!command.startsWith('/')) {
+    return { ok: false, error: `--slash 内容必须以 / 开头（收到 ${JSON.stringify(command.slice(0, 24))}）` };
+  }
+  return { ok: true, command };
+}
+
 export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   dispatch: (content: string, msgType: string) => Promise<string>;

@@ -10,7 +10,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 const structuralDeps = {
   workingDirReady: (bot: { workingDir?: string }) => !!bot.workingDir,
   reliableTurnTerminal: (bot: { cliId?: string }) => bot.cliId === 'claude-code',
-  managedSideEffectIsolation: () => true,
+  managedSideEffectEligible: () => true,
+  sandboxIsolated: () => true,
 };
 
 async function freshModules() {
@@ -338,13 +339,14 @@ describe('lock-protected default VC consumer profile bootstrap', () => {
     }
   });
 
-  it('does not seed a receiver that lacks managed side-effect isolation', async () => {
+  it('does not seed a receiver that is ineligible (e.g. requested sandbox is undeliverable)', async () => {
     writeConfig([listener()]);
     const before = readConfig();
     const { bootstrap } = await freshModules();
     const result = await bootstrap.bootstrapVcMeetingDefaultConsumerProfile('listener', {
       ...structuralDeps,
-      managedSideEffectIsolation: () => false,
+      managedSideEffectEligible: () => false,
+      sandboxIsolated: () => false,
     });
     expect(result).toEqual({ ok: true, seeded: false, reason: 'no_eligible_agent' });
     expect(readConfig()).toEqual(before);

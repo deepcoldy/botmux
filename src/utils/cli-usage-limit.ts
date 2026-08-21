@@ -120,26 +120,36 @@ export interface DetectUsageLimitOptions {
 
 /**
  * Whether a CLI adapter is authoritative for structured rate limits — i.e. it
- * actually PUBLISHES a `limited` screen_update from its transcript. Only the
- * Claude family does (via the worker's `maybeEmitStructuredRateLimit` on the
- * `bridgeJsonlPath` path), and it is exactly the adapters that carry
- * `claudeDataDir`. When true, the worker passes `suppressRateKind` so the
- * screen-scan `rate` verdict is suppressed in favor of the structured signal.
+ * actually PUBLISHES a `limited` screen_update from a machine signal in its
+ * transcript rather than from scraping screen text. Two families qualify:
  *
- * Gate on `claudeDataDir`, NOT `reliableTurnTerminal`: the codexBridgeQueue
- * CLIs emit NO structured `limited` state, so suppressing their screen `rate`
- * would drop the Dashboard「需要你」signal + backoff on a real 429. Most of
- * them (codex / grok / traex) DO set `reliableTurnTerminal`, so gating on that
- * flag would wrongly suppress them; pi is also codexBridgeQueue-backed but does
- * not set it — either way, none carry `claudeDataDir`, so all correctly stay
- * screen-scanning. Extracted as a pure predicate so the split has a direct
- * unit-test surface (see cli-usage-limit.test.ts) — a future adapter can't
- * silently re-broaden it.
+ *  - The Claude family (`claudeDataDir`): the worker's
+ *    `maybeEmitStructuredRateLimit` reads the transcript's `error:"rate_limit"`
+ *    record on the `bridgeJsonlPath` path.
+ *  - Codex (`emitsStructuredRateLimit`): `maybeEmitCodexStructuredRateLimit`
+ *    reads the rollout's `codex_rate_limited` terminal (`isCodexRateLimitEvent`)
+ *    and emits `limited`. This emit runs only under the `structuredBridgeIsCodex`
+ *    gate, so among codexBridgeQueue CLIs only codex sets the flag.
+ *
+ * When true the worker passes `suppressRateKind` so the screen-scan `rate`
+ * verdict is dropped in favor of the structured signal — otherwise the model's
+ * own output (or a dev editing rate-limit code) puts "429" / "exceeded retry
+ * limit" on screen and the scraper cannot tell a printed 429 from a request
+ * that actually returned 429.
+ *
+ * The other codexBridgeQueue CLIs (grok / traex / pi / hermes / mtr / cursor)
+ * emit NO structured `limited` state, so they must keep screen-scanning: set
+ * neither field on them or a real 429 silently loses its backoff + Dashboard
+ * 「需要你」signal. Most set `reliableTurnTerminal`, so gating on that flag would
+ * wrongly suppress them; gating on these two explicit capability fields keeps
+ * the split exact. Extracted as a pure predicate so it has a direct unit-test
+ * surface (see cli-usage-limit.test.ts) — a future adapter can't silently
+ * re-broaden it.
  */
 export function isStructuredRateLimitAuthoritative(
-  adapter: { readonly claudeDataDir?: string } | null | undefined,
+  adapter: { readonly claudeDataDir?: string; readonly emitsStructuredRateLimit?: boolean } | null | undefined,
 ): boolean {
-  return !!adapter?.claudeDataDir;
+  return !!adapter?.claudeDataDir || !!adapter?.emitsStructuredRateLimit;
 }
 
 export function detectCliUsageLimit(

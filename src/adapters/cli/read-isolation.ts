@@ -21,6 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import type { SessionProbe } from '../backend/types.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -321,10 +322,21 @@ export function buildSeatbeltProfile(
 //     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
 //     migration prompt. That is a new spawn-time mount; a pane predating it warm-
 //     reattaches with the old mount set and still wedges, so it must cold-spawn.
+//   · 9 → 10: credential-only Seatbelt/bwrap panes receive a private rotating
+//     managed-origin channel for capability-gated daemon IPC. A warm pane with
+//     the v9 marker lacks both the env and the private read carve-out.
+//   · 10 → 11: provenance proofs gain a two-phase `state:'pending'|'committed'`
+//     lifecycle (generational-race fix). A v10 marker was written UNCONDITIONALLY
+//     BEFORE spawn (the vulnerable path) and has NO `state` field, so a late-winner
+//     pane may already wear a "valid" v10 marker it never earned. Requiring v11 +
+//     strict `state:'committed'` forces every pre-existing no-state marker to
+//     cold-spawn ONCE under the new pending→commit contract — closing the INSTALLED
+//     BASE risk, not just new spawns. (A legacy no-state marker is now version-
+//     rejected, so validators no longer need to tolerate `state===undefined`.)
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
 // cold-spawns under the current contract rather than bypassing a migration.
-export const ISOLATION_PANE_MARKER_VERSION = 9;
+export const ISOLATION_PANE_MARKER_VERSION = 11;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -410,12 +422,17 @@ export function isolationPaneMarkerContent(
   if (policy
     && (!/^[a-f0-9]{64}$/.test(policy.originChannelId)
       || !/^[a-f0-9]{64}$/.test(policy.policyDigest))) {
-    throw new Error('invalid Darwin isolation marker policy');
+    throw new Error('invalid isolation marker policy');
   }
   return JSON.stringify({
     version: ISOLATION_PANE_MARKER_VERSION,
     bootId,
     capabilities: normalizeIsolationCapabilities(capabilities),
+    // Committed = an attributably-fresh generation was established (the proof is
+    // written PENDING before the pane exists, then rewritten committed only after
+    // spawn confirms a fresh, non-reattached generation). isolatedPaneReattachSafe
+    // refuses anything whose state is present-but-not-'committed'.
+    state: 'committed',
     ...(policy ?? {}),
   });
 }
@@ -431,6 +448,104 @@ export function isolatedPaneOriginChannel(
       : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** Directory holding per-session persistent-pane provenance files. */
+export function persistentPaneProvenanceDir(runtimeDataDir: string): string {
+  return `${runtimeDataDir.replace(/\/+$/, '')}/read-isolation`;
+}
+
+/** ISOLATION marker path (`<sid>.boot`) — stamped for a policy-ON sandboxed pane. */
+export function isolationPaneMarkerPath(runtimeDataDir: string, sessionId: string): string {
+  return `${persistentPaneProvenanceDir(runtimeDataDir)}/${assertSafeAppId(sessionId)}.boot`;
+}
+
+/** TOMBSTONE path (`<sid>.policy-off`) — positively proves a live pane was
+ *  cold-spawned by the current NO-SANDBOX policy (see
+ *  {@link evaluatePersistentPaneMigration}). Distinct filename so it survives /
+ *  is cleared independently of the isolation marker. */
+export function policyOffTombstonePath(runtimeDataDir: string, sessionId: string): string {
+  return `${persistentPaneProvenanceDir(runtimeDataDir)}/${assertSafeAppId(sessionId)}.policy-off`;
+}
+
+/** Tombstone body: a self-describing, version-stamped generation proof. Content
+ *  is diagnostic-bearing but its PRESENCE-as-valid (not equality to any live boot
+ *  id) is the reattach signal — a legitimate policy-off pane warm-reattaches
+ *  across daemon restarts, so binding to the current boot id would cold-spawn it
+ *  every restart. bootId is kept only for diagnostics.
+ *
+ *  `state:'committed'` is REQUIRED for authorization: a proof is written first as
+ *  PENDING (see {@link provenancePendingContent}) before the pane is created, and
+ *  only rewritten to committed once the fresh generation is attributably
+ *  established (see the generational-race guard in worker.ts). A pending record
+ *  never authorizes a reattach — {@link policyOffTombstoneValid} rejects it. */
+export function policyOffTombstoneContent(bootId: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId, state: 'committed' });
+}
+
+/**
+ * PENDING provenance body: written to the FINAL proof path BEFORE `backend.spawn()`
+ * for a predicted-fresh persistent launch, then rewritten to the committed body
+ * only after the fresh generation is attributably established. It carries a random
+ * `nonce` (compare-before-replace at commit time, so a superseded generation's
+ * deferred callback can't overwrite a newer pending) and, deliberately, NEITHER a
+ * committed `state` NOR the structural fields the validators require — so both
+ * {@link policyOffTombstoneValid} and {@link isolatedPaneReattachSafe} reject it
+ * outright. Its on-disk PRESENCE still drives the conservative guard: a pending
+ * file means "this system KNOWS a generation's attribution is incomplete", which
+ * is STRONGER than legacy provenance and dominates the migration scope (a live
+ * pane with a pending proof is always killed + cold-spawned; see
+ * {@link evaluatePersistentPaneMigration}).
+ */
+export function provenancePendingContent(nonce: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, state: 'pending', nonce });
+}
+
+/** Extract the pending nonce for the compare-before-replace at commit time.
+ *  Returns the nonce string only for a well-formed pending record read from a
+ *  secure 0600 file; null otherwise (so a garbage/committed/absent file never
+ *  matches a live launch's nonce). */
+export function provenancePendingNonce(content: string | null | undefined): string | null {
+  try {
+    const parsed = JSON.parse(content ?? '') as { state?: unknown; nonce?: unknown };
+    return parsed.state === 'pending' && typeof parsed.nonce === 'string' && parsed.nonce.length > 0
+      ? parsed.nonce
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate a policy-off tombstone body (already securely read from a real 0600
+ * file by the caller — see readManagedOriginAuthorityFile). Returns true only for
+ * a well-formed CURRENT-version `policyOff:true` record with a non-empty string
+ * bootId. bootId is NOT compared to the live daemon boot id (a legit policy-off
+ * pane must reattach across restarts); it only has to be present + a string, so a
+ * blank/garbage/structurally-wrong tombstone cannot authorize a warm reattach.
+ * Mirror of {@link isolatedPaneReattachSafe}'s fail-closed parse discipline, but
+ * for the opposite polarity: here VALID authorizes reattach.
+ *
+ * A `state:'pending'` record is explicitly rejected (an incomplete generation
+ * proof must never authorize). `state` is now REQUIRED to equal 'committed': the
+ * v11 version bump means every legitimate proof carries it, so a missing/other
+ * state is refused (this is what forces a pre-v11 no-state marker — possibly
+ * washed onto a late-winner pane under the old pre-spawn-write path — to
+ * cold-spawn once instead of being trusted).
+ */
+export function policyOffTombstoneValid(content: string | null | undefined): boolean {
+  try {
+    const parsed = JSON.parse(content ?? '') as {
+      version?: unknown; policyOff?: unknown; bootId?: unknown; state?: unknown;
+    };
+    return parsed.version === ISOLATION_PANE_MARKER_VERSION
+      && parsed.policyOff === true
+      && typeof parsed.bootId === 'string'
+      && parsed.bootId.trim().length > 0
+      && parsed.state === 'committed';
+  } catch {
+    return false;
   }
 }
 
@@ -467,10 +582,18 @@ export function isolatedPaneReattachSafe(
       writeSandbox?: unknown;
       originChannelId?: unknown;
       policyDigest?: unknown;
+      state?: unknown;
     };
     if (parsed.version !== ISOLATION_PANE_MARKER_VERSION
       || typeof parsed.bootId !== 'string'
       || parsed.bootId.trim().length === 0
+      // A committed generation proof is REQUIRED. A PENDING record (written before
+      // the pane is attributably established) must never authorize; and with the
+      // v11 bump every legitimate marker carries state:'committed', so a
+      // missing/other state (e.g. a washed pre-v11 no-state marker) is refused →
+      // cold-spawn once. (Version check above already rejects pre-v11; this keeps
+      // the contract explicit and rejects a same-version pending.)
+      || parsed.state !== 'committed'
       || !Array.isArray(parsed.capabilities)
       || parsed.capabilities.some(capability =>
         typeof capability !== 'string'
@@ -507,6 +630,315 @@ export function isolatedPaneReattachSafe(
   } catch {
     return false;
   }
+}
+
+/**
+ * Persistent-pane (tmux/zellij/herdr/zmx) reattach migration decision — the pure
+ * state machine behind the worker's stale-pane guard. Isolation is injected at
+ * CLI *spawn* time and lives on the RUNNING process, so a pane that survives a
+ * daemon restart keeps whatever confinement it was born with. This function
+ * decides, from persisted evidence + the current policy, whether the live pane
+ * may be warm-reattached or must be killed + cold-spawned under the new policy.
+ *
+ * Two provenance files live under `<runtimeDataDir>/read-isolation/`:
+ *   · `<sid>.boot`      — ISOLATION marker: written (best-effort) when a policy-ON
+ *                         (sandboxed) pane is spawned. Its capabilities/policy are
+ *                         version-checked by {@link isolatedPaneReattachSafe}.
+ *   · `<sid>.policy-off` — TOMBSTONE: written when a policy-OFF (no-sandbox) pane
+ *                         is cold-spawned, positively proving "this generation was
+ *                         created by the current no-sandbox policy".
+ *
+ * Why a tombstone and not just "no isolation marker": the isolation stamp is
+ * BEST-EFFORT (its write is wrapped in try/catch and the spawn proceeds anyway),
+ * so "no marker" does NOT prove the live process was never isolated — a sandboxed
+ * pane whose stamp write lost a race/perm/disk error looks identical. Under
+ * policy-OFF we therefore require POSITIVE, VALIDATED proof (a tombstone that
+ * passes secure-read + schema check) to warm-reattach; any other shape (isolation
+ * marker present, tombstone missing/invalid, or NEITHER file) is treated as
+ * possibly-still-confined and killed. Absence is never trusted as safe.
+ *
+ * Scope is split by policy direction:
+ *   · policy ON (file sandbox OR credential-only `credential` cap): the exact-
+ *     capability/policy check runs on EVERY persistent backend — credential-only
+ *     panes exist on zellij/herdr/zmx too, so this must NOT be tmux-scoped.
+ *   · policy OFF migration arm: scoped to `noTransport && isolationCapableBackend`
+ *     (only no-transport tmux was ever file-force-isolated by the removed rule).
+ *     An ordinary transport chat / non-tmux backend is never subjected to the
+ *     tombstone requirement — no false kills — though a DEAD pane's stale
+ *     provenance is still cleared so it cannot mislead a later decision.
+ *
+ * Existence flags MUST come from no-follow existence probes (a planted/tampered
+ * leaf that fails to parse still counts as present, so it can never be used to
+ * force a silent reattach). `policyOffTombstoneValid` is the secure-read result.
+ *
+ * Pane liveness is TRI-STATE (`paneProbe`: exists | missing | unknown), NOT a
+ * boolean. `unknown` (the backend could not answer) is never collapsed into
+ * "dead": a still-alive, still-confined pane whose probe is momentarily `unknown`
+ * would otherwise have its provenance cleared and be cold-spawned around, silently
+ * downgrading confinement. On `unknown` the machine returns
+ * `refuse-inconclusive-probe` (fail-closed) whenever anything is at stake — policy
+ * ON, in the policy-off migration scope, or ANY provenance on disk — and only
+ * `skip`s when a wholly unconcerned session (policy OFF, out of scope, no
+ * provenance) sees probe flakiness, so an ordinary chat never fails to start.
+ * Only an authoritative `missing` clears stale provenance / cold-spawns.
+ */
+export type PersistentPaneMigrationInput = {
+  /** Current-spawn isolation capabilities (empty ⇒ policy OFF this spawn). May be
+   *  non-empty on ANY persistent backend — `credential` is pushed for enrolled
+   *  hosts independent of the file sandbox, and its wrapper applies to
+   *  tmux/zellij/herdr/zmx alike. So the policy-ON capability check below is NOT
+   *  scoped to tmux. */
+  appliedIsolationCapabilities: readonly IsolationCapability[];
+  /** Backend can carry a FILE sandbox (tmux). Scopes ONLY the policy-off
+   *  no-transport migration arm (the removed force-isolation rule only ever
+   *  file-sandboxed tmux); policy-ON capability checks run on every backend. */
+  isolationCapableBackend: boolean;
+  /** apiOnly bot OR HTTP-virtual chat — the sessions the old rule force-isolated. */
+  noTransport: boolean;
+  /** `<sid>.boot` exists on disk (no-follow existence — planted/garbage counts). */
+  isolationMarkerPresent: boolean;
+  /** `<sid>.policy-off` tombstone exists on disk (no-follow existence). Triggers
+   *  CLEANUP / conservative decisions; does NOT by itself authorize a reattach. */
+  policyOffTombstonePresent: boolean;
+  /** The `<sid>.policy-off` tombstone passed secure-read + schema/version
+   *  validation ({@link policyOffTombstoneValid}). ONLY this authorizes a
+   *  policy-off warm reattach. */
+  policyOffTombstoneValid: boolean;
+  /** The persistent pane's liveness probe — TRI-STATE, NOT a boolean. `exists`
+   *  and `missing` are authoritative; `unknown` means the probe could not answer
+   *  (flaky/unavailable backend). Collapsing `unknown` into "dead" is the bug this
+   *  field prevents: a still-alive, still-confined pane whose probe is momentarily
+   *  `unknown` must never have its provenance cleared nor be cold-spawned around.
+   *  Only an authoritative `missing` proves the pane is gone. */
+  paneProbe: SessionProbe;
+  /** A PENDING provenance file (marker OR tombstone whose secure-read body parses
+   *  as `state:'pending'`) is present on disk. This is STRONGER than legacy
+   *  provenance and DOMINATES everything below: it means the system explicitly
+   *  knows a generation's fresh-attribution never completed (crash between
+   *  pending-write and commit, or a late-flip/collision that was never committed).
+   *  A pending file is evaluated FIRST, on ALL backends and BOTH policy directions,
+   *  independent of the tmux migration scope — `exists`→kill, `unknown`→refuse,
+   *  `missing`→clear. Its no-follow presence also keeps isolationMarkerPresent /
+   *  policyOffTombstonePresent true (the file exists), but the pending branch runs
+   *  before any of the committed-provenance logic. */
+  pendingProvenancePresent: boolean;
+  /**
+   * Result of {@link isolatedPaneReattachSafe}(marker, current policy) — only
+   * meaningful when policy is ON. The caller computes it (it needs the parsed
+   * marker + policy digest); passed in to keep this function pure.
+   */
+  isolationMarkerReattachSafe: boolean;
+};
+
+export type PersistentPaneMigrationDecision =
+  /** Guard does not apply (nothing to evaluate). */
+  | { action: 'skip' }
+  /** Live pane matches the current policy → keep the running process. */
+  | { action: 'reattach' }
+  /** Live pane's provenance is wrong/unknown → kill, then cold-spawn. Provenance
+   *  files are cleared ONLY AFTER the kill is confirmed (clearAfterKill). */
+  | { action: 'kill-then-cold-spawn'; clearAfterKill: boolean }
+  /** No live pane, but stale provenance files linger → clear them (verified) then
+   *  cold-spawn fresh, so a later restart doesn't misjudge the new pane. */
+  | { action: 'clear-stale-then-cold-spawn' }
+  /** The liveness probe is INCONCLUSIVE (`unknown`) in a context where acting would
+   *  be unsafe — clearing provenance the pane might still own, or cold-spawning
+   *  around a pane a later `exists` probe would warm-reattach unvalidated. The
+   *  caller MUST refuse to start rather than guess (fail-closed). Only reached when
+   *  the guard is security-concerned; an ordinary transport chat with no provenance
+   *  skips on `unknown` instead (no gratuitous start-failures on probe flakiness). */
+  | { action: 'refuse-inconclusive-probe' };
+
+export function evaluatePersistentPaneMigration(
+  input: PersistentPaneMigrationInput,
+): PersistentPaneMigrationDecision {
+  const {
+    appliedIsolationCapabilities, isolationCapableBackend, noTransport,
+    isolationMarkerPresent, policyOffTombstonePresent, policyOffTombstoneValid: tombstoneValid,
+    paneProbe, pendingProvenancePresent, isolationMarkerReattachSafe,
+  } = input;
+  const policyOn = appliedIsolationCapabilities.length > 0;
+  const anyProvenance = isolationMarkerPresent || policyOffTombstonePresent;
+  const paneLive = paneProbe === 'exists';
+
+  // ── PENDING dominates everything (all backends, both policy directions, ANY
+  //    scope). A pending provenance file means the system EXPLICITLY knows a
+  //    generation's fresh-attribution never completed — a crash between the
+  //    pre-spawn pending-write and the post-spawn commit, or a late-flip/collision
+  //    that was never committed. This is STRONGER than legacy provenance, so it is
+  //    judged BEFORE the migration-scope logic (which would otherwise `skip` a
+  //    live pane out of the tmux scope and warm-reattach an undetermined
+  //    generation — e.g. an enrolled zellij pane whose credential policy later
+  //    flipped OFF). Only an authoritative `missing` clears it; `unknown` refuses
+  //    (never erase evidence of a possibly-live pane); `exists` kills + cold-spawns.
+  if (pendingProvenancePresent) {
+    if (paneProbe === 'exists') return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    if (paneProbe === 'unknown') return { action: 'refuse-inconclusive-probe' };
+    return { action: 'clear-stale-then-cold-spawn' }; // authoritative missing
+  }
+
+  // TRI-STATE liveness. `unknown` is NOT "dead": the backend (tmux/zellij/herdr/
+  // zmx) could not answer, so the pane may still be alive AND still confined under
+  // its original (possibly obsolete) policy. Acting on `unknown` — clearing
+  // provenance the pane might still own, or cold-spawning around it so a later
+  // `exists` probe warm-reattaches an unvalidated generation — is exactly the
+  // silent-downgrade this guard exists to prevent. We fail closed on `unknown`
+  // whenever there is anything at stake (policy ON, in the policy-off migration
+  // scope, or ANY provenance on disk); only a truly unconcerned session (policy
+  // OFF, out of scope, no provenance) skips on `unknown` so probe flakiness on an
+  // ordinary chat never blocks startup. Only an authoritative `missing` is trusted
+  // as "the pane is gone".
+  const inMigrationScope = noTransport && isolationCapableBackend;
+  const guardConcerned = policyOn || inMigrationScope || anyProvenance;
+
+  if (policyOn) {
+    // Policy ON (file sandbox OR credential-only): runs on EVERY persistent
+    // backend — credential-only panes on zellij/herdr/zmx carry a marker too, so
+    // this check must not be scoped to tmux (that would skip their capability
+    // validation and warm-reattach a stale/mismatched credential pane).
+    if (paneLive) {
+      // Only a live pane stamped under the CURRENT policy may reattach; a
+      // legacy/mismatched one is killed. (isolationMarkerReattachSafe already
+      // fail-closes on a missing/garbage marker.)
+      if (isolationMarkerReattachSafe) return { action: 'reattach' };
+      return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    }
+    // Not authoritatively alive. An `unknown` probe under policy ON must not clear
+    // a still-confined pane's marker nor cold-spawn around it — fail closed.
+    if (paneProbe === 'unknown') return { action: 'refuse-inconclusive-probe' };
+    // Authoritative `missing`: nothing to reattach. A fresh policy-on spawn
+    // re-stamps its marker, but any stale tombstone from a prior policy-off
+    // generation must be cleared first, or a later flip back to policy-off could
+    // misread it.
+    if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
+    return { action: 'skip' };
+  }
+
+  // Policy OFF. The file-sandbox migration only ever confined no-transport tmux
+  // sessions, so the tombstone requirement is scoped to them; an ordinary chat
+  // (or a non-file-sandboxable backend) was never force-isolated and is left
+  // untouched — EXCEPT we still clear any stale provenance on a dead pane so a
+  // lingering file can't mislead a future decision.
+  if (paneLive) {
+    if (!inMigrationScope) return { action: 'skip' };
+    // Warm reattach requires POSITIVE, VALIDATED proof the live generation is a
+    // known policy-off pane: a VALID tombstone AND no isolation marker. Any other
+    // shape — isolation marker present (dominates), tombstone missing/invalid, or
+    // NEITHER file (absence never proves "was never isolated", since the isolation
+    // stamp is best-effort) — is treated as possibly-still-confined and killed.
+    const provenPolicyOffGeneration = tombstoneValid && !isolationMarkerPresent;
+    if (provenPolicyOffGeneration) return { action: 'reattach' };
+    return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+  }
+
+  // Not authoritatively alive under policy OFF.
+  if (paneProbe === 'unknown') {
+    // Inconclusive. Clearing provenance now could delete the marker/tombstone of a
+    // pane that is actually still alive (and, if it predates the 放宽, still
+    // confined) — and cold-spawning would let a later `exists` probe warm-reattach
+    // that unvalidated pane. Fail closed whenever the guard is concerned; a wholly
+    // unconcerned session (out of scope, no provenance) just skips.
+    return guardConcerned ? { action: 'refuse-inconclusive-probe' } : { action: 'skip' };
+  }
+
+  // Authoritative `missing`. Clear any lingering provenance (verified) before the
+  // fresh cold-spawn regardless of scope — a stale file must never survive to
+  // mislead a later restart.
+  if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
+  return { action: 'skip' };
+}
+
+/**
+ * Injectable side-effect seam for {@link executePersistentPaneMigration}. The
+ * worker supplies real implementations (backend kill, post-kill probe, verified
+ * provenance removal, backend re-selection); tests supply mocks to observe the
+ * ORDER of effects and the "not called" guarantees on each failure path — the
+ * part a pure truth-table cannot cover.
+ */
+export type PersistentPaneMigrationEffects = {
+  /** Kill the stale persistent pane. Throw on failure — caller must NOT proceed. */
+  killStalePane: () => void;
+  /** Probe AFTER the kill; throw (fail-closed) if termination cannot be confirmed. */
+  confirmPaneGone: () => void;
+  /** Remove BOTH provenance files, each verified-gone; throw if any cannot be
+   *  removed (fail-closed — a surviving file would mis-drive the next restart). */
+  clearProvenanceVerified: () => void;
+  /** Re-select the backend so a stale isReattach=true does not target the pane we
+   *  just destroyed. Only called after a confirmed kill + cleared provenance. */
+  reselectBackend: () => void;
+  /** Refuse to start the session because the liveness probe was inconclusive
+   *  (`unknown`) where acting would be unsafe. MUST throw — there is no safe
+   *  fall-through. */
+  refuseInconclusiveProbe: () => never;
+};
+
+/**
+ * Execute a {@link PersistentPaneMigrationDecision} with strict fail-closed
+ * ordering. Extracted from the worker so the ordering + "stop on failure"
+ * guarantees are unit-testable with injected effects:
+ *
+ *   kill-then-cold-spawn : killStalePane → confirmPaneGone → (clearAfterKill?
+ *                          clearProvenanceVerified) → reselectBackend.
+ *     Any throw from killStalePane or confirmPaneGone aborts BEFORE clearing
+ *     provenance (evidence is preserved for the retry) and BEFORE reselect. A
+ *     throw from clearProvenanceVerified aborts BEFORE reselect (never publish a
+ *     new generation while a stale proof lingers).
+ *   clear-stale-then-cold-spawn : clearProvenanceVerified only (no live pane to
+ *                          kill; a throw aborts the spawn).
+ *   refuse-inconclusive-probe : refuseInconclusiveProbe (always throws — the probe
+ *                          was `unknown` where clearing/cold-spawning is unsafe).
+ *                          NO provenance is touched and NO reselect happens.
+ *   reattach / skip : no effects.
+ *
+ * Returns the action taken so the caller can branch (e.g. set warm-reattach).
+ */
+export function executePersistentPaneMigration(
+  decision: PersistentPaneMigrationDecision,
+  effects: PersistentPaneMigrationEffects,
+): PersistentPaneMigrationDecision['action'] {
+  switch (decision.action) {
+    case 'reattach':
+    case 'skip':
+      return decision.action;
+    case 'refuse-inconclusive-probe':
+      effects.refuseInconclusiveProbe(); // always throws — no safe fall-through
+      return decision.action;
+    case 'clear-stale-then-cold-spawn':
+      effects.clearProvenanceVerified();
+      return decision.action;
+    case 'kill-then-cold-spawn':
+      effects.killStalePane();       // throws → stop (evidence preserved)
+      effects.confirmPaneGone();     // throws → stop (evidence preserved)
+      if (decision.clearAfterKill) {
+        effects.clearProvenanceVerified(); // throws → stop before reselect
+      }
+      effects.reselectBackend();
+      return decision.action;
+  }
+}
+
+/**
+ * Which kill/probe primitive a persistent-pane teardown must use, so it targets
+ * the EXACT just-launched pane and never a shared host. Pure so the worker's
+ * inline teardown and the migration effects share one behaviorally-tested policy:
+ *
+ *   · 'zmx'    — identity-verified kill against the frozen managed PID + owned probe.
+ *   · 'target' — the recorded PersistentBackendTarget (REQUIRED when one exists):
+ *                a herdr isolated/MCP agent lives as `{sessionName:'botmux',
+ *                agentName:<topic>}` on the SHARED host, so a name-only kill of
+ *                'botmux' would tear down every bot's agent. The target scopes the
+ *                kill to this agent.
+ *   · 'name'   — last-resort name-only kill, ONLY when no target was recorded
+ *                (legacy tmux/zellij that own their whole session by name).
+ */
+export type PersistentTeardownKillKind = 'zmx' | 'target' | 'name';
+export function persistentTeardownKillKind(input: {
+  backendType: string;
+  hasBackendTarget: boolean;
+}): PersistentTeardownKillKind {
+  if (input.backendType === 'zmx') return 'zmx';
+  if (input.hasBackendTarget) return 'target';
+  return 'name';
 }
 
 function dedupe(xs: string[]): string[] {

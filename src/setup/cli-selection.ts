@@ -84,6 +84,15 @@ const TRAE_COCO: CliSelectOption = { key: 'coco', label: 'TRAE CLI（CoCo）', c
 const TRAE_X: CliSelectOption = { key: 'traex', label: 'traex', cliId: 'traex' };
 const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_COCO, TRAE_X];
 
+// ─── OpenCode 选项 ──────────────────────────────────────────────────────────
+// OpenCode 与 OpenCode 2 合并成一个「OpenCode」二级菜单（都是原生 cliId，无
+// wrapperCli）：
+//   - OpenCode     → cliId `opencode`  ：OpenCode 1.x
+//   - OpenCode 2   → cliId `opencode2` ：OpenCode 2.0（beta，二进制 opencode2）
+const OPENCODE_NATIVE: CliSelectOption = { key: 'opencode', label: 'OpenCode', cliId: 'opencode' };
+const OPENCODE2_OPTION: CliSelectOption = { key: 'opencode2', label: 'OpenCode 2（beta）', cliId: 'opencode2' };
+const OPENCODE_VARIANTS: ReadonlyArray<CliSelectOption> = [OPENCODE_NATIVE, OPENCODE2_OPTION];
+
 // ─── Pi 选项 ─────────────────────────────────────────────────────────────────
 // Pi 与 Oh My Pi 不合并，但在菜单里相邻摆放（在 Pi 的位置成对发出）。
 const PI_OPTION: CliSelectOption = { key: 'pi', label: 'Pi', cliId: 'pi' };
@@ -169,6 +178,9 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
       { key: 'oh-my-pi', label: 'Oh My Pi', option: OHMYPI_OPTION },
     ];
     if (o.id === 'oh-my-pi') return [];
+    // opencode + opencode2 collapse into one「OpenCode」二级菜单 at opencode's position.
+    if (o.id === 'opencode') return [{ key: 'opencode', label: 'OpenCode', children: OPENCODE_VARIANTS }];
+    if (o.id === 'opencode2') return [];
     return [{ key: o.id, label: o.label, option: { key: o.id, label: o.label, cliId: o.id } }];
   }),
   ...EXTRA_GATEWAY_GROUPS,
@@ -189,6 +201,8 @@ export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
     if (o.id === 'traex') return [];
     if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
     if (o.id === 'oh-my-pi') return [];
+    if (o.id === 'opencode') return OPENCODE_VARIANTS;    // expands to OpenCode + OpenCode 2
+    if (o.id === 'opencode2') return [];
     return [{ key: o.id, label: o.label, cliId: o.id }];
   }),
   ...CJADK_VARIANTS,
@@ -422,6 +436,19 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
  * 前缀为空时返回 `{ bin: '', args }`，调用方据此跳过（不改写 spawn）。
  */
+/**
+ * Wrapper-specific launch ENVIRONMENT — the single source of truth shared by
+ * the worker spawn branch and one-shot child processes (session-group AI
+ * titling). cjadk launches its agent inside an interactive wrapper (startup
+ * selector + terminal quirks) unless CJADK_INTERACTIVE=0; without it a
+ * non-TTY one-shot call can hang on the selector.
+ */
+export function wrapperLaunchEnv(wrapperCli: string | undefined): Record<string, string> | undefined {
+  if (!wrapperCli?.trim()) return undefined;
+  if (parseWrapperCli(wrapperCli)[0] === 'cjadk') return { CJADK_INTERACTIVE: '0' };
+  return undefined;
+}
+
 export function buildWrappedLaunch(
   wrapperCli: string,
   cliArgs: ReadonlyArray<string>,

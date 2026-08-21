@@ -163,7 +163,7 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
         return { status: 200, raw: '', body: { sessions } };
       }
       if (req.method === 'POST' && req.path === '/__daemon/sessions/sess_close/close') {
-        return { status: 200, raw: '', body: { ok: true, alreadyClosed: false } };
+        return { status: 200, raw: '', body: { ok: true, outcome: 'closed', alreadyClosed: false } };
       }
       throw new Error('unexpected: ' + JSON.stringify(req));
     });

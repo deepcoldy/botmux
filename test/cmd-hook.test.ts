@@ -153,6 +153,154 @@ describe('runHook', () => {
     });
   });
 
+  describe('(d) OpenCode 原生会话 id 显式反查（托管 service 场景，P1 回归）', () => {
+    const openCodeAskPayload = {
+      hook_event_name: 'question.asked',
+      question_id: 'que_1',
+      session_id: 'ses_abc123',
+      tool_input: { questions: [{ question: '继续？', options: [{ label: '继续' }, { label: '取消' }] }] },
+    };
+    const EXPLICIT_ROUTE = {
+      sessionId: 'sess_real_target',
+      chatId: 'oc_real_chat',
+      larkAppId: 'cli_real_app',
+      rootMessageId: 'oc_real_root',
+    };
+    // env 指向首个启动 service 的会话（错投目标），必须被显式反查覆盖。
+    const STALE_ENV = {
+      ...FULL_ENV,
+      BOTMUX_SESSION_ID: 'sess_first_service_owner',
+      BOTMUX_CHAT_ID: 'oc_wrong_chat',
+      BOTMUX_LARK_APP_ID: 'cli_wrong_app',
+    };
+
+    it('反查命中 → 按反查结果路由（覆盖 ambient env，防跨会话错投）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, stub, 'opencode2',
+        async () => null,                       // adopt 兜底不应被触达
+        async (cliSessionId) => {
+          expect(cliSessionId).toBe('ses_abc123');
+          return EXPLICIT_ROUTE;
+        },
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(posted?.sessionId).toBe('sess_real_target');
+      expect(posted?.chatId).toBe('oc_real_chat');
+      expect(posted?.larkAppId).toBe('cli_real_app');
+      expect(posted?.rootMessageId).toBe('oc_real_root');
+    });
+
+    it('opencode2 反查未命中（独立终端会话 + 陈旧完整 env）→ fail closed，postAsk 未调用且 stdout 为空', async () => {
+      // 独立终端会话的 ses_* 不属于任何 active daemon → 反查必然 null；
+      // 若回落 STALE_ENV 会把问题投到首个启动 service 的 botmux 会话（泄露路径）。
+      // 共享 service hook 必须 fail closed：不发卡、问题留给原生终端。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => null,                       // 反查未命中
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 反查超时（budget 耗尽 / daemon 不可达 → 返回 null）→ fail closed passthrough', async () => {
+      // 1.5s budget 耗尽、daemon 短暂不可达、cliSessionId 刚产生尚未上报时反查同样
+      // 返回 null——与未命中同一安全语义：直接 passthrough，绝不回落陈旧 ambient env。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => null,                       // 反查超时未返回结果
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode（进程私有 hook）不走反查 → 直接按 ambient env 路由', async () => {
+      // 反查只对共享 service hook（opencode2）启用：V1 hook 的 ambient env 是
+      // 当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
+      let posted: Record<string, unknown> | undefined;
+      let resolved = 0;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, stub, 'opencode',
+        async () => null,
+        async () => { resolved++; return EXPLICIT_ROUTE; },
+      );
+      expect(resolved).toBe(0);
+      expect(result.stdout).toBeTruthy();
+      expect(posted?.sessionId).toBe('sess_first_service_owner');
+      expect(posted?.chatId).toBe('oc_wrong_chat');
+    });
+
+    it('opencode2 反查 resolver 抛错 → fail closed（结果未知，绝不回落 env）', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => { throw new Error('ipc down'); },
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 session_id 非 ses_* 形状 → fail closed passthrough（不落 env 路由）', async () => {
+      // 共享 service 的 ambient env 永远不可信：无法验证 native identity 时
+      // 直接 passthrough，绝不把问题投到首个启动 service 的 botmux 会话。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      let resolved = 0;
+      const payload = { ...openCodeAskPayload, session_id: 'some-other-format' };
+      const result = await runHook(
+        payload, FULL_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => { resolved++; return EXPLICIT_ROUTE; },
+      );
+      expect(resolved).toBe(0);
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 session_id 缺失 → fail closed passthrough（不落 env 路由）', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const payload = { ...openCodeAskPayload };
+      delete (payload as Record<string, unknown>).session_id;
+      const result = await runHook(
+        payload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => EXPLICIT_ROUTE,
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('反查命中后 adopt 兜底分支不被触达（env 即使缺失也直接路由）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      let adoptCalls = 0;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const env = { BOTMUX_ASK_TIMEOUT_MS: '5000' }; // 全缺 env（托管 service 真实场景）
+      const result = await runHook(
+        openCodeAskPayload, env, stub, 'opencode2',
+        async () => { adoptCalls++; return null; },
+        async () => EXPLICIT_ROUTE,
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(adoptCalls).toBe(0);
+      expect(posted?.sessionId).toBe('sess_real_target');
+    });
+  });
+
   describe('env 缺失 → passthrough 放行', () => {
     // 注：runHook 第 5 参数是可选的 resolveAdoptRouteFn。
     // 这里传 null-returning stub，确保测试不依赖真实 daemon 环境，

@@ -244,10 +244,11 @@ function OverviewPage() {
   const [activeSortMode, setActiveSortMode] = useState<ActiveSortMode>(readActiveSortMode);
   const [collapsedN, setCollapsedN] = useState(TEAM_COLLAPSED_ROWS * TEAM_DESKTOP_COLUMNS);
   const [namesVersion, forceNamesRefresh] = useState(0);
-  const { sessions, schedules, scheduleTimeZone } = useStoreSelector(snapshot => ({
+  const { sessions, schedules, scheduleTimeZone, schedulesAvailable } = useStoreSelector(snapshot => ({
     sessions: [...snapshot.sessions.values()] as SessionRow[],
     schedules: [...snapshot.schedules.values()] as ScheduleRow[],
     scheduleTimeZone: snapshot.scheduleTimeZone,
+    schedulesAvailable: snapshot.schedulesAvailable,
   }));
 
   useEffect(() => {
@@ -386,18 +387,23 @@ function OverviewPage() {
           </section>
         </div>
 
-        <aside className="overview-side">
-          <section className="overview-block">
-            <SectionHeader title={tr('overview.nextSchedules')}>
-              <HeaderAction href="#/schedules">{tr('overview.viewAllPlain')}</HeaderAction>
-            </SectionHeader>
-            <section className="panel schedules-panel" ref={schedulesPanelRef}>
-              <OverviewList id="next-schedules">
-                {upcoming.length ? upcoming.map(s => <ScheduleMini key={s.id} schedule={s} timeZone={scheduleTimeZone} />) : <li className="empty">{tr('overview.noSchedules')}</li>}
-              </OverviewList>
+        {/* P1-14：排程不在 Workbench-only 身份的能力表里（/api/schedules 明确
+            401）。这时排程既不是「暂时空」也不是「没有排程」，而是压根读不到，
+            画一个永远为空的面板只会误导——整块隐藏。 */}
+        {schedulesAvailable ? (
+          <aside className="overview-side">
+            <section className="overview-block">
+              <SectionHeader title={tr('overview.nextSchedules')}>
+                <HeaderAction href="#/schedules">{tr('overview.viewAllPlain')}</HeaderAction>
+              </SectionHeader>
+              <section className="panel schedules-panel" ref={schedulesPanelRef}>
+                <OverviewList id="next-schedules">
+                  {upcoming.length ? upcoming.map(s => <ScheduleMini key={s.id} schedule={s} timeZone={scheduleTimeZone} />) : <li className="empty">{tr('overview.noSchedules')}</li>}
+                </OverviewList>
+              </section>
             </section>
-          </section>
-        </aside>
+          </aside>
+        ) : null}
       </div>
     </section>
   );

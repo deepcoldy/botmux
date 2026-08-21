@@ -361,6 +361,254 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('SSE reconnect budget refund keyed on connection lifetime (~183s connection cap)', () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // These tests intentionally leave reconnect loops in flight (pending/looping
+    // streams). Track every backend and kill() it after each test so a leaked
+    // loop can't keep incrementing the NEXT test's shared fetchMock counter
+    // (kill sets `killed`, which makes the streamTask catch bail).
+    let liveBackends: RiffBackend[] = [];
+    const track = (be: RiffBackend) => { liveBackends.push(be); return be; };
+    afterEach(() => { liveBackends.forEach(b => b.kill()); liveBackends = []; });
+    // Healthy long connection: emits init(running), STAYS OPEN past the health
+    // threshold, then cleanly EOFs — models a task-stream connection severed by
+    // the ~183s proxy cap. The delay before close is what makes it "healthy".
+    const healthyThenEof = (openMs: number, status = 'running') =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(c) {
+            c.enqueue(new TextEncoder().encode(`event:init\ndata:{"status":"${status}"}\n\n`));
+            await sleep(openMs);
+            c.close();
+          },
+        }),
+        { status: 200 },
+      );
+    // Pathological: connects, emits init(running), then EOFs INSTANTLY (sub-
+    // threshold lifetime) — the stale-running-orphan hot loop. Must NOT refund.
+    const initThenInstantEof = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode('event:init\ndata:{"status":"running"}\n\n'));
+            c.close();
+          },
+        }),
+        { status: 200 },
+      );
+    // Dead endpoint: connects 200 then EOFs immediately with nothing.
+    const bareEof = () =>
+      new Response(new ReadableStream<Uint8Array>({ start(c) { c.close(); } }), { status: 200 });
+    // init replaying a TERMINAL status (task finished while a prior connection
+    // was dead — its `done` was lost with the closed stream).
+    const initTerminalThenEof = (status = 'completed') =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(`event:init\ndata:{"status":"${status}"}\n\n`));
+            c.close();
+          },
+        }),
+        { status: 200 },
+      );
+
+    it('a connection that lived past the health threshold refunds the budget → many ~183s caps never falsely fail', async () => {
+      const be = track(makeBackend({ injectStatusLines: false }));
+      (be as any).reconnectBaseDelayMs = 0; // collapse backoff for a fast test
+      (be as any).reconnectMaxDelayMs = 0;
+      (be as any).reconnectHealthyConnMs = 15; // healthy = lived ≥15ms (test scale)
+      const done = vi.fn();
+      const errored = vi.fn();
+      be.onTaskDone(done);
+      be.onData((d: string) => { if (d.includes('重连失败')) errored(); });
+
+      // 12 consecutive healthy caps — WAY past the 6-attempt budget. If a
+      // healthy-lived break did not refund, this would emitError long before 12.
+      let streamHits = 0;
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api2/task-stream')) {
+          streamHits++;
+          return streamHits <= 12 ? healthyThenEof(80) : pendingSseResponse();
+        }
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('task-1');
+      });
+      be.spawn('', [], {} as any);
+      be.write('long runner task');
+      // Real time must elapse for the 80ms-open connections — poll on progress.
+      for (let i = 0; i < 400 && streamHits <= 8; i++) await sleep(10);
+      for (let i = 0; i < 20; i++) await flush();
+
+      expect(streamHits).toBeGreaterThan(6);       // survived past the raw budget
+      expect(errored).not.toHaveBeenCalled();       // never surfaced 重连失败
+      expect(done).not.toHaveBeenCalled();          // still running
+      // Healthy break refunds to 0 then increments to 1 — settles at 1, never
+      // accumulates toward 6 however many caps occur. That is the fix.
+      expect((be as any).reconnectAttempts).toBeLessThanOrEqual(1);
+    });
+
+    it('a stale-running-orphan hot loop (init then INSTANT EOF, sub-threshold) exhausts the budget — the reopened-infinite-retry-hole guard', async () => {
+      const be = track(makeBackend({ injectStatusLines: false }));
+      (be as any).reconnectBaseDelayMs = 0;
+      (be as any).reconnectMaxDelayMs = 0;
+      (be as any).reconnectHealthyConnMs = 10_000; // instant EOF (few ms) << 10s → never refunds
+      const done = vi.fn();
+      const errored = vi.fn();
+      be.onTaskDone(done);
+      be.onData((d: string) => { if (d.includes('重连失败')) errored(); });
+
+      // The critical regression case: task is running (init=running) so the
+      // terminal-status completion path never fires, but the connection EOFs
+      // instantly every time. Keying refund on init-receipt would loop forever;
+      // keying on lifetime lets the budget exhaust and bail.
+      let streamHits = 0;
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api2/task-stream')) { streamHits++; return initThenInstantEof(); }
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('task-1');
+      });
+      be.spawn('', [], {} as any);
+      be.write('stale-running orphan');
+      for (let i = 0; i < 60; i++) await flush();
+
+      // 1 initial + 6 reconnects = 7, then bail. BOUNDED — no infinite hot loop.
+      expect(streamHits).toBe(7);
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(done).toHaveBeenCalledTimes(1); // emitError fires the turn boundary
+    });
+
+    it('a reconnect whose init replays a TERMINAL status completes the turn cleanly — no error (the false-positive being fixed)', async () => {
+      const be = track(makeBackend({ injectStatusLines: false }));
+      (be as any).reconnectBaseDelayMs = 0;
+      (be as any).reconnectMaxDelayMs = 0;
+      (be as any).reconnectHealthyConnMs = 20;
+      const done = vi.fn();
+      const errored = vi.fn();
+      be.onTaskDone(done);
+      be.onData((d: string) => { if (d.includes('重连失败')) errored(); });
+
+      // First connection: healthy-lived running then EOF (the ~183s cap).
+      // Reconnect: init replays completed (task finished during the dead window).
+      // Terminal completion must fire even though the reconnect's own connection
+      // is short-lived — completion does NOT depend on the lifetime gate.
+      let streamHits = 0;
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api2/task-stream')) {
+          streamHits++;
+          return streamHits === 1 ? healthyThenEof(40) : initTerminalThenEof('completed');
+        }
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: { output: 'final result' } } });
+        return taskResponse('task-1');
+      });
+      be.spawn('', [], {} as any);
+      be.write('task that completes during the dead window');
+      for (let i = 0; i < 200 && streamHits < 2; i++) await sleep(10);
+      for (let i = 0; i < 20; i++) await flush();
+
+      expect(errored).not.toHaveBeenCalled();      // the whole point: no false 重连失败
+      expect(done).toHaveBeenCalledTimes(1);        // completion fired exactly once
+      expect((be as any).taskDone).toBe(true);
+    });
+
+    it('a dead endpoint (connect→instant EOF, sub-threshold) still exhausts the budget and fails — no infinite retry', async () => {
+      const be = track(makeBackend({ injectStatusLines: false }));
+      (be as any).reconnectBaseDelayMs = 0;
+      (be as any).reconnectMaxDelayMs = 0;
+      (be as any).reconnectHealthyConnMs = 10_000; // instant EOF (few ms) << 10s → never refunds
+      const done = vi.fn();
+      const errored = vi.fn();
+      be.onTaskDone(done);
+      be.onData((d: string) => { if (d.includes('重连失败')) errored(); });
+
+      let streamHits = 0;
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api2/task-stream')) { streamHits++; return bareEof(); }
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('task-1');
+      });
+      be.spawn('', [], {} as any);
+      be.write('doomed task');
+      for (let i = 0; i < 40; i++) await flush();
+
+      // 1 initial + 6 reconnects = 7 stream attempts, then bail. Crucially BOUNDED.
+      expect(streamHits).toBe(7);
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(done).toHaveBeenCalledTimes(1); // emitError fires the turn boundary
+    });
+
+    // The connection-never-established path is DISTINCT from "connect then EOF":
+    // fetch throws / !resp.ok bail BEFORE connectionStartedAtMs is stamped, so it
+    // stays at its sentinel. The lifetime gate must treat "never stamped" as
+    // NOT-healthy (no refund), else a permanent 404 (task GC'd) or 401 (jwt dead)
+    // would compute a bogus huge lifetime, refund forever, and hot-loop a request
+    // storm with no idle backstop. These lock that path to bounded early-stop.
+    it('a permanent !resp.ok (404 task-gone / 401) never refunds → bounded early-stop, no request storm', async () => {
+      const be = track(makeBackend({ injectStatusLines: false }));
+      (be as any).reconnectBaseDelayMs = 0;
+      (be as any).reconnectMaxDelayMs = 0;
+      (be as any).reconnectHealthyConnMs = 10_000;
+      const done = vi.fn();
+      const errored = vi.fn();
+      be.onTaskDone(done);
+      be.onData((d: string) => { if (d.includes('重连失败')) errored(); });
+
+      let streamHits = 0;
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        // task-stream returns 404 → !resp.ok → throws before the connection is
+        // ever stamped (connectionStartedAtMs stays at its never-connected value).
+        if (u.includes('/api2/task-stream')) { streamHits++; return new Response('gone', { status: 404 }); }
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('task-1');
+      });
+      be.spawn('', [], {} as any);
+      be.write('task that was GC-ed');
+      for (let i = 0; i < 40; i++) await flush();
+
+      // Must be BOUNDED: 1 initial + 6 reconnects = 7, then emitError. A bogus
+      // "healthy lifetime" from an unstamped clock would loop unbounded here.
+      expect(streamHits).toBe(7);
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(done).toHaveBeenCalledTimes(1);
+    });
+
+    it('a fetch that throws (network error) before connecting never refunds → bounded early-stop', async () => {
+      const be = track(makeBackend({ injectStatusLines: false }));
+      (be as any).reconnectBaseDelayMs = 0;
+      (be as any).reconnectMaxDelayMs = 0;
+      (be as any).reconnectHealthyConnMs = 10_000;
+      const done = vi.fn();
+      const errored = vi.fn();
+      be.onTaskDone(done);
+      be.onData((d: string) => { if (d.includes('重连失败')) errored(); });
+
+      let streamHits = 0;
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api2/task-stream')) { streamHits++; throw new Error('ECONNREFUSED'); }
+        if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
+        return taskResponse('task-1');
+      });
+      be.spawn('', [], {} as any);
+      be.write('unreachable endpoint');
+      for (let i = 0; i < 40; i++) await flush();
+
+      expect(streamHits).toBe(7);       // bounded — no infinite reconnect
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(done).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('restart lineage resume (finding D)', () => {
     it('resumeParentTaskId makes the first write a follow-up on the persisted parent', async () => {
       const be = makeBackend({ resumeParentTaskId: 'task-old', injectStatusLines: false });
@@ -629,6 +877,9 @@ describe('RiffBackend', () => {
       });
       (be as any).currentTaskId = 'task-A';
       const p = (be as any).fetchDirectAccessUrl('task-A');
+      // getJwt is now async, so the task-detail fetch (which assigns resolveDetail)
+      // only fires after a microtask. Flush before driving the response.
+      await flush();
       (be as any).currentTaskId = 'task-B';
       resolveDetail(Response.json({ success: true, data: { task: { directAccessUrl: 'https://old-a.example/' } } }));
       await p;
@@ -676,6 +927,46 @@ describe('RiffBackend', () => {
       be.write('hello');
       await flush();
       expect(done).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('JWT resolved after attachment prep (safety-window sampling point)', () => {
+    it('reads the JWT AFTER slow attachment reads, right before fetch', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+
+      const order: string[] = [];
+      // Slow attachment read: records its ordering and yields to the event loop.
+      (be as any).readFileAsBlob = async (_p: string) => {
+        order.push('readFileAsBlob');
+        await new Promise((r) => setTimeout(r, 5));
+        return new Blob(['x']);
+      };
+      // getJwt must be sampled AFTER the attachment prep so the safety-window
+      // freshness check reflects the token that actually goes on the wire.
+      const realGetJwt = (be as any).getJwt.bind(be);
+      (be as any).getJwt = () => { order.push('getJwt'); return realGetJwt(); };
+
+      be.write('hello <attachments><file path="/tmp/a.bin" name="a.bin"/></attachments>');
+      // The write runs through the async writeChain, then a 5ms attachment read,
+      // then fetch — give it enough turns to reach the (manually-resolved) fetch.
+      for (let i = 0; i < 6; i++) await flush();
+      await new Promise((r) => setTimeout(r, 10));
+      for (let i = 0; i < 4; i++) await flush();
+      resolvers.shift()?.(taskResponse('task-1'));
+      await flush();
+
+      // The upload actually carried the JWT header…
+      const exec = calls.find((c) => c.url.includes('/api/task-execute'));
+      expect(exec, `no task-execute; calls=${calls.map((c) => c.url).join(',')}; order=${JSON.stringify(order)}`).toBeTruthy();
+      expect((exec!.init?.headers as any)?.['x-jwt-token']).toBe('test-jwt');
+      // …and the create-path JWT was sampled AFTER the attachment read (a later
+      // getJwt from the SSE stream connection may follow — we only require that
+      // the FIRST getJwt, the one on the create request, comes after the read).
+      const firstRead = order.indexOf('readFileAsBlob');
+      const firstJwt = order.indexOf('getJwt');
+      expect(firstRead).toBeGreaterThanOrEqual(0);
+      expect(firstJwt).toBeGreaterThan(firstRead);
     });
   });
 
@@ -1213,6 +1504,65 @@ describe('RiffBackend', () => {
       expect(urls[urls.length - 1]).toBe(`${BASE}/sandbox-access?sessionId=z`);
       await flush();
       expect(urls[urls.length - 1]).toBe('https://port-8080-z.sandbox.example.com/');
+    });
+  });
+
+  describe('create/follow-up 401 retry with refreshed JWT (申晗: startup must actually get a JWT)', () => {
+    /** A task-execute fetch mock: first POST 401s, the retry (if any) 200s.
+     *  task-stream stays pending; task-detail/cancel resolve instantly. */
+    function authRetryFetch(): { execHeaders: Array<string | undefined> } {
+      const execHeaders: Array<string | undefined> = [];
+      let execCount = 0;
+      const mock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes('/api/task-execute')) {
+          execCount += 1;
+          const h = (init?.headers ?? {}) as Record<string, string>;
+          execHeaders.push(h['x-jwt-token']);
+          return execCount === 1
+            ? new Response('unauthorized', { status: 401 })
+            : Response.json({ success: true, data: { id: 'task-ok', status: 'running' } });
+        }
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        return Response.json({ success: true, data: {} });
+      });
+      vi.stubGlobal('fetch', mock);
+      return { execHeaders };
+    }
+
+    it('retries ONCE with a freshly-refreshed token after a 401 and succeeds', async () => {
+      const { execHeaders } = authRetryFetch();
+      const be = makeBackend();
+      // Script getJwt: stale token first, forced refresh yields a different one.
+      const gj = vi.spyOn(be as any, 'getJwt').mockImplementation(async (opts: any) => {
+        return opts?.forceRefresh ? 'JWT-FRESH' : 'JWT-STALE';
+      });
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush(); await flush();
+
+      // Two task-execute POSTs: the stale-token attempt (401), then the refreshed retry.
+      expect(execHeaders).toEqual(['JWT-STALE', 'JWT-FRESH']);
+      // The retry used a forced refresh.
+      expect(gj.mock.calls.some(c => (c[0] as any)?.forceRefresh === true)).toBe(true);
+      // Task adopted → currentTaskId set from the successful retry.
+      expect((be as any).currentTaskId).toBe('task-ok');
+    });
+
+    it('does NOT retry when the forced refresh yields the SAME token (no pointless replay)', async () => {
+      const { execHeaders } = authRetryFetch();
+      const be = makeBackend();
+      // Refresh produces nothing new — same token both times.
+      vi.spyOn(be as any, 'getJwt').mockResolvedValue('JWT-SAME');
+      const emitErr = vi.spyOn(be as any, 'emitError');
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush(); await flush();
+
+      // Only the first POST happened; no retry because the token was unchanged.
+      expect(execHeaders).toEqual(['JWT-SAME']);
+      // The 401 surfaces as a turn-ending error (unchanged pre-existing behaviour).
+      expect(emitErr).toHaveBeenCalled();
     });
   });
 });

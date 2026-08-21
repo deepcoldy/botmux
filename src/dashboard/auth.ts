@@ -1,15 +1,11 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
-import {
-  readFileSync, existsSync, mkdirSync, chmodSync, linkSync, unlinkSync, writeFileSync,
-} from 'node:fs';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
 import {
   readSecureHostFileSync,
-  secureHostFilePath,
+  UnsafeHostAuthorityFileError,
+  withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../platform/secure-host-file.js';
-import { withFileLockSync } from '../utils/file-lock.js';
 
 const NONCE_TTL_MS = 60_000;
 const TS_WINDOW_S = 30;
@@ -99,61 +95,40 @@ export function generateToken(): string {
 /**
  * Load a dashboard HMAC secret from disk. Empty / whitespace-only files are
  * treated as missing so callers never sign requests with an empty key.
+ *
+ * Goes through the same strict host-authority primitives as the persisted
+ * token: the leaf must be a regular 0600 file owned by the current user and
+ * must not be a symlink, and its directory (`~/.botmux`) must not be
+ * group/other-writable. An unsafe shape throws
+ * {@link UnsafeHostAuthorityFileError} (fail-closed) instead of being followed:
+ * a symlinked or loose-perms secret could be planted by a local attacker who
+ * can replace the credential directory, letting them forge CLI HMAC headers
+ * and mint dashboard tokens.
  */
 export function loadDashboardSecret(secretPath: string): string | null {
-  if (!existsSync(secretPath)) return null;
-  const secret = readFileSync(secretPath, 'utf8').trim();
-  return secret.length > 0 ? secret : null;
+  const secret = readSecureHostFileSync(secretPath, 256)?.trim();
+  return secret ? secret : null;
 }
 
-/** Load the dashboard HMAC secret, creating a fresh 0600 secret when absent. */
+/**
+ * Load the dashboard HMAC secret, creating a fresh 0600 secret when absent or
+ * empty. The credential directory is pinned once (Linux: via an open directory
+ * descriptor) and the lock, the read, and the write all resolve through that
+ * same anchor — so a symlinked HOME / shared-drive ancestor still works while
+ * an ancestor rename mid-section cannot redirect the secret into a substituted
+ * directory, and a leaf symlink is refused. The file lock makes get-or-create
+ * linearizable across dashboard processes.
+ */
 export function loadOrCreateDashboardSecret(secretPath: string): string {
-  const existing = loadDashboardSecret(secretPath);
-  if (existing) return existing;
-  const secret = randomBytes(32).toString('base64url');
-  mkdirSync(dirname(secretPath), { recursive: true });
-  // Daemon fleets and the dashboard start concurrently on a fresh install.
-  // A rename-based "atomic write" is individually atomic but not
-  // create-if-absent: two winners can each return a different key while only
-  // the last rename remains on disk. Publish a fully-written temp inode with
-  // link(2) instead. The link is atomic and fails with EEXIST for every loser;
-  // losers then read the single winner's complete value.
-  const temp = `${secretPath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
-  try {
-    writeFileSync(temp, secret, { mode: 0o600, flag: 'wx' });
-    try {
-      linkSync(temp, secretPath);
-      chmodSync(secretPath, 0o600);
+  return withSecureHostParentSync(secretPath, (parent) =>
+    parent.withLeafLock(() => {
+      const existing = parent.readLeaf(256)?.trim();
+      if (existing) return existing;
+      const secret = randomBytes(32).toString('base64url');
+      parent.writeLeaf(secret);
       return secret;
-    } catch (err) {
-      const raced = loadDashboardSecret(secretPath);
-      if (raced) return raced;
-      // Existing-but-empty/corrupt file: publish one permanent repair seed via
-      // link(2). Every concurrent initializer either wins that O_EXCL election
-      // or reads the same fully-written seed, then atomically restores the main
-      // path with the identical value. Keeping the 0600 seed makes crash recovery
-      // replayable and avoids stale PID locks (and their delete/recreate races).
-      const repairSeedPath = `${secretPath}.repair-seed`;
-      let repairSecret: string;
-      try {
-        linkSync(temp, repairSeedPath);
-        chmodSync(repairSeedPath, 0o600);
-        repairSecret = secret;
-      } catch (seedErr) {
-        if ((seedErr as NodeJS.ErrnoException).code !== 'EEXIST') throw seedErr;
-        const published = loadDashboardSecret(repairSeedPath);
-        if (!published) {
-          throw new Error(`dashboard secret repair seed is unreadable: ${repairSeedPath}`);
-        }
-        repairSecret = published;
-      }
-      atomicWriteFileSync(secretPath, repairSecret, { mode: 0o600 });
-      chmodSync(secretPath, 0o600);
-      return repairSecret;
-    }
-  } finally {
-    try { unlinkSync(temp); } catch { /* already absent */ }
-  }
+    }),
+  );
 }
 
 /**
@@ -179,26 +154,120 @@ export function persistToken(tokenPath: string, token: string): void {
  * Load the active token, creating and persisting the first one when absent.
  * The file lock makes get-or-create linearizable across dashboard processes:
  * every concurrent caller returns the same durable token.
+ *
+ * The credential directory is pinned once (Linux: via an open directory
+ * descriptor) and the lock, the read, and the write all resolve through that
+ * same anchor. This keeps the whole critical section on one directory inode —
+ * so a symlinked HOME whose target sits under a shared-drive / 0777 ancestor
+ * still succeeds, while an ancestor rename mid-section cannot redirect the lock
+ * or the token write into a substituted directory. `~/.botmux` itself must
+ * still be 0700 and owned by the current user; a leaf symlink is still refused.
  */
 export function loadOrCreatePersistedToken(tokenPath: string): string {
-  const securePath = secureHostFilePath(tokenPath);
-  return withFileLockSync(securePath, () => {
-    const existing = loadPersistedToken(securePath);
-    if (existing) return existing;
-    const token = generateToken();
-    persistToken(securePath, token);
-    return token;
-  });
+  return withSecureHostParentSync(tokenPath, (parent) =>
+    parent.withLeafLock(() => {
+      const existing = parent.readLeaf(256)?.trim() || null;
+      if (existing) return existing;
+      const token = generateToken();
+      parent.writeLeaf(token);
+      return token;
+    }),
+  );
 }
 
 /** Generate and durably replace the token while serialized with first creation. */
 export function rotatePersistedToken(tokenPath: string): string {
-  const securePath = secureHostFilePath(tokenPath);
-  return withFileLockSync(securePath, () => {
-    const token = generateToken();
-    persistToken(securePath, token);
-    return token;
-  });
+  return withSecureHostParentSync(tokenPath, (parent) =>
+    parent.withLeafLock(() => {
+      const token = generateToken();
+      parent.writeLeaf(token);
+      return token;
+    }),
+  );
+}
+
+/**
+ * POSIX-single-quote a path for safe copy-paste into a shell, but only when it
+ * contains characters a shell treats specially — a clean path stays unquoted so
+ * the common-case hint reads naturally. Only ever used to build a POSIX command
+ * (never on win32, where we emit prose, not a command).
+ */
+function shellQuoteIfNeeded(p: string): string {
+  if (/^[A-Za-z0-9_./-]+$/.test(p)) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Diagnostic body for a dashboard token 500. The `/__cli/*` HTTP layer used to
+ * return a bare `{ error: 'token_persist_failed' | 'token_unavailable' }`, which
+ * the CLI printed verbatim — so a user whose `~/.botmux` (or `.dashboard-token`)
+ * has loose perms only saw an opaque code and had to be diagnosed remotely. The
+ * real, actionable cause is already on the thrown {@link
+ * UnsafeHostAuthorityFileError} (`message` is a precise reason like
+ * "宿主凭证目录可被组内或其它用户写入" / "宿主凭证文件权限必须严格为 0600" /
+ * "宿主凭证拒绝符号链接"). This surfaces that reason plus a one-line remediation
+ * hint WITHOUT changing any validation — every fail-closed check still fails
+ * closed; we only make the failure legible.
+ *
+ * `error` keeps the stable machine code (unchanged for programmatic callers);
+ * `reason`/`hint` are additive human-facing fields.
+ */
+export function describeDashboardTokenError(
+  code: 'token_persist_failed' | 'token_unavailable',
+  err: unknown,
+  tokenPath: string,
+): { error: string; reason?: string; hint?: string } {
+  if (!(err instanceof UnsafeHostAuthorityFileError)) return { error: code };
+  const reason = err.message;
+  // Map the credential-shape reason to a concrete fix. Remediations are
+  // intentionally NOT auto-applied: a group/other-writable (or wrongly-owned)
+  // credential dir may already be compromised, so tightening it is the user's
+  // explicit decision, not a silent self-heal — we only make the failure
+  // legible. Guard rails for the hint (the reason itself is always surfaced):
+  //   - Owner errors carry the failing node in their label ("宿主凭证目录" vs
+  //     "宿主凭证文件"); branch on it so we never tell someone to chmod the dir
+  //     when the *file* is the wrong owner (chmod can't fix ownership anyway).
+  //   - Never hand a single destructive command when the node kind is unknown:
+  //     a directory leaf makes a blind `rm -f` fail with "Is a directory", so
+  //     the generic non-regular-file case degrades to an inspection step.
+  //   - On non-POSIX hosts a chmod/rm one-liner is unusable, so degrade to prose
+  //     and quote paths (spaces / shell metacharacters) on POSIX.
+  const dir = dirname(tokenPath);
+  const posix = process.platform !== 'win32';
+  const qDir = shellQuoteIfNeeded(dir);
+  const qFile = shellQuoteIfNeeded(tokenPath);
+  const ownerErr = reason.includes('不属于当前用户');
+  let hint: string | undefined;
+  if (reason.includes('组内或其它用户写入') || (ownerErr && reason.includes('宿主凭证目录'))) {
+    hint = posix
+      ? `凭证目录权限过松或属主不对。请确认 ${dir} 归当前用户所有,并执行 chmod 700 ${qDir} 后重试。`
+      : `凭证目录权限过松或属主不对。请确认 ${dir} 归当前用户所有、且未对其他用户开放写权限后重试。`;
+  } else if (ownerErr && reason.includes('宿主凭证文件')) {
+    // Wrong-owner file: chmod can't change ownership; removing it lets ensure/
+    // rotate regenerate it as the current user (the dir is 0700-owned, so the
+    // unlink is permitted).
+    hint = posix
+      ? `凭证文件不属于当前用户。请执行 rm -f ${qFile} 让其以当前用户身份重新生成后重试。`
+      : `凭证文件不属于当前用户。请删除 ${tokenPath} 让其以当前用户身份重新生成后重试。`;
+  } else if (reason.includes('权限必须严格为 0600')) {
+    hint = posix
+      ? `凭证文件权限过松。请执行 chmod 600 ${qFile} 后重试。`
+      : `凭证文件权限过松。请将 ${tokenPath} 收紧为仅当前用户可读写后重试。`;
+  } else if (reason.includes('拒绝符号链接')) {
+    // ELOOP — definitely a symlink; `rm -f` removes a symlink safely.
+    hint = posix
+      ? `凭证文件是符号链接。请执行 rm -f ${qFile} 让其重新生成后重试。`
+      : `凭证文件是符号链接。请删除 ${tokenPath} 让其重新生成后重试。`;
+  } else if (reason.includes('必须是普通文件')) {
+    // Non-regular file of unknown kind (possibly a directory): give an
+    // inspection step, not a blind `rm -f` that could fail or over-delete.
+    hint = posix
+      ? `凭证路径不是普通文件(可能是目录/管道/设备等)。请先 ls -ld ${qFile} 查看,再手动移除该节点后重试。`
+      : `凭证路径不是普通文件(可能是目录等)。请检查并手动移除 ${tokenPath} 后重试。`;
+  } else if (reason.includes('祖先') || reason.includes('句柄')) {
+    hint = `凭证目录的某级祖先不安全或运行期被改动。请确认 ${dir} 及其上级目录属可信用户后重试。`;
+  }
+  return { error: code, reason, ...(hint ? { hint } : {}) };
 }
 
 /** Extract `botmux_dashboard_token` value from a Cookie header. */
@@ -234,6 +303,8 @@ export function buildSetCookie(token: string): string {
  *   - `GET/HEAD /`, `/assets/*`, root icons    — static SPA shell
  *   - `GET /api/workflows/*`                   — zero-I/O legacy retirement
  *                                                tombstone (HTTP 410).
+ *   - `GET /workbench-ticket/<ticket>`         — 短时票据兑换（票据即凭证，
+ *                                                处理器自行验票，P2-1）。
  *
  * Outside those always-public surfaces, the explicit `publicReadOnly`
  * allow-list controls tokenless observation. Mutations and private reads still
@@ -244,6 +315,87 @@ export type AuthDecision =
   | { kind: 'allow' }
   | { kind: 'allow+set-cookie'; token: string; redirectTo: string }
   | { kind: 'deny401' };
+
+/**
+ * Feishu/Lark H5 sessions are deliberately narrower than the legacy owner
+ * cookie.  They can render the Workbench, observe its session stream, and use
+ * the two explicitly leased interaction surfaces; they can never fall through
+ * into Dashboard administration merely because a new route was added.
+ *
+ * Keep this as a positive capability map.  In particular, broad rules such as
+ * "all GETs" would expose config/secrets, while "all POSTs under /api/sessions"
+ * would turn an H5 viewer into a host operator.
+ */
+export type WorkbenchH5Capability =
+  | 'workbench.view'
+  | 'terminal.view'
+  | 'terminal.operate'
+  | 'preview.view'
+  | 'preview.operate';
+
+export function workbenchH5Capability(method: string, pathname: string): WorkbenchH5Capability | null {
+  const normalizedMethod = method.toUpperCase();
+  if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && (pathname === '/api/sessions' || pathname === '/events' || pathname === '/api/workbench/h5-context'
+      // P1-4：只读的能力集投影（canLocate/canControl/canInteract 三布尔）。它
+      // 只描述该身份在本 capability 表 + 角色映射下的既有权限，不授予任何新
+      // 权限，所以归入观察级的 workbench.view。
+      || pathname === '/api/workbench/capabilities')) {
+    return 'workbench.view';
+  }
+
+  // Read-only terminal capability URL. A view capability cannot send input, so
+  // observing identities may fetch it; since P1-5 the returned URL carries a
+  // SHORT-LIVED read grant bound to this very auth session (revoked on
+  // logout/expiry), never a stable token. The writable twin (write-link) stays
+  // behind the local management cookie — H5 identities can never mint it (see
+  // the explicit dashboard-auth test): H5 write access exists only as the
+  // releasable/expiring /control/takeover lease.
+  if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && /^\/api\/sessions\/[^/]+\/view-link$/.test(pathname)) {
+    return 'terminal.view';
+  }
+  if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && /^\/api\/sessions\/[^/]+\/preview$/.test(pathname)) {
+    return 'preview.view';
+  }
+
+  const terminal = pathname.match(/^\/api\/sessions\/[^/]+\/control(?:\/(takeover|release))?$/);
+  if (terminal) {
+    if (normalizedMethod === 'GET' && !terminal[1]) return 'terminal.view';
+    if (normalizedMethod === 'POST' && terminal[1]) return 'terminal.operate';
+    return null;
+  }
+
+  const preview = pathname.match(/^\/api\/sessions\/[^/]+\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+  if (preview) {
+    if (normalizedMethod === 'GET' && !preview[1]) return 'preview.view';
+    if (normalizedMethod === 'POST' && preview[1]) return 'preview.operate';
+    return null;
+  }
+  return null;
+}
+
+/** Fail-closed auth decision for an already-authenticated H5/readonly-platform
+ * identity. Static shell reads retain the ordinary public behavior; everything
+ * else must name one of the Workbench capabilities above. */
+export function decideWorkbenchH5Auth(opts: {
+  method: string;
+  pathname: string;
+}): AuthDecision {
+  if (workbenchH5Capability(opts.method, opts.pathname)) return { kind: 'allow' };
+  return decideDashboardAuth({
+    method: opts.method,
+    pathname: opts.pathname,
+    hasTokenParam: false,
+    presentedToken: undefined,
+    activeToken: '',
+    // An authenticated Workbench identity is not an anonymous public-read
+    // viewer. Do not let a deployment-wide publicReadOnly flag broaden this
+    // capability set to settings/schedules/groups.
+    publicReadOnly: false,
+  });
+}
 
 /** Tokenless-readable API paths when `config.dashboard.publicReadOnly` is on.
  *  ALLOW-LIST (fail-closed): only the "watch work" surfaces the read-only
@@ -298,9 +450,27 @@ export function decideDashboardAuth(opts: {
       pathname === '/favicon.ico' ||
       pathname === '/favicon.png' ||
       pathname === '/apple-touch-icon.png' ||
+      // The install manifest is fetched by the OS, not the signed-in page, so a
+      // gated response silently disables "add to home screen". It names icons
+      // and a start URL — no session data.
+      pathname === '/workbench.webmanifest' ||
+      // Self-service diagnostics page. It is needed exactly when a device
+      // cannot authenticate or cannot load the SPA, so gating it behind the
+      // token would lock it out of its only job. The page is a static shell
+      // like the others: it reads no server state and renders no session data,
+      // and every probe it runs is the visitor's own browser calling the same
+      // gated APIs under the visitor's own (possibly absent) credentials.
+      pathname === '/workbench-doctor' ||
       pathname.startsWith('/assets/') ||
       pathname.startsWith('/game/')
     );
+
+  // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换端点。URL 路径里的票据本身
+  // 就是凭证（30 分钟 TTL、落盘只存 hash，见 workbench-ticket.ts），处理器自行
+  // 验票，无效/过期只回一个无凭据提示页——所以这条 GET 必须放在 token 门禁之外，
+  // 与静态壳同级。仅豁免 GET（处理器也只接 GET），其它方法保持 fail closed。
+  const isTicketRedemption =
+    method === 'GET' && /^\/workbench-ticket\/[^/]+$/.test(pathname);
 
   // Public read-only mode opens ONLY the allow-listed "watch work" reads
   // (PUBLIC_READ_PATHS) — fail-closed: a path not on the list stays token-gated
@@ -312,7 +482,7 @@ export function decideDashboardAuth(opts: {
 
   const authed = !!presentedToken && presentedToken === activeToken;
 
-  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isPublicRead) {
+  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isPublicRead && !isTicketRedemption) {
     return { kind: 'deny401' };
   }
 
@@ -322,9 +492,116 @@ export function decideDashboardAuth(opts: {
     return {
       kind: 'allow+set-cookie',
       token: presentedToken,
-      redirectTo: pathname || '/',
+      // The fragment-free Workbench entries are redirects themselves. Sending
+      // the cleaned URL back to the same path would bounce between "strip the
+      // token" and "redirect again", so resolve them to their real destination
+      // in this one hop.
+      redirectTo: pathname === '/workbench'
+        ? '/#/agent-workbench'
+        : pathname === '/workbench/dock'
+          ? '/#/agent-workbench-dock'
+          : pathname || '/',
     };
   }
 
   return { kind: 'allow' };
+}
+
+// ─── P1-4：工作台最小操作能力集投影 ──────────────────────────────────────────
+
+/**
+ * 前端可见的"最小操作能力集"。`workbenchAuthed` 只能证明可进工作台，不代表任何
+ * 一项操作权限；三布尔各自对应一条真实路由的门禁：
+ *
+ *   - `canLocate`   → `POST /api/sessions/:id/locate`（话题定位）。
+ *   - `canControl`  → `POST /api/sessions/:id/control/takeover|release`
+ *                     （终端接管/释放）。
+ *   - `canInteract` → `POST /api/sessions/:id/preview-interaction/unlock|
+ *                     activity|lock`（Preview 交互解锁）。
+ *
+ * 边界（P1-6 write token）：`canControl` 只描述该身份**不带显式 token 时**在
+ * Dashboard control API 上的默认能力。显式 `?token=`（write token）走终端前置
+ * 代理的独立授权链——它既不经过这三条 API，也不受本投影影响；一个 teammate 被
+ * 递了显式 write token 仍可直接写终端，本投影不试图（也不可能）描述那条通道。
+ */
+export interface WorkbenchOperationCapabilities {
+  canLocate: boolean;
+  canControl: boolean;
+  canInteract: boolean;
+}
+
+/** 匿名 / 解析失败时的 fail-closed 值：三项全 false。 */
+export const WORKBENCH_NO_OPERATION_CAPABILITIES: Readonly<WorkbenchOperationCapabilities> =
+  Object.freeze({ canLocate: false, canControl: false, canInteract: false });
+
+/**
+ * 处理器级角色门禁：谁能对预览交互做写操作（unlock / activity / lock）。
+ *
+ * 这一条判据同时被三处消费，必须只有一份实现，否则「画不画解锁按钮」和「POST 会
+ * 不会 403」会各走各的：
+ *   1. `dashboard.ts` 的 `/api/sessions/:id/preview-interaction/*` 路由（唯一权威，
+ *      false → 403 `preview_operation_forbidden`）；
+ *   2. 下面 {@link projectWorkbenchOperationCapabilities} 的 `canInteract`；
+ *   3. 由 2 驱动的工作台「开启交互」按钮与 Preview guard 壳里的解锁按钮。
+ *
+ * 身份缺失或 `previewCapability` 不是明确的 `'operate'` 一律 false（fail closed）。
+ */
+export function previewInteractionWriteAllowed(
+  identity: { previewCapability?: 'operate' | 'readonly' } | null | undefined,
+): boolean {
+  return identity?.previewCapability === 'operate';
+}
+
+/** 投影所需的最小身份切面——与 dashboard.ts 的 DashboardRequestIdentity 结构兼容
+ *  （kind 枚举 + terminal-control.ts 的角色能力字段）。 */
+export interface WorkbenchCapabilityActor {
+  kind: 'legacy-dashboard' | 'platform-dashboard' | 'feishu-h5';
+  terminalCapability?: 'controlled' | 'owner' | 'readonly';
+  previewCapability: 'operate' | 'readonly';
+}
+
+/**
+ * 由身份投影三布尔能力集。**不是一张平行的权限表**：每一项都通过复算真实路由
+ * 的两层门禁得出——
+ *
+ *   1. 路由级 auth 决策：workbench-only 身份（H5 / platform）走
+ *      {@link decideWorkbenchH5Auth}（capability 表里没有 /locate，所以 H5 与
+ *      platform 全员 canLocate=false）；legacy owner 走
+ *      {@link decideDashboardAuth}（cookie == active token，等价于 allow）。
+ *   2. 处理器级角色检查：dashboard.ts 对 control/preview-interaction 写操作分别
+ *      用 `terminalCapability === 'readonly'` / `previewCapability === 'readonly'`
+ *      403，这里逐字复用同一判据。
+ *
+ * 因此「投影为 true 而路由 401/403」或反向漂移只可能来自这两层规则本身的改动，
+ * 而 test/dashboard-auth.test.ts 的矩阵测试把两边钉在一起。
+ */
+export function projectWorkbenchOperationCapabilities(
+  identity: WorkbenchCapabilityActor | null,
+): WorkbenchOperationCapabilities {
+  if (!identity) return { ...WORKBENCH_NO_OPERATION_CAPABILITIES };
+  const legacy = identity.kind === 'legacy-dashboard';
+  // 会话 id 只是路由 pattern 的占位（[^/]+ 全匹配），对决策无影响；legacy 侧的
+  // probe token 复现的是「cookie 与 active token 相等」这一既成事实。
+  const routeAllows = (method: string, pathname: string): boolean => (legacy
+    ? decideDashboardAuth({
+        method,
+        pathname,
+        hasTokenParam: false,
+        presentedToken: 'capability-probe-token',
+        activeToken: 'capability-probe-token',
+        publicReadOnly: false,
+      }).kind === 'allow'
+    : decideWorkbenchH5Auth({ method, pathname }).kind === 'allow');
+  return {
+    canLocate: routeAllows('POST', '/api/sessions/probe/locate'),
+    // terminalCapability 缺失按 readonly 处理（fail closed）；'owner' 与
+    // 'controlled' 都不落入 403 分支，与 dashboard.ts 的判据一字不差。
+    canControl: routeAllows('POST', '/api/sessions/probe/control/takeover')
+      && identity.terminalCapability !== undefined
+      && identity.terminalCapability !== 'readonly',
+    // 与 dashboard.ts 路由里那次 403 判断共用 previewInteractionWriteAllowed，
+    // 不再各写一遍「!== 'readonly'」。
+    canInteract: routeAllows('POST', '/api/sessions/probe/preview-interaction/unlock')
+      && previewInteractionWriteAllowed(identity),
+  };
 }

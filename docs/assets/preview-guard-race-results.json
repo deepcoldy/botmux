@@ -1,0 +1,56 @@
+{
+  "ok": true,
+  "subject": "P1-16 guard lock generation + P2 readonly unlock button",
+  "browser": "local executable",
+  "screenshots": [
+    "docs/assets/preview-guard-race-unlocked.png",
+    "docs/assets/preview-guard-race-locked.png",
+    "docs/assets/preview-guard-readonly.png"
+  ],
+  "assertions": {
+    "staleActivityCannotUnhideOverlay": true,
+    "lockAppliesBeforeItsResponse": true,
+    "readonlyRendersNoUnlockControl": true,
+    "readonlyUnlockStillForbiddenServerSide": true,
+    "interactiveIdentityKeepsUnlock": true
+  },
+  "observed": {
+    "activityRequests": 2,
+    "activityAborted": 1,
+    "lockRequests": 2,
+    "unlockForbidden": 1
+  },
+  "findings": {
+    "staleActivity": {
+      "released": 1,
+      "lockedRightAfterClick": true,
+      "lockedAfterStale": true,
+      "badge": "预览模式（默认）"
+    },
+    "nativePath": {
+      "lockedAfterRelease": true,
+      "activityAbortedByClient": true,
+      "lockRequests": 2
+    },
+    "readonly": {
+      "unlockButtons": 0,
+      "lockButtons": 0,
+      "canInteractAttr": "false",
+      "locked": true,
+      "previewVisible": true,
+      "forcedUnlockStatus": 403
+    },
+    "ownerControl": {
+      "unlockButtons": 1,
+      "canInteractAttr": "true"
+    }
+  },
+  "auditActions": [
+    "preview.unlock",
+    "preview.activity",
+    "preview.lock",
+    "preview.unlock",
+    "preview.activity",
+    "preview.lock"
+  ]
+}

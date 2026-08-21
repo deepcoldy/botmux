@@ -13,7 +13,7 @@ function caseBody(type: string, nextType: string): string {
 
 describe('worker transfer detach lifecycle', () => {
   it('detaches through backend.kill without invoking permanent close teardown', () => {
-    const detach = caseBody('detach_for_transfer', 'riff_shutdown_prepare');
+    const detach = caseBody('detach_for_transfer', 'remote_shutdown_prepare');
     expect(detach).toContain('killCli({ preserveSandbox: true });');
     expect(detach).toContain('await flushTransferDetachAck(msg.requestId);');
     expect(detach).toContain('process.exit(0);');

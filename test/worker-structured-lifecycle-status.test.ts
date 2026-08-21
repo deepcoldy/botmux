@@ -122,9 +122,14 @@ describe('worker structured-turn status wiring', () => {
 
   it('settles terminals after optional output and preserves the empty-completed fallback', () => {
     const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
-    const emptyFallback = emit.indexOf('shouldEmitEmptyCompletedBridgeFallback');
+    // The empty-completed fallback is still wired before the output guard —
+    // now via the extracted structuredFallbackKind decision, whose
+    // 'empty_completed' branch posts emptyCompletedBridgeFallbackContent().
+    const fallbackKind = emit.indexOf('structuredFallbackKind');
+    const emptyFallback = emit.indexOf('emptyCompletedBridgeFallbackContent()', fallbackKind);
     const outputGuard = emit.indexOf('if (!content) continue;', emptyFallback);
     const terminalLoop = emit.indexOf('for (const turn of ready)', outputGuard);
+    expect(fallbackKind).toBeGreaterThanOrEqual(0);
     expect(emptyFallback).toBeGreaterThanOrEqual(0);
     expect(outputGuard).toBeGreaterThan(emptyFallback);
     expect(terminalLoop).toBeGreaterThan(outputGuard);
@@ -509,6 +514,98 @@ describe('worker structured-turn status wiring', () => {
     // so a deferred ZMX turn can never be pinned by the probe loop.
     const probe = functionSlice('scheduleBusyPatternIdleProbe', 'spawnCli');
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+  });
+
+  it('publishes first-turn working from the projected status for argv-baked prompts, as a pure publisher', () => {
+    const startScreen = functionSlice('startScreenUpdates', 'stopScreenUpdates');
+    const gate = startScreen.indexOf('if (awaitingFirstPrompt) {');
+    const gateEnd = startScreen.indexOf('void (async () => {', gate);
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(gateEnd).toBeGreaterThan(gate);
+    const channel = startScreen.slice(gate, gateEnd);
+
+    // Gated on spawnArgvNeedsWorkingSeed (argv-baked first prompt), NOT on
+    // busyPattern: a non-argv first turn (Claude/Codex/type-ahead) is still booting,
+    // so the publisher must be a no-op there and let the queued prompt flush after
+    // the ready edge.
+    expect(channel).toContain('spawnArgvNeedsWorkingSeed');
+    // It publishes the PROJECTED status ('working' during turn one because
+    // isPromptReady is still false) rather than scraping the screen for a busy
+    // marker — this is the general "sent to the CLI ⇒ working" model.
+    expect(channel).toContain('projectedRuntimeScreenStatus()');
+    expect(channel).toContain("projected === 'working'");
+    expect(channel).toContain("status: 'working'");
+    // No screen-scraping: the old busyPattern/capture path is gone from this gate.
+    expect(channel).not.toContain('cliAdapter?.busyPattern');
+    expect(channel).not.toContain('busyProbeRegion(content)');
+    expect(channel).not.toContain('captureBackendScreen(');
+    // The channel still ends in the original bare `return;` so the async sampler
+    // stays gated during turn one exactly as before.
+    expect(/return;\s*}\s*$/.test(channel.trimEnd())).toBe(true);
+
+    // Pure publisher: dedup via the local lastSentStatus only; it must NOT touch
+    // isPromptReady, the idle detector, or the argv seed flags — otherwise it
+    // would perturb the first-prompt evidence machinery / end-of-turn seed.
+    expect(channel).toContain("lastSentStatus !== 'working'");
+    expect(channel).toContain("lastSentStatus = 'working'");
+    expect(channel).not.toContain('isPromptReady =');
+    expect(channel).not.toContain('idleDetector');
+    expect(channel).not.toContain('spawnArgvInitialPromptBusy =');
+    expect(channel).not.toContain('spawnArgvNeedsWorkingSeed =');
+  });
+
+  it('suppresses the markPromptReady generic idle snapshot while the Grok-class busy arm is pending', () => {
+    const body = functionSlice('markPromptReady', 'persistCliSessionId');
+    // The "immediate idle snapshot" fires before the seed consumes
+    // spawnArgvInitialPromptBusy. For a Grok-class pre-execution ready edge that
+    // generic snapshot projects idle (isPromptReady just went true) and would reach
+    // the daemon BEFORE the busy arm re-publishes working — combined with the
+    // first-turn publisher's working, that working→idle fires a premature DONE. The
+    // snapshot must be gated on !spawnArgvInitialPromptBusy so no idle escapes.
+    const idleSnapshot = body.indexOf('Send immediate idle snapshot');
+    const guardedSend = body.indexOf('renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0', idleSnapshot);
+    expect(idleSnapshot).toBeGreaterThanOrEqual(0);
+    expect(guardedSend).toBeGreaterThan(idleSnapshot);
+    // The busy arm below still owns the working publish for this path.
+    const busyArm = body.indexOf('if (spawnArgvInitialPromptBusy) {', guardedSend);
+    const armWorking = body.indexOf("publishScreenStatus('working', { force: true })", busyArm);
+    expect(busyArm).toBeGreaterThan(guardedSend);
+    expect(armWorking).toBeGreaterThan(busyArm);
+  });
+
+
+  it('scopes the argv turn-start evidence machinery and its flush side effect to Pi', () => {
+    // The transcript-evidence latch lives on the GENERIC codexBridgeIngest
+    // path, which also serves Grok (argv-baked + structured bridge +
+    // type-ahead). Its flush side effect must be Pi-gated, or Grok would gain
+    // a new startup-window write whose first ready is owned by the
+    // SessionStart busy arm instead.
+    const note = functionSlice('noteSpawnArgvTurnStartTranscriptEvidence', 'stopSpawnArgvTurnStartFailOpen');
+    const piGuard = note.indexOf('if (!structuredBridgeIsPi()) return;');
+    const latch = note.indexOf('spawnArgvTurnStartEvidenceSeen = true');
+    const flush = note.indexOf('flushQueuedInputAfterTurnStartEvidence()');
+    expect(piGuard).toBeGreaterThanOrEqual(0);
+    expect(latch).toBeGreaterThan(piGuard);
+    expect(flush).toBeGreaterThan(latch);
+
+    const gate = functionSlice('spawnArgvTurnStartGateHolds', 'noteSpawnArgvTurnStartTranscriptEvidence');
+    expect(gate).toContain('structuredBridgeIsPi()');
+
+    // markPromptReady branch boundary: the no-evidence gate must NOT re-kick
+    // (startup input protection — the TUI may not accept input yet); the
+    // lifecycle-block branch must re-kick (turn-start evidence exists there).
+    // functionSlice('markPromptReady', …) starts at markPromptReadyFromPty
+    // (prefix match) and also spans the helper definitions, so anchor on the
+    // literal markPromptReady body before locating the two gate branches.
+    const body = functionSlice('markPromptReady', 'persistCliSessionId');
+    const markStart = body.indexOf('function markPromptReady(): void');
+    expect(markStart).toBeGreaterThanOrEqual(0);
+    const evidenceGate = body.indexOf('if (spawnArgvTurnStartGateHolds()) {', markStart);
+    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {', markStart);
+    expect(evidenceGate).toBeGreaterThanOrEqual(0);
+    expect(lifecycleGate).toBeGreaterThan(evidenceGate);
+    expect(body.slice(evidenceGate, lifecycleGate)).not.toContain('flushQueuedInputAfterTurnStartEvidence');
+    expect(body.slice(lifecycleGate)).toContain('flushQueuedInputAfterTurnStartEvidence()');
   });
 
   it('carries the structured mark through adopt submit confirmation and exception cleanup', () => {

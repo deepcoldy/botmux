@@ -42,6 +42,15 @@ export interface TeamFilters {
 
 export type TeamApiResult<T = any> = DashboardApiResult<T>;
 
+export interface FeedbackPolicyLayer {
+  enabled?: boolean;
+  audience?: 'requester';
+  visibleSemantics?: unknown[];
+  buttons?: unknown[];
+  negativeFollowup?: { reasons?: unknown[]; comment?: { enabled?: boolean; required?: boolean; placeholder?: string; maxLength?: number } };
+  allowReselect?: boolean;
+}
+
 export interface HostedTeamsResponse {
   ok?: boolean;
   deployment?: {
@@ -110,6 +119,10 @@ export async function createHostedTeam(name: string): Promise<TeamApiResult> {
 
 export async function deleteHostedTeam(teamId: string): Promise<TeamApiResult> {
   return jsend('DELETE', '/api/team/hosted/' + encodeURIComponent(teamId));
+}
+
+export async function updateHostedTeamFeedback(teamId: string, feedback: FeedbackPolicyLayer | null): Promise<TeamApiResult<{ feedback?: FeedbackPolicyLayer | null }>> {
+  return jput(`/api/team/hosted/${encodeURIComponent(teamId)}/feedback`, { feedback });
 }
 
 export async function generateLocalInvite(teamId: string): Promise<TeamApiResult<{ code?: string }>> {

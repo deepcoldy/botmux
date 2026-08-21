@@ -528,12 +528,16 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 
 const BOTS_SKILL = `---
 name: botmux-bots
-description: 列出当前飞书群里可协作的机器人（协作花名册：含能力标签、是否有团队角色、以及你能否可靠 @ 到它）。在需要点名其他机器人协作、或交棒给队友前查看时使用。
+description: 列出可协作的机器人（协作花名册）。默认列**当前飞书群内**的 bot（含能力标签、是否有团队角色、能否可靠 @ 到它）；加 --scope team 则跨机列**同团队、已 opt-in** 的 agent 供按专长发现，并可用 create-group --team 拉进新群、或 bots invite 补进已有团队群。在需要点名协作、交棒队友、或跨机找/拉别人的 agent 前使用。
 ---
 
-# botmux-bots — 群内协作花名册
+# botmux-bots — 协作花名册（群内 + 团队维度）
 
-## 用法
+两种 scope，用途不同：
+- **chat（默认）**：\`botmux bots list\` —— 列**当前群里**的 bot，判断能不能 @、派活。
+- **team**：\`botmux bots list --scope team\` —— 跨机列**同团队、已 opt-in** 的 agent（在别人机器上、还没进你的群），用于按专长发现后拉群协作。
+
+## 用法（chat scope，默认）
 
 \`\`\`bash
 botmux bots list
@@ -549,6 +553,12 @@ botmux bots list
 - \`mentionable\`：**你能不能可靠地 @ 到它**（关键）
 - \`mentionSource\`：\`cross-ref\` | \`observed\` | \`self\` | \`fallback\`
 
+另外每行还带两块**派活前的只读决策信息**（都是从本地配置推导，不代表运行时在线）：
+- \`dispatch\`：\`trigger\`（唤醒方式，恒为 \`mention\`）+ \`workspace\`（派活要不要指定仓库：\`required\`|\`optional\`|\`none\`|\`unknown\`）
+- \`collaboration\`：\`reachability\`（能否可靠寻址）、\`workspace\`（仓库要求 + 工作区候选来源）、\`authorization\`（\`talk\` 对话授权 / \`operate\` 管理动作授权，两层分开判）、\`session\`（普通群 \`mentionMode\` 要不要 @、\`replyMode\` 回复落哪）、\`runtime\`（\`transport\` 有无飞书通道、\`deployment\` 本地/远端、\`stale\` 健康证据是否过期）
+
+顶层还有一个 \`collaborationHelp\`：**逐字段逐枚举值的中文解释就印在同一份输出里**——不确定某个值什么意思，直接查它，不用来问。
+
 \`\`\`json
 {
   "sessionId": "...",
@@ -556,17 +566,59 @@ botmux bots list
   "bots": [
     { "name": "后端Bot", "openId": "ou_yyy", "isSelf": false, "larkAppId": "cli_b",
       "capability": "服务端排查，擅长日志", "hasTeamRole": true,
-      "mentionable": true, "mentionSource": "cross-ref" }
+      "mentionable": true, "mentionSource": "cross-ref",
+      "dispatch": { "trigger": "mention", "workspace": "required" },
+      "collaboration": {
+        "reachability": "ready",
+        "workspace": { "requirement": "required", "source": "oncall" },
+        "authorization": { "talk": "preflight-required", "operate": false },
+        "session": { "mentionMode": "always", "replyMode": "chat-topic" },
+        "runtime": { "transport": true, "deployment": "local", "stale": "unknown" }
+      } }
   ],
-  "total": 1
+  "total": 1,
+  "collaborationHelp": { "general": "unknown 表示当前命令没有足够证据…", "fields": { "reachability": { "description": "…", "values": { "ready": "…" } } } }
 }
 \`\`\`
 
-## 关键规则
+## 关键规则（chat scope）
 
 1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
 2. 按 \`capability\` 挑合适的队友，而不是乱点。
-3. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+3. **\`unknown\` ≠ 不可用、更 ≠ 离线**：只是这条命令当前没有足够证据。别把 \`unknown\` 当成"它挂了"而放弃派活；语义拿不准就查 \`collaborationHelp\`。
+4. \`authorization.operate\` 默认按 \`false\`/\`unknown\` 处理：能对话不等于能让它跑 \`/repo\`、\`/restart\` 等管理动作，那类要单独授权。
+5. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+
+## 团队维度：跨机发现 + 拉群（--scope team）
+
+用途：找到**同团队、还没进你群、在别人机器上**的 agent，按专长挑出来，拉进一个聚焦新群一起干活。
+
+\`\`\`bash
+# 1) 发现：列同团队已 opt-in 的 agent（本机在多团队时用 --team 指定）
+botmux bots list --scope team [--team <teamId>]
+
+# 2a) 建新群：把发现到的 agent（按 appId）+ 各自 owner 拉进一个平台代建的**新群**
+botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
+
+# 2b) 往已有群补人：把 agent + 各自 owner 加进一个**你已在场的**群（恒带 owner）
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+\`\`\`
+
+team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`。
+
+**必须知道的语义**：
+- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`）。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
+- **specialties / mentionable / online 是 agent 自报**：仅供你挑选参考，**不是可信凭据**，别拿它当权限判断。
+- **CLI 不做任何授权判断**：团队成员校验、opt-in 闸全在平台。你只管发现 + 拉群/补人，平台会拒绝越权的调用。
+- **只认 appId、不需要 @**：正因为别人 bot 进你群前你根本 @不到它，team 拉群/补人全走 appId + machine-auth，天然绕开"看不见就点不着"。结果里 \`invalidBotIds\` / \`invalidOwnerUnionIds\` 是平台过滤掉的（未 opt-in / 拉不动），如实展示即可。
+- \`bots invite\` 的目标群要满足：**平台机器人（BotmuxPlatform）已在群里**（否则平台加不进人 → 403 \`platform_bot_not_in_chat\`，先把它拉进群）+ **你本人已在该群**（→ 403 \`requester_not_in_chat\`，只能往你自己在场的群补人）+ **非机器人大厅**（→ 403 \`chat_is_hall\`）。补人恒把 agent + 各自 owner 一起拉进。
+- 平台端点没上线时命令会明确提示「平台尚未部署…端点」——那是平台侧还没部署，不是你调错。
+
+**三条拉人路径 —— 别混**：
+- \`create-group --team\`：跨机、把**同团队但不在任何共同群**的 agent + owner **新建**成一个聚焦群。"首次把没见过面的 agent 聚到一起"。
+- \`bots invite --chat\`：把同团队 agent + 各自 owner 加进一个**你已在场、且平台机器人也在**的群（跨机、machine-auth、只认 appId）。"群已经在了，往里补同团队的人（含其 owner）"。
+- \`/invite\`（飞书群内 slash）：把 bot 加进**当前已存在的**群，走飞书原生加成员，**限同租户**、只拉 bot 不带 owner。"群在了，把某个同租户 bot 也拉进来"。
+- 一句话：跨 team 从零聚人 → \`create-group --team\`；往你已在场的群补同团队的人 → \`bots invite\`；当前群补同租户 bot → \`/invite\`。
 
 ## 要把任务交棒给别的机器人？
 
@@ -1052,6 +1104,12 @@ botmux ask buttons --options "yes=继续,no=停止" "继续吗？"
 
 兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
 
+多选加 \`--multi\`，stdout 返回逗号分隔的 key；需要完整结构时加 \`--json\` 读取 \`answers[0]\`（多选下 \`selected\` 恒为 \`null\`，因为它只表示单问单选的兼容值）：
+
+\`\`\`bash
+choices=$(botmux ask buttons --multi --options "lint=Lint,test=测试,build=构建" "要执行哪些检查？")
+\`\`\`
+
 ## JSON 输出
 
 \`\`\`bash
@@ -1062,12 +1120,13 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 同时保留非 0 exit code。脚本判断超时必须看 exit code 或 \`timedOut\` 字段。
 
 \`\`\`json
-{"selected":"yes","by":"ou_xxx","timedOut":false,"comment":null}
+{"selected":"yes","answers":[["yes"]],"by":"ou_xxx","timedOut":false,"comment":null}
 \`\`\`
 
 ## 退出码和 stdout 契约
 
 - 成功：stdout 一行 \`<selected_key>\`，exit 0
+- \`--multi\` 成功：stdout 一行逗号分隔的 \`<selected_key>\`，exit 0
 - \`--json\`：stdout 一行 JSON（包括超时 / 失效），exit code 仍按结果返回
 - 超时：默认模式 stdout 为空，exit 124；\`--json\` 时 \`{"selected":null,"timedOut":true,...}\`
 - 缺少 botmux 环境变量 / 参数错误：stdout 为空，exit 2
@@ -1079,7 +1138,7 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 - \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
-- 不支持 comment / multi-select / free-form text（v0.1.7 范围外）
+- \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 
@@ -1513,11 +1572,32 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
+  { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
+];
+
+/** The v3 Workflow skill family, gated by the machine-wide workflow kill-switch
+ *  (`workflow.enabled` / `BOTMUX_WORKFLOW_ENABLED`, see
+ *  global-config.ts `isWorkflowFeatureEnabled`). Kept OUT of {@link BUILTIN_SKILLS}
+ *  — which is installed/advertised unconditionally — so that when the feature is
+ *  disabled these skills are neither written to a CLI's skills dir nor listed in
+ *  the prompt catalog (mirrors how the whiteboard skill is conditional).
+ *
+ *  `botmux-orchestrate` is deliberately NOT here: it is a separate multi-bot
+ *  long-running-orchestration capability, not a v3 workflow, and stays available
+ *  regardless of the workflow switch.
+ *
+ *  Order matches their historical position in the catalog (right after
+ *  `botmux-handoff`) so the ENABLED path renders byte-for-byte as before. */
+export const WORKFLOW_FEATURE_SKILLS: SkillDef[] = [
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-workflow', content: WORKFLOW_V3_SKILL },
   { name: 'botmux-goal-ask', content: GOAL_ASK_SKILL },
-  { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
 ];
+
+/** Names in {@link WORKFLOW_FEATURE_SKILLS}, for install cleanup + catalog
+ *  filtering when the workflow feature is off. */
+export const WORKFLOW_FEATURE_SKILL_NAMES: string[] =
+  WORKFLOW_FEATURE_SKILLS.map((s) => s.name);
 
 /** Skills that earlier botmux versions installed but no longer ship. The
  *  installer cleans these up so renamed skills don't linger as duplicates

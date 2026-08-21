@@ -1,6 +1,6 @@
 // src/dashboard.ts
-import { createServer, get as httpGet, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createServer as createTcpServer, connect as netConnect } from 'node:net';
+import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
@@ -9,18 +9,33 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
+  parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
+  projectWorkbenchOperationCapabilities, previewInteractionWriteAllowed,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
-  loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
+import {
+  resolveDashboardIdentity,
+  resolveDashboardRequestGate,
+  type DashboardRequestIdentity,
+} from './dashboard/request-identity.js';
+import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connections.js';
+import { createDashboardEventsStream, type DashboardEventAudience } from './dashboard/events-sse.js';
+import {
+  ControlCsrfTokens,
+  guardControlRequest,
+  injectControlCsrfMeta,
+  managementUpgradeOrigin,
+} from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
@@ -34,9 +49,28 @@ import {
   proxyDashboardAskAnswer,
 } from './dashboard/desktop-asks.js';
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
+import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
+import {
+  mintPreviewContentCapability,
+  verifyPreviewContentCapability,
+} from './dashboard/preview-content-capability.js';
+import {
+  previewDescriptorFromRow,
+  previewTeardownForDaemonEvent,
+  projectSessionDetailForBrowser,
+  projectSessionPreviewEventForBrowser,
+  projectSessionPreviewsForBrowser,
+  resolveSessionPreviewForProxy,
+} from './dashboard/preview-contract.js';
+import {
+  sameSessionPreviewTarget,
+  sessionPreviewTargetStillOwned,
+  type SessionPreviewTarget,
+} from './core/session-preview.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
+import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
 import {
@@ -48,13 +82,16 @@ import {
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
+  projectSessionEventForAudience,
+  projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
-  redactSessionEventForPublic,
-  redactSessionsForPublic,
   redactSettingsForPublic,
+  sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
+import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -62,6 +99,33 @@ import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguou
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
+import {
+  createDashboardH5AuthController,
+  DashboardSessionStore,
+  resolveDashboardH5AuthConfig,
+} from './dashboard/h5-auth.js';
+import { FileControlAuditSink } from './dashboard/control-audit.js';
+import {
+  TerminalControlManager,
+  terminalControlTtlFromEnv,
+} from './dashboard/terminal-control.js';
+import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
+import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
+import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
+import {
+  handleWorkbenchTicketRedemption,
+  revokeWorkbenchTicketsOutsideGeneration,
+  workbenchTicketGeneration,
+} from './dashboard/workbench-ticket.js';
+import { handleWorkbenchStandingLink } from './dashboard/standing-link.js';
+import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
+import {
+  centralViewLinkPath,
+  mintTerminalViewCapability,
+  terminalViewCapabilityAuthSession,
+  terminalViewForwardProof,
+  upstreamWorkerViewGeneration,
+} from './dashboard/terminal-view-capability.js';
 import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
@@ -77,14 +141,16 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
   buildPlatformDashboardLoginUrl,
+  workbenchEntryUrl,
   type DashboardUrls,
 } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
-import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot } from './utils/install-info.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
   fetchReleasesSince,
@@ -97,7 +163,15 @@ import {
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
-import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
+import { spawnDetachedRestart, globalInstallUpdateLockTarget } from './core/maintenance.js';
+import {
+  resolveLocalDevCheckoutDir,
+  resolveLocalDevRestartTarget,
+  isGitWorktree,
+  gitPorcelainStatus,
+  gitHeadSha,
+  localDevUpdateSteps,
+} from './utils/local-dev-update.js';
 import {
   detectGlobalInstallManager,
   formatGlobalInstallCommand,
@@ -121,7 +195,11 @@ import {
   writeRestartIntent,
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
-import { spawn } from 'node:child_process';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
+// Host children the dashboard forks (start/stop-bot, global install). They live
+// in their own module because every one of them must run on a REDACTED env —
+// see dashboard/managed-spawn.ts.
+import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -140,7 +218,7 @@ import {
 import { createDaemonInternalApi } from './dashboard/daemon-internal-api.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
@@ -149,9 +227,11 @@ import {
   readSkillRegistry,
   removeInstalledSkill,
   removeInstalledSkills,
+  sweepStoreTrash,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { readSkillPackRegistry } from './services/skill-pack-store.js';
+import { dashboardSessionActionTimeoutMs, type DashboardSessionAction } from './dashboard/session-action-timeout.js';
 import {
   cloneSkillPack,
   createSkillPack,
@@ -209,6 +289,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
+import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
@@ -301,6 +382,125 @@ let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
 
+const dashboardControlAudit = new FileControlAuditSink();
+const dashboardH5AuthConfig = resolveDashboardH5AuthConfig();
+const dashboardSessions = new DashboardSessionStore({ ttlMs: dashboardH5AuthConfig.sessionTtlMs });
+const dashboardH5Auth = createDashboardH5AuthController({
+  config: dashboardH5AuthConfig,
+  sessions: dashboardSessions,
+  audit: dashboardControlAudit,
+});
+const terminalControl = new TerminalControlManager({
+  secret: SECRET,
+  audit: dashboardControlAudit,
+  ttlMs: terminalControlTtlFromEnv(),
+});
+const previewInteraction = new PreviewInteractionManager({ audit: dashboardControlAudit });
+
+function legacyDashboardAuthSessionId(token: string): string {
+  return createHmac('sha256', SECRET)
+    .update('botmux-legacy-dashboard-session-id-v1\0')
+    .update(token)
+    .digest('base64url');
+}
+
+/** Stable per-machine scope for platform-dashboard actors. Shared between
+ * identity resolution and the read-capability liveness check so the two can
+ * never drift apart on the authSessionId format. */
+function platformDashboardActorScope(machineId: string): string {
+  return createHmac('sha256', SECRET)
+    .update('botmux-platform-dashboard-actor-v1\0')
+    .update(machineId)
+    .digest('base64url');
+}
+
+/**
+ * P1-5 liveness for a bound terminal read capability: `false` means the auth
+ * session it was minted under is over (H5 logout/expiry, dashboard token
+ * rotation, platform unbind), so the front proxy refuses the capability even
+ * though its signature/expiry would still verify at the worker.
+ */
+function terminalAuthSessionLive(authSessionId: string): boolean {
+  if (dashboardSessions.liveAuthSession(authSessionId)) return true;
+  const activeToken = currentDashboardToken();
+  if (activeToken && authSessionId === legacyDashboardAuthSessionId(activeToken)) return true;
+  const binding = readPlatformBinding();
+  if (binding) {
+    const scope = platformDashboardActorScope(binding.machineId);
+    if (authSessionId === `${scope}:owner`
+      || authSessionId === `${scope}:teammate`
+      || authSessionId === `${scope}:guest`) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** P1-8：预览内容凭据所属的认证会话（校验失败 → null，不予绑定）。 */
+function previewContentCapabilityAuthSession(capability: string, sessionId: string): string | null {
+  const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
+  return verified.ok ? verified.claims.authSessionId : null;
+}
+
+/** P1-7：身份判定只此一处（legacy > 平台角色 > H5），门禁选择也只读它的结论。 */
+function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentity | null {
+  return resolveDashboardIdentity({
+    legacyCookie: parseCookie(req.headers.cookie),
+    // The persisted file is the active-token authority (currentDashboardToken);
+    // there is no module-level mirror to compare against any more.
+    activeToken: currentDashboardToken(),
+    roleHeader: req.headers['x-botmux-role'],
+    platformMachineId: readPlatformBinding()?.machineId ?? null,
+    platformActorScope: platformDashboardActorScope,
+    legacyAuthSessionId: legacyDashboardAuthSessionId,
+    h5: dashboardH5Auth.resolve(req),
+  });
+}
+
+/** P1-8：authSession → 已建立的长连接（/events SSE、Preview SSE/长响应、
+ *  Preview WS）。身份一结束就遍历关闭，不等对端自己断。 */
+const authSessionConnections = new AuthSessionConnectionRegistry();
+/** P1-11：控制类端点的一次性 CSRF 票据（页面加载现签、绑定认证会话）。 */
+const controlCsrfTokens = new ControlCsrfTokens();
+
+/**
+ * 身份结束的统一收口：H5 logout/到期、legacy token rotate、平台解绑三条来源都
+ * 走这里，少走一条就等于留一扇后窗（P1-5 关写租约/读 socket，P1-8 关其余长连接，
+ * P1-11 作废该会话签出的 CSRF 票据）。
+ */
+function endDashboardAuthSession(authSessionId: string): void {
+  terminalControl.releaseByAuthSession(authSessionId);
+  previewInteraction.relockAuthSession(authSessionId);
+  authSessionConnections.closeAuthSession(authSessionId);
+  controlCsrfTokens.revokeAuthSession(authSessionId);
+}
+
+/**
+ * P1-8 平台解绑/改绑：`botmux bind|unbind` 先写 platform.json 再捅
+ * `/__cli/reload-binding`，所以进入 handler 时磁盘上已经是**新**值——想知道刚
+ * 才被吊销的是谁，只能由本进程自己记住上一次认可的 machineId。
+ */
+let observedPlatformMachineId: string | null = readPlatformBinding()?.machineId ?? null;
+
+function syncPlatformBindingRevocation(): void {
+  const current = readPlatformBinding()?.machineId ?? null;
+  if (observedPlatformMachineId && observedPlatformMachineId !== current) {
+    const scope = platformDashboardActorScope(observedPlatformMachineId);
+    for (const role of ['owner', 'teammate', 'guest'] as const) {
+      endDashboardAuthSession(`${scope}:${role}`);
+    }
+  }
+  observedPlatformMachineId = current;
+}
+
+dashboardSessions.onEnd(identity => {
+  // Ends BOTH capabilities of the authentication (P1-5): write leases AND every
+  // read socket the auth session opened (bound view-link capabilities included,
+  // via the front proxy's read-socket index). New connections with a capability
+  // minted under this authSessionId are refused by terminalAuthSessionLive.
+  endDashboardAuthSession(identity.authSessionId);
+});
+
 function tcpPortAvailable(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const probe = createTcpServer();
@@ -353,6 +553,157 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+/**
+ * P1-13：一个会话的预览目标失效时的收口动作（本进程侧）。
+ *
+ * 「失效」= 目标没了或换了主人：worker 换代 / 切 CLI / 会话关闭 / 端口被别的进程接管。
+ * 这三件事必须一起做，少一件就留一扇后窗：
+ *   1. 断掉该会话已经建立的预览 SSE / 长响应 / WebSocket——它们握手时是合法的，此刻
+ *      仍在把一个**不再属于这个会话**的进程的内容送进浏览器；
+ *   2. 收回该会话上的交互租约（resume 出来的新一代不得继承旧的「交互模式」授权）；
+ *   3. 让持有会话的 daemon 清掉 previewTarget 并广播 `preview: null`——代理进程只有
+ *      procfs 的只读视角，改不了会话行。
+ */
+const previewInvalidationsInFlight = new Set<string>();
+function teardownSessionPreview(sessionId: string): void {
+  authSessionConnections.closeSessionStreams(sessionId);
+  previewInteraction.relockSession(sessionId);
+}
+function invalidateStalePreviewTarget(
+  sessionId: string,
+  ownerLarkAppId: string | undefined,
+  staleTarget: SessionPreviewTarget,
+): void {
+  teardownSessionPreview(sessionId);
+  if (!ownerLarkAppId || previewInvalidationsInFlight.has(sessionId)) return;
+  // 每个会话同一时刻只发一次清理请求：刷新一次页面就是几十条子资源请求，逐条捅
+  // daemon 会把一次失效放大成一场风暴。拒绝本身已经生效，这里只是让状态收敛。
+  previewInvalidationsInFlight.add(sessionId);
+  // P1-3：指名要作废的是判定失效的**那一次注册**。这条 DELETE 跨进程飞过去的途中，
+  // 会话完全可以合法地重注册一个新目标；不带 revision 的清空会把它一起抹掉。
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/preview`
+    + `?expectedRegisteredAt=${encodeURIComponent(staleTarget.registeredAt)}`;
+  void proxyToDaemon(ownerLarkAppId, path, { method: 'DELETE' })
+    .catch(() => { /* 清理是收敛动作；失败时本次拒绝依旧成立 */ })
+    .finally(() => previewInvalidationsInFlight.delete(sessionId));
+}
+
+/**
+ * 每一跳预览请求的判定入口（HTTP、WebSocket 升级、guard 页面共用同一条）。
+ *
+ * P1-12：归属复核只读 /proc/net/tcp{,6} 与 /proc/<pid>/stat（全体可读），所以即便
+ * 代理进程与 daemon 不是同一个用户也能在每次落地前重新核验。
+ */
+function resolveDashboardSessionPreview(sessionId: string): PreviewProxyResolution {
+  const owner = aggregator.ownerOf(sessionId);
+  return resolveSessionPreviewForProxy({
+    row: aggregator.getSession(sessionId),
+    sessionId,
+    ownerLarkAppId: owner,
+    daemonOnline: !!owner && !!registry.getByAppId(owner),
+    isTargetOwned: target => sessionPreviewTargetStillOwned(target),
+    onStaleTarget: (staleSessionId, staleTarget) =>
+      invalidateStalePreviewTarget(staleSessionId, owner, staleTarget),
+  });
+}
+const sessionPreviewProxy = createSessionPreviewProxy({
+  // Preview HTTP/WS never accepts ?t=. The user must first establish either
+  // the legacy management cookie or an allow-listed short H5 session.
+  authenticated: req => dashboardRequestIdentity(req) !== null,
+  resolve: resolveDashboardSessionPreview,
+  // P0: the sandboxed content stream is an opaque origin, so it carries no
+  // cookie of any kind. Its path-scoped capability is the only credential —
+  // signature + session binding + expiry here, plus central revocation
+  // (logout / token rotation / platform unbind) through the same auth-session
+  // liveness the bound terminal read capability uses.
+  verifyContentCapability: (capability, sessionId) => {
+    const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
+    return verified.ok && terminalAuthSessionLive(verified.claims.authSessionId);
+  },
+  // P1-8: preview SSE / long responses / WebSocket bridges outlive the handshake
+  // that authorised them. Index each stream under its auth session so logout /
+  // rotation / unbind tears it down immediately. The content path carries no
+  // cookie, so its owner is the capability's own authSessionId.
+  // P1-13：同一条流再按 sessionId 建第二个索引。预览目标失效（换代 / 关闭 / 端口易主）
+  // 时身份仍然有效，只能靠这个索引定点断流。
+  // P1-4：这里同时是「登记点」和「最后一次判定点」。授权发生在拨号之前，而 dev
+  // server 的握手最长可以拖 45 秒；这段窗口里的登出/到期/rotate/解绑扫描不到一条
+  // 还没入索引的流。所以登记前把身份重新解一遍并复核存活：解不出身份（cookie 那条
+  // 路的会话已经没了）或已不存活，一律 fail closed，由代理销毁上游、不回 101/200。
+  // P1-1：同一段窗口里换靶也要 fail closed。身份没变、目标却已经换代 / 切 CLI /
+  // 端口易主时，旧流握完手照样能拿到 200/101，还会被**重新登记**进索引——换靶那一刻
+  // 的 teardown 扫的是索引，扫不到一条还没入索引的流。所以登记前把目标重解一遍
+  // （`resolveDashboardSessionPreview` 内含每跳的 owner 复核）并与拨号时那个比指纹：
+  // 不是同一次注册就不登记、不回 101/200，由代理销毁上游。
+  bindStream: (req, ctx, close) => {
+    const authSessionId = ctx.contentCapability
+      ? previewContentCapabilityAuthSession(ctx.contentCapability, ctx.sessionId)
+      : dashboardRequestIdentity(req)?.authSessionId ?? null;
+    if (!authSessionId || !terminalAuthSessionLive(authSessionId)) return false;
+    const current = resolveDashboardSessionPreview(ctx.sessionId);
+    if (!current.ok || !sameSessionPreviewTarget(current.target, ctx.target)) return false;
+    return authSessionConnections.register(authSessionId, close, ctx.sessionId);
+  },
+});
+/**
+ * P1-13：daemon 侧生命周期事件 → 预览收口。
+ *
+ * daemon 在每个权威换代边界广播 `preview: null`（worker 换代 / suspend / exit /
+ * close），会话彻底结束时广播 `session.exited`。中央 Dashboard 订阅这些事件，把本地
+ * 还挂着的预览长连接断掉、交互租约收回——否则「服务端已经没有目标了，浏览器那条流
+ * 还在流」，而且 resume 之后旧的交互授权会直接落到新一代 CLI 上。
+ *
+ * P1-1：`session.spawned` 也要认。daemon 重启期间广播的 `preview: null` 是丢的（事件
+ * 总线没有 replay buffer），重连之后只以 spawned 重放形式补齐。判据与记忆都在
+ * `previewTeardownForDaemonEvent` 里——只有目标指纹**确实变了**才收口，否则每次 SSE
+ * 重连都会误杀全部预览长连接。
+ */
+const lastSeenPreviewFingerprints = new Map<string, string>();
+aggregator.on(ev => {
+  const sessionId = previewTeardownForDaemonEvent(ev, lastSeenPreviewFingerprints);
+  if (sessionId) teardownSessionPreview(sessionId);
+});
+const previewGuardPage = createPreviewGuardPage({
+  authenticated: req => dashboardRequestIdentity(req) !== null,
+  resolve: resolveDashboardSessionPreview,
+  mintContentCapability: (req, sessionId) => {
+    const identity = dashboardRequestIdentity(req);
+    return identity
+      ? mintPreviewContentCapability(SECRET, sessionId, {
+        userId: identity.userId,
+        authSessionId: identity.authSessionId,
+        expiresAt: identity.expiresAt,
+      })
+      : null;
+  },
+  // P1-11: the guard shell is same-origin with the dashboard and POSTs
+  // unlock/activity/lock itself, so it needs its own control ticket.
+  mintCsrfToken: req => {
+    const identity = dashboardRequestIdentity(req);
+    return identity ? controlCsrfTokens.mint(identity.authSessionId) : null;
+  },
+  // P2：解锁按钮按能力渲染，与工作台面板用同一份投影（canInteract）。平台
+  // teammate/guest 这类 previewCapability=readonly 的身份，解锁 POST 本来就会被
+  // 下面的 preview-interaction 路由 403；壳里不再画那个按钮，避免「点了才知道
+  // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
+  canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
+});
+const terminalFrontProxy = createTerminalFrontProxy({
+  resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
+  resolveActor: dashboardRequestIdentity,
+  control: terminalControl,
+  // P1-5: bound `?viewToken=` capabilities are refused once the auth session
+  // they were minted under ended, and their bridged sockets are indexed so
+  // logout/expiry closes them immediately (see dashboardSessions.onEnd).
+  viewCapabilityAuthSession: (sessionId, viewToken) =>
+    terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+  isAuthSessionLive: terminalAuthSessionLive,
+  // P1-5: this proxy is the ONLY consumer allowed to spend a view capability.
+  // The countersignature proves the loopback hop passed through here — and
+  // therefore through the liveness check above — so a raw view URL aimed at the
+  // worker port or the daemon's own `/s/` proxy is refused by the worker.
+  viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+});
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
   onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
@@ -454,99 +805,6 @@ function resolveScheduleOwner(id: string): string | undefined {
   const primary = registry.list().find(d => d.botIndex === 0);
   return primary?.larkAppId;
 }
-/**
- * Bring a freshly-onboarded bot online without a fleet-wide restart by spawning
- * `botmux start-bot <appId> --json` (see cli.ts:ensureBotDaemonStarted). The new
- * daemon is forked+supervised by pm2 (reparented off this process), self-registers
- * and opens its Feishu WSClient, then publishes a descriptor the DaemonRegistry
- * auto-discovers — so no dashboard reload is needed either. Runs `botmux` on the
- * SAME host as the dashboard (shared pm2 home / bots.json — the documented
- * dashboard↔daemon co-location assumption). Resolves best-effort; the caller
- * falls back to the restart hint on failure.
- */
-function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    let out = '';
-    let err = '';
-    let settled = false;
-    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
-    try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'start-bot', appId, '--json'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-        // Run from HOME, not the dashboard's cwd (pm2 `cwd: PKG_ROOT`): a global
-        // package update replaces that dir, so a still-running dashboard would spawn
-        // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
-        cwd: globalInstallUpdateCwd(),
-      });
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        done({ ok: false, message: 'start-bot 超时（30s）' });
-      }, 30_000);
-      timer.unref?.();
-      child.stdout?.on('data', (d) => { out += String(d); });
-      child.stderr?.on('data', (d) => { err += String(d); });
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        // `start-bot --json` prints a single StartBotLiveResult object; prefer its
-        // own message/processName over the raw exit code.
-        let parsed: any;
-        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON → fall through */ }
-        if (code === 0) {
-          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已上线` : undefined });
-        } else {
-          done({ ok: false, message: parsed?.message || err.trim() || `start-bot 退出码 ${code}` });
-        }
-      });
-    } catch (e) {
-      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-    }
-  });
-}
-
-function spawnStopBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    let out = '';
-    let err = '';
-    let settled = false;
-    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
-    try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'stop-bot', appId, '--json'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-        cwd: globalInstallUpdateCwd(),
-      });
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        done({ ok: false, message: 'stop-bot 超时（30s）' });
-      }, 30_000);
-      timer.unref?.();
-      child.stdout?.on('data', (d) => { out += String(d); });
-      child.stderr?.on('data', (d) => { err += String(d); });
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        let parsed: any;
-        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON */ }
-        if (code === 0) {
-          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已停止` : undefined });
-        } else {
-          done({ ok: false, message: parsed?.message || err.trim() || `stop-bot 退出码 ${code}` });
-        }
-      });
-    } catch (e) {
-      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-    }
-  });
-}
-
 const botOnboarding = new BotOnboardingManager({
   botsJsonPath: BOTS_JSON_PATH,
   stopBotLive: spawnStopBotLive,
@@ -641,6 +899,10 @@ interface ResolvedDashboardSettings {
   autoUpdateSupported: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
+  /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
+   *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
+   *  family, and the CLI authoring/run subcommands host-wide. */
+  workflow: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -823,7 +1085,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         return false;
       }
     },
-    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+    managedSideEffectEligible: bot => evaluateVcMeetingConsumerIsolation({
       sandbox: bot.sandbox,
       platform: process.platform,
       backendType: resolvePairedSpawnBackendType(
@@ -833,6 +1095,19 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         config.daemon.backendType,
       ),
     }).ok,
+    sandboxIsolated: bot => {
+      const decision = evaluateVcMeetingConsumerIsolation({
+        sandbox: bot.sandbox,
+        platform: process.platform,
+        backendType: resolvePairedSpawnBackendType(
+          bot.cliId ?? config.daemon.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        ),
+      });
+      return decision.ok && decision.isolated;
+    },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
   };
 }
@@ -1233,6 +1508,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
+    workflow: { enabled: global.workflow?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
@@ -1319,6 +1595,15 @@ let updateInFlight = false;
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 
+// Local-dev counterpart: the checkout a successful /api/update/run built, and
+// its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
+// build's target — not a wrapper that a concurrent `pnpm use:here` in another
+// worktree may have re-pointed between the two requests (run builds B, wrapper
+// flips to C, restart would otherwise restart C or fall back to A). Cleared
+// once consumed by a restart. A plain "restart" (no preceding run) still
+// resolves the wrapper live.
+let pendingLocalDevRestart: { dir: string; head: string } | undefined;
+
 // Cache the upstream version/changelog lookups so the nav-badge check + the
 // Settings card don't hammer the npm registry / GitHub on every page load.
 // GitHub's unauthenticated API is only 60 req/h per IP, so caching the changelog
@@ -1397,52 +1682,71 @@ function currentInstalledVersion(): string {
 }
 
 /**
- * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
- * the event loop (async spawn, not execSync — the dashboard must keep serving
- * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
- * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
- * a fixed literal — no shell interpolation of untrusted input.
+ * Local-dev update: git-clean check (fail closed) → git pull --ff-only →
+ * pnpm build, all in the checkout the global wrapper points at. Mirrors the CLI
+ * `cmdUpgradeLocalDev` via the shared local-dev-update helpers. Returns the
+ * checkout dir, its version before/after, and whether HEAD advanced; the caller
+ * applies the restart through the existing lease/intent path. A successful
+ * build always requires a restart to take effect (dist/ is regenerated), which
+ * the caller signals independently of `changed`. Rejects with a stable `code`
+ * on the recoverable, UI-actionable failures.
  */
-function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn(plan.command, plan.args, {
-      cwd: globalInstallUpdateCwd(),
-      env: { ...process.env, ...plan.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd / bun.exe
+async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string }> {
+  const dir = resolveLocalDevCheckoutDir();
+  if (!isGitWorktree(dir)) {
+    throw Object.assign(new Error(`${dir} is not a git worktree`), { code: 'not_a_worktree', dir });
+  }
+  let status: string;
+  try {
+    status = gitPorcelainStatus(dir);
+  } catch (e) {
+    throw Object.assign(new Error(e instanceof Error ? e.message : String(e)), { code: 'git_status_failed', dir });
+  }
+  if (status) {
+    throw Object.assign(new Error('working tree has uncommitted changes'), {
+      code: 'dirty_worktree', dir, status,
     });
-    let tail = '';
-    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
-    child.stdout?.on('data', capture);
-    child.stderr?.on('data', capture);
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`${plan.manager} install timed out after 180s`));
-    }, 180_000);
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${plan.manager} exited ${code}: ${tail.trim().slice(-500)}`));
-    });
-  });
+  }
+  const before = gitHeadSha(dir);
+  const oldVersion = resolveCurrentVersionAt(dir);
+  for (const { command, args } of localDevUpdateSteps()) {
+    await runLocalDevStep(dir, command, args);
+  }
+  const after = gitHeadSha(dir);
+  const newVersion = resolveCurrentVersionAt(dir);
+  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after };
 }
 
 /**
  * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
- * THEN open the SSE subscription. Order matters — hydrating after subscribe
- * would let snapshot data clobber events that arrived between subscribe and
- * the snapshot fetch.
+ * THEN open the SSE subscription.
+ *
+ * The subscription runs a snapshot barrier (subscribeDaemon's `onConnected`):
+ * after every stream establishment — the first included — and BEFORE any
+ * frame is read, we install a fresh authoritative snapshot while incoming
+ * frames stay queued in the stream; frames then apply on top in order. This
+ * gives two guarantees at once:
+ *
+ * 1. No reverse clobber: the barrier snapshot is installed before any frame
+ *    is applied, so a slow snapshot response can never overwrite state that
+ *    a faster SSE event already delivered (a naive post-subscribe hydrate
+ *    would).
+ * 2. No forward gap: events fired between step 1 below and the stream
+ *    handshake are picked up by the barrier snapshot, and events missed
+ *    during a drop are recovered by the barrier re-run on reconnect.
+ *
+ * The blocking hydrate in step 1 still matters: it populates the cache
+ * before the dashboard starts serving, and keeps a daemon's last-known
+ * state visible even if its SSE stream never connects.
  *
  * Idempotent: a second call for the same daemon while one is in flight is a
- * no-op; a call after attach finished re-hydrates (useful when a daemon
- * restarts and we want to refresh its slice of the cache).
+ * no-op; the subscription itself is installed once.
  */
 async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   if (attaching.has(d.larkAppId)) return;
   attaching.add(d.larkAppId);
   try {
-    // 1. Hydrate snapshot (blocking — completes before we wire SSE)
+    // 1. Blocking snapshot (see above)
     try {
       const [sRes, schRes] = await Promise.all([
         fetchDaemonIpc(d.ipcPort, '/api/sessions'),
@@ -1455,22 +1759,47 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ));
       aggregator.hydrateSessions(d.larkAppId, rows);
       for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
-      aggregator.hydrateSchedules(sch.schedules ?? []);
+      aggregator.hydrateSchedules(d.larkAppId, sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
     }
-    // 2. Open SSE subscription if not already (idempotent)
+    // 2. Open SSE subscription if not already (idempotent). The barrier
+    //    below runs inside subscribeDaemon, after the stream is established.
     if (!subs.has(d.larkAppId)) {
       subs.set(
         d.larkAppId,
         subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
+          // Snapshot barrier: install an authoritative snapshot before any
+          // frame is read. Frames arriving during this fetch stay queued in
+          // the stream and apply afterwards, so the snapshot can never
+          // clobber fresher SSE state; on reconnect it recovers missed
+          // events. The subscription signal is the generation arbitration:
+          // if aborted mid-flight (daemon offline, newer generation), the
+          // snapshot is discarded instead of clobbering the new generation.
+          signal => reconcileDaemon(d, signal),
         ),
       );
     }
   } finally {
     attaching.delete(d.larkAppId);
+  }
+}
+
+/**
+ * Reconcile one daemon's snapshot into the aggregator (subscribeDaemon
+ * barrier). Thin wrapper over reconcileDaemonSnapshot that also schedules
+ * presentation enrichment for the session rows.
+ */
+async function reconcileDaemon(
+  d: import('./dashboard/registry.js').DaemonInfo,
+  signal: AbortSignal,
+): Promise<void> {
+  const snapshot = await reconcileDaemonSnapshot(d, aggregator, signal);
+  if (!snapshot) return;
+  for (const row of snapshot.sessions) {
+    sessionPresentation.schedule(d.larkAppId, row);
   }
 }
 
@@ -1615,7 +1944,12 @@ function injectDevReload(html: string): string {
   return html.includes('</body>') ? html.replace('</body>', `${snippet}\n</body>`) : `${html}\n${snippet}`;
 }
 
-function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+function serveStatic(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathname: string,
+  options: { injectHtml?: (html: string) => string } = {},
+): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
   const webRoot = resolve(WEB_DIR);
@@ -1630,13 +1964,17 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
-    const devIndex = relToRoot === 'index.html' && dashboardDevReloadEnabled();
+    const isIndex = relToRoot === 'index.html';
+    const devIndex = isIndex && dashboardDevReloadEnabled();
+    // 注入 CSRF 票据的壳是每次请求现生成的：ETag 只反映磁盘文件，走 304 会让浏览
+    // 器复用上一次（可能已随认证结束作废）的票据，所以这条路径不缓存、不 304。
+    const dynamicIndex = devIndex || (isIndex && !!options.injectHtml);
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': devIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
+      'cache-control': dynamicIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
-    if (!devIndex && req.headers['if-none-match'] === etag) {
+    if (!dynamicIndex && req.headers['if-none-match'] === etag) {
       res.writeHead(304, headers);
       res.end();
       return true;
@@ -1646,8 +1984,11 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
       res.end();
       return true;
     }
-    if (devIndex) {
-      res.end(injectDevReload(readFileSync(fp, 'utf8')));
+    if (dynamicIndex) {
+      let html = readFileSync(fp, 'utf8');
+      if (options.injectHtml) html = options.injectHtml(html);
+      if (devIndex) html = injectDevReload(html);
+      res.end(html);
     } else {
       res.end(readFileSync(fp));
     }
@@ -2099,7 +2440,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2110,18 +2451,20 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
       model: b.model,
+      reasoningEffort: b.reasoningEffort,
+      turnTimeoutMs: b.turnTimeoutMs,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } {
   const raw = ids.get(bot.larkAppId);
-  const fallback = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2129,6 +2472,8 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
+    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
   };
 }
 
@@ -2396,7 +2741,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
  */
 async function closeSessionsMatching(
   pred: (s: any) => boolean,
-): Promise<{ sessionId: string; ok: boolean; error?: string }[]> {
+): Promise<{ sessionId: string; ok: boolean; error?: string; residual?: ParsedCloseResidual }[]> {
   const matching = aggregator.getSessions().filter(s => s.status !== 'closed' && pred(s));
   return Promise.all(matching.map(async s => {
     try {
@@ -2408,9 +2753,11 @@ async function closeSessionsMatching(
       const text = await upstream.text();
       let body: any = null;
       try { body = JSON.parse(text); } catch { /* tolerate */ }
+      const residual = body?.ok ? parseCloseResidual(body) : undefined;
       return {
         sessionId: s.sessionId as string,
         ok: !!body?.ok,
+        ...(residual ? { residual } : {}),
         error: body?.ok ? undefined : (body?.error ?? `http_${upstream.status}`),
       };
     } catch (e: any) {
@@ -2548,8 +2895,9 @@ function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
   // Always scan all known CLI skill dirs, not just configured bots — users may
   // want to discover codex/trae/... skills even before creating a bot for them.
-  const allCliIds: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
-  for (const cliId of allCliIds) ids.add(cliId);
+  // Derived from the closed Record<CliId,…> in the registry — a hand-typed
+  // literal here silently omitted reasonix and mojo, hiding their skill dirs.
+  for (const cliId of ALL_CLI_IDS) ids.add(cliId);
   try {
     for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
   } catch {
@@ -2702,13 +3050,60 @@ async function dashboardSkillReferences(skillName: string): Promise<SkillReferen
   return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [], packs: [] };
 }
 
-/** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
- *  the first path segment after `/s/` (stops at the next `/`; query/hash are
- *  already stripped by URL.pathname). undefined when there's no segment. */
-function parseTerminalSessionId(pathname: string): string | undefined {
-  if (!pathname.startsWith('/s/')) return undefined;
-  const seg = pathname.slice(3).split('/')[0];
-  return seg || undefined;
+function dashboardControlJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+  });
+  res.end(JSON.stringify(body));
+}
+
+/**
+ * P1-11：控制类端点的跨站伪造门禁。返回 false 表示已经写完 403 响应，调用方直接
+ * return。只作用于「有副作用且可被无 body 表单触发」的 POST：终端接管/释放、
+ * 预览交互 unlock/activity/lock、话题定位。
+ *
+ * GET 不进门禁（读没有副作用，且壳/前端的状态轮询本身就是 GET）；Preview 自身的
+ * 不透明来源请求走 preview 专用路径的路径内凭据，不经过这里。
+ */
+function enforceControlCsrf(
+  req: IncomingMessage,
+  res: ServerResponse,
+  identity: DashboardRequestIdentity,
+): boolean {
+  if ((req.method ?? 'GET').toUpperCase() === 'GET') return true;
+  const verdict = guardControlRequest({
+    headers: req.headers,
+    authSessionId: identity.authSessionId,
+    tokens: controlCsrfTokens,
+  });
+  if (verdict.ok) return true;
+  dashboardControlJson(res, verdict.status, { ok: false, error: verdict.error });
+  return false;
+}
+
+function terminalControlAvailability(sessionId: string):
+  | { ok: true }
+  | { ok: false; status: number; error: string } {
+  const row = aggregator.getSession(sessionId) as {
+    status?: unknown;
+    larkAppId?: unknown;
+    webPort?: unknown;
+    proxyPort?: unknown;
+    riffAccessUrl?: unknown;
+  } | undefined;
+  if (!row || !aggregator.ownerOf(sessionId)) return { ok: false, status: 404, error: 'unknown_session' };
+  if (row.status === 'closed') return { ok: false, status: 409, error: 'session_not_active' };
+  if (typeof row.riffAccessUrl === 'string' && row.riffAccessUrl) {
+    return { ok: false, status: 409, error: 'terminal_external_only' };
+  }
+  const owner = aggregator.ownerOf(sessionId);
+  if (!owner || !registry.getByAppId(owner)) return { ok: false, status: 503, error: 'daemon_offline' };
+  if (!aggregator.terminalProxyPortOf(sessionId) || typeof row.webPort !== 'number') {
+    return { ok: false, status: 409, error: 'terminal_unavailable' };
+  }
+  return { ok: true };
 }
 
 /**
@@ -2759,6 +3154,10 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
+let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
+function analyticsService(): FeedbackAnalyticsService {
+  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -2795,6 +3194,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Configurable Feishu/Lark H5 passwordless entry and code exchange. It is
+    // self-authenticating and must run before the ordinary Dashboard cookie
+    // gate; no authorization code or session capability is ever put in a URL.
+    if (await dashboardH5Auth.handle(req, res, url)) return;
+
+    // Session Web preview is an authenticated, same-origin reverse proxy to an
+    // agent-registered literal loopback target. It owns its auth gate because
+    // WebSocket upgrades do not pass through decideDashboardAuth; using one
+    // manager for HTTP + WS keeps the cookie/ownership/SSRF contract identical.
+    if (previewGuardPage.handle(req, res, url)) return;
+    if (await sessionPreviewProxy.handleHttp(req, res, url)) return;
+
     // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's
     // terminal proxy. The central platform only tunnels the dashboard port, so
     // terminal links served under the machine subdomain
@@ -2805,27 +3216,12 @@ const server = createServer(async (req, res) => {
     // response straight back. Mounted before the dashboard auth gate because the
     // worker independently requires a view/write capability or authenticated
     // dashboard cookie before serving either HTTP or WebSocket terminal data.
-    if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
-      const sessionId = parseTerminalSessionId(url.pathname);
-      const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
-      if (!tport) {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-        return res.end('session terminal not available');
-      }
-      const upstream = httpRequest(
-        { host: '127.0.0.1', port: tport, method: req.method, path: req.url, headers: req.headers },
-        (up) => {
-          res.writeHead(up.statusCode ?? 502, up.headers);
-          up.pipe(res);
-        },
-      );
-      upstream.on('error', () => {
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('terminal proxy error');
-      });
-      req.pipe(upstream);
-      return;
-    }
+    // Since P1-5 this hop is also LOAD-BEARING for revocation, not just
+    // reachability: a signed view capability is checked here against live auth
+    // sessions and countersigned for the worker, which refuses one that arrived
+    // any other way. That is why the view-link API hands out a same-origin path
+    // instead of the daemon/worker origin — this is the only door.
+    if (terminalFrontProxy.handleHttp(req, res, url)) return;
 
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
@@ -2856,17 +3252,76 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // OAuth 回调接收页（/oauth/callback）— 也在 cookie/token gate 之前：飞书
+    // authorize 跳回来的浏览器请求不带 dashboard token（redirect_uri 固定），
+    // 挡在门外用户就只能回到人肉贴 URL 的旧流程。安全面：URL 里只有一次性
+    // code + 随机 state；处理方仍要求 state 命中某个 daemon 进程的 pending
+    // 表（5 分钟过期、一次即焚）并用 app_secret 换 token——本页面自身不持有
+    // 任何敏感能力，等价于把「用户手工回贴」自动化。
+    if (req.method === 'GET' && url.pathname === '/oauth/callback') {
+      const page = (title: string, body: string, ok: boolean) => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:90vh;background:#f5f6f8"><div style="text-align:center;padding:32px 40px;background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08)"><div style="font-size:56px">${ok ? '✅' : '❌'}</div><h2 style="margin:12px 0 8px">${title}</h2><p style="color:#666;max-width:420px">${body}</p></div></body>`);
+      };
+      if (!url.searchParams.get('code') || !url.searchParams.get('state')) {
+        page('回调参数缺失', '未收到授权码。请回到 Dashboard 重新发起授权。', false);
+        return;
+      }
+      // state 只在生成链接的那个 daemon 进程内存里，逐个询问在线 daemon。
+      let outcome: { ok: boolean; message: string } | null = null;
+      for (const d of registry.list()) {
+        try {
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/oauth-callback', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ url: url.toString() }),
+          });
+          const j: any = await r.json().catch(() => null);
+          if (j?.matched) { outcome = { ok: !!j.ok, message: String(j.message ?? '') }; break; }
+        } catch { /* daemon offline mid-iteration — try the next */ }
+      }
+      if (!outcome) {
+        page('授权未完成', '没有找到等待中的授权请求（可能已超时，链接有效期 5 分钟）。请回到 Dashboard 重新点击授权。', false);
+        return;
+      }
+      page(
+        outcome.ok ? '授权完成' : '授权失败',
+        outcome.ok ? '已完成授权，本页可以关闭。回到 Dashboard 即可看到状态更新。' : outcome.message,
+        outcome.ok,
+      );
+      return;
+    }
+
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard rotate`.
     // Publish the new token only after a durable write succeeds.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      const previousToken = currentDashboardToken();
       try {
         const token = rotatePersistedToken(TOKEN_PATH);
+        // The previous link is dead once the write lands: drop terminal control
+        // leases, re-lock preview interaction, and (P1-8) close every long-lived
+        // connection the old link opened — otherwise the old management SSE
+        // keeps streaming rows minted AFTER the rotation, including freshly
+        // issued `riffAccessUrl` write credentials.
+        // Ordered after the durable write so a failed rotation keeps both the
+        // old token and its live grants intact.
+        if (previousToken && previousToken !== token) {
+          endDashboardAuthSession(legacyDashboardAuthSessionId(previousToken));
+        }
+        // P1-6: the same reasoning covers the workbench entry tickets sitting in
+        // Feishu card history. They redeem into "whatever token is active now",
+        // so without this a ticket leaked BEFORE the rotation would hand out the
+        // freshly minted management cookie — rotation would protect nothing in
+        // exactly the case it is used for. Ticket verification independently
+        // requires the bound generation to still be current, so this call is the
+        // cleanup (drop dead rows from the shared file), not the guarantee.
+        revokeWorkbenchTicketsOutsideGeneration(workbenchTicketGeneration(token));
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_persist_failed' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
     }
 
@@ -2880,7 +3335,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to ensure token at ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_persist_failed' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
     }
 
@@ -2894,7 +3349,7 @@ const server = createServer(async (req, res) => {
         token = loadPersistedToken(TOKEN_PATH);
       } catch (e) {
         logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_unavailable' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_unavailable', e, TOKEN_PATH));
       }
       if (!token) return jsonRes(res, 404, { error: 'no_active_token' });
       return jsonRes(res, 200, dashboardUrlsFor(token));
@@ -2916,31 +3371,62 @@ const server = createServer(async (req, res) => {
         /* ignore */
       }
       platformTunnel = null;
+      // P1-8：解绑/改绑之后旧平台身份的短请求立刻 401，但它建立的 SSE / Preview
+      // 长连接不会自己断，三个角色作用域在这里一起收口。
+      syncPlatformBindingRevocation();
       startPlatformTunnelIfBound();
       return jsonRes(res, 200, { ok: true });
     }
 
     const activeToken = currentDashboardToken();
-    const presentedToken = authedToken(req, url, activeToken);
+    const requestIdentity = dashboardRequestIdentity(req);
     const globalDashboardConfig = readGlobalConfig().dashboard;
-    const decision = decideDashboardAuth({
+    const publicReadOnly = globalDashboardConfig?.publicReadOnly
+      ?? config.dashboard.publicReadOnly;
+    // P1-7：门禁选择与身份判定同源。旧代码在这里另算一遍 `h5Identity`，于是
+    // 「legacy owner + H5 cookie 并存」的浏览器被判成 workbench-only，管理读写
+    // 全 401，连正确的 `?t=` 也被一起清掉（详见 request-identity.ts 顶注）。
+    // Only the local legacy Dashboard cookie is management authority. Platform
+    // identities — owner included — retain terminal/preview capability through
+    // signed proxy grants, but cannot cross into host administration APIs.
+    const { legacyAuthed, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
-      presentedToken,
-      activeToken: activeToken ?? '',
-      publicReadOnly: globalDashboardConfig?.publicReadOnly
-        ?? config.dashboard.publicReadOnly,
+      identity: requestIdentity,
+      tokenFromRequest: authedToken(req, url, activeToken),
+      activeToken,
+      publicReadOnly,
     });
-    // `authed` is consumed by route handlers that distinguish the public-read
-    // carve-out from a valid management cookie (notably v3 run details).
-    const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
+    // `authed` is deliberately the local management capability, not merely a
+    // valid Workbench/platform identity. Privileged mutations and management
+    // reads (settings, schedules, groups) therefore cannot be widened by H5
+    // authentication.
+    const authed = legacyAuthed;
+    // The session board is the one surface where `!authed` must NOT mean
+    // "anonymous". `/api/sessions` and `/events` are exactly the two paths
+    // workbenchH5Capability grants as `workbench.view`, and the same identity
+    // holds `preview.view`/`preview.operate`; reusing the anonymous projection
+    // here deleted the `preview` descriptor those capabilities operate on, so
+    // the mobile Workbench and the Dock showed 「无网页预览」 unconditionally.
+    // The three-way audience keeps management/anonymous behavior byte-identical
+    // and only restores display fields for an authenticated Workbench viewer —
+    // the Riff sandbox bearer write URL stays stripped (see public-redact.ts).
+    const sessionBoardAudience = sessionBoardAudienceFor({
+      legacyAuthed,
+      workbenchIdentity: workbenchOnlyIdentity,
+    });
 
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
+        // A valid H5/platform Workbench identity is expected to be denied by
+        // management-only endpoints such as /api/settings. Let the SPA tell
+        // that narrow denial from an expired identity, otherwise its global
+        // fetch wrapper covers a healthy Workbench with the login overlay.
+        ...(workbenchOnlyIdentity ? { 'x-botmux-auth-scope': 'workbench' } : {}),
         ...(loginUrl ? { 'x-botmux-login-url': loginUrl } : {}),
       });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
@@ -2956,12 +3442,157 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie
+    // 流程——语义同款：验票通过就种同一个 legacy cookie，再 302 进工作台。票据由
+    // /dashboard 卡片构建时现 mint（TTL 30 分钟、可多端重复打开，落盘只存 hash，
+    // 见 dashboard/workbench-ticket.ts），长期管理 token 从此不再写进持久化卡片；
+    // 无效/过期回一个无凭据中文提示页。该 GET 在 decideDashboardAuth 里与静态壳
+    // 同级放行（票据本身就是凭证），其余方法不豁免。P1-10：正因为它在 auth gate
+    // 之前放行，端点自带每 IP + 全局限流，IP 口径与 H5 兑换口共用同一份可信代理
+    // 配置——否则两个公开面对同一个 `x-forwarded-for` 会得出不同结论。
+    if (handleWorkbenchTicketRedemption(req, res, url, {
+      activeToken: () => activeToken,
+      trustedProxyHops: dashboardH5AuthConfig.trustedProxyHops,
+    })) {
+      return;
+    }
+
     if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
       return jsonRes(res, 410, {
         ok: false,
         error: 'legacy_workflow_retired',
         message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
       });
+    }
+
+    // Authenticated, non-secret metadata used only to build Feishu appCenter
+    // and >=350px sidebar AppLinks. App secret and allowlist never cross this
+    // projection; the route is intentionally absent from public-read allowlists.
+    if (req.method === 'GET' && url.pathname === '/api/workbench/h5-context') {
+      return jsonRes(res, 200, {
+        ok: true,
+        h5: {
+          enabled: dashboardH5AuthConfig.enabled,
+          appId: dashboardH5AuthConfig.appId,
+          brand: dashboardH5AuthConfig.brand,
+          entryPath: dashboardH5AuthConfig.entryPath,
+        },
+      });
+    }
+
+    // P1-4：最小操作能力集投影。前端只据此渲染操作入口（定位 / 接管输入 / 开启
+    // 交互），投影函数复算的是本文件三条真实路由的同一套门禁（路由级 auth 决策 +
+    // terminalCapability/previewCapability 角色检查），见 auth.ts 的函数注释。
+    // 匿名请求到不了这里（该路径不在 publicReadOnly 白名单，decideDashboardAuth
+    // 已 401）；前端把任何非 200/缺字段一律回落为全 false。注意 canControl 只描述
+    // 无显式 token 的默认能力——显式 write token 走终端前置代理的独立授权（P1-6），
+    // 与本投影无关。
+    if (req.method === 'GET' && url.pathname === '/api/workbench/capabilities') {
+      return jsonRes(res, 200, {
+        ok: true,
+        capabilities: projectWorkbenchOperationCapabilities(requestIdentity),
+      });
+    }
+
+    // owner 在工作台内自取常驻链接（`<base>/workbench?t=<当前活跃 token>`）。
+    // 只有本机完整管理身份能取：上面的门禁已经把 workbench-only / 平台角色 /
+    // 匿名 deny401，处理器再自己判一次 kind === 'legacy-dashboard'（两层独立，
+    // 见 dashboard/standing-link.ts 顶注）。同源校验 + no-store + 每次落一条
+    // `auth.standing_link_issued` 审计；token 现读落盘的活跃值，所以
+    // `dashboard rotate` 之后这里自然发新链接。
+    if (handleWorkbenchStandingLink(req, res, url, {
+      identity: requestIdentity,
+      activeToken: () => activeToken,
+      standingLinkUrl: token => workbenchEntryUrl(dashboardUrlsFor(token).url),
+      audit: dashboardControlAudit,
+    })) {
+      return;
+    }
+
+    // Server-authoritative terminal control lease. The API returns only mode
+    // and timestamps; its signed read/write grant stays inside the central
+    // proxy and is never placed in a URL or response body.
+    let controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
+    if (controlMatch) {
+      if (!requestIdentity) {
+        return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      }
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(controlMatch[1]); }
+      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      const availability = terminalControlAvailability(sessionId);
+      if (!availability.ok) {
+        return dashboardControlJson(res, availability.status, { ok: false, error: availability.error });
+      }
+      const action = controlMatch[2];
+      if (req.method === 'GET' && !action) {
+        return dashboardControlJson(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
+      }
+      if (requestIdentity.terminalCapability === 'readonly') {
+        return dashboardControlJson(res, 403, { ok: false, error: 'terminal_operation_forbidden' });
+      }
+      if (req.method === 'POST' && action === 'takeover') {
+        const result = terminalControl.takeover(requestIdentity, sessionId);
+        const status = result.ok ? 200 : result.error === 'control_busy' ? 409 : 401;
+        return dashboardControlJson(
+          res,
+          status,
+          result.ok ? { ...result, owned: true } : { ok: false, error: result.error },
+        );
+      }
+      if (req.method === 'POST' && action === 'release') {
+        const result = terminalControl.release(requestIdentity, sessionId);
+        return dashboardControlJson(
+          res,
+          result.ok ? 200 : 403,
+          result.ok ? { ...result, owned: false } : { ok: false, error: result.error },
+        );
+      }
+      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
+    // Preview interaction is separately scoped per authenticated browser
+    // session. Default is always the visibly labelled preview overlay; unlock
+    // and activity are explicit, and the server hard-relocks after 15m idle.
+    controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+    if (controlMatch) {
+      if (!requestIdentity) {
+        return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      }
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(controlMatch[1]); }
+      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      const resolution = resolveDashboardSessionPreview(sessionId);
+      if (!resolution.ok) {
+        return dashboardControlJson(res, resolution.status, { ok: false, error: resolution.error });
+      }
+      const action = controlMatch[2];
+      if (req.method === 'GET' && !action) {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.state(requestIdentity, sessionId) });
+      }
+      // 唯一权威的角色门禁。guard 壳与工作台是否渲染解锁按钮，走的是同一个
+      // previewInteractionWriteAllowed（经 canInteract 投影），所以「按能力隐藏
+      // 按钮」永远只是把一次必然 403 的点击省掉，不会替代这里的检查。
+      if (!previewInteractionWriteAllowed(requestIdentity)) {
+        return dashboardControlJson(res, 403, { ok: false, error: 'preview_operation_forbidden' });
+      }
+      if (req.method === 'POST' && action === 'unlock') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.unlock(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'activity') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.activity(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'lock') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.lock(requestIdentity, sessionId) });
+      }
+      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
+    if (url.pathname.startsWith('/api/feedback/analytics/')) {
+      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      return;
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -2997,6 +3628,9 @@ const server = createServer(async (req, res) => {
       || url.pathname.startsWith('/api/debug-terminal/')
       || url.pathname.startsWith('/debug-terminal/')
     ) {
+      // H5 sessions are scoped to Dashboard/workbench control. They never
+      // inherit the legacy owner's unrestricted debug shell.
+      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
       if (debugTerminalManager.handleHttp(req, res, url)) return;
     }
 
@@ -3007,6 +3641,56 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname.startsWith('/plugins/')) {
       if (servePluginStatic(res, url.pathname)) return;
       res.writeHead(404); res.end(); return;
+    }
+
+    // Fragment-free entry points. The card's terminal AppLink works with a plain
+    // `/s/<id>?token=` URL; ours carried `#/agent-workbench`, and a fragment is
+    // the one structural difference between the two. Clients that re-encode or
+    // truncate an AppLink's `url` lose it and land on the Dashboard home, so
+    // offer a path that survives regardless.
+    if ((req.method === 'GET' || req.method === 'HEAD')
+      && (url.pathname === '/workbench' || url.pathname === '/workbench/dock')) {
+      const target = url.pathname === '/workbench/dock' ? '#/agent-workbench-dock' : '#/agent-workbench';
+      const token = url.searchParams.get('t');
+      const query = token ? `?t=${encodeURIComponent(token)}` : '';
+      res.writeHead(302, { location: `/${query}${target}`, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
+    // Self-service diagnostics for the same phone that cannot render the
+    // Workbench terminal. Desktop browsers and Chromium's mobile emulation both
+    // succeed, so the failing device has to report its own conditions: which
+    // build it cached, whether its cookie rides along, whether the terminal's
+    // HTTP and WebSocket hops are reachable from its network. Zero external
+    // resources and no SPA bundle — it must open precisely when the SPA cannot,
+    // which is also why it is allow-listed beside the static shell in
+    // `decideDashboardAuth`. It probes only the visitor's own reachability and
+    // echoes no token or secret.
+    if (handleWorkbenchDoctor(req, res, url)) return;
+
+    // Installable Workbench: Feishu has no way to pin a custom app into its
+    // mobile tab bar, so the closest thing to a permanent entry is the phone's
+    // own home screen. A manifest makes "add to home screen" launch straight
+    // into the session list, standalone and chrome-less.
+    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/workbench.webmanifest') {
+      const manifest = {
+        name: 'Botmux Workbench',
+        short_name: 'Workbench',
+        start_url: '/#/agent-workbench',
+        scope: '/',
+        display: 'standalone',
+        orientation: 'any',
+        background_color: '#080b10',
+        theme_color: '#080b10',
+        icons: [
+          { src: '/apple-touch-icon.png', sizes: '180x180', type: 'image/png' },
+          { src: '/favicon.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        ],
+      };
+      res.writeHead(200, { 'content-type': 'application/manifest+json', 'cache-control': 'no-cache' });
+      res.end(JSON.stringify(manifest));
+      return;
     }
 
     // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
@@ -3035,7 +3719,13 @@ const server = createServer(async (req, res) => {
         : url.pathname === '/favicon.ico'
           ? '/favicon.png'
         : url.pathname;
-      if (serveStatic(req, res, lookupPath)) return;
+      if (serveStatic(req, res, lookupPath, {
+        // P1-11：只给已认证身份签票据；匿名 public-read 壳不含票据，控制类端点
+        // 对它本来就 401/403。
+        injectHtml: requestIdentity
+          ? html => injectControlCsrfMeta(html, controlCsrfTokens.mint(requestIdentity.authSessionId))
+          : undefined,
+      })) return;
       if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
     }
 
@@ -3083,8 +3773,9 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       }), groupsMatrixSnapshot.peekPresentation());
+      const browserSessions = projectSessionPreviewsForBrowser(sessions);
       return jsonRes(res, 200, {
-        sessions: authed ? sessions : redactSessionsForPublic(sessions),
+        sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
     }
 
@@ -3166,9 +3857,14 @@ const server = createServer(async (req, res) => {
           // else (incl. an unparseable/missing body) as a failure rather than a
           // silent success.
           const ok = upstream.ok && parsed?.ok === true;
+          // A residual is NOT a failure (the row closed) but must not be counted
+          // as a clean close either: an idle/workerless mojo row can carry a
+          // parked lineage, so this path really does produce them.
+          const residual = ok ? parseCloseResidual(parsed) : undefined;
           return {
             sessionId: s.sessionId,
             ok,
+            ...(residual ? { residual } : {}),
             error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
         } catch (e: any) {
@@ -3298,6 +3994,7 @@ const server = createServer(async (req, res) => {
         ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
         lastCheckedAt: entry.lastCheckedAt,
       }));
+      const localDev = isLocalDevInstall();
       return jsonRes(res, 200, {
         current,
         latest,
@@ -3305,7 +4002,11 @@ const server = createServer(async (req, res) => {
         behind: !!latest && isNewerVersion(latest, current),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
-        localDevInstall: isLocalDevInstall(),
+        localDevInstall: localDev,
+        // Local-dev can self-update via git pull + build only when the checkout
+        // the wrapper points at is a real git worktree; otherwise the button
+        // stays disabled (there is nothing to pull).
+        localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
         updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
@@ -3334,7 +4035,60 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
-      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      // 本地 checkout：走 git pull --ff-only + pnpm build（与 CLI cmdUpgradeLocalDev
+      // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
+      // /api/update/restart 的 lease/intent 路径。
+      if (isLocalDevInstall()) {
+        const node = checkNode();
+        if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let result: { dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string } | undefined;
+        try {
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            result = await runLocalDevUpdate();
+          }, { maxWaitMs: 2_000 });
+        } catch (e) {
+          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          const code = (e as { code?: string }).code;
+          if (code === 'dirty_worktree') {
+            return jsonRes(res, 409, {
+              ok: false, error: 'dirty_worktree',
+              detail: (e as { status?: string }).status ?? '',
+              dir: (e as { dir?: string }).dir ?? '',
+            });
+          }
+          if (code === 'not_a_worktree') {
+            return jsonRes(res, 400, { ok: false, error: 'not_a_worktree', dir: (e as { dir?: string }).dir ?? '' });
+          }
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+        } finally {
+          updateInFlight = false;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        // Pin THIS build's checkout + HEAD so the follow-up restart applies it,
+        // even if the wrapper is re-pointed by a concurrent `use:here` before the
+        // user confirms the restart. Consumed (and re-verified) in /api/update/restart.
+        if (result) pendingLocalDevRestart = { dir: result.dir, head: result.head };
+        return jsonRes(res, 200, {
+          ok: true,
+          // Versions of the checkout we actually updated (may differ from the
+          // running process's install root when wrapper→B, dashboard runs A).
+          oldVersion: result?.oldVersion ?? '',
+          newVersion: result?.newVersion ?? '',
+          // changed = HEAD advanced (or version string changed) — for display.
+          changed: result?.changed === true || result?.oldVersion !== result?.newVersion,
+          // A successful build regenerates dist/, so a restart is ALWAYS needed
+          // to apply it — independent of whether HEAD moved (the checkout may
+          // have been pulled already and only needed a build).
+          restartRequired: true,
+          localDev: true,
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
         const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
@@ -3553,12 +4307,55 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      // The real restart runs in a detached `botmux restart` child, whose
+      // shutdown-capability throw would only reach the maintenance-restart log
+      // — the UI would then poll a reconnect that never happens and mislabel it
+      // as "restart is slow". Detect that fail-closed boundary synchronously so
+      // we can return a precise, actionable error instead of firing a restart
+      // that is guaranteed to die silently. A read failure is non-authoritative
+      // and falls through to the existing behavior (never fabricate a block).
+      try {
+        const preflight = evaluateRestartShutdownPreflight();
+        if (preflight.bootstrapRequired) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'bootstrap_shutdown_protocol_required',
+            unsafeDaemons: preflight.unsafeDaemonNames,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[dashboard] restart shutdown-capability preflight unavailable: ${error instanceof Error ? error.message : error}`);
+      }
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
         if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
       } catch { /* empty / bad body → plain restart */ }
       const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
+      // Resolve the local-dev restart target BEFORE claiming the lease so a
+      // fail-closed drift check can't leave a dangling lease. Prefer the plan a
+      // preceding /api/update/run pinned (dir + post-build HEAD); a plain manual
+      // restart (no pending plan) resolves the wrapper live. Verify the target's
+      // dist/cli.js exists and — for a pinned plan — that HEAD hasn't moved since
+      // the build; on drift/absence fail closed rather than restart the wrong tree.
+      let localDevRestartError: { status: number; body: Record<string, unknown> } | undefined;
+      let localDevTarget: string | undefined;
+      if (isLocalDevInstall()) {
+        const pinned = pendingLocalDevRestart;
+        pendingLocalDevRestart = undefined; // consume regardless of outcome
+        const decision = resolveLocalDevRestartTarget(pinned, resolveLocalDevCheckoutDir(), {
+          cliEntryExists: (dir) => existsSync(botmuxCliEntryAt(dir)),
+          headOf: (dir) => gitHeadSha(dir),
+        });
+        if (decision.action === 'fail') {
+          localDevRestartError = { status: 409, body: { ok: false, error: decision.reason, dir: decision.dir } };
+        } else if (decision.action === 'restart') {
+          localDevTarget = decision.dir;
+        } else {
+          localDevTarget = undefined; // fallback-running-root
+        }
+      }
+      if (localDevRestartError) return jsonRes(res, localDevRestartError.status, localDevRestartError.body);
       let acquired = false;
       let leaseId: string | null = null;
       let activePackageRoot: string | undefined;
@@ -3588,7 +4385,14 @@ const server = createServer(async (req, res) => {
             });
             return;
           }
-          activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          // Local-dev restarts from the target resolved above (pinned build's
+          // checkout, verified present + at the built HEAD); undefined falls back
+          // to this dashboard process's own cli.js via spawnDetachedRestart.
+          if (isLocalDevInstall()) {
+            activePackageRoot = localDevTarget;
+          } else {
+            activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          }
           // Send acknowledgement while holding the lock, then release immediately.
           // The lease itself prevents concurrent restarts — no need to hold the
           // lock across the network round-trip waiting for res.finish.
@@ -3626,7 +4430,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, dashboardSkillsPayload());
     }
 
-    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+    // Batch skill removal. POST /api/skills/remove is the canonical route the
+    // dashboard UI calls: the payload (names[], force) must travel in the body,
+    // and DELETE bodies are dropped by the platform dashboard proxy (it assumes
+    // DELETE carries no body, forwards content-length but never pipes the bytes,
+    // so readJsonBody hangs until the outer gateway returns 504). DELETE
+    // /api/skills stays as an alias for direct/scripted callers.
+    if ((req.method === 'DELETE' && url.pathname === '/api/skills')
+      || (req.method === 'POST' && url.pathname === '/api/skills/remove')) {
       let parsed: unknown;
       try {
         parsed = await readJsonBody(req);
@@ -3894,6 +4705,13 @@ const server = createServer(async (req, res) => {
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
       }
+    }
+
+    // ─── Customization center (built-in prompt/skill overrides) ──────────────
+    // GET is a public read (overview only, no secrets); all mutations are
+    // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
+    if (await handleCustomizationApi(req, res, url)) {
+      return;
     }
 
     if (await handleConnectorApi(req, res, url)) {
@@ -4187,10 +5005,29 @@ const server = createServer(async (req, res) => {
 
     let m: RegExpMatchArray | null;
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
-      const sid = decodeURIComponent(m[1]); const op = m[2];
+      const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
+      // P1-11：locate 与接管/解锁同属工作台三项操作能力，同样是无 body POST。
+      if (op === 'locate' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      // Defensive client-side deadline: the daemon side of every op here replies
+      // promptly (close resolves its fence on the worker's flushed ACK; restart/
+      // resume/start return after a fire-and-forget IPC). Close gets a separate
+      // 60s budget because Riff's 23s remote-cancel prepare and 29s worker-kill
+      // backstop are serialized; all other actions stay bounded at 15s.
+      let upstream: Response;
+      try {
+        upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs(op)),
+        });
+      } catch (err: any) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        return jsonRes(res, timedOut ? 504 : 502, {
+          ok: false,
+          error: timedOut ? 'daemon_timeout' : (err?.message ?? String(err)),
+        });
+      }
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -4264,9 +5101,16 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
+      const raw = await upstream.text();
+      if (!upstream.ok) {
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(raw);
+        return;
+      }
+      let body: unknown;
+      try { body = JSON.parse(raw); }
+      catch { return jsonRes(res, 502, { ok: false, error: 'invalid_daemon_response' }); }
+      return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
     }
 
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
@@ -4311,6 +5155,10 @@ const server = createServer(async (req, res) => {
     // so decideDashboardAuth has already 401'd unauthenticated callers before we
     // get here — the token only reaches authenticated dashboard sessions.
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/write-link$/))) {
+      // Short H5 sessions use the tokenless /control/takeover lease. Returning
+      // the legacy stable capability here would bypass release/expiry/disconnect
+      // enforcement and leak a token into browser-visible JSON.
+      if (!legacyAuthed) return dashboardControlJson(res, 403, { ok: false, error: 'control_takeover_required' });
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -4320,10 +5168,68 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Read-only web-terminal link. The Workbench terminal pane uses it so the
+    // frame authenticates by capability instead of by Dashboard cookie, which
+    // a Feishu WebView's WebSocket does not carry.
+    //
+    // Two things about the daemon's answer never reach the browser (P1-5):
+    //   • its `?viewToken=` is the worker's per-boot card token, unbound to the
+    //     requesting authentication. It is consumed here — converted to a
+    //     one-way worker generation id — and REPLACED with a short-lived signed
+    //     read grant bound to sessionId + authSessionId + expiresAt + that
+    //     generation + `audience: central`;
+    //   • its ORIGIN is the daemon terminal proxy / worker port, both network
+    //     reachable and both blind to logout. We answer with a same-origin
+    //     relative path instead, so the only entry point the browser ever learns
+    //     is this dashboard's front proxy — the one place that checks auth
+    //     session liveness and countersigns the hop for the worker.
+    // A view capability can never send input, so this stays safe for any
+    // identity allowed to observe the session; unauthenticated callers were
+    // already rejected by the auth decision above (no public allow-list).
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/view-link$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/view-link`, { method: 'GET' });
+      if (upstream.status !== 200) {
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      let upstreamUrl: unknown;
+      try {
+        upstreamUrl = (JSON.parse(await upstream.text()) as { url?: unknown }).url;
+      } catch {
+        upstreamUrl = undefined;
+      }
+      // No generation ⇒ no pinned capability. Fail closed rather than mint one
+      // that would outlive the worker boot it was meant for.
+      const generation = upstreamWorkerViewGeneration(SECRET, upstreamUrl);
+      const minted = requestIdentity && generation
+        ? mintTerminalViewCapability(SECRET, sid, requestIdentity, generation)
+        : null;
+      const rewritten = minted ? centralViewLinkPath(sid, minted.token) : null;
+      // Fail closed rather than fall back to the unbound upstream token/origin.
+      if (!minted || !rewritten) return jsonRes(res, 502, { ok: false, error: 'view_link_unavailable' });
+      return jsonRes(res, 200, { ok: true, url: rewritten, expiresAt: minted.expiresAt });
+    }
+
+    // Browser-safe preview metadata. The literal loopback host/port remains in
+    // the aggregator only; this authenticated API returns a same-origin path.
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const resolution = resolveDashboardSessionPreview(sid);
+      if (!resolution.ok) return jsonRes(res, resolution.status, { ok: false, error: resolution.error });
+      const preview = previewDescriptorFromRow(aggregator.getSession(sid));
+      if (!preview) return jsonRes(res, 404, { ok: false, error: 'preview_not_registered' });
+      return jsonRes(res, 200, { ok: true, preview });
+    }
+
 
     // Dashboard「复现命令」：透传到 owning daemon 取该 session 的真实 CLI 调用。
     // 与 write-link 同样只在管理 cookie（写权限）下可达：命令含 token/凭证。
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/spawn-command$/))) {
+      if (!legacyAuthed) return dashboardControlJson(res, 403, { ok: false, error: 'legacy_owner_required' });
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -4838,6 +5744,8 @@ const server = createServer(async (req, res) => {
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
+            reasoningEffort: j.reasoningEffort || d.reasoningEffort,
+            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
           }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));
@@ -5005,6 +5913,30 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
+    }
+
+    let mBotFeedback: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback$/))) {
+      const appId = decodeURIComponent(mBotFeedback[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-feedback`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    const mChatFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/chats\/([^/]+)\/feedback$/);
+    if (req.method === 'PUT' && mChatFeedback) {
+      const chunks: Buffer[] = []; for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mChatFeedback[1]), `/api/chat-feedback/${encodeURIComponent(decodeURIComponent(mChatFeedback[2]))}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+    const mEffectiveFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback\/effective$/);
+    if (req.method === 'GET' && mEffectiveFeedback) {
+      const upstream = await proxyToDaemon(decodeURIComponent(mEffectiveFeedback[1]), `/api/feedback-effective${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
     }
 
     // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
@@ -5212,9 +6144,37 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 会话群标签授权（Dashboard 一站式）：GET status / POST auth-link，
+    // 均代理到对应 bot 的 daemon（state 必须驻留在生成链接的进程内）。
+    let mBotTagAuth: RegExpMatchArray | null;
+    if (mBotTagAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-group-tag-(status|auth|config)$/)) {
+      const appId = decodeURIComponent(mBotTagAuth[1]);
+      const kind = mBotTagAuth[2];
+      const methodOk = (kind === 'status' && req.method === 'GET')
+        || (kind === 'auth' && req.method === 'POST')
+        || (kind === 'config' && req.method === 'PUT');
+      if (methodOk) {
+        let body: string | undefined;
+        if (req.method !== 'GET') {
+          const chunks: Buffer[] = [];
+          for await (const c of req) chunks.push(c as Buffer);
+          body = Buffer.concat(chunks).toString('utf8') || '{}';
+        }
+        const upstream = await proxyToDaemon(appId, `/api/session-group-tag-${kind}`, {
+          method: req.method,
+          headers: { 'content-type': 'application/json' },
+          ...(body !== undefined ? { body } : {}),
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
     // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
-    // `{ p2pMode: 'chat' | 'thread' }` ('thread' = per-message DM session;
-    // anything else clears back to the flat continuous chat default).
+    // `{ p2pMode: 'chat' | 'thread' | 'group' }` ('thread' = per-message DM
+    // session; 'group' = per-message dedicated session group; anything else
+    // clears back to the flat continuous chat default).
     let mBotP2pMode: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotP2pMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/p2p-mode$/))) {
       const appId = decodeURIComponent(mBotP2pMode[1]);
@@ -5222,6 +6182,25 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-p2p-mode`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/envelope-injection — proxy to that bot's daemon.
+    // Body `{ envelopeInjection: 'auto'|'off'|'' }` (''/other clears back to
+    // the inline default). #794: hook 注入 per-turn 上下文的 per-bot 开关。
+    let mBotEnvelopeInjection: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotEnvelopeInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/envelope-injection$/))) {
+      const appId = decodeURIComponent(mBotEnvelopeInjection[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-envelope-injection`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -5253,7 +6232,8 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
     // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
-    // messageQuotaDefaultLimit?: number|null, grantDefaultDurationMs?: number|null }`.
+    // p2pOpen?: boolean, messageQuotaDefaultLimit?: number|null,
+    // grantDefaultDurationMs?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);
@@ -5395,6 +6375,24 @@ const server = createServer(async (req, res) => {
         error: loginRequired ? 'user_login_required' : 'feed_group_api_unavailable',
         message: loginRequired ? '尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。' : '没有可用于读取标签的飞书机器人。',
       });
+    }
+
+    // PUT /api/bots/:appId/session-owner-reminder — per-Bot periodic owner
+    // reminder policy. The owning daemon validates, persists, and hot-applies.
+    let mBotOwnerReminder: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotOwnerReminder = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-owner-reminder$/))) {
+      const appId = decodeURIComponent(mBotOwnerReminder[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-session-owner-reminder`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
     }
 
     // Create a new chat — pick a creator from the user-selected larkAppIds
@@ -5666,14 +6664,45 @@ const server = createServer(async (req, res) => {
         'connection': 'keep-alive',
       });
       res.write('retry: 5000\n\n');
+      // P1-8：这条流的寿命必须等于建立它的那次认证的寿命。建流时登记进
+      // authSession→长连接索引（logout/rotate/解绑时被主动 destroy），并在每帧
+      // 推送前复核身份仍有效——否则 rotate 之后新签的 `riffAccessUrl`（Riff 沙箱
+      // 写凭据）会顺着这条老连接送给上一任持有者。匿名 public-read 连接没有认证
+      // 会话，行为不变。
+      // P1-14 姊妹项：这条流的能力口径必须与 REST 同源。Workbench-only 身份对
+      // `GET /api/schedules` 是明确的 401，`/events` 就不能把同一份排程（含
+      // prompt / workingDir / fired 的 error 原文）换个管子送出去——过滤在
+      // createDashboardEventsStream 内部按 audience 执行，见 events-sse.ts。
+      const eventsAudience: DashboardEventAudience = authed
+        ? 'management'
+        : workbenchOnlyIdentity ? 'workbench' : 'anonymous';
+      const stream = createDashboardEventsStream({
+        res,
+        authSessionId: requestIdentity?.authSessionId ?? null,
+        audience: eventsAudience,
+        isAuthSessionLive: terminalAuthSessionLive,
+        bind: (authSessionId, close) => authSessionConnections.register(authSessionId, close),
+      });
       const off = aggregator.on(ev => {
-        // Mirror the GET /api/schedules carve-out: schedule events carry the
-        // full task object — strip the prompt AND workingDir for anonymous SSE
-        // listeners, or the REST-side scrub would be trivially bypassed by
-        // `/events`.
-        let body = authed
-          ? ev.body
-          : redactSessionEventForPublic(ev.type, ev.body) as typeof ev.body;
+        // Session rows follow the same three-way audience as GET /api/sessions,
+        // or a Workbench viewer would receive the preview descriptor on the
+        // initial REST fetch and then lose it on the first live patch.
+        const projectedBody = projectSessionPreviewEventForBrowser(ev.type, ev.body) as typeof ev.body;
+        let body = projectSessionEventForAudience(
+          ev.type,
+          projectedBody,
+          sessionBoardAudience,
+        ) as typeof ev.body;
+        // Schedules stay on the MANAGEMENT gate, mirroring the GET
+        // /api/schedules carve-out: schedule events carry the full task object
+        // (prompt = business instructions, workingDir = repo/customer path) and
+        // `/api/schedules` is not a Workbench capability, so widening this to
+        // `sessionBoardAudience` would let an H5 identity read over `/events`
+        // what the REST route refuses it.
+        // Workbench-only identities never reach this redaction at all — the
+        // stream drops every `schedule.*` frame for them (P1-14 sibling); this
+        // branch is the ANONYMOUS publicReadOnly path, which the REST route
+        // does serve, redacted the same way.
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {
@@ -5682,10 +6711,10 @@ const server = createServer(async (req, res) => {
             ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
           } as typeof ev.body;
         }
-        res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body })}\n\n`);
+        stream.write(ev.type, { larkAppId: ev.larkAppId, body });
       });
       const hb = setInterval(() => {
-        res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+        stream.write('heartbeat', { ts: Date.now() });
       }, 15_000);
       // Push a bots.changed frame whenever the online bot roster actually
       // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
@@ -5697,9 +6726,9 @@ const server = createServer(async (req, res) => {
         const sig = botsRosterSignature(online);
         if (sig === lastRoster) return;
         lastRoster = sig;
-        res.write(`event: bots.changed\ndata: ${JSON.stringify({ body: { signature: sig } })}\n\n`);
+        stream.write('bots.changed', { body: { signature: sig } });
       });
-      res.on('close', () => { off(); offRoster(); clearInterval(hb); });
+      res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
       return;
     }
 
@@ -5755,38 +6784,32 @@ oauthCallbackServer.listen(9768, '127.0.0.1', () => {
 server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
+    // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
+    // 凭据是路径里的 content capability，绝不能被下面的管理类 Origin 校验误杀。
+    if (sessionPreviewProxy.handleUpgrade(req, clientSocket, head)) return;
+    // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
+    // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
+    // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
+    const upgradeOrigin = managementUpgradeOrigin(req.headers);
+    if (!upgradeOrigin.ok) {
+      const body = JSON.stringify({ ok: false, error: upgradeOrigin.error });
+      clientSocket.end([
+        'HTTP/1.1 403 Forbidden',
+        'content-type: application/json; charset=utf-8',
+        'cache-control: no-store',
+        'connection: close',
+        `content-length: ${Buffer.byteLength(body)}`,
+        '',
+        body,
+      ].join('\r\n'));
+      return;
+    }
     // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
     if (rawUrl.startsWith('/debug-terminal/')) {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
-    if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
-      return clientSocket.destroy();
-    }
-    // Strip query/hash before extracting the sessionId path segment.
-    const pathname = rawUrl.split(/[?#]/)[0];
-    const sessionId = parseTerminalSessionId(pathname);
-    const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
-    if (!tport) return clientSocket.destroy();
-
-    const upstream = netConnect(tport, '127.0.0.1', () => {
-      // rawHeaders is a flat [k, v, k, v, ...] list — preserves casing/duplicates.
-      const lines = [`${req.method} ${req.url} HTTP/1.1`];
-      const rh = req.rawHeaders;
-      for (let i = 0; i + 1 < rh.length; i += 2) lines.push(`${rh[i]}: ${rh[i + 1]}`);
-      lines.push('', '');
-      upstream.write(lines.join('\r\n'));
-      if (head?.length) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
-    const cleanup = () => {
-      try { upstream.destroy(); } catch { /* ignore */ }
-      try { clientSocket.destroy(); } catch { /* ignore */ }
-    };
-    upstream.on('error', cleanup);
-    clientSocket.on('error', cleanup);
-    upstream.on('close', () => clientSocket.destroy());
-    clientSocket.on('close', () => upstream.destroy());
+    if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
+    clientSocket.destroy();
   } catch {
     try { clientSocket.destroy(); } catch { /* ignore */ }
   }
@@ -5816,6 +6839,9 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
+  // (crash/restart mid-delete). Best-effort and fire-and-forget.
+  sweepStoreTrash();
   startPlatformTunnelIfBound();
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
@@ -5884,11 +6910,12 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
     // Merge per-bot team-visibility config (showInTeam) from bots.json by
     // larkAppId so the platform team page can hide bots. Default: showInTeam =
     // true (shown). bots.json may be unreadable from the dashboard process →
-    // fall back to the default.
-    const cfgByAppId = new Map<string, { showInTeam?: boolean }>();
+    // fall back to the default. apiOnly is read from the same config to derive
+    // `mentionable` (a core-only bot has no Feishu transport → can't be @-ed).
+    const cfgByAppId = new Map<string, { showInTeam?: boolean; apiOnly?: boolean }>();
     try {
       for (const cfg of loadBotConfigs()) {
-        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam });
+        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam, apiOnly: cfg.apiOnly });
       }
     } catch {
       /* defaults below */
@@ -5906,6 +6933,13 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
           unionId: e.larkAppId ? getBotUnionId(config.session.dataDir, e.larkAppId) : undefined,
+          // 团队维度 Agent 互查（additive，交接契约 §端点2 / register|heartbeat）：
+          //  · specialties：owner 预配的专长标签（bot-profiles），发现/拉群匹配依据，仅展示不可信。
+          //  · mentionable：是否有飞书传输身份能被 @（core-only/apiOnly → false）。cfg 读不到
+          //    时保守按可传输(true)，与 team-bot-directory「undefined 按可传输」同源
+          //    （fail-open 仅在本机自报、无跨部署放大风险；真正的 no-transport 由 apiOnly 明示）。
+          specialties: e.larkAppId ? getBotSpecialties(config.session.dataDir, e.larkAppId) : [],
+          mentionable: cfg?.apiOnly !== true,
         };
       })
       .filter((b) => b.appId);
@@ -5919,8 +6953,14 @@ function startPlatformTunnelIfBound(): void {
     const binding = readPlatformBinding();
     if (!binding) return;
     const existingToken = currentDashboardToken();
-    loadOrCreatePersistedToken(TOKEN_PATH);
+    // An already-materialized dashboard token is sufficient to start the
+    // tunnel. Avoid re-validating its path via secureHostFilePath(): on Linux
+    // the request-time read is descriptor-pinned, while deployments whose HOME
+    // is a root-owned symlink (common on managed dev hosts) can make the
+    // path-returning helper fail even though the 0600 file is safely readable.
+    // Only the first token creation needs the path+lock helper.
     if (!existingToken) {
+      loadOrCreatePersistedToken(TOKEN_PATH);
       logger.info('[platform-tunnel] 已初始化 dashboard token');
     }
     const version = readBotmuxVersion();
@@ -6058,6 +7098,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
+  feedbackAnalyticsService?.close();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s

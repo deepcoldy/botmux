@@ -1,6 +1,8 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, delimiter } from 'node:path';
+import { execFileSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import type {
   SessionBackend,
@@ -82,6 +84,28 @@ export interface RiffBackendConfig {
   jwt?: string;
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
   jwtEnv?: string;
+  /**
+   * Command to refresh the ByteCloud JWT when the keychain holds no live token.
+   * When neither `config.jwt` nor the env token is set and `readBytecloudKeychainJwt`
+   * returns null (every candidate expired / within the safety window / absent),
+   * riff task creation would fail with a 401 that aborts the whole turn. Before
+   * giving up, we run this command ONCE (debounced) to let the owning CLI
+   * (bytedcli / kaboo-cli) refresh credentials and rewrite the keychain, then
+   * re-read. bytedcli is the ByteCloud JWT owner: `bytedcli auth
+   * get-bytecloud-jwt-token --force-refresh` refreshes via its Auth SDK and
+   * writes the token to `~/.local/share/bytedcli/data/bytecloud-auth/…`, which is
+   * already a `bytecloudKeychainCandidates` path.
+   *
+   * Shape: [binary, ...args]. When unset, resolves in order:
+   *   1. env `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split, e.g. `bytedcli auth get-bytecloud-jwt-token --force-refresh`)
+   *   2. a `bytedcli` binary found on PATH → `bytedcli auth get-bytecloud-jwt-token --force-refresh`
+   *   3. otherwise no auto-refresh (fail-closed to the old behaviour — a 401).
+   * We intentionally do NOT default to `npx @bytedance-dev/bytedcli@latest`: an
+   * uncached/`@latest` npx resolve can block ~30s per call, far too slow for a
+   * synchronous pre-request refresh. Deployments wanting npx must set the env
+   * explicitly (and ideally pin the version).
+   */
+  jwtRefreshCmd?: string[];
   /** Sandbox resource pool selected for newly-created tasks. Riff defaults to
    *  BOE when omitted; follow-ups inherit the parent task's sandbox. */
   sandboxCluster?: RiffSandboxCluster;
@@ -251,7 +275,7 @@ export async function cancelRiffTaskById(
 ): Promise<boolean> {
   const attempt = async (): Promise<void> => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel')['resolveJwt']();
+    const jwt = await new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel')['resolveJwt']({ allowRefresh: false });
     if (jwt) headers['x-jwt-token'] = jwt;
     const resp = await fetch(`${cfg.baseUrl}/api/task-cancel`, {
       method: 'POST', headers, body: JSON.stringify({ id: taskId }), signal: AbortSignal.timeout(4000),
@@ -270,6 +294,383 @@ export async function cancelRiffTaskById(
  *  subdomain IS the write capability, so neither URL nor host may be logged. */
 export function hashUrlForLog(u: string): string {
   return createHash('sha256').update(u).digest('hex').slice(0, 8);
+}
+
+/** The keychain leaf under a ByteCloud tool's storage root:
+ *  `<root>/bytecloud-auth/keychain/auth/cn/default`, whose JSON holds the
+ *  `bytecloud_jwt` field. `cn` is ByteCloud CN (riff is an internal CN
+ *  service). NOTE the sibling `bytecloud-auth/auth/cn/credentials.json` (no
+ *  `keychain/` segment) carries only metadata (app_id / expires_at / user) and
+ *  NO `bytecloud_jwt` — we deliberately never read it. */
+const BYTECLOUD_KEYCHAIN_LEAF = join('bytecloud-auth', 'keychain', 'auth', 'cn', 'default');
+
+/**
+ * Reproduce bytedcli's `sanitizeFilenamePart` + AIME base-dir assembly EXACTLY
+ * (from `@bytedance-dev/bytedcli` dist/bytedcli-core.js, verified against
+ * 0.124.0): a username path segment keeps only `[a-zA-Z0-9._-]` (every other
+ * char → `_`), then a lone `.` → `_` and a lone `..` → `__`. Must match
+ * byte-for-byte or the AIME keychain path we build won't line up with where
+ * bytedcli actually wrote the token.
+ */
+function sanitizeAimeUser(user: string): string {
+  return user.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.$/, '_').replace(/^\.\.$/, '__');
+}
+
+/**
+ * bytedcli's data-home base when running inside an AIME workspace. bytedcli
+ * uses it (in place of `os.homedir()`) ONLY when both `AIME_WORKSPACE_PATH` and
+ * `AIME_CURRENT_USER` are set (trimmed non-empty); it then stores under
+ * `<workspace>/<sanitizedUser>/.local/share/bytedcli/data/…`. We return the
+ * `<workspace>/<sanitizedUser>/.local/share` prefix (parallel to the plain
+ * `~/.local/share` data-home, so the shared `join(base,'bytedcli','data')`
+ * below lands on the right leaf), or null when this is not an AIME runtime.
+ */
+function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
+  const workspace = env.AIME_WORKSPACE_PATH?.trim();
+  const user = env.AIME_CURRENT_USER?.trim();
+  if (!workspace || !user) return null;
+  return join(workspace, sanitizeAimeUser(user), '.local', 'share');
+}
+
+/** True when BOTH AIME vars are set (trimmed non-empty), i.e. bytedcli swaps its
+ *  storage root to the AIME workspace. In that runtime we must not trigger a
+ *  host-identity JWT refresh — see resolveJwt's fail-closed skip. */
+function isFullAimeRuntime(env: NodeJS.ProcessEnv): boolean {
+  return aimeDataHome(env) !== null;
+}
+
+/**
+ * The keychain candidates for a ByteCloud tool's `bytecloud-auth/` store, across
+ * the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk / bytedcli).
+ *
+ * ⚠️ This is NOT a "cast a wide net" list. The selector in
+ * `readBytecloudKeychainJwt` picks the globally-freshest token by `exp`
+ * REGARDLESS of order, so an extra candidate is not free: a stale/foreign token
+ * at a location the tool never actually writes could WIN and shadow the real
+ * one. Every entry must be a location the tool genuinely uses on THIS host:
+ *   - Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
+ *     Go's os.UserConfigDir (verified against kaboo 1.3.77): macOS →
+ *     `~/Library/Application Support`, Windows → `%AppData%` (Go errors, does
+ *     NOT default to `~/AppData/Roaming`, when it is unset — so we emit no
+ *     config candidate then), otherwise → `$XDG_CONFIG_HOME` (else `~/.config`).
+ *     We list ONLY the current platform's root, never several — a
+ *     foreign-platform root is never live here and would only invite shadowing.
+ *   - cjadk also uses a home dot-dir `~/.cjadk`; aipaas uses `~/.aipaas`.
+ *   - bytedcli stores under `~/.local/share/bytedcli/data` on Linux, macOS AND
+ *     Windows: its `bytedcliBaseDir()` (bytedcli-core.js, 0.125.0) has no
+ *     platform branch and ignores `$XDG_DATA_HOME`. Inside an AIME workspace it
+ *     swaps the home base for `$AIME_WORKSPACE_PATH/<sanitized $AIME_CURRENT_USER>`
+ *     — see the fail-closed early return below.
+ * Order is otherwise NOT significant (selection is by `exp`, not position).
+ * Non-existent candidates simply fail the read and are skipped.
+ */
+export function bytecloudKeychainCandidates(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const dedupe = (xs: string[]): string[] => [...new Set(xs.filter(Boolean))];
+  const isMac = platform === 'darwin';
+
+  // --- Full AIME runtime: fail-closed to the AIME identity domain ---------
+  // When BOTH AIME vars are set, bytedcli swaps its storage root to
+  // `$AIME_WORKSPACE_PATH/<sanitized user>/.local/share/bytedcli/data` and,
+  // crucially, does NOT fall back to the host HOME (bytedcliBaseDir returns the
+  // AIME root and stops). `os.homedir()` here is still the HOST home — that is
+  // precisely WHY bytedcli needs the override — so EVERY host-HOME-derived
+  // keychain (the config-style CLIs under ~/.config or Application Support,
+  // ~/.cjadk, ~/.aipaas) belongs to a DIFFERENT identity. Reading any of them
+  // would cross AIME user identities, and the exp-aware selector below would
+  // happily prefer a longer-lived host token. The safe boundary is the
+  // identity domain, not the tool name: in a full AIME runtime the ONLY
+  // in-domain source is the AIME-scoped bytedcli store. If it holds no live
+  // token we return nothing here and the caller fails closed (the user logs in
+  // inside AIME) rather than silently authenticating as someone else.
+  const aimeHome = aimeDataHome(env);
+  if (aimeHome) {
+    return [join(aimeHome, 'bytedcli', 'data', BYTECLOUD_KEYCHAIN_LEAF)];
+  }
+
+  // --- Ordinary (non-AIME) runtime ---------------------------------------
+  // Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
+  // Go's os.UserConfigDir (verified against kaboo 1.3.77's embedded ByteCloud
+  // auth). That maps per-platform: macOS → `~/Library/Application Support`;
+  // Windows → `%AppData%`; everything else → `$XDG_CONFIG_HOME` (falling back
+  // to `~/.config`). A single process only ever uses ONE of these — the current
+  // platform's. We must key off the actual platform, NOT list several: the
+  // exp-aware selector picks the globally-freshest token regardless of order,
+  // so a stale token under another platform's root could otherwise shadow the
+  // authoritative one (a foreign-platform root is never a live location on this
+  // host anyway). `platform` is injectable so every spelling stays testable.
+  //
+  // `configHome` is null when we cannot name the platform's real config root:
+  // on Windows Go ERRORS if `%AppData%` is unset (it does NOT default to
+  // `~/AppData/Roaming`), so with APPDATA absent we emit NO config-style
+  // candidate rather than invent a phantom path a stale token could shadow
+  // from. The other verified candidates (bytedcli, dot-dirs) are unaffected.
+  const xdgConfig = env.XDG_CONFIG_HOME?.trim();
+  let configHome: string | null;
+  if (isMac) {
+    configHome = join(home, 'Library', 'Application Support');
+  } else if (platform === 'win32') {
+    configHome = env.APPDATA?.trim() || null;
+  } else {
+    configHome = xdgConfig || join(home, '.config');
+  }
+  // bytedcli keeps `bytedcli/data/bytecloud-auth/...` under its data home.
+  // `bytedcliBaseDir()` in `@bytedance-dev/bytedcli` (dist/bytedcli-core.js,
+  // 0.125.0) has NO platform branch: in the ordinary case it unconditionally
+  // uses `~/.local/share/bytedcli` on Linux, macOS AND Windows, and it ignores
+  // $XDG_DATA_HOME. So the single `~/.local/share` data home is correct on
+  // every platform — there is no Application Support / %AppData% spelling to
+  // add. (The AIME workspace override is the only base swap, handled above.)
+  const bytedcliHome = join(home, '.local', 'share');
+  const roots: string[] = [];
+  // Config-dir CLIs (single platform-correct base, when we can name one).
+  if (configHome) {
+    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(configHome, cli));
+  }
+  // Home dot-dir layouts (Linux-observed; harmless as extra candidates elsewhere).
+  roots.push(join(home, '.cjadk'));
+  roots.push(join(home, '.aipaas'));
+  // Data-dir CLI (bytedcli) — the extra `data/` segment is part of its layout.
+  roots.push(join(bytedcliHome, 'bytedcli', 'data'));
+  return dedupe(roots).map((root) => join(root, BYTECLOUD_KEYCHAIN_LEAF));
+}
+
+/**
+ * Decode a JWT's `exp` (seconds since epoch) from its payload without verifying
+ * the signature — we only need the expiry to prefer a live token over a stale
+ * one. Returns null for anything we cannot confidently parse as an expiry so it
+ * ranks below any parseable-live token (opaque/non-JWT strings, malformed
+ * base64, missing/non-number `exp`).
+ *
+ * A JWS compact JWT is EXACTLY three non-empty base64url segments
+ * (`header.payload.signature`) whose header and payload are JSON. We require
+ * that shape up front: a 2- or 4-segment string, a segment that isn't
+ * base64url (incl. the signature), or a header/payload that isn't a JSON
+ * object is NOT a JWT and must never be ranked as a live token where its
+ * (accidentally decodable) `exp` could shadow a genuine JWT. We do NOT verify
+ * the signature (that is riff's job) — only that the structure is a real JWT.
+ */
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+function decodeJoseJson(seg: string): Record<string, unknown> | null {
+  try {
+    const obj = JSON.parse(Buffer.from(seg, 'base64url').toString('utf-8')) as unknown;
+    // A JOSE header / JWT payload is a JSON object (not an array, not a scalar).
+    if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+    return obj as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+export function decodeJwtExp(jwt: string): number | null {
+  const parts = jwt.split('.');
+  // Exactly three non-empty, strictly-base64url segments (header.payload.sig).
+  if (parts.length !== 3) return null;
+  if (!parts[0] || !parts[1] || !parts[2]) return null;
+  if (parts.some((p) => !BASE64URL_RE.test(p))) return null;
+  // Header must decode to a JSON object (confirms it's really JOSE, not just
+  // base64url-shaped noise); we don't require a specific `typ`/`alg`.
+  if (!decodeJoseJson(parts[0]!)) return null;
+  const payload = decodeJoseJson(parts[1]!);
+  if (!payload) return null;
+  const exp = payload['exp'];
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp : null;
+}
+
+/**
+ * Read the ByteCloud JWT from the keychain candidates, preferring a live token.
+ * Pure + injectable (home/env/now) so it is unit-testable without touching the
+ * real HOME. Never throws — unreadable/malformed candidates are skipped.
+ *
+ * Selection (fixes the stale-token-shadows-valid-token hazard: an expired token
+ * from an earlier-listed tool must not mask a valid token from a later one):
+ *   1. Collect every candidate's non-empty `bytecloud_jwt`, in candidate order.
+ *   2. Drop tokens whose decoded `exp` is already past `now`.
+ *   3. Among the survivors, pick the one with the greatest `exp` (freshest);
+ *      candidates whose `exp` we cannot parse (opaque values) rank BELOW any
+ *      parseable live token and are used only as a last-resort fallback when no
+ *      parseable-live token exists — so a broken/opaque old value can never
+ *      shadow a clearly-valid newer token.
+ * Returns null when nothing yields a usable token.
+ */
+/**
+ * Treat a token that expires within this many seconds as already expired. riff
+ * task creation reads the JWT once and does a single fetch; a 401 there throws
+ * and fails the whole turn (SSE reconnect only covers an ALREADY-created task),
+ * and a fresh sandbox cold-boot costs minutes — so a token about to expire
+ * mid-request is worse than skipping to a longer-lived candidate. Also absorbs
+ * small client/server clock skew.
+ */
+export const JWT_EXPIRY_SAFETY_WINDOW_SEC = 30;
+
+export function readBytecloudKeychainJwt(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const cutoffSec = nowMs / 1000 + JWT_EXPIRY_SAFETY_WINDOW_SEC;
+  let bestLive: { jwt: string; exp: number } | null = null; // parseable, unexpired, freshest
+  let opaqueFallback: string | null = null;                 // first exp-less, non-expired-unknown token
+  for (const path of bytecloudKeychainCandidates(home, env, platform)) {
+    let jwt: string;
+    try {
+      const data = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      const v = data['bytecloud_jwt'];
+      if (typeof v !== 'string' || v.length === 0) continue;
+      jwt = v;
+    } catch { continue; }
+    const exp = decodeJwtExp(jwt);
+    if (exp === null) {
+      // Cannot parse expiry — keep only the first as a last-resort fallback.
+      if (opaqueFallback === null) opaqueFallback = jwt;
+      continue;
+    }
+    if (exp <= cutoffSec) continue; // expired or about to expire — never select.
+    if (!bestLive || exp > bestLive.exp) bestLive = { jwt, exp };
+  }
+  return bestLive?.jwt ?? opaqueFallback;
+}
+
+/**
+ * Locate a `bytedcli` binary on PATH (used to build the default JWT-refresh
+ * command). Returns the bare name `bytedcli` when found so execFileSync resolves
+ * it via PATH, or null when absent. Injectable env/platform for testing.
+ *
+ * We look for a real installed binary rather than defaulting to
+ * `npx @bytedance-dev/bytedcli@latest`: an uncached / `@latest` npx resolve can
+ * block ~30s, which is unacceptable on the synchronous pre-request path. If
+ * bytedcli is not installed we simply do not auto-refresh (fail-closed to the
+ * prior behaviour — the request may 401, exactly as before this change).
+ */
+export function findBytedcliBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const pathVar = env.PATH ?? env.Path ?? '';
+  if (!pathVar) return null;
+  const names = platform === 'win32' ? ['bytedcli.cmd', 'bytedcli.exe', 'bytedcli'] : ['bytedcli'];
+  for (const dir of pathVar.split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      try {
+        if (existsSync(join(dir, name))) return 'bytedcli';
+      } catch { /* ignore unreadable PATH entry */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the JWT-refresh command: explicit config → env
+ * `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split) → a PATH-resident bytedcli →
+ * null (no auto-refresh). See RiffBackendConfig.jwtRefreshCmd for the rationale.
+ */
+export function resolveJwtRefreshCmd(
+  configured: string[] | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] | null {
+  if (configured && configured.length > 0) return configured;
+  const fromEnv = env.BOTMUX_RIFF_JWT_REFRESH_CMD?.trim();
+  if (fromEnv) {
+    const parts = fromEnv.split(/\s+/).filter(Boolean);
+    if (parts.length > 0) return parts;
+  }
+  const bin = findBytedcliBinary(env, platform);
+  if (bin) return [bin, 'auth', 'get-bytecloud-jwt-token', '--force-refresh'];
+  return null;
+}
+
+/** Minimum gap between speculative JWT refresh attempts. When the keychain
+ *  holds no live token, a reconnect/follow-up loop would otherwise trigger a
+ *  refresh on EVERY getJwt() call; we cap proactive refreshes at one per window
+ *  and let the shared keychain re-read serve the rest. Also caps the cost of a
+ *  refresh command that keeps failing (e.g. bytedcli not logged in). A refresh
+ *  driven by an actual server 401 bypasses this window (see `force`). */
+export const JWT_REFRESH_DEBOUNCE_MS = 60_000;
+
+/** How long a single refresh command may run before we give up. Once the
+ *  refresh is asynchronous (below) this no longer blocks the event loop — it
+ *  only bounds one awaited child process — so we keep it generous: a cold
+ *  bytedcli token fetch can take a few seconds, and a session that cannot get a
+ *  JWT has nothing useful to do anyway. */
+export const JWT_REFRESH_TIMEOUT_MS = 30_000;
+
+/** Process-wide last-attempt timestamp (ms). Shared across RiffBackend instances
+ *  because the orphan-cancel path builds a throwaway instance per call — a
+ *  per-instance clock there would never debounce. `-Infinity` means "never
+ *  attempted", so the first call always runs regardless of the clock's
+ *  magnitude. Reset helper for tests. */
+let lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+/** In-flight refresh, shared process-wide so concurrent callers COALESCE onto a
+ *  single child process instead of each spawning their own bytedcli. `null`
+ *  between attempts. */
+let inFlightJwtRefresh: Promise<boolean> | null = null;
+export function __resetJwtRefreshDebounceForTest(): void {
+  lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+  inFlightJwtRefresh = null;
+}
+
+export interface RefreshBytecloudJwtOpts {
+  /** Injectable async runner (defaults to a real execFile). */
+  runner?: (bin: string, args: string[]) => Promise<void>;
+  /** Injectable clock for the debounce window (defaults to Date.now()). */
+  nowMs?: number;
+  /** Bypass the debounce window. Set only when an actual server 401/403 proved
+   *  the current token is bad — a rejection is authoritative evidence worth one
+   *  more attempt even inside the window. Never set for speculative refreshes. */
+  force?: boolean;
+}
+
+/**
+ * Run the JWT-refresh command once, ASYNCHRONOUSLY. Never throws: a missing
+ * command, a non-zero exit, or a timeout all resolve to `false` (the caller then
+ * falls back to whatever the keychain holds — i.e. the pre-change behaviour).
+ * Resolves true only when a command actually ran to completion.
+ *
+ * Async + injectable (runner / now / force) so it never blocks the event loop
+ * (critical on the daemon-side orphan-cancel path) and the debounce / coalesce /
+ * fail-closed paths are unit-testable without spawning a real process.
+ *
+ * COALESCE: if a refresh is already in flight, ride it instead of spawning a
+ * second bytedcli — concurrent getJwt() callers share one refresh.
+ */
+export function refreshBytecloudJwt(
+  cmd: string[] | null,
+  opts: RefreshBytecloudJwtOpts = {},
+): Promise<boolean> {
+  const { runner = defaultJwtRefreshRunner, nowMs = Date.now(), force = false } = opts;
+  if (!cmd || cmd.length === 0) return Promise.resolve(false);
+  // Coalesce first: a forced caller still rides an in-flight refresh rather than
+  // racing a second child — the running one will rewrite the keychain either way.
+  if (inFlightJwtRefresh) return inFlightJwtRefresh;
+  // Debounce: cap the cost of a refresh that keeps failing. A forced (401-driven)
+  // refresh bypasses the window — the token was provably rejected.
+  if (!force && nowMs - lastJwtRefreshAtMs < JWT_REFRESH_DEBOUNCE_MS) return Promise.resolve(false);
+  lastJwtRefreshAtMs = nowMs;
+  const [bin, ...args] = cmd;
+  const run = (async (): Promise<boolean> => {
+    try {
+      await runner(bin!, args);
+      return true;
+    } catch (err) {
+      logger.warn(`[riff] JWT refresh command failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  })();
+  inFlightJwtRefresh = run;
+  return run.finally(() => { if (inFlightJwtRefresh === run) inFlightJwtRefresh = null; });
+}
+
+const execFileAsync = promisify(execFile);
+/** Default refresh runner: async execFile with a bounded timeout. stdout/stderr
+ *  are discarded — the command's SIDE EFFECT (rewriting the keychain) is what
+ *  matters; we re-read the keychain afterwards rather than parse its output. */
+async function defaultJwtRefreshRunner(bin: string, args: string[]): Promise<void> {
+  await execFileAsync(bin, args, { timeout: JWT_REFRESH_TIMEOUT_MS });
 }
 
 function defaultRunGit(cwd: string): (args: string[]) => string | null {
@@ -349,6 +750,12 @@ interface RiffTaskResponse {
   };
 }
 
+/** Terminal riff task statuses (riff openApiDocs task contract). Once a task
+ *  reaches one of these it will emit no further progress — an `init` replay or
+ *  a `done` event carrying one of these IS the task's completion. Non-terminal:
+ *  pending / creating_session / running. */
+const TERMINAL_RIFF_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timeout']);
+
 /**
  * RiffBackend — bridges botmux's SessionBackend interface to riff's HTTP API.
  *
@@ -387,11 +794,41 @@ export class RiffBackend implements SessionBackend {
    *  cleared past 64 entries (a session rarely exceeds a few dozen turns). */
   private completedTaskIds = new Set<string>();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
+  private maxReconnectAttempts = 6;
+  /** Wall-clock ms when the CURRENT SSE connection was established, or `null`
+   *  when none is open / the last fetch never connected. Typed `number | null`
+   *  (not a 0 sentinel) on purpose: 0 is both "not connected" AND a valid number
+   *  you could subtract, so a future edit dropping the guard would compute a
+   *  bogus multi-decade lifetime from `Date.now() - 0` and refund forever. `null`
+   *  makes "never connected" un-subtractable and forces the guard at the type
+   *  level. The reconnect budget is refunded only when a broken connection had
+   *  LIVED long enough to be a healthy long connection merely severed by the
+   *  upstream proxy's fixed ~183s lifetime cap — NOT merely because a connection
+   *  opened. Keying on "connection lived ≥ reconnectHealthyConnMs" (not on
+   *  receiving init, and not on any data event — both were falsified/
+   *  insufficient) is what separates the two cases that look identical from the
+   *  client:
+   *    • healthy cap:   connection lives ~183s, EOFs → refund → task streams on
+   *    • dead/hot-loop: connection opens then EOFs within ~1s, repeatedly →
+   *      NO refund → budget exhausts and bails. Covers BOTH a fetch that never
+   *      connects (stays null) AND a "connect→init→instant-EOF" loop against a
+   *      stale-running orphan (lives <threshold) — the latter is exactly the
+   *      infinite-retry hole a naive "reset on connect/init" would reopen. */
+  private connectionStartedAtMs: number | null = null;
   /** 预算层级（单调覆盖，见 destroySession 注释）；字段化以便测试注入边界。 */
   private cancelTimeoutMs = 4_000;
   private createTimeoutMs = 10_000;
   private destroyDeadlineMs = 20_000;
+  /** SSE 重连退避基数（指数退避的第一档）；字段化以便测试把重连间隔压到 0。 */
+  private reconnectBaseDelayMs = 1_000;
+  private reconnectMaxDelayMs = 30_000;
+  /** A broken SSE connection that lived at least this long is treated as a
+   *  healthy long connection severed by the ~183s proxy cap → refund the
+   *  reconnect budget. Shorter-lived breaks (dead endpoint / instant-EOF hot
+   *  loop) do NOT refund. 30s: the cap is metronomic at ~181-183s (6× margin)
+   *  while pathological EOFs are sub-second, so the two separate cleanly.
+   *  Field-ized for test injection. */
+  private reconnectHealthyConnMs = 30_000;
   /** Exact late/current task whose close cancellation failed. Retained across
    * the prepare-close handshake so the daemon can persist a retry handle. */
   private closeFailureTaskId: string | null = null;
@@ -443,44 +880,65 @@ export class RiffBackend implements SessionBackend {
     if (this.currentTaskId) cb(this.currentTaskId);
   }
 
-  /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh works. */
-  private getJwt(): string | null {
-    return this.resolveJwt();
+  /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh
+   *  works. Async because a keychain miss may trigger a (non-blocking) CLI
+   *  refresh. `opts.allowRefresh=false` skips the refresh entirely (daemon-side
+   *  orphan-cancel: a best-effort teardown must never freeze the daemon on a
+   *  host-identity refresh). `opts.forceRefresh=true` bypasses the debounce
+   *  window (an actual server 401 proved the token bad). */
+  private getJwt(opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {}): Promise<string | null> {
+    return this.resolveJwt(opts);
   }
 
-  private resolveJwt(): string | null {
+  private async resolveJwt(
+    opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {},
+  ): Promise<string | null> {
+    const { allowRefresh = true, forceRefresh = false } = opts;
     if (this.config.jwt) return this.config.jwt;
     const envKey = this.config.jwtEnv ?? 'RIFF_JWT';
     const fromEnv = process.env[envKey];
     if (fromEnv) return fromEnv;
 
-    // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk)
+    // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk / bytedcli)
     const fromKeychain = this.readJwtFromBytecloudKeychain();
-    if (fromKeychain) {
+    // A forced refresh (post-401) intentionally ignores an existing keychain
+    // token: the server just rejected whatever we had, so re-reading the same
+    // store without refreshing first would hand back the same bad token.
+    if (fromKeychain && !forceRefresh) {
       logger.info(`[riff] JWT loaded from ByteCloud keychain`);
       return fromKeychain;
     }
 
+    // No live keychain token (or a forced post-401 refresh) — every candidate is
+    // expired, within the safety window, or absent. This is exactly the "token
+    // expired mid-task" / "expired at startup" case (the JWT is re-read per
+    // request). Before giving up to a 401 that would abort the turn, ask the
+    // owning CLI to refresh (non-blocking async, coalesced, non-fatal), then
+    // re-read once. Skipped when allowRefresh=false (daemon-side orphan-cancel)
+    // and inside a full AIME runtime (fail-closed identity boundary — we never
+    // trigger a host-identity refresh there; the AIME store is refreshed inside
+    // AIME).
+    if (allowRefresh && !isFullAimeRuntime(process.env)) {
+      const cmd = resolveJwtRefreshCmd(this.config.jwtRefreshCmd);
+      if (await refreshBytecloudJwt(cmd, { force: forceRefresh })) {
+        const refreshed = this.readJwtFromBytecloudKeychain();
+        if (refreshed) {
+          logger.info(`[riff] JWT refreshed via ByteCloud CLI and reloaded from keychain`);
+          return refreshed;
+        }
+      }
+    }
+
+    // Forced refresh found nothing new — fall back to the (rejected) keychain
+    // token rather than null: a stale token is no worse than no token, and the
+    // caller already knows it 401'd.
+    if (fromKeychain) return fromKeychain;
     logger.warn(`[riff] JWT not found in config, env ${envKey}, or ByteCloud keychain; API calls will fail`);
     return null;
   }
 
   private readJwtFromBytecloudKeychain(): string | null {
-    const home = process.env.HOME ?? '~';
-    const candidates = [
-      `${home}/.config/kaboo-cli/bytecloud-auth/keychain/auth/cn/default`,
-      `${home}/.config/aiden-cli/bytecloud-auth/keychain/auth/cn/default`,
-      `${home}/.cjadk/bytecloud-auth/keychain/auth/cn/default`,
-    ];
-    for (const path of candidates) {
-      try {
-        const raw = readFileSync(path, 'utf-8');
-        const data = JSON.parse(raw) as Record<string, unknown>;
-        const jwt = data['bytecloud_jwt'] as string | undefined;
-        if (jwt) return jwt;
-      } catch { /* try next */ }
-    }
-    return null;
+    return readBytecloudKeychainJwt();
   }
 
   spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {
@@ -720,7 +1178,7 @@ export class RiffBackend implements SessionBackend {
       return { ok: false, taskId: this.currentTaskId, error: 'explicit_close_in_progress' };
     }
 
-    const attempt = Symbol('riff-shutdown-detach');
+    const attempt = Symbol('remote-shutdown-detach');
     this.shutdownDetachAttempt = attempt;
     this.shutdownDetaching = true;
     // Existing SSE delivery is presentation-only. Stop it now, but do not
@@ -1103,11 +1561,14 @@ export class RiffBackend implements SessionBackend {
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
   ): Promise<string> {
+    // Assemble the request body FIRST (attachment reads can be slow on large
+    // files / slow disks), THEN resolve the JWT immediately before fetch. The
+    // keychain selector skips tokens expiring within a safety window, but that
+    // guarantee only holds if we read the token close to the request — reading
+    // it before a multi-second upload prep could hand off a token that expires
+    // mid-flight. createTimeout only bounds the fetch, not the prep before it.
     const headers: Record<string, string> = {};
-    const jwt = this.getJwt();
-    if (jwt) headers['x-jwt-token'] = jwt;
-
-    let resp: Response;
+    let body: BodyInit;
     if (attachments.length > 0) {
       const form = new FormData();
       form.append('payload', JSON.stringify(payload));
@@ -1119,10 +1580,38 @@ export class RiffBackend implements SessionBackend {
           logger.warn(`[riff] failed to read attachment ${att.path}: ${err}`);
         }
       }
-      resp = await fetch(url, { method: 'POST', headers, body: form, signal: AbortSignal.timeout(this.createTimeoutMs) });
+      body = form;
     } else {
       headers['Content-Type'] = 'application/json';
-      resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(this.createTimeoutMs) });
+      body = JSON.stringify(payload);
+    }
+
+    // Resolve JWT last — right before the request — so the safety-window
+    // freshness check reflects the token that actually goes on the wire. `body`
+    // (string or FormData) is re-extractable per fetch, so the retry below can
+    // reuse it.
+    const post = (jwt: string | null): Promise<Response> => {
+      const h = { ...headers };
+      if (jwt) h['x-jwt-token'] = jwt;
+      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(this.createTimeoutMs) });
+    };
+
+    const firstJwt = await this.getJwt();
+    let resp = await post(firstJwt);
+
+    // One retry on an auth rejection. A 401/403 is authoritative proof the token
+    // was bad (expired mid-flight / stale at startup), so it justifies forcing a
+    // JWT refresh that bypasses the debounce window. We retry ONLY when the
+    // refresh produced a genuinely different token — otherwise the second POST
+    // would just replay the same rejected credential (this also naturally
+    // no-ops inside a full AIME runtime, where the host refresh is skipped).
+    // Other statuses (400/5xx) are not auth problems and are not retried.
+    if (resp.status === 401 || resp.status === 403) {
+      const freshJwt = await this.getJwt({ forceRefresh: true });
+      if (freshJwt && freshJwt !== firstJwt) {
+        logger.warn(`[riff] task create/follow-up got HTTP ${resp.status}; retrying once with a refreshed JWT`);
+        resp = await post(freshJwt);
+      }
     }
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
@@ -1191,7 +1680,7 @@ export class RiffBackend implements SessionBackend {
   private async cancelTask(taskId: string): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-cancel`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = this.getJwt();
+    const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
     const resp = await fetch(url, {
       method: 'POST',
@@ -1232,20 +1721,31 @@ export class RiffBackend implements SessionBackend {
   private async streamTask(taskId: string): Promise<void> {
     const url = `${this.config.baseUrl}/api2/task-stream?id=${encodeURIComponent(taskId)}`;
     const headers: Record<string, string> = {};
-    const jwt = this.getJwt();
+    const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
 
     this.abortController = new AbortController();
+    // Per-connection lifetime clock (see field doc): null until this connection
+    // is confirmed established below. Reset PER streamTask invocation so a fetch
+    // that never connects can't inherit the previous connection's start time.
+    this.connectionStartedAtMs = null;
 
     try {
       const resp = await fetch(url, { headers, signal: this.abortController.signal });
       if (!resp.ok || !resp.body) {
         throw new Error(`SSE HTTP ${resp.status}`);
       }
+      // Connection established — start its lifetime clock. On break, catch
+      // compares elapsed against reconnectHealthyConnMs to decide whether this
+      // was a healthy ~183s-capped connection (refund budget) or a short-lived
+      // dead/hot-loop break (do not refund).
+      this.connectionStartedAtMs = Date.now();
 
-      // NOTE: reconnectAttempts is reset per TASK (createTask/followUp), not
-      // here — resetting on every 200 would let a "connect OK → immediate
-      // clean EOF" loop retry forever.
+      // NOTE: reconnectAttempts is reset per TASK (createTask/followUp) AND
+      // whenever a broken connection had LIVED ≥ reconnectHealthyConnMs (see the
+      // catch) — NOT unconditionally on every 200, which would let a "connect OK
+      // → instant EOF" loop retry forever (the hole the per-task-only reset
+      // originally guarded, which a naive "reset on connect/init" reopens).
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -1288,10 +1788,29 @@ export class RiffBackend implements SessionBackend {
       if (taskId !== this.currentTaskId || this.completedTaskIds.has(taskId)) return;
       logger.warn(`[riff] SSE stream error: ${err}`);
 
+      // Core fix: an upstream proxy caps each task-stream connection at a fixed
+      // ~183s lifetime and closes it with a clean EOF (no done event) — verified
+      // against live data: tasks that "重连失败" had actually COMPLETED server-
+      // side; botmux gave up ~22s early on one, 16min early on another. A healthy
+      // long runner task thus breaks every ~183s. If this just-broken connection
+      // had LIVED long enough (≥ reconnectHealthyConnMs), it was such a healthy
+      // capped connection — refund the reconnect budget so those periodic caps
+      // never accumulate into a false failure, letting the task stream until it
+      // truly finishes. A short-lived break (dead endpoint that never connected,
+      // or a connect→instant-EOF hot loop against a stale-running orphan) does
+      // NOT refund, so it still exhausts the budget and bails (no infinite
+      // retry). Keyed on connection LIFETIME — not on connect/init receipt,
+      // which would refund every attempt and reopen the infinite-retry hole.
+      const connLivedMs = this.connectionStartedAtMs !== null ? Date.now() - this.connectionStartedAtMs : 0;
+      if (connLivedMs >= this.reconnectHealthyConnMs) this.reconnectAttempts = 0;
+
       // Attempt reconnect if task is still running
       if (!this.killed && !this.taskDone && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.reconnectAttempts++;
-        const delay = 1000 * this.reconnectAttempts;
+        // Exponential backoff with a cap: 1s,2s,4s,8s,16s,30s(cap). Linear 1s/2s/3s
+        // was negligible against a ~180s connection lifetime anyway; the cap keeps
+        // a truly-unreachable gateway from stalling teardown for minutes.
+        const delay = Math.min(this.reconnectMaxDelayMs, this.reconnectBaseDelayMs * 2 ** (this.reconnectAttempts - 1));
         logger.info(`[riff] SSE reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
         this.emitLine(`[riff] 连接中断，正在重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`, 'warn');
         await new Promise((r) => setTimeout(r, delay));
@@ -1302,6 +1821,47 @@ export class RiffBackend implements SessionBackend {
       } else if (!this.killed && !this.taskDone) {
         this.emitError(`SSE 连接中断，重连失败`);
       }
+    }
+  }
+
+  /**
+   * Fire a task's completion exactly once — the turn boundary + final-output
+   * fetch. Called from BOTH the `done` SSE event AND an `init` replay carrying a
+   * terminal status (the task finished while a prior connection was dead and its
+   * `done` was lost with the closed stream). Idempotency & staleness — per TASK,
+   * not per backend: streams can deliver done more than once (observed ~500ms
+   * apart live), and by the time a duplicate (or a reconnect's init replay)
+   * arrives, a queued follow-up may already be running as the NEXT task (write()
+   * reset the global taskDone). A plain boolean guard would re-fire the boundary
+   * mid-way through that next task and falsely mark it done, so gate on:
+   *   1) the completion must belong to the CURRENT task (stale streams no-op)
+   *   2) each task fires the boundary at most once (completedTaskIds)
+   */
+  private completeTask(taskId: string, status: string | undefined, exitCode: number | undefined): void {
+    if (taskId !== this.currentTaskId) return;
+    if (this.completedTaskIds.has(taskId)) return;
+    this.completedTaskIds.add(taskId);
+    // Bounded FIFO eviction — never a blanket clear(), which would drop the id
+    // just added and let its ~500ms duplicate done re-fire.
+    while (this.completedTaskIds.size > 64) {
+      const oldest = this.completedTaskIds.values().next().value!;
+      if (oldest === taskId) break;
+      this.completedTaskIds.delete(oldest);
+    }
+    this.taskDone = true;
+    if (this.config.injectStatusLines !== false) {
+      this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
+    }
+    // Fetch final output from task-detail API (SSE has no output events for
+    // runner tasks) BEFORE firing the turn boundary: the boundary flushes queued
+    // follow-ups → currentTaskId flips to the next task → the stale guard would
+    // (correctly) drop THIS task's only report.
+    if (status === 'completed' || status === 'failed') {
+      void this.fetchAndEmitOutput(taskId)
+        .catch(() => { /* logged inside */ })
+        .finally(() => { this.taskDoneCb?.(); });
+    } else {
+      this.taskDoneCb?.();
     }
   }
 
@@ -1362,44 +1922,27 @@ export class RiffBackend implements SessionBackend {
           if (changed && !this.accessUrlIsDirect) {
             void this.fetchDirectAccessUrl(taskId);
           }
+          // init REPLAYS the full accumulated task state, including a terminal
+          // `status` when the task finished while our previous connection was
+          // dead (the ~183s cap closes mid-flight and the `done` event is lost
+          // with it). Consume that replay: a terminal status here IS the missed
+          // completion — route it through the same completion path so the turn
+          // ends cleanly instead of the budget eventually exhausting into a
+          // false "重连失败". Non-terminal (running/pending/…) just means the
+          // reconnect resumed a still-live task — no completion, keep streaming.
+          if (eventType === 'init') {
+            const initStatus = data['status'] as string | undefined;
+            if (initStatus && TERMINAL_RIFF_STATUSES.has(initStatus)) {
+              const exitCode = data['exitCode'] as number | undefined;
+              this.completeTask(taskId, initStatus, exitCode);
+            }
+          }
           break;
         }
         case 'done': {
-          // Idempotency & staleness — per TASK, not per backend: streams can
-          // deliver done more than once (observed ~500ms apart live), and by
-          // the time the duplicate arrives a queued follow-up may already be
-          // running as the NEXT task (write() reset the global taskDone). A
-          // plain boolean guard would re-fire the turn-boundary callback mid-
-          // way through that next task and falsely mark it done, so gate on:
-          //   1) the done must belong to the CURRENT task (stale streams no-op)
-          //   2) each task fires the boundary at most once (completedTaskIds)
-          if (taskId !== this.currentTaskId) break;
-          if (this.completedTaskIds.has(taskId)) break;
-          this.completedTaskIds.add(taskId);
-          // Bounded FIFO eviction — never a blanket clear(), which would drop
-          // the id just added and let its ~500ms duplicate done re-fire.
-          while (this.completedTaskIds.size > 64) {
-            const oldest = this.completedTaskIds.values().next().value!;
-            if (oldest === taskId) break;
-            this.completedTaskIds.delete(oldest);
-          }
-          this.taskDone = true;
           const status = data['status'] as string | undefined;
           const exitCode = data['exitCode'] as number | undefined;
-          if (this.config.injectStatusLines !== false) {
-            this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
-          }
-          // Fetch final output from task-detail API (SSE has no output events
-          // for runner tasks) BEFORE firing the turn boundary: the boundary
-          // flushes queued follow-ups → currentTaskId flips to the next task →
-          // the stale guard would (correctly) drop THIS task's only report.
-          if (status === 'completed' || status === 'failed') {
-            void this.fetchAndEmitOutput(taskId)
-              .catch(() => { /* logged inside */ })
-              .finally(() => { this.taskDoneCb?.(); });
-          } else {
-            this.taskDoneCb?.();
-          }
+          this.completeTask(taskId, status, exitCode);
           // NOTE: task done does NOT trigger onExit — session stays alive
           // for follow-up messages. Only /close or unrecoverable errors exit.
           break;
@@ -1489,7 +2032,7 @@ export class RiffBackend implements SessionBackend {
     try {
       const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
       const headers: Record<string, string> = {};
-      const jwt = this.getJwt();
+      const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) return;
@@ -1521,7 +2064,7 @@ export class RiffBackend implements SessionBackend {
     try {
       const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
       const headers: Record<string, string> = {};
-      const jwt = this.getJwt();
+      const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
 
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });

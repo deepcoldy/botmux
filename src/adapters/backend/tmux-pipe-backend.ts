@@ -31,7 +31,7 @@ import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellLaunchArgv, TmuxBackend } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
@@ -83,6 +83,57 @@ export function composeSeedBody(
   return body + `\x1b[${cursor.y + 1};${cursor.x + 1}H`;
 }
 
+/** Pane input modes tmux tracks per pane but capture-pane cannot express.
+ *  A capture-pane seed carries screen cells only — the DECSET state that tells
+ *  the receiving xterm to REPORT mouse events (or use app cursor keys) is
+ *  gone, so a mouse-mode TUI (grok build: 1003+1006) never hears clicks from
+ *  a freshly-connected web client. */
+export interface PaneInputModes {
+  mouseStandard: boolean; // DECSET 1000 — press/release reporting
+  mouseButton: boolean;   // DECSET 1002 — 1000 + drag motion
+  mouseAll: boolean;      // DECSET 1003 — 1002 + any motion
+  mouseSgr: boolean;      // DECSET 1006 — SGR extended encoding
+  appCursorKeys: boolean; // DECSET 1 (DECCKM) — \x1bOA-style arrows
+  appKeypad: boolean;     // DECKPAM
+  cursorVisible: boolean; // DECTCEM — emit hide only (xterm default is visible)
+}
+
+/** Render {@link PaneInputModes} as the escape sequence that re-asserts them on
+ *  a fresh xterm. Appended AFTER the seed body: DECSET never moves the cursor,
+ *  so composeSeedBody's cursor restore stays intact. Exported for tests. */
+export function paneInputModeSeed(m: PaneInputModes): string {
+  let seq = '';
+  if (m.mouseStandard) seq += '\x1b[?1000h';
+  if (m.mouseButton) seq += '\x1b[?1002h';
+  if (m.mouseAll) seq += '\x1b[?1003h';
+  if (m.mouseSgr) seq += '\x1b[?1006h';
+  if (m.appCursorKeys) seq += '\x1b[?1h';
+  if (m.appKeypad) seq += '\x1b=';
+  if (!m.cursorVisible) seq += '\x1b[?25l';
+  return seq;
+}
+
+/** tmux display-message format string matching {@link parsePaneModeFlags}. */
+export const PANE_MODE_FLAGS_FORMAT =
+  '#{mouse_standard_flag} #{mouse_button_flag} #{mouse_all_flag} #{mouse_sgr_flag}'
+  + ' #{keypad_cursor_flag} #{keypad_flag} #{cursor_flag}';
+
+/** Parse the {@link PANE_MODE_FLAGS_FORMAT} output. Null on malformed output
+ *  (pane vanished mid-query → tmux prints an error line, not flags). */
+export function parsePaneModeFlags(out: string): PaneInputModes | null {
+  const f = out.trim().split(/\s+/);
+  if (f.length !== 7 || f.some(v => v !== '0' && v !== '1')) return null;
+  return {
+    mouseStandard: f[0] === '1',
+    mouseButton: f[1] === '1',
+    mouseAll: f[2] === '1',
+    mouseSgr: f[3] === '1',
+    appCursorKeys: f[4] === '1',
+    appKeypad: f[5] === '1',
+    cursorVisible: f[6] === '1',
+  };
+}
+
 /**
  * Spread lifecycle probes after a mass daemon restore. Workers are separate
  * processes, so a process-local mutex cannot prevent them all from hitting the
@@ -99,6 +150,7 @@ export function tmuxLifecycleInitialDelayMs(target: string): number {
 }
 
 export class TmuxPipeBackend implements SessionBackend {
+  readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
   private readonly paneTarget: string;
   private readonly fifoPath: string;
@@ -285,14 +337,14 @@ export class TmuxPipeBackend implements SessionBackend {
    * paste as a rapid input burst and swallows the trailing Enter as a soft
    * newline, stranding the message in the input box (it then gets submitted
    * by the *next* paste — the "replies to the previous message" off-by-one).
-   * NB: TmuxPipeBackend is the only backend used at runtime (see
-   * selectSessionBackend), so this is the path that actually matters.
+   * NB: this is the default/local tmux runtime backend path (see
+   * selectSessionBackend), not the only backend type in the repo.
    */
-  pasteText(text: string): void {
-    if (this.exited) return;
+  pasteText(text: string): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
-    this.guardedSend('paste-buffer', () => {
+    return this.guardedSend('paste-buffer', () => {
       let loaded = false;
       try {
         execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
@@ -617,6 +669,10 @@ export class TmuxPipeBackend implements SessionBackend {
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
     const shellSpec = resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
+    const script = shellWrapperScript(
+      resolveBotmuxWrapperBinDir(opts.env ?? process.env),
+      shellKindForPath(shellSpec.shell),
+    );
     execFileSync('tmux', [
       'new-session',
       '-d',
@@ -624,10 +680,11 @@ export class TmuxPipeBackend implements SessionBackend {
       '-x', String(opts.cols),
       '-y', String(opts.rows),
       '--',
-      ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
-      opts.cwd,
-      ...envAssignments,
-      bin, ...args,
+      ...shellCommandArgv(shellSpec, script, [
+        opts.cwd,
+        ...envAssignments,
+        bin, ...args,
+      ]),
     ], {
       cwd: opts.cwd,
       stdio: 'ignore',
@@ -673,6 +730,27 @@ export class TmuxPipeBackend implements SessionBackend {
    *  doesn't need this fix — applications write proper `\r\n`. */
   captureCurrentScreen(): string {
     return this.captureWithBounds('-S - -E -', { restoreCursor: true });
+  }
+
+  /** Escape sequence re-asserting the pane's live input modes (mouse tracking,
+   *  app cursor keys, cursor visibility) on a fresh web-terminal xterm. The
+   *  worker appends this to write-capable clients' capture-pane seed — without
+   *  it a mouse-mode TUI (grok build enables 1003+1006) never receives clicks,
+   *  so double-click-to-expand etc. silently do nothing in the web terminal.
+   *  Empty string when the pane is gone or tmux can't be queried. */
+  capturePaneInputModes(): string {
+    if (this.exited) return '';
+    try {
+      const out = execSync(
+        `tmux display-message -p -t ${shellescape(this.paneTarget)} ${shellescape(PANE_MODE_FLAGS_FORMAT)}`,
+        // Explicit stdio — see getChildPid for why default leaks tmux stderr.
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
+      );
+      const modes = parsePaneModeFlags(out);
+      return modes ? paneInputModeSeed(modes) : '';
+    } catch {
+      return '';
+    }
   }
 
   /** Snapshot ONLY the currently visible pane (no scrollback). Equivalent to
