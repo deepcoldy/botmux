@@ -19864,11 +19864,16 @@ async function handleThreadReplyAdmitted(
     //    consume when the selection forks — the merged repo-commit path reads
     //    pendingFollowUps, not the tail, so a non-raw picker follow-up must land
     //    there or it would be stranded at commit.
-    const pendingRepoOpeningExists = (ds.pendingPrompt?.trim().length ?? 0) > 0
-      || (ds.pendingAttachments?.length ?? 0) > 0
-      || !!ds.pendingRawInput;
-    if (ds.pendingRepo && !ds.repoScanInFlight && (!pendingRepoOpeningExists || ds.pendingRawInput)) {
-      const hasOpening = pendingRepoOpeningExists;
+    // Outside the async scan window, a pending-repo follower joins master's
+    // durable queued-activation tail (replayed by the worker pool once the
+    // repo-selected opening forks). Only DURING an in-flight scan
+    // (repoScanInFlight) do same-anchor turns buffer into pendingFollowUps and
+    // hold silently — the CLI has not forked yet, so there is no opening ACK to
+    // tail behind; those buffers are folded into the opening at commit.
+    if (ds.pendingRepo && !ds.repoScanInFlight) {
+      const hasOpening = (ds.pendingPrompt?.trim().length ?? 0) > 0
+        || (ds.pendingAttachments?.length ?? 0) > 0
+        || !!ds.pendingRawInput;
       ds.session.queued = true;
       if (!hasOpening) {
         // A bare /repo placeholder has no N yet. This inbound becomes the

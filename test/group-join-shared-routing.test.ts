@@ -483,10 +483,20 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       },
     );
 
-    expect(ds?.pendingFollowUps?.some(item => item.includes('继续补充约束'))).toBe(true);
+    // The card send failed but the session was already durably admitted with an
+    // opening, so a same-anchor follow-up joins master's durable queued-activation
+    // tail (replayed once the repo-selected opening forks) — not the legacy
+    // in-memory pendingFollowUps buffer. The follow-up is retained durably and no
+    // resend is advised (the turn is accepted, not dropped).
+    const tailHasFollowUp = (ds?.session.queuedActivationTail ?? []).some(
+      (entry: any) => typeof entry?.userPrompt === 'string' && entry.userPrompt.includes('继续补充约束'),
+    );
+    const followUpsHas = ds?.pendingFollowUps?.some(item => item.includes('继续补充约束')) ?? false;
+    expect(tailHasFollowUp || followUpsHas).toBe(true);
     const followUpRecovery = String(mocks.replyMessage.mock.calls.at(-1)?.[2]);
-    expect(followUpRecovery).toContain('/repo <项目名|路径>');
-    expect(followUpRecovery).not.toContain('上方卡片');
+    expect(followUpRecovery).not.toContain('系统错误');
+    // Durably admitted → the message is queued, not lost; never advise a resend.
+    expect(followUpRecovery).not.toContain('重新发送');
   });
 
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
