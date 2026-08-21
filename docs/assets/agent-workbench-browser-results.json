@@ -7,7 +7,7 @@
     "productionStoreExercised": false,
     "note": "生产 bundle 的端到端证据见 docs/assets/workbench-production-e2e-results.json"
   },
-  "head": "6efdd138262fb06fc50684745b55dc207f6f1a7d",
+  "head": "65d4d05ea852fb9314facd9539eec32c3c292b4e",
   "worktreeDirty": true,
   "headNote": "head 是跑这一轮时的 HEAD；worktreeDirty=true 表示工作区还有未提交改动（证据先于提交产生时的常态）",
   "fixtureBuild": {
@@ -29,39 +29,39 @@
   "scenarios": {
     "h5_success": {
       "ok": true,
-      "durationMs": 214
+      "durationMs": 228
     },
     "h5_failure": {
       "ok": true,
-      "durationMs": 60
+      "durationMs": 62
     },
     "h5_timeout": {
       "ok": true,
-      "durationMs": 81
+      "durationMs": 83
     },
     "h5_without_sdk": {
       "ok": true,
-      "durationMs": 54
+      "durationMs": 53
     },
     "workbench_route_switch_and_terminal_control": {
       "ok": true,
-      "durationMs": 595
+      "durationMs": 910
     },
     "workbench_failure": {
       "ok": true,
-      "durationMs": 286
+      "durationMs": 278
     },
     "unauthorized": {
       "ok": true,
-      "durationMs": 277
+      "durationMs": 268
     },
     "mobile_and_sidebar_layout": {
       "ok": true,
-      "durationMs": 452
+      "durationMs": 436
     },
     "dock_touch_view_token": {
       "ok": true,
-      "durationMs": 412
+      "durationMs": 384
     },
     "wide_touch_targets": {
       "ok": true,
@@ -69,27 +69,27 @@
     },
     "rail_collapsed_recovery": {
       "ok": true,
-      "durationMs": 1200
+      "durationMs": 1230
     },
     "mobile_preview_interaction": {
       "ok": true,
-      "durationMs": 437
+      "durationMs": 435
     },
     "preview_registration_and_proxy_boundaries": {
       "ok": true,
-      "durationMs": 171
+      "durationMs": 177
     },
     "preview_websocket": {
       "ok": true,
-      "durationMs": 137
+      "durationMs": 150
     },
     "terminal_disconnect_returns_readonly": {
       "ok": true,
-      "durationMs": 172
+      "durationMs": 173
     },
     "preview_idle_timeout_relocks": {
       "ok": true,
-      "durationMs": 118
+      "durationMs": 119
     }
   }
 }

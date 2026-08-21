@@ -550,6 +550,22 @@ try {
     assert.equal(await chatAnchor.getAttribute('rel'), 'noopener');
     assert.match(await chatAnchor.getAttribute('href') ?? '', /^https:\/\/applink\.feishu\.cn\/client\/chat\/open\?/);
     assert.deepEqual(await page.evaluate(() => window.__workbenchHarness?.sdkCalls), []);
+    // 行内「终端 / 接管」这两条**跨会话**与**降级**路径（#963 复审 P1-1、P1-2）：
+    // 面板标题栏那对按钮证明不了它们，回归时用户看到的正是「点另一行的终端，面板
+    // 直接没了」。
+    // ① A 的终端正接管着 → 点 B 行「终端」必须打开 B 的只读终端，不是关面板。
+    await rowAction(page, /Secondary session for route switching/, 'terminal');
+    await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
+    assert.equal(await page.locator('.wb-terminal-pane').count(), 1);
+    // ② 回到 A 重新接管，接管态点行内「终端」= 降为只读且面板还在（再点一次才关）。
+    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal-control');
+    await page.locator('.wb-mode-chip.is-controlled').waitFor();
+    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
+    assert.equal(await page.locator('.wb-terminal-pane').count(), 1);
+    // 接回写权限，下面那段既有断言从接管态开始。
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
+    await page.locator('.wb-mode-chip.is-controlled').waitFor();
     await page.locator('.wb-terminal-pane').getByRole('button', { name: '释放输入' }).click();
     await page.locator('.wb-mode-chip.is-readonly').waitFor();
     // 关掉面板，工作区收回，列表重新铺满。
