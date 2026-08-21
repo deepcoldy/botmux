@@ -11,6 +11,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir |
 | `/cd <path>` | Switch the working directory and restart the CLI process |
 | `/status` | View session info (uptime, terminal address, etc.) |
+| `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family / Codex terminal only) |

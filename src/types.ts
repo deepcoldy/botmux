@@ -174,6 +174,22 @@ export interface ReplyTargetEntry {
   participantsIncomplete?: boolean;
 }
 
+/** Record of the most recent failed/interrupted turn, persisted so `/retry`
+ *  can re-inject its exact CLI input. Written in the onTurnTerminal callback
+ *  (failed/ambiguous only); not cleared by new turn injection — only replaced
+ *  by a newer failed turn. */
+export interface FailedTurnRecord {
+  turnId: string;
+  userPrompt: string;
+  cliInput: string;
+  codexAppInput?: CodexAppTurnInput;
+  failedAt: string;        // ISO
+  errorCode?: string;
+  status: 'failed' | 'ambiguous';
+  retryCount: number;
+  lastRetryAt?: string;    // ISO
+}
+
 export interface Session {
   sessionId: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
@@ -511,6 +527,10 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** 最近一个失败或被中断的 turn 的记录，供 /retry 命令重注入。
+   *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
+   *  只被更新的失败 turn 覆盖。 */
+  lastFailedTurn?: FailedTurnRecord;
   /** Crash-safe Codex App accepted/prepared FIFO; daemon is the sole writer. */
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   /** Cumulative ACK boundary retained until a fresh runner retires the generation. */
