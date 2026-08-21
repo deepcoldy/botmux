@@ -49,6 +49,10 @@ import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRe
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
+import {
+  decodeTerminalWriteFrameSource,
+  terminalWriteFrame,
+} from './core/terminal-write-frame.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
@@ -15909,9 +15913,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // and read-only here. Tell the page what THIS socket actually got: it
       // stops forwarding input it knows will be dropped, and reports the truth
       // up to whatever embeds it (the Workbench terminal pane reads it to label
-      // the channel). OSC 1989 is the existing out-of-band channel on this
-      // stream; xterm swallows an unknown OSC, and the page strips it anyway.
-      try { ws.send(`\u001b]1989;write;${hasWrite ? 1 : 0}\u0007`); } catch { /* already closing */ }
+      // the channel).
+      //
+      // It used to ride the PTY byte stream as an OSC sequence, which the page
+      // then scanned for on EVERY frame — so any process running inside a
+      // read-only terminal could print the same bytes and flip the page's own
+      // write verdict (or DoS itself into read-only). It is now an out-of-band
+      // control frame that MUST be the first message on this socket, sent in the
+      // same synchronous tick that registered it: the page only ever decodes
+      // frame #1 of a connection as control, so PTY output can never be mistaken
+      // for it. Nothing awaits between `wsClients.add` above and this send.
+      try { ws.send(terminalWriteFrame(hasWrite)); } catch { /* already closing */ }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
       // delayed or bypassed, the worker independently removes any granted
@@ -16349,6 +16361,13 @@ var hasToken=${hasWrite};
 // wsHasWrite。两者会不一致——iOS WebView 的 WS 升级不带 Cookie，页面 HTTP 判可写、
 // WS 却只读，照抄 hasToken 就会让人对着一个不收字的终端打字。null = 还没连上。
 var wsHasWrite=null;
+// 「这条连接拿到什么权限」的解码器 —— 与 worker 侧同一份实现，原样嵌进来（这段页面
+// 代码住在模板字符串里，import 不进来，所以只能一份源码两处跑）。
+// 规则：只在**本连接的第一帧**上尝试，且要求整帧精确匹配。PTY 里跑的进程打出一模
+// 一样的字节也翻不动权限——它永远不可能是第一帧。
+var _wbDecodeWriteFrame=${decodeTerminalWriteFrameSource};
+// 本连接还没消费过首帧。每次 connect() 重置：上一条连接的结论套不到新连接上。
+var _wbFirstFrame=true;
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
@@ -16440,7 +16459,9 @@ try{
   if(_wbAo&&_wbAo.length&&_wbAo[0]&&_wbAo[0]!=='null')_wbParentOrigin=_wbAo[0];
 }catch(_e){}
 function _wbPostWrite(){
-  if(wsHasWrite===null||window.parent===window||!_wbParentOrigin)return;
+  if(window.parent===window||!_wbParentOrigin)return;
+  // wsHasWrite===null 也要上抛：那是「这条连接退回未知」的一次明确通知（重连开始时
+  // 发），嵌入方据此把上一条连接的结论清掉，而不是继续显示一个过期的判定。
   try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
 }
 function _wbSetWsWrite(v){
@@ -16449,10 +16470,10 @@ function _wbSetWsWrite(v){
   if(changed){
     var _wb=document.getElementById('readonly-banner');
     // 页面以为自己可写、这条连接其实只读：把只读横幅亮出来。反过来（连上后确认可写）
-    // 就把它收掉，别留一条与事实相反的提示。
+    // 就把它收掉，别留一条与事实相反的提示。null（未知）两边都不动：还没有依据。
     if(_wb&&!platformReadonly){
-      if(!v&&hasToken)_wb.classList.add('show');
-      else if(v)_wb.classList.remove('show');
+      if(v===false&&hasToken)_wb.classList.add('show');
+      else if(v===true)_wb.classList.remove('show');
     }
   }
   _wbPostWrite();
@@ -16745,6 +16766,10 @@ if(typeof ResizeObserver!=='undefined'){
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  // 新连接 = 新的一次鉴权。上一条连接拿到的权限说明不了这一条，先退回未知（并把这
+  // 个「未知」上抛给嵌入方），等这条连接自己的首帧说话。
+  _wbFirstFrame=true;
+  _wbSetWsWrite(null);
   // Force a resize on every (re)connect: clear the dedup memory first. On
   // reconnect the browser grid is usually unchanged, so without this the
   // dedup in sendResize() would suppress the resize — but a reconnect often
@@ -16754,10 +16779,15 @@ if(typeof ResizeObserver!=='undefined'){
   // (status-line update bleeds into the line below). Always re-assert size.
   ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
+    // 带外控制帧只可能是**本连接的第一帧**，而且必须整帧精确匹配（见页面顶部
+    // _wbDecodeWriteFrame 那段注释）。首帧一旦消费掉，这条连接上之后的每一个字节
+    // 就都只是 PTY 输出 —— 里面的进程再怎么打印控制帧的字面量也翻不动权限。
+    if(_wbFirstFrame){
+      _wbFirstFrame=false;
+      var _ctl=_wbDecodeWriteFrame(e.data,true);
+      if(_ctl!==null){_wbSetWsWrite(_ctl);return;}
+    }
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
-    // 这条连接实际拿到的权限（worker 在握手完成时发的第一条）。剥掉再交给 xterm。
-    var _wsW=data.match(/\x1b\]1989;write;([01])\x07/);
-    if(_wsW){data=data.replace(_wsW[0],'');_wbSetWsWrite(_wsW[1]==='1');}
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
     // mostly-overlapping full screen. Preserve the reader's anchor when older
     // rows were prepended; otherwise preserve their current position/follow.
