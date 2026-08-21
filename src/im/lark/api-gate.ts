@@ -350,6 +350,10 @@ export async function executeWithLarkGate<T>(
       circuit.status = 'half-open';
     }
     await acquireToken(larkAppId, op, cfg, signal);
+    // acquireToken 的 await 会让出事件循环——调用方的 abort() 可能在这期间
+    // 到达。此处必须复查：已 aborted 的 signal 上后注册的监听不会触发，
+    // 不提前抛出会让 fn 内的请求永远挂起。
+    if (signal?.aborted) throw gateAbortError(signal);
     try {
       const result = await fn();
       circuit.consecutiveFailures = 0;
