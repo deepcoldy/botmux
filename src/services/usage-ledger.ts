@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from '../core/cost-calculator.js';
+import { estimateCostCny, type ResolvedModelPricing } from './model-pricing.js';
 import type { DaemonSession } from '../core/types.js';
 
 export type InputTokenSemantics = 'includes_cache' | 'uncached';
@@ -59,6 +60,9 @@ export interface UsageLedgerRecord {
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   totalCacheCreateTokens: number;
+  /** 人民币估算金额（delta 口径，按模型定价表折算）。缺省 = 未定价/未知
+   *  模型或未接定价，绝非 0——消费方必须按字段存在性判断。 */
+  costCny?: number;
 }
 
 export interface RecordSessionUsageArgs {
@@ -71,6 +75,8 @@ export interface RecordSessionUsageArgs {
   title?: string;
   workingDir?: string;
   callerOpenId?: string;
+  /** 定价覆盖（按 bot 解析后的结果）；缺省时走进程级 pricingResolver。 */
+  pricing?: ResolvedModelPricing;
   /** Injectable for tests; defaults to wall clock. */
   now?: Date;
   /** Injectable for tests; defaults to ~/.botmux/usage (BOTMUX_USAGE_DIR overrides). */
@@ -104,6 +110,28 @@ const sessionBaselineMemory = new Map<string, SessionBaseline | null>();
 export function __resetUsageLedgerMemoryForTest(): void {
   sessionBaselineMemory.clear();
   ownershipWritten.clear();
+  pricingResolver = null;
+  recordSink = null;
+}
+
+// ─── Cost governance seams ───────────────────────────────────────────────────
+// 进程级注册缝，由 daemon 启动段接线：pricingResolver 把 larkAppId 解析成
+// bot 的定价配置（bots.json pricing 块 → 内置表），recordSink 在每条正
+// delta 记录成功落盘后被动喂给预算累加器（budget-tracker）。默认都不接
+// 线，ledger 行为与之前完全一致；sink 内异常被 catch，绝不影响主路径。
+
+export type UsageLedgerPricingResolver = (larkAppId?: string) => ResolvedModelPricing | undefined;
+export type UsageLedgerRecordSink = (record: UsageLedgerRecord) => void;
+
+let pricingResolver: UsageLedgerPricingResolver | null = null;
+let recordSink: UsageLedgerRecordSink | null = null;
+
+export function setUsageLedgerPricingResolver(resolver: UsageLedgerPricingResolver | null): void {
+  pricingResolver = resolver;
+}
+
+export function setUsageLedgerRecordSink(sink: UsageLedgerRecordSink | null): void {
+  recordSink = sink;
 }
 
 /** Ownership markers already written by this process (recordId-keyed). */
@@ -347,6 +375,11 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       return null;
     }
 
+    // 金额估算：显式 args.pricing 优先，否则问进程级 resolver（daemon 按
+    // bot 接线）。未定价模型 / 无 pricing → null（fail-closed，绝不猜价）。
+    const pricing = args.pricing ?? pricingResolver?.(args.larkAppId);
+    const costCny = pricing ? estimateCostCny(cur, pricing) : null;
+
     const record: UsageLedgerRecord = {
       v: 2,
       inputTokenSemantics: 'uncached',
@@ -370,6 +403,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       totalOutputTokens: cur.outputTokens,
       totalCacheReadTokens: cur.cacheReadTokens,
       totalCacheCreateTokens: cur.cacheCreateTokens,
+      ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
     };
 
     // Append first, then advance the baseline: a crash in between replays the
@@ -380,6 +414,15 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
     state.sessions[args.sessionId] = baseline;
     saveState(dir, args.larkAppId, state, now);
+    // 预算累加缝：仅正 delta 记录成功落盘后触发一次；ownership marker 与
+    // anchor 不经此路。sink 异常被 catch，绝不影响 ledger 主路径。
+    if (recordSink) {
+      try {
+        recordSink(record);
+      } catch (err: any) {
+        logger.warn(`usage-ledger: record sink failed: ${err?.message ?? err}`);
+      }
+    }
     return record;
   } catch (err: any) {
     // The ledger must never take the daemon down with it.
