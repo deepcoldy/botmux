@@ -6,6 +6,7 @@ import {
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
 } from './global-config.js';
+import { resolveLarkGateConfig, type LarkGateConfig } from './im/lark/api-gate.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
 function getLocalIp(): string {
@@ -310,6 +311,8 @@ export const config = {
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
+  // Live getter: re-reads env on each access so a restart isn't needed to tune QPS.
+  get larkGate(): LarkGateConfig { return resolveLarkGateConfig(); },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup
