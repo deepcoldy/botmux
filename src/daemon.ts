@@ -96,6 +96,7 @@ import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -17386,6 +17387,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
 
+  // 语音消息转写：下载 opus → ASR → 用转写文本替换 '[语音]' 占位符。
+  // 必须在 followupContent 之前——命令识别、标题生成、会话创建都读它。
+  // 转写失败（未配置/下载失败/空结果）已回复用户，直接返回不留孤儿会话。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
+
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
@@ -18758,6 +18778,24 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+
+  // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
+  // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      parsed.messageId ?? ctx.messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, anchor, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
 
   // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
   // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
