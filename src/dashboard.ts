@@ -29,6 +29,7 @@ import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connecti
 import { createDashboardEventsStream, type DashboardEventAudience } from './dashboard/events-sse.js';
 import {
   ControlCsrfTokens,
+  classifyManagementUpgrade,
   guardControlRequest,
   injectControlCsrfMeta,
   managementUpgradeOrigin,
@@ -6782,7 +6783,12 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
     // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
     // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
-    const upgradeOrigin = managementUpgradeOrigin(req.headers);
+    //
+    // 判之前**先按 path 分流**可信来源档位：会话终端 `/s/*` 认平台 `m-`+`t-`（分享
+    // 出去的终端页就住在 `t-`），而 `/debug-terminal/*` 的另一头是宿主裸 bash，只认
+    // management 档。合在一起判的话，`t-` 就连带成了裸 bash 那条 WS 的可信 Origin。
+    const upgradeRoute = classifyManagementUpgrade(rawUrl);
+    const upgradeOrigin = managementUpgradeOrigin(req.headers, upgradeRoute.surface);
     if (!upgradeOrigin.ok) {
       const body = JSON.stringify({ ok: false, error: upgradeOrigin.error });
       clientSocket.end([
@@ -6797,7 +6803,7 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
       return;
     }
     // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
-    if (rawUrl.startsWith('/debug-terminal/')) {
+    if (upgradeRoute.route === 'debug-terminal') {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;

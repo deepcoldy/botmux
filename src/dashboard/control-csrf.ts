@@ -25,6 +25,8 @@
  * upgrade 不经 HTTP 门禁，浏览器对 WS 握手 **一定** 带 `Origin`，所以「带了但对
  * 不上（含 `null`）」一律拒；完全不带 Origin 的是非浏览器客户端（本身就拿不到
  * 浏览器 cookie，不构成 CSRF），放行以免打断本机 CLI / 探针。
+ * 两条升级路径的可信来源**不一样宽**，先用 {@link classifyManagementUpgrade} 按 path
+ * 分流再判：`/s/*` 认平台 `m-`+`t-`，`/debug-terminal/*` 只认 management 档。
  * 注意 Preview 自身的 WS 是不透明来源（`Origin: null`），它走 preview 专用路径
  * 的路径内凭据校验，**不能**用本函数误杀——调用方必须在 preview 分支之后再调。
  */
@@ -262,22 +264,60 @@ export function refererMatchesHost(headers: ControlRequestHeadersLike): boolean 
   return originMatchesHost(origin, requestAuthorities(headers, 'management'));
 }
 
+/** 本进程会受理的两类管理类 WS 升级，外加「都不是」。 */
+export type ManagementUpgradeRoute = 'session-terminal' | 'debug-terminal' | 'unknown';
+
+export interface ManagementUpgradeClassification {
+  route: ManagementUpgradeRoute;
+  /** 该路径允许把哪一档平台子域算作同源（见 {@link platformBrowserAuthorities}）。 */
+  surface: PlatformBrowserSurface;
+}
+
+/**
+ * 按升级请求的 **path** 决定「这条 WS 的可信来源有多宽」。
+ *
+ * 两条路径的另一头根本不是一个东西，信任面不该共用：
+ *  - `/s/<sessionId>`：会话终端。页面被平台分享出去时住在 `t-<machineId>` 子域，
+ *    它的握手 Origin 就是 `t-`，所以这一档必须认 `m-` + `t-`（#933/#960 修的正是
+ *    这条，缺了它平台浏览器终端整片 disconnected）。写权限另有 `?token=` 与 worker
+ *    侧的 write-auth 把关，认这条 Origin 不等于给写。
+ *  - `/debug-terminal/<id>/ws`：**宿主裸 bash**，只有本机管理壳页会开它。它的可信
+ *    来源就该跟 `/api/debug-terminal` 的 HTTP 门禁一样窄——management 档（`m-` /
+ *    本机 Host / `BOTMUX_PUBLIC_URL`），`t-` 一律不算。
+ *
+ * 未识别的路径落窄档并标 `unknown`：调用方本来就会把它 destroy，这里只是保证
+ * 「漏加一条前缀」的失败方向是「连不上」，而不是静默把 `t-` 认成同源。
+ */
+export function classifyManagementUpgrade(rawUrl: string): ManagementUpgradeClassification {
+  const pathname = (rawUrl || '/').split(/[?#]/)[0];
+  if (pathname === '/s' || pathname.startsWith('/s/')) {
+    return { route: 'session-terminal', surface: 'terminal-upgrade' };
+  }
+  if (pathname.startsWith('/debug-terminal/')) {
+    return { route: 'debug-terminal', surface: 'management' };
+  }
+  return { route: 'unknown', surface: 'management' };
+}
+
 /**
  * 管理类 WebSocket 升级的 Origin 判定（terminal / debug-terminal）。
  * 带 Origin 就必须同源（`null` 也算带了，直接拒）；不带 Origin 视为非浏览器客
  * 户端放行。Preview 自身的 WS 不走这里，见文件头注释。
+ *
+ * `surface` 由调用方按 path 分流后给（{@link classifyManagementUpgrade}）。缺省是
+ * **窄档**：漏传参数只会把平台终端子域挡在门外（响、一眼可辨），不会反过来把裸
+ * bash 那条 WS 的可信来源悄悄放宽。
  */
-export function managementUpgradeOrigin(headers: ControlRequestHeadersLike):
-  { ok: true } | { ok: false; error: 'upgrade_origin_forbidden' } {
+export function managementUpgradeOrigin(
+  headers: ControlRequestHeadersLike,
+  surface: PlatformBrowserSurface = 'management',
+): { ok: true } | { ok: false; error: 'upgrade_origin_forbidden' } {
   const origin = headerValue(headers.origin);
   if (origin === undefined) return { ok: true };
-  // 终端页挂在平台的 `t-` 子域下，它的 WS 握手 Origin 就是 `t-`：这一档必须认，
-  // 否则平台浏览器终端整片 disconnected（#933/#960）。管理类 POST 不走这里，也就
-  // 不会跟着一起把 `t-` 认成可发起写操作的同源。
-  if (originMatchesHost(origin, requestAuthorities(headers, 'terminal-upgrade'))) return { ok: true };
+  if (originMatchesHost(origin, requestAuthorities(headers, surface))) return { ok: true };
   // WS 握手被拒最难查：浏览器拿不到 403 的状态码与响应体，页面只会显示「连不
   // 上」，workbench-doctor 的探测同样说不出原因。日志是唯一的线索。
-  warnForeignOrigin('WebSocket 升级', origin, headers, 'terminal-upgrade');
+  warnForeignOrigin('WebSocket 升级', origin, headers, surface);
   return { ok: false, error: 'upgrade_origin_forbidden' };
 }
 

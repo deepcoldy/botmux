@@ -19,6 +19,7 @@ vi.mock('../src/platform/secure-host-file.js', () => ({
 import { platformBrowserAuthorities } from '../src/platform/binding.js';
 import {
   ControlCsrfTokens,
+  classifyManagementUpgrade,
   guardControlRequest,
   managementUpgradeOrigin,
 } from '../src/dashboard/control-csrf.js';
@@ -85,7 +86,8 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
       origin: `https://t-${MACHINE_ID}.botmux.example.com`,
       host: '127.0.0.1:7891', // 平台隧道裸桥接后 daemon 看到的 Host
       // 注意：无 x-forwarded-host —— 正是线上的实况
-    });
+      // surface 必须显式给 `terminal-upgrade`：这一档才含 `t-`，而缺省是窄档。
+    }, 'terminal-upgrade');
     expect(verdict.ok).toBe(true);
   });
 
@@ -94,7 +96,7 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
     const verdict = managementUpgradeOrigin({
       origin: `https://m-${MACHINE_ID}.botmux.example.com`,
       host: '127.0.0.1:7891',
-    });
+    }, 'terminal-upgrade');
     expect(verdict.ok).toBe(true);
   });
 
@@ -103,7 +105,7 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
     const verdict = managementUpgradeOrigin({
       origin: `https://t-${MACHINE_ID}.botmux.example.com`,
       host: '127.0.0.1:7891',
-    });
+    }, 'terminal-upgrade');
     expect(verdict.ok).toBe(false);
   });
 
@@ -112,7 +114,7 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
     const verdict = managementUpgradeOrigin({
       origin: 'https://t-deadbeefdeadbeef.botmux.example.com',
       host: '127.0.0.1:7891',
-    });
+    }, 'terminal-upgrade');
     expect(verdict.ok).toBe(false);
   });
 
@@ -121,8 +123,67 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
     const verdict = managementUpgradeOrigin({
       origin: `https://t-${MACHINE_ID}.evil.example.com`,
       host: '127.0.0.1:7891',
-    });
+    }, 'terminal-upgrade');
     expect(verdict.ok).toBe(false);
+  });
+});
+
+/**
+ * 独立安全边界：WS 升级过去在「这是 /s 还是 /debug-terminal」分流**之前**就统一按
+ * `terminal-upgrade` 档跑同源判定，于是平台分享出去的终端子域 `t-` 连带成了调试终端
+ * WS 的可信来源——而那条 WS 的另一头是宿主的裸 bash。两条路径的信任面本来就不同：
+ *   • `/s/<id>`：终端页住在 `t-`，必须继续认 m-+t-（否则平台浏览器终端整片断线）；
+ *   • `/debug-terminal/<id>/ws`：只有管理壳页会开它，只认 management 档（m- / 本机 Host）。
+ * 未知升级路径同样落窄档：漏加一条前缀的失败方向是「连不上」，而不是静默放行。
+ */
+describe('WS 升级按 path 分流 authority 档位（调试终端不认 t-）', () => {
+  it('/s/<id> 落 terminal-upgrade 档，/debug-terminal/<id>/ws 落 management 档', () => {
+    expect(classifyManagementUpgrade('/s/s1?token=abc'))
+      .toEqual({ route: 'session-terminal', surface: 'terminal-upgrade' });
+    expect(classifyManagementUpgrade('/s'))
+      .toEqual({ route: 'session-terminal', surface: 'terminal-upgrade' });
+    expect(classifyManagementUpgrade('/debug-terminal/xyz/ws'))
+      .toEqual({ route: 'debug-terminal', surface: 'management' });
+  });
+
+  it('未知升级路径落窄档且标 unknown（fail-closed，不给平台 t- 背书）', () => {
+    expect(classifyManagementUpgrade('/whatever'))
+      .toEqual({ route: 'unknown', surface: 'management' });
+    // 前缀相近但不是终端路径：`/sneaky` 不能被 `/s` 前缀匹配吃掉。
+    expect(classifyManagementUpgrade('/sneaky/ws'))
+      .toEqual({ route: 'unknown', surface: 'management' });
+  });
+
+  it('缺省 surface 是窄档：调用方漏传参数也不会把 t- 放进候选', () => {
+    bindTo('https://botmux.example.com');
+    expect(managementUpgradeOrigin({
+      origin: `https://t-${MACHINE_ID}.botmux.example.com`,
+      host: '127.0.0.1:7891',
+    })).toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+  });
+
+  it('平台 t- 终端子域：/s 升级仍放行（不回退 #960），/debug-terminal 升级被拒', () => {
+    bindTo('https://botmux.example.com');
+    const headers = {
+      origin: `https://t-${MACHINE_ID}.botmux.example.com`,
+      host: '127.0.0.1:7891',
+    };
+    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/s/s1').surface))
+      .toEqual({ ok: true });
+    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/debug-terminal/t1/ws').surface))
+      .toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+  });
+
+  it('平台 m- 机器子域：两条路径都放行（管理壳页本来就住在 m-）', () => {
+    bindTo('https://botmux.example.com');
+    const headers = {
+      origin: `https://m-${MACHINE_ID}.botmux.example.com`,
+      host: '127.0.0.1:7891',
+    };
+    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/s/s1').surface))
+      .toEqual({ ok: true });
+    expect(managementUpgradeOrigin(headers, classifyManagementUpgrade('/debug-terminal/t1/ws').surface))
+      .toEqual({ ok: true });
   });
 });
 
