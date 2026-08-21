@@ -687,6 +687,12 @@ function joinPostNodeText(parts: string[]): string {
   return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+/** Placeholder for inbound voice messages. The daemon's audio-transcribe hook
+ *  replaces it with the ASR transcript (prefixed) before the turn is
+ *  dispatched; paths the hook doesn't cover still get this safe placeholder
+ *  instead of the raw {"file_key":...} JSON. */
+export const AUDIO_PLACEHOLDER = '[语音]';
+
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
     if (msgType === 'text') {
@@ -724,6 +730,11 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
         return '[文件]';
       }
     }
+    if (msgType === 'audio') {
+      // 语音消息的转写在 daemon 的 audio-transcribe hook 里完成（下载 opus →
+      // ASR → 带前缀文本）；这里只给占位符，避免原始 JSON 注入 CLI。
+      return AUDIO_PLACEHOLDER;
+    }
     if (msgType === 'interactive') {
       return extractCardContent(rawContent, numberer);
     }
@@ -733,6 +744,26 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
     return rawContent;
   } catch {
     return rawContent;
+  }
+}
+
+/**
+ * Extract the download key from an inbound audio message's raw content
+ * (`{"file_key":"...","duration":<ms>}`). Returns null when the content isn't
+ * valid JSON or carries no usable file_key — callers should treat that as a
+ * permanent failure (reply, don't retry). `duration` is optional and surfaced
+ * as durationMs for callers that want to log/skip overlong clips.
+ */
+export function extractAudioMeta(rawContent: string): { fileKey: string; durationMs?: number } | null {
+  try {
+    const parsed = JSON.parse(rawContent);
+    if (!parsed || typeof parsed.file_key !== 'string' || !parsed.file_key) return null;
+    return {
+      fileKey: parsed.file_key,
+      ...(typeof parsed.duration === 'number' ? { durationMs: parsed.duration } : {}),
+    };
+  } catch {
+    return null;
   }
 }
 

@@ -289,14 +289,15 @@ export interface DashboardGlobalConfig {
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
- *  recognizable engine or engine-specific creds. Deep validation (usable
- *  creds) happens in resolveVoiceConfig; here we just gate obvious garbage. */
+ *  recognizable engine or engine-specific creds (TTS) / an asr block. Deep
+ *  validation (usable creds / enabled) happens in resolveVoiceConfig /
+ *  resolveAsrConfig; here we just gate obvious garbage. */
 function readVoice(raw: unknown): VoiceConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === undefined;
   if (!engineOk) return undefined;
-  if (!v.sami && !v.openai && !v.engine) return undefined;
+  if (!v.sami && !v.openai && !v.engine && !v.asr) return undefined;
   return v as VoiceConfig;
 }
 

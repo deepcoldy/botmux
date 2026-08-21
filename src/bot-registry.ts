@@ -2862,8 +2862,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
-    // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
+    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
+    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
+    // resolveAsrConfig 做，这里只挡明显垃圾。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
@@ -2877,7 +2878,16 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
-        if (v.engine || v.sami || v.openai || v.speaker) voice = v;
+        const a = (rawVoice as any).asr;
+        if (a && typeof a === 'object') v.asr = {
+          enabled: a.enabled === true,
+          baseUrl: typeof a.baseUrl === 'string' ? a.baseUrl : undefined,
+          apiKey: typeof a.apiKey === 'string' ? a.apiKey : undefined,
+          model: typeof a.model === 'string' ? a.model : undefined,
+          ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
+          ...(typeof a.language === 'string' ? { language: a.language } : {}),
+        };
+        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
       }
     }
 
