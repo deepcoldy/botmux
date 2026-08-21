@@ -28585,9 +28585,9 @@ button.skills-issue-badge:hover {
 /* 末尾那句「⋯ 菜单」是补充说明，压一号字，别和上面的正文抢注意力 */
 .wb-ws-blocked p:last-of-type { font-size: 11px; }
 
-/* 控制权状态未知（接管/释放没拿到回执，复核 GET 还没回来）时盖在 iframe 上。
-   它不是提示而是**闸门**：这块终端可能仍然可写，盲输入会真的打进去。所以要不
-   透明、要吃掉指针事件，复核一回来就撤。 */
+/* 控制权状态未知（回执丢了、首屏读不到）时**顶替**终端 iframe 的那一屏——不是盖在
+   它上面：盖层只吃指针事件，焦点已经在 iframe 里时键盘照旧打得进去（真实 Chromium
+   里量过）。所以 TSX 那边直接不挂 iframe，这里铺满整块画布区，复核一回来就撤。 */
 .wb-control-unknown {
   position: absolute;
   inset: 0;

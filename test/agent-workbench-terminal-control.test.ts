@@ -183,7 +183,10 @@ async function openAndTakeOver(
 
 /** 直接挂一块终端面板（不经过工作台外壳）：要拨 15 秒轮询的表时，外壳里的其它
  *  定时器只会添乱。挂完先把首屏 GET 走完，返回时面板已经有权威读数。 */
-async function renderPane(api: WorkbenchApi): Promise<TestRenderer.ReactTestRenderer> {
+async function renderPane(
+  api: WorkbenchApi,
+  options?: TestRenderer.TestRendererOptions,
+): Promise<TestRenderer.ReactTestRenderer> {
   let renderer!: TestRenderer.ReactTestRenderer;
   await act(async () => {
     renderer = TestRenderer.create(React.createElement(TerminalPane, {
@@ -193,7 +196,7 @@ async function renderPane(api: WorkbenchApi): Promise<TestRenderer.ReactTestRend
       capabilities: FULL_CAPABILITIES,
       now: NOW,
       location: LOCATION,
-    }));
+    }), options);
   });
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   return renderer;
@@ -246,6 +249,14 @@ function feedback(renderer: TestRenderer.ReactTestRenderer): string {
 function maskShown(renderer: TestRenderer.ReactTestRenderer): boolean {
   return renderer.root.findAll(node =>
     String(node.props.className ?? '').includes('wb-control-unknown')).length > 0;
+}
+
+/** 此刻页面上还挂着几块终端 iframe。未知态的判据不是「有没有盖一层」，而是
+ *  「那块可能可写的 iframe 还在不在」——盖层挡得住鼠标，挡不住已经聚焦在 iframe
+ *  里的键盘。 */
+function terminalFrames(renderer: TestRenderer.ReactTestRenderer): number {
+  return renderer.root.findAll(node => node.type === 'iframe'
+    && String(node.props.className ?? '').includes('wb-pane-frame')).length;
 }
 
 /** 有状态的租约替身：接管/释放真的改变后续 getTerminalControl 的读数，并把服务端
@@ -873,6 +884,75 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     expect(worker).toContain('var hasToken=${hasWrite}');
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('{ hasToken?: unknown }');
+  });
+});
+
+// ─── ⑤ 未知态：不是盖一层，而是把可能可写的 iframe 卸掉 ──────────────────────
+describe('控制权未知时把可能可写的 iframe 卸掉，而不是只盖一层', () => {
+  /**
+   * 真实 Chromium 里量过的形状：焦点已经在 iframe 内部时，父文档往上盖一个
+   * `position:absolute` 的层**不会**把焦点抢走——盖层只吃指针事件，键盘照旧打进
+   * 终端。所以未知态必须把 iframe 从 DOM 里拿掉（焦点随之回到 document.body），
+   * 盖层再顺手把焦点收到自己身上做兜底。
+   */
+  it('释放失败进未知 → iframe 从 DOM 里消失，复核收敛后才重新挂上', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = leaseApi({ hold: 'release' });
+    const renderer = await renderPane(lease.api);
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(terminalFrames(renderer)).toBe(1);
+
+    lease.gate.hold();
+    await act(async () => {
+      paneControl(renderer, '释放输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      lease.held.reject(new WorkbenchApiError(500, 'terminal_unavailable'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(maskShown(renderer)).toBe(true);
+    // 回归的形状：iframe 还在，盖层只是浮在它上面，键盘照旧能打进去。
+    expect(terminalFrames(renderer)).toBe(0);
+
+    await act(async () => {
+      lease.gate.open();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(maskShown(renderer)).toBe(false);
+    expect(terminalFrames(renderer)).toBe(1);
+    act(() => renderer.unmount());
+  });
+
+  it('遮罩自己可以获得焦点（tabIndex=-1 + 挂载即 focus），作为焦点兜底', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const focused: string[] = [];
+    const offline: WorkbenchApi = {
+      ...baseApi,
+      getTerminalControl: async () => { throw new WorkbenchApiError(503, 'daemon_offline'); },
+    };
+    const renderer = await renderPane(offline, {
+      createNodeMock: (element: { type: unknown; props: Record<string, unknown> }) => (
+        String((element.props as { className?: string }).className ?? '').includes('wb-control-unknown')
+          ? { focus: () => focused.push('mask') }
+          : null
+      ),
+    });
+    await settle();
+    expect(maskShown(renderer)).toBe(true);
+    const mask = renderer.root.findAll(node =>
+      String(node.props.className ?? '').includes('wb-control-unknown'))[0];
+    expect(mask.props.tabIndex).toBe(-1);
+    expect(focused).toEqual(['mask']);
+    act(() => renderer.unmount());
   });
 });
 

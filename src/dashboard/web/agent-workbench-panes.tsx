@@ -271,6 +271,37 @@ async function withWriteTimeout<T>(
  *  调用方为了一个类型再多认一个模块。 */
 export type { TerminalPaneControlMode };
 
+/**
+ * 控制权未知时顶替终端 iframe 的那一屏。
+ *
+ * 它**不是**盖在 iframe 上的一层提示，而是把 iframe 整个换掉：真实 Chromium 里量
+ * 过——焦点已经落在 iframe 内部时，父文档往上盖一个 `position:absolute` 的层只吃
+ * 得到指针事件，`keyboard.type` 照旧一个字不落地打进终端。要真的挡住盲输入，只有
+ * 让那块可能可写的 iframe 从 DOM 里消失（焦点随之回到 document.body）。
+ *
+ * 自己再收一次焦点是兜底：将来若有调用方出于别的理由把 iframe 留着，至少焦点先
+ * 离开它；对读屏用户来说，这一屏也确实是此刻该被读出来的东西。
+ */
+function TerminalControlUnknown(props: { onRetry(): void }): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    try { ref.current?.focus?.(); } catch { /* 没有 DOM 的宿主（SSR / 组件测试） */ }
+  }, []);
+  return (
+    <div
+      ref={ref}
+      tabIndex={-1}
+      className="wb-pane-empty wb-control-unknown"
+      role="status"
+    >
+      <span aria-hidden="true">◇</span>
+      <strong>控制权状态未知</strong>
+      <p>没有拿到确认，这块终端可能仍然可写。已断开终端画面挡住输入，正在重新确认。</p>
+      <button type="button" onClick={props.onRetry}>立即重试</button>
+    </div>
+  );
+}
+
 export function TerminalPane(props: PaneCommonProps & {
   location: WorkbenchTerminalLocation | null;
   /** 这块面板是按哪个意图挂起来的，**两态**：
@@ -594,22 +625,25 @@ export function TerminalPane(props: PaneCommonProps & {
           <>
             {/* 手机端和桌面走同一条直嵌路径，不做任何 transform 缩放：iOS WKWebView 对被
                 缩放的 iframe 内 canvas/WebGL 有不渲染的合成缺陷，终端会整片空白。终端页
-                自身会按 iframe 的实际宽度 fit 出列数，窄屏直嵌即可正常显示。 */}
-            <iframe
-              key={frameKey}
-              ref={frameRef}
-              className="wb-pane-frame"
-              src={frameUrl}
-              title={`终端 — ${workbenchSessionTitle(props.session)}`}
-              allow="clipboard-read; clipboard-write"
-              referrerPolicy="no-referrer"
-              onLoad={onFrameLoad}
-            />
+                自身会按 iframe 的实际宽度 fit 出列数，窄屏直嵌即可正常显示。
+                控制权未知时这块 iframe 直接不挂：盖一层挡不住已经聚焦在里面的键盘。 */}
+            {masked ? null : (
+              <iframe
+                key={frameKey}
+                ref={frameRef}
+                className="wb-pane-frame"
+                src={frameUrl}
+                title={`终端 — ${workbenchSessionTitle(props.session)}`}
+                allow="clipboard-read; clipboard-write"
+                referrerPolicy="no-referrer"
+                onLoad={onFrameLoad}
+              />
+            )}
             {/* iframe 加载得出来、里面的实时通道却始终连不上（iOS 会拦掉 http 页里的
                 ws://）。这时终端区域只会是一片黑，与其让人对着黑屏猜，不如直说，并给一条
                 能自己走通的路。覆盖层盖在 iframe 上而不是替换它：页面自身一直在重连，
                 连上后这层会自动撤掉。 */}
-            {frameWatch.blocked ? (
+            {frameWatch.blocked && !masked ? (
               <div className="wb-pane-empty wb-ws-blocked" role="status">
                 <span aria-hidden="true">⚠</span>
                 <strong>终端实时连接未建立</strong>
@@ -618,17 +652,10 @@ export function TerminalPane(props: PaneCommonProps & {
                 <p>飞书内可通过右上角 ⋯ 菜单选择「在浏览器打开」。</p>
               </div>
             ) : null}
-            {/* 控制权状态未知、而这块 iframe 可能仍然可写（接管/释放的回执丢了）：
-                盖住它。乐观说一句「只读」再放任键盘打进去，是这轮复审里最实在的一
-                条风险；盖上之后复核 GET 一回来就撤（P1-3）。 */}
-            {masked ? (
-              <div className="wb-pane-empty wb-control-unknown" role="status">
-                <span aria-hidden="true">◇</span>
-                <strong>控制权状态未知</strong>
-                <p>刚才的接管 / 释放没有拿到确认，这块终端可能仍然可写。正在重新确认，确认前先挡住输入。</p>
-                <button type="button" onClick={() => void observe('reconcile')}>立即重试</button>
-              </div>
-            ) : null}
+            {/* 控制权状态未知、而这块 iframe 可能仍然可写（回执丢了、首屏读不到）：
+                把它换掉。乐观说一句「只读」再放任键盘打进去，是这轮复审里最实在的
+                一条风险；复核 GET 一回来 iframe 就重新挂上（P1-3）。 */}
+            {masked ? <TerminalControlUnknown onRetry={() => void observe('reconcile')} /> : null}
           </>
         ) : (touch || !props.authenticated) && !externalTerminalUrl && terminalUrl ? (
           // A terminal exists, we just have no credential for it yet. Say so
