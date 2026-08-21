@@ -15,7 +15,7 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 }));
 
 import { getSessionTokenUsage } from '../src/core/cost-calculator.js';
-import { composeRowFromActive, composeRowFromClosed } from '../src/core/dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 
 function makeDs(): DaemonSession {
   return {
@@ -83,5 +83,27 @@ describe('dashboard SessionRow token usage', () => {
       status: 'closed',
       createdAt: new Date(1000).toISOString(),
     }).chatType).toBe('group');
+  });
+
+  it('exposes a direct topic link only from a persisted native omt id', () => {
+    const active = makeDs();
+    active.session.scope = 'thread';
+    active.session.larkThreadId = 'omt_topic';
+    expect(composeRowFromActive(active).feishuThreadLink).toContain('/client/thread/open?');
+    expect(composeRowFromActive(active).feishuThreadLink).toContain('open_thread_id=omt_topic');
+
+    const persisted = { ...active.session, status: 'active' as const };
+    expect(composeRowFromPersistedActive(persisted).feishuThreadLink).toContain('open_thread_id=omt_topic');
+    const closed = { ...active.session, status: 'closed' as const };
+    expect(composeRowFromClosed(closed).feishuThreadLink).toContain('open_thread_id=omt_topic');
+
+    const legacy = makeDs();
+    legacy.session.scope = 'thread';
+    expect(composeRowFromActive(legacy).feishuThreadLink).toBeUndefined();
+
+    const corrupt = makeDs();
+    corrupt.session.scope = 'thread';
+    corrupt.session.larkThreadId = 'om_not_a_topic';
+    expect(composeRowFromActive(corrupt).feishuThreadLink).toBeUndefined();
   });
 });

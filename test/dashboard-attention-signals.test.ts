@@ -23,9 +23,12 @@ import {
   publishAttentionPatch,
   publishClosedSessionPatch,
   publishLastInputFromBotPatch,
+  publishNativeTopicLinkPatch,
   publishSessionMessagePreviewPatch,
 } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import { Aggregator } from '../src/dashboard/aggregator.js';
+import { fillNativeTopicId } from '../src/core/native-topic-id.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
 import {
   setTerminalProxyPort,
@@ -174,6 +177,39 @@ describe('attention signals', () => {
         body: { sessionId: 'sess-1', patch: { lastInputFromBot: false } },
       },
     ]);
+  });
+
+  it('immediately adds a direct topic link to an already-hydrated active row', () => {
+    const ds = makeDs();
+    ds.session.scope = 'thread';
+    const aggregator = new Aggregator();
+    aggregator.hydrateSessions(ds.larkAppId, [composeRowFromActive(ds)]);
+    expect(aggregator.getSession('sess-1')?.feishuThreadLink).toBeUndefined();
+
+    const seen = collectEvents();
+    expect(fillNativeTopicId(ds.session, 'thread', 'omt_original')).toBe(true);
+    expect(publishNativeTopicLinkPatch(ds)).toBe(true);
+    expect(seen).toEqual([{
+      type: 'session.update',
+      body: {
+        sessionId: 'sess-1',
+        patch: { feishuThreadLink: expect.stringContaining('open_thread_id=omt_original') },
+      },
+    }]);
+    aggregator.applyEvent(ds.larkAppId, seen[0]);
+    expect(aggregator.getSession('sess-1')?.feishuThreadLink).toContain('open_thread_id=omt_original');
+
+    // A repeated message cannot overwrite the original topic or emit another
+    // Dashboard patch; malformed/chat ids are rejected before this helper.
+    expect(fillNativeTopicId(ds.session, 'thread', 'omt_other')).toBe(false);
+    expect(fillNativeTopicId(ds.session, 'chat', 'omt_chat')).toBe(false);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('does not publish a native topic patch without a valid link', () => {
+    const seen = collectEvents();
+    expect(publishNativeTopicLinkPatch(makeDs())).toBe(false);
+    expect(seen).toEqual([]);
   });
 
   it('publishSessionMessagePreviewPatch refreshes the exchange after queue append', () => {

@@ -59,8 +59,9 @@ export interface AgentWorkbenchViewProps {
   online: boolean;
   authenticated: boolean;
   /** P1-4：服务端投影的最小操作能力集。`authenticated` 只决定观察级形态（同源
-   *  终端链路、控制权状态拉取）；三类操作入口分别看 canLocate（定位按钮）、
-   *  canControl（终端接管）、canInteract（Preview 解锁）。必填——调用方必须显式
+   *  终端链路、控制权状态拉取）；三类写操作入口分别看 canLocate（定位按钮）、
+   *  canControl（终端接管）、canInteract（Preview 解锁）。话题跳转是数据提供的
+   *  原生 AppLink，不是写操作。必填——调用方必须显式
    *  给出投影值（页面从 ui.workbenchCapabilities 取，缺省已是全 false）。 */
   capabilities: WorkbenchCapabilities;
   /** 本机**完整管理身份**（`/api/settings` 的 `authed`，即 Dashboard 既有的

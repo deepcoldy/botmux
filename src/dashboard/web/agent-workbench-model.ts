@@ -50,6 +50,8 @@ export interface WorkbenchSessionRow {
   chatDisplayName?: string;
   scope?: 'thread' | 'chat';
   feishuChatLink?: string;
+  /** Direct native topic AppLink; absent on legacy sessions without `omt_`. */
+  feishuThreadLink?: string;
   webPort?: number | null;
   proxyPort?: number;
   riffAccessUrl?: string;

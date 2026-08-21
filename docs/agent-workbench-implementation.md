@@ -17,7 +17,7 @@ Agent Workbench v1 是 Dashboard 内的单会话操作工作区，已经提供�
 
 最重要的产品边界：
 
-- Chat 始终由飞书客户端承载：入口是行内真实 AppLink 锚点（target=_blank rel=noopener），H5 里没有自绘聊天面板，也不调用 toggleChat/enterChat JSAPI。
+- Chat 始终由飞书客户端承载：「聊天」保持真实 AppLink 锚点（target=_blank rel=noopener），H5 里没有自绘聊天面板，也不调用 toggleChat/enterChat JSAPI；非话题不重复显示「跳转」。
 - Terminal 默认只读，写控制由服务端短租约决定，浏览器拿不到 write grant。
 - Web 默认是带可见标签的 Preview；交互必须显式解锁，15 分钟无操作后回锁。
 - Preview 蒙层只防误触，不是应用级强只读。真正的隔离靠 origin：应用被钉在 opaque origin 的 sandbox 里，够不到 Dashboard 的 DOM、cookie 与管理接口。
@@ -43,7 +43,7 @@ https://<dashboard-host>/auth/feishu?returnTo=/#/agent-workbench/<encoded-sessio
 Full Workbench 的基本流程：
 
 1. 在会话列表搜索并选择会话；支持六个分组维度（状态/机器人/会话位置/类型/CLI/活跃时间）、组折叠与未读标记。
-2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「终端」以只读打开工作区终端；「接管」打开终端并自动请求写权限。
+2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）保持原语义，让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「跳转」仅对已有原生 `omt_` 的话题显示；「终端」以只读打开工作区终端；「接管」打开终端并自动请求写权限。
 3. 工作区一次只有一个终端面板：释放、到期或断连回到只读，「关闭终端」后列表重新铺满。触屏与未登录浏览器走只读 viewToken 通道，不提供接管。
 4. Agent 在自己的 Botmux 会话内注册 Web 开发服务器后，窄屏详情才出现「网页」页；网页预览默认「预览」蒙层，「开启交互」显式解锁，15 分钟无操作回锁。桌面工作区只承载终端，网页预览经会话坞的「网页链接」或直接访问 /preview/<encoded-session-id>/ 打开，该 URL 是 Dashboard 同源的 guard shell，它维持蒙层与解锁，并把应用本身框进 opaque-origin sandbox。
 
@@ -143,9 +143,9 @@ Dashboard 进程读 `~/.botmux/.env` 时只按**白名单**取键（H5 族 + 上
 
 常见失败为 400 invalid_session_id、401 authentication_required、404 unknown_session、409 session_not_active / terminal_external_only / terminal_unavailable、503 daemon_offline。
 
-另有两个配套接口：GET /api/sessions/:id/view-link 为触屏或未登录浏览器换取只读 viewToken 终端链接（iOS WebView 的 WebSocket 升级不带 Cookie，同源地址必然握手失败）；POST /api/sessions/:id/locate 让 bot 在话题内 @ 用户定位会话，服务端限流，UI 侧 30 秒冷却。
+另有两个配套接口：GET /api/sessions/:id/view-link 为触屏或未登录浏览器换取只读 viewToken 终端链接（iOS WebView 的 WebSocket 升级不带 Cookie，同源地址必然握手失败）；POST /api/sessions/:id/locate 让 bot 在话题内 @ 用户定位会话，服务端限流，Workbench UI 侧 30 秒冷却。「跳转」是独立的只读 AppLink，不调用该接口。
 
-GET /api/workbench/capabilities 向已认证身份投影最小操作能力集 `{ canLocate, canControl, canInteract }`：三布尔由服务端复算真实路由门禁得出（路由级 auth 决策 + terminalCapability/previewCapability 角色检查），前端只据此渲染定位、终端接管与 Preview 解锁入口——workbenchAuthed 只证明可进工作台，不再被当作操作权限。legacy owner 三项全 true；H5 与平台 owner 为 `{false, true, true}`（capability 表没有 /locate）；平台 teammate/guest 与匿名全 false。该路径不在 publicReadOnly 白名单，匿名恒 401，前端把任何非 200 或缺字段严格回落为全 false。canControl 只描述无显式 token 时的默认能力：显式 write token 走终端前置代理的独立授权，不经过也不受本投影影响。
+GET /api/workbench/capabilities 向已认证身份投影最小操作能力集 `{ canLocate, canControl, canInteract }`：三布尔由服务端复算真实路由门禁得出（路由级 auth 决策 + terminalCapability/previewCapability 角色检查），前端据此渲染定位、终端接管与 Preview 解锁入口。「跳转」不依赖 canLocate，仅在话题行拥有经校验的原生 `omt_` AppLink 时显示；非话题行只保留 chat/open anchor。workbenchAuthed 只证明可进工作台，不再被当作写操作权限。legacy owner 三项全 true；H5 与平台 owner 为 `{false, true, true}`（capability 表没有 /locate）；平台 teammate/guest 与匿名全 false。该路径不在 publicReadOnly 白名单，匿名恒 401，前端把任何非 200 或缺字段严格回落为全 false。canControl 只描述无显式 token 时的默认能力：显式 write token 走终端前置代理的独立授权，不经过也不受本投影影响。
 
 central proxy 只在 loopback hop 注入签名 read/write grant。租约释放、到期、写 WebSocket 断开、H5 logout/expiry 或 legacy Dashboard token rotation 都会删除租约并关闭登记的写 socket；后续连接回到只读。H5 用户不能通过 legacy write-link 绕过接管。
 
@@ -192,9 +192,9 @@ Preview guard 的覆盖层只防误触，不是应用级强只读：解锁后应
 
 ### 5.3 Chat 边界
 
-Chat 不在 Workbench 页面内渲染，也不再脚本化调用 toggleChat/enterChat JSAPI。所有 surface 的聊天入口都是真实锚点（`target="_blank" rel="noopener"`）：href 优先取会话自带的 feishuChatLink，否则由 chatId 构造标准 `/client/chat/open?openChatId=…` AppLink。真实用户点击是飞书客户端唯一按标准聊天面板处理的派发；脚本化打开（window.open、合成 click、enterChat）会被客户端降级到窄容器——这正是当初「聊天开成窄窗」的问题根源。没有 chatId 的会话不渲染聊天入口（会话坞显示「无聊天」），不会拼接损坏链接。
+Chat 不在 Workbench 页面内渲染。所有「聊天」入口都是真实锚点（`target="_blank" rel="noopener"`）：href 优先取会话自带的 feishuChatLink，否则由 chatId 构造标准 `/client/chat/open?openChatId=…` AppLink；这条路径不调用任何 JSAPI。没有 chatId 的会话不渲染聊天入口，非话题不再重复渲染相同链接的「跳转」。
 
-chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，chat/open 带上会让客户端放弃就地放置而整页跳转。会话坞的「打开完整工作台」走 /client/web_app/open，mode=appCenter；侧边栏 AppLink 使用 mode=sidebar、min_width=350、max_width=520。普通浏览器不主动加载飞书 SDK。openWorkbenchChat（toggleChat → enterChat → AppLink 能力链）与 ensureFeishuJsApi 仍作为带测试的工具函数保留，但当前没有任何 surface 调用；浏览器验收断言 sdkCalls 为空。
+chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约。会话坞的「打开完整工作台」走 /client/web_app/open，mode=appCenter；侧边栏 AppLink 使用 mode=sidebar、min_width=350、max_width=520。普通浏览器不主动加载飞书 SDK；Workbench 的「聊天」和原生话题「跳转」均保持零 JSAPI。
 
 ## 6. 集成收口修复
 

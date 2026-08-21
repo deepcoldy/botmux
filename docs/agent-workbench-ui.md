@@ -15,17 +15,17 @@ Authenticated GET /api/workbench/h5-context exposes enabled, appId, brand and en
 
 The client tracks local management authority separately from narrow Workbench authority. H5/platform identities can use the server-scoped Terminal and Preview leases without gaining Dashboard management controls; expected management 401s do not masquerade as an expired Workbench login.
 
-Operation entries render from the server-projected minimal capability set (GET /api/workbench/capabilities → canLocate/canControl/canInteract), parsed strictly with a fail-closed all-false fallback. `authenticated` alone never shows an operation button: 定位 follows canLocate, the row 接管 shortcut and the pane takeover button follow canControl, and the Preview unlock follows canInteract — layered on top of (not replacing) the existing touch read-only restrictions.
+Operation entries render from the server-projected minimal capability set (GET /api/workbench/capabilities → canLocate/canControl/canInteract), parsed strictly with a fail-closed all-false fallback. `authenticated` alone never grants a write operation: 定位 follows canLocate, the row 接管 shortcut and the pane takeover button follow canControl, and Preview unlock follows canInteract — layered on top of the touch read-only restrictions. 跳转 is different: it appears only on thread rows with a validated `omt_...` AppLink and requires neither a write capability nor JSAPI. Non-thread rows keep only the ordinary chat action.
 
 ## Components and state
 
 - agent-workbench-view.tsx owns the full appCenter surface: responsive derivation, rail resize and collapse, per-session layout plus rail/unread persistence, the single-terminal workspace and the mobile drill-down stack.
 - agent-workbench-dock-view.tsx owns the narrow sidebar helper and its summary and link actions.
-- agent-workbench-session-list.tsx implements six grouping dimensions, collapsible groups, search, unread markers, fixed-height virtualization (54px desktop rows, 84px touch rows, 30px group headers) and keyboard navigation; each row carries the chat anchor plus 定位/终端/接管 actions.
+- agent-workbench-session-list.tsx implements six grouping dimensions, collapsible groups, search, unread markers, fixed-height virtualization (54px desktop rows, 84px touch rows, 30px group headers) and keyboard navigation; thread rows can carry the original server-backed 定位 plus direct-topic 跳转, while non-thread rows keep only the chat anchor.
 - agent-workbench-panes.tsx provides TerminalPane, WebPane and WorkbenchInfo. The desktop workspace hosts a single TerminalPane; WebPane and WorkbenchInfo render as mobile drill-down pages. Chat stays a Feishu-controlled external surface and is never drawn in-page.
 - agent-workbench-model.ts contains browser-safe routes, DTOs, grouping and attention/unread classification, layout clamps, responsive derivation and the terminal/preview href guards.
 - agent-workbench-storage.ts persists versioned browser-local primitives only: per-session layout, shared rail prefs, the seen/unread ledger, the grouping dimension and collapsed group keys.
-- agent-workbench-chat.ts builds the safe chat/open and web_app/open AppLinks and the H5 login URL. The legacy openWorkbenchChat JSAPI chain and lazy SDK loader remain as tested utilities, but no Workbench surface calls them.
+- agent-workbench-chat.ts builds the safe chat/open and web_app/open AppLinks and the H5 login URL. The legacy JSAPI helpers remain independently tested, but Workbench chat and jump entries do not use them.
 - agent-workbench-api.ts strictly validates terminal-control, terminal view-link, Preview interaction and H5 context responses, and surfaces locate rate limits (429 retry-after) as typed errors.
 
 The terminal pane is keyed by sessionId and control intent. Control and Preview mutations use monotonic request generations so an old response cannot overwrite an explicit Lock, a new session or an unmounted pane.
@@ -42,7 +42,7 @@ The CSS uses semantic dark/light tokens, no gradients, explicit pixel radii no l
 
 ## Chat
 
-Chat never renders inside the Workbench. Every chat entry is a real anchor — target="_blank" rel="noopener", href from the session's feishuChatLink or a built /client/chat/open?openChatId=… AppLink. A trusted user click on that anchor is the one dispatch the Feishu client honours with its standard chat placement; scripted variants (window.open, synthetic .click(), enterChat) are demoted to the narrow attached container. No surface calls toggleChat or enterChat — the browser harness asserts zero SDK calls — and chat/open links carry no sidebar/width parameters.
+Chat never renders inside the Workbench. Every chat entry is a real anchor — target="_blank" rel="noopener", href from the session's feishuChatLink or a built /client/chat/open?openChatId=… AppLink — and chat/open links carry no sidebar/width parameters. Workbench does not intercept these clicks with toggleChat or enterChat; placement is owned by the Feishu client. The separate jump action exists only for native topic links.
 
 Dock web_app AppLinks use mode=sidebar, min_width=350 and max_width=520. Full Workbench handoff uses mode=appCenter.
 

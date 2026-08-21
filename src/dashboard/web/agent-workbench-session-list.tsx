@@ -34,13 +34,6 @@ import { t } from './ui.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
-/** 会话类型徽标文案。键与 workbenchSessionKind 的返回值一一对应。 */
-const KIND_COPY: Record<WorkbenchSessionKind, { label: string; title: string }> = {
-  thread: { label: '话题', title: '话题会话' },
-  group: { label: '群', title: '群会话' },
-  p2p: { label: '单聊', title: '单聊会话' },
-};
-
 /** 与服务端 locateLimiter 对齐的按钮侧冷却；成功态只是短暂的视觉确认。 */
 const LOCATE_COOLDOWN_MS = 30_000;
 const LOCATE_SUCCESS_MS = 2_000;
@@ -56,6 +49,13 @@ function locateErrorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error ?? '');
   return message.trim() || '未知错误';
 }
+
+/** 会话类型徽标文案。键与 workbenchSessionKind 的返回值一一对应。 */
+const KIND_COPY: Record<WorkbenchSessionKind, { label: string; title: string }> = {
+  thread: { label: '话题', title: '话题会话' },
+  group: { label: '群', title: '群会话' },
+  p2p: { label: '单聊', title: '单聊会话' },
+};
 
 /** 行前的状态记号。分组名本身由 model 给（动态维度下就是机器人名/会话名），
  *  这里只留图标，避免同一份文案在两处各写一遍、日子久了对不上。 */
@@ -261,8 +261,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
     [groups],
   );
 
-  // 定位只在选中会话变化时发生一次，避免每次重渲染都把 scrollTop 拽回选中行、和用户滚动打架。
-  // 初始选中不定位（列表保持置顶的「待你处理」可见），只有用户切换选中才滚动定位。
+  // 列表滚动只在选中会话变化时发生一次，避免每次重渲染都把 scrollTop 拽回选中行、和用户滚动打架。
+  // 初始选中不滚动（列表保持置顶的「待你处理」可见），只有用户切换选中才滚动定位。
   useEffect(() => {
     if (!props.selectedSessionId) {
       lastScrolledSelectionRef.current = null;
@@ -281,9 +281,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
 
   // 冷却和成功态都是时间推导出来的，需要一个心跳把它们重绘掉。心跳只在真的有
   // 冷却时存在：过期条目在这里被剪掉，Map 空了 effect 自然清掉定时器。
-  // 用裸的 setInterval 而不是 window.setInterval：这个 effect 在首次成功定位后
-  // 才挂载，走 window 会让整个列表在没有 window 的环境（组件测试跑在 node 上）
-  // 一点定位就崩。同目录的 panes 一直是这么写的，计时本来也不需要 DOM。
   useEffect(() => {
     if (locateAt.size === 0) return undefined;
     const timer = setInterval(() => {
@@ -300,7 +297,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
   const onLocate = props.onLocate;
   const startLocate = (sessionId: string) => {
     if (!onLocate) return;
-    // 乐观进入冷却：请求还在飞的时候按钮就不可点，失败再放开。
     setLocateAt(previous => new Map(previous).set(sessionId, Date.now()));
     setLocateError(previous => {
       if (!previous.has(sessionId)) return previous;
@@ -310,8 +306,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
     });
     void onLocate(sessionId).then(
       () => {
-        // 成功后把时间戳推到「此刻」：成功态从这里开始算 2s，冷却也从服务端
-        // 真正受理的时刻开始算 30s，不会比服务端的限流窗口短。
         setLocateAt(previous => new Map(previous).set(sessionId, Date.now()));
       },
       (error: unknown) => {
@@ -319,8 +313,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
         const retryAfterMs = locateRetryAfterMs(error);
         setLocateAt(previous => {
           const next = new Map(previous);
-          // 429 说明服务端还在限流窗口里，按它给的剩余时间继续禁用；
-          // 其它错误立刻恢复可点，让用户能重试。
           if (retryAfterMs === null) next.delete(sessionId);
           else next.set(sessionId, Date.now() - (LOCATE_COOLDOWN_MS - retryAfterMs));
           return next;
@@ -567,8 +559,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                           onActivate={() => props.onSeen?.(session.sessionId)}
                         >聊天</FeishuChatAnchor>
                       ) : null}
-                      {/* 定位只对话题会话有意义：群/单聊会话没有可回跳的话题锚点。
-                          聊天按钮照旧开群，定位是它旁边的另一条路。 */}
+                      {/* 原「定位」语义不变：让 bot 在原话题里 @ owner，用户通过
+                          消息通知回到话题；写能力与 30 秒冷却也继续沿用。 */}
                       {kind === 'thread' && onLocate ? (() => {
                         const at = locateAt.get(session.sessionId) ?? 0;
                         const elapsed = Date.now() - at;
@@ -595,6 +587,17 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                           >{located ? '已发送' : '定位'}</button>
                         );
                       })() : null}
+                      {/* 「跳转」是新增的只读入口，仅在服务端已经拿到原生 `omt_`
+                          话题 id 时渲染；不能把 `om_` 路由锚点伪造成原话题链接。 */}
+                      {kind === 'thread' && session.feishuThreadLink ? (
+                        <FeishuChatAnchor
+                          className="wb-session-row-action is-jump"
+                          href={session.feishuThreadLink}
+                          title="跳转到原话题"
+                          ariaLabel={`跳转到原话题 — ${title}`}
+                          onActivate={() => props.onSeen?.(session.sessionId)}
+                        >跳转</FeishuChatAnchor>
+                      ) : null}
                       {([
                         ['terminal', '打开只读终端', '终端'] as const,
                         // 接管捷径只对有 canControl 能力的身份渲染（P1-4）；

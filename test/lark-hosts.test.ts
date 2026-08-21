@@ -5,7 +5,7 @@
  * Run:  pnpm vitest run test/lark-hosts.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { appCenterAppLink, larkHosts, normalizeBrand, sdkDomain, chatAppLink } from '../src/im/lark/lark-hosts.js';
+import { appCenterAppLink, larkHosts, normalizeBrand, sdkDomain, chatAppLink, threadAppLink } from '../src/im/lark/lark-hosts.js';
 
 describe('lark-hosts', () => {
   describe('normalizeBrand', () => {
@@ -68,6 +68,16 @@ describe('lark-hosts', () => {
     });
     it('defaults to the feishu applink host', () => {
       expect(chatAppLink('oc_x')).toContain('applink.feishu.cn');
+    });
+  });
+
+  describe('threadAppLink', () => {
+    it('uses the Lark applink host and native thread id', () => {
+      const link = new URL(threadAppLink('oc_abc', 'omt_topic', 'lark'));
+      expect(link.origin).toBe('https://applink.larksuite.com');
+      expect(link.pathname).toBe('/client/thread/open');
+      expect(link.searchParams.get('open_thread_id')).toBe('omt_topic');
+      expect(link.searchParams.get('thread_position')).toBe('-1');
     });
   });
 

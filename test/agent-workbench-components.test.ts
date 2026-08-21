@@ -1,7 +1,10 @@
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js';
+import {
+  AgentWorkbenchView,
+  type AgentWorkbenchViewProps,
+} from '../src/dashboard/web/agent-workbench-view.js';
 import { AgentWorkbenchDockView } from '../src/dashboard/web/agent-workbench-dock-view.js';
 import {
   TerminalPane,
@@ -76,7 +79,7 @@ function kindSession(patch: Partial<WorkbenchSessionRow>): WorkbenchSessionRow {
   };
 }
 
-function kindViewProps(session: WorkbenchSessionRow, overrides: Partial<{ api: WorkbenchApi }> = {}) {
+function kindViewProps(session: WorkbenchSessionRow, overrides: Partial<AgentWorkbenchViewProps> = {}) {
   return {
     sessions: [session],
     online: true,
@@ -103,6 +106,11 @@ function kindBadges(renderer: TestRenderer.ReactTestRenderer): ReactTestInstance
 function locateButtons(renderer: TestRenderer.ReactTestRenderer): ReactTestInstance[] {
   return renderer.root.findAll(node =>
     node.type === 'button' && String(node.props.className ?? '').includes('is-locate'));
+}
+
+function jumpLinks(renderer: TestRenderer.ReactTestRenderer): ReactTestInstance[] {
+  return renderer.root.findAll(node =>
+    node.type === 'a' && String(node.props.className ?? '').includes('is-jump'));
 }
 
 /** 组头是**按钮**，不是 div —— 折叠靠点它，所以它必须是可聚焦、可回车的原生控件。
@@ -347,12 +355,16 @@ describe('Agent Workbench components', () => {
     act(() => renderer.unmount());
   });
 
-  it('marks a thread row with the 话题 badge and gives it the locate action', async () => {
+  it('keeps the original locate action and adds a direct jump link for a native topic', async () => {
     const located: string[] = [];
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, kindViewProps(
-        kindSession({ chatType: 'group', scope: 'thread' }),
+        kindSession({
+          chatType: 'group',
+          scope: 'thread',
+          feishuThreadLink: 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_0',
+        }),
         { api: { ...api, locateSession: async sessionId => { located.push(sessionId); } } },
       )));
     });
@@ -362,26 +374,46 @@ describe('Agent Workbench components', () => {
     expect(badges[0].props.className).toContain('is-thread');
     expect(badges[0].props.title).toBe('话题会话');
 
-    // 定位是话题会话独有的第二条回跳路径，和聊天入口并存而不是替代它。
+    // 原定位仍走 POST /locate，并保留服务端一致的冷却状态。
     const locate = locateButtons(renderer);
     expect(locate).toHaveLength(1);
     expect(locate[0].props.disabled).toBe(false);
     expect(locate[0].props['aria-label']).toContain('在话题里 @ 我定位');
-    // 按钮是文字而不是图标：文案本身就是可读标签，别再退回纯 icon。
     expect(textOf(locate[0])).toBe('定位');
     await act(async () => { locate[0].props.onClick({ stopPropagation() {} }); });
     expect(located).toEqual(['session-0']);
-
-    // 冷却状态挂在列表上而不是按钮上：点过之后按钮立刻禁用，连点绕不过服务端 30s 限流。
     const cooling = locateButtons(renderer)[0];
     expect(cooling.props.disabled).toBe(true);
     expect(cooling.props.title).toContain('30 秒后可再次使用');
-    // 成功态换文案（而不是只换颜色），2 秒后自己退回「定位」。
     expect(textOf(cooling)).toBe('已发送');
+
+    // 新跳转是用户主动激活的原生话题 AppLink，不调用定位接口。
+    const jump = jumpLinks(renderer);
+    expect(jump).toHaveLength(1);
+    expect(jump[0].props.href).toContain('open_thread_id=omt_0');
+    expect(jump[0].props.target).toBe('_blank');
+    expect(jump[0].props.rel).toBe('noopener');
+    expect(jump[0].props['aria-label']).toContain('跳转到原话题');
+    expect(textOf(jump[0])).toBe('跳转');
     act(() => renderer.unmount());
   });
 
-  it('leaves a group-chat row without a locate action', async () => {
+  it('keeps locate but hides jump for a legacy thread row without its native topic id', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(
+        AgentWorkbenchView,
+        kindViewProps(kindSession({ chatType: 'group', scope: 'thread' })),
+      ));
+    });
+    expect(locateButtons(renderer)).toHaveLength(1);
+    expect(jumpLinks(renderer)).toHaveLength(0);
+    expect(renderer.root.findAll(node =>
+      node.type === 'a' && String(node.props.className ?? '').includes('is-chat')).length).toBeGreaterThan(0);
+    act(() => renderer.unmount());
+  });
+
+  it('leaves a group-chat row with chat only and no redundant locate or jump action', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(
@@ -393,8 +425,9 @@ describe('Agent Workbench components', () => {
     expect(badges).toHaveLength(1);
     expect(textOf(badges[0])).toBe('群');
     expect(badges[0].props.className).toContain('is-group');
-    // 群会话没有可回跳的话题锚点，所以定位按钮整体不渲染（而不是渲染成禁用态）。
+    // 群会话没有原话题定位；聊天已经是 chat/open，因此不再重复渲染跳转。
     expect(locateButtons(renderer)).toHaveLength(0);
+    expect(jumpLinks(renderer)).toHaveLength(0);
     // 但聊天入口照旧在，否则这条断言会把「按钮全没了」也当成通过。
     expect(renderer.root.findAll(node =>
       node.type === 'a' && String(node.props.className ?? '').includes('is-chat')).length).toBeGreaterThan(0);
@@ -1319,7 +1352,11 @@ describe('P1-4 操作入口按最小能力集渲染', () => {
    *  是能力位关掉的结果。 */
   function fullSurfaceSession(): WorkbenchSessionRow {
     return {
-      ...kindSession({ chatType: 'group', scope: 'thread' }),
+      ...kindSession({
+        chatType: 'group',
+        scope: 'thread',
+        feishuThreadLink: 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_surface',
+      }),
       webPort: 7681,
       proxyPort: 7682,
       preview: { path: '/preview/session-0/', registeredAt: new Date(NOW).toISOString() },
@@ -1344,7 +1381,7 @@ describe('P1-4 操作入口按最小能力集渲染', () => {
     return renderer.root.findAllByType('button').map(node => textOf(node));
   }
 
-  it('六类身份矩阵：定位/接管入口的存在性 = 服务端投影值', async () => {
+  it('六类身份矩阵：定位遵循写能力，跳转不依赖写能力，接管仍遵循投影', async () => {
     for (const { name, actor, authenticated } of MATRIX) {
       const capabilities = projectWorkbenchOperationCapabilities(actor);
       let renderer!: TestRenderer.ReactTestRenderer;
@@ -1365,8 +1402,9 @@ describe('P1-4 操作入口按最小能力集渲染', () => {
           onRouteChange: () => {},
         }));
       });
-      // 定位按钮：只随 canLocate 出现（H5/platform 的 capability 表没有 /locate）。
+      // 原定位仍走 POST /locate，只随 canLocate 出现；只读跳转对所有可见身份出现。
       expect(locateButtons(renderer).length, `${name} locate`).toBe(capabilities.canLocate ? 1 : 0);
+      expect(jumpLinks(renderer).length, `${name} jump`).toBe(1);
       // 行内「接管」捷径：只随 canControl 出现；只读「终端」入口对所有身份保留。
       const rowActions = renderer.root.findAll(node =>
         node.type === 'button' && String(node.props.className ?? '').includes('wb-session-row-action is-terminal'));
