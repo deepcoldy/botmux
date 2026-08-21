@@ -1205,12 +1205,21 @@ function substituteTargetMatchesMention(target: {
   );
 }
 
+// 替身触发只认「发送者本人当场亲手 @」的消息类型：text（纯文本）/ post（富文本）。
+// 转发一张卡片（interactive）或合并转发（merge_forward）时，飞书会把被转发内容
+// 里原本的接收人 / at-node 继承进这条消息的顶层 mentions —— 那不是发送者真的
+// @ 了替身对象（用户实测：卡片里灰色的「发送给:@某某」被当成了真 @，凭空触发替身
+// 在话题外回复）。这类消息一律不触发替身，避免转发误触发。
+const SUBSTITUTE_TRIGGER_MESSAGE_TYPES = new Set(['text', 'post']);
+
 export function resolveSubstituteTrigger(
   larkAppId: string,
   message: any,
 ): import('../../types.js').SubstituteTrigger | undefined {
   const cfg = getBot(larkAppId).config.substituteMode;
   if (!cfg?.enabled || !cfg.targets?.length) return undefined;
+  const messageType = message?.message_type ?? message?.msg_type;
+  if (!SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(messageType)) return undefined;
   const mentions = extractMentionIdentities(message);
   for (const mention of mentions) {
     const target = cfg.targets.find(t => substituteTargetMatchesMention(t, mention));
