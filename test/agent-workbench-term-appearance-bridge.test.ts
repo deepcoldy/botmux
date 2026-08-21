@@ -17,9 +17,13 @@ import {
  *  所以这里把子页那段监听器原样抠出来跑，喂父页真实构造的载荷，两侧一起验。 */
 function extractTerminalPageListener(): string {
   const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-  const start = source.indexOf('var _WB_THEME_KEYS=');
-  expect(start, 'worker.ts 里找不到终端页的外观监听器').toBeGreaterThan(-1);
-  const anchor = source.indexOf("window.addEventListener('message'", start);
+  // 起点是父页 origin 探针，不是主题键表：监听器现在还兼着「记住父页的 origin，好把
+  // 这条通道的写权限回报上去」，两段代码是同一块 postMessage 管道，抠一半跑不起来。
+  const start = source.indexOf('var _wbParentOrigin=');
+  expect(start, 'worker.ts 里找不到终端页的父页 origin 探针').toBeGreaterThan(-1);
+  const keys = source.indexOf('var _WB_THEME_KEYS=', start);
+  expect(keys, 'worker.ts 里找不到终端页的外观监听器').toBeGreaterThan(-1);
+  const anchor = source.indexOf("window.addEventListener('message'", keys);
   expect(anchor, '监听器没有注册 message 事件').toBeGreaterThan(-1);
   const end = source.indexOf('\n});', anchor);
   expect(end, '监听器没有正常闭合').toBeGreaterThan(-1);
@@ -317,5 +321,108 @@ describe('终端页字号按容器宽度自适应', () => {
       source.indexOf('\n}', source.indexOf('function sendResize(){')),
     );
     expect(sender).toContain('if(term.cols===_lastC&&term.rows===_lastR)return;');
+  });
+});
+
+/**
+ * 反方向的同一条管道：终端 iframe → 工作台的写权限回报。
+ *
+ * 为什么必须单独验：页面自己那份 `hasToken` 来自 HTTP GET，而 WebSocket 升级是**另
+ * 一次**鉴权——iOS WebView 的升级请求不带 Cookie，同一份页面完全可能 HTTP 判可写、
+ * WS 只读。worker 在握手完成时把这条连接的真实结论发下来，页面据此收起输入并上抛给
+ * 嵌入方。抠出来跑，验的是真正会下发的那份代码。
+ */
+describe('终端 iframe → 工作台的写权限回报接缝', () => {
+  interface WriteReporter {
+    set(value: boolean): void;
+    origin(): string | null;
+  }
+
+  function bootWriteReporter(options: {
+    ancestorOrigins?: string[];
+    hasToken?: boolean;
+    platformReadonly?: boolean;
+  } = {}): {
+    reporter: WriteReporter;
+    posted: Array<{ data: unknown; origin: unknown }>;
+    bannerShown(): boolean;
+    fireAppearance(origin: string): void;
+  } {
+    const posted: Array<{ data: unknown; origin: unknown }> = [];
+    const handlers: ((event: unknown) => void)[] = [];
+    const parent = {
+      tag: 'parent-window',
+      postMessage(data: unknown, origin: unknown) { posted.push({ data, origin }); },
+    };
+    const classes = new Set<string>();
+    const banner = {
+      classList: {
+        add: (name: string) => { classes.add(name); },
+        remove: (name: string) => { classes.delete(name); },
+      },
+    };
+    const win = {
+      parent,
+      location: options.ancestorOrigins ? { ancestorOrigins: options.ancestorOrigins } : {},
+      addEventListener(type: string, handler: (event: unknown) => void) {
+        if (type === 'message') handlers.push(handler);
+      },
+    };
+    const documentStub = { getElementById: (id: string) => (id === 'readonly-banner' ? banner : null) };
+    const reporter = new Function(
+      'window', 'document', 'term', 'fit', 'hasToken', 'platformReadonly', 'wsHasWrite',
+      `${extractTerminalPageListener()}
+return {set:_wbSetWsWrite,origin:function(){return _wbParentOrigin}};`,
+    )(
+      win,
+      documentStub,
+      { options: {} },
+      { fit() {} },
+      options.hasToken ?? true,
+      options.platformReadonly ?? false,
+      null,
+    ) as WriteReporter;
+    return {
+      reporter,
+      posted,
+      bannerShown: () => classes.has('show'),
+      fireAppearance(origin: string) {
+        const message = workbenchTermAppearanceMessage('classic', WORKBENCH_SKIN_IDS[0]);
+        for (const handler of handlers) handler({ data: message, source: parent, origin });
+      },
+    };
+  }
+
+  it('WS 判只读 → 上抛 write:false 并亮出只读横幅，目标 origin 取 ancestorOrigins', () => {
+    const harness = bootWriteReporter({ ancestorOrigins: ['https://dash.example'] });
+    expect(harness.reporter.origin()).toBe('https://dash.example');
+    harness.reporter.set(false);
+    expect(harness.posted).toEqual([{
+      data: { type: 'botmux:wb-terminal-write', write: false },
+      origin: 'https://dash.example',
+    }]);
+    // 页面以为自己可写（hasToken=true），这条连接却只读：横幅必须说出来。
+    expect(harness.bannerShown()).toBe(true);
+    harness.reporter.set(true);
+    expect(harness.posted.at(-1)).toEqual({
+      data: { type: 'botmux:wb-terminal-write', write: true },
+      origin: 'https://dash.example',
+    });
+    expect(harness.bannerShown()).toBe(false);
+  });
+
+  it('拿不到父页 origin 就一个字不发——绝不用星号广播', () => {
+    const harness = bootWriteReporter();
+    expect(harness.reporter.origin()).toBe(null);
+    harness.reporter.set(true);
+    expect(harness.posted).toEqual([]);
+    // 父页发来的外观消息本身就证明了它的 origin（来源已校验是 window.parent），
+    // 靠它补上之后，攒着的结论补发一次。
+    harness.fireAppearance('https://dash.example');
+    expect(harness.reporter.origin()).toBe('https://dash.example');
+    expect(harness.posted).toEqual([{
+      data: { type: 'botmux:wb-terminal-write', write: true },
+      origin: 'https://dash.example',
+    }]);
   });
 });

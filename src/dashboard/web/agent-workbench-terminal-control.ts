@@ -273,6 +273,15 @@ export function terminalControlReducer(
   }
 }
 
+/**
+ * 终端页 → 工作台的一次「这条通道到底能不能写」回报。
+ *
+ * 这个字符串是跨文件契约：终端页那侧的字面量写在 worker.ts 的模板字符串里（那段
+ * 代码不能出现反引号与插值序列，所以没法 import 这个常量），两处必须一起改。
+ * 跨文件接缝测试按这个名字比对 worker.ts。
+ */
+export const WORKBENCH_TERM_WRITE_MESSAGE = 'botmux:wb-terminal-write';
+
 // ─── 写租约的「还有人在管吗」登记簿 ─────────────────────────────────────────
 
 /**

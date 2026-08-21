@@ -32,6 +32,7 @@ import {
 } from './agent-workbench-api.js';
 // 控制权只有一份状态机（面板侧 + 外层意图），见该文件头部的注释。
 import {
+  WORKBENCH_TERM_WRITE_MESSAGE,
   claimTerminalWrite,
   hasLiveTerminalWriteClaim,
   initialTerminalControlModel,
@@ -90,23 +91,48 @@ export function readTerminalFrameStatus(frame: HTMLIFrameElement | null): Termin
 /** 终端页自己算出来的写权限。`unknown` = 读不出来（跨域、页面还没跑到那一行）。 */
 export type TerminalFrameWrite = 'writable' | 'readonly' | 'unknown';
 
-/** 生产实现：终端页把这次 GET 拿到的 grant 是不是 write，写进它自己的全局
- *  `hasToken`（worker.ts 的 `var hasToken=${hasWrite}`）。工作台和终端页同源，
- *  所以这是「这块 iframe 到底能不能输入」的第一手事实——比任何外部推断都准。
+/**
+ * 生产实现：读终端页自己的两个全局，**WS 的结论优先**。
  *
- *  为什么需要它：触屏挂的是带 viewToken 的只读通道，但前置代理会给**平台所有者**
- *  的 viewToken 请求补一个 WRITE grant（#960），而这条补签又取决于这个 WebView
- *  的请求带不带 Cookie。于是同一份 UI 在 Android Chrome 上其实可写、在 iOS
- *  WebView 上只读。与其写死一句「手机端只读」，不如照实读这一页的结论。 */
+ *   `wsHasWrite`  这条已经建立的 WebSocket 实际拿到的权限（worker 在握手完成时
+ *                 把结论发下来，终端页落成这个全局）。`null` = 还没连上。
+ *   `hasToken`    页面那次 HTTP GET 的判定（worker.ts 的 `var hasToken=${hasWrite}`），
+ *                 只当初值。
+ *
+ * 为什么必须分开：两次是**各自独立**的鉴权。页面是 HTTP 请求，iOS WebView 会带
+ * Cookie；紧接着的 WebSocket 升级**不带** Cookie，前置代理给平台所有者补 WRITE
+ * grant 这件事也就跟着落空。于是同一份页面完全可能「HTTP 判可写、WS 只读」——照抄
+ * hasToken 的 UI 会写着「手机端可输入」，用户打的字却被 worker 丢掉，屏幕上什么都
+ * 不发生。工作台与终端页同源，所以这是第一手事实，比任何外部推断都准。
+ */
 export function readTerminalFrameWrite(frame: HTMLIFrameElement | null): TerminalFrameWrite {
   try {
-    const value = (frame?.contentWindow as { hasToken?: unknown } | null | undefined)?.hasToken;
-    if (value === true) return 'writable';
-    if (value === false) return 'readonly';
+    const view = frame?.contentWindow as { wsHasWrite?: unknown; hasToken?: unknown } | null | undefined;
+    const settled = view?.wsHasWrite;
+    if (settled === true) return 'writable';
+    if (settled === false) return 'readonly';
+    const initial = view?.hasToken;
+    if (initial === true) return 'writable';
+    if (initial === false) return 'readonly';
     return 'unknown';
   } catch {
     return 'unknown';
   }
+}
+
+/**
+ * 终端页 → 工作台的一次写权限回报（终端页在 WS 建立后 postMessage 上抛）。
+ *
+ * 同源读全局已经够用，这条消息解决的是**时机**：不用等下一拍轮询，连上那一刻面板
+ * 就能把文案改对；而且万一将来这块 iframe 走到跨文档隔离的场景，同源读会直接抛，
+ * 消息通道仍然成立。来源校验沿用外观桥那一套：只认这块 iframe 自己的 contentWindow
+ * 发来的、结构完全对得上的消息。
+ */
+export function readTerminalWriteReport(data: unknown): boolean | null {
+  if (!data || typeof data !== 'object') return null;
+  const message = data as { type?: unknown; write?: unknown };
+  if (message.type !== WORKBENCH_TERM_WRITE_MESSAGE) return null;
+  return typeof message.write === 'boolean' ? message.write : null;
 }
 
 const FRAME_STATUS_POLL_MS = 1_000;
@@ -198,6 +224,40 @@ function useTerminalFrameWrite(params: {
       if (sample() || ticks >= FRAME_WRITE_MAX_TICKS) clearInterval(timer);
     }, FRAME_STATUS_POLL_MS);
     return () => clearInterval(timer);
+  }, [enabled, frameKey]);
+
+  return enabled ? write : 'unknown';
+}
+
+/**
+ * 收终端页在 WS 建立后主动上抛的写权限。
+ *
+ * 只认这块 iframe 自己的 `contentWindow` 发来的消息（与外观桥同一套来源校验）：这
+ * 页面会被跨 origin 嵌入，别的窗口发来的同名消息一律不作数。换一块 iframe 就把结论
+ * 清空——上一块的判定套不到新的连接上。
+ */
+function useTerminalFrameWriteReport(params: {
+  enabled: boolean;
+  frameKey: string;
+  frame(): { contentWindow?: unknown } | null;
+}): TerminalFrameWrite {
+  const { enabled, frameKey } = params;
+  const [write, setWrite] = useState<TerminalFrameWrite>('unknown');
+  const frameRef = useRef(params.frame);
+  useEffect(() => { frameRef.current = params.frame; });
+
+  useEffect(() => {
+    setWrite('unknown');
+    if (!enabled || typeof window === 'undefined' || !window.addEventListener) return undefined;
+    const onMessage = (event: { data?: unknown; source?: unknown }) => {
+      const source = frameRef.current()?.contentWindow;
+      if (!source || event.source !== source) return;
+      const reported = readTerminalWriteReport(event.data);
+      if (reported === null) return;
+      setWrite(reported ? 'writable' : 'readonly');
+    };
+    window.addEventListener('message', onMessage as EventListener);
+    return () => window.removeEventListener('message', onMessage as EventListener);
   }, [enabled, frameKey]);
 
   return enabled ? write : 'unknown';
@@ -532,11 +592,19 @@ export function TerminalPane(props: PaneCommonProps & {
   // owner 的 viewToken 请求补 WRITE grant，而补不补又取决于这个 WebView 带不带
   // Cookie）。桌面不启用：那边的权威是控制权接口，多一个来源只会两边打架。
   const readFrameWrite = props.readFrameWrite ?? readTerminalFrameWrite;
-  const frameWrite = useTerminalFrameWrite({
+  const polledFrameWrite = useTerminalFrameWrite({
     enabled: touch,
     frameKey,
     read: () => readFrameWrite(frameRef.current),
   });
+  // 终端页连上 WS 那一刻主动上抛的结论。它比轮询早、也比轮询确定（轮询读的是同一
+  // 份全局，只是要等下一拍），所以有它就以它为准。
+  const reportedFrameWrite = useTerminalFrameWriteReport({
+    enabled: touch,
+    frameKey,
+    frame: () => frameRef.current,
+  });
+  const frameWrite = reportedFrameWrite !== 'unknown' ? reportedFrameWrite : polledFrameWrite;
 
   // 终端渲染风格：容器 class 管几何（行距 / 内边距），xterm 的配色住在跨文档的
   // 终端页里，父页换 class 它收不到 —— 必须把 theme 推过去，否则会出现「工作台

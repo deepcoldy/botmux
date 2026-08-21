@@ -7,6 +7,7 @@ import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js
 import {
   TERMINAL_WRITE_TIMEOUT_MS,
   TerminalPane,
+  readTerminalFrameWrite,
   type TerminalFrameWrite,
 } from '../src/dashboard/web/agent-workbench-panes.js';
 import {
@@ -908,6 +909,64 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     return renderer;
   }
 
+  /** 触屏面板 + 一个能收发 `message` 的假 window + 一块有 contentWindow 的假 iframe：
+   *  终端页 WS 回报走的就是这条路。stub 全程留着，组件重渲染时才不会去碰真 global。 */
+  async function renderTouchWsPane(): Promise<{
+    renderer: TestRenderer.ReactTestRenderer;
+    frameWindow: object;
+    post(data: unknown, source: unknown): void;
+    restore(): void;
+  }> {
+    const listeners: Array<(event: unknown) => void> = [];
+    const previousWindow = (globalThis as Record<string, unknown>).window;
+    const frameWindow = { hasToken: false };
+    (globalThis as Record<string, unknown>).window = {
+      matchMedia: (query: string) => ({
+        matches: query === '(hover: none)',
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+      addEventListener: (type: string, handler: (event: unknown) => void) => {
+        if (type === 'message') listeners.push(handler);
+      },
+      removeEventListener: (type: string, handler: (event: unknown) => void) => {
+        const index = listeners.indexOf(handler);
+        if (index >= 0) listeners.splice(index, 1);
+      },
+    };
+    const lease = leaseApi();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: PAIR()[0],
+        api: {
+          ...lease.api,
+          getTerminalViewLink: async () => ({ url: '/s/session-a?viewToken=cap', expiresAt: null }),
+        },
+        authenticated: true,
+        capabilities: FULL_CAPABILITIES,
+        now: NOW,
+        location: LOCATION,
+      }), {
+        createNodeMock: (element: { props: Record<string, unknown> }) => (
+          String((element.props as { className?: string }).className ?? '').includes('wb-pane-frame')
+            ? { contentWindow: frameWindow }
+            : null
+        ),
+      });
+    });
+    await settle();
+    return {
+      renderer,
+      frameWindow,
+      post(data, source) { for (const handler of [...listeners]) handler({ data, source }); },
+      restore() {
+        if (previousWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+        else (globalThis as Record<string, unknown>).window = previousWindow;
+      },
+    };
+  }
+
   it('触屏 + 恒可写身份 + 这块 iframe 自报可写 → 说「可输入」，不再写死「手机端只读」', async () => {
     const renderer = await renderTouchPane({ fixed: true, write: 'writable' });
     expect(paneMode(renderer)).toBe('controlled');
@@ -937,6 +996,69 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     act(() => renderer.unmount());
   });
 
+  /**
+   * 触屏这条通道能不能写，判据必须是**已经建立的那条 WS**，不是 HTTP GET。
+   *
+   * 两次鉴权是分开的：页面本身是 HTTP 请求（iOS WebView 会带 Cookie），紧接着的
+   * WebSocket 升级却**不带** Cookie。于是同一份页面完全可能「HTTP 判定可写、WS 只
+   * 拿到只读」——UI 照抄 hasToken 就会写着「手机端可输入」，用户打的字却被 worker
+   * 原地丢掉，屏幕上什么都不发生。
+   */
+  it('readTerminalFrameWrite：WS 的结论压过 HTTP 的 hasToken', () => {
+    const frame = (contentWindow: unknown) => ({ contentWindow } as unknown as HTMLIFrameElement);
+    // HTTP 说可写、WS 说只读 → 以 WS 为准。
+    expect(readTerminalFrameWrite(frame({ hasToken: true, wsHasWrite: false }))).toBe('readonly');
+    // 反过来同理（前置代理给 owner 的 viewToken 请求补了 WRITE grant）。
+    expect(readTerminalFrameWrite(frame({ hasToken: false, wsHasWrite: true }))).toBe('writable');
+    // WS 还没说话时 hasToken 只是初值。
+    expect(readTerminalFrameWrite(frame({ hasToken: true, wsHasWrite: null }))).toBe('writable');
+    expect(readTerminalFrameWrite(frame({}))).toBe('unknown');
+  });
+
+  it('终端页 WS 建立后上抛的写权限能翻转面板文案，且只认这块 iframe 发来的', async () => {
+    const touch = await renderTouchWsPane();
+    try {
+      // 初值：这块 iframe 自报 hasToken=false（viewToken 通道），面板说只读。
+      expect(paneMode(touch.renderer)).toBe('readonly');
+
+      // 冒充者：别的窗口发同样的消息，一律不作数。
+      await act(async () => {
+        touch.post({ type: 'botmux:wb-terminal-write', write: true }, { imposter: true });
+      });
+      expect(paneMode(touch.renderer)).toBe('readonly');
+
+      // 终端页自己回报：WS 这一跳拿到了写权限（平台所有者 + WebView 带 Cookie）。
+      await act(async () => {
+        touch.post({ type: 'botmux:wb-terminal-write', write: true }, touch.frameWindow);
+      });
+      expect(paneMode(touch.renderer)).toBe('controlled');
+      expect(feedback(touch.renderer)).toContain('手机端也可直接输入');
+
+      // 断线重连后 WS 改判只读，面板跟着如实翻回去。
+      await act(async () => {
+        touch.post({ type: 'botmux:wb-terminal-write', write: false }, touch.frameWindow);
+      });
+      expect(paneMode(touch.renderer)).toBe('readonly');
+      expect(feedback(touch.renderer)).toContain('手机端为只读视图');
+    } finally {
+      act(() => touch.renderer.unmount());
+      touch.restore();
+    }
+  });
+
+  it('跨文件契约：终端页落下 wsHasWrite 并按同一个消息类型上抛', () => {
+    // 面板认的是这两样东西：同源读的 `wsHasWrite` 全局，和 postMessage 的类型串。
+    // worker 那边改了名而这里不改，面板会静默退回「读不出来」，触屏文案又悄悄回到
+    // 写死的「手机端只读」——正是这一条要修掉的反话。
+    const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(worker).toContain('var wsHasWrite=null');
+    expect(worker).toContain("'botmux:wb-terminal-write'");
+    // 服务端在握手完成时把**这次 WS 的**鉴权结论发下来；页面据此覆盖 hasToken。
+    expect(worker).toContain(']1989;write;');
+    const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
+    expect(panes).toContain('{ wsHasWrite?: unknown; hasToken?: unknown }');
+  });
+
   it('触屏读的那把钥匙是跨文件契约：终端页仍然导出同名的 hasToken 全局', () => {
     // 面板靠同源 iframe 里的 `window.hasToken` 判断这块终端到底能不能写
     // （readTerminalFrameWrite）。这个名字由 worker 渲染终端页时写下，两处必须
@@ -945,7 +1067,7 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     expect(worker).toContain('var hasToken=${hasWrite}');
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
-    expect(panes).toContain('{ hasToken?: unknown }');
+    expect(panes).toContain('hasToken?: unknown');
   });
 });
 

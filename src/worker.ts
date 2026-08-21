@@ -15903,6 +15903,15 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
+      // The page only knows the verdict of its own HTTP GET. This upgrade was a
+      // SECOND, independent authorization — and an iOS WebView does not send
+      // cookies on it, so the very same page can be judged writable over HTTP
+      // and read-only here. Tell the page what THIS socket actually got: it
+      // stops forwarding input it knows will be dropped, and reports the truth
+      // up to whatever embeds it (the Workbench terminal pane reads it to label
+      // the channel). OSC 1989 is the existing out-of-band channel on this
+      // stream; xterm swallows an unknown OSC, and the page strips it anyway.
+      try { ws.send(`\u001b]1989;write;${hasWrite ? 1 : 0}\u0007`); } catch { /* already closing */ }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
       // delayed or bypassed, the worker independently removes any granted
@@ -16335,6 +16344,11 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}
 var hasToken=${hasWrite};
+// hasToken 是**这一次 HTTP GET** 的判定，只当初值。真正说了算的是下面这条：worker 在
+// WebSocket 握手完成时把「这条连接实际拿到什么权限」发下来（OSC 1989 write），落成
+// wsHasWrite。两者会不一致——iOS WebView 的 WS 升级不带 Cookie，页面 HTTP 判可写、
+// WS 却只读，照抄 hasToken 就会让人对着一个不收字的终端打字。null = 还没连上。
+var wsHasWrite=null;
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
@@ -16412,6 +16426,37 @@ function _wbApplyAutoFontSize(){
   return true;
 }
 fit.fit();
+// 这条通道到底能不能写，以**已经建立的 WS** 为准（见页面顶部 wsHasWrite 那段注释）。
+// 结论一到手就做两件事：① 页面自己收起输入，别把注定被丢掉的字发出去；② 上抛给嵌入
+// 方（工作台终端面板据此显示「可输入 / 只读」，而不是照抄 HTTP 的 hasToken）。
+// 上抛的目标 origin 绝不用星号：优先取 location.ancestorOrigins（WebKit / Blink 都有，
+// iOS WebView 正是 WebKit），取不到就退回「父页给我们发外观消息时带的那个 origin」；
+// 两者都没有就不发——宁可不上抛，也不广播出去。
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+var _wbParentOrigin=null;
+try{
+  var _wbAo=window.location.ancestorOrigins;
+  if(_wbAo&&_wbAo.length&&_wbAo[0]&&_wbAo[0]!=='null')_wbParentOrigin=_wbAo[0];
+}catch(_e){}
+function _wbPostWrite(){
+  if(wsHasWrite===null||window.parent===window||!_wbParentOrigin)return;
+  try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
+}
+function _wbSetWsWrite(v){
+  var changed=wsHasWrite!==v;
+  wsHasWrite=v;
+  if(changed){
+    var _wb=document.getElementById('readonly-banner');
+    // 页面以为自己可写、这条连接其实只读：把只读横幅亮出来。反过来（连上后确认可写）
+    // 就把它收掉，别留一条与事实相反的提示。
+    if(_wb&&!platformReadonly){
+      if(!v&&hasToken)_wb.classList.add('show');
+      else if(v)_wb.classList.remove('show');
+    }
+  }
+  _wbPostWrite();
+}
 // 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
 // iframe 里，父页换 class / 换 CSS 变量都传不进来，配色只能靠 postMessage 递过来。
 // 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
@@ -16435,6 +16480,9 @@ window.addEventListener('message',function(_ev){
   if(_ev.source===window||_ev.source!==window.parent)return;
   var _d=_ev.data;
   if(!_d||_d.type!=='botmux:wb-appearance')return;
+  // 这一条消息本身就证明了父页的 origin（来源已经校验过是 window.parent）。
+  // ancestorOrigins 拿不到时（Firefox）靠它补上，并把攒着的写权限结论补发一次。
+  if(!_wbParentOrigin&&_ev.origin&&_ev.origin!=='null'){_wbParentOrigin=_ev.origin;_wbPostWrite();}
   var _theme=_wbSanitizeTheme(_d.theme);
   if(!_theme)return;
   try{
@@ -16631,7 +16679,9 @@ function _sendInput(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:
 var _MOTION_RE=/^(?:\\x1b\\[<(?:35|39|43|47|51|55|59|63);\\d+;\\d+[Mm])+$/;
 var _motionPend=null,_motionT=0;
 term.onData(function(d){
-  if(!hasToken){
+  // wsHasWrite===false：这条连接被判成只读了，无论页面自己怎么以为。继续发只会被
+  // worker 原地丢掉，屏幕上什么都不发生——那种「按键没反应」最难自查。
+  if(!hasToken||wsHasWrite===false){
     // Mouse escape sequences are input too: a TUI can bind clicks or wheel
     // events to actions. View links never forward terminal bytes.
     _showReadonlyToast();return;
@@ -16705,6 +16755,9 @@ if(typeof ResizeObserver!=='undefined'){
   ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    // 这条连接实际拿到的权限（worker 在握手完成时发的第一条）。剥掉再交给 xterm。
+    var _wsW=data.match(/\x1b\]1989;write;([01])\x07/);
+    if(_wsW){data=data.replace(_wsW[0],'');_wbSetWsWrite(_wsW[1]==='1');}
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
     // mostly-overlapping full screen. Preserve the reader's anchor when older
     // rows were prepended; otherwise preserve their current position/follow.
@@ -17059,6 +17112,8 @@ if(isTouch&&hasToken){
     var press=null;
     function fire(){
       if(!ws_||ws_.readyState!==1)return;
+      // 与 term.onData 同一条判据：这条连接只读时快捷键也别白发。
+      if(wsHasWrite===false){_showReadonlyToast();return;}
       var k=km[btn.getAttribute('data-k')];
       if(k)ws_.send(JSON.stringify({type:'input',data:k}));
     }
