@@ -85,6 +85,53 @@ describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
     expect(out[0]?.title).toBe('Late parser title');
   });
 
+  it('does not skip a customTitle that starts exactly at the tail boundary', async () => {
+    const tailBytes = 4 * 1024 * 1024;
+    const assistantLine = (content: string): string => JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content },
+    }) + '\n';
+    const prefix = JSON.stringify({
+      type: 'user',
+      cwd: '/root/boundary',
+      message: { role: 'user', content: 'initial prompt' },
+    }) + '\n';
+    const customTitleLine = JSON.stringify({
+      type: 'custom-title',
+      customTitle: 'Boundary title',
+    }) + '\n';
+    const fillerBytes = tailBytes - Buffer.byteLength(customTitleLine);
+    const emptyAssistantBytes = Buffer.byteLength(assistantLine(''));
+    expect(fillerBytes).toBeGreaterThanOrEqual(emptyAssistantBytes);
+    const fillerLine = assistantLine('x'.repeat(fillerBytes - emptyAssistantBytes));
+    expect(Buffer.byteLength(customTitleLine + fillerLine)).toBe(tailBytes);
+
+    const dir = join(dataDir, 'projects', '-root-boundary');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'tail-boundary.jsonl'), prefix + customTitleLine + fillerLine);
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Boundary title');
+  });
+
+  it('skips a genuinely truncated tail line before reading the next title', async () => {
+    const dir = join(dataDir, 'projects', '-root-truncated');
+    mkdirSync(dir, { recursive: true });
+    const oversizedAssistant = JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: 'x'.repeat(4 * 1024 * 1024) },
+    });
+    writeFileSync(join(dir, 'truncated-tail.jsonl'), [
+      JSON.stringify({ type: 'user', cwd: '/root/truncated', message: { role: 'user', content: 'prompt' } }),
+      oversizedAssistant,
+      JSON.stringify({ type: 'custom-title', customTitle: 'After truncated line' }),
+      '',
+    ].join('\n'));
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('After truncated line');
+  });
+
   it('falls back to the first real user prompt when customTitle is absent or invalid', async () => {
     writeSession('-root-proj', 'rename-fallback', [
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'the fallback prompt' } },

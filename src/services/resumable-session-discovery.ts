@@ -194,8 +194,8 @@ async function collectRecentJsonl(
 
 // ─── Claude-family JSONL (claude-code, seed, relay, genius) ──────────────────
 
-/** Scan a bounded tail for the latest valid customTitle. The first line may be
- *  truncated at the byte boundary, so it is skipped. */
+/** Scan a bounded tail for the latest valid customTitle. Skip the first line
+ *  only when the byte boundary cuts through it. */
 async function findLatestClaudeCustomTitle(path: string): Promise<string> {
   let stat;
   try {
@@ -206,6 +206,24 @@ async function findLatestClaudeCustomTitle(path: string): Promise<string> {
   if (stat.size <= 0) return '';
 
   const start = Math.max(0, stat.size - CLAUDE_CUSTOM_TITLE_TAIL_BYTES);
+  let skipFirstLine = false;
+  if (start > 0) {
+    let handle;
+    try {
+      handle = await fs.open(path, 'r');
+      const previous = Buffer.alloc(1);
+      const { bytesRead } = await handle.read(previous, 0, 1, start - 1);
+      // If the tail starts immediately after a newline, its first line is
+      // complete. Otherwise it is the residual of a line cut by the byte cap.
+      skipFirstLine = bytesRead !== 1 || previous[0] !== 0x0a;
+    } catch {
+      // Prefer dropping a possibly partial first line if the probe races with
+      // a rotated/unreadable transcript.
+      skipFirstLine = true;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
   const stream = createReadStream(path, {
     encoding: 'utf8',
     start,
@@ -214,13 +232,14 @@ async function findLatestClaudeCustomTitle(path: string): Promise<string> {
   stream.on('error', () => { /* handled via try/catch */ });
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
   let latest = '';
-  let first = start > 0;
+  let first = true;
   try {
     for await (const raw of rl) {
-      if (first) {
+      if (first && skipFirstLine) {
         first = false;
         continue;
       }
+      first = false;
       const rec = parseJsonRecord(raw);
       if (!rec || rec.isSidechain === true || typeof rec.customTitle !== 'string') continue;
       const title = truncateTitle(rec.customTitle);
