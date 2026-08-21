@@ -16700,12 +16700,17 @@ function _sendInput(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:
 var _MOTION_RE=/^(?:\\x1b\\[<(?:35|39|43|47|51|55|59|63);\\d+;\\d+[Mm])+$/;
 var _motionPend=null,_motionT=0;
 term.onData(function(d){
-  // wsHasWrite===false：这条连接被判成只读了，无论页面自己怎么以为。继续发只会被
-  // worker 原地丢掉，屏幕上什么都不发生——那种「按键没反应」最难自查。
-  if(!hasToken||wsHasWrite===false){
+  // 只有已建立的 WS 明确回报「可写」(wsHasWrite===true) 才放行输入。null（还没确认，
+  // 含重连中）和 false（这条连接判成只读）一律不发——桌面也要等首帧。照抄 hasToken
+  // （这一次 HTTP GET 的判定）会在 WS 不带 Cookie 的 iOS WebView 上让人对着一个不收字
+  // 的终端打字，按键石沉大海最难自查（第 17 点）。
+  if(wsHasWrite!==true){
     // Mouse escape sequences are input too: a TUI can bind clicks or wheel
     // events to actions. View links never forward terminal bytes.
-    _showReadonlyToast();return;
+    // 已经确定只读（这条连接判 false，或 HTTP GET 本来就没给写）才弹只读提示；null 是
+    // 还没连上的短暂过渡，此时 ws 多半也没 OPEN，静默丢弃即可，别闪一条与事实相反的只读。
+    if(!hasToken||wsHasWrite===false)_showReadonlyToast();
+    return;
   }
   if(_MOTION_RE.test(d)){
     // Trailing throttle: keep only the LATEST motion, flush every 90ms. Hover
@@ -17142,8 +17147,9 @@ if(isTouch&&hasToken){
     var press=null;
     function fire(){
       if(!ws_||ws_.readyState!==1)return;
-      // 与 term.onData 同一条判据：这条连接只读时快捷键也别白发。
-      if(wsHasWrite===false){_showReadonlyToast();return;}
+      // 与 term.onData 同一条判据：只有 WS 明确回报可写(wsHasWrite===true)才发；null
+      // （还没确认）与 false（只读）都不发，桌面也等首帧（第 17 点）。
+      if(wsHasWrite!==true){if(wsHasWrite===false)_showReadonlyToast();return;}
       var k=km[btn.getAttribute('data-k')];
       if(k)ws_.send(JSON.stringify({type:'input',data:k}));
     }

@@ -114,3 +114,54 @@ describe('工作台侧只认已建立的 WS（第 12 点）', () => {
     expect(readTerminalWriteReport(null)).toBeNull();
   });
 });
+
+/**
+ * 终端页的**输入门**：只有已建立的 WS 明确回报可写(wsHasWrite===true)才放行，null
+ * （还没确认 / 重连中）与 false（这条连接只读）一律不发（第 17 点）。
+ *
+ * 上面「工作台侧只认已建立的 WS」验的是**父页读数**（readTerminalFrameWrite）；这一
+ * 组钉的是**终端页自己发不发输入**——把 worker.ts 里 term.onData 与触屏 toolbar 那两处
+ * if 判据从源码抓出来直接跑真值表，抓的就是页面里真正那行逻辑，改回「只拦 ===false」
+ * 会立刻红。
+ */
+describe('终端页输入门只放行已确认可写的 WS（第 17 点）', () => {
+  const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+
+  // 从 worker.ts 源码里抓 anchor 之后那处对 wsHasWrite 的输入门判据，构造出「这一状态
+  // 放不放行」的真值函数——跑的是页面里真正那行 if，不是另写一份等价物。
+  function inputGate(anchor: string): (wsHasWrite: boolean | null) => boolean {
+    const at = worker.indexOf(anchor);
+    expect(at, `worker.ts 里应有 ${anchor}`).toBeGreaterThan(-1);
+    const region = worker.slice(at, at + 400);
+    const matched = region.match(/if\((wsHasWrite!==true)\)/);
+    expect(matched, `${anchor} 之后应以「只有 wsHasWrite===true 才放行」为输入门`).not.toBeNull();
+    const guard = matched![1];
+    // guard 为真 = 拦截；放行 = !guard。用 Function 把源码里那条判据原样跑起来。
+    // eslint-disable-next-line no-new-func
+    const blocks = new Function('wsHasWrite', `return (${guard});`) as (v: boolean | null) => boolean;
+    return (wsHasWrite) => !blocks(wsHasWrite);
+  }
+
+  it('term.onData 与触屏 toolbar：只有 wsHasWrite===true 放行，null/false 都拦', () => {
+    for (const anchor of ['term.onData(function(d){', 'function fire(){']) {
+      const allows = inputGate(anchor);
+      expect(allows(true)).toBe(true);   // WS 明确回报可写 → 放行
+      expect(allows(false)).toBe(false); // 明确只读 → 拦截
+      expect(allows(null)).toBe(false);  // 还没确认（含重连中）→ 拦截，桌面也等首帧
+    }
+  });
+
+  it('不再以「只拦 wsHasWrite===false」放行 hasToken=true & wsHasWrite=null 的盲打', () => {
+    const onData = worker.slice(
+      worker.indexOf('term.onData(function(d){'),
+      worker.indexOf('var fixedSize='),
+    );
+    // 拦截块（带 { 的那条 if）必须是新判据；输入放行由它把守，_sendInput 在其后。
+    expect(onData).toContain('if(wsHasWrite!==true){');
+    expect(onData.indexOf('if(wsHasWrite!==true){')).toBeLessThan(onData.indexOf('_sendInput(d);'));
+    // 回归的形状：旧门 `if(!hasToken||wsHasWrite===false){` 把守输入，hasToken=true &
+    // wsHasWrite=null 时照发，用户对着未确认连接盲打。注意：同样的判据现在只作为**只读
+    // 提示**的条件保留（不带 {、不 return），所以这里钉的是带 { 的那条拦截块已消失。
+    expect(onData).not.toContain('if(!hasToken||wsHasWrite===false){');
+  });
+});
