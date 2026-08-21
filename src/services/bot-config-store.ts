@@ -28,6 +28,12 @@ import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import {
+  CODEX_REASONING_EFFORTS,
+  codexModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
+  isCodexReasoningEffort,
+} from './codex-reasoning-effort.js';
 
 /**
  * 生效时机：
@@ -68,6 +74,7 @@ export interface ConfigFieldSpec {
 export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
+  { key: 'reasoningEffort', configKey: 'reasoningEffort', kind: 'enum', effect: 'next-session', clearable: true, enumValues: CODEX_REASONING_EFFORTS, hint: 'Codex 思考强度 low|medium|high|xhigh|max|ultra；可用档位取决于模型，unset 回 CLI/模型默认' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
   { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|fish|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；fish 用户把 PATH/nvm 放进 ~/.config/fish/config.fish，无需回填 bash/zsh；unset 回 $SHELL' },
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
@@ -223,6 +230,14 @@ export async function applyConfigField(
 
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
+  if (spec.configKey === 'reasoningEffort' && effective !== null) {
+    if (!isCodexReasoningCliId(bot.config.cliId) || !isCodexReasoningEffort(effective)) {
+      return { ok: false, reason: 'reasoning_effort_requires_codex' };
+    }
+    if (!codexModelSupportsReasoningEffort(bot.config.model, effective)) {
+      return { ok: false, reason: 'reasoning_effort_not_supported_by_model' };
+    }
+  }
 
   const r = await rmwBotEntry<null>(larkAppId, (entry) => {
     if (effective === null) {
@@ -235,6 +250,14 @@ export async function applyConfigField(
       entry[spec.configKey] = effective as any;
     } else {
       entry[spec.configKey] = effective;
+    }
+    if (spec.configKey === 'cliId' && !isCodexReasoningCliId(String(effective))) {
+      delete entry.reasoningEffort;
+    }
+    if (spec.configKey === 'model'
+        && isCodexReasoningEffort(entry.reasoningEffort)
+        && !codexModelSupportsReasoningEffort(typeof effective === 'string' ? effective : undefined, entry.reasoningEffort)) {
+      delete entry.reasoningEffort;
     }
     return { write: true, result: null };
   });
@@ -249,6 +272,14 @@ export async function applyConfigField(
     (bot.config as any)[spec.configKey] = effective;
   } else {
     (bot.config as any)[spec.configKey] = effective;
+  }
+  if (spec.configKey === 'cliId' && !isCodexReasoningCliId(String(effective))) {
+    bot.config.reasoningEffort = undefined;
+  }
+  if (spec.configKey === 'model'
+      && bot.config.reasoningEffort
+      && !codexModelSupportsReasoningEffort(typeof effective === 'string' ? effective : undefined, bot.config.reasoningEffort)) {
+    bot.config.reasoningEffort = undefined;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
   if (spec.configKey === 'feedback') {

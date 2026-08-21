@@ -83,6 +83,7 @@ describe('bot-config store', () => {
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys).toContain('allowedUsers');
     expect(keys).toContain('model');
+    expect(keys).toContain('reasoningEffort');
     expect(keys).not.toContain('repoPickerMode');
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
@@ -152,6 +153,51 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().model).toBeUndefined();
     expect(registry.getBot('app_default').config.model).toBeUndefined();
+  });
+
+  it('persists a model-compatible Codex reasoning effort and rejects invalid combinations', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex', model: 'gpt-5.6-luna' });
+    const spec = store.findConfigField('reasoningEffort')!;
+
+    expect(store.coerceConfigValue(spec, 'MAX')).toEqual({ ok: true, value: 'max' });
+    expect(store.coerceConfigValue(spec, 'extreme')).toEqual({ ok: false, reason: 'invalid_enum' });
+    expect(await store.applyConfigField('app_default', spec, 'max')).toMatchObject({ ok: true });
+    expect(readConfig().reasoningEffort).toBe('max');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('max');
+
+    expect(await store.applyConfigField('app_default', spec, 'ultra')).toEqual({
+      ok: false,
+      reason: 'reasoning_effort_not_supported_by_model',
+    });
+    expect(readConfig().reasoningEffort).toBe('max');
+
+    expect(await store.applyConfigField('app_default', spec, null)).toMatchObject({ ok: true });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('rejects reasoning effort for non-Codex bots and clears it when CLI/model becomes incompatible', async () => {
+    const nonCodex = await loaded({ cliId: 'claude-code' });
+    const effortSpec = nonCodex.store.findConfigField('reasoningEffort')!;
+    expect(await nonCodex.store.applyConfigField('app_default', effortSpec, 'high')).toEqual({
+      ok: false,
+      reason: 'reasoning_effort_requires_codex',
+    });
+
+    const { registry, store } = await loaded({
+      cliId: 'codex',
+      model: 'gpt-5.6-luna',
+      reasoningEffort: 'max',
+    });
+    expect(await store.applyConfigField('app_default', store.findConfigField('model')!, 'gpt-5.4')).toMatchObject({ ok: true });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+
+    await store.applyConfigField('app_default', store.findConfigField('model')!, 'gpt-5.6-luna');
+    await store.applyConfigField('app_default', effortSpec, 'max');
+    expect(await store.applyConfigField('app_default', store.findConfigField('cli')!, 'claude-code')).toMatchObject({ ok: true });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
   });
 
   it('displayName round-trips, fires the refresher hook, and clears on null', async () => {

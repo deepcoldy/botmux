@@ -241,6 +241,7 @@ async function runNodeImpl(
     cliId: req.botSnapshot.cliId,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     model: req.botSnapshot.model,
+    reasoningEffort: req.botSnapshot.reasoningEffort,
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,
