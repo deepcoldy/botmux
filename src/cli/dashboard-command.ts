@@ -1,3 +1,5 @@
+import { workbenchEntryUrl } from '../core/dashboard-url.js';
+
 import type { DashboardEndpoint, DashboardResult } from './dashboard-endpoint.js';
 
 export const DASHBOARD_COMMAND_USAGE = `用法:
@@ -18,6 +20,26 @@ function legacyEnsureRouteMissing(result: DashboardResult): boolean {
   if (result.reason === 'wrong-service') return true;
   return result.reason === 'http-error'
     && result.detail?.startsWith(LEGACY_ENSURE_TOKEN_GATE_PREFIX) === true;
+}
+
+/**
+ * `botmux dashboard` 成功时要打印的每一行，按顺序。
+ *
+ * ⚠️ 契约：**第 0 行永远是且只是那条 URL**，不带任何前缀、标签或修饰。脚本和用户
+ * 都靠「取第一行」拿链接（`botmux dashboard | head -1`）。往后追加行可以，动第一行
+ * 不行。
+ *
+ * 第二行是工作台直达入口（`<base>/workbench?t=<token>`）——`/workbench` 是
+ * Dashboard 上一个无 fragment 的入口，会 302 到 `/?t=…#/agent-workbench`
+ * （见 dashboard.ts）。它和第一行同源同 token，所以第一行能用它就能用；拼不出来
+ * （URL 不可解析）时这一行整行省略，不打印半截链接。
+ */
+export function formatDashboardSuccessLines(result: Extract<DashboardResult, { ok: true }>): string[] {
+  const lines = [result.url];
+  const workbench = workbenchEntryUrl(result.url);
+  if (workbench) lines.push(`工作台: ${workbench}`);
+  if (result.localUrl) lines.push(`本地直连(平台异常时可用): ${result.localUrl}`);
+  return lines;
 }
 
 export function formatDashboardFallbackFailure(

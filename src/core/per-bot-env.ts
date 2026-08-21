@@ -43,6 +43,15 @@ const RESERVED_ENV_KEYS = new Set<string>([
   '__OWNER_OPEN_ID',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
+  // The bots.json the CLI child loads. NOT covered by the `BOTMUX` prefix, and
+  // it is the TOP of the registry precedence chain — so a per-bot `env` setting
+  // it would let a bot REDIRECT THE REGISTRY THAT DEFINES IT: point it at an
+  // attacker-authored file and the child's `botmux send` resolves a different
+  // fleet (different appIds, different oncall chats, different brand label),
+  // while the host keeps believing it configured this bot. The daemon pins the
+  // exact path it loaded (see core/config-dir.ts resolveChildBotsConfig), so a
+  // per-bot value has no legitimate use.
+  'BOTS_CONFIG',
   // Claude session-identity markers (mirrors CLAUDE_SESSION_MARKER_ENV_KEYS in
   // utils/child-env.ts): explicitly configuring one would mark the bot's CLI
   // as a nested Claude child session (CLAUDE_CODE_CHILD_SESSION silently turns
@@ -56,6 +65,16 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'CLAUDE_PID',
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
+  // lark-cli keystore data root (Linux): `<value>/lark-cli` holds THIS bot's
+  // appsecret + the shared master key. The file sandbox freezes the keystore path
+  // from the worker's OWN process env value and denies the store (carving out only
+  // this bot's keys); a per-bot inject would (a) NOT reach a sandboxed child anyway
+  // (bwrap uses a --setenv allowlist that excludes it + the worker re-pins it), so
+  // it would be silently overridden — confusing — and (b) if it DID take effect on a
+  // non-sandboxed path, relocate the keystore out from under the frozen policy. So a
+  // per-bot `env` must not set it: reserve it (rejected + diagnosable), not silently
+  // accepted-then-ignored. The authoritative value is the worker's env.
+  'LARKSUITE_CLI_DATA_DIR',
   // Grok data root: daemon installs hooks/skills and drains transcripts under
   // the process-level GROK_HOME. A per-bot inject would only reach the child
   // CLI and split-brain path resolution (see grok-paths header).

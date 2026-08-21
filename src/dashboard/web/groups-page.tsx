@@ -1,3 +1,4 @@
+import { describeCloseResidual } from '../../core/close-residual.js';
 import {
   memo,
   useCallback,
@@ -14,6 +15,7 @@ import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -125,19 +127,25 @@ function DialogError(props: DialogErrorState) {
   );
 }
 
-function BotCheckboxes(props: { bots: GroupBot[]; excludeIds?: Set<string> }) {
+function BotCheckboxes(props: {
+  bots: GroupBot[];
+  excludeIds?: Set<string>;
+  tr: Translator;
+  selected: Set<string>;
+  onToggle(larkAppId: string, checked: boolean): void;
+}) {
+  const options = availableBotsForPicker(props.bots, props.excludeIds);
+  const tr = props.tr;
   return (
-    <>
-      {availableBotsForPicker(props.bots, props.excludeIds).map(bot => (
-        <label className="checkbox-row" key={bot.larkAppId}>
-          <input type="checkbox" name="bot" value={bot.larkAppId} />
-          <span className="checkbox-row-main">
-            <strong>{bot.botName ?? bot.larkAppId}</strong>
-            <small>({bot.larkAppId})</small>
-          </span>
-        </label>
-      ))}
-    </>
+    <BotMultiSelect
+      bots={options}
+      selected={props.selected}
+      onToggle={props.onToggle}
+      searchPlaceholder={tr('botPicker.searchPlaceholder')}
+      noMatchLabel={tr('botPicker.noMatch')}
+      emptyLabel={tr('botPicker.empty')}
+      selectedCountLabel={n => tr('botPicker.selectedCount', { n: String(n) })}
+    />
   );
 }
 
@@ -305,6 +313,7 @@ function CreateDialog(props: {
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [success, setSuccess] = useState<any | null>(null);
   const [copied, setCopied] = useState(false);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const [roleProfileId, setRoleProfileId] = useState('');
   const [feedGroups, setFeedGroups] = useState<FeedGroupOption[]>([]);
   const [feedGroupAppId, setFeedGroupAppId] = useState('');
@@ -393,7 +402,7 @@ function CreateDialog(props: {
     const name = String(fd.get('name') ?? '').trim();
     const bindWorkingDir = String(fd.get('bindWorkingDir') ?? '').trim();
     const roleProfileId = String(fd.get('roleProfileId') ?? '').trim();
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再创建群聊。' });
       return;
@@ -507,7 +516,16 @@ function CreateDialog(props: {
         <fieldset className="g-modal-field g-create-bots">
           <legend>{tr('groups.botPicker')}</legend>
           <div className="g-bot-picker">
-            <BotCheckboxes bots={props.bots} />
+            <BotCheckboxes
+              bots={props.bots}
+              tr={tr}
+              selected={selectedBots}
+              onToggle={(id, checked) => setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id); else next.delete(id);
+                return next;
+              })}
+            />
           </div>
         </fieldset>
 
@@ -628,7 +646,7 @@ function CreateInviteNote(props: { resp: any }) {
   );
 }
 
-function AddBotsDialog(props: {
+export function AddBotsDialog(props: {
   chat: GroupChat;
   bots: GroupBot[];
   tr: Translator;
@@ -639,6 +657,7 @@ function AddBotsDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [summary, setSummary] = useState<{ result: AddBotsSummary; refreshError?: unknown } | null>(null);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const inChatSet = useMemo(
     () => new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId)),
     [chat],
@@ -646,8 +665,7 @@ function AddBotsDialog(props: {
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
-    const fd = new FormData(ev.currentTarget);
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再添加。' });
       setSummary(null);
@@ -692,7 +710,17 @@ function AddBotsDialog(props: {
       <header><h3>{tr('groups.addBots')} · {chat.name ?? chat.chatId}</h3></header>
       <p>{tr('groups.createHelp')}</p>
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
-        <BotCheckboxes bots={props.bots} excludeIds={inChatSet} />
+        <BotCheckboxes
+          bots={props.bots}
+          excludeIds={inChatSet}
+          tr={tr}
+          selected={selectedBots}
+          onToggle={(id, checked) => setSelectedBots(prev => {
+            const next = new Set(prev);
+            if (checked) next.add(id); else next.delete(id);
+            return next;
+          })}
+        />
         <div data-add-status aria-live="polite">
           {error ? <DialogError {...error} /> : null}
           {summary ? (
@@ -1081,9 +1109,14 @@ function ManageDialog(props: {
         const closed = (x.closedSessions ?? []) as any[];
         const failed = closed.filter(c => !c.ok).length;
         const ok = closed.length - failed;
+        // Closed locally but the remote session survived: not a failure, but it
+        // must not disappear into the plain "closed N" tally.
+        const residuals = closed.filter(c => c.ok && c.residual)
+          .map(c => describeCloseResidual(c.residual));
         const note = closed.length === 0
           ? ''
-          : failed === 0 ? `（关闭 ${ok} 个会话）` : `（关闭 ${ok} 个，${failed} 个失败）`;
+          : `（关闭 ${ok} 个会话${failed ? `，${failed} 个失败` : ''}`
+            + `${residuals.length ? `，${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}）`;
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
       alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
@@ -1114,9 +1147,12 @@ function ManageDialog(props: {
           const closed = (respBody.closedSessions ?? []) as any[];
           const failed = closed.filter(c => !c.ok).length;
           const ok = closed.length - failed;
+          const residuals = closed.filter(c => c.ok && c.residual)
+            .map(c => describeCloseResidual(c.residual));
           const closedNote = closed.length === 0
             ? ''
-            : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
+            : `\n关闭了 ${ok} 个会话${failed ? `，${failed} 个会话关闭失败` : ''}`
+              + `${residuals.length ? `\n⚠️ ${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}。`;
           alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
           await props.onReloadGroups({ force: true });
           props.onClose();
@@ -1384,10 +1420,15 @@ function GroupsPage() {
     };
   }, [reloadGroups]);
 
-  const rows = useMemo(
+  // 会话群（p2pMode=group 自动创建，session-groups-store 分型标记）与常驻群
+  // 分开管理：主列表只展示常驻群，会话群收进下方折叠区——它们由 bot 自动
+  // 创建/命名/管理，数量随会话增长，混排会淹没真正需要人工管理的常驻群。
+  const allMatched = useMemo(
     () => filterGroupChats(snapshot.chats, filters),
     [snapshot.chats, filters],
   );
+  const rows = useMemo(() => allMatched.filter(c => !(c as any).sessionGroup), [allMatched]);
+  const sessionRows = useMemo(() => allMatched.filter(c => (c as any).sessionGroup), [allMatched]);
   const pageWindow = useMemo(
     () => paginateGroupRows(rows, page),
     [rows, page],
@@ -1556,6 +1597,28 @@ function GroupsPage() {
           </div>
         )}
       </section>
+      {!loading && sessionRows.length > 0 ? (
+        <details className="overview-block groups-session-section" open={!!filters.q} data-session-groups>
+          <summary style={{ cursor: 'pointer', padding: '10px 4px', fontWeight: 600, opacity: 0.85 }}>
+            🤖 {tr('groups.sessionSection')}（{sessionRows.length}）
+            <span style={{ fontWeight: 400, opacity: 0.7, marginLeft: 8 }}>{tr('groups.sessionSectionHint')}</span>
+          </summary>
+          <OverviewList id="g-session-body" className="groups-list">
+            {sessionRows.map(chat => (
+              <GroupListRow
+                chat={chat}
+                bots={snapshot.bots}
+                roleContext={roleContext}
+                tr={tr}
+                key={chat.chatId}
+                onAddBots={openAddBotsDialog}
+                onSaveProfile={openSaveProfileDialog}
+                onManage={openManageDialog}
+              />
+            ))}
+          </OverviewList>
+        </details>
+      ) : null}
       <DialogHost
         dialog={dialog}
         snapshot={snapshot}

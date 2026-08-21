@@ -289,17 +289,19 @@ describe('detectCliUsageLimit', () => {
   });
 });
 
-describe('isStructuredRateLimitAuthoritative — Claude-family only, not all reliableTurnTerminal', () => {
+describe('isStructuredRateLimitAuthoritative — structured-emit CLIs only, not all reliableTurnTerminal', () => {
   // This is the predicate the worker's structuredRateLimitAuthoritative()
-  // delegates to. Testing it directly (not the adapter.claudeDataDir field)
-  // means a regression that re-broadens the gate to reliableTurnTerminal — which
-  // would wrongly suppress screen-rate for codex/grok/traex/pi — turns this red.
+  // delegates to. Testing it directly (not the raw adapter fields) means a
+  // regression that re-broadens the gate to reliableTurnTerminal — which would
+  // wrongly suppress screen-rate for grok/traex/pi — turns this red.
   it('is true for the Claude family (they publish structured limited events)', () => {
     expect(isStructuredRateLimitAuthoritative(createClaudeCodeAdapter('/bin/claude'))).toBe(true);
     expect(isStructuredRateLimitAuthoritative(createGeniusAdapter('/bin/genius'))).toBe(true);
   });
-  it('is false for codexBridgeQueue CLIs (no structured limited emit → keep screen scan)', () => {
-    expect(isStructuredRateLimitAuthoritative(createCodexAdapter('/bin/codex'))).toBe(false);
+  it('is true for codex (maybeEmitCodexStructuredRateLimit publishes limited from codex_rate_limited)', () => {
+    expect(isStructuredRateLimitAuthoritative(createCodexAdapter('/bin/codex'))).toBe(true);
+  });
+  it('is false for codexBridgeQueue CLIs with no structured limited emit (keep screen scan)', () => {
     expect(isStructuredRateLimitAuthoritative(createGrokAdapter('/bin/grok'))).toBe(false);
     expect(isStructuredRateLimitAuthoritative(createTraexAdapter('/bin/traex'))).toBe(false);
     expect(isStructuredRateLimitAuthoritative(createPiAdapter('/bin/pi'))).toBe(false);

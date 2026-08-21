@@ -68,6 +68,24 @@ export interface HostOverloadAlertGlobalConfig {
   enterLoadRatio?: number;
   /** 进入过载的已用内存占比阈值(0..1)。缺省 0.92。退出线同样按 95% 派生。 */
   enterMemUsedFrac?: number;
+  /** 过载卡上「重启浏览器」按钮的可配置目标清单。缺省内置 Arc / Chrome / Edge
+   *  （见 core/browser-restart.ts 的 DEFAULT_BROWSER_TARGETS）。此处按 bundleId
+   *  合并覆盖：同 bundleId 覆盖 label/openArgs/enabled；新 bundleId 追加；
+   *  enabled:false 关闭某个默认项。绝不写死浏览器，加新浏览器只改配置。 */
+  browserRestartTargets?: HostOverloadBrowserTargetConfig[];
+}
+
+/** 单个可重启浏览器目标的配置项（全部可选，仅 bundleId 必填才生效）。 */
+export interface HostOverloadBrowserTargetConfig {
+  /** macOS CFBundleIdentifier，如 company.thebrowser.Browser。唯一定位键。 */
+  bundleId: string;
+  /** 卡片显示名，如 Arc / Chrome / Edge。缺省回退为 bundleId。 */
+  label?: string;
+  /** 重启时透传给 `open -b <id> --args …` 的额外参数（如 Chromium 的
+   *  --restore-last-session 强制恢复标签）。 */
+  openArgs?: string[];
+  /** 置 false 则该浏览器永不出现在卡片上（用于关掉某个默认项）。 */
+  enabled?: boolean;
 }
 
 export interface VcMeetingAgentGlobalConfig {
@@ -78,6 +96,19 @@ export interface VcMeetingAgentGlobalConfig {
   /** Optional bot app id that is allowed to own new VC meeting listeners. When
    *  unset, legacy per-bot vcMeetingAgent.enabled routing is preserved. */
   listenerBotAppId?: string;
+}
+
+export interface WorkflowFeatureGlobalConfig {
+  /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== false`
+   *  preserves the legacy behavior (feature ON). Set false to turn the whole
+   *  workflow feature off on this host: the `/workflow` grill + Saved-Workflow
+   *  run/save entries are refused, the `botmux-workflow` family of skills stops
+   *  being advertised/installed, and the CLI authoring/run subcommands refuse.
+   *  In-flight run management (cancel / retry / grant) stays available so a run
+   *  started before the flip can still be wound down. The multi-bot
+   *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
+   *  separate long-running-orchestration capability, not a v3 workflow. */
+  enabled?: boolean;
 }
 
 export interface GlobalConfig {
@@ -110,11 +141,22 @@ export interface GlobalConfig {
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
   vcMeetingAgent?: VcMeetingAgentGlobalConfig;
+  /** Machine-wide v3 Workflow kill-switch. Missing / enabled !== false keeps
+   *  the feature ON (legacy behavior); set false to disable it host-wide. The
+   *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
+  workflow?: WorkflowFeatureGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
    *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
   httpProxy?: string;
+  /** OAuth redirect base for user authorization (/login). When set (e.g.
+   *  `http://10.1.2.3:7891`, typically this host's dashboard origin), auth
+   *  links redirect to `<base>/oauth/callback`, which the dashboard receives
+   *  and completes automatically — the zero-copy-paste flow for daemons that
+   *  do NOT run on the user's own machine. Missing → the legacy
+   *  `http://127.0.0.1:9768/callback` paste-back flow. */
+  oauthRedirectBase?: string;
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;
@@ -435,7 +477,33 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
   ) {
     out.enterMemUsedFrac = value.enterMemUsedFrac;
   }
+  const browserTargets = readBrowserRestartTargets(value.browserRestartTargets);
+  if (browserTargets) out.browserRestartTargets = browserTargets;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Parse the `browserRestartTargets` array from config. Keep only entries with a
+ *  non-blank string bundleId; coerce the optional fields defensively so a
+ *  hand-edited config can't inject non-strings. Returns undefined when there's
+ *  nothing usable (so the default set applies). The daemon-side resolver
+ *  (core/browser-restart.ts) does the actual merge-over-defaults. */
+function readBrowserRestartTargets(raw: unknown): HostOverloadBrowserTargetConfig[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HostOverloadBrowserTargetConfig[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const v = item as Record<string, unknown>;
+    const bundleId = typeof v.bundleId === 'string' ? v.bundleId.trim() : '';
+    if (!bundleId) continue;
+    const entry: HostOverloadBrowserTargetConfig = { bundleId };
+    if (typeof v.label === 'string' && v.label.trim()) entry.label = v.label.trim();
+    if (Array.isArray(v.openArgs) && v.openArgs.every(a => typeof a === 'string')) {
+      entry.openArgs = v.openArgs as string[];
+    }
+    if (typeof v.enabled === 'boolean') entry.enabled = v.enabled;
+    out.push(entry);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefined {
@@ -446,6 +514,14 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
   }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WorkflowFeatureGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -515,7 +591,13 @@ export function readGlobalConfig(): GlobalConfig {
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
+  const workflow = readWorkflowFeature(raw.workflow);
+  if (workflow) out.workflow = workflow;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
+  // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
+  if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
+    out.oauthRedirectBase = raw.oauthRedirectBase.trim();
+  }
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
@@ -587,6 +669,28 @@ export function globalVcMeetingAgentListenerBotAppId(): string | undefined {
  *  URLs are emitted (see buildTerminalUrl / publicWebhookUrl). */
 export function isRemoteAccessEnabled(): boolean {
   return readGlobalConfig().remoteAccess === true;
+}
+
+/** Machine-wide v3 Workflow feature kill-switch.
+ *
+ * Missing / `workflow.enabled !== false` means ON (backwards compatible — the
+ * feature has always been on). An explicit `false` in `~/.botmux/config.json`
+ * disables it. The `BOTMUX_WORKFLOW_ENABLED` env var, when set to a non-empty
+ * value, OVERRIDES the config file either way (`true`/`1`/`yes`/`on` ⇒ enabled,
+ * anything else ⇒ disabled) — it is both the escape hatch if the config gate
+ * misfires and the channel the worker injects into CLI panes so a pane's
+ * `botmux workflow …` subcommand agrees with the daemon that spawned it.
+ *
+ * Read live off the short-TTL config cache so a dashboard toggle takes effect on
+ * the next session/turn without a daemon restart (mirrors whiteboardEnabled /
+ * isGlobalVcMeetingAgentEnabled). */
+export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_WORKFLOW_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().workflow?.enabled !== false;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

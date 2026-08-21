@@ -1,3 +1,4 @@
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -26,7 +27,7 @@ export const CONFIG_UNSET = '__unset__';
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -80,12 +81,19 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
     { action: 'config_set', field: 'lang', ...locVal }));
-  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）。chat 与
-  // 未设等价，故 chat 选项用 unset 哨兵：选它即清字段、回默认（扁平连续 DM），
-  // 避免把字面 'chat' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启
-  // 前后一致）。只有显式 'thread'（每条 DM 独立）才是需要落盘的值。
-  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'thread' ? 'thread' : CONFIG_UNSET,
-    [{ text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' }],
+  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）| group
+  //（每条 DM 自动建专属会话群）。chat 与未设等价，故 chat 选项用 unset 哨兵：
+  // 选它即清字段、回默认（扁平连续 DM），避免把字面 'chat' 写进 bots.json（与
+  // dashboard 下拉一致，/botconfig get 重启前后一致）。只有显式 'thread' /
+  // 'group' 才是需要落盘的值——回显同样按这三态，已配 group 不再错显为 chat。
+  runSelects.push(configSelect(
+    t('card.config.p2p.placeholder', undefined, locale),
+    data.p2pMode === 'thread' ? 'thread' : data.p2pMode === 'group' ? 'group' : CONFIG_UNSET,
+    [
+      { text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET },
+      { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' },
+      { text: t('card.config.p2p.group', undefined, locale), value: 'group' },
+    ],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
 
@@ -268,6 +276,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'gemini': 'Gemini',
   'genius': 'Genius',
   'opencode': 'OpenCode',
+  'opencode2': 'OpenCode 2',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -282,6 +291,8 @@ const cliDisplayNames: Record<CliId, string> = {
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
   'reasonix': 'Reasonix',
+  'dsh': 'DeepSeek Harness',
+  'mojo': 'Mojo',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -426,7 +437,13 @@ export function buildSessionCard(
       });
     }
   }
-  if (showManageButtons && !adoptMode && effectiveCliId !== 'riff') {
+  // No restart button for ANY remote CLI: the riff worker refuses the IPC
+  // (dead button), and the mojo worker EXECUTES it — cancelling the remote
+  // session and cold-booting a context-less replacement. The riff-only literal
+  // rendered a live remote-destruction button on mojo cards (fourth-round
+  // review, gate 1); the click handler also guards, this keeps the surface
+  // honest.
+  if (showManageButtons && !adoptMode && !isRemoteCliId(effectiveCliId)) {
     actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
@@ -486,13 +503,19 @@ export function buildSessionClosedCard(
   cliResumeCommand?: string | null,
   locale?: Locale,
   runtimeDisplayName?: string,
+  resumeStartsFresh?: boolean,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
     ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
+    : resumeStartsFresh
+      // The CLI can only resume a precise session id and none was persisted:
+      // resuming reactivates the topic's message route, but the next spawn
+      // starts a FRESH session — say so instead of implying history is back.
+      ? t('card.body.resume_starts_fresh', { cliName: escapeMd(cliName) }, locale)
+      : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
@@ -1009,9 +1032,12 @@ export function buildStreamingCard(
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // riff：远端任务后端没有可驱动的终端，PTY 快捷键只会变成内容为控制字符的
-  // follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  if (displayMode === 'screenshot' && cliId !== 'riff') {
+  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
+  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
+  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
+  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
+  // 以后再加远端 CLI 不会重复漏改。
+  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },
@@ -2413,6 +2439,8 @@ export interface AdoptPickerEntry {
   target?: string;
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
+  /** One-based position among history candidates, for same-screen disambiguation. */
+  candidateNumber?: number;
 }
 
 /** Deterministic key for a live adoptable session (tmux/herdr/zellij).
@@ -2465,18 +2493,19 @@ export function buildAdoptEntries(
       timeMs: s.startedAt,
     };
   });
-  const resume: AdoptPickerEntry[] = resumable.map((r) => {
+  const resume: AdoptPickerEntry[] = resumable.map((r, index) => {
     const project = r.cwd.split('/').pop() || r.cwd;
     return {
       key: `resume:${r.cliSessionId}`,
       kind: 'resume' as const,
       cliId: resumeCliId,
       ...(customName ? { cliDisplayName: customName } : {}),
-      title: r.title || r.cliSessionId.slice(0, 8),
+      title: r.title || project,
       project,
       cwd: r.cwd,
       sessionId: r.cliSessionId,
       timeMs: r.lastActivityAt || undefined,
+      candidateNumber: index + 1,
     };
   });
   return [...live, ...resume];
@@ -2597,7 +2626,7 @@ export function buildAdoptSelectCard(
   const labelKind    = t('card.adopt.field_kind',    undefined, locale);
   const labelCli     = t('card.adopt.field_cli',     undefined, locale);
   const labelDir     = t('card.adopt.field_dir',     undefined, locale);
-  const labelSession = t('card.adopt.field_session', undefined, locale);
+  const labelCandidate = t('card.adopt.field_candidate', undefined, locale);
   const labelTarget  = t('card.adopt.field_target',  undefined, locale);
   const selectedTag  = t('card.adopt.selected_tag',  undefined, locale);
   const selectedEntry = selectedKey ? filtered.find(e => e.key === selectedKey) : undefined;
@@ -2624,8 +2653,8 @@ export function buildAdoptSelectCard(
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
       `${labelDir}: \`${escapeMd(e.cwd)}\``,
-      `${labelSession}: \`${escapeMd(e.sessionId || sessionUnknown)}\``,
     ];
+    if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
     if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({

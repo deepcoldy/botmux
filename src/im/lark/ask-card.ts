@@ -224,12 +224,17 @@ export async function handleAskCardAction(
   // 新 Submit 路径：优先从按钮累积态提交；兼容旧 form_value 回调。
   // 同 ASK_SELECT_ACTION：accepted 时同步返回终态卡片。
   if (action === ASK_SUBMIT_ACTION) {
+    // 空提交二次确认标志。飞书按钮 value 回传只可靠保留字符串（对齐 settings-card 的
+    // next_value:'true' 与 toggle 的 String(i)），故按字符串判定；同时容忍真布尔，
+    // 兼容潜在的非飞书调用方。true = 用户已在 arm 卡片上再点了一次，允许空提交落地。
+    const confirmEmpty = value?.confirm_empty === 'true' || value?.confirm_empty === true;
     const formValue = data.action?.form_value ?? {};
     if (Object.keys(formValue).length > 0) {
       // 推断问题数量：找最大 qN 的 N+1
       const questionCount = guessQuestionCount(formValue);
       const selections = parseFormSelections(formValue, questionCount);
-      const outcome = submitAsk({ askId, nonce, by, selections });
+      const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty });
+      if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
       if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
       return settledCardResponse(askId, {
         kind: 'answered',
@@ -239,7 +244,11 @@ export async function handleAskCardAction(
         timedOut: false,
       });
     }
-    const outcome = submitAsk({ askId, nonce, by });
+    // 累积按钮路径。submitAsk 在鉴权 + nonce + 单选约束全过后，若「全多选且全空」返回
+    // needs_empty_confirm（防手滑）——空提交二次确认的判定全在 broker 内，卡片不再自行
+    // 预检（否则会绕过 nonce/canTalk，且需重复 mixed-question 规则）。
+    const outcome = submitAsk({ askId, nonce, by, confirmEmpty });
+    if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
     if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
     const updated = getAskSnapshot(askId);
     const answers = updated?.selections ?? updated?.questions.map(() => []) ?? [];
@@ -251,8 +260,28 @@ export async function handleAskCardAction(
       timedOut: false,
     });
   }
-
   return staleToast(locale);
+}
+
+/**
+ * 空提交二次确认的卡片响应：重渲染当前 pending ask，arm 一个红色「确认空提交」按钮
+ * + 警示条，并附 warning toast。
+ *
+ * 关键：必须包成 `{ card: { type: 'raw', data } }` —— event-dispatcher 的
+ * shapeCardActionResult 认「已整形响应」的标志是顶层 `toast`/`card`/`deferredCard`
+ * 之一；若把 card 字段摊在顶层再塞个 toast，它只认 toast、raw card 不会被 patch，
+ * 用户只看到 toast、arm 按钮不出现（外层整形契约）。这里同时带 card + toast，二者都生效。
+ */
+function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
+  const ask = getAskSnapshot(askId);
+  if (!ask) return staleToast(locale);
+  return {
+    card: {
+      type: 'raw',
+      data: JSON.parse(buildAskCard(ask, undefined, { confirmEmptyArmed: true })) as Record<string, unknown>,
+    },
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
 }
 
 /**
@@ -283,10 +312,11 @@ function settledCardResponse(askId: string, result: AskResult): Record<string, u
  *
  * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
  */
-export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
+export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   const locale = localeForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
+  const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 
   // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
   const metaDiv = {
@@ -353,17 +383,36 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult): string {
 
     if (requiresSubmit) {
       elements.push({ tag: 'hr' });
+      // 空提交二次确认：用户一个选项都没勾就点了提交，且至少有一问是多选（多选允许
+      // 「一个都不选」，但极可能是手滑）。第一次拦下来、渲染警示 + 把 Submit 按钮的
+      // value 打上 confirm_empty；用户再点一次才真正 settle 空答案。arm 态只活在按钮
+      // value 里（随卡片走），broker 不留状态，天然对 daemon 重启幂等。
+      if (confirmEmptyArmed) {
+        elements.push({
+          tag: 'div',
+          text: { tag: 'lark_md', content: t('card.ask.empty_warning', undefined, locale) },
+        });
+      }
       elements.push({
         tag: 'action',
         actions: [
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: t('card.ask.submit', undefined, locale) },
-            type: 'primary',
+            text: {
+              tag: 'plain_text',
+              content: confirmEmptyArmed
+                ? t('card.ask.submit_confirm_empty', undefined, locale)
+                : t('card.ask.submit', undefined, locale),
+            },
+            type: confirmEmptyArmed ? 'danger' : 'primary',
             value: {
               action: ASK_SUBMIT_ACTION,
               ask_id: ask.askId,
               nonce: ask.nonce,
+              // Feishu 按钮 value 只可靠地保留字符串（布尔/数字会被字符串化，见
+              // settings-card 的 `next_value:'true'` 约定 + toggle 的 `String(i)`）。
+              // 故 arm 标志用字符串 'true'，读取端按字符串判定。
+              ...(confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
             },
           },
         ],
@@ -455,6 +504,10 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
     case 'toggled':
       // 累积勾选，不弹 toast
       return undefined;
+    case 'needs_empty_confirm':
+      // 正常路径由 handleAskCardAction 提前拦成 arm 卡片响应，不会走到这里；
+      // 兜底给个 warning toast，避免静默。
+      return { toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) } };
   }
 }
 

@@ -1,0 +1,91 @@
+name: Cancel stale release approvals
+
+# 背景:Release workflow 的 `desktop` job（macOS 签名+公证）挂在 `environment:
+# macos-signing` 的人工审批 gate 上。GitHub 对「等待审批」的 pending 没有原生自动
+# 超时——job 的 timeout 不涵盖排队等审批的时间,environment 的 wait-timer 是「等 N
+# 分钟后自动放行」(反而会去发版),都不是我们要的「超期自动取消」。结果不想发
+# 桌面包时,run 会无限期停在 waiting(最长 30 天),在 deployments 页堆成一排。
+#
+# 本 workflow 每天跑一次,把 Release workflow 里 status=waiting 且创建超过阈值
+# (默认 24h)的 run 直接 cancel 掉。npm/GitHub Release 早在 release job 里发完了
+# (它不 needs desktop),所以 cancel 只终止那个干等的 macOS 签名,零副作用。
+# 想真出桌面包就在阈值时间内去点批准,或事后 workflow_dispatch 重跑 Release。
+
+on:
+  schedule:
+    # 每天一次(UTC 05:37,刻意避开整点分散负载)。cron 用 UTC。
+    - cron: '37 5 * * *'
+  workflow_dispatch:
+    inputs:
+      threshold_hours:
+        description: 取消早于这么多小时、仍在 waiting 的 Release run
+        required: false
+        default: '24'
+        type: string
+      dry_run:
+        description: 只列出会取消哪些、不实际取消
+        required: false
+        default: false
+        type: boolean
+
+# 取消其它 workflow 的 run 需要 actions: write。
+permissions:
+  actions: write
+
+concurrency:
+  group: cancel-stale-release-approvals
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel stale waiting Release runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # schedule 触发时没有 inputs → 回退到默认 24h / 非 dry-run。
+          THRESHOLD_HOURS: ${{ github.event.inputs.threshold_hours || '24' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          echo "threshold=${THRESHOLD_HOURS}h dry_run=${DRY_RUN}"
+
+          # 拉 Release workflow 当前处于 waiting(等审批)的 run。用 GitHub 服务端
+          # 时间算 age,避免 runner 时钟漂移。
+          RUNS_JSON=$(gh run list \
+            --workflow=release.yml \
+            --status=waiting \
+            --limit 100 \
+            --json databaseId,createdAt,displayTitle,headBranch,url)
+
+          COUNT=$(printf '%s' "$RUNS_JSON" | jq 'length')
+          echo "waiting Release runs: $COUNT"
+          if [ "$COUNT" = "0" ]; then
+            echo "Nothing waiting. Done."
+            exit 0
+          fi
+
+          NOW=$(date -u +%s)
+          CUTOFF=$(( THRESHOLD_HOURS * 3600 ))
+
+          # 逐个判断 age;超阈值的 cancel。用 jq 展开成 TSV(id \t createdAt \t ref \t title)。
+          printf '%s' "$RUNS_JSON" \
+            | jq -r '.[] | [.databaseId, .createdAt, .headBranch, (.displayTitle // "")] | @tsv' \
+            | while IFS=$'\t' read -r id created ref title; do
+                created_s=$(date -u -d "$created" +%s)
+                age=$(( NOW - created_s ))
+                age_h=$(( age / 3600 ))
+                if [ "$age" -ge "$CUTOFF" ]; then
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "[dry-run] WOULD cancel run $id (ref=$ref age=${age_h}h) \"$title\""
+                  else
+                    echo "Cancelling run $id (ref=$ref age=${age_h}h) \"$title\""
+                    # cancel 对 waiting 的 run 有效;失败不阻断其它(可能刚被人批准/取消)。
+                    gh run cancel "$id" || echo "  (cancel failed for $id — likely state changed, skipping)"
+                  fi
+                else
+                  echo "keep run $id (ref=$ref age=${age_h}h < ${THRESHOLD_HOURS}h)"
+                fi
+              done
+
+          echo "Sweep complete."

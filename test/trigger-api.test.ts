@@ -104,15 +104,17 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
-  it('accepts per-turn model + reasoningEffort overrides', () => {
-    const req = request();
-    req.options = { model: 'gpt-5.6-terra', reasoningEffort: 'high' };
-    expect(validateTriggerRequest(req).ok).toBe(true);
+  it('accepts per-turn model + every supported reasoningEffort override', () => {
+    for (const reasoningEffort of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
+      const req = request();
+      req.options = { model: 'gpt-5.6-terra', reasoningEffort };
+      expect(validateTriggerRequest(req).ok).toBe(true);
+    }
   });
 
   it('rejects an invalid reasoningEffort value', () => {
     const req = request();
-    (req.options as any) = { reasoningEffort: 'ultra' };
+    (req.options as any) = { reasoningEffort: 'extreme' };
     const v = validateTriggerRequest(req);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
@@ -199,6 +201,73 @@ describe('trigger request contract', () => {
     const req = request();
     req.options = { asyncReturnSessionId: true };
     expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
+  // ── turnIdempotencyKey (契約①, PR #71): follow-up async turn on an existing
+  //    session. Requires target.sessionId + asyncReturnSessionId, no wait/dryRun,
+  //    and is mutually exclusive with the fresh-session idempotencyKey. ──
+  it('accepts a well-formed turnIdempotencyKey on a follow-up async turn (target.sessionId + async)', () => {
+    const req = request();
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'bmx-123' };
+    req.options = { asyncReturnSessionId: true, turnIdempotencyKey: 'riff-turn-8a1f' };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
+  it('rejects an empty / whitespace-only / over-long / non-string turnIdempotencyKey', () => {
+    for (const turnIdempotencyKey of ['', '   ', 'k'.repeat(201), 42, {}]) {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1', sessionId: 'bmx-123' };
+      (req.options as any) = { asyncReturnSessionId: true, turnIdempotencyKey };
+      const v = validateTriggerRequest(req);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+  });
+
+  it('rejects turnIdempotencyKey + idempotencyKey together (mutually exclusive)', () => {
+    const req = request();
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'bmx-123' };
+    req.options = { asyncReturnSessionId: true, turnIdempotencyKey: 'tk', idempotencyKey: 'k' } as any;
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) {
+      expect(v.body.errorCode).toBe('bad_request');
+      // The PRECISE mutual-exclusion message must be reachable even WITH sessionId
+      // present — the check is hoisted above idempotencyKey's fresh-scope-lock so
+      // the latter can't mask it (riff #818 canary validation).
+      expect(v.body.error).toContain('mutually exclusive');
+    }
+    // Also holds with NO sessionId (idempotencyKey's shape is fine there, so only
+    // the mutual-exclusion check can reject).
+    const req2 = request();
+    req2.target = { kind: 'turn', botId: 'app1' };
+    req2.options = { asyncReturnSessionId: true, turnIdempotencyKey: 'tk', idempotencyKey: 'k' } as any;
+    const v2 = validateTriggerRequest(req2);
+    expect(v2.ok).toBe(false);
+    if (!v2.ok) expect(v2.body.error).toContain('mutually exclusive');
+  });
+
+  it('rejects turnIdempotencyKey WITHOUT target.sessionId (follow-up scope requires an existing session)', () => {
+    const req = request();
+    req.target = { kind: 'turn', botId: 'app1' }; // no sessionId
+    req.options = { asyncReturnSessionId: true, turnIdempotencyKey: 'tk' };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('rejects turnIdempotencyKey outside async scope (wait / dryRun / no async mode)', () => {
+    const cases: any[] = [
+      { asyncReturnSessionId: true, waitForFinalOutput: true, turnIdempotencyKey: 'tk' },
+      { asyncReturnSessionId: true, dryRun: true, turnIdempotencyKey: 'tk' },
+      { turnIdempotencyKey: 'tk' }, // no async response mode
+    ];
+    for (const options of cases) {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1', sessionId: 'bmx-123' };
+      (req.options as any) = options;
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
   });
 
   it('rejects non-boolean mode/gate flags (prevents validator/runtime scope divergence)', () => {

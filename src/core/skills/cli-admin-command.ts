@@ -12,6 +12,15 @@ import {
   removeInstalledSkill,
   updateInstalledSkill,
 } from '../../services/skill-registry-store.js';
+import { readSkillPackRegistry } from '../../services/skill-pack-store.js';
+import {
+  createSkillPack,
+  deleteSkillPack,
+  getSkillPack,
+  listSkillPacks,
+  updateSkillPack,
+  SkillPackStoreError,
+} from '../../services/skill-pack-store.js';
 import type { BotConfig } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { readGlobalConfig, mergeGlobalConfig } from '../../global-config.js';
@@ -21,7 +30,7 @@ import type { CliId } from '../../adapters/cli/types.js';
 import { discoverProjectSkills } from './discovery.js';
 import { resolveSkillPolicy } from './policy.js';
 import { analyzeSkillReferences, type SkillReferenceSummary } from './references.js';
-import type { SkillPackage, SkillSource } from './types.js';
+import type { SkillPackage, SkillPack, SkillSource } from './types.js';
 
 export interface AdminCommandResult {
   code: number;
@@ -133,6 +142,7 @@ function runResolve(args: string[]): AdminCommandResult {
     globalDelivery: globalSkills?.delivery,
     botPolicy: bot.skills,
     workingDir: cwd,
+    packs: readSkillPackRegistry().packs,
   });
   const lines = [
     `bot: ${bot.name ?? bot.larkAppId}`,
@@ -217,13 +227,17 @@ function runDiscover(args: string[]): AdminCommandResult {
   const parsed = parseSkillInstallSource(source);
   let discovery: ReturnType<typeof discoverLocalSkillCandidates>;
   if (parsed.kind === 'local') {
-    discovery = discoverLocalSkillCandidates(parsed.value, { fullDepth });
+    discovery = discoverLocalSkillCandidates(parsed.value, {
+      fullDepth,
+      fallbackToFullDepth: !fullDepth,
+    });
   } else if (parsed.kind === 'git') {
     discovery = discoverGitSkillCandidates({
       url: parsed.value,
       ref: argValue(args, '--ref'),
       path: argValue(args, '--path'),
       fullDepth,
+      fallbackToFullDepth: !fullDepth,
     });
   } else {
     const gh = parsed.github;
@@ -233,6 +247,7 @@ function runDiscover(args: string[]): AdminCommandResult {
       ref: argValue(args, '--ref') ?? gh.ref,
       path: argValue(args, '--path') ?? gh.path,
       fullDepth,
+      fallbackToFullDepth: !fullDepth,
     });
   }
   if (hasFlag(args, '--json')) return { code: 0, stdout: JSON.stringify(discovery, null, 2) + '\n', stderr: '' };
@@ -247,14 +262,134 @@ function findSkillReferences(skillName: string): SkillReferenceSummary {
   } catch {
     // CLI commands can run before bots.json exists; skip bot refs in that case.
   }
-  return analyzeSkillReferences(skillName, { bots });
+  let packs: Record<string, SkillPack> | undefined;
+  try {
+    packs = readSkillPackRegistry().packs;
+  } catch {
+    // packs.json may be absent or unreadable; fall back to direct-only analysis.
+  }
+  return analyzeSkillReferences(skillName, { bots, packs });
 }
 
 function formatSkillReferenceWarning(refs: SkillReferenceSummary): string {
   const lines = ['skill_in_use'];
   if (refs.bots.length > 0) lines.push(`bots: ${refs.bots.map((bot) => bot.botName).join(', ')}`);
+  if (refs.packs.length > 0) lines.push(`packs: ${refs.packs.join(', ')}`);
   lines.push('use --force to remove anyway');
   return lines.join('\n') + '\n';
+}
+
+function packUsage(): string {
+  return [
+    'usage:',
+    '  botmux skills pack list',
+    '  botmux skills pack show <id>',
+    '  botmux skills pack create --id <slug> --name <name> [--description <text>] [--tag <t>]... --skill <name>...',
+    '  botmux skills pack update <id> [--name <name>] [--description <text>] [--tag <t>]... [--skill <name>]... [--expected-revision <n>]',
+    '  botmux skills pack delete <id> [--force]',
+  ].join('\n') + '\n';
+}
+
+function botsReferencingPack(packId: string): string[] {
+  const selector = `pack:${packId}`;
+  let bots: BotConfig[] = [];
+  try { bots = loadBotConfigs(); } catch { return []; }
+  return bots
+    .filter((bot) => Array.isArray(bot.skills?.include) && bot.skills!.include!.includes(selector as any))
+    .map((bot) => bot.name ?? bot.larkAppId)
+    .sort();
+}
+
+function runPackCommand(args: string[]): AdminCommandResult {
+  const sub = args[0];
+  if (!sub || sub === 'list') {
+    const packs = listSkillPacks();
+    if (packs.length === 0) return { code: 0, stdout: 'no packs\n', stderr: '' };
+    const lines = packs.map((pack) => {
+      const refs = botsReferencingPack(pack.id).length;
+      return `${pack.id}\t${pack.name}\t${pack.include.length} skills\t${refs} bots\t${pack.tags?.join(',') ?? ''}`.trimEnd();
+    });
+    return { code: 0, stdout: lines.join('\n') + '\n', stderr: '' };
+  }
+
+  if (sub === 'show') {
+    const id = args[1];
+    if (!id) return { code: 2, stdout: '', stderr: 'usage: botmux skills pack show <id>\n' };
+    const pack = getSkillPack(id);
+    if (!pack) return { code: 1, stdout: '', stderr: 'pack not found\n' };
+    return { code: 0, stdout: JSON.stringify(pack, null, 2) + '\n', stderr: '' };
+  }
+
+  if (sub === 'create') {
+    const id = argValue(args, '--id');
+    const name = argValue(args, '--name');
+    if (!id || !name) return { code: 2, stdout: '', stderr: packUsage() };
+    const skills = argValues(args, '--skill');
+    if (skills.length === 0) return { code: 2, stdout: '', stderr: 'error: at least one --skill is required\n' };
+    try {
+      const pack = createSkillPack({
+        id,
+        name,
+        description: argValue(args, '--description'),
+        tags: argValues(args, '--tag'),
+        include: skills.map((s) => `skill:${s}` as `skill:${string}`),
+      });
+      return { code: 0, stdout: `created ${pack.id} (revision ${pack.revision})\n`, stderr: '' };
+    } catch (err) {
+      return { code: 1, stdout: '', stderr: packErrorText(err) };
+    }
+  }
+
+  if (sub === 'update') {
+    const id = args[1];
+    if (!id) return { code: 2, stdout: '', stderr: 'usage: botmux skills pack update <id> [flags]\n' };
+    const skills = argValues(args, '--skill');
+    const expectedRevisionRaw = argValue(args, '--expected-revision');
+    try {
+      const pack = updateSkillPack(id, {
+        name: argValue(args, '--name'),
+        description: argValue(args, '--description'),
+        tags: hasFlag(args, '--tag') ? argValues(args, '--tag') : undefined,
+        include: skills.length > 0 ? skills.map((s) => `skill:${s}` as `skill:${string}`) : undefined,
+        expectedRevision: expectedRevisionRaw !== undefined ? Number(expectedRevisionRaw) : undefined,
+      });
+      return { code: 0, stdout: `updated ${pack.id} (revision ${pack.revision})\n`, stderr: '' };
+    } catch (err) {
+      return { code: 1, stdout: '', stderr: packErrorText(err) };
+    }
+  }
+
+  if (sub === 'delete') {
+    const id = args[1];
+    if (!id) return { code: 2, stdout: '', stderr: 'usage: botmux skills pack delete <id> [--force]\n' };
+    const refs = botsReferencingPack(id);
+    if (!hasFlag(args, '--force') && refs.length > 0) {
+      return { code: 1, stdout: '', stderr: `pack_in_use\nbots: ${refs.join(', ')}\nuse --force to remove anyway\n` };
+    }
+    try {
+      deleteSkillPack(id);
+      return { code: 0, stdout: `deleted ${id}\n`, stderr: '' };
+    } catch (err) {
+      return { code: 1, stdout: '', stderr: packErrorText(err) };
+    }
+  }
+
+  return { code: 2, stdout: '', stderr: packUsage() };
+}
+
+function packErrorText(err: unknown): string {
+  if (err instanceof SkillPackStoreError) {
+    const d = err.detail;
+    switch (d.code) {
+      case 'SKILL_PACK_NOT_FOUND': return `pack not found: ${d.id}\n`;
+      case 'SKILL_PACK_ID_CONFLICT': return `pack id already exists: ${d.id}\n`;
+      case 'SKILL_PACK_REVISION_CONFLICT': return `revision conflict: current is ${d.current}\n`;
+      case 'SKILL_PACK_INVALID_SELECTOR': return `invalid selector: ${d.selector}\n`;
+      case 'SKILL_PACK_INVALID': return `invalid: ${d.reason}\n`;
+      default: return `${d.code}\n`;
+    }
+  }
+  return err instanceof Error ? `${err.message}\n` : `${String(err)}\n`;
 }
 
 export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
@@ -336,7 +471,7 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
       if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skills remove <name> [--force]\n' };
       if (!readSkillRegistry().skills[name]) return { code: 1, stdout: '', stderr: 'skill_not_installed\n' };
       const refs = findSkillReferences(name);
-      if (!hasFlag(args, '--force') && refs.bots.length > 0) {
+      if (!hasFlag(args, '--force') && (refs.bots.length > 0 || refs.packs.length > 0)) {
         return { code: 1, stdout: '', stderr: formatSkillReferenceWarning(refs) };
       }
       const result = removeInstalledSkill(name);
@@ -359,6 +494,9 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
     }
     if (sub === 'injection') {
       return runInjection(args.slice(1));
+    }
+    if (sub === 'pack') {
+      return runPackCommand(args.slice(1));
     }
     return { code: 2, stdout: '', stderr: `unknown skills command: ${sub}\n` };
   } catch (err: any) {

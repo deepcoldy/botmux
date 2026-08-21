@@ -1,5 +1,6 @@
 import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
+import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
 
 export type CliOption = {
   id: string;
@@ -57,6 +58,9 @@ export type BotDefaultsRow = {
   cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
+  turnTimeoutMs?: number;
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
@@ -85,14 +89,23 @@ export type BotDefaultsRow = {
   summaryMemory?: boolean;
   summaryMemoryPath?: string;
   p2pMode?: string;
+  /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
+  envelopeInjection?: 'auto' | 'off' | null;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;
+  feedback?: FeedbackPolicyLayer | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  sessionOwnerReminder?: {
+    enabled: boolean;
+    intervalMinutes: number;
+    text: string;
+    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
+  } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   canTalkDaemonCommands?: string;
@@ -104,6 +117,7 @@ export type BotDefaultsRow = {
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
+  p2pOpen?: boolean;
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;

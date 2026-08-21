@@ -86,8 +86,22 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(flatKeys[fi + 1]).toBe('oh-my-pi');
   });
 
-  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {
-    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
+  it('cascades OpenCode into one submenu of OpenCode + OpenCode 2 (no top-level opencode2)', () => {
+    const opencode = CLI_SELECT_TREE.find((g) => g.key === 'opencode');
+    expect(opencode?.label).toBe('OpenCode');
+    expect(opencode?.children?.map((c) => c.key)).toEqual(['opencode', 'opencode2']);
+    expect(opencode?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'opencode2')).toBeUndefined();
+    expect(resolveCliSelection('opencode')).toEqual({ cliId: 'opencode' });
+    expect(resolveCliSelection('opencode2')).toEqual({ cliId: 'opencode2' });
+    // flat list: both resolvable, opencode2 folded right under opencode
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('opencode');
+    expect(keys).toContain('opencode2');
+    expect(keys.indexOf('opencode2')).toBe(keys.indexOf('opencode') + 1);
+  });
+
+  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
     expect(mira?.children?.map((c) => c.key)).toEqual(['mira', 'mir']);
     expect(mira?.option).toBeUndefined();
     // mir is no longer a separate top-level entry — it lives under the Mira group.

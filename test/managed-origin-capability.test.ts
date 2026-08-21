@@ -42,7 +42,9 @@ describe('managed origin capability transport', () => {
     const dir = makeDir();
     const sessionId = '../session/private';
     const path = managedOriginCapabilityPath(dir, sessionId, G1);
-    expect(path).toMatch(/\/read-isolation\/origin-[a-f0-9]{64}\.json$/);
+    expect(path).toMatch(
+      /\/read-isolation\/origin-[a-f0-9]{64}\/\.botmux-origin-capability\.json$/,
+    );
     expect(path).not.toContain(sessionId);
     expect(managedOriginCapabilityPath(dir, 'another-session', G1)).not.toBe(path);
     expect(managedOriginCapabilityPath(dir, sessionId, G2)).not.toBe(path);

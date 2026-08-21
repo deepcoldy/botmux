@@ -80,6 +80,69 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
   return '';
 }
 
+/** Provider-neutral terminal semantics derived from one Claude transcript
+ * event. The classifier is deliberately fail-closed: an `unknown` API error is
+ * retryable only when its bounded text matches a verified transient signature. */
+export type ClaudeTerminalOutcome =
+  | { status: 'completed' }
+  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | { status: 'ambiguous'; errorCode: string; retryable: false }
+  | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
+
+function normalizedApiErrorCode(ev: TranscriptEvent): string {
+  return String(ev.error ?? '').trim().toLowerCase();
+}
+
+function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
+  return pattern.test(apiErrorMessageText(ev));
+}
+
+export function classifyClaudeTerminalEvent(
+  ev: TranscriptEvent,
+): ClaudeTerminalOutcome | undefined {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return undefined;
+  if (isTranscriptRateLimitEvent(ev)) {
+    return {
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    };
+  }
+  if (ev.isApiErrorMessage === true) {
+    const code = normalizedApiErrorCode(ev);
+    const status = ev.apiErrorStatus;
+    if (code.includes('auth') || status === 401 || status === 407) {
+      return { status: 'failed', errorCode: 'provider_authentication_failed', retryable: false };
+    }
+    if (code.includes('permission') || code.includes('authorization') || status === 403) {
+      return { status: 'failed', errorCode: 'provider_permission_denied', retryable: false };
+    }
+    if (code.includes('invalid') || code.includes('terms')
+      || (typeof status === 'number' && status >= 400 && status <= 499)) {
+      return { status: 'failed', errorCode: 'provider_invalid_request', retryable: false };
+    }
+    if (code.includes('cancel')) {
+      return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
+    }
+    if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
+      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+    }
+    if (code === 'server_error'
+      || (typeof status === 'number' && status >= 500 && status <= 599)
+      || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
+      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+    }
+    return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
+  }
+  if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return undefined;
+  const reason = ev.message?.stop_reason;
+  if (typeof reason !== 'string' || reason.length === 0
+    || reason === 'tool_use' || reason === 'pause_turn') return undefined;
+  return { status: 'completed' };
+}
+
 /**
  * Authoritative Claude Code end-of-turn markers observed in its JSONL:
  *
@@ -220,11 +283,10 @@ export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEv
   return events.filter(e => {
     if (!e || typeof e !== 'object') return false;
     if ((e as any).isSidechain === true) return false;
-    // The rate_limit API-error record is surfaced as a `limited` state, not a
-    // reply — drop it so its text ("... resets 10:40pm") isn't forwarded as an
-    // assistant answer. Other API errors (server_error / auth / the terms 400)
-    // have no dedicated surface, so they are still forwarded as their text.
-    if (isTranscriptRateLimitEvent(e)) return false;
+    // API-error lines are execution metadata rather than assistant answers.
+    // The bridge emits a structured terminal outcome (or the existing limited
+    // state) and daemon-owned recovery/attention provides user visibility.
+    if (e.isApiErrorMessage === true || isTranscriptRateLimitEvent(e)) return false;
     const role = e.message?.role ?? e.type;
     if (role !== 'assistant') return false;
     if (!e.uuid) return false;

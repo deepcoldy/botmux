@@ -86,11 +86,15 @@ function makeDocDs(sessionId: string, fileToken = 'doccnFILE'): DaemonSession {
 }
 
 describe('document-comment routing generation primitives', () => {
+  // The first daemon.js dynamic import pays the whole module-graph transform
+  // cost; under full-suite fork parallelism that can exceed the 10s default
+  // hookTimeout (the unit project only raises testTimeout). Align the hook
+  // budget with the project's 30s testTimeout.
   beforeEach(async () => {
     const daemon = await import('../src/daemon.js');
     daemon.__testOnly_activeSessions.clear();
     daemon.__testOnly_resetDocCommentClaims();
-  });
+  }, 30_000);
 
   it('accepts only the exact map occupant, Session object, route, and active status', async () => {
     const daemon = await import('../src/daemon.js');
@@ -409,7 +413,7 @@ describe('document-comment routing integration', () => {
     expect(region).toMatch(/const generation = captureRoutingGeneration\(ds\);[\s\S]*await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'prewarm:sender'\)/);
     const guard = region.indexOf("ensureCurrentRoutingGeneration(generation, 'prewarm:sender')");
     expect(guard).toBeGreaterThanOrEqual(0);
-    expect(region.indexOf('beginNewTurn(ds, title)')).toBeGreaterThan(guard);
+    expect(region.indexOf('beginNewTurn(ds, title, turnId)')).toBeGreaterThan(guard);
     expect(region.indexOf('sendWorkerInput(ds, cliInput', guard)).toBeGreaterThan(guard);
     expect(region.indexOf('forkWorker(ds, wrappedInput', guard)).toBeGreaterThan(guard);
   });

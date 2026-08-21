@@ -17,6 +17,10 @@ import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
   messageId: string;      // Lark message_id for PATCHing
+  /** Stable visible destination of this card (`plain:oc_*`, `thread:om_*`, or
+   *  `quote:om_*`). Chat-scope sessions can move between multiple Lark topics;
+   *  cleanup must only withdraw predecessors from the same destination. */
+  replyTargetKey?: string;
   content: string;        // frozen text snapshot — kept so "导出文字" still works on historical cards
   title: string;          // turn title at freeze time
   /** Legacy boolean expand/collapse — kept for migrating old persisted cards. */
@@ -83,6 +87,67 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /**
+   * Unprovable launcher-env keys this worker generation was ever HANDED, kept as
+   * a monotonically growing set for the life of the generation.
+   *
+   * `initConfig.env` is only written at spawn/refork, and a live `/restart`
+   * updates the worker's own copy without touching it — so neither the spawn-time
+   * snapshot nor the current live bot config can answer "what is the running
+   * child actually executing?". Three-phase counter-example: start clean → add
+   * `LD_PRELOAD` and `/restart` (child now hooked) → clear the config WITHOUT
+   * restarting. Both observable layers read clean while the child stays hooked,
+   * and the device-isolation proof wrongly returned safe_remote.
+   *
+   * Monotonic on purpose: a value is only ever removed by starting a brand-new
+   * worker generation (spawn/refork clears it). Clearing it when a *clean*
+   * restart is merely SENT would reintroduce the same amnesia, because a restart
+   * can fail or be coalesced and leave the dangerous child running.
+   *
+   * Only key NAMES are stored — never values — since the proof inspects names
+   * only and these keys can carry credentials.
+   */
+  mojoAppliedUnprovableEnvKeys?: string[];
+  /**
+   * Same ledger, inherited from EVERY previous generation of this session.
+   *
+   * `forkWorker`'s double-fork guard sends `close` + `kill()` and then continues
+   * synchronously to spawn the replacement — it never awaits the old worker's
+   * exit. And even that exit would not be enough: the dangerous env acts on the
+   * mojo CLI *child*, whose `kill()` is a bare SIGTERM with no escalation and no
+   * wait, which a trapping/detached child survives (its descendants too). So no
+   * observable exit signal proves the injected process is gone.
+   *
+   * Therefore monotonic for the life of the DaemonSession: parked on every
+   * generation boundary, never released. Being in-memory, it disappears only when
+   * the session ends or the daemon restarts. Cost: a session ever handed a
+   * dangerous launcher env stays unprovable until it ends — an availability
+   * trade, not a credential leak.
+   */
+  mojoRetiringUnprovableEnvKeys?: string[];
+  /** Per-session snapshot of the final-answer feedback policy. New config takes
+   * effect on the next new/restarted session, matching sandbox send-cred state. */
+  feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
+  /** Explicit per-trigger model override (trigger API `options.model`, codex
+   *  family only). Outranks the bot's configured model at spawn; everything
+   *  else resolves the model from the LIVE bot config on every spawn (see
+   *  sessionAgentConfig), so a dashboard edit reaches long sessions.
+   *
+   *  **In-memory only, deliberately.** The public contract is per-trigger /
+   *  fresh-spawn ("ignored when folding into an existing worker"), so it must
+   *  not outlive this daemon's view of the session: persisting it — which is
+   *  what the old `session.model` freeze did — turned a one-shot caller choice
+   *  into a permanent override that a later dashboard change could not undo.
+   *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
+   *  re-fork of the same session launches identically. */
+  spawnModelOverride?: string;
+  /** True while this session's worker sits in the crash-loop park state: its CLI
+   *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
+   *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
+   *  no restart IPC to refresh it. While set, message IPCs carry the freshly
+   *  resolved launch model so that recovery does not relaunch on a stale one.
+   *  Cleared when a worker generation reports ready. In-memory only. */
+  crashDiagnosticParked?: boolean;
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
@@ -179,7 +244,7 @@ export interface DaemonSession {
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
-  /** Sender (open_id + type + resolved name) of the initial message — stashed
+  /** Sender (open_id + type + resolved name/email) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
@@ -211,10 +276,26 @@ export interface DaemonSession {
      * were staged. Migration must preserve that exact sidecar decision. */
     codexAppInputGateFrozen?: true;
   }>;
-  ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
+  /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
+   *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
+  ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
-  streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  /** Visible Lark destination of the live streaming card. Unlike
+   * currentReplyTarget this remains bound to the card after a newer turn is
+   * accepted, so parking cannot attribute the predecessor to the new topic. */
+  streamCardReplyTargetKey?: string;
+  streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
+  /** Incremented for every worker status observation, including same-value
+   *  edges. A screen update can land while the Feishu starting-card POST is
+   *  in flight; the revision lets the POST completion distinguish that from
+   *  the pre-turn cached idle state and immediately reconcile the new card. */
+  streamCardStatusRevision?: number;
+  /** Monotonic in-memory generation for accepted user turns. Card POST
+   * completions use it to avoid clearing a newer turn's pending state. */
+  streamCardTurnGeneration?: number;
+  /** Exact newest turn awaiting its own streaming card. In-memory only. */
+  streamCardPendingTurnId?: string;
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
@@ -261,6 +342,21 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;
+  /** Queued suspend: the request arrived while the session was producing
+   *  (working/analyzing), where killing the worker would drop that turn's reply.
+   *  Record the reason instead and cash it in once screen_update settles into
+   *  idle/limited (see worker-pool.ts runPendingSuspendIfSettled). In-memory
+   *  only: lost on daemon restart, and the next `suspend all` cycle re-queues
+   *  it — the cost is one cycle of delay, not a missed session. */
+  pendingSuspendReason?: string;
+  /** Worker generation that owned the queued suspend above. A claim is only
+   *  ever about the generation that was producing when the request arrived, so
+   *  it must not outlive it: once that worker is suspended (by ANY path) or
+   *  exits, the goal state is reached and the claim is consumed. Without this,
+   *  a claim whose fulfilment checkpoint never ran (worker crashed, or `/cd` /
+   *  read-isolation switch suspended first) survives into the NEXT generation
+   *  and suspends it on its first idle. See clearPendingSuspendClaim. */
+  pendingSuspendGeneration?: number;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */
@@ -273,15 +369,19 @@ export interface DaemonSession {
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
-  /** Explicit-close transaction: while present, no new Riff input may be
+  /** Remote explicit-close transaction: while present, no new input may be
    * admitted until cancellation commits or admission restoration is ACKed. */
-  riffCloseState?: {
-    phase: 'preparing' | 'prepared' | 'uncertain';
+  remoteCloseState?: {
+    phase: 'preparing' | 'prepared' | 'abort_restored' | 'uncertain';
     requestId: string;
     taskId?: string;
+    /** LOCAL subtree residual carried by a `prepared` proof, so a retry after a
+     *  failed durable commit republishes the SAME residual close instead of
+     *  degrading it to a plain `closed` (see Session.mojoCloseJournal). */
+    localResidual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
   };
-  /** Graceful-shutdown transaction for the exact Riff worker generation. */
-  riffShutdownState?: {
+  /** Graceful-shutdown transaction for the exact remote worker generation. */
+  remoteShutdownState?: {
     phase: 'preparing' | 'prepared';
     requestId: string;
     taskId?: string | null;
@@ -315,10 +415,13 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed';
+    status: 'pending' | 'completed' | 'failed';
     createdAt: number;
     completedAt?: number;
+    failedAt?: number;
     content?: string;
+    errorCode?: 'trigger_failed';
+    terminalErrorCode?: string;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
@@ -329,16 +432,33 @@ export interface DaemonSession {
    *  ds.worker=null but keeps the session in activeSessions + the async record
    *  `pending`, which would otherwise poll `running` forever and let a same-key
    *  retry reuse the dead session until the next daemon reconcile (codex #776
-   *  round-6 finding #1). Cleared once the turn completes (final_output). */
-  idempotentAsyncTurn?: {
+   *  round-6 finding #1). Keyed by triggerId so MULTIPLE concurrent keyed turns
+   *  on ONE shared session each get their own convergence stamp — a single slot
+   *  let a later turn's stamp clobber an earlier turn's, stranding the earlier
+   *  turn `pending` forever on worker exit (codex #818 P1-1). Each entry is
+   *  removed once its OWN turn completes (final_output / nothing-to-send) or is
+   *  converged on worker exit; a fresh-session turn is just the 1-entry case. */
+  idempotentAsyncTurns?: Map<string, {
     ownerLarkAppId: string;
     key: string;
-    triggerId: string;
+    /** Store domain of the lease key (fresh async-virtual vs follow-up turn) so
+     *  convergence looks the lease up under the correct unforgeable namespace. */
+    kind: 'fresh' | 'turn';
     /** The worker generation this turn was dispatched on. The exit handler only
      *  converges when the DYING generation is this one (a later generation that
      *  completed and moved on must not be retro-failed). */
     workerGeneration: number;
-  };
+    /** Set when a post-barrier fault occurred (a throw between the
+     *  reserved→attempting barrier and a proven dispatch) AND the durable
+     *  terminalize write itself then failed — so the lease is `attempting`, no
+     *  durable async result exists, and NOTHING actually dispatched. For a LIVE
+     *  shared-session turn the worker never exits, so worker-exit convergence
+     *  never fires; the ONLY recovery is a same-key retry (or poll) re-attempting
+     *  the strict terminalize. Marks this entry as "terminal write owed" so the
+     *  retry pre-check reruns recordFailedStrict instead of `reuse`-ing forever
+     *  (codex #818 P1-8). Absent = a normally-dispatched turn (converge on exit). */
+    postBarrierFault?: true;
+  }>;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */
@@ -443,11 +563,12 @@ export interface DaemonSession {
   };
 }
 
-/** A non-null value means this Riff generation is deliberately rejecting new
- * input until a close/shutdown commit or an ACKed admission restore. */
-export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
-  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
-  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+/** A non-null value means this remote generation is deliberately rejecting new
+ * input until a close commit, remote shutdown commit, or ACKed admission restore. */
+export function remoteRetirementAdmissionPhase(ds: DaemonSession): string | null {
+  if (ds.remoteShutdownState) return `shutdown-${ds.remoteShutdownState.phase}`;
+  if (ds.remoteCloseState) return `close-${ds.remoteCloseState.phase}`;
+  if (ds.session.mojoCloseJournal) return `close-${ds.session.mojoCloseJournal.phase}`;
   return null;
 }
 

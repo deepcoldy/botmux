@@ -23,6 +23,7 @@ import { randomBytes } from 'node:crypto';
 import * as pty from 'node-pty';
 import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../utils/logger.js';
+import { redactChildEnv } from '../utils/child-env.js';
 import { parseCookie } from './auth.js';
 
 /** 单个 dashboard 最多同时存在的调试终端数——挡住失控泄漏 PTY。 */
@@ -72,12 +73,19 @@ function pickDefaultCwd(deps: DebugTerminalDeps): string {
   return homedir();
 }
 
-/** bash 的运行环境：继承 dashboard 进程 env，并把 ~/.botmux/bin 前置进 PATH，
- *  这样 `botmux`、被 wrapper 的 CLI 等复现命令里的 bin 都能直接找到（与 worker
- *  childEnv.PATH 处理保持一致）。 */
+/** bash 的运行环境：继承 dashboard 进程 env（**先脱敏**），并把 ~/.botmux/bin
+ *  前置进 PATH，这样 `botmux`、被 wrapper 的 CLI 等复现命令里的 bin 都能直接找到
+ *  （与 worker childEnv.PATH 处理保持一致）。
+ *
+ *  脱敏走 redactChildEnv——与 worker 给会话 CLI 子进程用的是同一条边界：这个 shell
+ *  跑在 dashboard 进程里，而 dashboard 是全机唯一合法持有飞书 H5 登录凭据
+ *  （BOTMUX_DASHBOARD_FEISHU_H5_*，含 APP_SECRET）的进程。不脱敏的话，owner 在
+ *  调试终端里一条 `env` 就能读到它，任何在此 shell 里起的进程（含它自己 spawn 的
+ *  CLI）也一并继承。顺带把 IM app 凭据 / GitHub token / Claude 会话标记一起摘掉，
+ *  让这里复现出来的环境和真实会话 CLI 子进程保持一致。 */
 function debugShellEnv(): Record<string, string> {
   const base: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (typeof v === 'string') base[k] = v;
+  for (const [k, v] of Object.entries(redactChildEnv(process.env))) if (typeof v === 'string') base[k] = v;
   base.PATH = `${join(homedir(), '.botmux', 'bin')}:${base.PATH ?? ''}`;
   base.BOTMUX_DEBUG_TERMINAL = '1';
   base.TERM = 'xterm-256color';
@@ -155,6 +163,11 @@ export function createDebugTerminalManager(deps: DebugTerminalDeps): DebugTermin
   function isAuthed(req: IncomingMessage): boolean {
     const active = deps.getActiveToken();
     if (!active) return false;
+    // P0 定向加固：`Origin: null` 只可能来自 opaque origin 文档——沙箱化的网页预览
+    // 就是这么一个来源，而调试终端页面永远带自己的真实 origin。这条 WS 是「拿宿主
+    // 裸 bash」的最后一跳，所以即便 opaque origin 已经带不出 SameSite=Lax cookie，
+    // 也在这里显式拒死，不依赖单一层防线。
+    if (req.headers.origin === 'null') return false;
     // Same credential as the management dashboard: cookie set by the `?t=` gate.
     const cookieTok = parseCookie(req.headers.cookie);
     return !!cookieTok && cookieTok === active;

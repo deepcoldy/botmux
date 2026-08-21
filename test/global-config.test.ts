@@ -8,6 +8,7 @@ import {
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
+  isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
   readGlobalConfig,
@@ -191,6 +192,43 @@ describe('global dashboard config', () => {
     mergeGlobalConfig({ vcMeetingAgent: { enabled: true, listenerBotAppId: ' cli_listener ' } });
     expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerBotAppId: 'cli_listener' });
     expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
+  });
+
+  it('workflow feature defaults ON and reads workflow.enabled as a top-level kill-switch', () => {
+    // No config file / no env: ON (backwards compatible).
+    expect(isWorkflowFeatureEnabled()).toBe(true);
+    expect(readGlobalConfig().workflow).toBeUndefined();
+    // Explicit false disables; round-trips as a typed field.
+    mergeGlobalConfig({ workflow: { enabled: false } });
+    expect(readGlobalConfig().workflow).toEqual({ enabled: false });
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    // Explicit true re-enables.
+    mergeGlobalConfig({ workflow: { enabled: true } });
+    expect(isWorkflowFeatureEnabled()).toBe(true);
+  });
+
+  it('ignores a non-boolean workflow.enabled (falls back to default ON)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ workflow: { enabled: 'no' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().workflow).toBeUndefined();
+    expect(isWorkflowFeatureEnabled()).toBe(true);
+  });
+
+  it('BOTMUX_WORKFLOW_ENABLED env overrides the config file both ways', () => {
+    // Config says disabled, env forces it back on.
+    mergeGlobalConfig({ workflow: { enabled: false } });
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'true');
+    expect(isWorkflowFeatureEnabled()).toBe(true);
+    // Config says enabled, env forces it off.
+    mergeGlobalConfig({ workflow: { enabled: true } });
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'false');
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    // Any non-truthy string ⇒ disabled; a blank env is ignored (config wins).
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'garbage');
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
+    expect(isWorkflowFeatureEnabled()).toBe(true); // blank ⇒ fall through to config (enabled)
   });
 
   it('keeps codexNotifier strictly disabled by default', () => {

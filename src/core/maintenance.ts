@@ -44,6 +44,7 @@ import {
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { scrubWorkflowWorkerEnv, stripDashboardH5Env } from '../utils/child-env.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -245,13 +246,28 @@ export function buildRestartLauncher(
 
 export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = { ...inheritedEnv };
+  // Defense in depth for dashboard/daemon processes resurrected from a stale
+  // PM2 snapshot. `botmux restart` checks workflow mode before pm2Env(), so it
+  // must not inherit node-worker identity even if a host boot scrub regresses.
+  scrubWorkflowWorkerEnv(env);
+  // The dashboard process legitimately holds the Feishu H5 credential family
+  // (index-dashboard.ts dotenv-loads it from ~/.botmux/.env — deliberately NOT
+  // baked into the PM2 env block, see DAEMON_ENV_KEYS), so a detached restart
+  // it spawns would inherit the APP_SECRET. The restart driver has no consumer
+  // for any of it and must not carry it toward pm2; the fresh dashboard reloads
+  // the family from .env itself. Not part of the DAEMON_ENV_KEYS mirror below —
+  // this is credential hygiene, not baked-snapshot invalidation.
+  stripDashboardH5Env(env);
   // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
   // fresh CLI reload these settings from the file.
   //
   // This list MUST mirror DAEMON_ENV_KEYS in src/cli/daemon-lifecycle-env.ts:
   // every key baked into the PM2 env block there has to be stripped here, or a
   // detached restart (dashboard update/restart, maintenance auto-update) keeps
-  // the stale baked value instead of reloading from the file. Keep them in sync.
+  // the stale baked value instead of reloading from the file. Kept as a local
+  // literal so this stays importable from the daemon/dashboard without pulling
+  // in the CLI layer; test/maintenance.test.ts iterates the exported
+  // DAEMON_ENV_KEYS and fails the moment the two drift apart.
   for (const key of [
     'WEB_EXTERNAL_HOST',
     'BOTMUX_DASHBOARD_EXTERNAL_HOST',
@@ -260,6 +276,9 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
     'BOTMUX_PUBLIC_URL',
+    // Dashboard control-audit destination + terminal takeover lease TTL.
+    'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
+    'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
   ]) delete env[key];
   return env;
 }

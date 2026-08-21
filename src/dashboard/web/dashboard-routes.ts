@@ -30,6 +30,18 @@ function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof 
 }
 
 export const dashboardRoutes: DashboardRoute[] = [
+  pageRoute(
+    'agent-workbench-dock',
+    '#/agent-workbench-dock',
+    () => import('./agent-workbench-dock-page.js'),
+    'renderAgentWorkbenchDockPage',
+  ),
+  pageRoute(
+    'agent-workbench',
+    '#/agent-workbench',
+    () => import('./agent-workbench-page.js'),
+    'renderAgentWorkbenchPage',
+  ),
   {
     id: 'plugins',
     routePrefix: '#/plugins',
@@ -44,6 +56,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('settings', '#/settings', () => import('./settings-page.js'), 'renderSettingsPage'),
   pageRoute('bot-defaults', '#/bot-defaults', () => import('./bot-defaults-page.js'), 'renderBotDefaultsPage'),
   pageRoute('skills', '#/skills', () => import('./skills-page.js'), 'renderSkillsPage'),
+  pageRoute('customization', '#/customization', () => import('./customization-page.js'), 'renderCustomizationPage'),
   pageRoute('connectors-logs', '#/connectors/logs', () => import('./connectors-page.js'), 'renderConnectorsLogsPage'),
   pageRoute('webhook-logs', '#/webhook-logs', () => import('./connectors-page.js'), 'renderConnectorsLogsPage'),
   pageRoute('connectors', '#/connectors', () => import('./connectors-page.js'), 'renderConnectorsPage'),
@@ -58,6 +71,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('monitor-room', '#/monitor-room', () => import('./monitor-room.js'), 'renderMonitorRoomPage', true),
   pageRoute('office', '#/office', () => import('./office-page.js'), 'renderOfficePage'),
   pageRoute('insights', '#/insights', () => import('./insights-page.js'), 'renderInsightsPage'),
+  pageRoute('feedback', '#/feedback', () => import('./feedback-page.js'), 'renderFeedbackPage'),
 ];
 
 export function findDashboardRoute(hash: string): DashboardRoute | undefined {

@@ -126,8 +126,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       sessionId,
       resume,
       resumeSessionId,
+      forkSession,
       workingDir,
       model,
+      reasoningEffort,
       initialPrompt,
       disableCliBypass,
       botName,
@@ -146,11 +148,30 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
+      if (reasoningEffort && reasoningEffort.trim()) {
+        args.push('--reasoning-effort', reasoningEffort.trim());
+      }
 
       if (resume) {
         const sid = resumeSessionId || sessionId;
-        if (sid) args.push('--resume', sid);
-        else args.push('--continue');
+        if (sid) {
+          // `--resume <botmux-sessionId>` is precise: grok's fresh spawn pins
+          // `--session-id <botmux-uuid>` (below), so the botmux id IS the
+          // grok session id.
+          args.push('--resume', sid);
+        }
+        // No --continue fallback (#927): it would resume the globally most
+        // recent grok session, which is shared across every botmux session of
+        // this bot (same GROK_HOME) — a worker restart with no id would then
+        // load a SIBLING session's conversation (topic-group context leaking
+        // into a private chat). Start fresh instead, matching
+        // reasonix/antigravity.
+        // Branch the source transcript into the child's Botmux UUID (#931).
+        // The explicit child id preserves exact ownership on restart.
+        if (forkSession) {
+          args.push('--fork-session');
+          if (sessionId) args.push('--session-id', sessionId);
+        }
       } else if (sessionId && !grokSessionDirExists(sessionId, workingDir)) {
         // Pin grok's id to the botmux UUID so resume can reuse it. Skipped
         // when the dir already exists: grok exits 1 on a reused --session-id
@@ -189,6 +210,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       if (!sid) return null;
       return `grok --resume ${sid}`;
     },
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
 
     checkResumeTargetExists({ sessionId, cliSessionId, workingDir }) {
       const sid = cliSessionId || sessionId;
@@ -229,10 +251,13 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       const historyPath = grokPromptHistoryPath(cwd);
       const baseByte = grokFileSize(historyPath);
 
-      // Paste text once; retries only re-send Enter (codex/coco parity).
-      // Re-pasting the full body on retry double-submits when the first Enter
-      // actually landed but prompt_history was slow, or doubles composer text
-      // when Enter was dropped but the paste stuck.
+      // Paste text once, then a single Enter. Do not retry Enter: while a
+      // turn is running, an empty composer plus a queued follow-up makes
+      // Grok treat the next Enter as send-now (cancel-and-send). Slow
+      // prompt_history is not proof the first Enter dropped.
+      // Re-pasting the full body would double-submit when the first Enter
+      // landed but prompt_history was slow, or double composer text when
+      // Enter was dropped but the paste stuck.
       // TmuxPipeBackend (adopt) returns false on failed writes instead of
       // throwing — treat false as definite failure.
       const trySendEnter = (): boolean => {
@@ -272,20 +297,17 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
         return matchGrokPromptAppend(historyPath, base, content, { preferSessionId });
       };
 
+      // Keep polling for a late history append. A dropped first Enter is
+      // recovered by the worker's deferred recheck, not by a second Enter.
       const deadline = Date.now() + scaleMs(4_000);
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const waitUntil = Math.min(deadline, Date.now() + scaleMs(800));
-        while (Date.now() < waitUntil) {
-          const hit = probe();
-          if (hit.found) {
-            return hit.cliSessionId
-              ? { submitted: true, cliSessionId: hit.cliSessionId }
-              : { submitted: true };
-          }
-          await delay(scaleMs(100));
+      while (Date.now() < deadline) {
+        const hit = probe();
+        if (hit.found) {
+          return hit.cliSessionId
+            ? { submitted: true, cliSessionId: hit.cliSessionId }
+            : { submitted: true };
         }
-        if (Date.now() >= deadline) break;
-        if (!trySendEnter()) return { submitted: false };
+        await delay(scaleMs(100));
       }
 
       const late = probe();
@@ -331,8 +353,8 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       sessionStartCommand: sessionReadyHookCommand(),
     },
     modelChoices: [
+      'grok-4.6',
       'grok-4.5',
-      'grok-composer-2.5-fast',
     ],
   };
 }

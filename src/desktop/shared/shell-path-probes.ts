@@ -17,7 +17,7 @@ export interface ShellPathProbe {
  *    and many CLI installers edit only the rc file;
  *  - users whose login shell is bash never had .bash_profile/.bashrc read at all.
  *
- * The ladder probes the user's own `$SHELL` (when it is zsh or bash) before the
+ * The ladder probes the user's own `$SHELL` (when it is zsh, bash, or fish) before the
  * macOS default /bin/zsh, and probes `-ic` before `-lc`: a real terminal runs a
  * login+interactive shell where rc-file prepends (nvm's node dir) end up in
  * front of profile entries, so the interactive snapshot is the closer match for
@@ -34,7 +34,7 @@ export function shellPathProbes(env: NodeJS.ProcessEnv = process.env): ShellPath
   };
 
   const userShell = env.SHELL?.trim();
-  const shells = userShell && ['zsh', 'bash'].includes(basename(userShell))
+  const shells = userShell && ['zsh', 'bash', 'fish'].includes(basename(userShell))
     ? [userShell, '/bin/zsh']
     : ['/bin/zsh'];
   for (const shell of shells) {

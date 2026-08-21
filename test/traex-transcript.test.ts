@@ -3,6 +3,11 @@ import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CODEX_CONNECTION_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE } from '../src/services/codex-transcript.js';
+import {
+  isBridgeNothingToSendFinal,
+  shouldEmitEmptyCompletedBridgeFallback,
+} from '../src/services/bridge-fallback-gate.js';
 import {
   drainTraexRollout,
   readLatestTraexRuntime,
@@ -21,6 +26,20 @@ function line(value: unknown): string {
 }
 
 function user(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      message: text,
+      images: [],
+      local_images: [],
+      text_elements: [],
+    },
+  };
+}
+
+function userResponseItem(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
   return {
     timestamp,
     type: 'response_item',
@@ -54,6 +73,34 @@ function taskComplete(lastAgentMessage?: string) {
       type: 'task_complete',
       turn_id: '00000000-0000-7000-8000-000000000010',
       ...(lastAgentMessage === undefined ? {} : { last_agent_message: lastAgentMessage }),
+      completed_at: 946_684_803,
+      duration_ms: 1_000,
+    },
+  };
+}
+
+function agentMessage(text: string, phase: 'commentary' | 'final_answer' = 'commentary') {
+  return {
+    timestamp: '2000-01-01T00:00:02.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'agent_message',
+      message: text,
+      phase,
+      memory_citation: null,
+    },
+  };
+}
+
+function taskCompleteWithError(error: unknown, lastAgentMessage?: string) {
+  return {
+    timestamp: '2000-01-01T00:00:03.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: '00000000-0000-7000-8000-000000000010',
+      ...(lastAgentMessage === undefined ? {} : { last_agent_message: lastAgentMessage }),
+      error,
       completed_at: 946_684_803,
       duration_ms: 1_000,
     },
@@ -188,6 +235,27 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
+  it('ignores internal role=user injections without a user_message event', () => {
+    writeFileSync(path, [
+      line(userResponseItem('<environment_context>runtime context</environment_context>')),
+      line(userResponseItem('Warning: runtime-generated process limit notice')),
+      line(userResponseItem('real terminal input')),
+      line(user('real terminal input')),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events).toEqual([
+      expect.objectContaining({
+        kind: 'user',
+        text: 'real terminal input',
+      }),
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: 'done',
+      }),
+    ]);
+  });
+
   it('emits an empty task_complete so a silent durable turn can settle', () => {
     writeFileSync(path, line(user('finish silently')) + line(taskComplete()));
     const result = drainTraexRollout(path, 0);
@@ -255,6 +323,246 @@ describe('drainTraexRollout', () => {
         finalText: 'one merged answer',
       }),
     ]);
+  });
+
+  it('maps a task_complete error payload to a failed terminal (path A: endpoint failure)', () => {
+    // Real shape from rollout-…01a0098a….jsonl: traecli writes task_complete
+    // with last_agent_message=null AND error when the model endpoint fails.
+    writeFileSync(path, [
+      line(user('call the model')),
+      line(taskCompleteWithError({
+        message: 'model endpoint connection failed before receiving an HTTP response: error sending request for url (https://copilot.byteintl.net/api/ide/v2/llm_raw_chat)',
+        codex_error_info: { http_connection_failed: { http_status_code: null } },
+      })),
+    ].join(''));
+
+    const result = drainTraexRollout(path, 0);
+    expect(result.events.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_CONNECTION_ERROR_CODE,
+    });
+    expect(result.events.at(-1)!.terminalErrorSummary).toContain('model endpoint connection failed');
+    // The provider URL must not survive into the user-facing summary.
+    expect(result.events.at(-1)!.terminalErrorSummary).not.toContain('copilot.byteintl.net');
+  });
+
+  it('classifies as failed even when last_agent_message is present alongside the error', () => {
+    writeFileSync(path, line(user('partial turn'))
+      + line(taskCompleteWithError({ message: 'connection reset by peer' }, 'partial answer')));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      text: 'partial answer',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_CONNECTION_ERROR_CODE,
+    });
+  });
+
+  it('synthesises the bare sentinel when the last commentary ends with BOTMUX_NO_REPLY (path B: deliberate silence)', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('进度：CI 已绿', 'commentary')),
+      line(agentMessage('我已完成状态回报。BOTMUX_NO_REPLY', 'commentary')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'BOTMUX_NO_REPLY',
+    }));
+  });
+
+  it('recognises the current BOTMUX_NOTHING_TO_SEND sentinel as deliberate silence', () => {
+    writeFileSync(path, [
+      line(user('ambient chatter')),
+      line(agentMessage('BOTMUX_NOTHING_TO_SEND', 'commentary')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'BOTMUX_NOTHING_TO_SEND',
+    }));
+  });
+
+  it('retains agent_message state across drain calls (commentary drained before task_complete)', () => {
+    // Turns run for minutes while the poller drains on the second scale: the
+    // commentary batch and the task_complete almost never share a drain call.
+    const firstBatch = line(user('long-running turn'))
+      + line(agentMessage('工作中', 'commentary'))
+      + line(agentMessage('已通过 botmux send 回报。BOTMUX_NO_REPLY', 'commentary'));
+    writeFileSync(path, firstBatch);
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    appendFileSync(path, line(taskComplete()));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: 'BOTMUX_NO_REPLY' }),
+    ]);
+  });
+
+  it('does not treat a commentary without a trailing sentinel as silence', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('随便聊聊，没有结论', 'commentary')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '',
+    }));
+  });
+
+  it('reconstructs the final from the last final_answer-phase agent_message (defensive: TRAE dropped the final)', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('思考中', 'commentary')),
+      line(agentMessage('这是最终答案', 'final_answer')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
+  it('prefers a final_answer reconstruction over a commentary sentinel', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary')),
+      line(agentMessage('真正的最终答案', 'final_answer')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '真正的最终答案',
+    }));
+  });
+
+  it('resets pending agent state at each user_message so a prior turn cannot leak', () => {
+    writeFileSync(path, [
+      line(user('first turn')),
+      line(agentMessage('第一轮已回报。BOTMUX_NO_REPLY', 'commentary')),
+      line(taskComplete()),
+      line(user('second turn')),
+      line(taskComplete()),
+    ].join(''));
+
+    const finals = drainTraexRollout(path, 0).events.filter(event => event.kind === 'assistant_final');
+    expect(finals[0]).toEqual(expect.objectContaining({ text: 'BOTMUX_NO_REPLY' }));
+    expect(finals[1]).toEqual(expect.objectContaining({ text: '' }));
+  });
+
+  it('synthesised sentinel final is genuine silence: the empty-completed alert stays suppressed', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary')),
+      line(taskComplete()),
+    ].join(''));
+
+    const queue = new CodexBridgeQueue();
+    queue.mark('delivery-1', 'do the work', Date.parse('2000-01-01T00:00:00.000Z'), 1);
+    queue.ingest(drainTraexRollout(path, 0).events);
+    const turn = queue.drainEmittable()[0];
+    expect(turn.finalText).toBe('BOTMUX_NO_REPLY');
+    expect(isBridgeNothingToSendFinal(turn.finalText)).toBe(true);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      {
+        markTimeMs: turn.markTimeMs,
+        isLocal: false,
+        finalText: turn.finalText,
+        terminalStatus: turn.terminalStatus,
+      },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('does not synthesise a bare sentinel in adopt mode (verbatim contract)', () => {
+    // adopt posts transcript text verbatim, so a synthesised token would leak
+    // the literal sentinel into Lark. Keep the empty final; no alert fires in
+    // adopt either (shouldEmitEmptyCompletedBridgeFallback is adopt-gated).
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '',
+    }));
+    // Non-adopt still synthesises (existing behaviour).
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'BOTMUX_NO_REPLY',
+    }));
+  });
+
+  it('reconstructs a final_answer-phase message in adopt mode (real answer, not synthesis)', () => {
+    // final_answer reconstruction is safe in BOTH modes: it is the model's
+    // real transcript answer (phase-guaranteed, not tool narration), and adopt
+    // posts transcript text verbatim anyway. Only the bare-sentinel synthesis
+    // is adopt-gated. adopt is in fact the mode where reconstruction matters
+    // most — drain is the only channel to Lark there.
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('思考中', 'commentary')),
+      line(agentMessage('这是最终答案', 'final_answer')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+    // Non-adopt reconstructs identically.
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
+  it('a probe re-drain mid-turn does not clear the production pending state', () => {
+    // traexRolloutHasUserInputSince re-drains the same live rollout; its
+    // user_message processing must not delete the commentary the production
+    // drainer is holding for the still-open turn.
+    const firstBatch = line(user('long turn'))
+      + line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary'));
+    writeFileSync(path, firstBatch);
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    // Submit-confirmation probe re-drains the same rollout.
+    expect(traexRolloutHasUserInputSince(path, 0, 'long turn')).toBe(true);
+
+    // Turn completes; the production drain must still see the cached commentary.
+    appendFileSync(path, line(taskComplete()));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: 'BOTMUX_NO_REPLY' }),
+    ]);
+  });
+
+  it('maps a 429 task_complete error to the rate-limit failure code', () => {
+    writeFileSync(path, [
+      line(user('hit the limit')),
+      line(taskCompleteWithError({ message: '429 Too Many Requests' })),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE,
+    });
   });
 });
 

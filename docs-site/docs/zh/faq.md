@@ -71,7 +71,13 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 ## 多个机器人怎么互相协作？
 
-先用 `botmux bots list` 或消息里的 `<available_bots>` 找到目标 bot 的 `openId`，再用 `botmux send --mention <对方 openId>` 显式触发对方。不 `--mention` 对方 bot 不会被触发。`/introduce` 现在只是旧版 / 外部 bot 兜底：目标缺失或 `mentionable=false` 时再手动登记一次。
+**默认就支持，不用任何额外设置**——把要协作的机器人拉进同一个群就行。
+
+- **群里只有你和一个 bot**：直接说话即可，自动响应、无需 @。
+- **多个 bot / 多个人的群**：发消息时 @ 你想交给的那个 bot。
+- 需要 bot 之间接力（如一个写、一个 review）时，由 bot 用 @ 互相触发，你只管把活交给第一个。
+
+详见 [多机器人协作](/multi-bot)。
 
 ## daemon 重启会丢上下文吗？
 
@@ -111,10 +117,10 @@ botmux 在 tmux 里用 `<$SHELL> -i -c '… 启动 CLI'` 拉起会话，`-i` 会
 
 v2.95.0 起 botmux 会检测这种"会话没真正起来"的情况并发一张诊断卡，不再把消息打进空 shell。修复二选一：
 
-- **配 `launchShell`（推荐）**：给该 bot 指定直接用目标 shell 启动，绕开会跳转的启动文件。`/config launchShell zsh`，或 dashboard「机器人默认设置 → 启动 Shell」，或 `bots.json` 加 `"launchShell": "zsh"`。注意 PATH / nvm 等要放进所选 shell 的启动文件（如 `.zshrc`）。
+- **配 `launchShell`（推荐）**：给该 bot 指定直接用目标 shell 启动，绕开会跳转的启动文件。`/config launchShell zsh`，或 dashboard「机器人默认设置 → 启动 Shell」，或 `bots.json` 加 `"launchShell": "zsh"`。注意 PATH / nvm 等要放进所选 shell 的启动文件（如 `.zshrc`，fish 用户写 `~/.config/fish/config.fish`，fish 已作为一等启动 shell 支持）。
 - **改启动文件**：给跳转加守卫，只在手动开终端时切：`[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh`（PATH / nvm 等导出放在它之前）。
 
-改完 `botmux restart`，重发一条消息即可。仅 `tmux` / `zellij` 后端涉及；`pty` 后端直接启动 CLI，不受影响。
+改完 `botmux restart`，重发一条消息即可。这会影响需要 shell 包装的持久后端（`tmux` / `zellij` / `zmx`）；`pty` 后端直接启动 CLI，不受影响。
 
 ## 把机器人拉进新群能看之前的聊天记录吗？
 

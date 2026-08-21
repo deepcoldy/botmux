@@ -58,7 +58,15 @@ export interface CliRuntimeUpdateEntry {
   cliId: 'codex';
   runtimeId: string;
   displayName: string;
+  /** Executable path as discovered at probe time. Display-only: it may be a
+   * short-lived launcher symlink (e.g. FNM's per-shell `fnm_multishells`), so
+   * it must never be part of the persisted identity. */
   binPath: string;
+  /** Canonical realpath of the installation this entry tracks, captured when
+   * the entry was written. This is the stable persistence identity: a rotating
+   * `binPath` that resolves here must reuse the same TTL/notification state
+   * instead of minting a fresh row every tick. */
+  installationPath: string;
   provider: CliRuntimeUpdateProvider;
   /** Explicit npm source, when configured. Persisted so source changes can
    * invalidate the TTL/status cache instead of inheriting another package. */
@@ -165,6 +173,13 @@ function validEntry(raw: unknown): ValidatedStoreEntry | null {
   const v = raw as Record<string, unknown>;
   if (v.cliId !== 'codex' || typeof v.binPath !== 'string' || !v.binPath) return null;
   if (typeof v.lastCheckedAt !== 'number' || !Number.isFinite(v.lastCheckedAt)) return null;
+  // Entries written before stable-identity keying lack installationPath. Derive
+  // it once from the persisted binPath: for a still-present install that is its
+  // realpath; for a dead rotating symlink it degrades to the raw path, which is
+  // exactly what the old key already used, so nothing regresses.
+  const installationPath = typeof v.installationPath === 'string' && v.installationPath
+    ? v.installationPath
+    : canonicalInstallationPath(v.binPath);
   const current = typeof v.current === 'string' && parseVersion(v.current) ? v.current : null;
   const runtimeId = typeof v.runtimeId === 'string' && v.runtimeId ? v.runtimeId : 'codex';
   const displayName = typeof v.displayName === 'string' && v.displayName ? v.displayName : 'Codex';
@@ -204,6 +219,7 @@ function validEntry(raw: unknown): ValidatedStoreEntry | null {
       runtimeId,
       displayName,
       binPath: v.binPath,
+      installationPath,
       provider,
       ...(packageName ? { packageName } : {}),
       // Recompute instead of trusting persisted input. Besides hardening corrupted
@@ -533,13 +549,32 @@ export async function probeCodexRuntimeUpdate(
   return probeCliRuntimeUpdate(target, deps);
 }
 
-function targetKey(target: Pick<CliRuntimeUpdateTarget, 'runtimeId' | 'binPath'>): string {
-  return `${target.runtimeId}:${target.binPath}`;
+/** Canonicalize an executable path to a stable filesystem identity. A present
+ * install resolves through every launcher symlink to its real file; a dead or
+ * rotated symlink (e.g. an expired `fnm_multishells` entry) has no realpath, so
+ * we fall back to a normalized absolute path. */
+function canonicalInstallationPath(binPath: string): string {
+  try { return realpathSync(binPath); }
+  catch { return resolve(binPath); }
 }
 
-function targetInstallationKey(target: Pick<CliRuntimeUpdateTarget, 'binPath'>): string {
-  try { return realpathSync(target.binPath); }
-  catch { return resolve(target.binPath); }
+/** Persisted identity of a tracked runtime. Keyed by the canonical installation
+ * path, not the raw `binPath`: FNM hands each new shell a fresh
+ * `/run/user/.../fnm_multishells/<pid>_.../bin/codex` symlink that all resolve
+ * to one npm install, so keying by raw path would mint a new row (losing the
+ * 24h TTL and per-version notification watermark) on every hourly tick. */
+function targetKey(target: Pick<CliRuntimeUpdateTarget, 'runtimeId' | 'binPath'>): string {
+  return `${target.runtimeId}:${canonicalInstallationPath(target.binPath)}`;
+}
+
+/** Key an already-persisted entry by its stored canonical installation path.
+ * Unlike a live target the entry's rotating `binPath` may no longer resolve, so
+ * the value frozen at write time is the authoritative identity. In-memory or
+ * legacy stores that never passed through the reader may lack it; fall back to
+ * canonicalizing the raw path so those callers still get a stable key. */
+function entryKey(entry: Pick<CliRuntimeUpdateEntry, 'runtimeId' | 'installationPath' | 'binPath'>): string {
+  const installationPath = entry.installationPath || canonicalInstallationPath(entry.binPath);
+  return `${entry.runtimeId}:${installationPath}`;
 }
 
 /** De-duplicate only identical update sources. If two bots assign different
@@ -553,7 +588,7 @@ function dedupeCandidates(targets: CliRuntimeUpdateCandidate[]): CliRuntimeUpdat
   }>();
   for (const target of targets) {
     if (!target.binPath) continue;
-    const key = targetInstallationKey(target);
+    const key = canonicalInstallationPath(target.binPath);
     const sourceFingerprint = updateSourceFingerprint(target.provider, target.packageName);
     const existing = grouped.get(key);
     if (!existing) {
@@ -583,6 +618,16 @@ function dedupeTargets(targets: CliRuntimeUpdateTarget[]): CliRuntimeUpdateTarge
   return dedupeCandidates(targets);
 }
 
+/** Group key for reconciling a persisted entry / live target onto its update
+ * source. A runtimeId can host multiple installs and an installation can be
+ * re-pointed at a different package, so identity is (runtimeId, source
+ * fingerprint). Uses a `\u0000` separator so neither half can forge the
+ * boundary, written as a source escape (not a literal NUL byte) to keep the
+ * file text-tool friendly. */
+function sourceGroupKey(runtimeId: string, sourceFingerprint: string): string {
+  return `${runtimeId}\u0000${sourceFingerprint}`;
+}
+
 /** Project persisted status onto the runtimes configured right now. The
  * monitor eventually prunes stale entries, but Dashboard reads can happen
  * immediately after an agent/runtime edit; filtering here prevents an old
@@ -598,7 +643,7 @@ export function filterCliRuntimeUpdateEntriesForTargets(
   const current = new Map(dedupeTargets(refreshedTargets).map((target) => [targetKey(target), target]));
   const visible: CliRuntimeUpdateEntry[] = [];
   for (const entry of entries) {
-    const target = current.get(targetKey(entry));
+    const target = current.get(entryKey(entry));
     if (!target) continue;
     if (updateSourceFingerprint(entry.provider, entry.packageName)
         !== updateSourceFingerprint(target.provider, target.packageName)) continue;
@@ -712,6 +757,90 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
   ));
   const targets = dedupeTargets(refreshedTargets);
   const configuredKeys = new Set(targets.map(targetKey));
+
+  // Reconcile persisted keys onto stable canonical identities before any TTL
+  // decision. Two things move an entry:
+  //   1. Reindex: an entry keyed by a historical raw path whose install is
+  //      still present collapses onto its realpath identity (entryKey).
+  //   2. Migrate: a legacy entry whose raw path is already dead (a rotated FNM
+  //      launcher symlink from before this build) is adopted onto the live
+  //      target's stable key, but only when exactly one orphan shares the
+  //      target's runtimeId + sourceFingerprint — so a rotating path stops
+  //      minting fresh rows and the post-upgrade tick keeps its watermark
+  //      instead of notifying once more.
+  const reconciled: Record<string, CliRuntimeUpdateEntry> = {};
+  let reindexed = false;
+  for (const [oldKey, entry] of Object.entries(store.entries)) {
+    const key = entryKey(entry);
+    if (key !== oldKey) reindexed = true;
+    const existing = reconciled[key];
+    if (!existing) {
+      reconciled[key] = entry;
+    } else {
+      // Duplicate identity (e.g. two raw-path keys for one live install): keep
+      // the freshest row and drop the rest.
+      reindexed = true;
+      if (entry.lastCheckedAt > existing.lastCheckedAt) reconciled[key] = entry;
+    }
+  }
+  store.entries = reconciled;
+  storeChanged ||= reindexed;
+
+  // Orphans are reconciled entries not already sitting on a configured target
+  // key. Only a *stale* orphan — installationPath no longer on disk (a dead
+  // rotating FNM launcher, or a removed install) — may be adopted. An orphan
+  // whose installationPath still resolves to a real file is a genuinely
+  // different install; adopting it would splice its watermark onto another
+  // installation, so it is pruned and re-probed under its own identity. Group
+  // by (runtimeId, sourceFingerprint) so a target only adopts an unambiguous
+  // one.
+  const orphansBySource = new Map<string, { key: string; entry: CliRuntimeUpdateEntry }[]>();
+  for (const [key, entry] of Object.entries(store.entries)) {
+    if (configuredKeys.has(key)) continue;
+    if (existsSync(entry.installationPath)) continue;
+    const group = sourceGroupKey(
+      entry.runtimeId,
+      entry.sourceFingerprint ?? updateSourceFingerprint(entry.provider, entry.packageName),
+    );
+    (orphansBySource.get(group) ?? orphansBySource.set(group, []).get(group)!).push({ key, entry });
+  }
+  // A group's watermark can only be reattributed when *both* sides are
+  // unambiguous: exactly one stale orphan AND exactly one live install lacking
+  // an entry. When a runtimeId+source hosts two distinct installs (allowed —
+  // they keep independent TTL/watermark by canonical path), there is no way to
+  // decide which install the dead orphan's state belonged to, so migrating by
+  // target iteration order would silently graft a stale watermark onto an
+  // arbitrary install and suppress its next probe. In that case migrate none;
+  // the ambiguous orphan is pruned below and each install re-probes under its
+  // own identity.
+  const liveTargetsNeedingEntry = new Map<string, number>();
+  for (const target of targets) {
+    if (store.entries[targetKey(target)]) continue;
+    const group = sourceGroupKey(
+      target.runtimeId,
+      updateSourceFingerprint(target.provider, target.packageName),
+    );
+    liveTargetsNeedingEntry.set(group, (liveTargetsNeedingEntry.get(group) ?? 0) + 1);
+  }
+  for (const target of targets) {
+    const key = targetKey(target);
+    if (store.entries[key]) continue;
+    const group = sourceGroupKey(
+      target.runtimeId,
+      updateSourceFingerprint(target.provider, target.packageName),
+    );
+    const candidates = orphansBySource.get(group);
+    if (!candidates || candidates.length !== 1) continue;
+    if (liveTargetsNeedingEntry.get(group) !== 1) continue;
+    const { key: oldKey, entry } = candidates[0]!;
+    delete store.entries[oldKey];
+    orphansBySource.delete(group);
+    // Rebind identity to the live installation; status/watermark carry over.
+    store.entries[key] = { ...entry, binPath: target.binPath, installationPath: canonicalInstallationPath(target.binPath) };
+    storeChanged = true;
+    log(`migrated ${target.displayName} store identity onto ${key}`);
+  }
+
   let pruned = false;
   for (const key of Object.keys(store.entries)) {
     if (configuredKeys.has(key)) continue;
@@ -722,6 +851,7 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
 
   for (const target of targets) {
     const key = targetKey(target);
+    const installationPath = canonicalInstallationPath(target.binPath);
     const previous = store.entries[key];
     const sourceFingerprint = updateSourceFingerprint(target.provider, target.packageName);
     const previousSourceFingerprint = previous
@@ -750,6 +880,7 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
         runtimeId: target.runtimeId,
         displayName: target.displayName,
         binPath: target.binPath,
+        installationPath,
         provider: target.provider,
         ...(target.packageName ? { packageName: target.packageName } : {}),
         sourceFingerprint,
@@ -769,6 +900,7 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
         runtimeId: target.runtimeId,
         displayName: target.displayName,
         binPath: target.binPath,
+        installationPath,
         provider: target.provider,
         ...(target.packageName ? { packageName: target.packageName } : {}),
         sourceFingerprint,

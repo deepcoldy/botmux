@@ -41,6 +41,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       enterMemUsedFrac: 0.92,
     },
     vcMeetingAgent: { enabled: true },
+    workflow: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -234,6 +235,29 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ whiteboard: { enabled: true } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ whiteboard: { enabled: true } });
+  });
+
+  it('writes workflow.enabled toggle via mergeGlobalConfig, preserving sibling keys', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ workflow: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ workflow: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ workflow: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('rejects a non-object workflow patch', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ workflow: 'off' }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_workflow' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-boolean workflow.enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ workflow: { enabled: 'yes' } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_workflow_enabled' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {

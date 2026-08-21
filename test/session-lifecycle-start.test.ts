@@ -57,6 +57,10 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
+  // Provenance travels with the path (see core/config-dir.ts): 'loaded' = the
+  // daemon really parsed that file, which is what forkWorker freezes into the
+  // worker init message alongside loadedBotsConfigPath.
+  getLoadedConfigProvenance: vi.fn(() => 'loaded' as const),
   loadBotConfigs: vi.fn(() => [{
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
@@ -107,6 +111,7 @@ vi.mock('../src/skills/installer.js', () => ({
   ensureSkills: vi.fn(),
   ensureAskSkill: vi.fn(),
   ensureWhiteboardSkill: vi.fn(),
+  ensureWorkflowSkills: vi.fn(),
   removeGlobalBotmuxSkills: vi.fn(),
 }));
 
@@ -445,6 +450,515 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   });
 });
 
+describe('ordinary Claude semantic recovery', () => {
+  it('continues twice without another user message, then warns exactly once', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const firstRecovery = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(firstRecovery).toEqual(expect.objectContaining({
+      content: expect.stringContaining('[BOTMUX_RECOVERY]'),
+    }));
+    expect(firstRecovery.content).not.toContain('original task');
+    worker.emit('message', { type: 'turn_input_received', turnId: firstRecovery.turnId });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: firstRecovery.turnId,
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    const recoveries = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(recoveries).toHaveLength(2);
+    expect(recoveries[1].turnId).not.toBe(recoveries[0].turnId);
+    worker.emit('message', { type: 'turn_input_received', turnId: recoveries[1].turnId });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: recoveries[1].turnId,
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('自动续跑 2 次'),
+      'text',
+      'app_test',
+      'om_original',
+    );
+    expect(ds.agentAttention).toEqual(expect.objectContaining({
+      kind: 'blocked',
+      reason: expect.stringContaining('自动续跑 2 次'),
+    }));
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'exhausted',
+      continuationsStarted: 2,
+      alertSentAt: expect.any(Number),
+    }));
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: recoveries[1].turnId,
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(2);
+  });
+
+  it.each([
+    ['codex', {}],
+    ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
+    ['claude-code', { session: { vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 } } }],
+    ['claude-code', { chatId: 'http_async_test' }],
+  ])('does not attach semantic recovery outside eligible ordinary Lark sessions (%s)', async (cliId, shape) => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId }));
+    const { session: sessionShape, ...daemonShape } = shape as any;
+    const ds = makeDs(daemonShape);
+    if (sessionShape) Object.assign(ds.session, sessionShape);
+    forkWorker(ds, 'task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+  });
+
+  it('warns an adopt user when a suppressed provider failure has no recovery consumer', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      adoptedFrom: { sessionId: 'external', cliId: 'claude-code', cwd: '/repo' },
+    } as any);
+    forkWorker(ds, 'adopted turn', 'om_adopted');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_adopted',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('provider_unexpected_eof'),
+      'text',
+      'app_test',
+      'om_adopted',
+      undefined,
+    ));
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
+    expect(ds.agentAttention).toEqual(expect.objectContaining({
+      kind: 'blocked',
+      reason: expect.stringContaining('provider_unexpected_eof'),
+    }));
+  });
+
+  it('keeps turn N as recovery owner when type-ahead N+1 is admitted', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'turn N', 'om_turn_n');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_turn_n' });
+
+    expect(sendWorkerInput(ds, 'turn N+1', 'om_turn_n_plus_1')).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({
+      logicalTurnId: 'om_turn_n',
+      currentTurnId: 'om_turn_n',
+      status: 'running',
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn_n',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel the running terminal owner when N+1 is staged behind activation', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'turn N', 'om_turn_n');
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'turn N' };
+
+    expect(sendWorkerInput(ds, 'turn N+1', 'om_turn_n_plus_1')).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({
+      logicalTurnId: 'om_turn_n',
+      currentTurnId: 'om_turn_n',
+      status: 'running',
+    });
+  });
+
+  it('cancels a pending backoff when a fresh user message is admitted', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    await Promise.resolve();
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await Promise.resolve();
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_new')).toBe(true);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_new',
+      currentTurnId: 'om_new',
+      continuationsStarted: 0,
+      status: 'running',
+    }));
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+  });
+
+  it('starts recovery tracking when an admitted queued user turn is promoted to the worker', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'opening turn');
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening turn' };
+
+    expect(sendWorkerInput(ds, 'queued instruction', 'om_queued')).toBe(true);
+    ds.session.queuedActivationPending = undefined;
+    ds.session.queuedActivationInput = undefined;
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_queued',
+      currentTurnId: 'om_queued',
+      continuationsStarted: 0,
+      status: 'running',
+    }));
+  });
+
+  it('keeps a pending backoff armed when queued user input admission fails', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    await Promise.resolve();
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await Promise.resolve();
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      status: 'backoff',
+    }));
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening turn' };
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => {
+      throw new Error('session store unavailable');
+    });
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_new')).toBe(false);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      status: 'backoff',
+    }));
+
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original',
+      currentTurnId: expect.stringMatching(/^bmx-recovery-/),
+      continuationsStarted: 1,
+      status: 'running',
+    }));
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: expect.stringMatching(/^bmx-recovery-/) }),
+    ]);
+  });
+
+  it('does not report an admitted user turn as failed when recovery bookkeeping persistence fails', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => {
+      throw new Error('session store unavailable');
+    });
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_new')).toBe(true);
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_new'))
+      .toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      status: 'running',
+    }));
+  });
+
+  it('does not clear exhausted recovery attention when cancellation persistence fails', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_original',
+      currentTurnId: 'bmx-recovery-last',
+      continuationsStarted: 2,
+      status: 'exhausted',
+      alertSentAt: Date.now(),
+      warningDispatched: true,
+    };
+    const recoveryAttention = {
+      kind: 'blocked',
+      reason: 'automatic continuation exhausted',
+      at: Date.now(),
+    };
+    ds.agentAttention = recoveryAttention;
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => {
+      throw new Error('session store unavailable');
+    });
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_new')).toBe(true);
+
+    expect(ds.agentAttention).toEqual(recoveryAttention);
+  });
+
+  it('clears exhausted recovery attention when a fresh user message is admitted', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_original',
+      currentTurnId: 'bmx-recovery-last',
+      continuationsStarted: 2,
+      status: 'exhausted',
+      alertSentAt: Date.now(),
+      warningDispatched: true,
+    };
+    ds.agentAttention = {
+      kind: 'blocked',
+      reason: 'automatic continuation exhausted',
+      at: Date.now(),
+    };
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_new')).toBe(true);
+
+    expect(ds.agentAttention).toBeUndefined();
+    expect(vi.mocked(dashboardEventBus.publish)).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: expect.objectContaining({ agentAttention: null }),
+      },
+    });
+  });
+
+  it('preserves unrelated attention when a fresh user message is admitted', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const unrelatedAttention = {
+      kind: 'blocked',
+      reason: 'manual authorization required',
+      at: Date.now(),
+    };
+    ds.agentAttention = unrelatedAttention;
+
+    expect(sendWorkerInput(ds, 'new instruction', 'om_new')).toBe(true);
+
+    expect(ds.agentAttention).toEqual(unrelatedAttention);
+    expect(vi.mocked(dashboardEventBus.publish)).not.toHaveBeenCalledWith({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: expect.objectContaining({ agentAttention: null }),
+      },
+    });
+  });
+
+  it('cold-resumes through forkWorker when the recovery timer finds no live worker', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    ds.worker = null;
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).toHaveBeenCalledTimes(2);
+    const replacement = forkMock.mock.results.at(-1)!.value;
+    const recoveryInit = vi.mocked(replacement.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'init'
+        && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(recoveryInit).toEqual(expect.objectContaining({
+      resume: true,
+      prompt: expect.stringContaining('[BOTMUX_RECOVERY]'),
+    }));
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'running',
+      continuationsStarted: 1,
+      currentTurnId: recoveryInit.turnId,
+    }));
+  });
+
+  it('raises one recovery warning when the synthetic turn never reaches the worker', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    await Promise.resolve();
+
+    const recoverySends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(recoverySends).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('未能送达 Worker'),
+      'text',
+      'app_test',
+      'om_original',
+    );
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'attention_required',
+      lastErrorCode: 'recovery_delivery_failed',
+      alertSentAt: expect.any(Number),
+      warningDispatched: true,
+    }));
+  });
+});
+
 describe('persistent backend target handoff', () => {
   it('passes the recorded shared Herdr target back to a replacement worker', () => {
     const target = {
@@ -464,6 +978,53 @@ describe('persistent backend target handoff', () => {
       backendType: 'herdr',
       persistentBackendTarget: target,
     }));
+  });
+});
+
+describe('no-transport read isolation follows local sandbox config (not forced)', () => {
+  // Behavioral lock for the 2026-08 change: a no-transport session (apiOnly bot
+  // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in
+  // only — driven purely by explicit per-bot `readIsolation` — so a no-transport
+  // session with no sandbox config reads the disk like a normal chat. The env
+  // secret-withhold (asserted in api-only-mode-wiring) is a SEPARATE boundary and
+  // stays independent of this.
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('apiOnly bot WITHOUT sandbox config → readIsolation:false (was forced true)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: '' }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+
+  it('HTTP virtual session (http_wait_) on a normal bot WITHOUT sandbox → readIsolation:false', () => {
+    const ds = makeDs({ chatId: 'http_wait_abc', session: { ...makeDs().session, chatId: 'http_wait_abc' } });
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+
+  it('HTTP virtual session (http_async_) on a normal bot WITHOUT sandbox → readIsolation:false', () => {
+    const ds = makeDs({ chatId: 'http_async_xyz', session: { ...makeDs().session, chatId: 'http_async_xyz' } });
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
+  });
+
+  it('no-transport session with explicit bot readIsolation:true STILL isolates (follows config)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: '', readIsolation: true }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    // Proves the follow-config path: the owner can still opt in; the change only
+    // removed the FORCED disjunct, not the explicit opt-in.
+    expect(readInit().readIsolation).toBe(true);
+  });
+
+  it('a normal transport-enabled chat is unaffected (readIsolation:false by default)', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    expect(readInit().readIsolation).toBe(false);
   });
 });
 
@@ -1914,6 +2475,25 @@ describe('session.start lifecycle integration', () => {
     vi.unstubAllEnvs();
   });
 
+  it('removes leaked workflow identity from the daemon→worker fork env', () => {
+    vi.stubEnv('BOTMUX_WORKFLOW', '1');
+    vi.stubEnv('BOTMUX_WORKFLOW_RUN_ID', 'run-leaked');
+    vi.stubEnv('BOTMUX_WORKFLOW_NODE_ID', 'node-leaked');
+    vi.stubEnv('BOTMUX_V3_GOAL', '1');
+    vi.stubEnv('BOTMUX_GOAL_ATTEMPT_DIR', '/tmp/leaked-attempt');
+
+    forkWorker(makeDs(), 'hello', false);
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW_RUN_ID).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW_NODE_ID).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_V3_GOAL).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_GOAL_ATTEMPT_DIR).toBeUndefined();
+
+    vi.unstubAllEnvs();
+  });
+
   it('re-checks the resident-session cap after spawn and again on an idle edge', async () => {
     const enforceLiveSessionCap = vi.fn();
     initWorkerPool({
@@ -2093,6 +2673,31 @@ describe('session.start lifecycle integration', () => {
     const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
     expect(forkOpts?.env?.GITHUB_TOKEN).toBeUndefined();
     expect(forkOpts?.env?.GH_TOKEN).toBeUndefined();
+
+    vi.unstubAllEnvs();
+  });
+
+  it('removes leaked workflow identity from the daemon→adopt-worker fork env', () => {
+    vi.stubEnv('BOTMUX_WORKFLOW', '1');
+    vi.stubEnv('BOTMUX_WORKFLOW_PTY_LOG_PATH', '/tmp/leaked-pty.log');
+    vi.stubEnv('BOTMUX_V3_GOAL', '1');
+    vi.stubEnv('BOTMUX_GOAL_MANIFEST_PATH', '/tmp/leaked-manifest.json');
+
+    forkAdoptWorker(makeDs({
+      adoptedFrom: {
+        tmuxTarget: 'bmx-deadbeef:0.0',
+        originalCliPid: 23456,
+        sessionId: 'codex-session',
+        cliId: 'codex',
+        cwd: '/repo',
+      },
+    }));
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW_PTY_LOG_PATH).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_V3_GOAL).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_GOAL_MANIFEST_PATH).toBeUndefined();
 
     vi.unstubAllEnvs();
   });
@@ -2927,13 +3532,16 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('records cli wrapper and model on fresh sessions before spawning', () => {
+  it('records cli wrapper on fresh sessions and launches with the live bot model (model NOT frozen)', () => {
     const ds = makeDs();
 
     forkWorker(ds, 'hello', false);
 
     expect(ds.session.cliId).toBe('codex');
     expect(ds.session.wrapperCli).toBe('ttadk codex');
+    // The model is resolved per spawn from the bot config; what lands on the
+    // session is only a RECORD of what it launched with (read back solely when
+    // the bot later switches CLI), never a freeze that outranks the config.
     expect(ds.session.model).toBe('glm-5.1');
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -2944,7 +3552,7 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('fills wrapper and model on fresh sessions that already stamped cliId', () => {
+  it('fills wrapper on fresh sessions that already stamped cliId', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;
 
@@ -2952,7 +3560,7 @@ describe('forkWorker session agent config freeze', () => {
 
     expect(ds.session.cliId).toBe('codex');
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBe('glm-5.1');
+    expect(ds.session.model).toBe('glm-5.1');   // record of the launched model
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -2962,7 +3570,7 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('resumes a frozen session with its recorded cli/wrapper/model, ignoring bot config changes', () => {
+  it('resumes a frozen session with its recorded cli/wrapper, and keeps its own model when the bot moved to another CLI', () => {
     const ds = makeDs();
     // A session that was already frozen on a prior spawn: bot config has since
     // been switched (codex/ttadk/glm-5.1), but the frozen session must not budge.
@@ -2978,14 +3586,93 @@ describe('forkWorker session agent config freeze', () => {
       type: 'init',
       cliId: 'claude-code',
       wrapperCli: 'aiden x claude',
+      // The bot now runs codex with `glm-5.1`: that model belongs to ANOTHER
+      // CLI, so this claude-code session keeps the model it was launched with
+      // instead of being handed a foreign model id.
       model: 'opus',
       resume: true,
     }));
   });
 
-  it('back-fills wrapper/model from bot config on the first resume of a legacy (pre-freeze) session', () => {
-    // Created before agentFrozen/wrapperCli/model existed: cliId was stamped
-    // historically, but wrapper/model are absent and it has no freeze marker.
+  // ── THE regression this whole change exists for: a long-lived session whose
+  //    frozen CLI still matches the bot must pick up the model configured in the
+  //    dashboard on its next resume. Restoring the `session.model` freeze (or
+  //    preferring the recorded value over botCfg) flips this red. ──
+  it('resumes a frozen session with the CURRENT bot model, ignoring the model it recorded', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;          // same CLI the bot still runs
+    ds.session.wrapperCli = 'ttadk codex';
+    ds.session.model = 'stale-frozen-model';    // written by an older botmux
+    ds.session.agentFrozen = true;
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      model: 'glm-5.1',
+      resume: true,
+    }));
+    // …and the stale record is refreshed to what it actually launched with, so
+    // the mismatch fallback stays truthful if the bot later switches CLI.
+    expect(ds.session.model).toBe('glm-5.1');
+  });
+
+  // ── The record exists so that rule 3 still has something to fall back ON for
+  //    sessions created AFTER this change: spawn once under the codex bot, then
+  //    switch the bot to another CLI (`/botconfig set cli` hot-swaps cliId
+  //    without the dashboard's mismatch sweep) — the session pinned to codex
+  //    must keep launching with the model it actually ran, not drop to the CLI
+  //    default nor inherit the new CLI's model. ──
+  it('a session whose bot later switched CLI keeps the model it recorded on its first spawn', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);            // codex bot, model glm-5.1
+    expect(ds.session.model).toBe('glm-5.1');  // recorded on the first spawn
+
+    vi.mocked(getBot).mockReturnValueOnce({
+      config: {
+        larkAppId: 'app_test',
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',                  // bot moved to another CLI…
+        model: 'opus',                         // …with a model meant for it
+      },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      model: 'glm-5.1',
+      resume: true,
+    }));
+  });
+
+  // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
+  //    over the bot config — that is the only thing that outranks it now. ──
+  it('prefers an explicit per-trigger model override over the bot config', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+    ds.session.agentFrozen = true;
+    (ds as any).spawnModelOverride = 'gpt-5.6-terra';
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      model: 'gpt-5.6-terra',
+      resume: true,
+    }));
+  });
+
+  it('back-fills the wrapper from bot config on the first resume of a legacy (pre-freeze) session', () => {
+    // Created before agentFrozen/wrapperCli existed: cliId was stamped
+    // historically, but the wrapper is absent and it has no freeze marker.
     // The bot launches via a `ttadk codex` wrapper — the first post-upgrade resume
     // must restore that wrapper, not silently relaunch as bare `codex`.
     const ds = makeDs();
@@ -2994,7 +3681,7 @@ describe('forkWorker session agent config freeze', () => {
     forkWorker(ds, '', true);
 
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBe('glm-5.1');
+    expect(ds.session.model).toBe('glm-5.1');   // record of the launched model
     expect(ds.session.agentFrozen).toBe(true);
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({

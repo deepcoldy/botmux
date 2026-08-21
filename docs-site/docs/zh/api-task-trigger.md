@@ -56,10 +56,11 @@
 - **`envelope.trusted` 必须是 `false`**。这是防注入设计：`trusted:false` 声明「以下 envelope 内容是不可信外部数据」，daemon 才会把它包成 untrusted event、不执行里面夹带的指令。你要机器人真正执行的东西放在顶层 `instruction`（可信指令），不要放进 envelope。
 - **不传 `chatId`** 时，`options` 必须含 `waitForFinalOutput` 或 `asyncReturnSessionId` 之一，否则报 `target_required`。
 - **`options.timeoutMs` 范围 `[1000, 300000]`**（1 秒 ~ 5 分钟），越界报 400。不传默认 120000。
-- **`options.model`** / **`options.reasoningEffort`**（可选，**仅对 codex / codex-app 机器人生效**）：按本次触发覆盖模型与推理档位。
-  - `model`：codex 模型 id（≤200 字符）；`reasoningEffort`：`low` / `medium` / `high` / `xhigh`（原样透传给 codex，不做降级）。
-  - **仅新建会话生效**：只在这次触发**创建新会话**时冻结；折叠进已有 worker 的续轮不改写。
-  - **作用域收窄到 codex 家族**：目标机器人不是 codex/codex-app 时，这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
+- **`options.model`** / **`options.reasoningEffort`**（可选，**仅对 codex / codex-app / grok 机器人生效**）：按本次触发覆盖模型与推理档位。
+  - `model`：该 CLI 的模型 id（≤200 字符）；`reasoningEffort`：`low` / `medium` / `high` / `xhigh`（以及 Codex 部分模型的 `max` / `ultra`）。原样透传，不做降级；目标模型不支持该档位时请求 400。
+  - **仅新建会话生效**：只在这次触发**创建新会话**时记录；折叠进已有 worker 的续轮不改写。
+  - `model` **只驻内存、不落盘**：它在该会话本次生命周期内的每次启动生效，daemon 重启后不恢复——之后按机器人配置的模型启动。`reasoningEffort` 仍随会话持久化。
+  - **作用域收窄到带思考强度控制的 CLI**：目标机器人不是 codex/codex-app/grok 时，这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
 
 ### 同步模式（waitForFinalOutput）
 
@@ -146,6 +147,32 @@ curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json
 **崩溃语义（at-most-once）**：daemon 在真正派发前会把该键的 lease durable 标记为 `attempting`（commit-unknown 屏障）。若 daemon 恰好在「已开始派发」与「拿到完成证据」之间崩溃，重启后**不会盲目重派**（`forkWorker` 返回并不证明模型没开始跑）——该键会收敛到终态、`trigger-result` 报 `failed`（错误码 `no_output`，语义为「上次派发结果未知、按至多一次不重跑」）。你的 recovery 把它当 **Failed** 处理即可（宁可让你看到明确失败去新建重试，也不双跑）。
 
 **保留**：键→session 映射只增不删（与异步结果同策略，保证完成后的迟到重试仍复用同一 session、不重建）。
+
+---
+
+### 续会话轮幂等键（`options.turnIdempotencyKey`）—— 给追问轮同样的保证
+
+上面的 `idempotencyKey` 只覆盖 **fresh 新会话**。当你往**已存在的会话追加一轮追问**（带 `target.sessionId`）时，改用 `options.turnIdempotencyKey`——追加轮的 HTTP 回包一旦丢失，你无法判断 daemon 是否已受理该轮，重试就可能**重复注入两次**。
+
+传一个**在发起前就持久化**的稳定键。同键重试到同一会话时，daemon 解析到**同一轮（同 `triggerId`）、不二次注入**：
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx","sessionId":"<已存在会话>"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "turnIdempotencyKey":"my-followup-7"}
+  }'
+```
+
+命中带 `idempotent:true`；照常用 `sessionId`/`triggerId` 轮询 `trigger-result`。
+
+**适用范围**：`turnIdempotencyKey` 仅支持**已存在会话上的续会话异步轮**——`target.kind:'turn'` + 带 `target.sessionId` + `options.asyncReturnSessionId:true`，不带 `waitForFinalOutput` / `dryRun`。它与 `idempotencyKey` **互斥**（同时传返回 **400**），且两者位于**互不碰撞的独立键空间**——即便 `turnIdempotencyKey` 和 `idempotencyKey` 取相同字符串也绝不会共用同一 lease。
+
+**同键异 payload → 409 `idempotency_conflict`**；**崩溃语义（at-most-once）**与**保留**策略与上面的 `idempotencyKey` 完全一致（派发结果未知的追问轮收敛为 `failed` / `no_output`，绝不盲目重跑）。另有一个瞬时情况：若目标会话仍在完成其**开场激活**，该追问轮会被**可重试地**拒绝（errorCode `trigger_failed`，提示含 “session activation in progress”）——稍后重试即可。
 
 ---
 

@@ -21,19 +21,36 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ resume, resumeSessionId, model, disableCliBypass }) {
+      // --trust pre-answers the "Workspace Trust Required" startup dialog.
+      // Without it, the first spawn in a never-trusted directory (= every
+      // fresh-worktree topic) blocks on that dialog; the dialog sits silent,
+      // so quiescence-based idle fires and the worker types the first prompt
+      // INTO it — the first literal `a` in the text answers [a] Trust (a `q`
+      // would quit the CLI outright) and everything typed before the composer
+      // renders scatters into scrollback, truncating the prompt head.
+      // Deliberately NOT gated by disableCliBypass: this is a startup gate no
+      // headless spawn can answer, orthogonal to --force's approval bypass
+      // (--force alone does not suppress the dialog — verified empirically).
+      const base = ['--trust'];
       // --force skips approvals so the model can act inside the topic without
       // every shell/edit bouncing back to Lark for confirmation — same posture
       // as codex's --dangerously-bypass-approvals-and-sandbox and claude-code's
       // --dangerously-skip-permissions.
-      const base = disableCliBypass ? [] : ['--force'];
+      if (!disableCliBypass) base.push('--force');
       if (model && model.trim()) {
         base.push('--model', model.trim());
       }
       if (!resume) return base;
       if (resumeSessionId) return [...base, '--resume', resumeSessionId];
-      // No id on hand — fall back to "last chat" so we at least don't drop
-      // the user's context. --continue is cursor's shorthand for --resume=-1.
-      return [...base, '--continue'];
+      // No persisted chat id: start FRESH, never `--continue`. Cursor's
+      // `--continue` (= `--resume=-1`) resumes the globally most recent chat,
+      // which is shared across every botmux session of this bot (same Cursor
+      // config home). A worker restart whose cliSessionId was never captured
+      // would then silently load a SIBLING session's conversation — e.g. a
+      // topic group's context leaking into a private chat. Losing this
+      // session's context is the lesser evil; matches reasonix/antigravity,
+      // which reject `--continue` for the same "most recent is racy" reason.
+      return base;
     },
 
     buildResumeCommand({ cliSessionId }) {
@@ -43,6 +60,11 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       if (!cliSessionId) return null;
       return `cursor-agent --resume ${cliSessionId}`;
     },
+
+    // buildArgs can only resume a precise id (no --continue fallback — it
+    // would resume the globally most recent chat, a sibling-context leak).
+    // Tells the worker to demote resume-without-id to a fresh launch + notify.
+    resumeRequiresCliSessionId: true,
 
     async writeInput(pty: PtyHandle, content: string) {
       // Emit line-by-line instead of writing the whole message at once.

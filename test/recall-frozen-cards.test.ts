@@ -9,6 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
+import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
@@ -113,6 +114,8 @@ import {
   recallFrozenCards,
   parkStreamCard,
   postFreshStreamingCard,
+  postTurnStartingCard,
+  setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
   usageRefreshShouldRun,
@@ -122,7 +125,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
-import { resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -175,10 +178,14 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
   vi.mocked(buildStreamingCard).mockClear();
+  vi.mocked(getBot).mockReturnValue({
+    config: { larkAppId: APP_ID, cliId: 'claude-code' },
+  } as any);
   setTerminalProxyPort(8800);
 });
 
 afterEach(() => {
+  setActiveSessionsRegistry(undefined as any);
   vi.clearAllTimers();
   vi.useRealTimers();
 });
@@ -321,6 +328,26 @@ describe('recallFrozenCards', () => {
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_only');
   });
+
+  it('withdraws only frozen cards from the live card reply target', () => {
+    const map = new Map<string, FrozenCard>();
+    map.set('topic_a', makeFrozen('om_card_a', { replyTargetKey: 'thread:om_topic_a' }));
+    map.set('topic_b', makeFrozen('om_card_b', { replyTargetKey: 'thread:om_topic_b' }));
+    map.set('legacy', makeFrozen('om_card_legacy'));
+    const ds = makeDs(map);
+    ds.streamCardId = 'om_card_b_live';
+    ds.streamCardReplyTargetKey = 'thread:om_topic_b';
+
+    recallFrozenCards(ds);
+
+    expect(deleteMessageMock).toHaveBeenCalledTimes(1);
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_card_b');
+    expect(ds.frozenCards?.has('topic_a')).toBe(true);
+    expect(ds.frozenCards?.has('topic_b')).toBe(false);
+    // Old persisted cards have no trustworthy topic attribution. Once the live
+    // card does, fail safe instead of potentially withdrawing another topic.
+    expect(ds.frozenCards?.has('legacy')).toBe(true);
+  });
 });
 
 describe('restoreUsageLimitRuntimeState', () => {
@@ -443,6 +470,405 @@ describe('receiver streaming card boundary', () => {
     await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(false);
     expect(sessionReply).not.toHaveBeenCalled();
     expect(buildStreamingCard).not.toHaveBeenCalled();
+  });
+});
+
+describe('postTurnStartingCard', () => {
+  it('does not start a card POST while Riff retirement is already active', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-before-post' };
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.streamCardPending).toBe(true);
+    expect(ds.streamCardPendingTurnId).toBe('om_turn_1');
+  });
+
+  it('starts a live Grok turn as working instead of starting', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: APP_ID, cliId: 'grok' },
+    } as any);
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const sessionReply = vi.fn(async () => 'om_grok_card');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(vi.mocked(buildStreamingCard).mock.calls[0]?.[5]).toBe('working');
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('reconciles the posted card when worker status changes during the POST', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.lastScreenStatus = 'idle';
+    ds.lastScreenContent = '';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(buildStreamingCard).mock.calls[0]?.[5]).toBe('starting');
+
+    ds.lastScreenStatus = 'working';
+    ds.lastScreenContent = 'Grok is thinking';
+    ds.streamCardStatusRevision = (ds.streamCardStatusRevision ?? 0) + 1;
+
+    resolvePost('om_turn_card_1');
+    await expect(post).resolves.toBe(true);
+    await flush();
+
+    const statuses = vi.mocked(buildStreamingCard).mock.calls.map(call => call[5]);
+    expect(statuses).toContain('working');
+    expect(vi.mocked(buildStreamingCard).mock.calls.at(-1)?.[4]).toBe('Grok is thinking');
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1', '{}');
+  });
+
+  it('does not patch when no newer worker status arrived during the POST', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const sessionReply = vi.fn(async () => 'om_turn_card_stable');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('posts a new-turn card immediately without waiting for screen_update', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+    const sessionReply = vi.fn(async () => 'om_turn_card_1');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('om_turn_1');
+    expect(ds.streamCardId).toBe('om_turn_card_1');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('isolates frozen-card cleanup when one chat session moves A to B to A', async () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.workerReady = true;
+    ds.streamCardId = 'om_card_a1';
+    ds.streamCardNonce = 'nonce_a1';
+    ds.streamCardReplyTargetKey = 'thread:om_topic_a';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_b1';
+    ds.currentTurnTitle = 'topic B';
+    ds.session.turnReplyContexts = {
+      om_turn_b1: { target: { mode: 'thread', rootMessageId: 'om_topic_b' } },
+      om_turn_a2: { target: { mode: 'thread', rootMessageId: 'om_topic_a' } },
+    };
+    const sessionReply = vi.fn()
+      .mockResolvedValueOnce('om_card_b1')
+      .mockResolvedValueOnce('om_card_a2');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_b1')).resolves.toBe(true);
+
+    expect(ds.streamCardReplyTargetKey).toBe('thread:om_topic_b');
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect([...ds.frozenCards!.values()].map(card => card.messageId)).toEqual(['om_card_a1']);
+
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_a2';
+    ds.currentTurnTitle = 'topic A again';
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_a2')).resolves.toBe(true);
+
+    expect(ds.streamCardReplyTargetKey).toBe('thread:om_topic_a');
+    expect(deleteMessageMock).toHaveBeenCalledTimes(1);
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_card_a1');
+    expect([...ds.frozenCards!.values()].map(card => card.messageId)).toEqual(['om_card_b1']);
+    expect([...ds.frozenCards!.values()][0]?.replyTargetKey).toBe('thread:om_topic_b');
+  });
+
+  it('posts the newest queued turn after an older card POST finishes', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('om_turn_card_2');
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    ds.currentTurnTitle = 'second turn';
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_2')).resolves.toBe(false);
+
+    resolveFirst('om_turn_card_1');
+    await firstPost;
+    await flush();
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][4]).toBe('om_turn_2');
+    expect(ds.streamCardId).toBe('om_turn_card_2');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+  });
+
+  it('restores the previous live card when the starting-card POST fails', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+    const sessionReply = vi.fn(async () => { throw new Error('network unavailable'); });
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(ds.streamCardPending).toBe(true);
+    expect(ds.streamCardPendingTurnId).toBe('om_turn_1');
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not let an old POST overwrite a replacement session', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session = {
+      ...ds.session,
+      sessionId: 'sess-replacement',
+      rootMessageId: 'om_replacement_root',
+    };
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    persistStreamCardStateMock.mockClear();
+
+    resolvePost('om_stale_turn_card');
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_stale_turn_card');
+  });
+
+  it('deletes an orphan card when the session closes during POST', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session.status = 'closed' as any;
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    persistStreamCardStateMock.mockClear();
+
+    resolvePost('om_orphan_card');
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_orphan_card');
+  });
+
+  it('does not adopt an old-route card after a completed transfer', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session.rootMessageId = 'om_transferred_root';
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+
+    resolvePost('om_old_route_card');
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_old_route_card');
+  });
+
+  it('does not roll an old POST failure back into a replacement session', async () => {
+    let rejectPost!: (error: Error) => void;
+    const sessionReply = vi.fn(() => new Promise<string>((_resolve, reject) => { rejectPost = reject; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session = {
+      ...ds.session,
+      sessionId: 'sess-replacement',
+      rootMessageId: 'om_replacement_root',
+    };
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    persistStreamCardStateMock.mockClear();
+
+    rejectPost(new Error('old route failed'));
+    await expect(post).resolves.toBe(false);
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+  });
+
+  it('discards an in-flight card when Riff explicit close starts preparing', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-1' };
+    resolvePost('om_riff_orphan_card');
+
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(ds.streamCardPending).toBe(true);
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_riff_orphan_card');
+  });
+
+  it('discards an in-flight card when Riff daemon shutdown starts preparing', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.remoteShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
+    resolvePost('om_riff_shutdown_orphan_card');
+
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_riff_shutdown_orphan_card');
+  });
+
+  it('can retry after Riff close preparation aborts without leaving the sentinel stuck', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('om_retry_card');
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-abort' };
+    resolveFirst('om_aborted_close_orphan_card');
+    await expect(firstPost).resolves.toBe(false);
+
+    ds.remoteCloseState = undefined;
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(ds.streamCardId).toBe('om_retry_card');
+    expect(ds.streamCardPending).toBe(false);
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_aborted_close_orphan_card');
+  });
+
+  it('rejects a POST whose active registry key was taken by another session', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const registry = new Map([[sessionKey('om_root', APP_ID), ds]]);
+    setActiveSessionsRegistry(registry);
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    registry.set(sessionKey('om_root', APP_ID), makeDs());
+    resolvePost('om_displaced_registry_card');
+
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).not.toBe('om_displaced_registry_card');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_displaced_registry_card');
   });
 });
 
@@ -611,6 +1037,105 @@ describe('scheduleCardPatch withdrawn handling', () => {
 
     expect(ds.streamCardId).toBeUndefined();
     expect(persistStreamCardStateMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('scheduleCardPatch adjacent duplicate handling', () => {
+  it('drops an identical PATCH queued for the same card after the in-flight PATCH succeeds', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_SAME';
+
+    let resolvePatch!: () => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise<void>(resolve => { resolvePatch = resolve; }),
+    );
+
+    scheduleCardPatch(ds, '{"state":"same"}');
+    scheduleCardPatch(ds, '{"state":"same"}');
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardId).toBe('om_SAME');
+    expect(ds.pendingCardJson).toBe('{"state":"same"}');
+
+    resolvePatch();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardId).toBeUndefined();
+    expect(ds.pendingCardJson).toBeUndefined();
+    expect(ds.cardPatchInFlight).toBe(false);
+
+    // The optimization is adjacency-only: once the successful PATCH has
+    // settled, the same state scheduled later must still reach Lark.
+    scheduleCardPatch(ds, '{"state":"same"}');
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+
+  it('retries an identical queued PATCH when the in-flight PATCH fails', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_RETRY';
+
+    let rejectPatch!: (error: Error) => void;
+    let resolveRetry!: () => void;
+    updateMessageMock
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => { rejectPatch = reject; }),
+      )
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveRetry = resolve; }),
+      );
+
+    scheduleCardPatch(ds, '{"state":"retry"}');
+    scheduleCardPatch(ds, '{"state":"retry"}');
+
+    rejectPatch(new Error('temporary failure'));
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls[1]).toEqual([
+      APP_ID,
+      'om_RETRY',
+      '{"state":"retry"}',
+    ]);
+
+    resolveRetry();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+  });
+
+  it('does not deduplicate identical JSON queued for a different card', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_OLD';
+
+    let resolveOldPatch!: () => void;
+    let resolveNewPatch!: () => void;
+    updateMessageMock
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveOldPatch = resolve; }),
+      )
+      .mockImplementationOnce(
+        () => new Promise<void>(resolve => { resolveNewPatch = resolve; }),
+      );
+
+    scheduleCardPatch(ds, '{"state":"same-json"}');
+    ds.streamCardId = 'om_NEW';
+    scheduleCardPatch(ds, '{"state":"same-json"}');
+
+    resolveOldPatch();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls[1]).toEqual([
+      APP_ID,
+      'om_NEW',
+      '{"state":"same-json"}',
+    ]);
+
+    resolveNewPatch();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
   });
 });
 

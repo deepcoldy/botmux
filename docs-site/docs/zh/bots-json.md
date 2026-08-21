@@ -45,12 +45,12 @@
 |------|------|
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
-| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选 |
+| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
 | `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
 | `cliPathOverride` | 旧版 CLI 入口覆盖，继续兼容 wrapper / router 和存量自定义二进制。新接入的 Codex 兼容发行版优先用 `cliRuntime`。为支持降级到旧版 BotMux，写入端会同时保存一个与 `cliRuntime.executable` 完全相同的兼容影子；不要手工配置不一致的两者 |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
 | `backendType` | 会话后端，可选 `pty` / `tmux` / `herdr` / `zellij`。**留空默认 `tmux`**（PTY 已退役自动回落）：tmux/herdr/zellij 这类持久后端在本机不可用时**硬拦截**、弹卡提示安装，**不再静默降级 pty**（`zellij` 需 ≥ 0.44）。`pty` 仅作显式兜底（`backendType:"pty"` 或 `BACKEND_TYPE=pty`）——直连进程、**不跨 daemon 重启存活**。见 [tmux 后端](/tmux) |
-| `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`）。留空＝用 `$SHELL`。下个会话生效；仅 `tmux` / `zellij` 后端（`pty` 直接 exec CLI，本就不受影响）。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
+| `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `fish` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`，fish 用户写 `~/.config/fish/config.fish`）。fish 是一等启动 shell：`launchShell: "fish"` 和 fish 绝对路径（如 `/usr/bin/fish`）都支持，`$SHELL` 为 fish 时桌面 PATH 探测也会读 fish，所以 fish 用户无需把 PATH / 环境变量回填到 `.bashrc` / `.zshrc`。下个会话对需要 shell 包装的持久后端（`tmux` / `zellij` / `zmx`）生效；`pty` 直接 exec CLI，本就不受影响。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
@@ -141,7 +141,7 @@
 
 | 字段 | 说明 |
 |------|------|
-| `allowedUsers` | 操作权名单（**完整邮箱**或 `ou_xxx`）。配了 `allowedChatGroups` 时至少要有一个作为 owner |
+| `allowedUsers` | 操作权名单。推荐使用**完整邮箱**、手机号或 `on_xxx`；`ou_xxx` 只能用于签发它的同一应用，禁止跨 Bot 复制。配了 `allowedChatGroups` 时至少要有一个作为 owner |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
 | `oncallChats` | oncall 绑定，`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |
@@ -183,6 +183,44 @@
 | `autoStartOnGroupJoin` | `true` 时，被拉入含至少一名 `allowedUsers` 的新群即自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
+
+## 群消息监听
+
+让 Bot **主动盯住某个群**：命中条件的群消息无需 @ 就自动拉起一个会话去处理。典型用途是**报警运维**——监控/告警系统本来就有自己的飞书机器人在往群里发告警，把这个 Bot 拉进那个群、开启监听，每条告警自动开工排查，不必额外配 [Webhook 接入点](/webhook)。
+
+推荐在 **Dashboard「角色 → 消息监听」** 里按群配置（可**预览**最近 24h 命中的消息、**试运行**验证效果）；也可直接写 `bots.json` 的 `messageListeners`（键为 `chat_id`，值为下表配置）：
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 是否启用该群的监听。启用时 `prompt` 必填，否则整条配置被忽略 |
+| `prompt` | 监听提示词：告诉 Bot 哪些消息要处理、怎么回复。命中消息会在其**下方新建话题**回复 |
+| `name` | 监听名称（可选），如「告警监听」，用于 Dashboard 展示 |
+| `replyCardTitle` | 回复卡片标题（可选），留空用默认 |
+| `workingDir` | 该监听拉起会话的工作目录（可选），留空用 Bot 默认工作目录 |
+| `senderPolicy.mode` | `all_except_excluded`（黑名单，默认）：处理所有匹配发送者类型、仅排除指定项；`include_only`（白名单）：只处理 `includeSenderOpenIds` 里的发送者 |
+| `senderPolicy.includeSenderTypes` | 监听的发送者类型：`["user"]` / `["bot"]` / 两者。**监听第三方告警机器人必须含 `"bot"`** |
+| `senderPolicy.includeSenderOpenIds` / `excludeSenderOpenIds` | 按 `open_id` 精确白名单 / 黑名单 |
+| `senderPolicy.excludeSelf` | 默认 `true`，始终排除当前 Bot 自己发的消息（防自触发） |
+| `messagePolicy.includeMsgTypes` | 监听的消息类型，默认文本 + 富文本（`post`） |
+
+```json
+{
+  "messageListeners": {
+    "oc_xxxxxxxxxxxxxxxx": {
+      "enabled": true,
+      "name": "告警监听",
+      "prompt": "群里每条告警都是线上事件。定位受影响服务、给出初步排查方向；确认是误报就说明理由。",
+      "senderPolicy": { "mode": "all_except_excluded", "includeSenderTypes": ["bot"] }
+    }
+  }
+}
+```
+
+约定与边界（V1）:
+
+- **只处理群聊顶层消息**：已有话题里的普通回复不处理；显式 @ 本 Bot 的消息仍走普通 @ 路由（不重复触发）。
+- **每条命中消息各拉起一个会话**，回复到该消息下方的新话题。
+- **触达方式**：实时事件路径覆盖飞书推送到的消息；**其他机器人发的、以及未 @ 的消息，靠约 30s 一次的历史轮询补齐**（即最长约 30s 延迟）。所以监听第三方告警机器人时用黑名单模式（`all_except_excluded` + 含 `"bot"`）最稳——白名单按 `open_id` 匹配，而历史接口里第三方机器人按 `app_id` 上报、可能解析不出 `open_id` 从而命中不到。
 
 ## 总结命令
 

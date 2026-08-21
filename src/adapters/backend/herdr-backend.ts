@@ -79,6 +79,7 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   agy: 'agy',
   omp: 'omp',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   copilot: 'copilot',
   kimi: 'kimi',
   'kiro-cli': 'kiro',
@@ -371,11 +372,18 @@ export class HerdrBackend implements SessionBackend {
   cliPid?: number;
   cliCwd?: string;
 
+  /** Default managed agent name for a Botmux-launched CLI (the single source of
+   *  truth shared by the constructor default and the selector's agent-precise
+   *  reattach probe). */
+  static defaultAgentName(): string {
+    return 'botmux';
+  }
+
   constructor(
     readonly sessionName: string,
     private readonly opts: HerdrBackendOptions = {},
   ) {
-    this.agentName = opts.agentName ?? 'botmux';
+    this.agentName = opts.agentName ?? HerdrBackend.defaultAgentName();
     if (opts.externalTarget?.paneId) this.paneId = opts.externalTarget.paneId;
   }
 
@@ -536,6 +544,23 @@ export class HerdrBackend implements SessionBackend {
       if (existing) {
         this.actuallyReattached = true;
         this.paneId = existing.pane_id;
+      } else if (this.opts.isReattach) {
+        // FREEZE the reattach decision (mirrors ZmxBackend: "never turn a stale
+        // reattach into a new CLI after the backing session disappeared"). The
+        // worker predicted reattach from an earlier probe and therefore SKIPPED
+        // the cold-path setup that only runs on !willReattachPersistent — the
+        // PENDING generation proof AND the credential-only Seatbelt/bwrap wrapper.
+        // If the `botmux` agent vanished between that probe and here, silently
+        // `agent start`ing a fresh CLI would launch it WITHOUT the credential
+        // boundary (unsafe on an enrolled host) and leave the old committed marker
+        // in place to later reattach it as "isolated". Post-spawn teardown can't
+        // undo an already-executed unwrapped CLI, so we must refuse HERE: throw so
+        // the worker's next launch takes the cold path (write PENDING + assemble
+        // the wrapper BEFORE creating the agent).
+        throw new Error(
+          `herdr agent ${this.agentName} in ${this.sessionName} disappeared before reattach; `
+          + `refusing to silently start a fresh (unwrapped) generation`,
+        );
       } else if (herdrUsesPaneAgentStart()) {
         this.paneId = this.startPaneAgent(bin, args, opts);
       } else {
@@ -593,8 +618,8 @@ export class HerdrBackend implements SessionBackend {
     );
   }
 
-  pasteText(text: string): void {
-    this.write(text);
+  pasteText(text: string): boolean {
+    return this.write(text);
   }
 
   resize(cols: number, rows: number): void {

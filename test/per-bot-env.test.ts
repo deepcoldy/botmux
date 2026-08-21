@@ -54,6 +54,7 @@ describe('sanitizePerBotEnv()', () => {
         CLAUDE_CONFIG_DIR: '/tmp/evil',
         CODEX_HOME: '/tmp/evil-codex',
         GROK_HOME: '/tmp/evil-grok',
+        LARKSUITE_CLI_DATA_DIR: '/tmp/evil-keystore',
         CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '1',
         CJADK_INTERACTIVE: '1',
         IS_SANDBOX: '1',
@@ -82,7 +83,7 @@ describe('isReservedPerBotEnvKey()', () => {
       'CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
       'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
       'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
-      'CODEX_HOME', 'GROK_HOME',
+      'CODEX_HOME', 'GROK_HOME', 'LARKSUITE_CLI_DATA_DIR',
       'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR', '__OWNER_OPEN_ID',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);

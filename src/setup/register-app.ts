@@ -28,9 +28,10 @@ export type RegisterAppOk = {
   appSecret: string;
   brand: RegisterBrand;
   /**
-   * 扫码人的 open_id (飞书 device flow `request_user_info=open_id tenant_brand`
-   * 字段返回). 给 setup 用作 `allowedUsers` 默认值, 省掉用户手动输入"我自己"
-   * 这一步. 没拿到时为 undefined (理论上不会, 但接口可能改).
+   * 扫码人的 open_id（飞书 device flow `request_user_info=open_id tenant_brand`
+   * 字段返回）。它只是 owner candidate：必须由目标应用验证并尽量转换为
+   * union_id 后才能持久化，验证失败不得把这个 open_id fallback 写入
+   * `allowedUsers`。没拿到时为 undefined（理论上不会，但接口可能改）。
    */
   userOpenId?: string;
 };

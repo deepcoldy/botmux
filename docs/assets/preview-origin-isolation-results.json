@@ -1,0 +1,38 @@
+{
+  "ok": true,
+  "subject": "P0 preview opaque-origin isolation",
+  "browser": "local executable",
+  "sandbox": "allow-scripts allow-forms allow-popups",
+  "assertions": {
+    "parentDomUnreadable": true,
+    "managementApiAnonymous": true,
+    "debugTerminalUnreachable": true,
+    "exfiltrationEmpty": true,
+    "previewOwnResourcesWork": true,
+    "cspSandboxOnProxiedDocuments": true
+  },
+  "findings": {
+    "iframeSandbox": "allow-scripts allow-forms allow-popups",
+    "attack": {
+      "relativeScriptExecuted": true,
+      "origin": "null",
+      "parentDomRead": "THREW:SecurityError",
+      "parentLocation": "THREW:SecurityError",
+      "parentGlobals": "THREW:SecurityError",
+      "cookieRead": "THREW:SecurityError",
+      "localStorage": "THREW:SecurityError",
+      "apiSessions": "THREW:TypeError",
+      "debugCreate": "THREW:TypeError",
+      "debugSocketKnownId": "error",
+      "ownWebSocket": "message:preview-own-ws:ping",
+      "ownRelativeFetch": {
+        "status": 200,
+        "body": "preview-own-resource-ok"
+      },
+      "exfiltration": "sent:200"
+    },
+    "exfiltratedBytes": 448,
+    "reportedByPreview": 1,
+    "contentSecurityPolicy": "sandbox allow-scripts allow-forms allow-popups"
+  }
+}

@@ -14,7 +14,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(envSetup).toContain('engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;');
     expect(envSetup).toContain('engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
     expect(envSetup).toContain("engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';");
-    expect(envSetup).toContain('engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;');
+    expect(envSetup).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);');
     expect(envSetup).not.toContain('BOTMUX_LARK_APP_SECRET');
   });
 
@@ -24,7 +24,10 @@ describe('TRAE worker structured-bridge wiring', () => {
     const body = workerSource.slice(start, end);
 
     expect(body).toContain('if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);');
-    expect(body).toContain('if (structuredBridgeIsTraex()) return drainTraexRollout(path, offset);');
+    // adoptMode is threaded into the TRAE drainer so it does not synthesise a
+    // bare sentinel in adopt mode (where transcript text is posted verbatim).
+    expect(body).toContain('if (structuredBridgeIsTraex())');
+    expect(body).toContain('drainTraexRollout(path, offset, { adoptMode:');
   });
 
   it('publishes the latest TRAE runtime on attach and incremental ingest', () => {
@@ -174,7 +177,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n', start);
     const follower = workerSource.slice(start, end);
 
-    expect(follower).toContain('findTraexRolloutByPid(pid)');
+    expect(follower).toContain('findTraexRolloutByPid(pid, currentSid)');
     expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
     expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
   });
@@ -184,7 +187,10 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n\nfunction stopCodexBridge', start);
     const body = workerSource.slice(start, end);
 
-    expect(body).toContain('shouldEmitEmptyCompletedBridgeFallback');
+    // The empty-completed fallback is still wired — now via the extracted
+    // structuredFallbackKind decision, whose 'empty_completed' branch posts
+    // emptyCompletedBridgeFallbackContent().
+    expect(body).toContain('structuredFallbackKind');
     expect(body).toContain('emptyCompletedBridgeFallbackContent()');
     expect(body).not.toContain('if (!turn.finalText) continue;');
   });

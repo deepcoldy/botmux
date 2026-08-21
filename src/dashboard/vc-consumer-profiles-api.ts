@@ -52,7 +52,12 @@ export interface VcMeetingAgentOptionDto {
   online: boolean;
   workingDirReady: boolean;
   reliableTurnTerminal: boolean;
-  managedSideEffectIsolation: boolean;
+  /** May this bot be selected as a meeting consumer at all (plan B: true unless
+   *  an explicit sandbox request is undeliverable on this platform/backend). */
+  managedSideEffectEligible: boolean;
+  /** Is the managed sandbox boundary actually in force? false ⇒ the bot's Lark
+   *  credential is exposed to untrusted meeting input (informed opt-out). */
+  sandboxIsolated: boolean;
 }
 
 export interface VcMeetingConsumerProfilesGetBody {
@@ -102,7 +107,8 @@ export interface VcMeetingConsumerProfilesApiDeps {
   onlineBotName(appId: string): string | undefined;
   isOnline(appId: string): boolean;
   adapterReliableTurnTerminal(cliId: string | undefined, cliPathOverride?: string): boolean;
-  managedSideEffectIsolation(bot: BotConfig): boolean;
+  managedSideEffectEligible(bot: BotConfig): boolean;
+  sandboxIsolated(bot: BotConfig): boolean;
   /** Called after a successful PUT so the live daemon reloads the new catalog. */
   reloadDaemons(appIds: string[]): Promise<void>;
 }
@@ -303,7 +309,7 @@ export function buildVcMeetingAgentOptions(
   deps: Pick<
     VcMeetingConsumerProfilesApiDeps,
     'loadBotConfigs' | 'effectiveDefaultWorkingDir' | 'onlineBotName' | 'isOnline'
-    | 'adapterReliableTurnTerminal' | 'managedSideEffectIsolation'
+    | 'adapterReliableTurnTerminal' | 'managedSideEffectEligible' | 'sandboxIsolated'
   >,
 ): VcMeetingAgentOptionDto[] {
   let configs: BotConfig[];
@@ -326,7 +332,8 @@ export function buildVcMeetingAgentOptions(
       online: deps.isOnline(bot.larkAppId),
       workingDirReady,
       reliableTurnTerminal: deps.adapterReliableTurnTerminal(bot.cliId, bot.cliPathOverride),
-      managedSideEffectIsolation: deps.managedSideEffectIsolation(bot),
+      managedSideEffectEligible: deps.managedSideEffectEligible(bot),
+      sandboxIsolated: deps.sandboxIsolated(bot),
     };
   }).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
 }

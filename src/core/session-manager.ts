@@ -5,15 +5,17 @@
  */
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliAdapter } from '../adapters/cli/types.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -34,11 +36,13 @@ import {
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
+import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
   composeSpawnCodexAppContext,
@@ -81,6 +85,9 @@ import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
+import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { writePromptContext } from '../services/prompt-context-store.js';
+import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -204,6 +211,38 @@ async function resumeRestoredPendingRepoSetup(
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }
 
+/**
+ * Drop a persisted `previewTarget` that belonged to the previous worker
+ * generation, before this restore pass rebuilds a DaemonSession from the row.
+ *
+ * `previewTarget` is the literal loopback (host, port) an agent registered with
+ * `botmux preview <port>`; it is routing state for the worker that was live at
+ * registration time, not a durable property of the conversation. Restore always
+ * opens a NEW generation — every row here is rebuilt with `worker: null`, and
+ * killStalePids has just reaped the previous run's CLI processes — so whatever
+ * served that port is gone and the OS may hand the number to any unrelated
+ * local service. The preview proxy dials a registered target by host/port
+ * alone, so carrying one across the restart can proxy a user's preview into
+ * someone else's local server. Applies to adopt rows too: a surviving adopted
+ * CLI is no proof that its dev server survived, and re-registering costs one
+ * command inside the session.
+ *
+ * Cleanup only — registration (`POST /api/sessions/:id/preview`, which probes
+ * reachability first) and the proxy are untouched; the session simply
+ * re-registers. A failed save is logged and swallowed: the in-memory row this
+ * pass registers is already clear (so nothing dials the stale target), and the
+ * next successful save converges the file.
+ */
+function clearRestoredPreviewTarget(session: Session): void {
+  // P1-13：与 worker 换代 / suspend / exit / close 走同一个收口（清字段 + 落盘 +
+  // 广播 `preview: null`），restore 只是「代次边界」的又一种形态，不该有第二份实现。
+  if (!clearSessionPreviewTarget(session, 'restore opens a new worker generation')) return;
+  logger.debug(
+    `[${session.sessionId.substring(0, 8)}] Dropped preview target registered by the previous worker `
+    + `generation; the session must re-register with \`botmux preview <port>\``,
+  );
+}
+
 function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
   session.restoreQuarantinedAt ??= new Date().toISOString();
   try {
@@ -290,6 +329,10 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
 type CliMismatchCloseResult =
   | 'not_mismatched'
   | 'closed'
+  /** Closed, but its remote session survived and needs manual cleanup. */
+  | 'closed_with_residual'
+  /** closeSession REFUSED (e.g. remote cancellation unproven). Row stays active. */
+  | 'close_failed'
   | 'teardown_failed'
   | 'transfer_deferred';
 
@@ -369,7 +412,30 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
   } else {
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
-  await closeSession(ds.session.sessionId);
+  const result = await closeSession(ds.session.sessionId);
+  if (!result.ok) {
+    // closeSession models a refused close as a RETURNED {ok:false}, not a throw.
+    // Falling through to 'closed' here counted a still-active row (whose remote
+    // session may still be running) as torn down, and the caller then reported a
+    // green "closed N". The row and its registry owner are deliberately left
+    // intact by closeSession, so the sweep just reports the failure.
+    logger.error(
+      `[${tag}] CLI mismatch close REFUSED (${result.error}); row stays active`,
+    );
+    return 'close_failed';
+  }
+  if (result.outcome === 'closed_with_residual') {
+    // A hot CLI/backend switch can hit an old mojo row carrying either a parked
+    // remote lineage OR a local host subtree that could not be proven terminated.
+    // This path has no interactive surface, so the warning has to be loud in the
+    // log AND counted separately for whatever is showing the sweep total. Kind-
+    // aware so a LOCAL residual is not logged as a phantom `(undefined)` remote id.
+    const r = result.residual;
+    logger.warn(r.taskId
+      ? `[${tag}] CLI mismatch close left an UNCANCELLED remote session (${r.taskId}); manual cleanup required`
+      : `[${tag}] CLI mismatch close left a local host subtree unproven (${r.reason}); manual cleanup required`);
+    return 'closed_with_residual';
+  }
   return 'closed';
 }
 
@@ -383,10 +449,23 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * 豁免口径与 restoreActiveSessions 一致：queued（待办池）会话从没起过 CLI；
  * adopt 会话接管的是用户自己的外部 CLI，其 cliId 与 bot 配置不同是合法状态。
  */
-export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promise<number> {
+/**
+ * 返回值区分三种结果，而不是一个 closed 计数：远端 CLI（mojo / riff）的会话活在
+ * 本机之外，本地行关掉了而远端仍存活是真实可能的结果。
+ *
+ * - `closed`：本地行已关闭，且没有需要人工处理的残留。
+ * - `residual`：本地行已关闭（因此不会再被路由到），但远端会话还在，其 taskId 需要
+ *   上报给运维，否则调用方只看到「closed N」而拿不到清理线索。
+ * - `failed`：关闭被拒绝（例如远端取消无法证明），该行仍然 active。
+ */
+export async function closeCliMismatchedSessionsForBot(
+  larkAppId: string,
+): Promise<{ closed: number; residual: number; failed: number }> {
   const registry = getActiveSessionsRegistry();
-  if (!registry) return 0;
+  if (!registry) return { closed: 0, residual: 0, failed: 0 };
   let closed = 0;
+  let residual = 0;
+  let failed = 0;
   // 先快照再遍历：closeSession 会在迭代途中从 registry 删项。
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
@@ -403,15 +482,20 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     try {
       const result = await closeActiveSessionIfCliMismatch(ds);
       if (result === 'closed') closed++;
+      else if (result === 'closed_with_residual') { closed++; residual++; }
+      else if (result === 'close_failed' || result === 'teardown_failed') failed++;
       else if (result === 'transfer_deferred') armCliMismatchResweep(ds);
     } catch (err) {
+      // A thrown close is a failure too — count it, or the caller reports a clean
+      // sweep while this row is still active.
+      failed++;
       logger.error(
         `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed; continuing sweep: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  return closed;
+  return { closed, residual, failed };
 }
 
 /**
@@ -651,7 +735,7 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 
 /**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
- * (open_id + type + optional name) via `resolveSender(...)` in identity-cache.
+ * (open_id + type + optional name/email) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
@@ -659,6 +743,7 @@ export function renderSenderTag(sender?: ResolvedSender): string {
   if (!sender || !sender.openId) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
+  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -1138,12 +1223,45 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-export function buildFollowUpContent(
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+
+/**
+ * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
+ * （#794）把 reminder/whiteboard 挪进 sidecar，其余块照常 join 进 PTY 文本。
+ */
+/** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
+ *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
+type FollowUpOpts = {
+  attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
+  isAdoptMode?: boolean;
+  cliId?: CliId;
+  cliPathOverride?: string;
+  locale?: Locale;
+  sender?: ResolvedSender;
+  larkAppId?: string;
+  chatId?: string;
+  whiteboardId?: string;
+  substituteTrigger?: SubstituteTrigger;
+  codexAppText?: string;
+  codexAppApplicationContext?: string;
+  codexAppMessageContext?: string;
+  /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
+   *  Claude hook 进程，强制 inline 模式。 */
+  sessionBackendType?: BackendType;
+  /** 本轮的权威 turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId）。
+   *  hook 模式下 sidecar 按 (turnId, fingerprint) 绑定，claim 时按权威 turnId 精确取。
+   *  缺失时无法做 turn 绑定，回退 inline（避免 reminder 被剥离却无 sidecar 可领）。 */
+  turnId?: string;
+};
+
+function buildFollowUpBlocks(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
-): string {
-  const parts: string[] = [];
+  opts?: FollowUpOpts,
+  hookMode = false,
+): Array<{ key: FollowUpBlockKey; text: string }> {
+  const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
@@ -1156,9 +1274,9 @@ export function buildFollowUpContent(
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-  if (roleBlock) parts.push(roleBlock);
-  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
+  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -1166,39 +1284,153 @@ export function buildFollowUpContent(
     // (config.noVisibleOutputHint, default OFF); otherwise the reminder is
     // byte-for-byte the pre-feature baseline. Live-read so a Settings flip
     // applies to the next follow-up turn without a daemon restart.
-    const reminder = t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
-    parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
+    // hook 模式（#794）：reminder 经 system-reminder 离带注入，命令式措辞可能触发
+    // 模型的注入防御被表面化，改用描述式的 reminder_hook。
+    const reminderKey = hookMode
+      ? 'ai.followup.reminder_hook'
+      : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
+    const reminder = t(reminderKey, undefined, opts?.locale);
+    blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
-  if (whiteboardBlock) parts.push(whiteboardBlock);
+  if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  parts.push(`<user_message>\n${content}\n</user_message>`);
+  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender);
-  if (senderBlock) parts.push(senderBlock);
+  if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
-  if (substituteBlock) parts.push(substituteBlock);
+  if (substituteBlock) blocks.push({ key: 'substitute', text: substituteBlock });
 
   const senderNote = renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
-  if (senderNote) parts.push(senderNote);
+  if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = opts?.attachments && opts.attachments.length > 0
     ? formatAttachmentsHint(opts.attachments, opts.locale)
     : '';
-  if (attachHint) parts.push(attachHint);
+  if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   const mentionBlock = renderMentionBlock(opts?.mentions);
-  if (mentionBlock) parts.push(mentionBlock);
+  if (mentionBlock) blocks.push({ key: 'mentions', text: mentionBlock });
 
-  return parts.join('\n\n');
+  return blocks;
+}
+
+export function buildFollowUpContent(
+  content: string,
+  sessionId: string,
+  opts?: FollowUpOpts,
+): string {
+  return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
+}
+
+/**
+ * UserPromptSubmit hook 注入的单条 additionalContext 大小上限（#794）。
+ * Claude Code 对超过 10k 字符的 additionalContext 会落文件传路径（模型需额外
+ * 工具调用读取，行为分叉）；8k 留余量。超限的轮次回退 inline 模式。
+ */
+const HOOK_ENVELOPE_MAX_CHARS = 8000;
+
+/**
+ * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
+ *  1. 适配器支持不可见 system-reminder 注入（目前仅 claude-code）；
+ *  2. per-bot 开关 envelopeInjection=auto（默认 off）；
+ *  3. preflight：botmux 的 UserPromptSubmit hook 已装进 **CLI 实际读取的** settings
+ *     （read-isolation 下是 per-bot BOT_HOME 那份，不是全局）；
+ *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
+ * 任一不满足 → inline（现状字节不变）。
+ */
+function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
+  if (!opts?.cliId) return 'inline';
+  // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
+  // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
+  // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
+  // 时默认 inline，不会静默丢 reminder（review hardening：黑名单会漏）。
+  const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
+  // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
+  // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
+  // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
+  if (!opts.sessionBackendType || !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
+  let adapter: CliAdapter;
+  try {
+    adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
+  } catch { return 'inline'; }
+  if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
+  if (!opts.larkAppId) return 'inline';
+  let botConfig: BotConfig;
+  try {
+    botConfig = getBot(opts.larkAppId).config;
+  } catch { return 'inline'; }
+  if (botConfig.envelopeInjection !== 'auto') return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId, opts.sessionBackendType);
+  if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
+  return 'hook';
+}
+
+/**
+ * 与 worker 的 willRedirectCliData 同条件，算出 CLI 实际读取的 Claude settings 路径。
+ * read-isolation（sandbox + supportsReadIsolation + 无 wrapperCli + 非 riff 后端）
+ * 下，CLI 经 CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`；
+ * preflight 必须查这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome
+ * 吞异常），查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
+ *
+ * 与 worker willRedirectCliData 的微差保持一致：
+ *  - backendType !== 'riff'：riff 后端的 CLI 跑在远端，本地 settings 不适用，
+ *    hook 模式对它无意义（远端没有 botmux hook，sidecar 写了没人读）。
+ *  - process.env.SESSION_DATA_DIR（不用 config.session.dataDir 的 packagedDataDir
+ *    fallback）：daemon 进程必有此 env，与 worker 严格一致。
+ *  - dirname 派生：与 worker 的 botHomePath(dirname(SESSION_DATA_DIR), appId) 相同。
+ */
+function effectivePromptHookConfigPath(
+  adapter: CliAdapter,
+  botConfig: BotConfig,
+  larkAppId: string,
+  sessionBackendType?: BackendType,
+): string | undefined {
+  const base = adapter.hookInstall?.configPath;
+  if (!base) return undefined;
+  const sandboxRequested = botConfig.sandbox === true
+    || botConfig.readIsolation === true
+    || process.env.BOTMUX_SANDBOX === '1';
+  const willRedirect = sandboxRequested
+    && adapter.supportsReadIsolation === true
+    && !botConfig.wrapperCli
+    && (sessionBackendType ?? botConfig.backendType) !== 'riff'
+    && !!process.env.SESSION_DATA_DIR;
+  if (!willRedirect) return base;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir) return base;
+  const botmuxHome = dirname(dataDir);
+  return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
 
 /** Follow-up counterpart of buildNewTopicCliInput. */
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: FollowUpOpts,
 ): CliTurnPayload {
+  // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
+  // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
+  // turnId 是 claim 的权威键：缺失时无法做 turn 绑定，回退 inline（避免 reminder 被
+  // 剥离却无 sidecar 可领）。
+  const hookTurnId = opts?.turnId;
+  if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
+    const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
+    const ptyText = blocks
+      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
+      .map((b) => b.text)
+      .join('\n\n');
+    const hookEnvelope = blocks
+      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard')
+      .map((b) => b.text)
+      .join('\n\n');
+    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
+      return { content: ptyText };
+    }
+    // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
+  }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
@@ -1361,6 +1593,7 @@ export function buildReforkPrompt(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
   });
 }
 
@@ -1381,6 +1614,7 @@ export function buildReforkCliInput(
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
+    turnId?: string;
   },
 ): CliTurnPayload {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -1405,6 +1639,8 @@ export function buildReforkCliInput(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
+    turnId: opts?.turnId,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -1424,6 +1660,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
+    s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
@@ -1436,6 +1673,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
+  s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
@@ -1612,6 +1850,167 @@ export async function restoreActiveSessions(
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
     }
+    // New worker generation ⇒ no registered preview port. Runs before every
+    // branch below (adopt / queued / ordinary / close / quarantine — including
+    // the mojo journal reconciliation right after, which has its own `continue`
+    // paths) so no rebuilt DaemonSession or announced row, and no row persisted
+    // by a quarantine/recovered close, can carry the old target.
+    clearRestoredPreviewTarget(session);
+    // Freeze the mojo control plane BEFORE this row becomes visible in the active
+    // map. The dispatcher is already live during restore, so a row registered
+    // first could be woken — or `/close`d — while still reading live bot config,
+    // pairing a lineage created on one tenant with another. Idempotent and cheap
+    // for non-mojo rows.
+    //
+    // Attribution must never be guessed. Legacy rows can genuinely lack
+    // larkAppId (session-store keeps them for compatibility), and falling back
+    // to getAllBots()[0] classified such rows against an ARBITRARY bot: if
+    // bot[0] happened to be mojo, an unrelated old riff/remote row was frozen
+    // with bot[0]'s tenant identity and its lineage parked into
+    // mojoQuarantinedLineage — the exact cross-tenant misbinding the freeze
+    // exists to prevent, inverted, and idempotently locked in (an existing
+    // mojoIdentity short-circuits every later boot). A single registered bot is
+    // the one unambiguous fallback; with several, leave the row unfrozen so
+    // `mojoIdentity === undefined` keeps meaning "predates this field".
+    {
+      const allBots = getAllBots();
+      const freezeAppId = session.larkAppId
+        ?? (allBots.length === 1 ? allBots[0]?.config.larkAppId : undefined);
+      if (freezeAppId !== undefined) {
+        freezeMojoIdentityForSession(session, freezeAppId);
+      } else if (session.backendType === 'mojo' || session.cliId === 'mojo') {
+        logger.warn(
+          `[${session.sessionId.substring(0, 8)}] mojo row has no larkAppId and `
+          + `${allBots.length} bots are registered; refusing to guess its tenant — `
+          + 'identity stays unfrozen (no automatic resume or cancel)',
+        );
+      }
+    }
+
+    if (session.mojoCloseJournal
+        && !sessionStore.isValidMojoCloseJournal(session.mojoCloseJournal)) {
+      // Session JSON is a runtime boundary. A forged/truncated `prepared` object
+      // must not become proof that cancellation happened merely because the TS
+      // interface says its fields exist.
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_malformed');
+      continue;
+    }
+    if (session.mojoCloseJournal && session.backendType !== 'mojo') {
+      // A Mojo close proof on another backend is corrupt metadata, not authority
+      // to close that backend's row. Fence it for operator inspection; never let
+      // an untyped JSON field become a cross-backend teardown primitive.
+      session.mojoCloseJournal = {
+        phase: 'uncertain',
+        requestId: session.mojoCloseJournal.requestId,
+        ...(session.mojoCloseJournal.taskId
+          ? { taskId: session.mojoCloseJournal.taskId }
+          : {}),
+        // State the verdict rather than leaving a reader to infer it from the
+        // phase, and rebuild the row from scratch so a stale commit-only marker
+        // cannot survive as false proof of an irreversible teardown.
+        recovery: 'uncertain',
+        admission: 'fenced',
+        updatedAt: new Date().toISOString(),
+      };
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_backend_mismatch');
+      continue;
+    }
+    // ORDER IS LOAD-BEARING: this branch must stay ABOVE the catch-all below,
+    // which rebuilds any remaining journal as `uncertain` + fenced. A commit-only
+    // `prepared` row means the remote teardown already happened and only the local
+    // commit is outstanding; downgrading it to `uncertain` would demand manual
+    // reconciliation for something no retry can resolve, wedging the session open
+    // forever with its device-isolation blocker held. Pinned by
+    // "does NOT downgrade a COMMIT-ONLY prepared close" in
+    // test/restore-zombie-close.test.ts, which goes red if these are reordered.
+    if (session.mojoCloseJournal?.phase === 'prepared') {
+      if (session.mojoQuarantinedLineage) {
+        // The active lineage is proven gone, but an older PARKED lineage still
+        // needs a user-visible manual-cleanup warning. Auto-closing during boot
+        // has no reply surface and would strand the pending notice on a row that
+        // can never accept another turn. Keep the prepared row quarantined until
+        // an explicit close can return closed_with_residual to its caller.
+        quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_has_residual');
+        continue;
+      }
+      // The previous daemon durably recorded irreversible cancellation before it
+      // crashed. Complete only the local close; closeSession recognizes the
+      // prepared journal and never calls Mojo cancellation again.
+      try {
+        const recoveredClose = await closeSession(session.sessionId);
+        if (recoveredClose.ok) {
+          // The device-isolation blocker is held by the durable containment
+          // handle regardless, but the recovered close may carry a LOCAL residual
+          // (the crashed daemon proved the remote gone but not the host subtree).
+          // Surface it distinctly at boot rather than swallowing it into a plain
+          // "recovered" line, so the residual the row still carries is visible.
+          if (recoveredClose.outcome === 'closed_with_residual') {
+            logger.warn(
+              `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close WITH residual `
+              + `(${recoveredClose.residual.reason}); the device-isolation blocker is retained`,
+            );
+          } else {
+            logger.info(
+              `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close without re-cancelling`,
+            );
+          }
+          continue;
+        }
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Prepared Mojo close recovery was refused: `
+          + `${recoveredClose.error}`,
+        );
+      } catch (err) {
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Prepared Mojo close recovery failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_commit_failed');
+      continue;
+    }
+    if (session.mojoCloseJournal
+        && session.mojoCloseJournal.phase === 'preparing'
+        && session.mojoCloseJournal.recovery === 'retryable'
+        && session.mojoCloseJournal.admission === 'restorable') {
+      // P1-2: a prepare that FAILED CLEANLY — nothing irreversible happened, the
+      // worker restored write admission, and the verdict was durably recorded as
+      // retryable/restorable. Downgrading this to `uncertain` made the persisted
+      // `retryable` dead-code and the user-facing "retryable" promise a lie: the
+      // row was quarantined unregistered and every later /close refused. Keep
+      // the journal exactly as persisted and register the row normally — writes
+      // were already legal (admission restorable), and an explicit /close can
+      // re-run the cancel (beginMojoCloseJournal accepts the fresh requestId).
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] restoring row with retryable Mojo close `
+        + `journal (${session.mojoCloseJournal.requestId}); close may be retried`,
+      );
+      // fall through to normal registration below
+    } else if (session.mojoCloseJournal) {
+      // A crash while the worker cancel was in flight cannot be classified as
+      // cancelled or safely resumable without a real remote status oracle. Turn
+      // the durable intent into an explicit uncertainty fence and reserve the
+      // routing anchor; never auto-cancel or launch a replacement generation.
+      // The fence is not a dead end: an explicit /close DRAINS it — the row
+      // closes with its lineage parked as a residual for manual cleanup (see
+      // prepareMojoExplicitClose).
+      session.mojoCloseJournal = {
+        phase: 'uncertain',
+        requestId: session.mojoCloseJournal.requestId,
+        ...(session.mojoCloseJournal.taskId
+          ? { taskId: session.mojoCloseJournal.taskId }
+          : {}),
+        // State the verdict rather than leaving a reader to infer it from the
+        // phase, and rebuild the row from scratch so a stale commit-only marker
+        // cannot survive as false proof of an irreversible teardown.
+        recovery: 'uncertain',
+        admission: 'fenced',
+        updatedAt: new Date().toISOString(),
+      };
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_reconciliation_required');
+      continue;
+    }
+
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1684,6 +2083,7 @@ export async function restoreActiveSessions(
           adoptedFrom: adopted,
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
+          streamCardReplyTargetKey: session.streamCardReplyTargetKey,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -1888,6 +2288,7 @@ export async function restoreActiveSessions(
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
+      streamCardReplyTargetKey: session.streamCardReplyTargetKey,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -1950,8 +2351,17 @@ export async function restoreActiveSessions(
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
       if (mismatchClose !== 'not_mismatched') {
+        // Both failure kinds must quarantine, and neither can rely on the catch
+        // below: a REFUSED close (remote cancellation unproven) is a returned
+        // {ok:false}, not an exception. Without this the row stays active on disk
+        // while never being registered — the exact "active on disk, invisible at
+        // runtime" owner quarantineUnregisteredRestoreSession exists to prevent,
+        // after which a later inbound on the same anchor mints a second session
+        // while the old remote one is still running.
         if (mismatchClose === 'teardown_failed') {
           quarantineUnregisteredRestoreSession(session, 'cli_mismatch_teardown_unverified');
+        } else if (mismatchClose === 'close_failed') {
+          quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
         }
         continue;
       }
@@ -2081,6 +2491,13 @@ export async function restoreActiveSessions(
       );
       continue;
     }
+  }
+
+  // Re-arm persisted semantic-recovery timers only after the whole restore
+  // pass has registered collision winners. A zero-delay overdue backoff must
+  // not wake while a later row is still competing for the same route.
+  for (const ds of restoredByThisInvocation) {
+    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -2527,6 +2944,13 @@ export async function resumeSession(
   if (!reactivated.ok) return reactivated;
   session = reactivated.session;
 
+  // Same reason as in restoreActiveSessions: freeze the mojo control plane BEFORE
+  // this row is registered, so it can never be woken or cancelled while still
+  // resolving against live bot config. This is the second path that re-registers
+  // a legacy row, and startup migration does not cover it (the row may have been
+  // closed then, or created after boot).
+  freezeMojoIdentityForSession(session, larkAppId);
+
   const now = Date.now();
   const ds: DaemonSession = {
     session,
@@ -2545,6 +2969,7 @@ export async function resumeSession(
     ownerOpenId: session.ownerOpenId,
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
+    streamCardReplyTargetKey: session.streamCardReplyTargetKey,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
@@ -2640,6 +3065,37 @@ export function resolveScheduledTaskExecutionPosition(
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
 }
 
+async function buildScheduledTargetNotice(params: {
+  kind: 'chat' | 'thread';
+  taskName: string;
+  targetAppId: string;
+  targetChatId: string;
+  targetRootMessageId?: string;
+  targetBrand?: unknown;
+  locale?: Locale;
+}): Promise<string> {
+  const { getMessageThreadId } = await import('../im/lark/client.js');
+  const brand = normalizeBrand(params.targetBrand);
+  let link = chatAppLink(params.targetChatId, brand);
+  if (params.kind === 'thread' && params.targetRootMessageId) {
+    try {
+      const threadId = await getMessageThreadId(params.targetAppId, params.targetRootMessageId);
+      if (threadId) link = threadAppLink(params.targetChatId, threadId, brand);
+    } catch (err: any) {
+      logger.warn(
+        `[scheduler] Failed to resolve target topic ${params.targetRootMessageId}; falling back to chat link (${err.message})`,
+      );
+    }
+  }
+  return t(
+    params.kind === 'thread'
+      ? 'scheduler.task_triggered_target_thread'
+      : 'scheduler.task_triggered_target_chat',
+    { name: params.taskName, link },
+    params.locale,
+  );
+}
+
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
@@ -2709,13 +3165,20 @@ export async function executeScheduledTask(
     } else {
       if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
         const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        replyMessage(
+        buildScheduledTargetNotice({
+          kind: 'chat',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
           creatorAppId,
-          task.creatorRootMessageId,
-          t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
+          task.creatorRootMessageId!,
+          content,
           'text',
           true,
-        ).catch((err: any) => {
+        )).catch((err: any) => {
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
@@ -2739,13 +3202,20 @@ export async function executeScheduledTask(
       // target bot/chat's shared or independent-topic regular-group mode.
       if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
         const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        replyMessage(
+        buildScheduledTargetNotice({
+          kind: 'chat',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
           creatorAppId,
-          task.creatorRootMessageId,
-          t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
+          task.creatorRootMessageId!,
+          content,
           'text',
           true,
-        ).catch((err: any) => {
+        )).catch((err: any) => {
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
@@ -2786,13 +3256,21 @@ export async function executeScheduledTask(
     if (isCrossThread) {
       if (!silent) {
         const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        replyMessage(
+        buildScheduledTargetNotice({
+          kind: 'thread',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetRootMessageId: task.rootMessageId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
           creatorAppId,
           task.creatorRootMessageId!,
-          t('scheduler.task_triggered_target_thread', { name: task.name }, localeForBot(creatorAppId)),
+          content,
           'text',
           true,
-        ).catch((err: any) => {
+        )).catch((err: any) => {
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
@@ -2890,6 +3368,8 @@ export async function executeScheduledTask(
           larkAppId,
           chatId: task.chatId,
           whiteboardId: existing.session.whiteboardId,
+          sessionBackendType: existing.session.backendType,
+          turnId: scheduledTurnId,
         });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);

@@ -28,6 +28,7 @@ import {
   parseCodexAppControlWireRecord,
   takeCodexAppControlLocatorEndpoint,
 } from './utils/codex-app-control.js';
+import { CODEX_APP_NO_PROGRESS_TIMEOUT_MS } from './utils/codex-app-turn-liveness.js';
 import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
@@ -107,8 +108,10 @@ interface ActiveTurn {
   startResponsePending?: boolean;
   /** New steer admission is closed (completion seen or a definite rejection). */
   steeringClosed?: boolean;
-  /** The authoritative terminal `turn/completed` payload, once observed for the
-   * proven canonical id. */
+  /** A terminal `turn/completed` payload observed while a start/steer response
+   * is still in flight. It may be canonical or non-canonical; once that RPC
+   * barrier clears, the former settles directly and the latter reconciles from
+   * bounded history. */
   terminalCompletion?: JsonObject;
   /** The single in-flight steer RPC (at most one), and the id it targets. */
   steerInFlight?: { dispatch: Dispatch; expectedTurnId: string };
@@ -117,6 +120,12 @@ interface ActiveTurn {
    * completion seen while a steer RPC is still in flight is buffered here as a
    * barrier and only settles the group after the steer response resolves. */
   completionSeen?: boolean;
+  /** Wall-clock ceiling for a keep-pending reconcile's re-scan loop, stored on
+   * the turn so the notification handler can RESET it on forward progress. A
+   * fixed deadline would kill a legitimate long-running turn before the 90s
+   * liveness window fires; resetting on progress aligns the two: the loop only
+   * fail-closes after the same no-progress interval the watchdog projects. */
+  keepPendingDeadlineAtMs?: number;
 }
 
 /** One admitted input tracked inside an ActiveTurn's ordered accepted group. */
@@ -154,6 +163,38 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const RECONCILIATION_TIMEOUT_MS = 5_000;
 const RECONCILIATION_PAGE_LIMIT = 3;
 const RECONCILIATION_PAGE_SIZE = 50;
+/** Delay between bounded-history re-scans while a keep-pending reconcile waits
+ * for the accepted native turn's own completion. The regular notification
+ * handler settles the turn the moment its real completion arrives, so this only
+ * paces the fallback scan (a thin completion whose full record is history-only). */
+const RECONCILIATION_KEEP_PENDING_RETRY_MS = 200;
+/** Fail-closed window for a keep-pending reconcile's re-scan loop, structurally
+ * aligned with the worker's Codex App no-progress liveness window by reusing
+ * its constant: the loop must never fail-closed while the watchdog still
+ * considers the turn alive. The deadline is RESET on every forward-progress
+ * notification for the accepted turn (see handleNotification), so a legitimate
+ * long tool/model turn that keeps emitting activity is not killed by a stale
+ * fixed ceiling. The accepted native turn's own lifecycle normally bounds the
+ * wait (its completion settles the turn through the regular notification
+ * handler); this window is the fail-closed safety net for a turn that goes
+ * silent — without it the loop would poll thread/turns/list (~5Hz) forever.
+ * The no-progress watchdog only projects a stalled UI state and never cancels
+ * the runner, so it is NOT a safety net for this loop. */
+const RECONCILIATION_KEEP_PENDING_TIMEOUT_MS = CODEX_APP_NO_PROGRESS_TIMEOUT_MS;
+
+/** Test-only shrink for the keep-pending ceiling (same convention as the
+ * startup timeout override); production always uses the constant above. */
+function keepPendingTimeoutMs(): number {
+  if (process.env.NODE_ENV === 'test') {
+    const override = Number(process.env.BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS);
+    if (Number.isFinite(override) && override > 0) return override;
+  }
+  return RECONCILIATION_KEEP_PENDING_TIMEOUT_MS;
+}
+/** Consecutive app-server lifecycle notifications may arrive in separate stdout
+ * reads. Briefly debounce an idle edge so turn/completed followed immediately
+ * by an autonomous turn/started never exposes a false ready boundary. */
+const RUNNER_IDLE_SETTLE_MS = 20;
 
 class AppServerRpcError extends Error {
   constructor(
@@ -275,7 +316,7 @@ class AppServerClient {
     });
     this.child.on('error', err => {
       const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
-        ? '\nHint: install the Codex CLI, or set cliPathOverride to the Codex App bundled binary, for example /Applications/Codex.app/Contents/Resources/codex.'
+        ? '\nHint: install the Codex CLI, or set cliPathOverride to the desktop app bundled binary, for example /Applications/ChatGPT.app/Contents/Resources/codex (current) or /Applications/Codex.app/Contents/Resources/codex (legacy).'
         : '';
       this.failAll(new Error(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
     });
@@ -361,22 +402,46 @@ class AppServerClient {
     this.pending.clear();
   }
 
+  /**
+   * Message ordering must not depend on pipe chunk boundaries. Dispatching
+   * line N+1 synchronously after line N starves the microtask continuations
+   * line N scheduled: a response resolving `await request(...)` runs its
+   * awaiting caller (which records protocol state, e.g. "steer accepted,
+   * group grew") only AFTER the whole synchronous loop — so a notification
+   * coalesced into the same chunk behind its own request's response was
+   * processed against stale state and the turn stalled forever. The kernel
+   * coalesces adjacent writes whenever this reader is scheduled late (routine
+   * on loaded CI runners, possible anywhere), so yield a MICROtask between
+   * lines: already-queued continuations run before the next dispatch, while
+   * anything the runner deliberately defers past the current burst (e.g.
+   * macrotask-deferred publications) still sees the burst as one unit.
+   */
+  private stdoutDraining = false;
+
   private onStdout(data: string): void {
     this.stdoutBuffer += data;
-    for (;;) {
+    if (this.stdoutDraining) return;
+    this.stdoutDraining = true;
+    const step = (): void => {
       const nl = this.stdoutBuffer.indexOf('\n');
-      if (nl < 0) return;
+      if (nl < 0) {
+        this.stdoutDraining = false;
+        return;
+      }
       const line = this.stdoutBuffer.slice(0, nl).trim();
       this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (!line) continue;
-      let msg: JsonObject;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
+      if (line) {
+        let msg: JsonObject | undefined;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          msg = undefined;
+        }
+        if (msg) this.dispatch(msg);
       }
-      this.dispatch(msg);
-    }
+      queueMicrotask(step);
+    };
+    step();
   }
 
   private dispatch(msg: JsonObject): void {
@@ -536,7 +601,7 @@ function connectControlSocket(): void {
         // The first acceptance happens before app-server initialization; it is
         // not a ready boundary. Re-authentication can publish the live state
         // only after initialization has completed.
-        if (controlAcceptanceCount > 1 && runnerReady) emitRunnerState();
+        if (controlAcceptanceCount > 1 && runnerReady) settleRunnerState();
         flushControlQueue();
       } else if (action.type === 'ack' && controlAccepted) {
         if (action.seq > controlAckedSeq) controlAckedSeq = action.seq;
@@ -669,6 +734,7 @@ let cleanInputUnsupported = false;
 let codexVersionChecked = false;
 let codexVersion: CodexVersion | undefined;
 let cleanVersionWarningShown = false;
+let runnerIdleSettleTimer: NodeJS.Timeout | undefined;
 
 /** Per-turn token accumulators keyed by codex native turn id. Fed by
  *  thread/tokenUsage/updated notifications; drained (and deleted) when the
@@ -712,6 +778,33 @@ function emitRunnerState(
     acceptingInput: runnerReady,
     ...(busy && !tracksTurn ? { tracksTurn: false } : {}),
   });
+}
+
+function cancelRunnerIdleSettle(): void {
+  if (!runnerIdleSettleTimer) return;
+  clearTimeout(runnerIdleSettleTimer);
+  runnerIdleSettleTimer = undefined;
+}
+
+/** Publish native-busy immediately, but debounce idle across adjacent app-server
+ * lifecycle records. The timer re-reads live state, so queued input or a newly
+ * started native turn cannot be overwritten by a stale busy:false callback. */
+function settleRunnerState(): void {
+  if (generationFenced) return;
+  if (nativeActiveTurnId !== undefined) {
+    cancelRunnerIdleSettle();
+    emitRunnerState(true, activeTurn !== null);
+    return;
+  }
+  if (runnerIdleSettleTimer) return;
+  runnerIdleSettleTimer = setTimeout(() => {
+    runnerIdleSettleTimer = undefined;
+    if (generationFenced) return;
+    const busy = processing || queue.length > 0 || nativeActiveTurnId !== undefined;
+    emitRunnerState(busy, activeTurn !== null);
+    if (!busy) prompt();
+  }, RUNNER_IDLE_SETTLE_MS);
+  runnerIdleSettleTimer.unref?.();
 }
 
 function detectedCodexVersion(): CodexVersion | undefined {
@@ -881,7 +974,11 @@ function reportIdentityConflict(turn: ActiveTurn, observedNativeTurnId?: string,
   turn.resolveDone();
 }
 
-async function reconcileCompletedTurn(turn: ActiveTurn, observedNativeTurnId?: string): Promise<void> {
+async function reconcileCompletedTurn(
+  turn: ActiveTurn,
+  observedNativeTurnId?: string,
+  options: { keepPendingWhileActive?: boolean } = {},
+): Promise<void> {
   if (turn.reconciliation || turn.completed) return turn.reconciliation;
   const clientUserMessageId = turn.clientUserMessageId;
   if (!clientUserMessageId || !threadId) {
@@ -889,42 +986,105 @@ async function reconcileCompletedTurn(turn: ActiveTurn, observedNativeTurnId?: s
     return;
   }
   const epoch = turn.epoch;
-  const deadlineAtMs = Date.now() + RECONCILIATION_TIMEOUT_MS;
+  const sleep = (ms: number) => new Promise<void>(resolvePromise => setTimeout(resolvePromise, ms));
+  // keepPendingWhileActive: wall-clock ceiling for the re-scan loop below.
+  // Stored on the turn (not a closure local) so handleNotification can RESET
+  // it on every forward-progress notification — a fixed deadline would kill a
+  // legitimate long-running turn before the 90s liveness window fires.
+  //
+  // Gate arming on a bound native id. The progress-reset guard in
+  // handleNotification is `notificationTurnId !== turn.nativeTurnId` — when
+  // nativeTurnId is unset (a protocol-anomaly start response that returned no
+  // id and had no prior exact turn/started proof) that guard falls fully open,
+  // so ANY foreign/autonomous turn's progress would keep resetting this
+  // deadline while `acceptedTurnWentTerminal` can never fire (it needs the id).
+  // The loop would then never terminate. Without a native id we cannot track
+  // this turn's own liveness at all, so fail closed immediately (leave the
+  // deadline unset → the `?? 0` check below trips on the first scan) rather
+  // than hang on unrelated activity.
+  if (options.keepPendingWhileActive && turn.nativeTurnId) {
+    turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
+  }
+  let conflictReason = 'bounded history lookup found no match';
   turn.reconciliation = (async () => {
-    const matches: Array<{ turn: JsonObject; itemIndex: number }> = [];
-    let cursor: string | null | undefined;
-    for (let page = 0; page < RECONCILIATION_PAGE_LIMIT; page++) {
-      const remaining = deadlineAtMs - Date.now();
-      if (remaining <= 0) break;
-      const result = await client.request('thread/turns/list', {
-        threadId,
-        ...(cursor ? { cursor } : {}),
-        limit: RECONCILIATION_PAGE_SIZE,
-        sortDirection: 'desc',
-        itemsView: 'full',
-      }, { timeoutMs: remaining });
-      for (const candidate of Array.isArray(result?.data) ? result.data : []) {
-        if (!isTerminalNativeTurn(candidate)) continue;
-        const indexes = exactClientItemIndexes(candidate, clientUserMessageId);
-        if (indexes.length === 1) matches.push({ turn: candidate, itemIndex: indexes[0] });
-        else if (indexes.length > 1) {
-          reportIdentityConflict(turn, observedNativeTurnId, 'client id appears more than once in one turn');
-          return;
+    for (;;) {
+      // Each scan gets a fresh RPC budget.
+      const scanDeadlineAtMs = Date.now() + RECONCILIATION_TIMEOUT_MS;
+      const matches: Array<{ turn: JsonObject; itemIndex: number }> = [];
+      // Whether THIS turn's own native turn has a terminal record in the
+      // scanned history. The GLOBAL nativeActiveTurnId slot flipping to a
+      // different id is NOT proof this turn terminated — an autonomous Goal
+      // turn/started (or a late edge from another turn) flips it while the
+      // accepted turn is still running. Only the accepted turn's own terminal
+      // record is, so it is tracked per scan instead of comparing global slots.
+      let acceptedTurnWentTerminal = false;
+      let cursor: string | null | undefined;
+      for (let page = 0; page < RECONCILIATION_PAGE_LIMIT; page++) {
+        const remaining = scanDeadlineAtMs - Date.now();
+        if (remaining <= 0) break;
+        const result = await client.request('thread/turns/list', {
+          threadId,
+          ...(cursor ? { cursor } : {}),
+          limit: RECONCILIATION_PAGE_SIZE,
+          sortDirection: 'desc',
+          itemsView: 'full',
+        }, { timeoutMs: remaining });
+        for (const candidate of Array.isArray(result?.data) ? result.data : []) {
+          if (!isTerminalNativeTurn(candidate)) continue;
+          if (turn.nativeTurnId && candidate?.id === turn.nativeTurnId) {
+            acceptedTurnWentTerminal = true;
+          }
+          const indexes = exactClientItemIndexes(candidate, clientUserMessageId);
+          if (indexes.length === 1) matches.push({ turn: candidate, itemIndex: indexes[0] });
+          else if (indexes.length > 1) {
+            reportIdentityConflict(turn, observedNativeTurnId, 'client id appears more than once in one turn');
+            return;
+          }
         }
+        cursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
+        if (!cursor) break;
       }
-      cursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
-      if (!cursor) break;
+      if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
+      if (matches.length === 1) {
+        completeActiveTurnFromNative(turn, matches[0].turn, matches[0].itemIndex);
+        return;
+      }
+      if (matches.length > 1) {
+        reportIdentityConflict(turn, observedNativeTurnId, 'bounded history lookup found multiple matches');
+        return;
+      }
+      // No terminal turn with an exact client-id match in bounded history.
+      //
+      // A single foreign-id completion buffered before the start/steer response
+      // is not causal proof that the ACCEPTED turn terminated: it can be a late
+      // arrival from a previous / autonomous turn while the accepted turn is
+      // still running, whose terminal record cannot be in history yet. Failing
+      // closed immediately would kill the running turn and discard its real
+      // completion when it arrives moments later.
+      //
+      // keepPendingWhileActive: keep the turn pending and re-scan while the
+      // accepted native turn has NOT itself gone terminal in history. The
+      // turn's own completion settles it through the regular notification
+      // handler (tripping the turn.completed guard above); a thin completion
+      // whose full record exists only in history is picked up by a re-scan.
+      // Fail closed only when (a) the accepted turn's OWN terminal record is
+      // in history with still no exact match — a genuine identity conflict,
+      // distinct from another turn merely starting — or (b) the wall-clock
+      // ceiling is reached (the turn never completes), so the loop cannot
+      // poll thread/turns/list forever.
+      if (!options.keepPendingWhileActive) break;
+      if (acceptedTurnWentTerminal) {
+        conflictReason = 'accepted native turn terminated without an exact client id match';
+        break;
+      }
+      if (Date.now() >= (turn.keepPendingDeadlineAtMs ?? 0)) {
+        conflictReason = 'bounded history lookup found no match within the keep-pending deadline';
+        break;
+      }
+      await sleep(RECONCILIATION_KEEP_PENDING_RETRY_MS);
+      if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
     }
-    if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
-    if (matches.length === 1) {
-      completeActiveTurnFromNative(turn, matches[0].turn, matches[0].itemIndex);
-      return;
-    }
-    reportIdentityConflict(
-      turn,
-      observedNativeTurnId,
-      matches.length === 0 ? 'bounded history lookup found no match' : 'bounded history lookup found multiple matches',
-    );
+    reportIdentityConflict(turn, observedNativeTurnId, conflictReason);
   })().catch(err => {
     if (activeTurn === turn && !turn.completed) {
       reportIdentityConflict(turn, observedNativeTurnId, `bounded history lookup failed: ${asError(err).message}`);
@@ -1011,7 +1171,10 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
     // A Goal continuation is native work, not a Botmux turn. Keep the worker
     // busy while explicitly advertising that the initialized runner can accept
     // a Lark follow-up through turn/steer.
-    if (runnerReady) emitRunnerState(true, false);
+    if (runnerReady) {
+      cancelRunnerIdleSettle();
+      emitRunnerState(true, false);
+    }
     return;
   }
 
@@ -1025,7 +1188,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       // false-flag head was parked behind it (B3 gate), nativeActiveTurnId is
       // now cleared (line above) so re-kick the drain to start it as its own
       // turn — otherwise it would sleep forever. drainQueue no-ops when idle.
-      if (runnerReady) emitRunnerState();
+      if (runnerReady) settleRunnerState();
       if (queue.length > 0 && nativeActiveTurnId === undefined) void drainQueue();
       return;
     }
@@ -1037,13 +1200,23 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
     if (inGroupMode(turn)) {
       turn.completionSeen = true;
       turn.steeringClosed = true;
+      // Preserve every completion across an outstanding RPC response. Prefer a
+      // canonical candidate if several terminal notifications cross the same
+      // barrier; a later foreign completion must not overwrite proven content.
+      const bufferedId = typeof turn.terminalCompletion?.id === 'string'
+        ? turn.terminalCompletion.id
+        : undefined;
+      if (!turn.terminalCompletion
+          || completedId === turn.canonicalNativeTurnId
+          || bufferedId !== turn.canonicalNativeTurnId) {
+        turn.terminalCompletion = nativeTurn;
+      }
       // A steer RPC racing this completion, or a still-pending root start
       // response, is a barrier: buffer and let that continuation settle the group
       // once it appends its member / binds canonical. (canonical-only barrier.)
       const isCanonical = turn.canonicalNativeTurnId !== undefined
         && completedId === turn.canonicalNativeTurnId;
       if (isCanonical) {
-        turn.terminalCompletion = nativeTurn;
         if (turn.steerInFlight || turn.startResponsePending) {
           emitLifecycle({ kind: 'completion_race', appTurnId: completedId, category: 'steer_in_flight' });
           return;
@@ -1156,6 +1329,12 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   // Every notification for the active app-server turn is evidence of forward
   // progress, including reasoning/status events that do not render text.
   emitTurnActivity(turn, 'progress');
+  // Reset the keep-pending reconcile ceiling on progress: a turn that is still
+  // emitting activity must not be killed by a stale fixed deadline while the
+  // 90s liveness window is being refreshed by the same progress markers.
+  if (turn.keepPendingDeadlineAtMs !== undefined) {
+    turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
+  }
 
   if (msg.method === 'item/started') {
     const item = params.item;
@@ -1284,8 +1463,8 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     config: {
       shell_environment_policy: { inherit: 'all' },
       // Per-turn reasoning effort → codex config key (ThreadStartParams accepts an
-      // arbitrary config map). Codex 0.145 accepts low/medium/high/xhigh and echoes
-      // xhigh back verbatim, so pass it through unchanged (no downgrade).
+      // arbitrary config map). Codex 0.146.1 accepts
+      // low/medium/high/xhigh/max/ultra, so pass it through unchanged (no downgrade).
       ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort } : {}),
     },
     // Per-turn model override → ThreadStartParams top-level model. Only set on a
@@ -1559,6 +1738,29 @@ async function reconcileSteeredGroupFromHistory(
   await turn.reconciliation;
 }
 
+/** Resume group settlement after an outstanding start/steer RPC has cleared.
+ * app-server responses and notifications can share one stdout read, so the
+ * notification handler may run before the awaiting RPC continuation. Preserve
+ * both canonical and non-canonical completions across that boundary. */
+function resumeBufferedGroupCompletion(turn: ActiveTurn): boolean {
+  if (activeTurn !== turn
+      || turn.completed
+      || !inGroupMode(turn)
+      || !turn.completionSeen
+      || !turn.terminalCompletion
+      || turn.steerInFlight
+      || turn.startResponsePending) return false;
+  const completedId = typeof turn.terminalCompletion.id === 'string'
+    ? turn.terminalCompletion.id
+    : undefined;
+  if (completedId !== undefined && completedId === turn.canonicalNativeTurnId) {
+    settleSteeredCompletion(turn, turn.terminalCompletion);
+  } else {
+    void reconcileSteeredGroupFromHistory(turn, completedId);
+  }
+  return true;
+}
+
 
 /**
  * Opportunistically admit the queue head as a pre-final `turn/steer` into the
@@ -1627,7 +1829,24 @@ async function tryAdmitSteer(): Promise<void> {
       // once this native turn completes the head starts its own turn.
       turn.steeringClosed = true;
       emitLifecycle({ kind: 'steer_rejected_fallback', appTurnId: expectedTurnId, category: 'definite_rejection' });
-      if (turn.completionSeen && turn.terminalCompletion) settleSteeredCompletion(turn, turn.terminalCompletion);
+      // A completion buffered while this steer was in flight must settle now.
+      // terminalCompletion may be non-canonical (PR broadened it), so route by
+      // identity exactly like resumeBufferedGroupCompletion — but WITHOUT its
+      // inGroupMode guard: this rejected steer never appended, so accepted.length
+      // is still 1 and inGroupMode is false here. Blindly calling
+      // settleSteeredCompletion would trust a foreign turn's items (wrong
+      // attribution); the helper would instead no-op and strand the completion
+      // (hang). Canonical → settle directly; non-canonical → bounded reconcile.
+      if (turn.completionSeen && turn.terminalCompletion) {
+        const bufferedId = typeof turn.terminalCompletion.id === 'string'
+          ? turn.terminalCompletion.id
+          : undefined;
+        if (bufferedId !== undefined && bufferedId === turn.canonicalNativeTurnId) {
+          settleSteeredCompletion(turn, turn.terminalCompletion);
+        } else {
+          void reconcileSteeredGroupFromHistory(turn, bufferedId);
+        }
+      }
       return;
     }
     // Unknown outcome (transport/timeout/generic rpc/protocol): fence — never
@@ -1667,10 +1886,7 @@ async function tryAdmitSteer(): Promise<void> {
   });
   // A completion may have arrived while this steer was in flight (barrier): settle
   // now that the group is final. Otherwise chain the next queued follow-up.
-  if (turn.completionSeen && turn.terminalCompletion) {
-    settleSteeredCompletion(turn, turn.terminalCompletion);
-    return;
-  }
+  if (resumeBufferedGroupCompletion(turn)) return;
   void tryAdmitSteer();
 }
 
@@ -1935,9 +2151,12 @@ async function runTurn(message: QueuedInput): Promise<void> {
   // R4-B2 defense-in-depth: the buffered terminal's id MUST equal the proven
   // canonical id before we settle from it — a first-proof-wins violation upstream
   // would otherwise let terminal A's content ship under a different native id.
+  // A MISSING id must NOT settle directly: it routes through bounded-history
+  // reconcile (the same rule resumeBufferedGroupCompletion applies), so a
+  // malformed payload can never bypass attribution by omitting its id.
   const bufferedTerminalMatchesCanonical = turn.terminalCompletion !== undefined
-    && (typeof turn.terminalCompletion.id !== 'string'
-      || turn.terminalCompletion.id === turn.canonicalNativeTurnId);
+    && typeof turn.terminalCompletion.id === 'string'
+    && turn.terminalCompletion.id === turn.canonicalNativeTurnId;
   const settleBufferedCanonical = !turn.completed
     && turn.completionSeen
     && turn.terminalCompletion
@@ -1947,6 +2166,10 @@ async function runTurn(message: QueuedInput): Promise<void> {
     && ((turn.accepted?.length ?? 0) > 1
       || turn.identityProof === 'exact_started'
       || turn.identityProof === 'exact_completed');
+  // A group may have received a non-canonical completion in the same stdout
+  // read as its start/steer response. With both RPC barriers clear, reconcile
+  // it before the single-root compatibility path below.
+  resumeBufferedGroupCompletion(turn);
   if (settleBufferedCanonical) {
     settleSteeredCompletion(turn, turn.terminalCompletion!);
   }
@@ -1975,13 +2198,30 @@ async function runTurn(message: QueuedInput): Promise<void> {
       void reconcileCompletedTurn(turn, turn.nativeTurnId);
     } else if (turn.requestKind === 'start' && nativeMatches.length === 1) {
       completeActiveTurnFromNative(turn, nativeMatches[0]);
+    } else if (pendingCompletions.length > 0) {
+      // A mismatched completion can share one stdout read with turn/start's
+      // response. It was buffered while requestAccepted was false; replay the
+      // regular reconciliation path instead of silently dropping it.
+      //
+      // keepPendingWhileActive: this single foreign-id completion is not proof
+      // the accepted turn terminated — it may be a late arrival from a previous
+      // / autonomous turn while the accepted turn is still running (its terminal
+      // record cannot be in history yet). Keep the turn pending until its own
+      // completion settles it; fail closed only if the native turn is no longer
+      // active with no exact match in bounded history.
+      const observedId = pendingCompletions.slice().reverse().find(
+        (completion: JsonObject) => typeof completion?.id === 'string',
+      )?.id;
+      void reconcileCompletedTurn(turn, observedId, { keepPendingWhileActive: true });
     }
   }
   // B4: only NOW, after buffered completions were replayed, admit a follow-up.
   // A follow-up that arrived during the RPC (before canonical was proven) steers
   // here; if the group already closed (completion-before-response), canSteer
   // refuses and it stays serial. Never kick before the replay above.
-  if (!turn.completed) void tryAdmitSteer();
+  // Reconciliation owns settlement once started. Do not admit a follow-up into
+  // a turn whose non-canonical terminal identity is still being resolved.
+  if (!turn.completed && !turn.reconciliation) void tryAdmitSteer();
   await turn.done;
 
   // Expand the ordered accepted group into N signed finals (N===1 for every
@@ -2052,9 +2292,7 @@ async function drainQueue(): Promise<void> {
         && nativeActiveTurnId !== undefined
         && queue[0].codexAppSteerable !== true;
       if (queue.length === 0 || parkedBehindGoal) {
-        const nativeBusy = nativeActiveTurnId !== undefined;
-        emitRunnerState(nativeBusy, !nativeBusy);
-        if (!nativeBusy) prompt();
+        settleRunnerState();
       }
     }
   } finally {
@@ -2160,6 +2398,7 @@ async function main(): Promise<void> {
 }
 
 process.on('SIGTERM', () => {
+  cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
   client?.close();
@@ -2167,6 +2406,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
+  cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
   client?.close();

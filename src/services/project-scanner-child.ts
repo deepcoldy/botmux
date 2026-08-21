@@ -27,7 +27,7 @@ interface ResolveRequest {
 type ChildRequest = ScanRequest | ResolveRequest;
 
 type ScanResponse =
-  | { ok: true; projects: ReturnType<typeof scanMultipleProjects> }
+  | { ok: true; projects: ReturnType<typeof scanMultipleProjects>; budgetHit: boolean }
   | { ok: false; error: string };
 
 type ResolveResponse =
@@ -88,10 +88,15 @@ process.once('message', (request: ChildRequest) => {
       sendResponse({ ok: true, resolved: resolveRepoSelection(request.repoArg, request.scanDirs) });
       return;
     }
-    sendResponse({
-      ok: true,
-      projects: scanMultipleProjects(request.baseDirs, request.maxDepth, request.options),
+    // The onBudgetExceeded callback can't cross IPC, so set it here in the child
+    // and report the flag back — preserving the caller's "partial / narrow the
+    // root" UX while keeping the scan itself off the daemon event loop.
+    let budgetHit = false;
+    const projects = scanMultipleProjects(request.baseDirs, request.maxDepth, {
+      ...request.options,
+      onBudgetExceeded: () => { budgetHit = true; },
     });
+    sendResponse({ ok: true, projects, budgetHit });
   } catch (error) {
     sendResponse({
       ok: false,

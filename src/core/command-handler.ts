@@ -7,15 +7,16 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
+import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, describeProjectDir } from '../services/project-scanner.js';
-import { scanMultipleProjectsAsync, resolveRepoSelectionAsync } from '../services/project-scanner-async.js';
+import { scanMultipleProjectsAsync, scanMultipleProjectsAsyncDetailed, resolveRepoSelectionAsync } from '../services/project-scanner-async.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -26,7 +27,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -44,7 +45,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -87,7 +88,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker, CodexAppTurnInput } from '../types.js';
+import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -98,10 +99,12 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { rehomeReplyTargetState } from './reply-target.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -152,11 +155,25 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  */
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
 
-export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
+/**
+ * Adapter-scoped default passthrough commands (e.g. Codex's `/goal`).
+ *
+ * `cliIdOverride` lets a caller resolve against a session's FROZEN CLI instead
+ * of the bot's current config — an existing session keeps the runtime it was
+ * created with, so changing `/botconfig cli` must not silently strip an old
+ * interactive Codex session's adapter-scoped `/goal` (nor grant one to a Codex
+ * App session). `defaultPassthroughCommands` is a static per-adapter list and
+ * does not depend on the resolved binary, so when the override diverges from
+ * the bot's current CLI we intentionally drop `cliPathOverride` (it belongs to
+ * the other CLI) and let the adapter resolve with no path hint.
+ */
+export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cliIdOverride?: string): string[] {
   if (!larkAppId) return [];
   try {
     const bot = getBot(larkAppId);
-    const adapter = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride);
+    const cliId = (cliIdOverride ?? bot.config.cliId) as CliId;
+    const cliPathOverride = cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined;
+    const adapter = createCliAdapterSync(cliId, cliPathOverride);
     const normalized = (adapter.defaultPassthroughCommands ?? [])
       .map(normalizePassthroughCommand)
       .filter((c): c is string => !!c);
@@ -173,12 +190,47 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): st
  * daemon commands must keep their daemon semantics, and passthrough is checked
  * BEFORE DAEMON_COMMANDS in the router, so an un-filtered custom `/status`
  * would hijack the daemon's own.
- * Unknown / no bot → falls back to the builtin set unchanged.
+ * Codex App deliberately resolves to an empty set because its runner speaks
+ * App Server rather than an interactive TUI; slash-looking text must use the
+ * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
-export function resolvePassthroughCommands(larkAppId?: string): Set<string> {
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI:
+ * raw slash passthrough would bypass the turn ledger and the runner rejects
+ * non-frame input. Both the routing and the /list-slash-command display must
+ * agree on this set. */
+const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh']);
+
+export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
+  return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
+}
+
+export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
-  for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId)) {
+  // Resolve the EFFECTIVE CLI once and thread it through every layer below
+  // (early return, adapter defaults). An existing session freezes its CLI, so
+  // the override must reach the adapter-scoped defaults too — otherwise a bot
+  // switched to Codex App would still read the current config there and drop a
+  // frozen interactive Codex session's `/goal` (or vice versa). undefined when
+  // the bot is unknown → builtin set only.
+  let effectiveCliId: string | undefined;
+  try {
+    effectiveCliId = cliIdOverride ?? getBot(larkAppId).config.cliId;
+  } catch {
+    /* unknown bot — builtin set only */
+  }
+  // Codex App speaks the structured app-server protocol: its PTY only hosts
+  // botmux's runner/viewer and is not an interactive Codex TUI. Sending a
+  // slash command through raw_input therefore bypasses the App Server turn
+  // ledger; the model still completes the text as an ordinary turn, but the
+  // worker has no pending dispatch to attribute that final to and the session
+  // remains stuck. Keep these messages on the normal structured turn path.
+  // Runner adapters (codex-app/mira/mir/dsh) speak a framed stdin protocol,
+  // not an interactive TUI: a slash command through raw_input bypasses the
+  // turn ledger and the runner rejects non-frame input, wedging the session.
+  // Keep these messages on the normal structured turn path.
+  if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
+  for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
   }
   try {
@@ -369,9 +421,12 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  /** Immutable Lark placement captured by the daemon for this slash-command
+   * invocation. Unlike session state, it remains valid after close/replace. */
+  invocationReplyTarget?: FrozenSessionReplyTarget;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
 }
@@ -1273,14 +1328,34 @@ export async function handleCommand(
             // Capture the closed-session card BEFORE closeWorkerPoolSession —
             // it reads the live session's identity off `current`.
             const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            let closeResult;
             try {
               // closeWorkerPoolSession proves fail-closed backing teardown
               // before mutating any registry/store state, throwing when it
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
-              await closeWorkerPoolSession(targetSessionId);
+              closeResult = await closeWorkerPoolSession(targetSessionId);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
+            }
+            // A remote backend (riff / mojo) that could not prove its remote
+            // session was cancelled RETURNS a retryable failure rather than
+            // throwing, and deliberately leaves the row active. Reporting
+            // "closed" here is exactly the lie that fix meant to remove: the
+            // remote session would still be running and holding the credential.
+            if (!closeResult.ok) {
+              return { status: 'close_refused' as const, result: closeResult };
+            }
+            if (closeResult.outcome === 'closed_with_residual') {
+              // Local row IS closed, so this is not a failure — but a remote
+              // session was deliberately left running, and the ordinary "closed"
+              // card would imply everything is gone.
+              return {
+                status: 'closed_with_residual' as const,
+                current,
+                card,
+                residual: closeResult.residual,
+              };
             }
             return { status: 'closed' as const, current, card };
           });
@@ -1296,20 +1371,60 @@ export async function handleCommand(
             );
             break;
           }
+          if (closed.status === 'close_refused') {
+            logger.error(
+              `[${logTag}] Refused /close: remote session cancellation not proven `
+              + `(${closed.result.error}); active record kept for retry`,
+            );
+            await sessionReply(
+              rootId,
+              closed.result.taskId
+                ? t('cmd.close.refused_with_task', {
+                    error: closed.result.error,
+                    taskId: closed.result.taskId,
+                  }, loc)
+                : t('cmd.close.refused', { error: closed.result.error }, loc),
+            );
+            break;
+          }
+          // The session is actually closed now (plain or closed_with_residual),
+          // so retire its inert scan progress card too.
           ds.repoScanCardMessageId = undefined;
           if (scanCardToWithdraw) {
             void deleteMessage(ds.larkAppId, scanCardToWithdraw)
               .catch(err => logger.debug(`[${logTag}] Repo scan card withdraw after /close failed: ${err}`));
           }
-          // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
-          // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
-          // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
+          if (closed.status === 'closed_with_residual') {
+            const isLocal = closeResidualIsLocal(closed.residual);
+            logger.warn(
+              `[${logTag}] session closed locally with residual (${closed.residual.reason}); `
+              + `${isLocal ? 'local host subtree unproven' : `remote lineage ${closed.residual.taskId} NOT cancelled`}; `
+              + 'manual cleanup required',
+            );
+            await sessionReply(
+              rootId,
+              isLocal
+                ? '✅ 会话已在本地关闭，远端会话已取消。\n'
+                  + '⚠️ 但**本机可能残留带凭证的子进程未确认终止**'
+                  + `（${describeCloseResidual(closed.residual)}）——**请人工核查该主机进程**。`
+                  + 'device-isolation 会保留隔离直到主机重启或 `botmux mojo-containment revoke`。'
+                : '✅ 会话已在本地关闭。\n'
+                  + `⚠️ 但远端会话 \`${closed.residual.taskId}\` **未被取消** —— 它的控制面无法验证`
+                  + '（quarantined），盲目取消可能打到别的租户，因此保留下来。**需要人工清理**，'
+                  + '否则它会继续占用云端沙箱并持有已注入的凭据。',
+            );
+            break;
+          }
+          // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
+          // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
+          // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
           await deliverEphemeralOrReply(
             closed.current,
             message.senderId,
             closed.card,
             'interactive',
             () => sessionReply(rootId, closed.card, 'interactive'),
+            deps.invocationReplyTarget,
           );
           logger.info(`[${logTag}] Session closed by /close command`);
         } else {
@@ -1380,9 +1495,13 @@ export async function handleCommand(
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
             break;
           }
-          if (isRiffBackendSession(ds)) {
-            logger.info(`[${logTag}] Rejected /restart for Riff backend session`);
-            await sessionReply(rootId, t('cmd.restart.riff_unsupported', undefined, loc));
+          // ALL remote backends: destroy-and-respawn severs or replaces the
+          // remote lineage. The riff-only guard let mojo /restart through to
+          // restartCliProcess, which cancels the remote session and cold-boots
+          // a context-less replacement (third-round review, gate 4).
+          if (isRemoteBackendSession(ds)) {
+            logger.info(`[${logTag}] Rejected /restart for remote backend session`);
+            await sessionReply(rootId, t('cmd.restart.remote_unsupported', undefined, loc));
             break;
           }
           // Codex App: an accepted-but-unsettled dispatch still owns the turn
@@ -1428,12 +1547,14 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
-        // A live Riff worker owns a remote task rooted in its original cwd.
-        // killWorker/restart deliberately refuse to replace that generation,
-        // so persisting a new cwd here would report success while the remote
-        // task keeps running in the old directory.
-        if (isRiffBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+        // A live remote worker (Riff OR Mojo) owns a remote lineage rooted in
+        // its original cwd. killWorker refuses unprepared live retirement for
+        // EVERY remote backend, so persisting a new cwd here would report
+        // success while the live generation keeps running against the old
+        // directory — the exact split brain the riff-only guard used to allow
+        // for mojo (P1-a).
+        if (isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
           break;
         }
         // Cheap preflight avoids creating a requested directory when the
@@ -1523,13 +1644,15 @@ export async function handleCommand(
         break;
       }
       case '/repo': {
-        // A live Riff generation must finish the explicit /close protocol before
-        // its anchor can be reused.  The generic repo-switch path closes and
-        // immediately reforks; if remote cancellation fails, that would fall
-        // through to the double-fork kill and orphan the remote task.
-        if (ds && !ds.pendingRepo && isRiffBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
-          logger.warn(`[${logTag}] Repo switch refused: Riff session requires explicit close before replacement`);
+        // A live REMOTE generation (Riff or Mojo) must finish the explicit
+        // /close protocol before its anchor can be reused. The generic
+        // repo-switch path closes and immediately reforks; if remote
+        // cancellation fails, that would fall through to the double-fork kill
+        // and orphan the remote task — the guard's own rationale, which the
+        // riff-only predicate left open for mojo (third-round review, gate 4).
+        if (ds && !ds.pendingRepo && isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
+          logger.warn(`[${logTag}] Repo switch refused: remote session requires explicit close before replacement`);
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
@@ -1768,7 +1891,24 @@ export async function handleCommand(
                 }
                 const closedCard = buildClosedSessionCard(current, loc);
                 const oldSession = current.session;
-                await closeWorkerPoolSession(targetSessionId);
+                const closeResult = await closeWorkerPoolSession(targetSessionId);
+                // A refused close (remote cancellation unproven) leaves the row
+                // ACTIVE on purpose. Continuing would delete it from the registry
+                // anyway, stranding an active row with no owner — a ghost — while
+                // the remote session keeps running. Abort the replacement instead.
+                if (!closeResult.ok) {
+                  return { ok: false as const, error: 'close_refused' as const };
+                }
+                if (closeResult.outcome === 'closed_with_residual') {
+                  // The user asked to switch directory, not to consent to leaving a
+                  // remote session running. Stop here and tell them, rather than
+                  // quietly spawning a replacement on top of the residual.
+                  return {
+                    ok: false as const,
+                    error: 'close_residual' as const,
+                    residual: closeResult.residual,
+                  };
+                }
                 // The key lock excludes every sanctioned creator. A direct
                 // lifecycle callback may still have published unexpectedly;
                 // fail closed instead of overwriting that first owner.
@@ -1797,6 +1937,7 @@ export async function handleCommand(
                 session.ownerOpenId = oldSession.ownerOpenId;
                 session.creatorOpenId = oldSession.creatorOpenId;
                 session.lastCallerOpenId = oldSession.lastCallerOpenId;
+                rehomeReplyTargetState(current);
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
                 activeSessions.set(key, current);
@@ -1815,6 +1956,29 @@ export async function handleCommand(
                   rootId,
                   '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
                 );
+              } else if (switched.error === 'close_residual') {
+                const isLocal = closeResidualIsLocal(switched.residual);
+                logger.warn(`[${logTag}] Repo switch stopped: old session closed with `
+                  + `${isLocal ? 'an unproven local host subtree' : 'an uncancelled remote lineage'}`);
+                await sessionReply(
+                  rootId,
+                  isLocal
+                    ? '⚠️ 原会话已在本地关闭、远端会话已取消，但**本机可能残留带凭证的子进程未确认终止**'
+                      + `（${describeCloseResidual(switched.residual)}），请人工核查该主机进程。\n`
+                      + '**未创建新会话** —— 请先确认该子进程已终止，再重新切换仓库。'
+                    : '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+                      + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+                      + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
+                );
+              } else if (switched.error === 'close_refused') {
+                // Silence here would be the worst outcome: the old session is
+                // still active AND its remote session is still running, but the
+                // user asked for a switch and would see nothing at all.
+                logger.error(`[${logTag}] Repo switch aborted: old session's remote cancellation was not proven`);
+                await sessionReply(
+                  rootId,
+                  '⚠️ 无法切换仓库：原会话的远端会话未能确认取消，已保留原会话以便重试。请稍后重试。',
+                );
               } else {
                 logger.warn(`[${logTag}] Repo switch aborted because the session was replaced`);
               }
@@ -1826,6 +1990,7 @@ export async function handleCommand(
               switched.closedCard,
               'interactive',
               () => sessionReply(rootId, switched.closedCard, 'interactive'),
+              deps.invocationReplyTarget,
             );
             await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
             if (switched.cardToWithdraw) {
@@ -2031,11 +2196,28 @@ export async function handleCommand(
         }
         // Bare `/repo` rebuilds the picker over every scan root. Use the
         // isolated, watchdog-bounded child scanner so this (the recovery text's
-        // "safe" fallback) can't wedge the daemon event loop on a slow/hung mount.
-        const projects = await scanMultipleProjectsAsync(validDirs, 3, repoPickerScanOptions());
+        // "safe" fallback) can't wedge the daemon event loop on a slow/hung
+        // mount. The child reports whether it bailed at the scan budget (the
+        // onBudgetExceeded callback can't cross IPC), preserving the partial /
+        // narrow-the-root UX.
+        const { projects, budgetHit: scanBudgetHit } = await scanMultipleProjectsAsyncDetailed(
+          validDirs,
+          3,
+          repoPickerScanOptions(),
+        );
         if (projects.length === 0) {
-          await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
+          // Distinguish "genuinely no repos here" from "we bailed at the scan
+          // budget before we could find them" — the latter is actionable
+          // (narrow the root / give an explicit path) and must not read as an
+          // empty projects dir.
+          const key = scanBudgetHit ? 'cmd.repo.scan_budget_no_repos' : 'cmd.repo.no_git_repos';
+          await sessionReply(rootId, t(key, { dirs: validDirs.join(', ') }, loc));
           break;
+        }
+        if (scanBudgetHit) {
+          // We have a partial list; show it but warn it may be incomplete so a
+          // missing target repo doesn't look like it simply isn't there.
+          await sessionReply(rootId, t('cmd.repo.scan_budget_partial', undefined, loc));
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
@@ -2230,6 +2412,29 @@ export async function handleCommand(
         }
         if (subCmd === 'status' || subCmd === '状态') {
           await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
+          break;
+        }
+        // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
+        // im:feed_group_v1 scope（与 /subscribe-lark-doc 的专项 scope 同款模式，
+        // 不污染通用 /login）。授权完成后 feed-group 标签模式全自动挂载。
+        if (subCmd === 'tags' || subCmd === 'tag' || subCmd === '标签') {
+          const { authUrl: tagAuthUrl } = generateAuthUrl(
+            botCfg2.larkAppId,
+            botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand),
+            FEED_GROUP_OAUTH_SCOPES,
+          );
+          await sessionReply(rootId, [
+            t('cmd.login.tags_title', undefined, loc),
+            '',
+            t('cmd.login.step1', undefined, loc),
+            tagAuthUrl,
+            '',
+            t('cmd.login.step2', undefined, loc),
+            t('cmd.login.step3', undefined, loc),
+            '',
+            t('cmd.login.tags_footer', undefined, loc),
+          ].join('\n'));
           break;
         }
         const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));
@@ -2707,6 +2912,12 @@ export async function handleCommand(
           break;
         }
 
+        // 会话群的 oncall 绑定在出生时由 bot 自动写入，禁止手改（冲突隔离）。
+        if (isSessionGroup(chatId)) {
+          await sessionReply(rootId, t('sg.cmd_unsupported', { cmd: '/oncall' }, loc));
+          break;
+        }
+
         if (!sub || sub === 'status' || sub === '状态') {
           const entry = getOncallStatus(appId, chatId);
           if (!entry) {
@@ -3118,12 +3329,14 @@ export async function handleCommand(
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
           // ── Ephemeral (仅邀请者可见) picker ────────────────────────────────
           // The picker exposes session metadata — title + source-chat name — to
-          // everyone who can see the message. When the bot runs in privateCard
-          // mode we hide it: send the picker as an ephemeral card visible only to
-          // the invoker.
+          // everyone who can see the message. There is NO benefit to showing it
+          // publicly: the invoker is always the owner (每张菜单 owner-only，别人点
+          // 会被拒), so a public picker only leaks his session list to the whole
+          // group. We therefore default it to private — decoupled from the
+          // `privateCard` config, which continues to gate ONLY /card & /close.
           //
-          // Gate on group + privateCard + **chat-scope**. The chat-scope clause
-          // is load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
+          // Gate on group + **chat-scope**. The chat-scope clause is
+          // load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
           // `chat_id` only — it has NO thread/root anchor — so a thread-scope
           // target (话题群 / 话题 inside a 普通群 / new-topic·shared) can't keep the
           // card in its 话题. A 话题群 rejects with 18053 (→ fall back below), but
@@ -3132,12 +3345,11 @@ export async function handleCommand(
           // guards against with a REGRESSION test; PR #164 was the original live
           // fix. Per 申晗 (2026-07-29): 话题内公开可接受 — so thread-scope pickers
           // stay on the visible in-thread reply (public card in the 话题), and
-          // ephemeral is scoped to flat 普通群 only, mirroring /card & /close
-          // private cards. p2p has no ephemeral option; an unexpected reject
-          // (18053 etc.) still falls back to the visible reply below.
+          // ephemeral is scoped to flat 普通群 only. p2p has no ephemeral option;
+          // an unexpected reject (18053 etc.) still falls back to the visible
+          // reply below.
           const privatePicker = targetChatType === 'group'
-            && targetScope === 'chat'
-            && getBot(myAppId).config.privateCard === true;
+            && targetScope === 'chat';
           const card = buildRelayPickerCard(
             entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
             targetScope, targetChatType, privatePicker ? 'private' : 'public',
@@ -3696,7 +3908,12 @@ export async function handleCommand(
         // is empty by construction, so no target-anchor conflict. Source is
         // never touched.
         const { forkSession } = await import('./worker-pool.js');
-        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat');
+        // forkTaskText = the group name (the human-readable intent for this
+        // fork), so /forklist can label the child row instead of falling back to
+        // the raw session title.
+        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat', {
+          forkTaskText: forkGroupName,
+        });
         if (!forkResult.ok) {
           // Residual-orphan cleanup: the front guards already ran before
           // createGroupWithBots, so this only fires on a narrow TOCTOU race
@@ -3733,8 +3950,55 @@ export async function handleCommand(
           break;
         }
 
-        await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        // Persist the child on the SOURCE session's lineage BEFORE any
+        // user-visible send. The sub-topic fork path also records lineage; the
+        // --create (new-group) path historically skipped it entirely, leaving
+        // forkChildSessionIds permanently empty and /forklist always reporting
+        // "no forks".
+        //
+        // Ordering is load-bearing: the "created" notice below is a reply to the
+        // parent session's root message, i.e. the SAME message whose expiry
+        // (HTTP 400) this PR's other fix addresses. If that reply threw while it
+        // still ran first, control would unwind to handleCommand's outer catch
+        // (log-only) and the lineage write would be skipped — so in the very
+        // "root expired" scenario this change targets, /forklist would stay
+        // empty. Writing lineage first makes it independent of the notify path;
+        // the notice and panel refresh are best-effort afterwards.
+        if (!ds.session.forkChildSessionIds?.includes(forkResult.childSessionId)) {
+          ds.session.forkChildSessionIds = [
+            ...(ds.session.forkChildSessionIds ?? []),
+            forkResult.childSessionId,
+          ];
+          try {
+            sessionStore.updateSession(ds.session);
+          } catch (err) {
+            logger.warn(
+              `[${logTag}] /fork --create parent lineage update failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+        // User-visible notice + panel refresh: best-effort, AFTER lineage is
+        // durable. A failure here (e.g. the root-message 400) must not undo the
+        // lineage write, so swallow locally instead of letting it reach the
+        // outer catch.
+        try {
+          await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        } catch (err) {
+          logger.warn(
+            `[${logTag}] /fork --create created-notice send failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        try {
+          await upsertForkPanelCard(ds, loc, { preferredReplyToMessageId: message.messageId });
+        } catch (err) {
+          logger.warn(
+            `[${logTag}] /fork --create panel refresh failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         break;
       }
 
@@ -3743,7 +4007,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
           break;
         }
-        await upsertForkPanelCard(ds, loc, { allowEmpty: true });
+        await upsertForkPanelCard(ds, loc, { allowEmpty: true, preferredReplyToMessageId: message.messageId });
         break;
       }
 
@@ -3781,29 +4045,45 @@ export async function handleCommand(
         //   ③ 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
         //   ④ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
         // MCP 的 /mcp__<server>__<prompt> 需运行时握手才能枚举，这里仅按 .mcp.json 提示 server 名。
+        // 展示口径必须与 resolvePassthroughCommands 的实际路由一致：既有会话按其
+        // 冻结的 CLI（session.cliId）解析，不偷读当前 bot 配置——否则切换默认 CLI 后
+        // 清单会与真正生效的透传集合漂移（Codex App 会话展示伪 passthrough，或旧交互
+        // 式会话丢掉 adapter-scoped 命令）。
         const botCfg = ds
           ? getBot(ds.larkAppId).config
           : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
-        const cliId = botCfg?.cliId ?? 'claude-code';
+        const effectiveCliId = (ds?.session.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId;
         const cliName = ds
           ? sessionCliDisplayName(ds)
-          : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(cliId);
+          : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
         const workingDir = getSessionWorkingDir(ds);
-        const builtin = [...PASSTHROUGH_COMMANDS];
-        const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
+        // Runner adapters route everything through the structured turn lane,
+        // so they have NO passthrough surface at all — mirror
+        // resolvePassthroughCommands's early empty return here and skip
+        // filesystem discovery (their PTY is the runner, not an interactive
+        // TUI that would honor those).
+        const noPassthrough = cliHasNoRawPassthroughSurface(effectiveCliId);
+        const builtin = noPassthrough ? [] : [...PASSTHROUGH_COMMANDS];
+        const adapterDefaults = noPassthrough ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
         // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
         // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
         // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
-        const custom = [...new Set(
+        // Codex App 无透传面，custom 也不生效 → 与路由一致清空。
+        const custom = noPassthrough ? [] : [...new Set(
           (botCfg?.customPassthroughCommands ?? [])
             .map(normalizePassthroughCommand)
             .filter((c): c is string => !!c),
         )];
+        // 文件发现按有效会话 CLI 解析；跨 CLI（冻结 ≠ 当前配置）时不套用当前配置的
+        // cliPathOverride（它属于另一个 CLI）。Codex App 直接跳过发现。
+        const adapterPathOverride = effectiveCliId === botCfg?.cliId ? botCfg?.cliPathOverride : undefined;
         let cliAdapter;
-        try {
-          cliAdapter = createCliAdapterSync(cliId, botCfg?.cliPathOverride);
-        } catch (err) {
-          logger.warn(`[${logTag}] /list-slash-command could not create adapter for ${cliId}: ${err instanceof Error ? err.message : String(err)}`);
+        if (!noPassthrough) {
+          try {
+            cliAdapter = createCliAdapterSync(effectiveCliId, adapterPathOverride);
+          } catch (err) {
+            logger.warn(`[${logTag}] /list-slash-command could not create adapter for ${effectiveCliId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
         const discoverySupported = supportsFilesystemCommandDiscovery(cliAdapter);
         const discovered = cliAdapter && discoverySupported
@@ -3827,7 +4107,7 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
-        const passthroughCommands = [...resolvePassthroughCommands(helpAppId)];
+        const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
@@ -3879,10 +4159,16 @@ export async function handleCommand(
           t('help.login', undefined, loc),
           t('help.login_status', undefined, loc),
           t('help.pair', undefined, loc),
-          '',
-          t('help.heading_workflow', undefined, loc),
-          t('help.workflow_run', undefined, loc),
-          t('help.workflow_cancel', undefined, loc),
+          // Workflow help section — omitted when the machine-wide workflow
+          // switch is off, so `/help` never advertises a disabled feature.
+          ...(isWorkflowFeatureEnabled()
+            ? [
+              '',
+              t('help.heading_workflow', undefined, loc),
+              t('help.workflow_run', undefined, loc),
+              t('help.workflow_cancel', undefined, loc),
+            ]
+            : []),
           '',
           t('help.heading_role', undefined, loc),
           t('help.role_show', undefined, loc),
@@ -4028,10 +4314,12 @@ async function blockRiffTakeover(
   ds: DaemonSession,
   sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
 ): Promise<boolean> {
-  if (!isRiffBackendSession(ds)) return false;
+  // Historical name, remote-wide guard: takeover/import replaces the live
+  // generation, which every remote backend forbids outside prepare/commit.
+  if (!isRemoteBackendSession(ds)) return false;
   const loc = localeForBot(ds.larkAppId);
-  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.riff_unsupported', undefined, loc));
-  logger.warn(`[${tag(ds)}] Takeover refused: Riff session requires explicit close before replacement`);
+  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.remote_unsupported', undefined, loc));
+  logger.warn(`[${tag(ds)}] Takeover refused: remote session requires explicit close before replacement`);
   return true;
 }
 
@@ -4476,7 +4764,7 @@ export async function startForkSubtopicSession(
 async function upsertForkPanelCard(
   parentDs: DaemonSession,
   loc: Locale,
-  opts?: { allowEmpty?: boolean },
+  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string },
 ): Promise<void> {
   const appId = parentDs.larkAppId;
   const chatId = parentDs.chatId;
@@ -4487,9 +4775,13 @@ async function upsertForkPanelCard(
     .map(session => ({
       instruction: session.forkTaskText ?? session.title,
       status: (session.status === 'active' ? 'active' : 'closed') as 'active' | 'closed',
+      // Link to the child's OWN chat: a sub-topic fork shares the parent chat and
+      // carries a larkThreadId (deep-link into that topic); a --create fork lives
+      // in its own new group (different chatId, no thread) so the link must use
+      // the child's chatId, not the parent's, or it would point back here.
       link: session.larkThreadId
-        ? threadAppLink(chatId, session.larkThreadId, brand)
-        : chatAppLink(chatId, brand),
+        ? threadAppLink(session.chatId ?? chatId, session.larkThreadId, brand)
+        : chatAppLink(session.chatId ?? chatId, brand),
     }));
   if (children.length === 0 && !opts?.allowEmpty) return;
 
@@ -4503,17 +4795,65 @@ async function upsertForkPanelCard(
     }
   }
 
-  try {
-    const cardId = await replyMessage(
-      appId,
-      parentDs.session.rootMessageId,
-      buildForkPanelCard(children, loc),
-      'interactive',
-      true,
-    );
+  // Post the panel. Primary: reply-in-thread to the session's root message so
+  // the panel anchors to this conversation. Fallback: if that reply fails (the
+  // most common cause is the root message aging past Lark's reply window —
+  // surfaces as HTTP 400 — but also covers a withdrawn root), post the card flat
+  // to the chat instead. The panel IS the user-visible output of /forklist, so a
+  // swallowed failure looks like the command silently did nothing; the flat send
+  // keeps it visible. Only if BOTH transports fail do we give up (and warn).
+  const cardBody = buildForkPanelCard(children, loc);
+  // Reply targets are tried in order, then a flat send as the last resort:
+  //   1) the FRESH triggering command message (when /forklist or /fork passes
+  //      it) — a just-arrived message is never past Lark's reply window, and in
+  //      a 话题群 it keeps the panel inside the current topic;
+  //   2) the session root message — the historical target, but it can age past
+  //      the reply window (HTTP 400) or be withdrawn;
+  //   3) a flat chat sendMessage — always delivers, though in a 话题群 it starts
+  //      a new sibling topic rather than threading. The panel is the user-visible
+  //      output of /forklist, so a visible-but-flat panel beats silent nothing.
+  const replyTargets: string[] = [];
+  if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);
+  if (parentDs.session.rootMessageId
+    && parentDs.session.rootMessageId !== opts?.preferredReplyToMessageId) {
+    replyTargets.push(parentDs.session.rootMessageId);
+  }
+  let cardId: string | undefined;
+  for (const target of replyTargets) {
+    try {
+      cardId = await replyMessage(appId, target, cardBody, 'interactive', true);
+      break;
+    } catch (replyErr) {
+      logger.warn(
+        `[fork-panel] reply to ${target} failed `
+        + `(${replyErr instanceof Error ? replyErr.message : replyErr})`,
+      );
+    }
+  }
+  if (!cardId) {
+    logger.warn('[fork-panel] all reply targets failed; falling back to a flat chat message');
+    try {
+      cardId = await sendMessage(appId, chatId, cardBody, 'interactive');
+    } catch (sendErr) {
+      logger.warn(
+        `[fork-panel] failed to post panel card via both reply and flat send: `
+        + `${sendErr instanceof Error ? sendErr.message : sendErr}`,
+      );
+    }
+  }
+  if (cardId) {
+    // Local guard: a write-store failure here must not bubble to /forklist's
+    // outer catch (which would look like the command errored even though the
+    // panel already posted). Losing only the stale-card id just means the next
+    // /forklist can't delete the previous panel — a benign duplicate at worst.
     parentDs.session.forkPanelCardId = cardId;
-    sessionStore.updateSession(parentDs.session);
-  } catch (err) {
-    logger.warn(`[fork-panel] failed to post panel card: ${err instanceof Error ? err.message : err}`);
+    try {
+      sessionStore.updateSession(parentDs.session);
+    } catch (err) {
+      logger.warn(
+        `[fork-panel] persist forkPanelCardId failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }

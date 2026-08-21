@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv, stripDashboardH5Env } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -16,6 +16,17 @@ installStdioEpipeGuard();
 const globalEnv = join(homedir(), '.botmux', '.env');
 dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
+// The dotenv load above pulls in ~/.botmux/.env WHOLESALE — including the
+// Dashboard-only Feishu H5 login family, whose APP_SECRET can mint
+// app_access_token for the Dashboard's login app. Its single consumer runs in
+// the dashboard process (index-dashboard.ts loads the same file for itself);
+// the daemon process must not hold Dashboard credentials at all, so drop the
+// whole family (named keys + prefix sweep, so a future H5 knob is covered the
+// day it is added) before any daemon code can observe it. The
+// redactChildEnv()/tmux-pane-unset strip at every CLI-child boundary stays in
+// place as the second layer of defense.
+stripDashboardH5Env(process.env);
+
 // A daemon is never a session. pm2 startOrRestart injects the caller's
 // environment into restarted apps, so a `botmux restart` issued from inside a
 // botmux session leaks session-scoped vars into this long-lived process —
@@ -26,9 +37,9 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // v3 workflow workers spread this process's env into their spawn env, so a
 // restart issued from a bot session would otherwise pin that session's owner
 // onto every workflow CLI child.
-for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_OWNER_OPEN_ID', '__OWNER_OPEN_ID']) {
-  delete process.env[k];
-}
+// (Covers BOTMUX_LARK_APP_ID too: the daemon resolves its own bot via
+// BOTMUX_BOT_INDEX and must not trust an inherited app id.)
+scrubSessionTurnMarkerEnv(process.env);
 // Same vector, session-level CLI data-root pointers (CLAUDE_CONFIG_DIR /
 // CODEX_HOME): a value baked into pm2's saved app env — or resurrected from a
 // stale dump.pm2, which bypasses the pm2Env() strip in cli.ts — would make
@@ -41,6 +52,24 @@ scrubSessionCliHomeEnv(process.env);
 // as a nested child session (transcript saving OFF → --resume continuity
 // silently lost). See CLAUDE_SESSION_MARKER_ENV_KEYS.
 scrubClaudeSessionMarkerEnv(process.env);
+// A stale PM2 dump can bypass cli.ts pm2Env(). Daemons are workflow hosts,
+// never workflow workers; remove node-scoped identity before importing daemon
+// code or forking ordinary chat workers. The ephemeral pool re-adds the exact
+// markers only to genuine workflow workers.
+scrubWorkflowWorkerEnv(process.env);
+// Same vector once more, invoker-terminal fingerprints: NO_COLOR=1 /
+// CODEX_CI=1 / PAGER=cat baked by a restart issued from an agent's
+// non-interactive shell (or resurrected from a stale dump) would flow into
+// every worker and session PTY and render every bot TUI colorless. Scrubbing
+// here also heals an already-poisoned fleet on its next daemon boot without
+// waiting for a clean-shell restart. See INVOKER_TERMINAL_ENV_KEYS.
+scrubInvokerTerminalEnv(process.env);
+// Re-pin TERM after the scrub, same constant as both pm2Env() entries:
+// deterministic instead of absent. Workers fork from this env, and the zmx
+// backend's fresh sessions inherit the create client's env verbatim (zmx has
+// no node-pty `name` forcing TERM) — left absent, every CLI in a zmx session
+// fails supports-color detection and renders colorless.
+process.env.TERM = 'xterm-256color';
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading
@@ -51,6 +80,9 @@ async function main() {
     const { setDefaultLocale } = await import('./i18n/index.js');
     const cfg = readGlobalConfig();
     if (cfg.lang) setDefaultLocale(cfg.lang);
+    // Wire user prompt-key overrides into t() before any prompt is built.
+    const { registerPromptOverrideResolver } = await import('./skills/effective-builtins.js');
+    registerPromptOverrideResolver();
   }
 
   // Dynamic import so config.ts reads env vars AFTER dotenv has loaded them

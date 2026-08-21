@@ -1,0 +1,82 @@
+{
+  "ok": true,
+  "harnessType": "production-e2e",
+  "subject": "H5 身份 + 真实触屏下的生产 Workbench 端到端验收（P1-14 / P1-17 / guard lock）",
+  "bundle": {
+    "entry": "src/dashboard/web/app.tsx",
+    "config": "same esbuild options as pnpm dashboard:bundle (bundle+splitting+minify, target es2022)"
+  },
+  "identity": "feishu-h5 session cookie minted by the real DashboardSessionStore",
+  "productionModules": [
+    "src/dashboard/web/app.tsx + store.ts (real SPA bootstrap)",
+    "src/dashboard/h5-auth.ts (session store + controller.resolve)",
+    "src/dashboard/auth.ts (decideWorkbenchH5Auth + projectWorkbenchOperationCapabilities)",
+    "src/dashboard/terminal-view-capability.ts (mint + centralViewLinkPath + verify)",
+    "src/dashboard/control-csrf.ts (ControlCsrfTokens + guardControlRequest + injectControlCsrfMeta)",
+    "src/dashboard/preview-guard-page.ts + preview-proxy.ts + preview-interaction.ts",
+    "src/core/preview-port-owner.ts (real listening-port ownership proof)"
+  ],
+  "head": "60074da93dee399711791eaf35678d60905225d2",
+  "worktreeDirty": true,
+  "headNote": "head 是跑这一轮时的 HEAD；worktreeDirty=true 表示工作区还有未提交改动（证据先于提交产生时的常态）",
+  "browser": "local executable (/home/wanglingfeng.linvon/.cache/ui-check/chrome-headless-shell-linux64/chrome-headless-shell)",
+  "browserVersion": "121.0.6167.85",
+  "viewports": [
+    "1440x900 (desktop, H5 cookie)",
+    "390x844 iPhone 13 profile (hasTouch)"
+  ],
+  "screenshots": [
+    "docs/assets/workbench-production-e2e-h5-sessions.png",
+    "docs/assets/workbench-production-e2e-dock-touch.png",
+    "docs/assets/workbench-production-e2e-cookieless-terminal.png",
+    "docs/assets/workbench-production-e2e-guard-locked.png",
+    "docs/assets/workbench-production-e2e-guard-unlocked.png"
+  ],
+  "observed": {
+    "scheduleRequests": 0,
+    "settingsRequests": 3,
+    "viewLinkRequests": 2,
+    "viewTokenTerminalHits": 2,
+    "cookieTerminalHits": 1,
+    "terminalUnauthorized": 1,
+    "viewTokenSockets": 1,
+    "rejectedSockets": 1
+  },
+  "findings": {
+    "h5Bootstrap": {
+      "sessionRows": 2,
+      "rowText": [
+        "●\n生产 E2E 主会话\n话题\nProd Harness · codex · botmux\n刚刚\n聊天\n终端\n接管",
+        "●\n生产 E2E 次会话\n话题\nProd Harness · claude\n1分钟前\n聊天\n终端\n接管"
+      ],
+      "scheduleRequests": 0,
+      "settingsRequests": 1,
+      "authOverlayVisible": false,
+      "bootstrapError": null
+    },
+    "touchViewToken": {
+      "environment": {
+        "hoverNone": true,
+        "touchPoints": 1
+      },
+      "hrefHasViewToken": true,
+      "actionHeight": 44,
+      "cookielessPageStatus": 200,
+      "cookielessSocket": {
+        "withToken": "message:terminal-stream-ready",
+        "bare": "error"
+      },
+      "bareTerminalStatus": 401,
+      "viewLinkRequests": 1
+    },
+    "guardOverlay": {
+      "lockedByDefault": true,
+      "unlockedBadge": "交互模式",
+      "relockedBadge": "预览模式（默认）",
+      "auditActions": [
+        "preview.unlock",
+        "preview.lock"
+      ]
+    }
+  }
+}

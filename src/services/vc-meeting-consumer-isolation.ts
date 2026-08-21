@@ -1,27 +1,34 @@
 import type { BackendType } from '../adapters/backend/types.js';
 
 export type VcMeetingConsumerIsolationFailure =
-  | 'sandbox_required'
   | 'platform_unsupported'
   | 'backend_unsupported';
 
 export type VcMeetingConsumerIsolationResult =
-  | { ok: true }
+  | { ok: true; isolated: boolean }
   | { ok: false; reason: VcMeetingConsumerIsolationFailure; error: string };
 
 /**
- * VC meeting entries are untrusted input, while their consumer role can request
- * externally-visible side effects.  A receiver is therefore eligible only
- * when the whole CLI is inside the Linux bwrap boundary. Its mandatory
- * credential masks and host-authorized outbox relay make the managed action
- * ledger the only credentialed Lark output path.
+ * Decide whether a bot may act as a VC meeting consumer, and whether the
+ * managed side-effect boundary is actually in force for it.
  *
- * On macOS, `sandbox: true` can also add Seatbelt read isolation for supported
- * CLIs, but the ordinary sandbox still exposes this bot's own send credential
- * and has no host-authorized outbox relay. Riff injects the Lark app secret into
- * the remote task; herdr/zellij are not wrapped by the local bwrap
- * implementation. All are intentionally rejected instead of treating a prompt
- * instruction as a security boundary.
+ * Meeting transcripts/chat are untrusted multi-party input, and the consumer is
+ * an AI process holding this bot's ambient Lark credential. The Linux bwrap
+ * sandbox is what masks that credential and forces every outbound action
+ * through the host-authorized outbox relay + managed action ledger.
+ *
+ * POLICY (operator owns the choice — see plan B):
+ *  - `sandbox` not requested → the consumer runs UNSANDBOXED and is still
+ *    eligible. `isolated: false` signals that the credential is exposed to
+ *    meeting input, so callers surface an explicit risk notice. This is the
+ *    default; it does not silently pretend a boundary exists.
+ *  - `sandbox` requested + Linux + pty/tmux → the boundary is real:
+ *    `{ ok: true, isolated: true }`.
+ *  - `sandbox` requested but UNDELIVERABLE (macOS Seatbelt has no host relay and
+ *    still exposes the send credential; riff runs remotely; herdr/zellij aren't
+ *    wrapped by the local bwrap impl) → FAIL CLOSED. An explicit isolation
+ *    request must never be silently downgraded to unsandboxed; the operator has
+ *    to either turn sandbox off (informed) or move to a Linux pty/tmux backend.
  */
 export function evaluateVcMeetingConsumerIsolation(input: {
   sandbox: boolean | undefined;
@@ -29,25 +36,23 @@ export function evaluateVcMeetingConsumerIsolation(input: {
   backendType: BackendType;
 }): VcMeetingConsumerIsolationResult {
   if (input.sandbox !== true) {
-    return {
-      ok: false,
-      reason: 'sandbox_required',
-      error: 'sandbox=true is required for untrusted meeting input',
-    };
+    // Plan B: no sandbox requested → allowed, but not isolated.
+    return { ok: true, isolated: false };
   }
+  // Sandbox WAS requested; it must be delivered or refused, never faked.
   if (input.platform !== 'linux') {
     return {
       ok: false,
       reason: 'platform_unsupported',
-      error: `managed side-effect isolation is unavailable on ${input.platform}`,
+      error: `sandbox was requested but managed side-effect isolation is unavailable on ${input.platform}; turn sandbox off to run the meeting consumer unsandboxed, or use a Linux pty/tmux backend`,
     };
   }
   if (input.backendType !== 'pty' && input.backendType !== 'tmux') {
     return {
       ok: false,
       reason: 'backend_unsupported',
-      error: `backend ${input.backendType} cannot enforce the managed Lark output boundary`,
+      error: `sandbox was requested but backend ${input.backendType} cannot enforce the managed Lark output boundary; turn sandbox off to run unsandboxed, or use a pty/tmux backend`,
     };
   }
-  return { ok: true };
+  return { ok: true, isolated: true };
 }

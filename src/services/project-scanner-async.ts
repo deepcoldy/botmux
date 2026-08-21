@@ -43,7 +43,7 @@ function scanTimeoutMs(): number {
 }
 
 type ScanResponse =
-  | { ok: true; projects: ProjectInfo[] }
+  | { ok: true; projects: ProjectInfo[]; budgetHit: boolean }
   | { ok: false; error: string };
 
 type ResolveResponse =
@@ -178,14 +178,33 @@ export async function scanMultipleProjectsAsync(
   maxDepth: number = 3,
   options: ProjectScanOptions = {},
 ): Promise<ProjectInfo[]> {
+  return (await scanMultipleProjectsAsyncDetailed(baseDirs, maxDepth, options)).projects;
+}
+
+/**
+ * Same isolated scan as scanMultipleProjectsAsync, but also reports whether the
+ * child bailed at the scan budget. The onBudgetExceeded callback cannot cross
+ * the IPC boundary, so it is set inside the child and its result returned here —
+ * callers that need the "partial / narrow the root" UX use this variant.
+ */
+export async function scanMultipleProjectsAsyncDetailed(
+  baseDirs: string[],
+  maxDepth: number = 3,
+  options: ProjectScanOptions = {},
+): Promise<{ projects: ProjectInfo[]; budgetHit: boolean }> {
+  // onBudgetExceeded is a function — it cannot be structured-cloned over IPC and
+  // is re-established inside the child, so drop it from the forwarded options.
+  const { onBudgetExceeded: _drop, ...serializableOptions } = options;
   const request: ScanRequest = {
     kind: 'scan',
     baseDirs: [...baseDirs],
     maxDepth,
-    options: { ...options },
+    options: { ...serializableOptions },
   };
   const response = await enqueueChild(request);
-  return 'projects' in response ? response.projects : [];
+  return 'projects' in response
+    ? { projects: response.projects, budgetHit: response.budgetHit }
+    : { projects: [], budgetHit: false };
 }
 
 /**

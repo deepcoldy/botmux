@@ -37,9 +37,12 @@ describe('worker pipe initial screen ordering', () => {
       source.indexOf("case 'close':"),
       source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const localCloseIdx = closeCase.indexOf('// Local close destroys');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
-    const ackIdx = closeCase.lastIndexOf("send({ type: 'session_close_ready', sessionId });", localCloseIdx);
+    // The ACK is flushed (sendAndFlush), not fire-and-forget send(): a queued
+    // send() is dropped when process.exit(0) wedges in node-pty's native exit
+    // teardown, stranding /close behind the daemon's 7s SIGKILL backstop.
+    const ackIdx = closeCase.lastIndexOf("await sendAndFlush({ type: 'session_close_ready', sessionId });", localCloseIdx);
     const stopBridgeIdx = closeCase.lastIndexOf('stopBridgeWatcher();', localCloseIdx);
     const teardownIdx = closeCase.indexOf('backend?.destroySession?.();', localCloseIdx);
     const clearIdx = closeCase.indexOf('clearSendMarkers();', localCloseIdx);
@@ -186,7 +189,10 @@ describe('worker pipe initial screen ordering', () => {
     const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
     const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
     const idle = source.slice(idleStart, idleEnd);
-    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)");
+    // The defer label is templated by evidence source (`screen-idle` /
+    // `external-idle`) since Pi's transcript final is guarded by the same
+    // helper; pin the call itself and its ordering before the ready drain.
+    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)");
     const drainIdx = idle.indexOf('drainBridgesThenMarkReady(evidenceSource);');
     const adoptStart = source.indexOf('function setupAdoptIdleDetection');
     const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
@@ -409,7 +415,7 @@ describe('worker pipe initial screen ordering', () => {
     expect(finalizeIdx).toBeGreaterThan(spawnIdx);
     expect(onDataIdx).toBeGreaterThan(finalizeIdx);
     expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
-    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir']);");
+    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
     expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
     expect(source).not.toContain('codexAppControlNonceForSpawn');
   });
@@ -442,8 +448,10 @@ describe('worker pipe initial screen ordering', () => {
     const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
     expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
     // Two additional checks normalize nested spawn failures before the three
-    // restart/init/message handlers consume them.
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    // restart/init/message handlers consume them; plus the generational-race
+    // provenance commit re-throws a superseded spawn instead of tearing down
+    // (the commit-fail path must not swallow CliSpawnSupersededError).
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(6);
     const restartHandler = source.slice(
       source.indexOf('async function restartCliProcess('),
       source.indexOf('// ─── HTTP + WebSocket Server'),

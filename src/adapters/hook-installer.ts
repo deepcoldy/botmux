@@ -15,7 +15,7 @@ import { hookCommandParts } from './hook-command.js';
 
 export interface HookInstallConfig {
   readonly configPath: string;
-  readonly format: 'claude-settings' | 'opencode-plugin' | 'grok-hooks';
+  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks';
   /** Claude read-isolation: merge the shared settings `env` map into a
    *  per-bot settings file before installing hooks. Shared values win so
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
@@ -26,6 +26,9 @@ export interface HookInstallConfig {
    *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
    *  见 adapters/cli/types.ts 同名字段。 */
   readonly sessionStartCommand?: string;
+  /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
+   *  仅 claude-settings：写全局 settings.json 的 hooks.UserPromptSubmit。 */
+  readonly userPromptSubmitCommand?: string;
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -211,6 +214,29 @@ function removeBotmuxReadyHookGroups(hooks: Record<string, ClaudeHookGroup[]>, e
 }
 
 /**
+ * 判断某 hook group 是否是 botmux UserPromptSubmit 上下文 hook（用于幂等替换）。
+ * 与 ready hook 同策略：结构化识别（命令引用 botmux 的 cli.js 且尾部是
+ * `user-prompt-hook`），不按完整字符串比对。
+ */
+function isBotmuxPromptHookGroup(group: ClaudeHookGroup): boolean {
+  return Array.isArray(group?.hooks) && group.hooks.some(
+    (e) =>
+      !!e &&
+      e.type === 'command' &&
+      typeof e.command === 'string' &&
+      e.command.includes('cli.js') &&
+      e.command.trimEnd().endsWith('user-prompt-hook'),
+  );
+}
+
+function removeBotmuxPromptHookGroups(hooks: Record<string, ClaudeHookGroup[]>, eventName: string): void {
+  const existing = hooks[eventName] ?? [];
+  const filtered = existing.filter((g) => !isBotmuxPromptHookGroup(g));
+  if (filtered.length === 0) delete hooks[eventName];
+  else hooks[eventName] = filtered;
+}
+
+/**
  * Read-only preflight used by the worker before it arms the ready gate.
  * Installation is intentionally best-effort, so the gate must not assume that
  * a requested SessionStart hook actually reached the CLI's effective config.
@@ -231,6 +257,45 @@ export function hasInstalledSessionReadyHook(hookInstall: HookInstallConfig): bo
 }
 
 /**
+ * Read-only preflight: is the botmux UserPromptSubmit hook present in the
+ * settings file the CLI actually reads? 结构化匹配（不像
+ * hasInstalledSessionReadyHook 那样按完整字符串相等——dev checkout 与 npm global
+ * 的 cli.js 路径不同，精确匹配会把已安装的 hook 误判为未安装）。
+ */
+export function hasInstalledPromptHook(hookInstall: HookInstallConfig): boolean {
+  if (!hookInstall.userPromptSubmitCommand) return false;
+  if (hookInstall.format !== 'claude-settings') return false;
+  return hasInstalledPromptHookAtPath(hookInstall.configPath);
+}
+
+/** 按实际 settings 路径做 preflight。read-isolation 下 CLI 经 CLAUDE_CONFIG_DIR
+ *  实际读的是 per-bot BOT_HOME/claude/settings.json，不是全局那份——调用方需传入
+ *  effective 路径（与 worker 的 effectiveReadyHookInstall 改写同逻辑）。 */
+export function hasInstalledPromptHookAtPath(configPath: string): boolean {
+  const settings = readJsonFile<ClaudeSettings>(expandHome(configPath));
+  const groups = settings?.hooks?.UserPromptSubmit;
+  return Array.isArray(groups) && groups.some((group) => isBotmuxPromptHookGroup(group));
+}
+
+/**
+ * 带 60s TTL 缓存的 preflight——每个 follow-up turn 都会判定一次模式，读文件虽便宜
+ * 也没必要每 turn 读。缓存按 configPath 键控（全局 vs per-bot 自然分键）；安装发生在
+ * daemon 启动时（ensureCliSkills），60s 内的滞后可接受（最坏情况是新装 hook 后
+ * 60s 内仍走 inline）。
+ */
+const promptHookPreflightCache = new Map<string, { at: number; ok: boolean }>();
+const PROMPT_HOOK_PREFLIGHT_TTL_MS = 60_000;
+
+export function hasInstalledPromptHookCached(configPath: string): boolean {
+  const now = Date.now();
+  const cached = promptHookPreflightCache.get(configPath);
+  if (cached && now - cached.at < PROMPT_HOOK_PREFLIGHT_TTL_MS) return cached.ok;
+  const ok = hasInstalledPromptHookAtPath(configPath);
+  promptHookPreflightCache.set(configPath, { at: now, ok });
+  return ok;
+}
+
+/**
  * 向 Claude settings.json 的 hooks.PreToolUse 合并 botmux ask hook entry。
  * AskUserQuestion 在 bypassPermissions 模式下不会经过 PermissionRequest，
  * 但 PreToolUse 仍会在工具执行前触发，因此这里必须挂 PreToolUse。
@@ -245,6 +310,7 @@ function installClaudeSettings(
   hookCommand: string,
   sessionStartCommand?: string,
   inheritClaudeEnvFrom?: string,
+  userPromptSubmitCommand?: string,
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -293,6 +359,16 @@ function installClaudeSettings(
     existingHooks['SessionStart'] = [
       ...(existingHooks['SessionStart'] ?? []),
       { hooks: [{ type: 'command', command: sessionStartCommand }] },
+    ];
+  }
+
+  // UserPromptSubmit per-turn 上下文 hook（#794，幂等替换旧的 botmux 条目）。
+  // timeout 10s：hook 本身是纯文件读，10s 足够；防任何意外挂起。
+  if (userPromptSubmitCommand) {
+    removeBotmuxPromptHookGroups(existingHooks, 'UserPromptSubmit');
+    existingHooks['UserPromptSubmit'] = [
+      ...(existingHooks['UserPromptSubmit'] ?? []),
+      { hooks: [{ type: 'command', command: userPromptSubmitCommand, timeout: 10 }] },
     ];
   }
 
@@ -483,6 +559,166 @@ function installOpenCodePlugin(configPath: string, parts: { cmd: string; args: s
   }
 }
 
+// ─── OpenCode 2.0（opencode2）插件 ───────────────────────────────────────────
+//
+// V2 插件 API 与 V1 完全不兼容（V1 插件格式在 V2 里会被 loader 拒绝，日志报
+// `Missing key at ["default"]["setup"]`）：module 必须 default export
+// `{ id, setup }`，事件监听走 `setup(ctx)` 里 `ctx.event.subscribe()` 返回的
+// **异步迭代流**（不是回调！回调会被静默忽略）。V2 插件文件放在全局发现目录
+// `~/.config/opencode/plugins/`（复数）。
+//
+// V2 事件形状：`{ id:'evt_…', created, type:'question.asked',
+//   location:{ directory:'…' }, data:{ id:'que_…', sessionID:'ses_…', questions:[…], tool } }`
+// （openapi 的 question.asked 变体；questions 结构与 V1 相同）。
+//
+// 回传答案与 V1 不同：
+//   - 端点是 **session-scoped** 的 `POST {base}/api/session/{sessionID}/question/{requestID}/reply`
+//     （body `{ answers: string[][] }`，成功 204）。
+//   - 服务地址/凭证从注册文件发现：`$XDG_STATE_HOME/opencode/service.json`（默认
+//     `~/.local/state/opencode/service.json`）→ `{ url, password }`，Basic auth
+//     用户名固定 `opencode`。opencode2 的托管后台服务（`serve --service`）会写这个
+//     文件；`--standalone` 私有服务不注册，此时插件读不到 → 放行给原生 picker。
+//   - 必须带 `x-opencode-directory` 头（= 事件 location.directory）：共享服务是
+//     「单 server 多 worktree 实例」，缺该头 reply 会路由到 process.cwd() 的实例，
+//     找不到 request → 永远卡 picker。
+function buildOpenCode2Plugin(parts: { cmd: string; args: string[] }): string {
+  const cmdLit = JSON.stringify(parts.cmd);
+  const argsLit = JSON.stringify(parts.args);
+  return `// botmux-ask opencode2 plugin
+// 监听 OpenCode 2.0 原生 \`question\` 工具触发的 \`question.asked\` 事件（事件流
+// ctx.event.subscribe() 异步迭代），转发到 \`botmux hook opencode2\`（飞书问答），
+// 再把答案 POST 回 session-scoped reply 端点解阻塞。
+import { spawn } from "child_process";
+import { readFileSync, appendFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+
+const CMD = ${cmdLit};
+const ARGS = ${argsLit};
+
+// 诊断日志：默认关闭，设 BOTMUX_OPENCODE_ASK_DEBUG=1 后每步落盘到
+// ~/.botmux/opencode2-ask-debug.log，用于排查 ask 链路（事件→转发→reply）。
+const DBG_ON = !!process.env.BOTMUX_OPENCODE_ASK_DEBUG;
+const DBG = join(homedir(), ".botmux", "opencode2-ask-debug.log");
+function dbg(m) {
+  if (!DBG_ON) return;
+  try { appendFileSync(DBG, new Date().toISOString() + " " + m + "\\n"); } catch {}
+}
+
+// 异步 spawn \`botmux hook opencode2\`：stdin 喂 payload，收集 stdout。
+// 任何失败都 resolve("")（= passthrough 放行）。child 自带超时（hook 客户端按
+// BOTMUX_ASK_TIMEOUT_MS 自限），这里再加 25h 兜底 kill 防僵尸（unref 不拖住事件循环）。
+function askBotmux(payload) {
+  return new Promise((resolve) => {
+    let out = "";
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    let child;
+    try {
+      child = spawn(CMD, ARGS, { stdio: ["pipe", "pipe", "ignore"] });
+    } catch {
+      return done("");
+    }
+    const backstop = setTimeout(() => { try { child.kill(); } catch {} done(""); }, 90000000);
+    if (typeof backstop.unref === "function") backstop.unref();
+    child.stdout.on("data", (d) => { out += d.toString("utf-8"); });
+    child.on("error", () => { clearTimeout(backstop); done(""); });
+    child.on("close", (code) => { clearTimeout(backstop); done(code === 0 ? out : ""); });
+    try { child.stdin.write(payload); child.stdin.end(); } catch { clearTimeout(backstop); done(""); }
+  });
+}
+
+// 服务注册文件发现：托管后台服务（serve --service）把 { url, password } 写进
+// $XDG_STATE_HOME/opencode/service.json（默认 ~/.local/state/opencode/service.json）
+// —— 只认这一个位置，无其它 fallback。插件运行在服务进程内，同一宿主直接读文件
+// 即可；读不到（--standalone 私有服务/首次启动）→ null → 放行给原生 picker。
+function readRegistration() {
+  const state = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+  try {
+    const raw = readFileSync(join(state, "opencode", "service.json"), "utf8");
+    const j = JSON.parse(raw);
+    if (typeof j.url === "string" && j.url) return j;
+  } catch {}
+  return null;
+}
+
+// 把答案回传给 OpenCode 2.0 解阻塞。必须带 x-opencode-directory 头（多 worktree
+// 路由），带注册文件里的 Basic auth。
+async function postReply(directory, sessionID, requestID, answers) {
+  const reg = readRegistration();
+  if (!reg) { dbg("NO_REGISTRATION id=" + requestID); return; }
+  const headers = { "content-type": "application/json" };
+  try {
+    if (reg.password) headers.authorization = "Basic " + Buffer.from("opencode:" + reg.password, "utf-8").toString("base64");
+  } catch {}
+  if (directory) headers["x-opencode-directory"] = directory;
+  const base = String(reg.url).replace(/\\/+$/, "");
+  const url = base + "/api/session/" + encodeURIComponent(sessionID) + "/question/" + encodeURIComponent(requestID) + "/reply";
+  dbg("POST_REPLY id=" + requestID + " url=" + url);
+  try {
+    const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ answers }) });
+    let txt = ""; try { txt = await r.text(); } catch {}
+    dbg("REPLY_DONE id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
+    if (!r.ok) dbg("REPLY_NON_OK id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
+  } catch (e) { dbg("REPLY_ERR id=" + requestID + " err=" + String(e)); }
+}
+
+export default {
+  id: "botmux.ask",
+  setup: async (ctx) => {
+    dbg("PLUGIN_LOADED hasEvent=" + !!(ctx && ctx.event && typeof ctx.event.subscribe === "function"));
+    if (!ctx || !ctx.event || typeof ctx.event.subscribe !== "function") return;
+    const iterator = ctx.event.subscribe();
+    const consume = async () => {
+      for await (const ev of iterator) {
+        if (!ev || ev.type !== "question.asked") continue;
+        const data = ev.data || {};
+        const id = data.id;
+        const sessionID = data.sessionID;
+        const questions = data.questions;
+        const directory = (ev.location && ev.location.directory) || "";
+        dbg("EVENT question.asked id=" + id + " sessionID=" + sessionID + " nQ=" + (Array.isArray(questions) ? questions.length : "?"));
+        if (!id || !sessionID || !Array.isArray(questions) || questions.length === 0) { dbg("SKIP missing id/sessionID/questions"); continue; }
+        // fire-and-forget：不 await，避免阻塞事件消费（飞书作答可能很久）。
+        // 问题在服务端独立阻塞，答案经 reply 回去即可解阻塞。
+        (async () => {
+          const payload = JSON.stringify({
+            hook_event_name: "question.asked",
+            question_id: id,
+            session_id: sessionID,
+            tool_input: { questions },
+          });
+          dbg("SPAWN botmux hook opencode2 id=" + id);
+          const stdout = (await askBotmux(payload)).trim();
+          dbg("HOOK_STDOUT id=" + id + " len=" + stdout.length + " body=" + stdout.slice(0, 300));
+          if (!stdout) { dbg("PASSTHROUGH empty stdout id=" + id); return; } // passthrough/超时 → 不应答，留给原生 picker
+          let directive;
+          try { directive = JSON.parse(stdout); } catch (e) { dbg("PARSE_FAIL id=" + id + " err=" + String(e)); return; }
+          const answers = directive && directive.answers;
+          if (!Array.isArray(answers)) { dbg("NO_ANSWERS id=" + id + " directive=" + JSON.stringify(directive).slice(0, 200)); return; }
+          await postReply(directory, sessionID, id, answers);
+        })().catch((e) => { dbg("HANDLER_ERR id=" + id + " err=" + String(e)); });
+      }
+    };
+    consume().catch((e) => { dbg("STREAM_ERR " + String(e)); });
+  },
+};
+`;
+}
+
+/**
+ * 写入 OpenCode 2.0 插件文件（V2 插件 API）。幂等：内容相同则跳过。
+ */
+function installOpenCode2Plugin(configPath: string, parts: { cmd: string; args: string[] }): void {
+  const content = buildOpenCode2Plugin(parts);
+  const changed = writeIfChanged(configPath, content);
+  if (changed) {
+    logger.info(`[hook] 已写入 OpenCode 2.0 插件 → ${configPath}`);
+  } else {
+    logger.info(`[hook] OpenCode 2.0 插件已是最新，跳过写入 → ${configPath}`);
+  }
+}
+
 // ─── Grok hooks/*.json 格式 ───────────────────────────────────────────────────
 //
 // Grok discovers global hooks from `~/.grok/hooks/*.json` (always trusted).
@@ -546,11 +782,16 @@ export function installHook(
           hookCommand,
           hookInstall.sessionStartCommand,
           hookInstall.inheritClaudeEnvFrom,
+          hookInstall.userPromptSubmitCommand,
         );
         break;
       case 'opencode-plugin':
         // OpenCode 插件走 argv parts（异步 spawn），不复用 shell 字符串，避免被 split 拆坏。
         installOpenCodePlugin(configPath, hookCommandParts(cliId));
+        break;
+      case 'opencode2-plugin':
+        // OpenCode 2.0 插件走 argv parts（异步 spawn），新插件 API（见 buildOpenCode2Plugin）。
+        installOpenCode2Plugin(configPath, hookCommandParts(cliId));
         break;
       case 'grok-hooks':
         // Grok has no ask-hook surface yet; only SessionStart ready-gate.

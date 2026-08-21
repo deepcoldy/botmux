@@ -45,12 +45,12 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 |------|------|
 | `name` | Process name suffix, e.g. `claude-main` → `botmux-claude-main`; leave empty to default to `botmux-<index>` |
 | `cliId` | CLI adapter, defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) |
-| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup` |
+| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup`. **Resolved from the current config on every CLI launch**, resume included: a change (dashboard or this file) also applies to **existing sessions**, from their next launch/resume onward. Unlike `cliId` / `cliRuntime` / `wrapperCli`, which are frozen when the session is created so a live conversation never has its runtime swapped underneath it |
 | `cliRuntime` | Structured runtime descriptor for a Codex-compatible distribution: `{ id, displayName?, executable, update? }`. It reuses the `codex` adapter while retaining its own version, update source, and session identity. See [Codex-compatible distributions](/en/adapters#codex-compatible-distributions) |
 | `cliPathOverride` | Legacy CLI entry-point override, retained for wrappers / routers and existing custom binaries. Prefer `cliRuntime` for a new Codex-compatible distribution. To support downgrading BotMux, writers also persist an exact compatibility shadow of `cliRuntime.executable`; do not manually configure mismatched values |
 | `disableCliBypass` | When `true`, the CLI's auto-approve / sandbox-bypass flags (`--yolo`, `--dangerously-*`) are not appended automatically; omitted / `false` keeps the original behavior |
 | `backendType` | Session backend, one of `pty` / `tmux` / `herdr` / `zellij`. **Leave empty to default to `tmux`** (PTY auto-fallback is retired): when a persistent backend (tmux/herdr/zellij) isn't available on this host it **hard-gates** and posts a card asking you to install it — it does **not** silently downgrade to pty (`zellij` requires ≥ 0.44). `pty` is an explicit fallback only (`backendType:"pty"` or `BACKEND_TYPE=pty`) — attaches directly to the process and **does not survive daemon restarts**. See [tmux backend](/en/tmux) |
-| `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`). Empty = use `$SHELL`. Takes effect next session; `tmux` / `zellij` backends only (`pty` execs the CLI directly and is unaffected). Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
+| `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `fish` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`, or `~/.config/fish/config.fish` for fish). fish is a first-class launch shell: `launchShell: "fish"` and absolute fish paths (e.g. `/usr/bin/fish`) are supported, and the desktop PATH probe reads fish when `$SHELL` is fish, so fish users don't need to mirror PATH / env into `.bashrc` / `.zshrc`. Empty = use `$SHELL`. Takes effect next session for shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); `pty` execs the CLI directly and is unaffected. Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
@@ -141,7 +141,7 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 
 | Field | Description |
 |------|------|
-| `allowedUsers` | The operate-permission list (**full email** or `ou_xxx`). When `allowedChatGroups` is configured, at least one is required to serve as owner |
+| `allowedUsers` | The operate-permission list. Prefer a **full email**, mobile number, or `on_xxx`; an `ou_xxx` is valid only for the same app that issued it and must never be copied across Bots. When `allowedChatGroups` is configured, at least one is required to serve as owner |
 | `allowedChatGroups` | Conversable groups (`oc_xxx`). Any member of the group can converse (only `canTalk`); sensitive operations are still controlled by `allowedUsers` |
 | `p2pOpen` | When `true`, any user within the Lark app's availability scope may DM this bot (only `canTalk`). Group behavior is unchanged and sensitive operations still require `allowedUsers`. Always configure at least one `allowedUsers` owner |
 | `oncallChats` | Oncall bindings, `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [oncall](/en/oncall) |
@@ -183,6 +183,44 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+
+## Group message listener
+
+Have a bot **actively watch a group**: matching group messages start a session automatically, no @ required. The classic use is **alert operations** — your monitoring/alerting system usually already has its own Lark bot posting alerts into a group, so just add this bot to that group and enable the listener; every alert triggers an investigation session, with no need to set up a separate [Webhook integration point](/en/webhook).
+
+Configure it per-group in the **Dashboard "Roles → Message Listener"** tab (with **Preview** of the last 24h of matches and a **dry run** to validate); or write `messageListeners` directly in `bots.json` (keyed by `chat_id`, valued by the config below):
+
+| Field | Description |
+|------|------|
+| `enabled` | Whether the listener is on for this chat. `prompt` is required when enabled, otherwise the whole entry is ignored |
+| `prompt` | Listener prompt: tells the bot which messages to handle and how to reply. A matched message is replied to in a **new topic beneath it** |
+| `name` | Listener name (optional), e.g. "Alert listener", shown in the Dashboard |
+| `replyCardTitle` | Reply card title (optional); blank uses the default |
+| `workingDir` | Working directory for sessions this listener starts (optional); blank uses the bot's default |
+| `senderPolicy.mode` | `all_except_excluded` (blacklist, default): handle every matching sender type except the excluded ones; `include_only` (whitelist): handle only the senders in `includeSenderOpenIds` |
+| `senderPolicy.includeSenderTypes` | Sender types to listen to: `["user"]` / `["bot"]` / both. **Listening to a third-party alert bot must include `"bot"`** |
+| `senderPolicy.includeSenderOpenIds` / `excludeSenderOpenIds` | Exact whitelist / blacklist by `open_id` |
+| `senderPolicy.excludeSelf` | Default `true`; always excludes the bot's own messages (prevents self-triggering) |
+| `messagePolicy.includeMsgTypes` | Message types to listen to; defaults to text + rich text (`post`) |
+
+```json
+{
+  "messageListeners": {
+    "oc_xxxxxxxxxxxxxxxx": {
+      "enabled": true,
+      "name": "Alert listener",
+      "prompt": "Every alert in this group is a production event. Identify the affected service and give an initial investigation direction; if it's a false alarm, explain why.",
+      "senderPolicy": { "mode": "all_except_excluded", "includeSenderTypes": ["bot"] }
+    }
+  }
+}
+```
+
+Conventions and limits (V1):
+
+- **Top-level group messages only**: ordinary replies inside an existing topic are not handled; a message that explicitly @s this bot still goes through normal @ routing (no double trigger).
+- **One session per matched message**, replied to in a new topic beneath it.
+- **Delivery**: the realtime event path covers messages Lark pushes; **messages from other bots, and non-@ messages, are backfilled by a history poll roughly every 30s** (so up to ~30s of latency). That's why listening to a third-party alert bot works most reliably in blacklist mode (`all_except_excluded` + include `"bot"`) — whitelist matches by `open_id`, but the history API reports third-party bots by `app_id`, which may not resolve to an `open_id` and therefore won't match.
 
 ## Summary command
 

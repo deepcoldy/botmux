@@ -1,3 +1,5 @@
+export { isInternalCodexSessionMeta } from '../../services/codex-session-meta.js';
+
 const TITLE_GENERATOR_HEADER = /^\s*You\s+are\s+a\s+helpful\s+assistant\.\s+You\s+will\s+be\s+presented\s+with\s+a\s+user\s+prompt,\s+and\s+your\s+job\s+is\s+to\s+provide\s+a\s+short\s+title\s+for\s+a\s+task\b/i;
 const AMBIENT_SUGGESTIONS_WORKER_HEADER = /^\s*Generate\s+\d+\s+to\s+\d+\s+ambient\s+suggestions\b/i;
 const HYPERPERSONALIZED_SUGGESTIONS_WORKER_HEADER = /^\s*#\s*Overview\s+Generate\s+\d+\s+to\s+\d+\s+hyperpersonalized\s+suggestions\b/i;
@@ -26,15 +28,4 @@ export function isInternalCodexPrompt(prompt: unknown): boolean {
     || GUARDIAN_REVIEWER_HEADER.test(prompt)
     || APPROVAL_REVIEW_HEADER.test(prompt)
     || AGENT_BOX_RUNTIME_HEADER.test(prompt);
-}
-
-/** session_meta.source 是协议级来源；出现 internal/subagent 时不属于用户主任务。 */
-export function isInternalCodexSessionMeta(meta: unknown): boolean {
-  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return false;
-  const payload = meta as Record<string, unknown>;
-  if (typeof payload.thread_source === 'string' && payload.thread_source !== 'user') return true;
-  const source = payload.source;
-  if (!source || typeof source !== 'object' || Array.isArray(source)) return false;
-  const sourceRecord = source as Record<string, unknown>;
-  return sourceRecord.internal !== undefined || sourceRecord.subagent !== undefined;
 }

@@ -3,11 +3,20 @@
  *
  * TRAE is a Codex-family CLI, but its terminal event is NOT byte-identical to
  * upstream Codex:
- *   - user input is a response_item role=user message, like Codex;
+ *   - genuine user input is confirmed by event_msg `user_message`; TRAE also
+ *     writes internal runtime injections as response_item role=user messages,
+ *     so those records alone are not user-attribution evidence;
  *   - assistant response_item messages have no `phase` and are emitted many
  *     times during tool use, so none of them is a safe turn boundary;
  *   - event_msg `task_complete` is the durable end-of-turn marker and carries
  *     the final visible text in `last_agent_message` (which may be empty).
+ *     When it is empty the drainer consults the turn's `agent_message`
+ *     records: a `final_answer`-phase message reconstructs a dropped final,
+ *     and a commentary message ending in the nothing-to-send sentinel marks
+ *     deliberate silence. A non-null `error` payload maps the terminal to
+ *     `failed` (mirroring the Codex drainer) so a model-endpoint failure
+ *     surfaces its real reason instead of the misleading "completed but
+ *     empty" diagnostic.
  *   - Directory layout differs: sessions live under
  *     ~/.trae/cli/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
  *     (note the extra `cli/` level vs Codex's ~/.codex/sessions/...).
@@ -33,7 +42,14 @@ import {
   type CodexBridgeEvent,
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
+  codexTaskFailureCode,
+  safeFailureSummary,
 } from './codex-transcript.js';
+import {
+  BRIDGE_NOTHING_TO_SEND_SENTINEL,
+  BRIDGE_NO_REPLY_SENTINEL_LEGACY,
+} from './bridge-fallback-gate.js';
+import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot } from './traex-paths.js';
 
@@ -48,30 +64,94 @@ export interface TraexDrainResult extends CodexDrainResult {
   latestReasoningEffort?: string;
 }
 
+export interface TraexDrainOptions {
+  /** Adopt mode: the adopted CLI is botmux-unaware, so the drainer must NOT
+   *  synthesise a bare nothing-to-send sentinel for an empty final — the emit
+   *  layer posts transcript text verbatim in adopt mode and the literal token
+   *  would leak into Lark. Default false (synthesise, matching the non-adopt
+   *  genuine-silence contract). */
+  adoptMode?: boolean;
+  /** Read-only probe: skip the per-turn agent_message cache mutations. Used by
+   *  submit-confirmation probes that re-drain the same live rollout at a
+   *  different offset and must not disturb the production drainer's pending
+   *  turn state. */
+  probe?: boolean;
+}
+
 export interface TraexRuntimeSnapshot {
   model?: string;
   reasoningEffort?: string;
 }
 
 const IS_LINUX = platform() === 'linux';
+const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';
+
+interface TraexRolloutRef {
+  path: string;
+  cliSessionId: string;
+  kind: TraexRolloutKind;
+  startedAtMs?: number;
+}
+
+const traexRolloutMetaCache = new Map<string, {
+  kind: TraexRolloutKind;
+  startedAtMs?: number;
+}>();
+
+/** Per-rollout `agent_message` state for the CURRENTLY OPEN turn, retained
+ *  across drain calls. A turn's commentary/final_answer records are almost
+ *  always drained in earlier polls than its `task_complete` (turns run for
+ *  minutes while the poller runs on the second scale), so same-batch state
+ *  would never see them. Reset on every `user_message` (turn start) and
+ *  consumed/cleared by `task_complete`/`turn_aborted` (turn end); a turn that
+ *  terminates without either leaves at most one stale entry, bounded by the
+ *  same cap/eviction as traexRolloutMetaCache. */
+interface TraexPendingAgentMessages {
+  /** Last commentary-phase `agent_message` since the turn's user_message.
+   *  Its trailing sentinel is the deliberate-silence signal. */
+  lastCommentary?: string;
+  /** Last final_answer-phase `agent_message` since the turn's user_message.
+   *  Defensive reconstruction source when task_complete drops the final it
+   *  actually produced. */
+  lastFinalAnswer?: string;
+}
+
+const traexPendingAgentCache = new Map<string, TraexPendingAgentMessages>();
+const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
+
+function traexPendingAgentState(path: string): TraexPendingAgentMessages {
+  let state = traexPendingAgentCache.get(path);
+  if (!state) {
+    state = {};
+    traexPendingAgentCache.set(path, state);
+    if (traexPendingAgentCache.size > TRAEX_PENDING_AGENT_CACHE_MAX) {
+      const oldest = traexPendingAgentCache.keys().next().value;
+      if (oldest) traexPendingAgentCache.delete(oldest);
+    }
+  }
+  return state;
+}
+
+/** Matches a commentary message that ENDS with a nothing-to-send sentinel
+ *  (current or legacy token), optionally glued to trailing prose — the shape
+ *  TRAE writes when the model replied via `botmux send` and kept only
+ *  narration in the commentary phase. Captures the exact token so the
+ *  synthesised final carries the same one the gate recognises. */
+const TRAEX_TRAILING_SENTINEL_RE = new RegExp(
+  `(${BRIDGE_NOTHING_TO_SEND_SENTINEL}|${BRIDGE_NO_REPLY_SENTINEL_LEGACY})\\s*$`,
+);
+
+function traexTrailingSentinel(message: string): string | undefined {
+  return TRAEX_TRAILING_SENTINEL_RE.exec(message)?.[1];
+}
 
 /** Upper bound on how far back readLatestTraexRuntime scans for the newest
  * model/effort. The newest turn_context sits near the tail, so this is only a
  * pathological-file guard (cf. #740): never synchronously parse a multi-GB
  * rollout on attach just to surface advisory runtime identity. */
 const TRAEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
-
-function joinInputText(content: unknown): string {
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block && typeof block === 'object' && (block as any).type === 'input_text') {
-      const text = (block as any).text;
-      if (typeof text === 'string') parts.push(text);
-    }
-  }
-  return parts.join('');
-}
 
 function eventTimestampMs(value: unknown): number {
   const parsed = typeof value === 'string' ? Date.parse(value) : NaN;
@@ -111,8 +191,25 @@ function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
  * `task_complete` is intentionally emitted even when last_agent_message is
  * missing/empty: a silent successful turn still has to release a durable
  * delivery. A non-newline-terminated tail is never parsed, so a process crash
- * halfway through the terminal JSON object cannot manufacture completion. */
-export function drainTraexRollout(path: string, fromOffset: number): TraexDrainResult {
+ * halfway through the terminal JSON object cannot manufacture completion.
+ *
+ * Terminal refinement on an empty `last_agent_message`:
+ *   - a non-null `error` payload maps the event to `failed` (same shape as the
+ *     Codex drainer) — traecli writes task_complete with
+ *     last_agent_message=null AND error when the model endpoint fails, so the
+ *     failure must not be read as a silent success;
+ *   - otherwise the turn's agent_message records (tracked across drain calls)
+ *     recover a dropped final_answer or recognise a trailing
+ *     nothing-to-send sentinel as deliberate silence. The sentinel synthesis
+ *     runs only in non-adopt mode: adopt posts transcript text verbatim, so a
+ *     synthesised bare token would leak into Lark. */
+export function drainTraexRollout(
+  path: string,
+  fromOffset: number,
+  opts?: TraexDrainOptions,
+): TraexDrainResult {
+  const adoptMode = opts?.adoptMode === true;
+  const probe = opts?.probe === true;
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -153,21 +250,75 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       timestampMs: eventTimestampMs(obj.timestamp),
       ...(sourceSessionId ? { sourceSessionId } : {}),
     };
-    if (obj.type === 'response_item'
-      && payload.type === 'message'
-      && payload.role === 'user') {
-      const userText = joinInputText(payload.content);
-      if (userText) events.push({ ...base, kind: 'user', text: userText });
+    if (obj.type === 'event_msg'
+      && payload.type === 'user_message'
+      && typeof payload.message === 'string') {
+      const userText = payload.message;
+      if (userText) {
+        events.push({ ...base, kind: 'user', text: userText });
+        // New turn: drop any agent_message state an unterminated predecessor
+        // left behind so it can't be attributed to this turn.
+        if (!probe) traexPendingAgentCache.delete(path);
+      }
+      continue;
+    }
+    // agent_message records are narration (commentary) or the produced final
+    // (final_answer). They are NOT turn boundaries — only task_complete is —
+    // so they are tracked per turn and consulted when the terminal arrives
+    // with an empty/missing last_agent_message.
+    if (!probe
+      && obj.type === 'event_msg'
+      && payload.type === 'agent_message'
+      && typeof payload.message === 'string'
+      && payload.message.length > 0) {
+      const pending = traexPendingAgentState(path);
+      if (payload.phase === 'final_answer') pending.lastFinalAnswer = payload.message;
+      else pending.lastCommentary = payload.message;
       continue;
     }
     if (obj.type === 'event_msg'
       && payload.type === 'task_complete'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      const pending = traexPendingAgentCache.get(path);
+      const failed = payload.error !== null && payload.error !== undefined;
+      const rawFinal = typeof payload.last_agent_message === 'string'
+        ? payload.last_agent_message
+        : '';
+      let text = rawFinal;
+      if (!failed && rawFinal.trim().length === 0) {
+        // TRAE wrote no final for a successful turn. Recover, in order:
+        //   1. a final_answer-phase agent_message — TRAE dropped the final it
+        //      actually produced (the phase field guarantees it is an answer,
+        //      not tool narration). Safe in BOTH modes: it is the model's real
+        //      answer, and adopt posts transcript text verbatim anyway;
+        //   2. a commentary message ending in the nothing-to-send sentinel —
+        //      the model deliberately stayed silent (it replied via
+        //      `botmux send`), so synthesise the bare sentinel the fallback
+        //      gate already treats as genuine silence instead of tripping the
+        //      misleading "completed but empty" diagnostic. NON-ADOPT ONLY:
+        //      adopt posts transcript text verbatim, so a synthesised bare
+        //      token would leak the literal into Lark.
+        text = pending?.lastFinalAnswer?.trim()
+          ? pending.lastFinalAnswer
+          : !adoptMode
+            ? traexTrailingSentinel(pending?.lastCommentary ?? '') ?? ''
+            : '';
+      }
+      if (!probe) traexPendingAgentCache.delete(path);
       events.push({
         ...base,
         kind: 'assistant_final',
-        text: typeof payload.last_agent_message === 'string' ? payload.last_agent_message : '',
+        text,
+        // A non-null error means the turn FAILED (e.g. the model endpoint
+        // connection failed before any response). Mirror the Codex drainer:
+        // classify as failed with a safe code/summary so the worker surfaces
+        // the real reason instead of an empty-final alert.
+        ...(failed ? {
+          terminalStatus: 'failed' as const,
+          terminalErrorCode: codexTaskFailureCode(payload.error),
+          terminalErrorSummary: safeFailureSummary(payload.error),
+        } : {}),
       });
       continue;
     }
@@ -179,6 +330,7 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       && payload.type === 'turn_aborted'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      if (!probe) traexPendingAgentCache.delete(path);
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -279,15 +431,19 @@ function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** Authoritative submit confirmation used by the adapter. Only a complete
- * role=user rollout record appended after `fromOffset` can match. */
+/** Submit-confirmation probe: only a complete event_msg/user_message record
+ * appended after `fromOffset` can match. Read-only — drains with `probe` so
+ * it never mutates the per-turn agent_message cache the production drainer
+ * relies on (a re-drain of the same live rollout at a different offset must
+ * not clear pending turn state). Not currently wired into the production
+ * submit-confirmation path; kept as a tested probe. */
 export function traexRolloutHasUserInputSince(
   path: string,
   fromOffset: number,
   expectedText: string,
 ): boolean {
   const expected = normaliseInputText(expectedText);
-  return drainTraexRollout(path, fromOffset).events.some(event =>
+  return drainTraexRollout(path, fromOffset, { probe: true }).events.some(event =>
     event.kind === 'user' && normaliseInputText(event.text) === expected,
   );
 }
@@ -382,6 +538,121 @@ function matchTraexRolloutPath(target: string): { path: string; cliSessionId: st
   return { path: target, cliSessionId: sid };
 }
 
+function traexRolloutMeta(path: string): {
+  kind: TraexRolloutKind;
+  startedAtMs?: number;
+} {
+  const cached = traexRolloutMetaCache.get(path);
+  if (cached) return cached;
+
+  let size: number;
+  try { size = statSync(path).size; } catch { return { kind: 'empty' }; }
+  if (size <= 0) return { kind: 'empty' };
+
+  const length = Math.min(size, TRAEX_SESSION_META_SCAN_MAX_BYTES);
+  const buffer = Buffer.alloc(length);
+  let bytesRead = 0;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    bytesRead = readSync(fd, buffer, 0, length, 0);
+  } catch {
+    return { kind: 'pending' };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+
+  const content = buffer.subarray(0, bytesRead);
+  const newline = content.indexOf(0x0a);
+  if (newline < 0) return { kind: 'pending' };
+
+  let entry: any;
+  try { entry = JSON.parse(content.subarray(0, newline).toString('utf8')); } catch {
+    return { kind: 'pending' };
+  }
+  if (entry?.type !== 'session_meta' || !entry.payload || typeof entry.payload !== 'object') {
+    const result = { kind: 'legacy' as const };
+    traexRolloutMetaCache.set(path, result);
+    return result;
+  }
+
+  const payload = entry.payload;
+  const threadSource = payload.thread_source;
+  let kind: TraexRolloutKind = 'legacy';
+  if (isInternalCodexSessionMeta(payload)) {
+    kind = 'internal';
+  } else if (threadSource === 'user') {
+    kind = 'user';
+  }
+  const rawTimestamp = typeof payload.timestamp === 'string'
+    ? payload.timestamp
+    : typeof entry.timestamp === 'string'
+      ? entry.timestamp
+      : undefined;
+  const parsedTimestamp = rawTimestamp ? Date.parse(rawTimestamp) : NaN;
+  const result = {
+    kind,
+    ...(Number.isFinite(parsedTimestamp) ? { startedAtMs: parsedTimestamp } : {}),
+  };
+  if (traexRolloutMetaCache.size >= 512) {
+    const oldest = traexRolloutMetaCache.keys().next().value;
+    if (oldest) traexRolloutMetaCache.delete(oldest);
+  }
+  traexRolloutMetaCache.set(path, result);
+  return result;
+}
+
+function traexRolloutRefs(targets: Iterable<string>): TraexRolloutRef[] {
+  const refs = new Map<string, TraexRolloutRef>();
+  for (const target of targets) {
+    const hit = matchTraexRolloutPath(target);
+    if (!hit || refs.has(hit.path)) continue;
+    refs.set(hit.path, { ...hit, ...traexRolloutMeta(hit.path) });
+  }
+  return [...refs.values()];
+}
+
+function newestTraexRollout(refs: TraexRolloutRef[]): TraexRolloutRef | undefined {
+  const timestamped = refs.filter(
+    (ref): ref is TraexRolloutRef & { startedAtMs: number } => ref.startedAtMs !== undefined,
+  );
+  if (timestamped.length === 0) return undefined;
+  const maxStartedAt = Math.max(...timestamped.map(ref => ref.startedAtMs));
+  const newest = timestamped.filter(ref => ref.startedAtMs === maxStartedAt);
+  return newest.length === 1 ? newest[0] : undefined;
+}
+
+function selectableTraexRollouts(refs: TraexRolloutRef[]): TraexRolloutRef[] {
+  const userRefs = refs.filter(ref => ref.kind === 'user');
+  if (userRefs.length > 0) return userRefs;
+  const legacyRefs = refs.filter(ref => ref.kind === 'legacy');
+  if (legacyRefs.length > 0) return legacyRefs;
+  return [];
+}
+
+function selectTraexRollout(
+  refs: TraexRolloutRef[],
+  preferredSessionId?: string,
+): TraexRolloutRef | undefined {
+  const candidates = selectableTraexRollouts(refs);
+  if (candidates.length === 0) return undefined;
+
+  const preferred = preferredSessionId
+    ? candidates.find(ref => ref.cliSessionId.toLowerCase() === preferredSessionId.toLowerCase())
+    : undefined;
+  const newest = newestTraexRollout(candidates);
+  if (preferred) {
+    if (newest?.startedAtMs !== undefined
+      && preferred.startedAtMs !== undefined
+      && newest.startedAtMs > preferred.startedAtMs) {
+      return newest;
+    }
+    return preferred;
+  }
+  if (candidates.length === 1) return candidates[0];
+  return newest;
+}
+
 /** Enumerate the file paths a pid holds open (Linux /proc, else lsof). Shared
  *  by findTraexRolloutByPid (single) and findTraexRolloutSetByPid (ownership
  *  set) so both derive from one source. Returns undefined when enumeration is
@@ -412,17 +683,19 @@ function traexProcessOpenTargets(pid: number): string[] | undefined {
   return targets;
 }
 
-/** Find the rollout file an externally-running TRAE process has open.
- *  Same /proc/<pid>/fd strategy as findCodexRolloutByPid, but with a
- *  TRAE-specific path matcher so we never bind to a sibling Codex pane. */
-export function findTraexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
+/** Find the visible top-level rollout an externally-running TRAE process owns.
+ *  TRAE can keep the parent rollout and internal guardian/subagent rollouts open
+ *  in the same process. Internal rollouts are never adoptable. When a current
+ *  top-level session is supplied it remains preferred unless a newer top-level
+ *  user rollout proves a real in-process `/new` rotation. */
+export function findTraexRolloutByPid(
+  pid: number,
+  preferredSessionId?: string,
+): { path: string; cliSessionId: string } | undefined {
   const targets = traexProcessOpenTargets(pid);
   if (!targets) return undefined;
-  for (const target of targets) {
-    const hit = matchTraexRolloutPath(target);
-    if (hit) return hit;
-  }
-  return undefined;
+  const selected = selectTraexRollout(traexRolloutRefs(targets), preferredSessionId);
+  return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
 }
 
 /** Lowercased set of TRAE session ids whose rollout the pid holds open. The
@@ -436,9 +709,8 @@ export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
   const targets = traexProcessOpenTargets(pid);
   if (!targets) return undefined;
   const set = new Set<string>();
-  for (const target of targets) {
-    const hit = matchTraexRolloutPath(target);
-    if (hit) set.add(hit.cliSessionId.toLowerCase());
+  for (const ref of selectableTraexRollouts(traexRolloutRefs(targets))) {
+    set.add(ref.cliSessionId.toLowerCase());
   }
   return set;
 }

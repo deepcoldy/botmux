@@ -28,11 +28,11 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
     expect(source).toContain('codexAppText: ds.pendingCodexAppText');
     // Pinned (oncall/inherited/default-dir) new topics still fork immediately via
-    // forkReservedInitialSession. The no-project fork now happens off the critical
-    // path: repo scanning is async, so an empty scan folds into commitRepoSelection
-    // inside the detached scan-completion handler rather than a second inline
-    // forkReservedInitialSession call.
-    expect(block.match(/forkReservedInitialSession\(ds, availableBots\)/g)).toHaveLength(1);
+    // forkReservedInitialSession(ds, availableBots, trustedCaller). The no-project
+    // fork now happens off the critical path: repo scanning is async, so an empty
+    // scan folds into commitRepoSelection inside the detached scan-completion
+    // handler rather than a second inline forkReservedInitialSession call.
+    expect(block.match(/forkReservedInitialSession\(ds, availableBots, trustedCaller\)/g)).toHaveLength(1);
     expect(block).toContain('await commitRepoSelection(');
     expect(block).toContain('scanMultipleProjectsAsync(scanDirs');
   });

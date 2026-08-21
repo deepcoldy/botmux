@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { chmod, lstat, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -20,6 +20,7 @@ export const LOCAL_CLI_IDS = [
   'cursor',
   'genius',
   'opencode',
+  'opencode2',
   'antigravity',
   'mtr',
   'hermes',
@@ -45,6 +46,7 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'cursor': 'cursor-agent --resume',
   'genius': 'genius --resume',
   'opencode': 'opencode -s',
+  'opencode2': 'opencode2 -s',
   'antigravity': 'agy --conversation',
   'mtr': 'mtr --session',
   'hermes': 'hermes --resume',
@@ -184,7 +186,18 @@ function adoptedMetadata(ds: DaemonSession): AdoptedMetadata | undefined {
 }
 
 function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null {
-  if (cliId === 'oh-my-pi') return raw === 'omp --continue' ? raw : null;
+  if (cliId === 'oh-my-pi') {
+    const quotedPath = String.raw`'(?:[^']|'\\'')*'`;
+    const match = new RegExp(
+      `^omp --resume (${quotedPath}) --session-dir (${quotedPath})(?![\\s\\S])`,
+    ).exec(raw);
+    if (!match) return null;
+    const decodePath = (token: string): string | null => {
+      const value = token.slice(1, -1).split("'\\''").join("'");
+      return isAbsolute(value) && shellQuote(value) === token ? value : null;
+    };
+    return decodePath(match[1]) !== null && decodePath(match[2]) !== null ? raw : null;
+  }
   const prefix = `${RESUME_COMMAND_PREFIXES[cliId]} `;
   if (!raw.startsWith(prefix)) return null;
   const sid = raw.slice(prefix.length).trim();

@@ -19,13 +19,21 @@ describe('dashboard bot payload helpers', () => {
       'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
-      'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
-      'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
+      'envelopeInjection', 'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
+      'feedback',
+      'overloadAlert', 'p2pMode', 'p2pOpen', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
       'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',
+      'sessionOwnerReminder',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
+  it('exposes feedback policy only in private Bot Defaults payloads', () => {
+    const feedback = { enabled: true, audience: 'requester' };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { feedback })).toMatchObject({ feedback });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('feedback');
   });
 
   it('keeps executable runtime details out of public group roster summaries', () => {
@@ -165,6 +173,15 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ codexAppCleanInput: false });
     expect(botDefaultsPayload(daemon, { codexAppCleanInput: true }))
       .toMatchObject({ codexAppCleanInput: true });
+  });
+
+  it('projects hook envelope injection so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'off' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'auto' }))
+      .toMatchObject({ envelopeInjection: 'auto' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'invalid' }))
+      .toMatchObject({ envelopeInjection: 'off' });
   });
 
   it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {

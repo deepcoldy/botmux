@@ -56,10 +56,11 @@ Hard constraints (all validated; violations return 400):
 - **`envelope.trusted` must be `false`**. This is an injection-defense design: `trusted:false` declares "the envelope content is untrusted external data", so the daemon wraps it as an untrusted event and does not execute instructions embedded inside it. Put what you actually want the bot to do in the top-level `instruction` (the trusted directive), not in the envelope.
 - **Omitting `chatId`** requires `options` to contain either `waitForFinalOutput` or `asyncReturnSessionId`, else `target_required`.
 - **`options.timeoutMs` range `[1000, 300000]`** (1s–5min); out of range returns 400. Defaults to 120000.
-- **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app bots only**): override the model and reasoning level for this trigger.
-  - `model`: a codex model id (≤200 chars); `reasoningEffort`: `low` / `medium` / `high` / `xhigh` (passed to codex verbatim — no downgrade).
-  - **Fresh-session only**: frozen only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
-  - **Scoped to the codex family**: ignored when the target bot is not codex/codex-app (never changes a Claude/Gemini/CoCo bot's model).
+- **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app / grok bots only**): override the model and reasoning level for this trigger.
+  - `model`: a model id for that CLI (≤200 chars); `reasoningEffort`: `low` / `medium` / `high` / `xhigh` (plus `max` / `ultra` on some Codex models). Passed through verbatim — no downgrade; the request returns 400 when the target model does not support the effort.
+  - **Fresh-session only**: recorded only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
+  - `model` is **held in memory, never persisted**: it applies to every launch of that session within this daemon's lifetime and is not restored after a daemon restart — later launches use the bot's configured model. `reasoningEffort` is still persisted with the session.
+  - **Scoped to CLIs with an explicit reasoning control**: ignored when the target bot is not codex/codex-app/grok (never changes a Claude/Gemini/CoCo bot's model).
 
 ### Sync mode (waitForFinalOutput)
 
@@ -146,6 +147,32 @@ A hit carries `idempotent:true` (reused, no new dispatch); the first create carr
 **Crash semantics (at-most-once)**: before dispatching, the daemon durably marks the key's lease `attempting` (a commit-unknown barrier). If the daemon crashes between "dispatch started" and "completion proven", it will **not** blindly re-dispatch on restart (`forkWorker` returning is not proof the model didn't start). The key converges to a terminal state and `trigger-result` reports `failed` (errorCode `no_output`, meaning "previous dispatch outcome unknown; not re-run under at-most-once"). Treat it as **Failed** in your recovery (better a visible failure you retry as a new task than a double run).
 
 **Retention**: the key→session mapping is append-only (same policy as async results), so a late retry after completion still reuses the same session instead of rebuilding it.
+
+---
+
+### Turn idempotency key (`options.turnIdempotencyKey`) — same guarantee for a follow-up turn
+
+`idempotencyKey` above only covers a **fresh** session. When you append a **follow-up turn to an existing session** (`target.sessionId` set), use `options.turnIdempotencyKey` instead — a lost HTTP response on the append otherwise can't tell you whether the daemon already accepted that turn, so a retry risks injecting it **twice**.
+
+Pass a stable key you **persist before issuing the follow-up**. On a same-key retry to the same session, the daemon resolves to the **same turn (same `triggerId`) — no second injection**:
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx","sessionId":"<existing session>"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "turnIdempotencyKey":"my-followup-7"}
+  }'
+```
+
+A hit carries `idempotent:true`; poll `trigger-result` by `sessionId`/`triggerId` as usual.
+
+**Scope**: `turnIdempotencyKey` is supported only for a **follow-up async turn on an existing session** — `target.kind:'turn'` + `target.sessionId` set + `options.asyncReturnSessionId:true`, no `waitForFinalOutput` / `dryRun`. It is **mutually exclusive** with `idempotencyKey` (a request carrying both returns **400**), and the two live in separate, non-collidable key spaces — a `turnIdempotencyKey` and an `idempotencyKey` with the same string never share a lease.
+
+**Same key, different payload → 409 `idempotency_conflict`**; **crash semantics (at-most-once)** and **retention** are identical to `idempotencyKey` above (a follow-up whose dispatch outcome is unknown converges to `failed` / `no_output` and is never blindly re-run). One extra transient case: if the target session is still finishing its **opening activation**, the follow-up is refused **retryably** (errorCode `trigger_failed`, message mentions "session activation in progress") — retry shortly.
 
 ---
 

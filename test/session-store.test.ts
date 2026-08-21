@@ -13,7 +13,7 @@ import { tmpdir } from 'os';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
-const fsControl = vi.hoisted(() => ({ failSessionWrite: false }));
+const fsControl = vi.hoisted(() => ({ failSessionWrite: false, failReaddir: false }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
@@ -23,6 +23,12 @@ vi.mock('node:fs', async (importOriginal) => {
         throw new Error('simulated session repair write failure');
       }
       return actual.writeFileSync(...args);
+    },
+    readdirSync: (...args: Parameters<typeof actual.readdirSync>) => {
+      // Simulates the CLI file sandbox: per-bot files readable, data dir
+      // enumeration denied (EPERM-like failure).
+      if (fsControl.failReaddir) throw new Error('simulated readdir denial');
+      return actual.readdirSync(...args);
     },
   };
 });
@@ -61,12 +67,23 @@ import {
   getSession,
   getOwnedSession,
   listSessions,
+  listSessionsStrict,
+  SessionStoreUnavailableError,
+  beginMojoCloseJournal,
+  markMojoClosePrepared,
+  finishMojoCloseAbort,
   closeSession,
   reactivateClosedSession,
   updateSession,
   updateSessionPid,
+  persistActiveRemoteLineageExact,
+  persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
   repairMissingChatScope,
+  loadAllSessionsSnapshot,
+  mutateSessionRowOffline,
+  readSessionRowFromDisk,
+  readSessionRowCopiesAcrossStores,
 } from '../src/services/session-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -349,7 +366,142 @@ describe('listSessions()', () => {
   });
 });
 
+describe('listSessionsStrict()', () => {
+  it('returns a healthy empty projection when no store exists', () => {
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('rejects a malformed store instead of treating it as safely empty', () => {
+    writeFileSync(join(tempDir, 'sessions.json'), '{not-json');
+    init();
+
+    // Preserve the compatibility reader for non-transactional callers.
+    expect(listSessions()).toEqual([]);
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    expect(() => listSessionsStrict()).toThrow(/session store is unavailable/i);
+  });
+
+  it('stays unhealthy until an explicit init reloads the repaired projection', () => {
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '{not-json');
+    init();
+
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    writeFileSync(fp, '{}');
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+
+    init();
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('rejects a malformed legacy projection during per-bot migration', () => {
+    writeFileSync(join(tempDir, 'sessions.json'), '{broken-legacy');
+    init('app-A');
+
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+  });
+
+  it('rejects a JSON value that is not a session-record projection', () => {
+    writeFileSync(join(tempDir, 'sessions.json'), '[]');
+    init();
+
+    expect(() => listSessionsStrict()).toThrow(/invalid sessions projection/i);
+  });
+});
+
 // ─── closeSession() ──────────────────────────────────────────────────────
+
+describe('write health gate', () => {
+  const corruptCurrentStore = (): { session: ReturnType<typeof createSession>; fp: string } => {
+    const session = createSession('chat-write-gate', 'root-write-gate', 'Write Gate');
+    session.backendType = 'mojo';
+    updateSession(session);
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '{not-json');
+    init();
+    return { session, fp };
+  };
+
+  it.each([
+    ['createSession', (_session: ReturnType<typeof createSession>) => {
+      createSession('chat-new', 'root-new', 'Must Not Create');
+    }],
+    ['updateSession', (session: ReturnType<typeof createSession>) => {
+      updateSession({ ...session, title: 'Must Not Update' });
+    }],
+    ['updateSessionPid', (session: ReturnType<typeof createSession>) => {
+      updateSessionPid(session.sessionId, 12345);
+    }],
+    ['closeSession', (session: ReturnType<typeof createSession>) => {
+      closeSession(session.sessionId);
+    }],
+    ['reactivateClosedSession', (session: ReturnType<typeof createSession>) => {
+      reactivateClosedSession(session.sessionId);
+    }],
+    ['Mojo close journal', (session: ReturnType<typeof createSession>) => {
+      beginMojoCloseJournal(session.sessionId, 'request-write-gate');
+    }],
+    ['single Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
+      persistActiveRemoteLineageExact(session.sessionId, 'task-next');
+    }],
+    ['batch Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
+      persistActiveRemoteLineagesExactBatch([{
+        sessionId: session.sessionId,
+        taskId: null,
+        owner: { pid: null, larkAppId: null, backendType: 'mojo' },
+        targetTaskId: 'task-next',
+        expectedCurrentTaskIds: [null],
+      }]);
+    }],
+  ])('rejects %s after a malformed current store load without changing disk or cache', (_name, mutate) => {
+    const { session, fp } = corruptCurrentStore();
+
+    expect(() => mutate(session)).toThrow(SessionStoreUnavailableError);
+    expect(readFileSync(fp, 'utf-8')).toBe('{not-json');
+    expect(listSessions()).toEqual([]);
+  });
+
+  it('keeps the write fence sticky after external repair until init reloads the store', () => {
+    const { fp } = corruptCurrentStore();
+    expect(() => createSession('chat-blocked', 'root-blocked', 'Blocked')).toThrow(
+      SessionStoreUnavailableError,
+    );
+
+    writeFileSync(fp, '{}');
+    expect(() => createSession('chat-still-blocked', 'root-still-blocked', 'Still Blocked')).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(fp, 'utf-8')).toBe('{}');
+
+    init();
+    expect(createSession('chat-reloaded', 'root-reloaded', 'Reloaded').status).toBe('active');
+  });
+
+  it('does not create a per-bot projection after malformed legacy migration input', () => {
+    const legacyFp = join(tempDir, 'sessions.json');
+    const botFp = join(tempDir, 'sessions-app-A.json');
+    writeFileSync(legacyFp, '{broken-legacy');
+    init('app-A');
+
+    expect(() => createSession('chat-app-a', 'root-app-a', 'App A')).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(legacyFp, 'utf-8')).toBe('{broken-legacy');
+    expect(existsSync(botFp)).toBe(false);
+  });
+
+  it('rejects writes after a valid JSON value that is not a session projection', () => {
+    const session = createSession('chat-array', 'root-array', 'Array Projection');
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '[]');
+    init();
+
+    expect(() => updateSession({ ...session, title: 'Must Not Overwrite Array' })).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(fp, 'utf-8')).toBe('[]');
+  });
+});
 
 describe('closeSession()', () => {
   it('should set status to closed and add closedAt timestamp', () => {
@@ -410,6 +562,264 @@ describe('closeSession()', () => {
     });
   });
 
+  // `previewTarget` is the literal loopback (host, port) an agent registered
+  // with `botmux preview <port>`; the dashboard proxy dials it by host/port
+  // alone. A closed session owns no port any more, and the OS may hand that
+  // number to an unrelated local server — so it must not survive in the row.
+  it('clears the registered preview target from the closed row data', () => {
+    const session = createSession('chat1', 'root1', 'Close Preview');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
+
+    // Atomic with status='closed': neither the parsed row nor the raw file
+    // (read by offline/cross-store row readers) may still carry the target.
+    init();
+    expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
+    const raw = readFileSync(join(tempDir, 'sessions.json'), 'utf-8');
+    expect(raw).not.toContain('previewTarget');
+    expect(raw).not.toContain('4173');
+  });
+
+  it('keeps the preview target in memory when the atomic close save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Preview Save Failure');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(session.sessionId))
+      .toThrow(/simulated session repair write failure/);
+
+    // The close did not happen, so the still-active session keeps proxying its
+    // own live port — rollback must restore the field with the rest of the row.
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.previewTarget).toEqual({
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    });
+  });
+
+  it('parks an uncancellable mojo lineage in the same transaction as the close', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Park');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-1';
+    updateSession(session);
+
+    closeSession(session.sessionId, {
+      parkMojoLineage: 'mojo-sid-1',
+      clearRiffParentTaskId: true,
+    });
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      mojoQuarantinedLineage: 'mojo-sid-1',
+      mojoQuarantineNoticePending: true,
+    });
+    // The active slot is cleared in the same write; the parked slot is the handle.
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('keeps BOTH ids when a different lineage was already parked', () => {
+    // Each id is the only handle left for manual cleanup of its own remote
+    // session, so the second must not overwrite the first.
+    const session = createSession('chat1', 'root1', 'Close Mojo Park Merge');
+    session.backendType = 'mojo';
+    session.mojoQuarantinedLineage = 'mojo-old';
+    session.riffParentTaskId = 'mojo-new';
+    updateSession(session);
+
+    closeSession(session.sessionId, {
+      parkMojoLineage: 'mojo-new',
+      clearRiffParentTaskId: true,
+    });
+
+    expect(getSession(session.sessionId)?.mojoQuarantinedLineage).toBe('mojo-old,mojo-new');
+  });
+
+  it('restores the mojo park fields when the atomic save fails', () => {
+    // The rollback is the whole point of doing the park inside this transaction:
+    // a FAILED close must not leave the row parked, or the next turn treats a
+    // still-live remote session as quarantined and silently starts a new one.
+    const session = createSession('chat1', 'root1', 'Close Mojo Save Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-retry';
+    updateSession(session);
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(
+      session.sessionId,
+      { parkMojoLineage: 'mojo-sid-retry', clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+
+    const inMemory = getSession(session.sessionId);
+    expect(inMemory).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
+    expect(inMemory?.mojoQuarantinedLineage).toBeUndefined();
+    expect(inMemory?.mojoQuarantineNoticePending).toBeUndefined();
+
+    // ...and the same must be true of what is actually on disk.
+    fsControl.failSessionWrite = false;
+    init();
+    const reloaded = getSession(session.sessionId);
+    expect(reloaded).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
+    expect(reloaded?.mojoQuarantinedLineage).toBeUndefined();
+    expect(reloaded?.mojoQuarantineNoticePending).toBeUndefined();
+  });
+
+  it('journals Mojo prepare/proof and clears it atomically with close', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Journal');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+    markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      taskId: 'mojo-sid-journal',
+    });
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('never accepts a Mojo close journal as authority for another backend', () => {
+    const session = createSession('chat1', 'root1', 'Non Mojo Journal');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task';
+    updateSession(session);
+
+    expect(() => beginMojoCloseJournal(
+      session.sessionId,
+      'request-1',
+      'riff-task',
+    )).toThrow(/non-Mojo session/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      backendType: 'riff',
+      riffParentTaskId: 'riff-task',
+    });
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('keeps a prepared Mojo journal in memory and on disk when close commit fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Journal Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(
+      session.sessionId,
+      { clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-journal',
+      mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
+    });
+
+    fsControl.failSessionWrite = false;
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-journal',
+      mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
+    });
+  });
+
+  it('rolls back a failed journal transition without publishing false proof', () => {
+    const session = createSession('chat1', 'root1', 'Mojo Journal Transition Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    fsControl.failSessionWrite = true;
+
+    expect(() => markMojoClosePrepared(
+      session.sessionId,
+      'request-1',
+      'mojo-sid-journal',
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+
+    fsControl.failSessionWrite = false;
+    init();
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+  });
+
+  it('never rewrites a prepared proof to a different remote lineage', () => {
+    const session = createSession('chat1', 'root1', 'Mojo Journal Lineage CAS');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-original';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-original');
+
+    expect(() => markMojoClosePrepared(
+      session.sessionId,
+      'request-1',
+      'mojo-different',
+    )).toThrow(/journal lineage/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      riffParentTaskId: 'mojo-original',
+      mojoCloseJournal: {
+        phase: 'preparing',
+        requestId: 'request-1',
+        taskId: 'mojo-original',
+      },
+    });
+  });
+
+  it('clears a failed prepare only after admission restore, otherwise persists uncertainty', () => {
+    const session = createSession('chat1', 'root1', 'Abort Mojo Journal');
+    session.backendType = 'mojo';
+    updateSession(session);
+
+    beginMojoCloseJournal(session.sessionId, 'request-1');
+    finishMojoCloseAbort(session.sessionId, 'request-1', {
+      admissionRestored: false,
+      taskId: 'mojo-late-id',
+    });
+    expect(getSession(session.sessionId)).toMatchObject({
+      riffParentTaskId: 'mojo-late-id',
+      mojoCloseJournal: { phase: 'uncertain', taskId: 'mojo-late-id' },
+    });
+
+    finishMojoCloseAbort(session.sessionId, 'request-1', {
+      admissionRestored: true,
+      taskId: 'mojo-late-id',
+    });
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBe('mojo-late-id');
+  });
+
   it('should call deleteFrozenCards with the sessionId', () => {
     const session = createSession('chat1', 'root1', 'Frozen');
     closeSession(session.sessionId);
@@ -468,6 +878,29 @@ describe('reactivateClosedSession()', () => {
     expect(reloaded.queuedActivationInput).toBeUndefined();
     expect(reloaded.queuedActivationTail).toBeUndefined();
   });
+
+  it('does not revive a preview target left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Preview');
+    closeSession(session.sessionId);
+    // Rows closed by a build older than the close-path cleanup still carry the
+    // target on disk. Resume starts a new worker generation that has registered
+    // no port, so reactivation must not hand the proxy the old host/port.
+    const legacy = getSession(session.sessionId)!;
+    legacy.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+
+    init();
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.previewTarget).toBeUndefined();
+  });
 });
 
 // ─── updateSession() ─────────────────────────────────────────────────────
@@ -493,6 +926,23 @@ describe('updateSession()', () => {
     init();
     const reloaded = getSession(session.sessionId);
     expect(reloaded!.webPort).toBe(9999);
+  });
+
+  it('persists the explicitly registered preview target across a store restart', () => {
+    const session = createSession('chat1', 'root1', 'Preview target');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+
+    init();
+    expect(getSession(session.sessionId)?.previewTarget).toEqual({
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    });
   });
 
   it('skips the disk write when an update produces byte-identical content', () => {
@@ -752,5 +1202,213 @@ describe('legacy placeholder-card field stripping', () => {
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardState');
     expect(onDisk.s1).not.toHaveProperty('lastPatchedResponseCardId');
+  });
+});
+
+// ─── cross-process offline access ────────────────────────────────────────────
+// The absorbed CLI-side persistence (formerly cli.ts loadSessions /
+// mutateSessionOffline / saveSession) and the daemon/provenance direct reads.
+
+function seedFile(name: string, rows: Record<string, unknown>): void {
+  mkdirSync(tempDir, { recursive: true });
+  writeFileSync(join(tempDir, name), JSON.stringify(rows, null, 2));
+}
+
+function row(sessionId: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    sessionId, chatId: 'oc_chat', rootMessageId: `om_${sessionId}`, title: sessionId,
+    status: 'active', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
+  };
+}
+
+describe('loadAllSessionsSnapshot()', () => {
+  it('merges legacy + per-bot files, per-bot wins duplicates and gets larkAppId stamped', () => {
+    seedFile('sessions.json', {
+      legacy1: row('legacy1'),
+      dup: row('dup', { title: 'legacy copy' }),
+    });
+    seedFile('sessions-appA.json', {
+      dup: row('dup', { title: 'per-bot copy' }),
+      a1: row('a1'),
+    });
+
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect(snapshot.size).toBe(3);
+    expect(snapshot.get('legacy1')?.larkAppId).toBeUndefined();
+    expect(snapshot.get('dup')?.title).toBe('per-bot copy');
+    expect(snapshot.get('dup')?.larkAppId).toBe('appA');
+    expect(snapshot.get('a1')?.larkAppId).toBe('appA');
+  });
+
+  it('applies the scope repair and skips malformed entries', () => {
+    seedFile('sessions.json', {
+      broken: { notASession: true },
+      chatScoped: { ...row('chatScoped'), chatId: 'oc_x', rootMessageId: 'oc_x' },
+    });
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect(snapshot.size).toBe(1);
+    expect(snapshot.get('chatScoped')?.scope).toBe('chat');
+  });
+
+  it('falls back to the exact per-bot file when the data dir cannot be enumerated', () => {
+    seedFile('sessions-appB.json', { b1: row('b1') });
+    seedFile('sessions-appC.json', { c1: row('c1') });
+    fsControl.failReaddir = true;
+    try {
+      const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appB' });
+      // The sandboxed fallback loads only the injected bot's own file.
+      expect([...snapshot.keys()]).toEqual(['b1']);
+      expect(snapshot.get('b1')?.larkAppId).toBe('appB');
+    } finally {
+      fsControl.failReaddir = false;
+    }
+  });
+});
+
+describe('readSessionRowFromDisk()', () => {
+  it('prefers the owning per-bot file and falls back to legacy', () => {
+    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+    seedFile('sessions-appA.json', { s1: row('s1', { title: 'per-bot' }) });
+    expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('per-bot');
+    expect(readSessionRowFromDisk('s1', 'appMissing', tempDir)?.title).toBe('legacy');
+    expect(readSessionRowFromDisk('s1', undefined, tempDir)?.title).toBe('legacy');
+    expect(readSessionRowFromDisk('nope', 'appA', tempDir)).toBeUndefined();
+  });
+
+  it('skips a corrupt per-bot file and still reads the legacy copy', () => {
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-appA.json'), '{corrupt');
+    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+    expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('legacy');
+  });
+});
+
+describe('readSessionRowCopiesAcrossStores()', () => {
+  it('returns one entry per file that holds the id', () => {
+    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+    seedFile('sessions-appA.json', { s1: row('s1', { title: 'per-bot' }) });
+    seedFile('sessions-appB.json', { other: row('other') });
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies.map(c => c.title).sort()).toEqual(['legacy', 'per-bot']);
+    expect(readSessionRowCopiesAcrossStores('other', tempDir)).toHaveLength(1);
+    expect(readSessionRowCopiesAcrossStores('missing', tempDir)).toHaveLength(0);
+  });
+
+  it('skips corrupt files and key-mismatched rows without failing the scan', () => {
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-appA.json'), 'not json');
+    seedFile('sessions-appB.json', { s1: row('someOtherId') }); // key ≠ row.sessionId
+    seedFile('sessions.json', { s1: row('s1') });
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies).toHaveLength(1);
+  });
+
+  it('throws when the data dir itself cannot be listed (fail-closed identity scan)', () => {
+    expect(() => readSessionRowCopiesAcrossStores('s1', join(tempDir, 'no-such-dir')))
+      .toThrow();
+  });
+});
+
+describe('mutateSessionRowOffline()', () => {
+  it('mutates the FRESH on-disk row, never the caller snapshot (stale-clobber regression)', () => {
+    // The row gained a newer field on disk after the caller took its snapshot.
+    // The old cli.ts saveSession() would have written the stale snapshot back,
+    // erasing workerGeneration; the locked mutation must preserve it.
+    seedFile('sessions-appA.json', {
+      s1: row('s1', { workerGeneration: 7, larkAppId: 'appA' }),
+    });
+
+    const published = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => {
+        current.status = 'closed';
+        current.closedAt = '2026-08-13T00:00:00.000Z';
+        return true;
+      },
+      { dataDir: tempDir },
+    );
+
+    expect(published?.status).toBe('closed');
+    expect(published?.workerGeneration).toBe(7);
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8'));
+    expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.workerGeneration).toBe(7);
+  });
+
+  it('returns the fresh row without writing when mutate declines', () => {
+    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    const current = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      () => false,
+      { dataDir: tempDir },
+    );
+    expect(current?.sessionId).toBe('s1');
+    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+  });
+
+  it('returns undefined for a missing row', () => {
+    seedFile('sessions-appA.json', { s1: row('s1') });
+    expect(mutateSessionRowOffline(
+      { sessionId: 'ghost', larkAppId: 'appA' },
+      () => true,
+      { dataDir: tempDir },
+    )).toBeUndefined();
+  });
+
+  it('aborts untouched when abortIf trips at entry', () => {
+    seedFile('sessions-appA.json', { s1: row('s1') });
+    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    const result = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir, abortIf: () => true },
+    );
+    expect(result).toBeUndefined();
+    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+  });
+
+  it('re-checks abortIf immediately before publication and leaves the file untouched', () => {
+    // A daemon that appears during the read/decision phase becomes
+    // authoritative — the second probe must catch it.
+    seedFile('sessions-appA.json', { s1: row('s1') });
+    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    let probes = 0;
+    const result = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir, abortIf: () => ++probes > 1 },
+    );
+    expect(result).toBeUndefined();
+    expect(probes).toBe(2);
+    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+  });
+
+  it('converges the file on write: drops key-mismatched rows and legacy card fields', () => {
+    seedFile('sessions-appA.json', {
+      s1: row('s1', { pendingResponseCardId: 'om_old' }),
+      wrongKey: row('actualId'),
+    });
+    mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.title = 'touched'; return true; },
+      { dataDir: tempDir },
+    );
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8'));
+    expect(onDisk.s1.title).toBe('touched');
+    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
+    expect(onDisk).not.toHaveProperty('wrongKey');
+  });
+
+  it('targets the legacy sessions.json when the row carries no larkAppId', () => {
+    seedFile('sessions.json', { s1: row('s1') });
+    const published = mutateSessionRowOffline(
+      { sessionId: 's1' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir },
+    );
+    expect(published?.status).toBe('closed');
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions.json'), 'utf-8'));
+    expect(onDisk.s1.status).toBe('closed');
   });
 });

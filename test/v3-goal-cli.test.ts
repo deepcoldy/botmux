@@ -391,3 +391,44 @@ describe('botmux goal run — machine terminal contract', () => {
       .toEqual(['goal#001/attempts/001', 'goal#001/attempts/002']);
   }, 15_000);
 });
+
+describe('botmux goal run — workflow kill-switch gate', () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+    roots.length = 0;
+  });
+  function root(): string {
+    const value = mkdtempSync(join(tmpdir(), 'botmux-goal-gate-'));
+    roots.push(value);
+    return value;
+  }
+
+  it('refuses to launch (exit 14, WORKFLOW_DISABLED) and never invokes the ephemeral runNode when disabled', async () => {
+    const base = root();
+    let runNodeCalls = 0;
+    const runNode: RunNode = (async () => { runNodeCalls++; throw new Error('runNode must not be reached when workflow disabled'); }) as unknown as RunNode;
+    const h = harness(base, runNode);
+    const exitCode = await cmdGoal('run', h.args('gated-run'), {
+      ...h.deps,
+      env: { BOTMUX_WORKFLOW_ENABLED: 'false' },
+    });
+    expect(exitCode).toBe(GOAL_RUN_EXIT.error); // 14
+    expect(runNodeCalls).toBe(0); // gate is BEFORE any run launch
+    const result = onlyJson(h.stdout);
+    expect(result.state).toBe('error');
+    expect(result.error?.code).toBe('WORKFLOW_DISABLED');
+  });
+
+  it('passes the gate and launches when explicitly enabled via env', async () => {
+    const base = root();
+    let runNodeCalls = 0;
+    const h = harness(base, successfulRunNode(() => { runNodeCalls++; }));
+    const exitCode = await cmdGoal('run', h.args('enabled-run'), {
+      ...h.deps,
+      env: { BOTMUX_WORKFLOW_ENABLED: 'true' },
+    });
+    expect(exitCode).toBe(GOAL_RUN_EXIT.succeeded);
+    expect(runNodeCalls).toBe(1); // reached the real run
+  });
+});

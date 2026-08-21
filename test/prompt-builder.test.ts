@@ -315,8 +315,8 @@ describe('botmux routing prose XML boundaries', () => {
   });
 
   it.each([
-    ['zh', '&lt;对方 bot 的 open_id&gt;'],
-    ['en', '&lt;other-bot-open-id&gt;'],
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
   ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
     const prompt = buildBotmuxSystemPromptText({
       locale,
@@ -412,7 +412,7 @@ describe('buildFollowUpContent', () => {
     // every follow-up reminder intentionally tiny. By default (experimental
     // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
     // baseline — no anti-resend clause appended.
-    expect(content).toContain('<botmux_reminder>有内容给用户必须先 botmux send;仅当本轮确实无需回复（消息不是发给你的 / 指派给别的机器人）才让 final 只输出 BOTMUX_NOTHING_TO_SEND 这一个词</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
@@ -439,7 +439,7 @@ describe('buildFollowUpContent', () => {
     // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>有内容给用户必须先 botmux send;仅当本轮确实无需回复（消息不是发给你的 / 指派给别的机器人）才让 final 只输出 BOTMUX_NOTHING_TO_SEND 这一个词</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
   });
@@ -650,6 +650,18 @@ describe('renderSenderTag', () => {
     expect(out).toContain('type="user"');
     expect(out).toContain('open_id="ou_a"');
     expect(out).toContain('name="张三"');
+  });
+
+  it('includes and XML-escapes the optional sender email', () => {
+    const out = renderSenderTag({
+      openId: 'ou_email',
+      type: 'user',
+      name: 'Alice',
+      email: 'alice&ops@example.com',
+    });
+    expect(out).toBe(
+      '<sender type="user" open_id="ou_email" name="Alice" email="alice&amp;ops@example.com" />',
+    );
   });
 
   it('preserves bot type for foreign botmux peers', () => {

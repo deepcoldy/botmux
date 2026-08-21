@@ -6,6 +6,10 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import {
+  RELAY_ORIGIN_CAPABILITY_BASENAME,
+  replaceManagedOriginCapabilityFile,
+} from '../src/core/managed-origin-capability.js';
 
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -30,7 +34,77 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
 }
 
 describe('Riff worker session environment', () => {
-  it('forwards a disabled reply-card usage switch into the remote sandbox', async () => {
+  it('forwards an omitted response kind through the Riff relay as non-final', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-cli-riff-feedback-'));
+    const outbox = join(root, 'outbox');
+    const dataDir = join(root, 'data');
+    const capability = 'ab'.repeat(32);
+    writeFileSync(join(root, 'placeholder'), '');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(outbox, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    replaceManagedOriginCapabilityFile(join(outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
+      token: capability,
+      turnId: 'turn-riff-feedback',
+      dispatchAttempt: 1,
+    }));
+    const fixture = join(root, 'host-send.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      process.stdout.write(JSON.stringify({
+        content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        responseKind: argv.includes('--response-kind') ? argv[argv.indexOf('--response-kind') + 1] : null,
+      }));
+    `);
+    const stop = (await import('../src/adapters/backend/sandbox.js')).startOutboxWatcher(
+      outbox,
+      { ...process.env },
+      'sid-riff-feedback',
+      {
+        cliPath: fixture,
+        authorize: claim => claim.capability === capability
+          ? { ok: true as const, origin: { turnId: 'turn-riff-feedback', dispatchAttempt: 1 } }
+          : { ok: false as const, error: 'stale' },
+      },
+    );
+    try {
+      const childResult = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+        const cli = spawn(process.execPath, [
+          '--import', 'tsx', resolve('src/cli.ts'),
+          'send', 'unclassified Riff progress', '--session-id', 'sid-riff-feedback', '--no-mention',
+        ], {
+          cwd: resolve('.'),
+          env: {
+            ...process.env,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'sid-riff-feedback',
+            BOTMUX_SEND_RELAY: outbox,
+            BOTMUX_FEEDBACK_POLICY: JSON.stringify({ enabled: true }),
+            BOTMUX_WORKFLOW: '',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        cli.stdout.on('data', chunk => { stdout += String(chunk); });
+        cli.stderr.on('data', chunk => { stderr += String(chunk); });
+        cli.once('error', rejectPromise);
+        cli.once('close', status => resolvePromise({ status, stdout, stderr }));
+      });
+      expect(childResult.status, childResult.stderr).toBe(0);
+      expect(JSON.parse(childResult.stdout)).toEqual({
+        content: 'unclassified Riff progress',
+        responseKind: null,
+      });
+    } finally {
+      stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-env-'));
     const sockets = new Set<Socket>();
     let child: ChildProcess | undefined;
@@ -133,10 +207,39 @@ describe('Riff worker session environment', () => {
         workingDir: root,
         cliId: 'riff',
         backendType: 'riff',
-        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, injectStatusLines: false },
+        backendConfig: {
+          baseUrl: `http://127.0.0.1:${port}`,
+          injectStatusLines: false,
+          env: {
+            BOTMUX_OWNER_OPEN_ID: 'ou_stale_config_owner',
+            __OWNER_OPEN_ID: 'ou_stale_config_owner',
+            // A stale / attacker-shaped backend env trying to flip the workflow
+            // kill-switch OFF in the remote pane. riffCfg.env merges LAST and is
+            // NOT sanitized (unlike per-bot env), so the host must re-freeze the
+            // resolved value after the merge — otherwise this would desync the
+            // pane's CLI-side gate from the daemon's authoritative decision.
+            BOTMUX_WORKFLOW_ENABLED: 'false',
+          },
+        },
         prompt: 'verify remote session environment',
         larkAppId: appId,
         larkAppSecret: 'secret',
+        ownerOpenId: 'ou_authenticated_owner',
+        feedback: {
+          enabled: true,
+          audience: 'requester',
+          visibleSemantics: ['positive', 'progress', 'negative'],
+          buttons: [
+            { key: 'yes', label: 'Yes', semantic: 'positive', style: 'primary' },
+            { key: 'progress', label: 'Progress', semantic: 'progress', style: 'default' },
+            { key: 'no', label: 'No', semantic: 'negative', style: 'danger' },
+          ],
+          negativeFollowup: {
+            reasons: [],
+            comment: { enabled: false, required: false, placeholder: 'Explain', maxLength: 100 },
+          },
+          allowReselect: false,
+        },
       };
       child.send(init);
 
@@ -147,6 +250,16 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      // The workflow kill-switch is host-resolved and re-frozen after the merge:
+      // the daemon default (no config / no env override) is ON, so the stale
+      // backendConfig.env `false` must NOT survive into the remote pane.
+      expect(request.config?.env?.BOTMUX_WORKFLOW_ENABLED).toBe('true');
+      expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
+        enabled: true,
+        buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],
+      });
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();

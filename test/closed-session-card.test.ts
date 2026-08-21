@@ -104,6 +104,22 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).not.toContain('Current Codex');
   });
 
+  // The printed ttadk resume command carries `-m <model>`, and the model is NOT
+  // frozen onto the session (it follows the live bot config at every spawn), so
+  // this surface has to read the live config too. Reading `session.model` alone
+  // yields undefined for every frozen session, which silently degrades the
+  // pasted command to ttadk's built-in default model instead of the bot's.
+  it('puts the live bot model into the ttadk resume command of a frozen session', () => {
+    botConfig.model = 'glm-5.9-pro';         // ≠ TTADK_DEFAULT_MODEL
+    const ds = makeSession();
+    ds.session.wrapperCli = 'ttadk codex';   // frozen with the session
+
+    const content = markdown(buildClosedSessionCard(ds, 'en'));
+
+    expect(content).toContain('ttadk');
+    expect(content).toContain('-m glm-5.9-pro');
+  });
+
   it('does not inherit a new bot wrapper, model, or runtime into an old frozen official session', () => {
     botConfig.wrapperCli = 'ttadk codex';
     botConfig.model = 'new-model';

@@ -89,6 +89,44 @@ export function platformMachineBaseUrl(): string | null {
 }
 
 /**
+ * 平台面向浏览器的、本机可信子域 authority 列表（`host` 形式，不含 scheme）。
+ *
+ * 中心平台把本机放在 `<前缀>-<machineId>.<平台域名>` 子域下,再经隧道反代回本机
+ * dashboard——反代时把 `Host` 改写成回环上游、且**不带 `X-Forwarded-Host`**,于是
+ * 浏览器发的管理类 WS/请求携带的 `Origin: https://<前缀>-<machineId>.<平台域名>`
+ * 在 dashboard 的同源校验里找不到匹配的候选 authority(见 dashboard/control-csrf.ts
+ * 的 `requestAuthorities`),被判跨站拒掉——平台浏览器终端 disconnected。
+ *
+ * 这里由本机 `platform.json`(0600 host-authority,machineId 平台签发、跨站页面
+ * **伪造不进**)派生出**精确前缀**的可信 authority,交给 `requestAuthorities` 并入
+ * 候选。为什么**枚举** `m-`/`t-` 精确前缀而非通配 `<任意前缀>-<machineId>`:
+ *   • 安全门须 fail-closed。枚举只依赖「这 2 个前缀反代到本机」这条弱不变量;通配
+ *     `*-<machineId>` 依赖「**任何**前缀标签都不会落到攻击者可控源」——强得多、且
+ *     本进程无从验证(平台路由表不在部署机上)。
+ *   • 失败方向相反:枚举漏一个前缀 = 那种终端连不上(响、加一行前缀即修);通配一旦
+ *     平台某天把某 `<label>-<machineId>` 挂到多租户/共享源上 = **静默把跨源认成同源**
+ *     的 CSRF 洞。宁可响不可哑。
+ * `m-` 是仓库既有约定(`platformMachineBaseUrl`);`t-` 是平台给浏览器分享链接实际使用
+ * 的独立终端子域(仓库无此字面量,故 #933 的同源门漏了它)。未绑定平台 → 返回空数组,
+ * 不放行任何平台 authority(fail-closed)。
+ *
+ * 每次调用都重读 `platform.json`(不缓存):`botmux bind|unbind` 热重载不重启 daemon
+ * (见 worker.ts 亦每请求 uncached 读),缓存会在解绑+machineToken 吊销后仍放行 stale
+ * 平台 authority = fail-open;每请求读天然 fail-closed(解绑→文件没了→空数组)。
+ */
+export function platformBrowserAuthorities(): string[] {
+  const b = readPlatformBinding();
+  if (!b) return [];
+  try {
+    const host = new URL(b.platformUrl).host;
+    if (!host) return [];
+    return [`m-${b.machineId}.${host}`, `t-${b.machineId}.${host}`];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * 自建反代对外基址（`BOTMUX_PUBLIC_URL`）：没接中心平台、但自己用 nginx 等反代把
  * dashboard 暴露到单一公网/内网域名时，设成 `http://botmux.example.com`
  * （scheme + host[:port]，尾部斜杠会被去掉）。设了之后 dashboard / 卡片终端链接改吐

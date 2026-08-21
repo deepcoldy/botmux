@@ -87,6 +87,41 @@ describe('bot-config store', () => {
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
+    expect(keys).toContain('feedback');
+  });
+
+  it('strictly normalizes feedback JSON through the shared config field', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    expect(store.coerceConfigValue(spec, '{"enabled":true}')).toMatchObject({
+      ok: true,
+      value: { enabled: true, audience: 'requester' },
+    });
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('persists bot and per-chat feedback layers and updates the live registry', async () => {
+    const { registry, store } = await loaded();
+    expect(await store.setBotFeedbackPolicy('app_default', { enabled: true, allowReselect: true })).toMatchObject({ ok: true });
+    expect(readConfig().feedback).toMatchObject({ enabled: true, allowReselect: true });
+    expect(registry.getBot('app_default').config.feedback).toMatchObject({ enabled: true, allowReselect: true });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { enabled: false })).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies.oc_chat).toEqual({ enabled: false });
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies?.oc_chat).toEqual({ enabled: false });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', null)).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies).toBeUndefined();
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies).toBeUndefined();
+  });
+
+  it('rejects invalid feedback layers without changing disk or live memory', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const beforeDisk = readConfig();
+    const beforeMemory = structuredClone(registry.getBot('app_default').config);
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { buttons: {} } as any)).toMatchObject({ ok: false, reason: 'invalid_policy' });
+    expect(readConfig()).toEqual(beforeDisk);
+    expect(registry.getBot('app_default').config).toEqual(beforeMemory);
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -462,6 +497,27 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().maxLiveWorkers).toBeUndefined();
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('session owner reminder config round-trips and hot-updates the registered Bot', async () => {
+    const { registry } = await loaded();
+    const reminderStore = await import('../src/services/session-owner-reminder-config-store.js');
+    const value = {
+      enabled: true,
+      intervalMinutes: 30,
+      text: '请继续处理。',
+      states: ['idle', 'tui_prompt'],
+    };
+    const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
+    expect(saved).toEqual({ ok: true, config: value });
+    expect(readConfig().sessionOwnerReminder).toEqual(value);
+    expect(registry.getBot('app_default').config.sessionOwnerReminder).toEqual(value);
+
+    expect(await reminderStore.updateSessionOwnerReminderConfig('app_default', {
+      ...value,
+      text: '<at user_id="ou_other"></at>',
+    })).toEqual({ ok: false, reason: 'invalid_session_owner_reminder' });
+    expect(readConfig().sessionOwnerReminder).toEqual(value);
   });
 
   it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {

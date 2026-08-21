@@ -235,28 +235,56 @@ function eventUuid(path: string, lineStart: number, update: any, obj: any): stri
   return `${path}:${lineStart}`;
 }
 
+/** Read `cancelTrigger` from the first `_meta` that actually carries it.
+ *  Production `turn_completed` lines put it on `params._meta`; fixtures may
+ *  hang it on `update._meta`. Do not stop at an inner `_meta` that only has
+ *  eventId / timestamps. */
+function grokCancelTrigger(update: any, obj: any): string {
+  for (const meta of [update?._meta, obj?.params?._meta, obj?._meta]) {
+    if (!meta || typeof meta !== 'object') continue;
+    const trigger = (meta as { cancelTrigger?: unknown }).cancelTrigger;
+    if (typeof trigger === 'string' && trigger.trim()) return trigger.trim().toLowerCase();
+  }
+  return '';
+}
+
 /** Map Grok's authoritative turn boundary to the durable terminal contract.
  * `end_turn` means the submitted turn finished, even when its visible final is
- * empty (for example a tool-only turn). Explicit errors are retryable; an
- * explicit cancellation is a retryable failure after the receiver fences the
- * old attempt. Unknown reasons fail closed instead of being
- * reported as a successful delivery. */
-function grokTerminalOutcome(stopReason: unknown): Pick<
-  GrokBridgeEvent,
-  'terminalStatus' | 'terminalErrorCode'
-> {
+ * empty (for example a tool-only turn). Explicit errors are retryable.
+ * `cancelled` + `cancelTrigger=send_now` means a newer prompt aborted the
+ * previous active turn: the new turn already owns delivery, so this maps to
+ * `ambiguous` like Codex `turn_aborted` instead of a user-visible failed card.
+ * Other cancellations stay retryable failures after the receiver fences the
+ * old attempt. Unknown reasons fail closed instead of being reported as a
+ * successful delivery. */
+function grokTerminalOutcome(
+  stopReason: unknown,
+  cancelTrigger = '',
+): Pick<GrokBridgeEvent, 'terminalStatus' | 'terminalErrorCode' | 'terminalErrorSummary'> {
   const raw = typeof stopReason === 'string' ? stopReason.trim().toLowerCase() : '';
   if (raw === 'end_turn') return { terminalStatus: 'completed' };
   if (raw === 'cancelled' || raw === 'canceled') {
-    return { terminalStatus: 'failed', terminalErrorCode: 'grok_turn_cancelled' };
+    if (cancelTrigger === 'send_now') {
+      return { terminalStatus: 'ambiguous', terminalErrorCode: 'grok_turn_cancelled' };
+    }
+    return {
+      terminalStatus: 'failed',
+      terminalErrorCode: 'grok_turn_cancelled',
+      terminalErrorSummary: 'turn cancelled',
+    };
   }
   if (raw === 'error') {
-    return { terminalStatus: 'failed', terminalErrorCode: 'grok_turn_error' };
+    return {
+      terminalStatus: 'failed',
+      terminalErrorCode: 'grok_turn_error',
+      terminalErrorSummary: 'turn error',
+    };
   }
   const normalized = raw.replace(/[^a-z0-9_.-]+/g, '_').slice(0, 80) || 'missing';
   return {
     terminalStatus: 'failed',
     terminalErrorCode: `grok_stop_reason:${normalized}`,
+    terminalErrorSummary: `stop reason: ${normalized}`,
   };
 }
 
@@ -368,7 +396,16 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
       // that followed them. The terminal boundary itself is NOT conditional on
       // text: an empty/error/cancelled turn must still release (or fail) an
       // exact durable delivery attempt.
-      const finalText = agentParts.join('').trim();
+      const cancelTrigger = grokCancelTrigger(update, obj);
+      const outcome = grokTerminalOutcome(
+        update.stop_reason ?? update.stopReason,
+        cancelTrigger,
+      );
+      // send_now abort: drop buffered partial so worker cannot post it as a
+      // normal final_output while the newer prompt is already in flight.
+      const dropSupersededText = outcome.terminalStatus === 'ambiguous'
+        && outcome.terminalErrorCode === 'grok_turn_cancelled';
+      const finalText = dropSupersededText ? '' : agentParts.join('').trim();
       agentParts = [];
       openTurnStartOffset = null;
       events.push({
@@ -377,7 +414,7 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         kind: 'assistant_final',
         text: finalText,
         sourceSessionId: sessionId ?? openTurnSessionId,
-        ...grokTerminalOutcome(update.stop_reason ?? update.stopReason),
+        ...outcome,
       });
       openTurnSessionId = undefined;
       lastFullyConsumedOffset = cursor;
