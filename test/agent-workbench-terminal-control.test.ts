@@ -353,12 +353,12 @@ function leaseServer(): {
   let held: { promise: Promise<void>; resolve(value: void): void; reject(error: unknown): void } | null = null;
   const snapshot = (): TerminalControlState => (marker === null
     ? READONLY
-    : { mode: 'controlled', owned: true, expiresAt: NOW + 60_000, marker });
+    : { mode: 'controlled', owned: true, expiresAt: NOW + 60_000, acquisition: marker });
   return {
     calls,
     controlled: () => marker !== null,
     marker: () => marker,
-    supersede() { ops += 1; marker = `op-${ops}`; },
+    supersede() { ops += 1; marker = `op-supersede-${ops}`; },
     holdNextTakeover() {
       const gate = deferred<void>();
       held = gate;
@@ -370,11 +370,11 @@ function leaseServer(): {
         calls.push('get');
         return snapshot();
       },
-      takeoverTerminal: async (sessionId: string) => {
+      takeoverTerminal: async (sessionId: string, _signal?: AbortSignal, acquisitionId?: string) => {
         calls.push(`takeover:${sessionId}`);
-        // 服务端在**受理这一刻**就发了租约；下面那道闸只按住回执。
+        // 服务端在**受理这一刻**就绑定客户端给的 acquisition；下面那道闸只按住回执。
         ops += 1;
-        marker = `op-${ops}`;
+        marker = acquisitionId ?? `op-${ops}`;
         const answer = snapshot();
         const gate = held;
         held = null;
@@ -1004,14 +1004,16 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
    * 拿到只读」——UI 照抄 hasToken 就会写着「手机端可输入」，用户打的字却被 worker
    * 原地丢掉，屏幕上什么都不发生。
    */
-  it('readTerminalFrameWrite：WS 的结论压过 HTTP 的 hasToken', () => {
+  it('readTerminalFrameWrite：只认已建立的 WS，没结论就说未知', () => {
     const frame = (contentWindow: unknown) => ({ contentWindow } as unknown as HTMLIFrameElement);
     // HTTP 说可写、WS 说只读 → 以 WS 为准。
     expect(readTerminalFrameWrite(frame({ hasToken: true, wsHasWrite: false }))).toBe('readonly');
     // 反过来同理（前置代理给 owner 的 viewToken 请求补了 WRITE grant）。
     expect(readTerminalFrameWrite(frame({ hasToken: false, wsHasWrite: true }))).toBe('writable');
-    // WS 还没说话时 hasToken 只是初值。
-    expect(readTerminalFrameWrite(frame({ hasToken: true, wsHasWrite: null }))).toBe('writable');
+    // WS 还没说话 → 未知。以前这里回退 hasToken 说「可写」，于是 WS 还没建立（甚至
+    // 永远连不上）的页面也被宣称成可输入，用户打的字被 worker 原地丢掉。
+    expect(readTerminalFrameWrite(frame({ hasToken: true, wsHasWrite: null }))).toBe('unknown');
+    expect(readTerminalFrameWrite(frame({ hasToken: true }))).toBe('unknown');
     expect(readTerminalFrameWrite(frame({}))).toBe('unknown');
   });
 
@@ -1053,21 +1055,12 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     expect(worker).toContain('var wsHasWrite=null');
     expect(worker).toContain("'botmux:wb-terminal-write'");
-    // 服务端在握手完成时把**这次 WS 的**鉴权结论发下来；页面据此覆盖 hasToken。
-    expect(worker).toContain(']1989;write;');
+    // 结论走的是带外首帧（见 terminal-write-frame.test.ts 那一组），不再混在 PTY
+    // 字节流里让页面逐帧去扫。
+    expect(worker).toContain('terminalWriteFrame(hasWrite)');
+    expect(worker).not.toContain(']1989;write;');
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
-    expect(panes).toContain('{ wsHasWrite?: unknown; hasToken?: unknown }');
-  });
-
-  it('触屏读的那把钥匙是跨文件契约：终端页仍然导出同名的 hasToken 全局', () => {
-    // 面板靠同源 iframe 里的 `window.hasToken` 判断这块终端到底能不能写
-    // （readTerminalFrameWrite）。这个名字由 worker 渲染终端页时写下，两处必须
-    // 对得上：worker 改名而这里不改，面板会静默退回「读不出来」，触屏文案又会
-    // 悄悄回到写死的「手机端只读」——正是本次要修掉的那句反话。
-    const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    expect(worker).toContain('var hasToken=${hasWrite}');
-    const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
-    expect(panes).toContain('hasToken?: unknown');
+    expect(panes).toContain('{ wsHasWrite?: unknown }');
   });
 });
 
@@ -1117,7 +1110,7 @@ describe('卸载补偿只还自己那一次接管拿到的租约', () => {
     act(() => second.unmount());
   });
 
-  it('没有活面板但租约已被别处接管：补偿带着自己的 marker 发出去，被服务端拒掉', async () => {
+  it('没有活面板但租约已被别处接管：补偿带着自己的 acquisition 发出去，被服务端拒掉', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const server = leaseServer();
@@ -1142,7 +1135,7 @@ describe('卸载补偿只还自己那一次接管拿到的租约', () => {
     expect(server.controlled()).toBe(true);
   });
 
-  it('回执直接失败且面板已卸载：不许裸 return——拿权威读数复核，确认落地就按 marker 收掉', async () => {
+  it('回执直接失败且面板已卸载：不许裸 return——按自己 POST 前生成的 acquisition 收掉', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const server = leaseServer();
@@ -1163,7 +1156,10 @@ describe('卸载补偿只还自己那一次接管拿到的租约', () => {
     await settle();
     // 回归的形状：catch 里 `if (!mounted.current) return;`，租约从此没人管，
     // 一直挂到 TTL 到期为止。
-    expect(server.calls.some(call => call.startsWith('release:session-a:op-'))).toBe(true);
+    // 而且释放**一定**带着条件（不是 `release:session-a:*` 那种无条件释放）。
+    const releases = server.calls.filter(call => call.startsWith('release:session-a:'));
+    expect(releases.length).toBeGreaterThan(0);
+    expect(releases.every(call => call !== 'release:session-a:*')).toBe(true);
     expect(server.controlled()).toBe(false);
   });
 });

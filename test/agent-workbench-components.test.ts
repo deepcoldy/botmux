@@ -1469,7 +1469,13 @@ describe('Agent Workbench 接管态点「终端」应降为只读而不是关掉
     expect(paneOpen(renderer)).toBe(true);
     expect(paneMode(renderer)).toBe('readonly');
     // 只读不是「画面上写着只读」，是租约真的还回去了。
-    expect(calls).toEqual(['takeover:session-a', 'release:session-a']);
+    // 两条 release：切模式会重挂面板，**关掉的那一块**先按自己那一次 acquisition 做
+    // 条件释放（关面板 = 放弃这次接管，见终端面板里那段卸载补偿），新挂上来的那块
+    // 再兑现一次性的只读开场意图。两条都指向同一把租约，服务端按 CAS 处理，重复的
+    // 那一条得到「已经没有租约了」。
+    expect(calls.filter(call => call.startsWith('takeover'))).toEqual(['takeover:session-a']);
+    expect(calls.filter(call => call.startsWith('release'))).not.toEqual([]);
+    expect(calls.every(call => call.endsWith('session-a'))).toBe(true);
     act(() => renderer.unmount());
   });
 

@@ -19,9 +19,12 @@
  *   - **只看「有没有在途写」拦不住旧读数**：takeover 发起**之前**就出门的那发轮询，
  *     若在接管回执结算之后才回来，此刻 pending 已经清空，于是这份写之前的读数被当
  *     成权威，界面从 controlled 倒写成 readonly（release 方向对称：把已经还掉的租约
- *     倒写回「可输入」）。→ 读数按**发出时刻**盖写：观察发出时记下当时已结算的写
- *     epoch，回来时早于最新的已结算写 epoch 就丢掉。复核 GET 不受影响——它发出时写
- *     已经不在途，快照与当前相等，照旧能把 unknown 收敛掉。
+ *     倒写回「可输入」）。→ 读数按**发出时刻**盖写：观察发出时记下当时最新那次**已
+ *     发起**的写 epoch，回来时早于当前的写 epoch 就丢掉。基准取「已发起」而不是「已
+ *     结算成功」：写失败（回执丢了、超时）同样把世界推进了一格，而那恰恰是最需要
+ *     unknown 防线的场景——用「已结算」当基准时，旧 poll 会在写失败清掉 pending 之后
+ *     把 unknown 一把抹回只读。复核 GET 不受影响：它发出于 write-start 之后，快照与
+ *     当前相等，照旧能把 unknown 收敛掉。
  *   - **把「还不知道」当成只读**：首屏 GET 没回来时对外说 readonly，用户第二次点
  *     「终端」就被判成「模式没变 → 重挂」而不是关闭。→ `loading` 是一个显式状态，
  *     没有权威读数时同一个按钮再点一次一律按关闭处理。
@@ -62,15 +65,21 @@ export interface TerminalControlModel {
   authoritative: TerminalControlState | null;
   /** 观察 epoch（首屏 / 轮询 / 复核）。只作废观察，作废不了写。 */
   observeEpoch: number;
-  /** 当前这发观察**发出时**，已经结算过的最新那次写的 epoch。读数描述的是「发出那
-   *  一刻的世界」，所以它是否过期只能拿发出时刻去比，不能拿回来时的 pending 去比。 */
+  /** 当前这发观察**发出时**，最新那次**已发起**的写的 epoch。读数描述的是「发出那
+   *  一刻的世界」，所以它是否过期只能拿发出时刻去比，不能拿回来时的 pending 去比。
+   *
+   *  基准是「已发起」而不是「已结算成功」：写**失败**同样把世界推进了一格——回执丢了
+   *  不代表服务端没受理，那恰恰是最需要 unknown 这道防线的场景。用「已结算成功」当
+   *  基准时，接管之前发出的旧 poll 会在写失败清掉 pending 之后被当成权威，把 unknown
+   *  倒写回只读，遮罩跟着撤掉，用户对着一个写着「只读」的终端照样能打字。
+   *  写失败后的复核 GET 不受影响：它发出于 write-start 之后，快照与当前 writeEpoch
+   *  相等，照旧放行去收敛 unknown。 */
   observeIssueEpoch: number;
-  /** 写 epoch（takeover / release）。只被更新的写作废，轮询碰不到它。 */
+  /** 这发观察发出时有没有写在途。有的话它描述的是一个「还没定」的世界，回来时无论
+   *  那次写成没成都不作数。 */
+  observeIssuedDuringWrite: boolean;
+  /** 写 epoch（takeover / release），write-start 就 +1。只被更新的写作废，轮询碰不到它。 */
   writeEpoch: number;
-  /** 最近一次**结算成功**（拿到权威回执）的写 epoch。发出时刻早于它的读数一律作废。
-   *  写**失败**不算：失败没有产生任何权威读数，随后的复核 GET 正是要靠它收敛
-   *  unknown，把失败也计进来就等于把复核自己挡在门外。 */
-  settledWriteEpoch: number;
   /** 在途写。非空期间轮询读数一律丢弃。 */
   pending: { action: TerminalWriteAction; epoch: number } | null;
   /** 这块 iframe **可能**仍然可写（拿过租约，或有过一次可能已经生效的接管）。
@@ -110,8 +119,8 @@ export function initialTerminalControlModel(): TerminalControlModel {
     authoritative: null,
     observeEpoch: 0,
     observeIssueEpoch: 0,
+    observeIssuedDuringWrite: false,
     writeEpoch: 0,
-    settledWriteEpoch: 0,
     pending: null,
     mayWrite: false,
     error: null,
@@ -138,6 +147,18 @@ export function terminalControlBusy(model: TerminalControlModel): boolean {
 /** 已经有过权威读数（开场意图只在这之后兑现一次）。 */
 export function terminalControlSettled(model: TerminalControlModel): boolean {
   return model.phase === 'readonly' || model.phase === 'controlled';
+}
+
+/**
+ * 这份刚回来的观察是不是「上一个世界」的读数。
+ *
+ * 两种过期形状，都是同一件事的两面：
+ *   ① 它发出之后又有写**发起**过（成功、失败、还是超时都算——回执丢了不代表服务端
+ *      没受理，那正是最需要保住 unknown 的场景）；
+ *   ② 它本身就发出在一次写在途的当口，描述的是一个还没定的世界。
+ */
+function staleObservation(state: TerminalControlModel): boolean {
+  return state.observeIssueEpoch < state.writeEpoch || state.observeIssuedDuringWrite;
 }
 
 /** 未知且这块 iframe 可能是可写的 → 调用方必须遮住它。 */
@@ -168,10 +189,11 @@ export function terminalControlReducer(
       return {
         ...state,
         observeEpoch: event.epoch,
-        // 盖写判据的快照：这一刻的世界已经含进了哪些写。回来时拿它跟最新的
-        // settledWriteEpoch 比，才拦得住「写发起之前发出、写结算之后才回来」的旧
+        // 盖写判据的快照：这一刻的世界已经含进了哪些**已发起**的写。回来时拿它跟
+        // 最新的 writeEpoch 比，才拦得住「写发起之前发出、写结算之后才回来」的旧
         // poll——那种读数回来时 pending 已经清空，光看 pending 是拦不住的。
-        observeIssueEpoch: state.settledWriteEpoch,
+        observeIssueEpoch: state.writeEpoch,
+        observeIssuedDuringWrite: state.pending !== null,
         // 首屏才把画面压回 loading；轮询和复核是背景动作，不该让已经settle 的
         // 徽标闪一下，复核更要把 unknown 保持到 GET 真的回来为止。
         phase: event.source === 'load' && !state.pending ? 'loading' : state.phase,
@@ -180,11 +202,12 @@ export function terminalControlReducer(
     case 'observe-settled': {
       // 过期观察；或有在途写——它描述的是写之前的世界，写的回执才是新的权威。
       if (event.epoch !== state.observeEpoch || state.pending) return state;
-      // 发出之后又有写结算过：这份读数描述的是那次写**之前**的世界，接受它就是把
+      // 发出之后又有写**发起**过：这份读数描述的是那次写之前的世界，接受它就是把
       // takeover 刚拿到的 controlled 倒写成 readonly（release 方向则是反过来，把已经
-      // 还掉的租约倒写成「可输入」）。复核 GET 不在此列——它发出时写已经不在途了，
-      // 快照与当前 settledWriteEpoch 相等，照旧放行去收敛 unknown。
-      if (state.observeIssueEpoch < state.settledWriteEpoch) return state;
+      // 还掉的租约倒写成「可输入」），写失败留下的 unknown 更是会被它一把抹平。
+      // 复核 GET 不在此列——它发出于 write-start 之后，快照与当前 writeEpoch 相等，
+      // 照旧放行去收敛 unknown。
+      if (staleObservation(state)) return state;
       const downgraded = ownsWrite(state.authoritative) && !ownsWrite(event.control);
       return {
         ...state,
@@ -200,9 +223,9 @@ export function terminalControlReducer(
 
     case 'observe-failed': {
       if (event.epoch !== state.observeEpoch || state.pending) return state;
-      // 同一条判据：写结算之后才失败回来的旧观察说的是上一个世界，连它的错误文案都
-      // 不该盖掉刚落地的写回执（首屏失败时两边都是 0，照旧放行）。
-      if (state.observeIssueEpoch < state.settledWriteEpoch) return state;
+      // 同一条判据：写发起之后才失败回来的旧观察说的是上一个世界，连它的错误文案都
+      // 不该盖掉刚落地的写回执 / 写失败（首屏失败时两边都是 0，照旧放行）。
+      if (staleObservation(state)) return state;
       const error = { text: event.error, from: 'observe' as const };
       // 从来没读到过权威状态（首屏就失败，daemon 抖一下是典型）。能接管的身份这里
       // **不能**落只读：租约挂在（会话 × 登录）上，不挂在这块面板上——同一个登录里上
@@ -264,8 +287,6 @@ export function terminalControlReducer(
         phase: settledPhase(event.control),
         authoritative: event.control,
         pending: null,
-        // 这一刻之前发出的观察全部作废：它们描述的是这次写之前的世界。
-        settledWriteEpoch: event.epoch,
         mayWrite: ownsWrite(event.control),
         error: null,
         // 写成功一律换 iframe：新的 grant 只在新的一次加载里生效。
@@ -312,8 +333,8 @@ export const WORKBENCH_TERM_WRITE_MESSAGE = 'botmux:wb-terminal-write';
  * 同登录，没有任何判据拦得住——实际却把用户此刻正在打字的那块终端的写权限收走了。
  *
  * 补偿前先问一句「还有别的面板正靠着这把租约吗」，是唯一能在**同一个标签页内**把
- * 这两件事分开的判据。跨标签页 / 跨设备靠服务端的 marker CAS（见
- * `TerminalControlState.marker`）：两条判据合起来才完整，缺一条都有洞。
+ * 这两件事分开的判据。跨标签页 / 跨设备靠服务端按 acquisition 做的 CAS（见
+ * `TerminalControlState.acquisition`）：两条判据合起来才完整，缺一条都有洞。
  */
 const liveTerminalWriteClaims = new Map<string, Set<object>>();
 

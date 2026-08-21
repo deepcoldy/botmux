@@ -28603,6 +28603,16 @@ button.skills-issue-badge:hover {
   background: var(--bg-l3);
 }
 
+/* 首屏控制权还在确认：与「未知」同一种「先不接入终端画面」的处理，只是文案更平静
+   （这是正常的等待，不是出了岔子），所以不给重试按钮。 */
+.wb-control-checking {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  border-radius: 0;
+  background: var(--bg-l1);
+}
+
 .wb-info-drawer {
   position: absolute;
   top: 106px;

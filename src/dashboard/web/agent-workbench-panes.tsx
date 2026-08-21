@@ -26,6 +26,7 @@ import {
 } from './agent-workbench-model.js';
 import {
   WorkbenchApiError,
+  newTerminalAcquisitionId,
   type PreviewInteractionState,
   type TerminalControlState,
   type WorkbenchApi,
@@ -88,32 +89,26 @@ export function readTerminalFrameStatus(frame: HTMLIFrameElement | null): Termin
   }
 }
 
-/** 终端页自己算出来的写权限。`unknown` = 读不出来（跨域、页面还没跑到那一行）。 */
+/** 终端页自己算出来的写权限。`unknown` = 还没有依据（WS 没确认、跨域读不到）。 */
 export type TerminalFrameWrite = 'writable' | 'readonly' | 'unknown';
 
 /**
- * 生产实现：读终端页自己的两个全局，**WS 的结论优先**。
+ * 生产实现：只读终端页的 `wsHasWrite`——**已经建立的那条 WebSocket** 实际拿到什么
+ * 权限（worker 在握手完成时用一条带外控制帧告诉页面，页面落成这个全局）。
+ * `null` / 读不到 = 还没有结论，一律 `unknown`。
  *
- *   `wsHasWrite`  这条已经建立的 WebSocket 实际拿到的权限（worker 在握手完成时
- *                 把结论发下来，终端页落成这个全局）。`null` = 还没连上。
- *   `hasToken`    页面那次 HTTP GET 的判定（worker.ts 的 `var hasToken=${hasWrite}`），
- *                 只当初值。
- *
- * 为什么必须分开：两次是**各自独立**的鉴权。页面是 HTTP 请求，iOS WebView 会带
- * Cookie；紧接着的 WebSocket 升级**不带** Cookie，前置代理给平台所有者补 WRITE
- * grant 这件事也就跟着落空。于是同一份页面完全可能「HTTP 判可写、WS 只读」——照抄
- * hasToken 的 UI 会写着「手机端可输入」，用户打的字却被 worker 丢掉，屏幕上什么都
- * 不发生。工作台与终端页同源，所以这是第一手事实，比任何外部推断都准。
+ * 为什么不拿页面那次 HTTP GET 的 `hasToken` 兜底：两次是**各自独立**的鉴权。页面是
+ * HTTP 请求，iOS WebView 会带 Cookie；紧接着的 WebSocket 升级**不带** Cookie，前置
+ * 代理给平台所有者补 WRITE grant 这件事也就跟着落空。拿 hasToken 兜底等于在 WS 还
+ * 没连上（或永远连不上）时宣称「可以输入」，用户打的字被 worker 原地丢掉，屏幕上
+ * 什么都不发生。没有依据时说未知，是这里唯一诚实的答案。
  */
 export function readTerminalFrameWrite(frame: HTMLIFrameElement | null): TerminalFrameWrite {
   try {
-    const view = frame?.contentWindow as { wsHasWrite?: unknown; hasToken?: unknown } | null | undefined;
+    const view = frame?.contentWindow as { wsHasWrite?: unknown } | null | undefined;
     const settled = view?.wsHasWrite;
     if (settled === true) return 'writable';
     if (settled === false) return 'readonly';
-    const initial = view?.hasToken;
-    if (initial === true) return 'writable';
-    if (initial === false) return 'readonly';
     return 'unknown';
   } catch {
     return 'unknown';
@@ -127,12 +122,16 @@ export function readTerminalFrameWrite(frame: HTMLIFrameElement | null): Termina
  * 就能把文案改对；而且万一将来这块 iframe 走到跨文档隔离的场景，同源读会直接抛，
  * 消息通道仍然成立。来源校验沿用外观桥那一套：只认这块 iframe 自己的 contentWindow
  * 发来的、结构完全对得上的消息。
+ *
+ * `write: null` 是终端页每次**重连**时先发的一条「退回未知」——上一条连接的结论套
+ * 不到新连接上。返回 `null` 表示「这压根不是我们的消息」，两者不能混。
  */
-export function readTerminalWriteReport(data: unknown): boolean | null {
+export function readTerminalWriteReport(data: unknown): TerminalFrameWrite | null {
   if (!data || typeof data !== 'object') return null;
   const message = data as { type?: unknown; write?: unknown };
   if (message.type !== WORKBENCH_TERM_WRITE_MESSAGE) return null;
-  return typeof message.write === 'boolean' ? message.write : null;
+  if (message.write === null) return 'unknown';
+  return typeof message.write === 'boolean' ? (message.write ? 'writable' : 'readonly') : null;
 }
 
 const FRAME_STATUS_POLL_MS = 1_000;
@@ -254,7 +253,7 @@ function useTerminalFrameWriteReport(params: {
       if (!source || event.source !== source) return;
       const reported = readTerminalWriteReport(event.data);
       if (reported === null) return;
-      setWrite(reported ? 'writable' : 'readonly');
+      setWrite(reported);
     };
     window.addEventListener('message', onMessage as EventListener);
     return () => window.removeEventListener('message', onMessage as EventListener);
@@ -385,7 +384,7 @@ export function TerminalPane(props: PaneCommonProps & {
    *  生产默认走同源 contentWindow（`readTerminalFrameStatus`）。 */
   readFrameStatus?: (frame: HTMLIFrameElement | null) => TerminalFrameStatus;
   /** 同上，注入「这块 iframe 自报能不能写」的读数源（生产走
-   *  `readTerminalFrameWrite`，读终端页同源的 `hasToken`）。 */
+   *  `readTerminalFrameWrite`，读终端页同源的 `wsHasWrite`）。 */
   readFrameWrite?: (frame: HTMLIFrameElement | null) => TerminalFrameWrite;
 }): JSX.Element {
   // 控制权的唯一状态机。散着的 useState 版本让观察轮询和写操作共用一个
@@ -523,59 +522,111 @@ export function TerminalPane(props: PaneCommonProps & {
   });
 
   /**
-   * 面板已经没了，而这次写**可能**已经在服务端落地：收掉没人管的写租约。
+   * 这块面板此刻**可能**握着的那一次接管。
    *
-   * 三条判据缺一不可：
+   * 值是这块面板在 POST **之前**自己生成的 acquisition id，不是服务端回执带回来的
+   * ——回执可能根本回不来，而那恰恰是最需要补偿的场景。清空只发生在确认释放之后。
+   * 连着 sessionId 一起记：面板换会话是重挂，但卸载清理跑在 React 之外，必须自带
+   * 「这是哪个会话的哪一次」才不会还错。
+   */
+  const heldAcquisition = useRef<{ sessionId: string; acquisitionId: string } | null>(null);
+
+  /**
+   * 收掉一次**没人管的**接管：按 acquisition 做条件释放。
+   *
+   * 两条判据缺一不可：
    *   ① 这份文档里还有活面板攥着同一把租约 → 它不是孤儿，别动。租约挂在
    *      （会话 × 登录）上，第二块面板 takeover 拿到的是同一把，服务端看来两次
-   *      请求完全同形，只有这里分得清。
-   *   ② 回执丢了（失败 / 超时）时先拿一次**权威读数**：这次写到底有没有落地。
-   *      以前这条分支是裸 `return`，于是「服务端已经发了租约、回执却没回来」的
-   *      租约从此没人管，一直挂到 TTL 到期。
-   *   ③ 释放时带上 marker，说明白要还的是**哪一次**接管。跨标签页 / 跨设备的
-   *      抢先接管只有服务端看得见，marker 不匹配时它会拒绝（P1 的 CAS）。
+   *      请求完全同形，只有这里分得清（同标签页内的判据）。
+   *   ② 释放带上**自己那一次**的 acquisition id，服务端按它 CAS。跨标签页 / 跨设备
+   *      的抢先接管只有服务端看得见，不匹配时它拒绝，用户正在打字的那块终端不受伤。
+   *
+   * 这里**不再**去 GET 一次「当前 marker」再拿它释放：事后读到的是此刻活着的那一次
+   * acquisition，跨标签页接管之后正是别人的那一把，拿它补偿等于精准误删。
+   * 幂等：租约已经没了就是 `released:false`，被别人接管过就是 `control_lease_superseded`，
+   * 两种都当成「不用我管了」，所以随后 socket 断开再走一遍也不冲突。
    */
-  const compensateUnmounted = useCallback(async (settled: TerminalControlState | null) => {
-    if (hasLiveTerminalWriteClaim(sessionId)) return;
-    let marker = settled?.marker;
-    if (settled) {
-      // 拿到回执了：只有真的握到手的接管才需要还。释放成功没有东西要还，恒可写
-      // 身份压根没有租约。
-      if (settled.fixed === true || settled.mode !== 'controlled' || !settled.owned) return;
-    } else {
-      const authoritative = await props.api.getTerminalControl(sessionId).catch(() => null);
-      if (!authoritative || authoritative.fixed === true) return;
-      if (authoritative.mode !== 'controlled' || !authoritative.owned) return;
-      // 复核这一个 await 的工夫里可能已经有新面板接手了。
-      if (hasLiveTerminalWriteClaim(sessionId)) return;
-      marker = authoritative.marker;
-    }
-    await props.api.releaseTerminal(sessionId, undefined, marker).catch(() => {});
-  }, [props.api, sessionId]);
+  const compensateAcquisition = useCallback(async (
+    target: { sessionId: string; acquisitionId: string } | null,
+  ) => {
+    if (!target) return;
+    if (hasLiveTerminalWriteClaim(target.sessionId)) return;
+    await props.api
+      .releaseTerminal(target.sessionId, undefined, target.acquisitionId)
+      .catch(() => {});
+  }, [props.api]);
+
+  /** 在途写的计数。卸载补偿据此让路：在途那一条自己会在回执（或失败）之后补偿，
+   *  它比卸载那一刻知道得更多，两边都发只是多一次必然被拒的请求。 */
+  const writesInFlight = useRef(0);
 
   const mutate = async (action: TerminalWriteAction) => {
     const epoch = ++writeEpoch.current;
+    // POST **之前**就把这一次接管的 id 定下来。回执丢了也不影响补偿的精确度。
+    const acquisitionId = action === 'takeover' ? newTerminalAcquisitionId() : undefined;
+    const attempt = acquisitionId ? { sessionId, acquisitionId } : null;
+    if (attempt) heldAcquisition.current = attempt;
+    const releasing = action === 'release' ? heldAcquisition.current : null;
+    writesInFlight.current += 1;
     dispatch({ type: 'write-start', epoch, action });
     try {
       // 硬超时：永久 pending 的 POST 会把 busy / 按钮 / 卸载补偿一起焊死。
       const next = await withWriteTimeout(signal => (action === 'takeover'
-        ? props.api.takeoverTerminal(sessionId, signal)
+        ? props.api.takeoverTerminal(sessionId, signal, acquisitionId)
         : props.api.releaseTerminal(sessionId, signal)));
+      if (action === 'release' && releasing?.sessionId === sessionId
+        && heldAcquisition.current?.acquisitionId === releasing.acquisitionId) {
+        // 用户手动释放成功：这块面板不再握着任何东西，卸载时也就没什么要补偿。
+        heldAcquisition.current = null;
+      }
       if (!mounted.current) {
         // 服务端刚刚把写租约发给了这次调用，面板却已经关掉 / 换会话 / 离开工作台。
-        void compensateUnmounted(next);
+        void compensateAcquisition(next.fixed === true ? null : attempt);
         return;
       }
       dispatch({ type: 'write-settled', epoch, control: next });
     } catch (cause) {
       if (!mounted.current) {
-        // 失败不代表服务端没受理——超时、断连都只是丢了回执。这里**不能**裸 return。
-        void compensateUnmounted(null);
+        // 失败不代表服务端没受理——超时、断连都只是丢了回执。这里**不能**裸 return，
+        // 也不能去问「现在的租约是谁的」，只能认自己 POST 前生成的那个 id。
+        // 释放失败同理：租约很可能还在服务端挂着，而它属于这块面板此前接管的那一次，
+        // 所以按**那一次**的 id 再条件释放一遍（成了就成了，被别人接管过就被拒）。
+        void compensateAcquisition(attempt ?? releasing);
         return;
       }
       dispatch({ type: 'write-failed', epoch, error: apiErrorText(cause) });
+    } finally {
+      writesInFlight.current -= 1;
     }
   };
+
+  // 恒可写身份没有租约可还（服务端会 403），别把它记成「握着一次接管」。
+  useEffect(() => {
+    if (model.authoritative?.fixed === true) heldAcquisition.current = null;
+  }, [model.authoritative]);
+
+  /**
+   * 关面板 / 换会话 = 放弃这一次接管（第 15 点）。
+   *
+   * 接管已经回执、model 也已经 controlled，但新的 iframe / WS 还没连上就把终端关掉
+   * 时：没有在途 promise 可补偿，也没有已注册的 socket 会在断开时触发服务端那条
+   * disconnect —— 旧实现只撤掉本地认领，租约一路挂到 TTL 到期，同一个会话在那之前
+   * 谁也接管不了。这里按自己确认过的 acquisition 做一次条件释放，与 socket 随后
+   * 断开触发的清理天然可重入（服务端两边都是同一条 CAS）。
+   *
+   * 走微任务是必需的：这块面板自己那份写租约认领由另一个 effect 的清理撤销，React
+   * 按 effect 定义顺序跑清理，同步做判断有可能看见的是**自己**的认领而白白放弃补偿。
+   * `compensateRef` 同理——把函数写进依赖会让 api 引用一变就"卸载"一次。
+   */
+  const compensateRef = useRef(compensateAcquisition);
+  useEffect(() => { compensateRef.current = compensateAcquisition; });
+  useEffect(() => () => {
+    const target = heldAcquisition.current;
+    // 有写在途时让路：那一条自己会在回执 / 失败之后补偿，而且那时它知道得更多。
+    if (!target || writesInFlight.current > 0) return;
+    heldAcquisition.current = null;
+    void Promise.resolve().then(() => compensateRef.current(target));
+  }, [sessionId]);
 
   // 只要这块面板**可能**握着写租约，就在登记簿上留个名：别的面板的迟到补偿据此
   // 知道「这把租约还有人在管」。卸载时 effect 的清理先跑，补偿的续行在其后的微
@@ -587,7 +638,19 @@ export function TerminalPane(props: PaneCommonProps & {
   }, [model.mayWrite, sessionId]);
 
   const frameRef = useRef<HTMLIFrameElement | null>(null);
-  const frameKey = `${sessionId}-${model.frameGeneration}`;
+  /**
+   * 链接换代计数。短时 viewToken 到期前会**换一条链接**，那是一条全新的连接、全新的
+   * 授权；不把它算进 iframe / watcher 的 key，React 就会复用同一块 iframe 与同一个
+   * WindowProxy，上一条连接回报的写权限一路留着，UI 继续说「可输入」。
+   * 存的是计数不是链接本身：key 会进 DOM，token 绝不能跟着进去。
+   */
+  const linkGeneration = useRef(0);
+  const lastFrameUrl = useRef<string | null | undefined>(undefined);
+  if (lastFrameUrl.current !== frameUrl) {
+    if (lastFrameUrl.current !== undefined) linkGeneration.current += 1;
+    lastFrameUrl.current = frameUrl;
+  }
+  const frameKey = `${sessionId}-${model.frameGeneration}-l${linkGeneration.current}`;
   const readFrameStatus = props.readFrameStatus ?? readTerminalFrameStatus;
   const frameWatch = useTerminalFrameWatch({
     enabled: touch,
@@ -662,6 +725,22 @@ export function TerminalPane(props: PaneCommonProps & {
   // 未知且这块 iframe 可能仍然可写 → 盖住它。这一刻既不能说「已接管」也不能说
   // 「只读」，而盲输入会真的打进终端（P1-3）。复核 GET 回来后遮罩自动撤掉。
   const masked = !touch && terminalControlNeedsMask(model);
+  /**
+   * 这条通道有没有可能握着写租约。租约挂在（会话 × 登录）上，**不**挂在面板上：
+   * 同一个登录里上一块面板接管过、这块面板刚挂上来时，服务端那把写租约仍在，前置
+   * 代理照旧会给这个 iframe 补 WRITE grant —— 也就是说它**真的能打字**。
+   * `canControl=false`（平台 teammate/guest）与无凭证的只读通道则永远握不到。
+   */
+  const leaseCapableChannel = !externalTerminalUrl && !!terminalUrl && !touch
+    && props.authenticated && props.capabilities.canControl;
+  /**
+   * 首屏 GET 还没回来（第 9 / 9b 点）：这一刻我们**什么都不知道**，而上面那条判据
+   * 说明它可能可写。iframe 一旦挂上去就能收键盘，等 GET 回来再撤已经晚了 —— 所以
+   * 能握租约的通道在 loading 期间干脆不挂。随后才会被识别为 fixed 的平台 owner 也
+   * 走这条：识别完成前它同样是 authenticated + canControl。
+   */
+  const withheldWhileChecking = model.phase === 'loading' && leaseCapableChannel;
+  const frameWithheld = masked || withheldWhileChecking;
 
   // 把徽标看到的这份结论原样回执给外层。回执的是**渲染出来的模式**（含触屏那层
   // 覆盖），不是接口原始读数——外层拿它决定行内按钮的开关语义，两边看到的必须是
@@ -744,8 +823,9 @@ export function TerminalPane(props: PaneCommonProps & {
             {/* 手机端和桌面走同一条直嵌路径，不做任何 transform 缩放：iOS WKWebView 对被
                 缩放的 iframe 内 canvas/WebGL 有不渲染的合成缺陷，终端会整片空白。终端页
                 自身会按 iframe 的实际宽度 fit 出列数，窄屏直嵌即可正常显示。
-                控制权未知时这块 iframe 直接不挂：盖一层挡不住已经聚焦在里面的键盘。 */}
-            {masked ? null : (
+                控制权未知 / 首屏还没读到时这块 iframe 直接不挂：盖一层挡不住已经聚焦
+                在里面的键盘，而「还不知道」与「已知可写」一样不能放任盲输入。 */}
+            {frameWithheld ? null : (
               <iframe
                 key={frameKey}
                 ref={frameRef}
@@ -761,7 +841,7 @@ export function TerminalPane(props: PaneCommonProps & {
                 ws://）。这时终端区域只会是一片黑，与其让人对着黑屏猜，不如直说，并给一条
                 能自己走通的路。覆盖层盖在 iframe 上而不是替换它：页面自身一直在重连，
                 连上后这层会自动撤掉。 */}
-            {frameWatch.blocked && !masked ? (
+            {frameWatch.blocked && !frameWithheld ? (
               <div className="wb-pane-empty wb-ws-blocked" role="status">
                 <span aria-hidden="true">⚠</span>
                 <strong>终端实时连接未建立</strong>
@@ -774,6 +854,14 @@ export function TerminalPane(props: PaneCommonProps & {
                 把它换掉。乐观说一句「只读」再放任键盘打进去，是这轮复审里最实在的
                 一条风险；复核 GET 一回来 iframe 就重新挂上（P1-3）。 */}
             {masked ? <TerminalControlUnknown onRetry={() => void observe('reconcile')} /> : null}
+            {/* 首屏权威读数还在路上：诚实地说「正在确认」，别先把可能可写的终端摆出来。 */}
+            {!masked && withheldWhileChecking ? (
+              <div className="wb-pane-empty wb-control-checking" role="status">
+                <span aria-hidden="true">⋯</span>
+                <strong>正在确认终端控制权</strong>
+                <p>确认之前先不接入终端画面，避免在不知道能不能写的情况下把输入打进去。</p>
+              </div>
+            ) : null}
           </>
         ) : (touch || !props.authenticated) && !externalTerminalUrl && terminalUrl ? (
           // A terminal exists, we just have no credential for it yet. Say so
