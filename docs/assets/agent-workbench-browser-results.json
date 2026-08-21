@@ -7,13 +7,13 @@
     "productionStoreExercised": false,
     "note": "生产 bundle 的端到端证据见 docs/assets/workbench-production-e2e-results.json"
   },
-  "head": "60074da93dee399711791eaf35678d60905225d2",
+  "head": "6efdd138262fb06fc50684745b55dc207f6f1a7d",
   "worktreeDirty": true,
   "headNote": "head 是跑这一轮时的 HEAD；worktreeDirty=true 表示工作区还有未提交改动（证据先于提交产生时的常态）",
   "fixtureBuild": {
     "bundler": "esbuild (in-process, esm/chrome120)",
-    "bytes": 1191780,
-    "sha256": "b62d2122fc9559ad7f7bbba065505e3d45029c5558c00ed1ef36598293add5b6"
+    "bytes": 1672933,
+    "sha256": "95be3f2fa9b6f0bedb35bb8cfa0ae46d861370ef5f8d8c2cc2040a0f23b50344"
   },
   "browser": "local executable (/home/wanglingfeng.linvon/.cache/ui-check/chrome-headless-shell-linux64/chrome-headless-shell)",
   "browserVersion": "121.0.6167.85",
@@ -29,67 +29,67 @@
   "scenarios": {
     "h5_success": {
       "ok": true,
-      "durationMs": 201
+      "durationMs": 214
     },
     "h5_failure": {
       "ok": true,
-      "durationMs": 54
+      "durationMs": 60
     },
     "h5_timeout": {
       "ok": true,
-      "durationMs": 77
+      "durationMs": 81
     },
     "h5_without_sdk": {
       "ok": true,
-      "durationMs": 52
+      "durationMs": 54
     },
     "workbench_route_switch_and_terminal_control": {
       "ok": true,
-      "durationMs": 481
+      "durationMs": 595
     },
     "workbench_failure": {
       "ok": true,
-      "durationMs": 251
+      "durationMs": 286
     },
     "unauthorized": {
       "ok": true,
-      "durationMs": 250
+      "durationMs": 277
     },
     "mobile_and_sidebar_layout": {
       "ok": true,
-      "durationMs": 388
+      "durationMs": 452
     },
     "dock_touch_view_token": {
       "ok": true,
-      "durationMs": 371
+      "durationMs": 412
     },
     "wide_touch_targets": {
       "ok": true,
-      "durationMs": 323
+      "durationMs": 359
     },
     "rail_collapsed_recovery": {
       "ok": true,
-      "durationMs": 1076
+      "durationMs": 1200
     },
     "mobile_preview_interaction": {
       "ok": true,
-      "durationMs": 377
+      "durationMs": 437
     },
     "preview_registration_and_proxy_boundaries": {
       "ok": true,
-      "durationMs": 159
+      "durationMs": 171
     },
     "preview_websocket": {
       "ok": true,
-      "durationMs": 125
+      "durationMs": 137
     },
     "terminal_disconnect_returns_readonly": {
       "ok": true,
-      "durationMs": 149
+      "durationMs": 172
     },
     "preview_idle_timeout_relocks": {
       "ok": true,
-      "durationMs": 119
+      "durationMs": 118
     }
   }
 }

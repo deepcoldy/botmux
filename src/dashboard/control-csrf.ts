@@ -30,7 +30,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { logger } from '../utils/logger.js';
-import { platformBrowserAuthorities } from '../platform/binding.js';
+import { platformBrowserAuthorities, type PlatformBrowserSurface } from '../platform/binding.js';
 
 /** 提交控制类请求时携带 CSRF 票据的头名。`<form>` 设不了自定义头，这是关键。 */
 export const CONTROL_CSRF_HEADER = 'x-botmux-csrf';
@@ -168,15 +168,21 @@ function publicUrlAuthority(): string | undefined {
  *  运维显式声明的对外基址；绑定中心平台时再加本机可信的平台浏览器子域
  *  (`m-`/`t-<machineId>.<平台域名>`)——平台隧道反代不透传 `X-Forwarded-Host`，
  *  这是唯一能让平台浏览器终端的同源校验认出「浏览器实际访问的子域」的候选来源
- *  （见 {@link platformBrowserAuthorities}，每请求重读 platform.json、fail-closed）。 */
-function requestAuthorities(headers: ControlRequestHeadersLike): Array<string | undefined> {
+ *  （见 {@link platformBrowserAuthorities}，每请求重读 platform.json、fail-closed）。
+ *
+ *  `surface` 决定平台子域给到哪一档：终端 WS 升级要认 `t-`（分享出去的终端页就挂
+ *  在那儿），管理类 POST 只认 `m-`（SPA 与 CSRF 票据只存在于那张壳页）。 */
+function requestAuthorities(
+  headers: ControlRequestHeadersLike,
+  surface: PlatformBrowserSurface,
+): Array<string | undefined> {
   const forwarded = headerValue(headers['x-forwarded-host']);
   return [
     headerValue(headers.host),
     // 逗号分隔时第一个才是最初的客户端所见 host。
     forwarded ? forwarded.split(',')[0] : undefined,
     publicUrlAuthority(),
-    ...platformBrowserAuthorities(),
+    ...platformBrowserAuthorities(surface),
   ];
 }
 
@@ -195,8 +201,13 @@ function logSafeValue(value: string): string {
  * 服务端再零日志，运维只能看到「终端连不上、一点接管就 403」。把 Origin 与全部
  * 候选 authority 打出来，反代配错（Host 被改写 / 端口被剥掉）一眼可辨。
  */
-function warnForeignOrigin(kind: string, origin: string, headers: ControlRequestHeadersLike): void {
-  const authorities = requestAuthorities(headers)
+function warnForeignOrigin(
+  kind: string,
+  origin: string,
+  headers: ControlRequestHeadersLike,
+  surface: PlatformBrowserSurface,
+): void {
+  const authorities = requestAuthorities(headers, surface)
     .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
     .map(logSafeValue);
   logger.warn(`[dashboard-csrf] ${kind} 判为跨站并拒绝：origin=${logSafeValue(origin)}`
@@ -212,8 +223,8 @@ function warnForeignOrigin(kind: string, origin: string, headers: ControlRequest
 export function controlRequestOriginState(headers: ControlRequestHeadersLike): ControlRequestOriginState {
   const site = headerValue(headers['sec-fetch-site']);
   const origin = headerValue(headers.origin);
-  if (origin !== undefined && !originMatchesHost(origin, requestAuthorities(headers))) {
-    warnForeignOrigin('控制类请求', origin, headers);
+  if (origin !== undefined && !originMatchesHost(origin, requestAuthorities(headers, 'management'))) {
+    warnForeignOrigin('控制类请求', origin, headers, 'management');
     return 'foreign';
   }
   if (site !== undefined && site !== 'same-origin') return 'foreign';
@@ -248,7 +259,7 @@ export function refererMatchesHost(headers: ControlRequestHeadersLike): boolean 
   } catch {
     return false;
   }
-  return originMatchesHost(origin, requestAuthorities(headers));
+  return originMatchesHost(origin, requestAuthorities(headers, 'management'));
 }
 
 /**
@@ -260,10 +271,13 @@ export function managementUpgradeOrigin(headers: ControlRequestHeadersLike):
   { ok: true } | { ok: false; error: 'upgrade_origin_forbidden' } {
   const origin = headerValue(headers.origin);
   if (origin === undefined) return { ok: true };
-  if (originMatchesHost(origin, requestAuthorities(headers))) return { ok: true };
+  // 终端页挂在平台的 `t-` 子域下，它的 WS 握手 Origin 就是 `t-`：这一档必须认，
+  // 否则平台浏览器终端整片 disconnected（#933/#960）。管理类 POST 不走这里，也就
+  // 不会跟着一起把 `t-` 认成可发起写操作的同源。
+  if (originMatchesHost(origin, requestAuthorities(headers, 'terminal-upgrade'))) return { ok: true };
   // WS 握手被拒最难查：浏览器拿不到 403 的状态码与响应体，页面只会显示「连不
   // 上」，workbench-doctor 的探测同样说不出原因。日志是唯一的线索。
-  warnForeignOrigin('WebSocket 升级', origin, headers);
+  warnForeignOrigin('WebSocket 升级', origin, headers, 'terminal-upgrade');
   return { ok: false, error: 'upgrade_origin_forbidden' };
 }
 
