@@ -522,38 +522,53 @@ export function TerminalPane(props: PaneCommonProps & {
   });
 
   /**
-   * 这块面板此刻**可能**握着的那一次接管。
+   * 这块面板**可能已经提交**的接管集合（第 16 点）。
    *
-   * 值是这块面板在 POST **之前**自己生成的 acquisition id，不是服务端回执带回来的
-   * ——回执可能根本回不来，而那恰恰是最需要补偿的场景。清空只发生在确认释放之后。
-   * 连着 sessionId 一起记：面板换会话是重挂，但卸载清理跑在 React 之外，必须自带
-   * 「这是哪个会话的哪一次」才不会还错。
+   * 为什么是集合而不是单值：单值每次 takeover 都覆盖上一次，于是「acq1 提交但回执
+   * 丢 → unknown → 用户立即重试 acq2、acq2 在到服务端之前就失败」时，客户端只剩
+   * acq2，服务端却仍持有 acq1；卸载补偿只 release(acq2)，acq1 一路泄漏到 TTL。改成
+   * 集合后，本 pane POST 过的每一次 acquisition 都留着，卸载时逐个按各自的 id 做 CAS
+   * （服务端最多匹配其中一条，其余全部落空即无害）。
+   *
+   * 键是 acquisition id：客户端在 POST **之前**自己生成，不依赖回执——回执可能根本
+   * 回不来，而那恰恰是最需要补偿的场景。手动释放成功 / 恒可写身份确认后清空整份
+   * 集合。每条都连着 sessionId：面板换会话是重挂，但卸载清理跑在 React 之外，必须
+   * 自带「这是哪个会话的哪一次」才不会还错。
    */
-  const heldAcquisition = useRef<{ sessionId: string; acquisitionId: string } | null>(null);
+  const heldAcquisitions = useRef<Map<string, { sessionId: string; acquisitionId: string }>>(new Map());
+
+  /** 快照并清空「可能已提交」集合，返回待补偿的全部条目。快照 + 清空同步完成，两条
+   *  在途补偿就不会各自拿到同一批条目重复发请求（CAS 本身幂等，这里只是少发无谓的）。 */
+  const drainHeldAcquisitions = (): { sessionId: string; acquisitionId: string }[] => {
+    const entries = [...heldAcquisitions.current.values()];
+    heldAcquisitions.current.clear();
+    return entries;
+  };
 
   /**
-   * 收掉一次**没人管的**接管：按 acquisition 做条件释放。
+   * 收掉一批**没人管的**接管：逐个按各自的 acquisition 做条件释放。
    *
-   * 两条判据缺一不可：
+   * 每一条的两条判据缺一不可：
    *   ① 这份文档里还有活面板攥着同一把租约 → 它不是孤儿，别动。租约挂在
    *      （会话 × 登录）上，第二块面板 takeover 拿到的是同一把，服务端看来两次
    *      请求完全同形，只有这里分得清（同标签页内的判据）。
-   *   ② 释放带上**自己那一次**的 acquisition id，服务端按它 CAS。跨标签页 / 跨设备
+   *   ② 释放带上**那一次自己的** acquisition id，服务端按它 CAS。跨标签页 / 跨设备
    *      的抢先接管只有服务端看得见，不匹配时它拒绝，用户正在打字的那块终端不受伤。
    *
    * 这里**不再**去 GET 一次「当前 marker」再拿它释放：事后读到的是此刻活着的那一次
    * acquisition，跨标签页接管之后正是别人的那一把，拿它补偿等于精准误删。
    * 幂等：租约已经没了就是 `released:false`，被别人接管过就是 `control_lease_superseded`，
-   * 两种都当成「不用我管了」，所以随后 socket 断开再走一遍也不冲突。
+   * 服务端最多匹配集合里一条、其余全部落空即无害，所以随后 socket 断开再走一遍也不冲突。
    */
-  const compensateAcquisition = useCallback(async (
-    target: { sessionId: string; acquisitionId: string } | null,
+  const compensateAcquisitions = useCallback(async (
+    targets: ReadonlyArray<{ sessionId: string; acquisitionId: string }>,
   ) => {
-    if (!target) return;
-    if (hasLiveTerminalWriteClaim(target.sessionId)) return;
-    await props.api
-      .releaseTerminal(target.sessionId, undefined, target.acquisitionId)
-      .catch(() => {});
+    for (const target of targets) {
+      if (hasLiveTerminalWriteClaim(target.sessionId)) continue;
+      await props.api
+        .releaseTerminal(target.sessionId, undefined, target.acquisitionId)
+        .catch(() => {});
+    }
   }, [props.api]);
 
   /** 在途写的计数。卸载补偿据此让路：在途那一条自己会在回执（或失败）之后补偿，
@@ -562,11 +577,10 @@ export function TerminalPane(props: PaneCommonProps & {
 
   const mutate = async (action: TerminalWriteAction) => {
     const epoch = ++writeEpoch.current;
-    // POST **之前**就把这一次接管的 id 定下来。回执丢了也不影响补偿的精确度。
+    // POST **之前**就把这一次接管的 id 定下来，并记进「可能已提交」集合。回执丢了也
+    // 不影响补偿的精确度；单值覆盖会漏掉更早那次尚未收敛的接管（第 16 点）。
     const acquisitionId = action === 'takeover' ? newTerminalAcquisitionId() : undefined;
-    const attempt = acquisitionId ? { sessionId, acquisitionId } : null;
-    if (attempt) heldAcquisition.current = attempt;
-    const releasing = action === 'release' ? heldAcquisition.current : null;
+    if (acquisitionId) heldAcquisitions.current.set(acquisitionId, { sessionId, acquisitionId });
     writesInFlight.current += 1;
     dispatch({ type: 'write-start', epoch, action });
     try {
@@ -574,24 +588,24 @@ export function TerminalPane(props: PaneCommonProps & {
       const next = await withWriteTimeout(signal => (action === 'takeover'
         ? props.api.takeoverTerminal(sessionId, signal, acquisitionId)
         : props.api.releaseTerminal(sessionId, signal)));
-      if (action === 'release' && releasing?.sessionId === sessionId
-        && heldAcquisition.current?.acquisitionId === releasing.acquisitionId) {
-        // 用户手动释放成功：这块面板不再握着任何东西，卸载时也就没什么要补偿。
-        heldAcquisition.current = null;
-      }
+      // 手动释放成功（租约已还清）/ 恒可写身份（压根没有租约）→ 整份集合清空，卸载
+      // 时也就没什么要补偿。takeover 成功则保留——它是本 pane 此刻握着的那把活租约，
+      // 连同更早提交但回执丢失的几次一并留到卸载时逐个 CAS（服务端最多匹配一条）。
+      if (action === 'release' || next.fixed === true) heldAcquisitions.current.clear();
       if (!mounted.current) {
-        // 服务端刚刚把写租约发给了这次调用，面板却已经关掉 / 换会话 / 离开工作台。
-        void compensateAcquisition(next.fixed === true ? null : attempt);
+        // 服务端刚刚把写租约发给了这次调用，面板却已经关掉 / 换会话 / 离开工作台：把
+        // 集合里每一次 acquisition 都逐个 CAS 释放（release 成功已清空 → 这里空转）。
+        void compensateAcquisitions(drainHeldAcquisitions());
         return;
       }
       dispatch({ type: 'write-settled', epoch, control: next });
     } catch (cause) {
       if (!mounted.current) {
         // 失败不代表服务端没受理——超时、断连都只是丢了回执。这里**不能**裸 return，
-        // 也不能去问「现在的租约是谁的」，只能认自己 POST 前生成的那个 id。
-        // 释放失败同理：租约很可能还在服务端挂着，而它属于这块面板此前接管的那一次，
-        // 所以按**那一次**的 id 再条件释放一遍（成了就成了，被别人接管过就被拒）。
-        void compensateAcquisition(attempt ?? releasing);
+        // 也不能去问「现在的租约是谁的」，只能认自己 POST 前生成的那些 id：把本 pane
+        // 全部「可能已提交」的 acquisition 逐个条件释放（含这次 attempt 与更早提交但
+        // 回执丢失的那几次），服务端最多匹配其中一条。
+        void compensateAcquisitions(drainHeldAcquisitions());
         return;
       }
       dispatch({ type: 'write-failed', epoch, error: apiErrorText(cause) });
@@ -600,32 +614,33 @@ export function TerminalPane(props: PaneCommonProps & {
     }
   };
 
-  // 恒可写身份没有租约可还（服务端会 403），别把它记成「握着一次接管」。
+  // 恒可写身份没有租约可还（服务端会 403），别把它记成「握着接管」。
   useEffect(() => {
-    if (model.authoritative?.fixed === true) heldAcquisition.current = null;
+    if (model.authoritative?.fixed === true) heldAcquisitions.current.clear();
   }, [model.authoritative]);
 
   /**
-   * 关面板 / 换会话 = 放弃这一次接管（第 15 点）。
+   * 关面板 / 换会话 = 放弃本 pane 可能已提交的每一次接管（第 15 / 16 点）。
    *
    * 接管已经回执、model 也已经 controlled，但新的 iframe / WS 还没连上就把终端关掉
    * 时：没有在途 promise 可补偿，也没有已注册的 socket 会在断开时触发服务端那条
    * disconnect —— 旧实现只撤掉本地认领，租约一路挂到 TTL 到期，同一个会话在那之前
-   * 谁也接管不了。这里按自己确认过的 acquisition 做一次条件释放，与 socket 随后
-   * 断开触发的清理天然可重入（服务端两边都是同一条 CAS）。
+   * 谁也接管不了。这里把「可能已提交」集合里的每一次 acquisition 都做一次条件释放，
+   * 与 socket 随后断开触发的清理天然可重入（服务端每一条都是同一把 CAS）。
    *
    * 走微任务是必需的：这块面板自己那份写租约认领由另一个 effect 的清理撤销，React
    * 按 effect 定义顺序跑清理，同步做判断有可能看见的是**自己**的认领而白白放弃补偿。
    * `compensateRef` 同理——把函数写进依赖会让 api 引用一变就"卸载"一次。
    */
-  const compensateRef = useRef(compensateAcquisition);
-  useEffect(() => { compensateRef.current = compensateAcquisition; });
+  const compensateRef = useRef(compensateAcquisitions);
+  useEffect(() => { compensateRef.current = compensateAcquisitions; });
   useEffect(() => () => {
-    const target = heldAcquisition.current;
-    // 有写在途时让路：那一条自己会在回执 / 失败之后补偿，而且那时它知道得更多。
-    if (!target || writesInFlight.current > 0) return;
-    heldAcquisition.current = null;
-    void Promise.resolve().then(() => compensateRef.current(target));
+    // 有写在途时让路：那一条自己会在回执 / 失败之后补偿整份集合，而且那时它知道得更多。
+    if (writesInFlight.current > 0) return;
+    const targets = [...heldAcquisitions.current.values()];
+    if (targets.length === 0) return;
+    heldAcquisitions.current.clear();
+    void Promise.resolve().then(() => compensateRef.current(targets));
   }, [sessionId]);
 
   // 只要这块面板**可能**握着写租约，就在登记簿上留个名：别的面板的迟到补偿据此

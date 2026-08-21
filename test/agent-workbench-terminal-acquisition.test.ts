@@ -540,6 +540,74 @@ describe('门禁③：接管已回执但 WS 未注册就关面板，租约必须
   });
 });
 
+// ─── 门禁⑤：重试角落——更早那次已提交的接管不能被后一次覆盖丢掉（第 16 点）──────
+describe('门禁⑤：acq1 提交但回执丢 + acq2 到服务端前失败 → 关面板后 acq1 租约必须清掉', () => {
+  it('本 pane「可能已提交」的每一次 acquisition 都逐个 CAS，不再单值覆盖', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = liveLease();
+    let takeovers = 0;
+    const gate1 = lease.holdNextTakeover();
+    const api: WorkbenchApi = {
+      ...lease.api,
+      takeoverTerminal: async (sessionId, signal, acquisitionId) => {
+        takeovers += 1;
+        if (takeovers >= 2) {
+          // acq2：请求在去程就断了，真 manager 从没受理过这一次（服务端仍只持有 acq1）。
+          lease.calls.push(`takeover-lost:${acquisitionId ?? '*'}`);
+          throw new WorkbenchApiError(504, 'control_request_timeout');
+        }
+        // acq1：服务端受理（真 manager 里租约已发出），回执被 gate1 按住随后 reject。
+        return lease.api.takeoverTerminal(sessionId, signal, acquisitionId);
+      },
+    };
+    const renderer = await renderPane(api);
+    expect(paneMode(renderer)).toBe('readonly');
+
+    // 复核 GET 先按住，让面板停在 unknown（接管按钮才在），好把两次重试串起来。
+    lease.holdGets(true);
+
+    // ① acq1：服务端受理，回执在路上丢了 → 写失败 → unknown + 遮罩。
+    await act(async () => { paneControl(renderer, '接管输入')?.props.onClick(); });
+    await act(async () => {
+      gate1.reject(new WorkbenchApiError(504, 'control_request_timeout'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await settle();
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(lease.leaseHeld()).toBe(true);
+    const committed = lease.leaseAcquisition();
+
+    // ② acq2：立刻重试，去程就失败，服务端从没见过它。单值实现会把 held 覆盖成 acq2，
+    //    acq1 就此失联；服务端此刻仍然只持有 acq1。
+    await act(async () => { paneControl(renderer, '接管输入')?.props.onClick(); });
+    await settle();
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(lease.leaseHeld()).toBe(true);
+    expect(lease.leaseAcquisition()).toBe(committed);
+
+    // ③ 写失败后新发的复核放行：读到的正是服务端真持有的 acq1（reconcile 显示 acq1）。
+    await act(async () => {
+      lease.flushGet(1);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await settle();
+    expect(lease.leaseAcquisition()).toBe(committed);
+
+    // ④ 关面板：逐个 CAS 释放集合里的每一次 acquisition，acq1 命中 → 服务端租约收掉。
+    //    回归的形状：单值实现只 release(acq2)，acq1 一路泄漏到 TTL。
+    act(() => renderer.unmount());
+    await settle(8);
+    expect(lease.leaseHeld()).toBe(false);
+    // 补偿真的发出去了，而且带的是具体 acquisition（不是无条件 release:*），其中一条正是
+    // 服务端真持有的 acq1。
+    const releases = lease.calls.filter(call => call.startsWith('release:'));
+    expect(releases.length).toBeGreaterThan(0);
+    expect(releases.every(call => call !== 'release:*')).toBe(true);
+    expect(releases.some(call => call === `release:${committed}`)).toBe(true);
+  });
+});
+
 // ─── 门禁④：viewToken 换链立刻回到未知 ──────────────────────────────────────
 describe('门禁④：短时 viewToken 换链后，旧连接的写权限结论必须作废', () => {
   async function renderTouchFixedPane(links: string[]): Promise<{
