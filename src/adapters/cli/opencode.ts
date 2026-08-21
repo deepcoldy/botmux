@@ -229,7 +229,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
         out.push({
           cliSessionId: r.id,
           cwd: r.directory,
-          title: (r.title ?? '').trim() || r.id,
+          title: (r.title ?? '').trim(),
           lastActivityAt: r.timeUpdated,
         });
       }

@@ -1995,7 +1995,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const target = resumable.find(r => r.cliSessionId === cliSessionId);
       if (!target) {
-        await sessionReply(rootId, t('cmd.adopt.resume_not_found', { id: cliSessionId }, localeForBot(ds.larkAppId)));
+        await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, localeForBot(ds.larkAppId)));
         clearAdoptCandidates(rootId);
         if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
         return;
