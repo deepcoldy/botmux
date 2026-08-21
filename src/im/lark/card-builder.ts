@@ -22,6 +22,18 @@ import {
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
 
+/** 流式卡片上下文占用百分比变色/高亮的缺省阈值（dashboard.contextCompactThreshold
+ *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
+export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
+
+/** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
+ *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
+export function contextCompactThreshold(): number {
+  const v = readGlobalConfig().dashboard?.contextCompactThreshold;
+  if (typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 100) return Math.round(v);
+  return DEFAULT_CONTEXT_COMPACT_THRESHOLD;
+}
+
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
@@ -833,7 +845,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
 const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green',
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green', interrupted: 'orange',
 } as const;
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
@@ -848,6 +860,7 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
     case 'limited': return usageLimit?.retryReady
       ? t('card.status.retry_ready', undefined, locale)
       : t('card.status.limited', undefined, locale);
+    case 'interrupted': return t('card.status.interrupted', undefined, locale);
   }
 }
 
@@ -942,6 +955,22 @@ export function buildStreamingCard(
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
+  // ── 上下文余量指示（header 之下、控制行之上的显著位置）────────────────────
+  // 数据来自 usage.context.percentUsed（worker-pool 的 getDaemonStreamingCardUsageSnapshot
+  // 算好传入）；无 contextWindow 数据（percentUsed 非有限数）时不渲染——优雅降级。
+  const contextPct = usage?.context?.percentUsed;
+  const hasContextPct = typeof contextPct === 'number' && Number.isFinite(contextPct);
+  if (hasContextPct) {
+    const pct = Math.min(100, Math.round(contextPct));
+    const overThreshold = pct >= contextCompactThreshold();
+    elements.push({
+      tag: 'markdown',
+      content: overThreshold
+        ? `<font color='red'>⚠️ ${t('card.context.over_threshold', { pct }, locale)}</font>`
+        : `<font color='grey'>📊 ${t('card.context.indicator', { pct }, locale)}</font>`,
+    });
+  }
+
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
 
@@ -991,6 +1020,31 @@ export function buildStreamingCard(
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
       type: 'default',
       value: { action: 'get_write_link', ...actionBase },
+    });
+  }
+  // 「🗜️ 压缩」：仅在有上下文占用数据时出现（无 contextWindow 的 CLI 优雅降级为不渲染）。
+  // 点击走 card-handler 的 compact_session → daemon 的 deliverPassthroughToExistingSession
+  // （raw_input 透传 /compact，含完整 turn 生命周期），不新造压缩逻辑。
+  if (hasContextPct) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'compact_session', ...actionBase },
+    });
+  }
+  // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
+  // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
+  // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
+  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
+  // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
+  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.stop', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'stop_turn', ...actionBase },
     });
   }
   if (adoptMode) {

@@ -5340,6 +5340,16 @@ const cardDeps: CardHandlerDeps = {
     }
     handlers.replayMessageEvent(data);
   },
+  // 卡片「🗜️ 压缩」按钮：等价于用户在话题里发 /compact——走已有的
+  // deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 生命周期）。
+  deliverPassthroughCommand: (ds, cmd, opts) =>
+    deliverPassthroughToExistingSession(ds, cmd, cmd, opts.anchor, ds.larkAppId, {
+      messageId: opts.messageId,
+      replyRootId: opts.replyRootId,
+      senderOpenId: opts.senderOpenId,
+      senderIsBot: opts.senderIsBot,
+      substitute: false,
+    }),
 };
 
 const LEGACY_WORKFLOW_API_RETIRED = {

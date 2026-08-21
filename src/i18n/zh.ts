@@ -30,6 +30,8 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
   'card.btn.retry_last_task': '🔁 重发上一条任务',
+  'card.btn.stop': '⏹ 停止',
+  'card.btn.compact': '🗜️ 压缩',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
@@ -38,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',
   'card.status.stalled': '长时间无进展',
+  'card.status.interrupted': '已中断',
   'card.status.limited': '限额已达',
   'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
@@ -64,6 +67,10 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
   'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
+
+  // ─── 上下文余量指示 ──────────────────────────────────────────────────────
+  'card.context.indicator': '上下文 {pct}%',
+  'card.context.over_threshold': '上下文 {pct}% · 建议压缩',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -830,6 +837,12 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
+  'card.action.stop_sent': '⏹ 已发送停止信号（^C），会话保留',
+  'card.action.stop_unsupported': '⚠️ 当前 CLI 模式不支持卡片停止（实验性 RPC 输入 / App Runner），请用 /close 关闭会话',
+  'card.action.stop_no_worker': '⚠️ CLI 未运行，无法停止',
+  'card.action.compact_sent': '🗜️ 已发送 /compact 到 {cliName}',
+  'card.action.compact_no_worker': '⚠️ CLI 未运行，无法压缩',
+  'card.action.compact_unsupported': '⚠️ 当前环境不支持卡片压缩，请直接发送 /compact',
   'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
   'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
   'card.action.no_output': '(当前无输出内容)',
