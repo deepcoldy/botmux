@@ -119,11 +119,14 @@ await act(async () => { collapsedHeader.props.onClick(); });
 // 分组维度下拉（状态/机器人/会话/类型/CLI/时间）。
 assert.ok(main.root.findByProps({ className: 'wb-group-dim' }).props.children.length >= 2);
 
-// 行操作是文字按钮：聊天（真锚点）/ 定位 / 终端 / 接管。
+// 行操作是文字按钮：聊天（真锚点）/ 定位 / 终端。
+// 「接管」已按产品决策从行内移除，统一走终端面板标题栏的「接管输入」——所以这里既要
+// 查到剩下的三个，也要反向守住「行内不许再长出接管入口」。
 const rowActions = main.root.findAll(node => typeof node.type === 'string'
   && String(node.props.className ?? '').includes('wb-session-row-action'));
 const rowActionText = new Set(rowActions.map(node => textOf(node)));
-for (const label of ['聊天', '定位', '终端', '接管']) assert.ok(rowActionText.has(label), `缺少行操作「${label}」`);
+for (const label of ['聊天', '定位', '终端']) assert.ok(rowActionText.has(label), `缺少行操作「${label}」`);
+assert.equal(rowActionText.has('接管'), false, '行内不应再有「接管」');
 // 聊天必须是真锚点：脚本化打开会被飞书客户端降级成窄容器，这条契约不能退化成 button。
 assert.equal(rowActions.find(node => textOf(node) === '聊天')!.type, 'a');
 
@@ -131,10 +134,15 @@ assert.equal(rowActions.find(node => textOf(node) === '聊天')!.type, 'a');
 assert.equal(main.root.findAll(node => node.props['aria-label'] === '终端面板').length, 0);
 assert.ok(main.root.findByProps({ className: 'wb-pane-placeholder' }));
 
-// 行内「接管」= 打开终端面板并自动请求写权限。
-const takeover = rowActions.find(node => textOf(node) === '接管')!;
-await act(async () => { takeover.props.onClick({ stopPropagation() {} }); });
+// 行内「终端」= 只读打开终端面板，一个写请求都不发。
+const openTerminal = rowActions.find(node => textOf(node) === '终端')!;
+await act(async () => { openTerminal.props.onClick({ stopPropagation() {} }); });
+await act(async () => {});
 assert.ok(main.root.findByProps({ 'aria-label': '终端面板' }));
+assert.equal(takeovers, 0, '行内「终端」不该替用户发起接管');
+// 接管的唯一入口：面板标题栏的「接管输入」。
+await act(async () => { buttonWithText(main.root, '接管输入')!.props.onClick(); });
+await act(async () => {});
 assert.equal(takeovers, 1);
 assert.ok(main.root.findAll(node => String(node.props.className ?? '').includes('wb-mode-chip is-controlled')).length === 1);
 assert.ok(buttonWithText(main.root, '释放输入'));
@@ -180,7 +188,7 @@ act(() => dock.unmount());
 
 process.stdout.write(JSON.stringify({
   ok: true,
-  componentChecks: 21,
+  componentChecks: 23,
   renderedSessionOptions: options.length,
   rowHeight: 54,
 }) + '\n');
