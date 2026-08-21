@@ -273,6 +273,42 @@ export function terminalControlReducer(
   }
 }
 
+// ─── 写租约的「还有人在管吗」登记簿 ─────────────────────────────────────────
+
+/**
+ * 此刻这份文档里，哪些会话的写租约还有活着的面板在管。
+ *
+ * 为什么需要它：租约挂在（会话 × 登录）上，**不**挂在面板上。同一个登录里第二块
+ * 面板 takeover，服务端给的是同一把租约。于是「我这次接管的回执迟到了、面板却已经
+ * 没了 → 把租约还回去」这条补偿，在服务端看来与正常释放完全同形——同源、同会话、
+ * 同登录，没有任何判据拦得住——实际却把用户此刻正在打字的那块终端的写权限收走了。
+ *
+ * 补偿前先问一句「还有别的面板正靠着这把租约吗」，是唯一能在**同一个标签页内**把
+ * 这两件事分开的判据。跨标签页 / 跨设备靠服务端的 marker CAS（见
+ * `TerminalControlState.marker`）：两条判据合起来才完整，缺一条都有洞。
+ */
+const liveTerminalWriteClaims = new Map<string, Set<object>>();
+
+/** 认领：这块面板可能握着 `sessionId` 的写租约。返回撤销函数（卸载时调用）。 */
+export function claimTerminalWrite(sessionId: string, claim: object): () => void {
+  let claims = liveTerminalWriteClaims.get(sessionId);
+  if (!claims) {
+    claims = new Set();
+    liveTerminalWriteClaims.set(sessionId, claims);
+  }
+  claims.add(claim);
+  return () => {
+    const current = liveTerminalWriteClaims.get(sessionId);
+    if (!current) return;
+    current.delete(claim);
+    if (current.size === 0) liveTerminalWriteClaims.delete(sessionId);
+  };
+}
+
+export function hasLiveTerminalWriteClaim(sessionId: string): boolean {
+  return (liveTerminalWriteClaims.get(sessionId)?.size ?? 0) > 0;
+}
+
 // ─── 外层侧：行内「终端」的打开意图 ─────────────────────────────────────────
 
 /** 面板给外层的回执。外层的行内按钮只认它，不认自己当初递进去的意图——标题栏的

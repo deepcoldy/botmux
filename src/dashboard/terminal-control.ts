@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   issueTerminalControlGrant,
   type TerminalControlGrantClaims,
@@ -40,6 +41,21 @@ interface TerminalControlLease {
   authSessionId: string;
   grant: string;
   grantId: string;
+  /**
+   * Browser-safe marker of the LAST acquisition of this lease. Rotates on every
+   * successful takeover, reuse included, and carries no authority of its own —
+   * it is a plain equality nonce, unlike `grantId` (a segment of the signed
+   * grant, which must never leave this process).
+   *
+   * It exists for compare-and-swap release: a caller that acquired the lease and
+   * then lost track of its UI (pane unmounted before the receipt arrived) can
+   * name the acquisition it is compensating for. If somebody else has taken the
+   * lease over since — under the SAME login, which reuses this very lease and so
+   * is invisible to any session-level check — the marker no longer matches and
+   * the release is refused instead of silently stripping write from the pane the
+   * user is actually looking at.
+   */
+  opMarker: string;
   issuedAt: number;
   expiresAt: number;
   timer?: ReturnType<typeof setTimeout>;
@@ -47,12 +63,28 @@ interface TerminalControlLease {
 }
 
 export type TerminalControlTakeoverResult =
-  | { ok: true; mode: 'controlled'; expiresAt: number; reused: boolean }
+  | {
+    ok: true;
+    mode: 'controlled';
+    expiresAt: number;
+    reused: boolean;
+    /** This acquisition's CAS marker; absent for the leaseless platform-owner
+     *  role, which has nothing to compare or release. */
+    marker?: string;
+  }
   | { ok: false; error: 'authentication_expired' | 'control_busy' | 'terminal_operation_forbidden' };
 
 export type TerminalControlReleaseResult =
   | { ok: true; mode: 'readonly'; released: boolean }
-  | { ok: false; error: 'control_owned_by_another_session' | 'terminal_operation_forbidden' };
+  | {
+    ok: false;
+    error: 'control_owned_by_another_session'
+      | 'terminal_operation_forbidden'
+      /** A conditional release named an acquisition that is no longer the current
+       *  one. The lease stays exactly as it is — reporting `readonly` here would
+       *  tell the caller the opposite of the truth. */
+      | 'control_lease_superseded';
+  };
 
 /** Internal central-proxy material. The browser receives neither the signed
  * token nor the lease marker; both stay on the loopback hop. */
@@ -70,6 +102,8 @@ export interface TerminalControlManagerOptions {
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
   grantId?: () => string;
+  /** Injectable CAS marker source; production uses a random nonce. */
+  opMarker?: () => string;
 }
 
 function validControlTtl(value: number): boolean {
@@ -93,6 +127,7 @@ export class TerminalControlManager {
   private readonly schedule: typeof setTimeout;
   private readonly cancel: typeof clearTimeout;
   private readonly nextGrantId?: () => string;
+  private readonly nextOpMarker: () => string;
 
   constructor(opts: TerminalControlManagerOptions) {
     if (!opts.secret) throw new Error('terminal control secret is required');
@@ -104,6 +139,7 @@ export class TerminalControlManager {
     this.schedule = opts.setTimer ?? setTimeout;
     this.cancel = opts.clearTimer ?? clearTimeout;
     this.nextGrantId = opts.grantId;
+    this.nextOpMarker = opts.opMarker ?? (() => randomBytes(12).toString('base64url'));
   }
 
   takeover(actor: TerminalDashboardActor, sessionId: string): TerminalControlTakeoverResult {
@@ -129,7 +165,12 @@ export class TerminalControlManager {
         return { ok: false, error: 'control_busy' };
       }
       this.audit.append(controlAuditRecord(actor.userId, sessionId, 'terminal.takeover_reused', { now: new Date(now) }));
-      return { ok: true, mode: 'controlled', expiresAt: current.expiresAt, reused: true };
+      // Reuse is still an acquisition: whoever asked for it now owns the lease,
+      // and any earlier holder's pending compensation must stop applying to it.
+      current.opMarker = this.nextOpMarker();
+      return {
+        ok: true, mode: 'controlled', expiresAt: current.expiresAt, reused: true, marker: current.opMarker,
+      };
     }
 
     const expiresAt = Math.min(now + this.ttlMs, actor.expiresAt);
@@ -155,6 +196,7 @@ export class TerminalControlManager {
       // Internal equality marker; never serialized or logged. Using the signed
       // payload avoids retaining an additional secret value.
       grantId: verifiedGrantId,
+      opMarker: this.nextOpMarker(),
       issuedAt: now,
       expiresAt,
       sockets: new Set(),
@@ -162,10 +204,23 @@ export class TerminalControlManager {
     lease.timer = this.schedule(() => this.invalidate(sessionId, lease, 'expired'), expiresAt - now);
     lease.timer.unref?.();
     this.leases.set(sessionId, lease);
-    return { ok: true, mode: 'controlled', expiresAt, reused: false };
+    return { ok: true, mode: 'controlled', expiresAt, reused: false, marker: lease.opMarker };
   }
 
-  release(actor: TerminalDashboardActor, sessionId: string): TerminalControlReleaseResult {
+  /**
+   * Give up the lease. `expectedMarker` makes it a compare-and-swap: the release
+   * only applies while the lease is still the acquisition the caller named.
+   *
+   * Compensation paths (a takeover whose receipt outlived its pane) MUST pass it.
+   * Without it, "release whatever this login holds on this session" also releases
+   * a lease that a newer pane of the same login has since taken over — same auth
+   * session, same lease object, so no identity check can tell the two apart.
+   */
+  release(
+    actor: TerminalDashboardActor,
+    sessionId: string,
+    expectedMarker?: string,
+  ): TerminalControlReleaseResult {
     if (actor.terminalCapability === 'readonly' || actor.terminalCapability === 'owner') {
       return { ok: false, error: 'terminal_operation_forbidden' };
     }
@@ -176,6 +231,9 @@ export class TerminalControlManager {
     if (lease.authSessionId !== actor.authSessionId || lease.userId !== actor.userId) {
       return { ok: false, error: 'control_owned_by_another_session' };
     }
+    if (expectedMarker !== undefined && lease.opMarker !== expectedMarker) {
+      return { ok: false, error: 'control_lease_superseded' };
+    }
     this.invalidate(sessionId, lease, 'release', now);
     return { ok: true, mode: 'readonly', released: true };
   }
@@ -185,6 +243,7 @@ export class TerminalControlManager {
     owned: boolean;
     expiresAt?: number;
     fixed?: boolean;
+    marker?: string;
   } {
     const now = this.now();
     if (actor.terminalCapability === 'readonly') return { mode: 'readonly', owned: false };
@@ -194,10 +253,14 @@ export class TerminalControlManager {
     this.expireSessionIfDue(sessionId, now);
     const lease = this.leases.get(sessionId);
     if (!lease) return { mode: 'readonly', owned: false };
+    const owned = lease.authSessionId === actor.authSessionId && lease.userId === actor.userId;
     return {
       mode: 'controlled',
-      owned: lease.authSessionId === actor.authSessionId && lease.userId === actor.userId,
+      owned,
       expiresAt: lease.expiresAt,
+      // Only the holder learns which acquisition the lease is currently on — it
+      // is what lets a compensation decide "still mine" vs "someone took over".
+      ...(owned ? { marker: lease.opMarker } : {}),
     };
   }
 

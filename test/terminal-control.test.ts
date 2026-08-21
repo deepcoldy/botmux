@@ -95,12 +95,12 @@ describe('terminal server-side takeover lifecycle', () => {
     expect(manager.state(owner, 's1')).toEqual({ mode: 'readonly', owned: false });
 
     expect(manager.takeover(owner, 's1')).toEqual({
-      ok: true, mode: 'controlled', expiresAt: 11_000, reused: false,
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: false, marker: expect.any(String),
     });
     const firstGrant = manager.grantFor(owner, 's1');
     now = 2_000;
     expect(manager.takeover(owner, 's1')).toEqual({
-      ok: true, mode: 'controlled', expiresAt: 11_000, reused: true,
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: true, marker: expect.any(String),
     });
     expect(manager.grantFor(owner, 's1')).toBe(firstGrant);
     expect(manager.takeover(actor('ou_other'), 's1')).toEqual({ ok: false, error: 'control_busy' });
@@ -109,6 +109,60 @@ describe('terminal server-side takeover lifecycle', () => {
       'terminal.takeover', 'terminal.takeover_reused',
     ]);
     expect(JSON.stringify(audit.records)).not.toContain(firstGrant);
+  });
+
+  it('rotates a browser-safe op marker on every takeover and refuses a superseded release', () => {
+    // Why this exists: the Workbench compensates a takeover whose receipt arrived
+    // after its pane had already gone (tab closed, session switched). Releasing
+    // "whatever lease this session has" is wrong — a NEWER pane under the same
+    // login reuses the very same lease, so the blind release would silently strip
+    // write from the pane the user is actually looking at. The marker rotates on
+    // every acquisition, so a compensation can name the lease *as it acquired it*
+    // and be refused once somebody else has taken it over.
+    let now = 1_000;
+    let issued = 0;
+    const audit = new MemoryAudit();
+    const manager = new TerminalControlManager({
+      secret: SECRET,
+      audit,
+      ttlMs: 10_000,
+      now: () => now,
+      opMarker: () => `op-${++issued}`,
+    });
+    const owner = actor('ou_owner');
+    const first = manager.takeover(owner, 's1');
+    expect(first).toEqual({ ok: true, mode: 'controlled', expiresAt: 11_000, reused: false, marker: 'op-1' });
+    // The marker is a plain equality nonce, NOT the signed grant's internal id —
+    // that one must never reach a browser.
+    expect(manager.grantForProxy(owner, 's1').leaseMarker).not.toBe('op-1');
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, marker: 'op-1',
+    });
+
+    // A second pane under the same login takes over: same lease, new marker.
+    now = 2_000;
+    expect(manager.takeover(owner, 's1')).toEqual({
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: true, marker: 'op-2',
+    });
+
+    // The first pane's late compensation names op-1 and must be refused.
+    expect(manager.release(owner, 's1', 'op-1')).toEqual({ ok: false, error: 'control_lease_superseded' });
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, marker: 'op-2',
+    });
+    // Naming the current acquisition still releases; so does an unconditional one.
+    expect(manager.release(owner, 's1', 'op-2')).toEqual({ ok: true, mode: 'readonly', released: true });
+    expect(manager.state(owner, 's1')).toEqual({ mode: 'readonly', owned: false });
+    // Another auth session's marker guess never leaks the lease either.
+    manager.takeover(owner, 's1');
+    expect(manager.release(actor('ou_other'), 's1', 'op-3')).toEqual({
+      ok: false, error: 'control_owned_by_another_session',
+    });
+    // A trusted platform owner has no lease at all, hence no marker to compare.
+    const platform = { ...actor('platform-owner'), terminalCapability: 'owner' as const };
+    const platformTakeover = manager.takeover(platform, 's2');
+    expect(platformTakeover.ok).toBe(true);
+    expect('marker' in platformTakeover).toBe(false);
   });
 
   it('explicit release destroys writable sockets and returns the next connection to read-only', () => {
@@ -144,7 +198,9 @@ describe('terminal server-side takeover lifecycle', () => {
 
     const staleSocket = { destroyed: false, destroy() { this.destroyed = true; } };
     expect(manager.registerWritableSocket(owner, 's1', staleSocket, stale.leaseMarker)).toEqual({ registered: false });
-    expect(manager.state(owner, 's1')).toEqual({ mode: 'controlled', owned: true, expiresAt: 11_000 });
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, marker: expect.any(String),
+    });
 
     const currentSocket = { destroyed: false, destroy() { this.destroyed = true; } };
     expect(manager.registerWritableSocket(owner, 's1', currentSocket, current.leaseMarker).registered).toBe(true);

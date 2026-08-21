@@ -331,6 +331,68 @@ function leaseApi(options: {
   };
 }
 
+/**
+ * 会记账的租约替身：像服务端那样把租约挂在**会话**上（不挂在面板上），并给每一次
+ * 接管发一个新的 op marker。两件事都是复现「卸载补偿踩掉别人租约」所必需的——
+ * 同一个登录里第二块面板接管拿到的是**同一把**租约，只有 marker 会变。
+ */
+function leaseServer(): {
+  api: WorkbenchApi;
+  calls: string[];
+  controlled(): boolean;
+  marker(): string | null;
+  /** 模拟「别的标签页又接管了一次」：租约不变，marker 往前滚。 */
+  supersede(): void;
+  /** 拦住下一次 takeover 的**回执**（服务端受理照常发生，只是响应迟到）。 */
+  holdNextTakeover(): { resolve(): void; reject(error: unknown): void };
+} {
+  const calls: string[] = [];
+  let marker: string | null = null;
+  let ops = 0;
+  let held: { promise: Promise<void>; resolve(value: void): void; reject(error: unknown): void } | null = null;
+  const snapshot = (): TerminalControlState => (marker === null
+    ? READONLY
+    : { mode: 'controlled', owned: true, expiresAt: NOW + 60_000, marker });
+  return {
+    calls,
+    controlled: () => marker !== null,
+    marker: () => marker,
+    supersede() { ops += 1; marker = `op-${ops}`; },
+    holdNextTakeover() {
+      const gate = deferred<void>();
+      held = gate;
+      return { resolve: () => gate.resolve(undefined), reject: error => gate.reject(error) };
+    },
+    api: {
+      ...baseApi,
+      getTerminalControl: async () => {
+        calls.push('get');
+        return snapshot();
+      },
+      takeoverTerminal: async (sessionId: string) => {
+        calls.push(`takeover:${sessionId}`);
+        // 服务端在**受理这一刻**就发了租约；下面那道闸只按住回执。
+        ops += 1;
+        marker = `op-${ops}`;
+        const answer = snapshot();
+        const gate = held;
+        held = null;
+        if (gate) await gate.promise;
+        return answer;
+      },
+      releaseTerminal: async (sessionId: string, _signal?: AbortSignal, expectedMarker?: string) => {
+        calls.push(`release:${sessionId}:${expectedMarker ?? '*'}`);
+        if (marker === null) return READONLY;
+        if (expectedMarker !== undefined && expectedMarker !== marker) {
+          throw new WorkbenchApiError(403, 'control_lease_superseded');
+        }
+        marker = null;
+        return READONLY;
+      },
+    },
+  };
+}
+
 afterEach(() => { vi.useRealTimers(); });
 
 // ─── ⓪ 行内操作集：只剩 聊天 / 终端 ─────────────────────────────────────────
@@ -884,6 +946,103 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     expect(worker).toContain('var hasToken=${hasWrite}');
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('{ hasToken?: unknown }');
+  });
+});
+
+// ─── ① 卸载补偿：按标记精确释放，别把别人的租约踩掉 ──────────────────────────
+describe('卸载补偿只还自己那一次接管拿到的租约', () => {
+  /**
+   * 租约挂在（会话 × 登录）上，不挂在面板上：同一个登录里第二块面板 takeover，拿到
+   * 的是**同一把**租约。所以「按 sessionId 无条件 release」这条补偿在服务端看来完全
+   * 合法，实际却是把用户此刻正在用的那块终端的写权限收走。
+   */
+  it('迟到的接管回执遇上正在使用同一把租约的新面板 → 一个 release 都不发', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const server = leaseServer();
+
+    // ① 第一块面板发起接管，服务端受理了，但回执被按住。
+    const gate = server.holdNextTakeover();
+    const first = await renderPane(server.api);
+    await act(async () => {
+      paneControl(first, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(server.controlled()).toBe(true);
+    // ② 面板没了（关标签页 / 切会话 / 离开工作台）。
+    act(() => first.unmount());
+
+    // ③ 同一个登录里另一块面板挂上来并接管：同一把租约，marker 往前滚。
+    const second = await renderPane(server.api);
+    await act(async () => {
+      paneControl(second, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(second)).toBe('controlled');
+    const liveMarker = server.marker();
+
+    // ④ 第一块面板的回执现在才到。回归的形状：它按 sessionId 无条件 release，
+    //    第二块面板的写权限被凭空收走，用户正打着字就变成只读。
+    await act(async () => {
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await settle();
+    expect(server.calls.filter(call => call.startsWith('release'))).toEqual([]);
+    expect(server.controlled()).toBe(true);
+    expect(server.marker()).toBe(liveMarker);
+    expect(paneMode(second)).toBe('controlled');
+    act(() => second.unmount());
+  });
+
+  it('没有活面板但租约已被别处接管：补偿带着自己的 marker 发出去，被服务端拒掉', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const server = leaseServer();
+    const gate = server.holdNextTakeover();
+    const pane = await renderPane(server.api);
+    await act(async () => {
+      paneControl(pane, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const mine = server.marker();
+    act(() => pane.unmount());
+
+    // 另一个标签页（这份文档里看不见的活面板）又接管了一次：同一把租约，新 marker。
+    server.supersede();
+    await act(async () => {
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await settle();
+    // 补偿确实发了，而且**指名道姓**说的是自己那一次；服务端据此拒绝。
+    expect(server.calls).toContain(`release:session-a:${mine}`);
+    expect(server.controlled()).toBe(true);
+  });
+
+  it('回执直接失败且面板已卸载：不许裸 return——拿权威读数复核，确认落地就按 marker 收掉', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const server = leaseServer();
+    const gate = server.holdNextTakeover();
+    const pane = await renderPane(server.api);
+    await act(async () => {
+      paneControl(pane, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // 服务端已经把租约发出来了，只是回执在路上丢了。
+    expect(server.controlled()).toBe(true);
+    act(() => pane.unmount());
+
+    await act(async () => {
+      gate.reject(new WorkbenchApiError(502, 'terminal_unavailable'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await settle();
+    // 回归的形状：catch 里 `if (!mounted.current) return;`，租约从此没人管，
+    // 一直挂到 TTL 到期为止。
+    expect(server.calls.some(call => call.startsWith('release:session-a:op-'))).toBe(true);
+    expect(server.controlled()).toBe(false);
   });
 });
 

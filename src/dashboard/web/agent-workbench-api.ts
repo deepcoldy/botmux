@@ -8,6 +8,17 @@ export interface TerminalControlState {
   reused?: boolean;
   /** Trusted platform owners have a fixed role, not a releasable takeover lease. */
   fixed?: boolean;
+  /**
+   * Opaque marker of the acquisition this lease is currently on (server-side
+   * `opMarker`). Present only when this login owns a real lease.
+   *
+   * It carries no authority — it is an equality nonce for compare-and-swap
+   * release. The lease lives on (session x login), so a second pane of the SAME
+   * login reuses the very same lease: without naming the acquisition, a late
+   * compensation for a pane that is already gone would release the lease the
+   * user is actively typing into.
+   */
+  marker?: string;
 }
 
 export interface PreviewInteractionState {
@@ -20,7 +31,15 @@ export interface PreviewInteractionState {
 export interface WorkbenchApi {
   getTerminalControl(sessionId: string, signal?: AbortSignal): Promise<TerminalControlState>;
   takeoverTerminal(sessionId: string, signal?: AbortSignal): Promise<TerminalControlState>;
-  releaseTerminal(sessionId: string, signal?: AbortSignal): Promise<TerminalControlState>;
+  /** `expectedMarker` turns the release into a compare-and-swap: the server only
+   *  gives the lease up while it is still the acquisition the caller names, and
+   *  answers `control_lease_superseded` once somebody else has taken it over.
+   *  Compensation paths (a receipt that outlived its pane) must pass it. */
+  releaseTerminal(
+    sessionId: string,
+    signal?: AbortSignal,
+    expectedMarker?: string,
+  ): Promise<TerminalControlState>;
   getPreviewInteraction(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
   unlockPreview(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
   touchPreview(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
@@ -126,6 +145,11 @@ function terminalControlState(value: unknown, fallbackOwned?: boolean): Terminal
   if (reused !== undefined && typeof reused !== 'boolean') {
     throw new WorkbenchApiError(502, 'invalid_control_response');
   }
+  // Bounded opaque string; it only ever travels back out as a query parameter.
+  const marker = body.marker === undefined ? undefined : body.marker;
+  if (marker !== undefined && (typeof marker !== 'string' || !marker || marker.length > 256)) {
+    throw new WorkbenchApiError(502, 'invalid_control_response');
+  }
   if (fixed === true && (body.mode !== 'controlled' || !owned || expiresAt !== undefined)) {
     throw new WorkbenchApiError(502, 'invalid_control_response');
   }
@@ -135,6 +159,7 @@ function terminalControlState(value: unknown, fallbackOwned?: boolean): Terminal
     ...(expiresAt === undefined ? {} : { expiresAt }),
     ...(reused === undefined ? {} : { reused }),
     ...(fixed === undefined ? {} : { fixed }),
+    ...(marker === undefined ? {} : { marker }),
   };
 }
 
@@ -192,8 +217,16 @@ function sameOriginViewLink(path: string): string {
   }
 }
 
-function controlPath(sessionId: string, action?: 'takeover' | 'release'): string {
-  return `/api/sessions/${encodeURIComponent(sessionId)}/control${action ? `/${action}` : ''}`;
+function controlPath(
+  sessionId: string,
+  action?: 'takeover' | 'release',
+  expectedMarker?: string,
+): string {
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/control${action ? `/${action}` : ''}`;
+  // The marker is a CAS condition, not a credential: it names which acquisition
+  // the caller is giving up. A server that does not (yet) read it simply performs
+  // the unconditional release it always did.
+  return expectedMarker ? `${path}?expect=${encodeURIComponent(expectedMarker)}` : path;
 }
 
 function previewPath(sessionId: string, action?: 'unlock' | 'activity' | 'lock'): string {
@@ -209,8 +242,12 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
       await jsonRequest(fetchImpl, controlPath(sessionId, 'takeover'), { method: 'POST', signal }),
       true,
     ),
-    releaseTerminal: async (sessionId, signal) => terminalControlState(
-      await jsonRequest(fetchImpl, controlPath(sessionId, 'release'), { method: 'POST', signal }),
+    releaseTerminal: async (sessionId, signal, expectedMarker) => terminalControlState(
+      await jsonRequest(
+        fetchImpl,
+        controlPath(sessionId, 'release', expectedMarker),
+        { method: 'POST', signal },
+      ),
       false,
     ),
     getPreviewInteraction: async (sessionId, signal) => previewInteractionState(

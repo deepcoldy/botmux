@@ -27,10 +27,13 @@ import {
 import {
   WorkbenchApiError,
   type PreviewInteractionState,
+  type TerminalControlState,
   type WorkbenchApi,
 } from './agent-workbench-api.js';
 // 控制权只有一份状态机（面板侧 + 外层意图），见该文件头部的注释。
 import {
+  claimTerminalWrite,
+  hasLiveTerminalWriteClaim,
   initialTerminalControlModel,
   terminalControlBusy,
   terminalControlMode,
@@ -452,6 +455,37 @@ export function TerminalPane(props: PaneCommonProps & {
     if (control.mode === 'controlled' && control.owned) void mutate('release');
   });
 
+  /**
+   * 面板已经没了，而这次写**可能**已经在服务端落地：收掉没人管的写租约。
+   *
+   * 三条判据缺一不可：
+   *   ① 这份文档里还有活面板攥着同一把租约 → 它不是孤儿，别动。租约挂在
+   *      （会话 × 登录）上，第二块面板 takeover 拿到的是同一把，服务端看来两次
+   *      请求完全同形，只有这里分得清。
+   *   ② 回执丢了（失败 / 超时）时先拿一次**权威读数**：这次写到底有没有落地。
+   *      以前这条分支是裸 `return`，于是「服务端已经发了租约、回执却没回来」的
+   *      租约从此没人管，一直挂到 TTL 到期。
+   *   ③ 释放时带上 marker，说明白要还的是**哪一次**接管。跨标签页 / 跨设备的
+   *      抢先接管只有服务端看得见，marker 不匹配时它会拒绝（P1 的 CAS）。
+   */
+  const compensateUnmounted = useCallback(async (settled: TerminalControlState | null) => {
+    if (hasLiveTerminalWriteClaim(sessionId)) return;
+    let marker = settled?.marker;
+    if (settled) {
+      // 拿到回执了：只有真的握到手的接管才需要还。释放成功没有东西要还，恒可写
+      // 身份压根没有租约。
+      if (settled.fixed === true || settled.mode !== 'controlled' || !settled.owned) return;
+    } else {
+      const authoritative = await props.api.getTerminalControl(sessionId).catch(() => null);
+      if (!authoritative || authoritative.fixed === true) return;
+      if (authoritative.mode !== 'controlled' || !authoritative.owned) return;
+      // 复核这一个 await 的工夫里可能已经有新面板接手了。
+      if (hasLiveTerminalWriteClaim(sessionId)) return;
+      marker = authoritative.marker;
+    }
+    await props.api.releaseTerminal(sessionId, undefined, marker).catch(() => {});
+  }, [props.api, sessionId]);
+
   const mutate = async (action: TerminalWriteAction) => {
     const epoch = ++writeEpoch.current;
     dispatch({ type: 'write-start', epoch, action });
@@ -461,20 +495,29 @@ export function TerminalPane(props: PaneCommonProps & {
         ? props.api.takeoverTerminal(sessionId, signal)
         : props.api.releaseTerminal(sessionId, signal)));
       if (!mounted.current) {
-        // 面板已经没了，服务端却刚刚把写租约发给了这次调用（关面板 / 换会话 /
-        // 离开工作台都会走到这里）。精确补偿：只还**真的拿到手的接管**——释放成功
-        // 本来就没有东西要还，失败的接管也没有租约可还，恒可写身份更没有租约。
-        if (action === 'takeover' && next.mode === 'controlled' && next.owned && next.fixed !== true) {
-          void props.api.releaseTerminal(sessionId).catch(() => {});
-        }
+        // 服务端刚刚把写租约发给了这次调用，面板却已经关掉 / 换会话 / 离开工作台。
+        void compensateUnmounted(next);
         return;
       }
       dispatch({ type: 'write-settled', epoch, control: next });
     } catch (cause) {
-      if (!mounted.current) return;
+      if (!mounted.current) {
+        // 失败不代表服务端没受理——超时、断连都只是丢了回执。这里**不能**裸 return。
+        void compensateUnmounted(null);
+        return;
+      }
       dispatch({ type: 'write-failed', epoch, error: apiErrorText(cause) });
     }
   };
+
+  // 只要这块面板**可能**握着写租约，就在登记簿上留个名：别的面板的迟到补偿据此
+  // 知道「这把租约还有人在管」。卸载时 effect 的清理先跑，补偿的续行在其后的微
+  // 任务里，所以补偿看到的永远是**别人**的认领，不是自己的。
+  const writeClaim = useRef({});
+  useEffect(() => {
+    if (!model.mayWrite) return undefined;
+    return claimTerminalWrite(sessionId, writeClaim.current);
+  }, [model.mayWrite, sessionId]);
 
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const frameKey = `${sessionId}-${model.frameGeneration}`;
