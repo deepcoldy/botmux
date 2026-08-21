@@ -1263,6 +1263,35 @@ describe('首屏控制权 GET 失败不许落成「只读」', () => {
     act(() => renderer.unmount());
   });
 
+  it('没有接管能力的身份读失败 → 照旧只读：它压根不可能握着租约，别糊一层遮罩', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    // 租约只有能 takeover 的身份才拿得到（P1-4 服务端投影的最小能力集）。平台
+    // teammate / guest 这类身份读失败时说「未知」是虚惊一场，还会把它们唯一能用的
+    // 只读终端也撤下来。
+    const offline: WorkbenchApi = {
+      ...baseApi,
+      getTerminalControl: async () => { throw new WorkbenchApiError(503, 'daemon_offline'); },
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: PAIR()[0],
+        api: offline,
+        authenticated: true,
+        capabilities: { canLocate: true, canControl: false, canInteract: true },
+        now: NOW,
+        location: LOCATION,
+      }));
+    });
+    await settle();
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(maskShown(renderer)).toBe(false);
+    expect(terminalFrames(renderer)).toBe(1);
+    expect(feedback(renderer)).toContain('所属 daemon 已离线');
+    act(() => renderer.unmount());
+  });
+
   it('读通之后再失败照旧保留权威读数（这条既有行为不许被上面那条改坏）', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);

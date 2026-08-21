@@ -89,7 +89,15 @@ export interface TerminalControlModel {
 export type TerminalControlEvent =
   | { type: 'observe-start'; epoch: number; source: 'load' | 'poll' | 'reconcile' }
   | { type: 'observe-settled'; epoch: number; control: TerminalControlState }
-  | { type: 'observe-failed'; epoch: number; error: string }
+  | {
+    type: 'observe-failed';
+    epoch: number;
+    error: string;
+    /** 这个身份**有没有可能**握着写租约（能 takeover 才有）。首屏就读不到时它是
+     *  唯一的判据：能握租约的身份必须按未知处理（可能真的能打字），永远握不到的
+     *  身份说未知只是虚惊一场，还会把它唯一能用的只读终端也撤下来。 */
+    canHoldLease: boolean;
+  }
   /** 没有凭证 / 没有终端可框：控制权接口只会 401，直接落到只读，不发请求。 */
   | { type: 'settle-readonly' }
   | { type: 'write-start'; epoch: number; action: TerminalWriteAction }
@@ -196,15 +204,26 @@ export function terminalControlReducer(
       // 不该盖掉刚落地的写回执（首屏失败时两边都是 0，照旧放行）。
       if (state.observeIssueEpoch < state.settledWriteEpoch) return state;
       const error = { text: event.error, from: 'observe' as const };
-      // 从来没读到过权威状态（首屏就失败，daemon 抖一下是典型）。这里**不能**落只读：
-      // 租约挂在（会话 × 登录）上，不挂在这块面板上——同一个登录里上一块面板接管过、
-      // 这块面板刚挂上来时，服务端那把写租约仍在，前置代理照旧会给这个 iframe 补
-      // WRITE grant，也就是说它**真的能打字**。此时说一句「只读」既是没有依据的结论，
-      // 又顺手把遮罩取消了（mayWrite=false），等于给可写终端盖了个只读的章。
-      // 照实说未知：mayWrite 保持为真，遮罩挡住盲输入，等下一拍轮询或用户手动重试
-      // 把它收敛掉。
-      if (!state.authoritative) {
+      // 从来没读到过权威状态（首屏就失败，daemon 抖一下是典型）。能接管的身份这里
+      // **不能**落只读：租约挂在（会话 × 登录）上，不挂在这块面板上——同一个登录里上
+      // 一块面板接管过、这块面板刚挂上来时，服务端那把写租约仍在，前置代理照旧会给
+      // 这个 iframe 补 WRITE grant，也就是说它**真的能打字**。此时说一句「只读」既是
+      // 没有依据的结论，又顺手把遮罩取消了（mayWrite=false），等于给可写终端盖了个
+      // 只读的章。照实说未知：mayWrite 保持为真，遮罩挡住盲输入，等下一拍轮询或用户
+      // 手动重试把它收敛掉。
+      if (!state.authoritative && event.canHoldLease) {
         return { ...state, phase: 'unknown', mayWrite: true, error };
+      }
+      // 永远拿不到租约的身份（平台 teammate / guest、触屏那条 viewToken 只读通道）：
+      // 「只读 + 说明原因」就是事实，也不该把它唯一能看的终端撤掉。
+      if (!state.authoritative) {
+        return {
+          ...state,
+          phase: 'readonly',
+          authoritative: { mode: 'readonly', owned: false },
+          mayWrite: false,
+          error,
+        };
       }
       // 已经有过权威读数：一次读失败推翻不了它——尤其不该把「我正握着写租约」改口
       // 成只读。保留原判，把错误说出来，等下一拍轮询自己收敛。

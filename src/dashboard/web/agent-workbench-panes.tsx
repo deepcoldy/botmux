@@ -460,9 +460,16 @@ export function TerminalPane(props: PaneCommonProps & {
       dispatch({ type: 'observe-settled', epoch, control: next });
     } catch (cause) {
       if (signal?.aborted) return;
-      dispatch({ type: 'observe-failed', epoch, error: apiErrorText(cause) });
+      dispatch({
+        type: 'observe-failed',
+        epoch,
+        error: apiErrorText(cause),
+        // 触屏走的是 viewToken 只读通道，没有租约可言；无 canControl 的身份连
+        // takeover 都会 403。这两类读失败落只读才是事实。
+        canHoldLease: props.capabilities.canControl && !touch,
+      });
     }
-  }, [externalTerminalUrl, props.api, props.authenticated, sessionId, terminalUrl]);
+  }, [externalTerminalUrl, props.api, props.authenticated, props.capabilities.canControl, sessionId, terminalUrl, touch]);
 
   useEffect(() => {
     const controller = new AbortController();
