@@ -13,6 +13,7 @@ import {
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
+import { estimateCostCny, type ResolvedModelPricing } from '../services/model-pricing.js';
 import {
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
@@ -50,13 +51,16 @@ export interface SessionContextUsage {
  * is cumulative for the Session; neither value is inferred from the other.
  * `turnTokens` is the delta for the latest user turn (cumulative since the last
  * user message) — small, matches what the CLI's own TUI shows for "this turn",
- * whereas `tokens` is the whole-session cumulative (cache-inclusive, large). */
+ * whereas `tokens` is the whole-session cumulative (cache-inclusive, large).
+ * `costCny` is the cumulative CNY estimate for the whole session (pricing-gated:
+ * absent when no pricing is supplied or the session model is unpriced). */
 export interface SessionUsageSnapshot {
   context: SessionContextUsage | null;
   tokens: SessionTokenUsage | null;
   turnTokens: { in: number; out: number } | null;
   model?: string;
   reasoningEffort?: string;
+  costCny?: number;
 }
 
 export interface SessionTokenUsageQuery {
@@ -70,6 +74,10 @@ export interface SessionTokenUsageQuery {
   /** Bypass the reparse throttle (stat short-circuit and incremental folding
    *  still apply). Use at low-frequency exact points like ledger/card snapshots. */
   fresh?: boolean;
+  /** Optional pricing for CNY cost estimation. When supplied (and the session
+   *  model is priced), getSessionUsageSnapshot fills `costCny` on the
+   *  cumulative token totals — distinct from the ledger's per-delta cost. */
+  pricing?: ResolvedModelPricing;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1373,6 +1381,9 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     && (agg.turnInputTokens > 0 || agg.turnOutputTokens > 0)
     ? { in: agg.turnInputTokens, out: agg.turnOutputTokens }
     : null;
+  // 累计口径金额（区别于 ledger 的 delta 口径）：无 pricing 或模型未定价时
+  // estimateCostCny 返回 null，字段缺省而非报错。
+  const costCny = read?.result ? estimateCostCny(read.result, q.pricing) : null;
   return {
     context: agg?.latestContextUsage ?? null,
     tokens: read?.result ?? null,
@@ -1382,6 +1393,7 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     // be internal routing codes and intentionally never surface on cards.
     ...(q.cliId === 'grok' && agg?.model ? { model: agg.model } : {}),
     ...(q.cliId === 'grok' && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
 }
 
