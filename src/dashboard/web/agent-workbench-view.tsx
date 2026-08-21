@@ -209,6 +209,12 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   const [terminal, setTerminal] = useState<WorkbenchTerminalIntent | null>(null);
   const terminalSessionId = terminal?.sessionId ?? null;
   const terminalWantsControl = terminal?.wantsControl ?? false;
+  /** 这个身份是不是**恒可写**（平台所有者：没有租约可接管，也就没有只读模式）。
+   *  它是身份级的事实，不随会话变，所以一旦从任意一块面板的回执里学到，就对整张
+   *  列表生效：行内不再画那个对它毫无意义的「接管」按钮，「终端」的说明也不再写
+   *  「只读」（P1-4：不改服务端，但也不要留一句与实际能力相反的文案）。 */
+  const [fixedTerminalIdentity, setFixedTerminalIdentity] = useState(false);
+
   /** 只有行内的「终端 / 接管」按钮走这里 —— 接管意图只能由这条路产生。
    *  没有 canControl 能力时把意图压回只读：既不该发出注定 403 的 takeover，
    *  也不该让面板顶着一个实现不了的「接管中」状态。 */
@@ -220,6 +226,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   /** 面板回执：把它真实的模式记回意图里。只改回执那几个字段，不动 wantsControl /
    *  generation —— 那两个决定面板的 key，被回执带着走就会无谓重挂，终端连接跟着断。 */
   const noteTerminalControlMode = useCallback((mode: TerminalPaneControlMode) => {
+    if (mode.fixed) setFixedTerminalIdentity(true);
     setTerminal(current => receiveTerminalIntentMode(current, mode));
   }, []);
 
@@ -516,7 +523,12 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       // P1-17：触屏一并不渲染行内「接管」。那边的终端挂的是 viewToken 只读通道，
       // 接管到手也送不进输入（面板早就跳过 auto-takeover 了），行里还摆着这个按钮
       // 只会让人反复点一个注定没反应的入口。
-      canControlTerminal={props.capabilities.canControl && !touch}
+      // P1-4：恒可写身份（平台所有者）同样收敛成一个「终端」开关——它没有租约可
+      // 接管，两个按钮做的是同一件事，摆两个只会让人以为存在只读模式。
+      canControlTerminal={props.capabilities.canControl && !touch && !fixedTerminalIdentity}
+      // 行内按钮的文案要跟这个身份真实的能力一致：恒可写身份点开就是可输入的终端，
+      // 再写「打开只读终端」就是明着说反话。
+      fixedTerminal={fixedTerminalIdentity}
       // 有写在途时禁用这一行的终端按钮：连点只会再发一条 takeover/release，
       // 第一条的租约反而没有任何面板在管。
       terminalBusySessionId={terminal?.busy ? terminal.sessionId : null}

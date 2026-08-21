@@ -1,8 +1,10 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js';
-import { TerminalPane } from '../src/dashboard/web/agent-workbench-panes.js';
+import { TerminalPane, type TerminalFrameWrite } from '../src/dashboard/web/agent-workbench-panes.js';
 import {
   WorkbenchApiError,
   type TerminalControlState,
@@ -23,6 +25,8 @@ import type { WorkbenchSessionRow } from '../src/dashboard/web/agent-workbench-m
  *      精确补偿掉；快速双击「接管」只许发一次；15 秒观察轮询不许丢掉在途写的回执。
  *   3. release 失败：不许乐观宣称只读——保留最后一次权威读数、盖住可写 iframe、
  *      立刻 GET 复核。
+ *   4. fixed / touch 的只读语义：恒可写身份行内收敛成一个开关且文案如实；触屏文案
+ *      跟着这块 iframe 真实的写权限走。
  */
 
 const FULL_CAPABILITIES: WorkbenchCapabilities = { canLocate: true, canControl: true, canInteract: true };
@@ -464,6 +468,116 @@ describe('release 失败不许乐观宣称只读', () => {
     expect(paneMode(renderer)).toBe('readonly');
     expect(maskShown(renderer)).toBe(false);
     act(() => renderer.unmount());
+  });
+});
+
+// ─── ④ fixed / touch 的只读语义（P1-4）──────────────────────────────────────
+describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
+  it('平台 owner：行内收敛成一个「终端」开关，文案不再写「只读」，也不发任何控制 POST', async () => {
+    const lease = leaseApi({ fixed: true });
+    const renderer = await renderView(lease.api);
+
+    // 还不知道身份时两个入口都在（第一次点开之前没有任何依据）。
+    expect(rowAction(renderer, 'Session A', 'terminal-control')).not.toBeNull();
+
+    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    expect(pane(renderer)).not.toBeNull();
+    expect(paneMode(renderer)).toBe('controlled');
+
+    // 面板回执带回 fixed：这是身份级事实，整张列表都收敛成一个开关。
+    expect(rowAction(renderer, 'Session A', 'terminal-control')).toBeNull();
+    expect(rowAction(renderer, 'Session B', 'terminal-control')).toBeNull();
+    const toggle = rowAction(renderer, 'Session A', 'terminal')!;
+    expect(toggle.props.title).toBe('打开终端（当前身份可直接输入）');
+    expect(toggle.props.title).not.toContain('只读');
+
+    // 一个按钮 = 一个开关：点一次关、再点一次开。
+    await clickRowAction(renderer, 'Session A', 'terminal');
+    expect(pane(renderer)).toBeNull();
+    await clickRowAction(renderer, 'Session A', 'terminal');
+    expect(pane(renderer)).not.toBeNull();
+    expect(paneMode(renderer)).toBe('controlled');
+
+    // 恒可写身份没有租约，别对它发注定 403 的 takeover/release。
+    expect(lease.calls.filter(call => call !== 'get')).toEqual([]);
+    act(() => renderer.unmount());
+  });
+
+  async function renderTouchPane(options: {
+    fixed?: boolean;
+    write: TerminalFrameWrite;
+  }): Promise<TestRenderer.ReactTestRenderer> {
+    const previousWindow = (globalThis as Record<string, unknown>).window;
+    (globalThis as Record<string, unknown>).window = {
+      matchMedia: (query: string) => ({
+        matches: query === '(hover: none)',
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    };
+    const lease = leaseApi({ fixed: options.fixed });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(TerminalPane, {
+          session: PAIR()[0],
+          api: {
+            ...lease.api,
+            getTerminalViewLink: async () => ({ url: '/s/session-a?viewToken=cap', expiresAt: null }),
+          },
+          authenticated: true,
+          capabilities: FULL_CAPABILITIES,
+          now: NOW,
+          location: LOCATION,
+          readFrameWrite: () => options.write,
+        }));
+      });
+      await settle();
+    } finally {
+      if (previousWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+      else (globalThis as Record<string, unknown>).window = previousWindow;
+    }
+    return renderer;
+  }
+
+  it('触屏 + 恒可写身份 + 这块 iframe 自报可写 → 说「可输入」，不再写死「手机端只读」', async () => {
+    const renderer = await renderTouchPane({ fixed: true, write: 'writable' });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(feedback(renderer)).toContain('手机端也可直接输入');
+    expect(feedback(renderer)).not.toContain('手机端为只读视图');
+    act(() => renderer.unmount());
+  });
+
+  it('触屏 + 普通身份 → 照旧只读（那条 viewToken 通道确实只读）', async () => {
+    const renderer = await renderTouchPane({ write: 'readonly' });
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(feedback(renderer)).toContain('手机端为只读视图');
+    act(() => renderer.unmount());
+  });
+
+  it('触屏 + 恒可写身份 + 读不出这块 iframe 的写权限 → 说未知，不冒充只读', async () => {
+    const renderer = await renderTouchPane({ fixed: true, write: 'unknown' });
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(feedback(renderer)).toContain('以终端页内的提示为准');
+    act(() => renderer.unmount());
+  });
+
+  it('触屏 + 普通身份 + 读不出写权限 → 仍说只读：那条通道对非 owner 必定只读', async () => {
+    const renderer = await renderTouchPane({ write: 'unknown' });
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(feedback(renderer)).toContain('手机端为只读视图');
+    act(() => renderer.unmount());
+  });
+
+  it('触屏读的那把钥匙是跨文件契约：终端页仍然导出同名的 hasToken 全局', () => {
+    // 面板靠同源 iframe 里的 `window.hasToken` 判断这块终端到底能不能写
+    // （readTerminalFrameWrite）。这个名字由 worker 渲染终端页时写下，两处必须
+    // 对得上：worker 改名而这里不改，面板会静默退回「读不出来」，触屏文案又会
+    // 悄悄回到写死的「手机端只读」——正是本次要修掉的那句反话。
+    const worker = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(worker).toContain('var hasToken=${hasWrite}');
+    const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
+    expect(panes).toContain('{ hasToken?: unknown }');
   });
 });
 

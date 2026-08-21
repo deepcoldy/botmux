@@ -145,10 +145,14 @@ export interface WorkbenchSessionListProps {
   /** Row-level shortcuts: jump straight to a surface instead of selecting the
    *  session and then hunting for the layout control. */
   onOpenSurface?(sessionId: string, surface: 'terminal' | 'terminal-control' | 'chat'): void;
-  /** P1-4：显式传 false 时不渲染行内「接管」捷径（只留只读「终端」）——没有
-   *  canControl 能力的身份（平台 teammate/guest、触屏 H5）接管必 403。不传按
-   *  旧行为渲染（dock 等不带能力投影的精简形态）。 */
+  /** P1-4：显式传 false 时不渲染行内「接管」捷径（只留「终端」一个开关）——没有
+   *  canControl 能力的身份（平台 teammate/guest、触屏 H5）接管必 403；恒可写的
+   *  平台所有者也走这条，它没有租约可接管。不传按旧行为渲染（dock 等不带能力
+   *  投影的精简形态）。 */
   canControlTerminal?: boolean;
+  /** 恒可写身份（平台所有者）：「终端」按钮点开就是可输入的终端，说明文案不能
+   *  再写「只读」（P1-4：宁可不提只读，也不留一句与实际能力相反的话）。 */
+  fixedTerminal?: boolean;
   /** 这个会话的终端面板有写请求在途：两个终端按钮此刻禁用，连点不会再发一条
    *  takeover/release，也不会在 POST 回执前把面板关掉。 */
   terminalBusySessionId?: string | null;
@@ -599,7 +603,14 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                         );
                       })() : null}
                       {([
-                        ['terminal', '打开只读终端', '终端'] as const,
+                        [
+                          'terminal',
+                          // 恒可写身份点开就能输入，这里再写「只读」等于说反话；
+                          // 普通身份的「终端」确实是只读打开（面板会把攥着的租约
+                          // 还回去），照旧说清楚。
+                          props.fixedTerminal ? '打开终端（当前身份可直接输入）' : '打开只读终端',
+                          '终端',
+                        ] as const,
                         // 接管捷径只对有 canControl 能力的身份渲染（P1-4）；
                         // undefined（dock/旧调用方）保持旧行为。
                         ...(props.canControlTerminal !== false

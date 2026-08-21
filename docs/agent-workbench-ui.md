@@ -48,7 +48,9 @@ Dock web_app AppLinks use mode=sidebar, min_width=350 and max_width=520. Full Wo
 
 ## Preview and Terminal
 
-Terminal starts READ ONLY (只读). 接管输入 calls the server-authoritative lease API; release, expiry or write-WebSocket disconnect returns it to read-only. Touch environments always use the read-only viewToken channel and hide the takeover control. The browser never receives a signed write grant.
+Terminal starts READ ONLY (只读). 接管输入 calls the server-authoritative lease API; release, expiry or write-WebSocket disconnect returns it to read-only. Control state is a single explicit machine — loading / taking-over / controlled / releasing / unknown — with separate epochs for observation polls and writes, so a 15s poll can never discard an in-flight write result, and a failed write lands in 未知 (masking the possibly-writable frame and re-reading the server) instead of optimistically claiming read-only.
+
+Touch environments use the viewToken channel and hide the takeover control, because that channel carries no lease to take over. It is not unconditionally read-only: a verified platform owner opening a viewToken link still receives the signed WRITE grant the front proxy mints for that identity (#960), so the pane reports what the framed terminal page itself resolved (its own `hasToken`) rather than asserting "phones are read-only". Trusted platform owners have a fixed, always-writable role instead of a lease, so their rows collapse to a single 终端 toggle and never claim to open a read-only terminal.
 
 Web accepts only the exact /preview/<encoded-session-id>/ descriptor for the selected session. It starts 预览 (PREVIEW), enters 可交互 (INTERACTIVE) only after explicit 开启交互, sends bounded activity updates and fails closed to Preview, relocking after 15 idle minutes. The visible security notice says the overlay prevents accidental interaction but is not an application security sandbox — the actual trust boundary is the opaque origin the app is framed in, which is what keeps it away from the dashboard DOM, cookies and management APIs.
 

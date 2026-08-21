@@ -84,6 +84,28 @@ export function readTerminalFrameStatus(frame: HTMLIFrameElement | null): Termin
   }
 }
 
+/** 终端页自己算出来的写权限。`unknown` = 读不出来（跨域、页面还没跑到那一行）。 */
+export type TerminalFrameWrite = 'writable' | 'readonly' | 'unknown';
+
+/** 生产实现：终端页把这次 GET 拿到的 grant 是不是 write，写进它自己的全局
+ *  `hasToken`（worker.ts 的 `var hasToken=${hasWrite}`）。工作台和终端页同源，
+ *  所以这是「这块 iframe 到底能不能输入」的第一手事实——比任何外部推断都准。
+ *
+ *  为什么需要它：触屏挂的是带 viewToken 的只读通道，但前置代理会给**平台所有者**
+ *  的 viewToken 请求补一个 WRITE grant（#960），而这条补签又取决于这个 WebView
+ *  的请求带不带 Cookie。于是同一份 UI 在 Android Chrome 上其实可写、在 iOS
+ *  WebView 上只读。与其写死一句「手机端只读」，不如照实读这一页的结论。 */
+export function readTerminalFrameWrite(frame: HTMLIFrameElement | null): TerminalFrameWrite {
+  try {
+    const value = (frame?.contentWindow as { hasToken?: unknown } | null | undefined)?.hasToken;
+    if (value === true) return 'writable';
+    if (value === false) return 'readonly';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 const FRAME_STATUS_POLL_MS = 1_000;
 /** 连续 8 拍（≈8 秒）都是 disconnected 才提示。终端页自己每 2 秒重连一次，正常网络下
  *  一两拍就连上了；8 秒还连不上，基本可以断定是这个浏览器环境拦掉了 ws://。 */
@@ -140,6 +162,44 @@ function useTerminalFrameWatch(params: {
   return { blocked: enabled && blocked, onFrameLoad: enabled ? onFrameLoad : undefined };
 }
 
+/** 最多读几拍就收手：`hasToken` 是终端页顶部同步赋的全局，onLoad 时通常已经在了；
+ *  读不到基本就是读不到（跨域 / 页面报错），一直转下去没有意义。 */
+const FRAME_WRITE_MAX_TICKS = 5;
+
+/** 盯着 iframe 自报的写权限。只在需要它当判据的场景启用（触屏那条 viewToken
+ *  通道）；桌面同源链路的权威是控制权接口本身，多一个来源只会打架。 */
+function useTerminalFrameWrite(params: {
+  enabled: boolean;
+  /** iframe 换一次（重挂 / 换链接）就重新判定：上一块的结论套不到新的上面。 */
+  frameKey: string;
+  read(): TerminalFrameWrite;
+}): TerminalFrameWrite {
+  const { enabled, frameKey } = params;
+  const [write, setWrite] = useState<TerminalFrameWrite>('unknown');
+  const readRef = useRef(params.read);
+  useEffect(() => { readRef.current = params.read; });
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    setWrite('unknown');
+    let ticks = 0;
+    const sample = (): boolean => {
+      const value = readRef.current();
+      if (value === 'unknown') return false;
+      setWrite(value);
+      return true;
+    };
+    if (sample()) return undefined;
+    const timer = setInterval(() => {
+      ticks += 1;
+      if (sample() || ticks >= FRAME_WRITE_MAX_TICKS) clearInterval(timer);
+    }, FRAME_STATUS_POLL_MS);
+    return () => clearInterval(timer);
+  }, [enabled, frameKey]);
+
+  return enabled ? write : 'unknown';
+}
+
 function browserHref(): string | undefined {
   try {
     return typeof window === 'undefined' ? undefined : window.location?.href;
@@ -185,6 +245,9 @@ export function TerminalPane(props: PaneCommonProps & {
   /** 测试注入点：组件测试环境里没有真 iframe 的 internals，注入一个假的读数源即可。
    *  生产默认走同源 contentWindow（`readTerminalFrameStatus`）。 */
   readFrameStatus?: (frame: HTMLIFrameElement | null) => TerminalFrameStatus;
+  /** 同上，注入「这块 iframe 自报能不能写」的读数源（生产走
+   *  `readTerminalFrameWrite`，读终端页同源的 `hasToken`）。 */
+  readFrameWrite?: (frame: HTMLIFrameElement | null) => TerminalFrameWrite;
 }): JSX.Element {
   // 控制权的唯一状态机。散着的 useState 版本让观察轮询和写操作共用一个
   // generation，15 秒一发的轮询会把在途写的回执丢掉；失败又一律乐观压成只读。
@@ -354,6 +417,15 @@ export function TerminalPane(props: PaneCommonProps & {
     frameKey,
     read: () => readFrameStatus(frameRef.current),
   });
+  // 触屏那条 viewToken 通道到底能不能写，只有终端页自己知道（前置代理会给平台
+  // owner 的 viewToken 请求补 WRITE grant，而补不补又取决于这个 WebView 带不带
+  // Cookie）。桌面不启用：那边的权威是控制权接口，多一个来源只会两边打架。
+  const readFrameWrite = props.readFrameWrite ?? readTerminalFrameWrite;
+  const frameWrite = useTerminalFrameWrite({
+    enabled: touch,
+    frameKey,
+    read: () => readFrameWrite(frameRef.current),
+  });
 
   // 终端渲染风格：容器 class 管几何（行距 / 内边距），xterm 的配色住在跨文档的
   // 终端页里，父页换 class 它收不到 —— 必须把 theme 推过去，否则会出现「工作台
@@ -372,14 +444,22 @@ export function TerminalPane(props: PaneCommonProps & {
 
   const control = model.authoritative;
   const busy = terminalControlBusy(model);
-  const fixed = !touch && control?.fixed === true;
+  const fixed = control?.fixed === true;
   // 标题栏能不能切模式 —— 也就是这块面板有没有第二种状态可去。触屏（viewToken
   // 通道没有租约可接管）、无 canControl 能力、恒可写身份、外部终端都没有。
   const canSwitchMode = !externalTerminalUrl && !!terminalUrl && props.authenticated
     && props.capabilities.canControl && !touch && !fixed;
-  // 用户眼里的模式。触屏挂的是 viewToken 只读通道：控制权接口哪怕报「已接管」，
-  // 这块 iframe 也送不进输入，徽标必须跟着说只读。
-  const paneMode = touch ? 'readonly' : terminalControlMode(model);
+  // 触屏这块 iframe 到底能不能写，最终以终端页自己的结论为准。它还没给出结论时
+  // 别急着猜：非恒可写身份走的 viewToken 通道**必定**只读（前置代理只对平台所有者
+  // 补 WRITE grant），照实说只读；恒可写身份则取决于这个 WebView 带不带 Cookie，
+  // 只能先说未知，等页面自己说话——这总好过写死一句与实际能力相反的「只读」。
+  const touchWrite = frameWrite !== 'unknown' ? frameWrite : fixed ? 'unknown' : 'readonly';
+  // 用户眼里的模式。触屏不看租约：那条通道上「控制权接口说什么」和「这一页能不能
+  // 输入」本来就是两件事，照抄接口就会得出「UI 说只读、链路其实可写」的分裂表述
+  // （P1-4）。
+  const paneMode = touch
+    ? (touchWrite === 'writable' ? 'controlled' : touchWrite === 'readonly' ? 'readonly' : 'unknown')
+    : terminalControlMode(model);
   const controlled = paneMode === 'controlled';
   const status = controlled ? '可输入' : paneMode === 'unknown' ? '未知' : '只读';
   const chipClass = controlled ? 'is-controlled' : paneMode === 'unknown' ? 'is-unknown' : 'is-readonly';
@@ -434,9 +514,14 @@ export function TerminalPane(props: PaneCommonProps & {
         </div>
       </header>
       <div className="wb-pane-feedback" role="status" aria-live="polite">
-        {/* 触屏一句话说死，登录与否都一样：这块 iframe 挂的是 viewToken 只读通道，控制权
-            接口报什么都改变不了这个事实，转述它反而误导。 */}
-        {touch ? '只读查看中。手机端为只读视图，需要输入请在电脑上操作。'
+        {/* 触屏说的是这块 iframe **自报**的写权限：那条 viewToken 通道对平台所有者
+            会被前置代理补成可写（#960），一口咬定「手机端只读」会与用户实际能打字
+            的事实相矛盾；读不出来时才退回保守说法，并说清依据在终端页自己身上。 */}
+        {touch ? (controlled
+          ? '当前身份在手机端也可直接输入。'
+          : paneMode === 'unknown'
+            ? '只读链接查看中，能否输入以终端页内的提示为准。'
+            : '只读查看中。手机端为只读视图，需要输入请在电脑上操作。')
           : model.phase === 'loading' ? '正在检查终端权限…'
             : model.phase === 'taking-over' ? '正在接管输入…'
               : model.phase === 'releasing' ? '正在释放输入…'
