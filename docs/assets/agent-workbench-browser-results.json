@@ -7,13 +7,13 @@
     "productionStoreExercised": false,
     "note": "生产 bundle 的端到端证据见 docs/assets/workbench-production-e2e-results.json"
   },
-  "head": "5bc9befbfad2cbc528ba801c1ce86c92a0aa9203",
+  "head": "592cbb468a695c08ad39b9531c7823b144183222",
   "worktreeDirty": true,
   "headNote": "head 是跑这一轮时的 HEAD；worktreeDirty=true 表示工作区还有未提交改动（证据先于提交产生时的常态）",
   "fixtureBuild": {
     "bundler": "esbuild (in-process, esm/chrome120)",
-    "bytes": 1677362,
-    "sha256": "124e11a4e85c492a69cd3f35cd45ddfbf46c287ccf953a4844a65838fc61e74d"
+    "bytes": 1680275,
+    "sha256": "d530b99438755904737b2be006cafddd5ecaed0791194c3110b5dcb5df1846b8"
   },
   "browser": "local executable (/home/wanglingfeng.linvon/.cache/ui-check/chrome-headless-shell-linux64/chrome-headless-shell)",
   "browserVersion": "121.0.6167.85",
@@ -25,11 +25,11 @@
     "390x844 (iPhone 13 profile)",
     "375x800"
   ],
-  "screenshots": "/tmp/claude-1001/-data00-home-wanglingfeng-linvon-work/dda01430-310f-4f3b-a595-004a984ff5c1/scratchpad/impl-evidence",
+  "screenshots": "/tmp/botmux-workbench-shots",
   "scenarios": {
     "h5_success": {
       "ok": true,
-      "durationMs": 206
+      "durationMs": 218
     },
     "h5_failure": {
       "ok": true,
@@ -37,19 +37,19 @@
     },
     "h5_timeout": {
       "ok": true,
-      "durationMs": 76
+      "durationMs": 84
     },
     "h5_without_sdk": {
       "ok": true,
-      "durationMs": 54
+      "durationMs": 61
     },
     "workbench_route_switch_and_terminal_control": {
       "ok": true,
-      "durationMs": 1042
+      "durationMs": 981
     },
     "control_unknown_unloads_writable_frame": {
       "ok": true,
-      "durationMs": 693
+      "durationMs": 711
     },
     "touch_write_follows_established_socket": {
       "ok": true,
@@ -57,47 +57,47 @@
     },
     "workbench_failure": {
       "ok": true,
-      "durationMs": 438
+      "durationMs": 436
     },
     "unauthorized": {
       "ok": true,
-      "durationMs": 282
+      "durationMs": 283
     },
     "mobile_and_sidebar_layout": {
       "ok": true,
-      "durationMs": 445
+      "durationMs": 452
     },
     "dock_touch_view_token": {
       "ok": true,
-      "durationMs": 386
+      "durationMs": 380
     },
     "wide_touch_targets": {
       "ok": true,
-      "durationMs": 365
+      "durationMs": 364
     },
     "rail_collapsed_recovery": {
       "ok": true,
-      "durationMs": 1195
+      "durationMs": 1197
     },
     "mobile_preview_interaction": {
       "ok": true,
-      "durationMs": 433
+      "durationMs": 416
     },
     "preview_registration_and_proxy_boundaries": {
       "ok": true,
-      "durationMs": 173
+      "durationMs": 175
     },
     "preview_websocket": {
       "ok": true,
-      "durationMs": 139
+      "durationMs": 142
     },
     "terminal_disconnect_returns_readonly": {
       "ok": true,
-      "durationMs": 166
+      "durationMs": 175
     },
     "preview_idle_timeout_relocks": {
       "ok": true,
-      "durationMs": 107
+      "durationMs": 109
     }
   }
 }

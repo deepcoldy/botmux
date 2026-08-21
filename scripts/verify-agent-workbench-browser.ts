@@ -29,7 +29,7 @@ import {
   mintPreviewContentCapability,
   verifyPreviewContentCapability,
 } from '../src/dashboard/preview-content-capability.js';
-import { terminalWriteFrame } from '../src/core/terminal-write-frame.js';
+import { decodeTerminalWriteFrameSource, terminalWriteFrame } from '../src/core/terminal-write-frame.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
 import {
   matchTerminalControlRoute,
@@ -68,21 +68,13 @@ function terminalPageReporter(): string {
   return source.slice(start, end + '\n});'.length);
 }
 
-/** 同样是真代码：把 WS 下发的写权限标记从终端流里剥出来那两行。 */
-function terminalPageWriteMarkerParse(): string {
-  const source = readFileSync(join(root, 'src', 'worker.ts'), 'utf8');
-  const start = source.indexOf('var _wsW=data.match(');
-  const end = source.indexOf('\n', source.indexOf('_wbSetWsWrite(_wsW[1]', start));
-  assert.ok(start > -1 && end > start, 'worker.ts 里找不到终端页的写权限标记解析');
-  return source.slice(start, end);
-}
-
 /**
  * 夹具终端页。三件事都是为了让浏览器里的断言有落点：
  *   ① 记录真实按键（`#typed`）——「盖层出现后键盘还能不能打进这块 iframe」只有真按键
  *      量得出来；
  *   ② 落下 hasToken / wsHasWrite 两个全局，与生产同名（面板同源读的就是它们）；
- *   ③ 接一条 WS，收 worker 那条 OSC 写权限标记，用生产代码解析并上抛。
+ *   ③ 接一条 WS，收 worker 那条**带外写权限首帧**，用生产解码器（terminal-write-frame.ts
+ *      那一份，与 worker 内嵌的同源）剥出结论并上抛。
  */
 function terminalPage(options: { sessionId: string; hasToken: boolean; label: string }): string {
   return `<!doctype html><html><head><meta charset="utf-8"></head>
@@ -95,6 +87,10 @@ var wsHasWrite=null;
 var platformReadonly=false;
 var term={options:{}},fit={fit:function(){}};
 ${terminalPageReporter()}
+// 带外写权限首帧的解码器：与 worker 内嵌的同一份源码（terminal-write-frame.ts），只认
+// 本连接第一帧、整帧精确匹配，之后一律当普通终端数据，绝不改判权限。
+var _wbDecodeWriteFrame=${decodeTerminalWriteFrameSource};
+var _wbFirstFrame=true;
 var _typed='';
 document.addEventListener('keydown',function(e){
   if(e.key&&e.key.length===1){_typed+=e.key;document.getElementById('typed').textContent=_typed;}
@@ -103,8 +99,13 @@ document.body.focus();
 try{
   var _ws=new WebSocket(location.origin.replace('http','ws')+'/terminal-socket?session=${options.sessionId}');
   _ws.onmessage=function(e){
-    var data=typeof e.data==='string'?e.data:'';
-${terminalPageWriteMarkerParse()}
+    // 与 worker 的 onmessage 同构：首帧是带外写权限控制帧，用生产解码器剥出结论并上抛；
+    // 解不出来（或非首帧）就当普通终端数据。
+    if(_wbFirstFrame){
+      _wbFirstFrame=false;
+      var _ctl=_wbDecodeWriteFrame(e.data,true);
+      if(_ctl!==null){_wbSetWsWrite(_ctl);return;}
+    }
   };
 }catch(_e){}
 </script>
