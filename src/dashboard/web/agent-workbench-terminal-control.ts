@@ -5,8 +5,8 @@
  * 词汇（`TerminalPaneMode`）：
  *
  *   ① 面板侧（{@link terminalControlReducer}）—— 这块终端此刻的租约状态。
- *   ② 外层侧（{@link toggleTerminalIntent} 等）—— 行内「终端 / 接管」按钮的开关
- *      意图：面板开在哪个会话上、这次开带不带接管。
+ *   ② 外层侧（{@link toggleTerminalIntent} 等）—— 行内「终端」按钮的开关意图：
+ *      面板开在哪个会话上。接管不在这一侧，它只由面板标题栏的「接管输入」驱动。
  *
  * 之所以要一个显式状态机，而不是几个 useState 拼起来：控制权同时被四种事件推着走
  * ——首屏 GET、15 秒观察轮询、用户的写操作（takeover/release）、以及面板自己的重挂
@@ -18,7 +18,7 @@
  *     时轮询读数一律丢弃（它描述的是写之前的世界）。
  *   - **把「还不知道」当成只读**：首屏 GET 没回来时对外说 readonly，用户第二次点
  *     「终端」就被判成「模式没变 → 重挂」而不是关闭。→ `loading` 是一个显式状态，
- *     没有权威读数时开关只认「当初用哪个按钮打开的」。
+ *     没有权威读数时同一个按钮再点一次一律按关闭处理。
  *   - **写失败就乐观宣称只读**：release 失败后界面说只读，可写租约其实还在服务端
  *     挂着，用户对着一个「只读」的终端照样能打字。→ 写失败进 `unknown`：保留最后
  *     一次权威读数、立刻发一次 GET 复核，期间由调用方把可写 iframe 遮住。
@@ -246,7 +246,7 @@ export function terminalControlReducer(
   }
 }
 
-// ─── 外层侧：行内「终端 / 接管」的打开意图 ───────────────────────────────────
+// ─── 外层侧：行内「终端」的打开意图 ─────────────────────────────────────────
 
 /** 面板给外层的回执。外层的行内按钮只认它，不认自己当初递进去的意图——标题栏的
  *  「接管输入 / 释放输入」不经过外层，恒可写身份更是从头到尾没发过任何请求。 */
@@ -264,17 +264,16 @@ export interface TerminalPaneControlMode {
 }
 
 /**
- * 终端面板的完整意图：开在**哪个会话**上、这次开是否带接管、以及面板回执回来的
- * 真实模式。三者必须原子地一起变——拆开写时踩过的坑：
- *   - 只改会话 id、接管意图原样留着 → 在 A 行点过「接管」之后普通选中 B，会替用户
- *     对 B 发起接管；
- *   - 先 `selectSession` 把面板迁到 B（压成只读）、再判断「B 行的终端按钮」→ 迁移
- *     后的状态刚好等于只读，于是被判成同按钮二次点击，面板被关掉。
+ * 终端面板的完整意图：开在**哪个会话**上，以及面板回执回来的真实模式。两者必须
+ * 原子地一起变——拆开写时踩过的坑：先 `selectSession` 把面板迁到 B（压成只读）、
+ * 再判断「B 行的终端按钮」→ 迁移后的状态刚好等于只读，于是被判成同按钮二次点击，
+ * 面板被关掉。
+ *
+ * 行内**没有**接管入口（产品决策：接管只走终端面板标题栏的「接管输入」），所以
+ * 这里也不再记「这次开带不带接管」——行内点开的终端一律是只读打开。
  */
 export interface WorkbenchTerminalIntent {
   sessionId: string;
-  /** 当初用哪个按钮打开的。它会过期，只在还没有权威读数时用来判开关。 */
-  wantsControl: boolean;
   mode: TerminalPaneMode;
   fixed: boolean;
   toggleOnly: boolean;
@@ -284,16 +283,14 @@ export interface WorkbenchTerminalIntent {
   generation: number;
 }
 
-/** 一次新的打开 / 换模式。`mode` 先记成 loading：面板还没说话之前我们**不知道**
+/** 一次新的打开 / 重挂。`mode` 先记成 loading：面板还没说话之前我们**不知道**
  *  它是什么模式，把意图当成模式正是「第二次点击重挂而不是关闭」的来源。 */
 export function openTerminalIntent(
   sessionId: string,
-  wantsControl: boolean,
   generation = 0,
 ): WorkbenchTerminalIntent {
   return {
     sessionId,
-    wantsControl,
     mode: 'loading',
     fixed: false,
     toggleOnly: false,
@@ -304,7 +301,7 @@ export function openTerminalIntent(
 
 /**
  * 普通选中（行点击 / j-k / 路由）：已经开着的面板跟到新会话，但**只跟到只读**。
- * 接管属于「你在那一行按下接管」的那个会话，普通选中不是要写权限的表示。
+ * 接管属于「你在那块面板标题栏按下接管」的那个会话，普通选中不是要写权限的表示。
  */
 export function followTerminalIntent(
   current: WorkbenchTerminalIntent | null,
@@ -313,36 +310,33 @@ export function followTerminalIntent(
   if (!current) return null;
   // 同一个会话内重复选中不动意图：正在接管 A 时点 A 的行，不该把自己的写权限收掉。
   if (current.sessionId === sessionId) return current;
-  return openTerminalIntent(sessionId, false);
+  return openTerminalIntent(sessionId);
 }
 
 /**
- * 行内「终端 / 接管」按钮：选中会话 + 打开指定 surface 的那一次原子更新。
+ * 行内「终端」按钮：选中会话 + 只读打开终端面板的那一次原子更新。
  * 返回 `null` = 关掉面板。
  */
 export function toggleTerminalIntent(
   current: WorkbenchTerminalIntent | null,
   sessionId: string,
-  wantsControl: boolean,
 ): WorkbenchTerminalIntent | null {
-  // 在途写期间对同一个会话的重复点击一律吞掉（串行）：快速双击「接管」只发一次
-  // takeover，也不会在 POST 还没回来时把面板关掉、留下一条没人管的写租约。
+  // 在途写期间对同一个会话的重复点击一律吞掉（串行）：标题栏刚发出的 takeover /
+  // release 还没回执时再点一次，不会在 POST 回来前把面板关掉、留下没人管的写租约。
   if (current && current.busy && current.sessionId === sessionId) return current;
   // 换会话 = 一次全新的打开。这里绝不能先经过「跟随选中」把面板迁过来，迁移后的
   // 状态会让紧接着的判断误以为是同按钮二次点击。
-  if (!current || current.sessionId !== sessionId) return openTerminalIntent(sessionId, wantsControl);
+  if (!current || current.sessionId !== sessionId) return openTerminalIntent(sessionId);
   // 切不出第二种模式的面板（恒可写身份 / 触屏只读通道）只有开和关两种结果。
   if (current.toggleOnly) return null;
-  // 关不关看**面板此刻真实的模式**；还没有权威读数（loading / unknown）时只能认
-  // 「当初用哪个按钮打开的」——这两种情况下同一个按钮再点一次就是关掉。
-  const effective = current.mode === 'controlled' || current.mode === 'readonly'
-    ? current.mode === 'controlled'
-    : current.wantsControl;
-  if (effective === wantsControl) return null;
-  return openTerminalIntent(sessionId, wantsControl, current.generation + 1);
+  // 面板此刻真的可写（标题栏接管过）→ 这一次点「终端」是「降回只读」：重挂一块带
+  // 只读意图的面板，把租约真的还回去。已经是只读、或还没有权威读数（loading /
+  // unknown）→ 同一个按钮再点一次就是关掉。
+  if (current.mode !== 'controlled') return null;
+  return openTerminalIntent(sessionId, current.generation + 1);
 }
 
-/** 面板回执：把真实模式记回意图。只改回执那几个字段，不动 wantsControl /
+/** 面板回执：把真实模式记回意图。只改回执那几个字段，不动 sessionId /
  *  generation —— 那两个决定面板的 key，被回执带着走就会无谓重挂、终端连接跟着断。 */
 export function receiveTerminalIntentMode(
   current: WorkbenchTerminalIntent | null,

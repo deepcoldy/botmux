@@ -43,7 +43,7 @@ https://<dashboard-host>/auth/feishu?returnTo=/#/agent-workbench/<encoded-sessio
 Full Workbench 的基本流程：
 
 1. 在会话列表搜索并选择会话；支持六个分组维度（状态/机器人/会话位置/类型/CLI/活跃时间）、组折叠与未读标记。
-2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「终端」以只读打开工作区终端；「接管」打开终端并自动请求写权限。
+2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「终端」以只读打开工作区终端（已接管时再点降回只读、真的还回租约，只读时再点关闭）。行内不提供接管捷径——接管统一走终端面板标题栏的「接管输入」。
 3. 工作区一次只有一个终端面板：释放、到期或断连回到只读，「关闭终端」后列表重新铺满。触屏与未登录浏览器走只读 viewToken 通道，不提供接管。
 4. Agent 在自己的 Botmux 会话内注册 Web 开发服务器后，窄屏详情才出现「网页」页；网页预览默认「预览」蒙层，「开启交互」显式解锁，15 分钟无操作回锁。桌面工作区只承载终端，网页预览经会话坞的「网页链接」或直接访问 /preview/<encoded-session-id>/ 打开，该 URL 是 Dashboard 同源的 guard shell，它维持蒙层与解锁，并把应用本身框进 opaque-origin sandbox。
 
@@ -265,12 +265,12 @@ Store 快照或终端代理跑通的证据**——后者见 8.2.1。结果 JSON 
 | h5_failure — provider 失败显示可重试错误 | 通过 |
 | h5_timeout — SDK 有界超时进入可重试错误 | 通过 |
 | h5_without_sdk — 普通浏览器无 SDK 安全降级 | 通过 |
-| workbench_route_switch_and_terminal_control — 行内终端/接管、路由与会话切换、释放与关闭终端；聊天为真实锚点且 sdkCalls 为空 | 通过 |
+| workbench_route_switch_and_terminal_control — 行内「终端」只读打开 + 标题栏「接管输入」、路由与会话切换、降级为只读、释放与关闭终端；聊天为真实锚点且 sdkCalls 为空 | 通过 |
 | workbench_failure — 控制接口 503 daemon_offline 报错并停在只读 | 通过 |
 | unauthorized — 未登录只读、不渲染接管按钮，preview 与 h5-context 均 401 | 通过 |
 | mobile_and_sidebar_layout — 390×844 下钻栈（无页内 tab 栏、无分屏）与 375×800 会话坞（minWidth 350、零 pane） | 通过 |
 | dock_touch_view_token — iPhone 13 真机 profile（hasTouch）下会话坞终端链接带 viewToken；把它拿到完全无 Cookie 的上下文里仍能打开终端，同上下文的裸 /s/&lt;id&gt; 401 | 通过 |
-| wide_touch_targets — 1194×834 触屏（iPad 横屏）下行操作 ≥44px，且触屏不渲染行内「接管」 | 通过 |
+| wide_touch_targets — 1194×834 触屏（iPad 横屏）下行操作 ≥44px，且行内不渲染「接管」（该按钮已整体移除） | 通过 |
 | rail_collapsed_recovery — 预置「已收起」偏好后 1440/900/390 三档视口都能把列表叫回来并选到会话 | 通过 |
 | mobile_preview_interaction — 移动「网页」页蒙层、开启交互/立即锁定与 guard 同步 | 通过 |
 | preview_registration_and_proxy_boundaries — 注册、无效/未注册端口、不可达与代理边界不泄漏内部 target | 通过 |

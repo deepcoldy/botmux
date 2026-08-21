@@ -457,11 +457,18 @@ async function waitForText(page: Page, text: string): Promise<void> {
 
 /** 行操作浮层平时是 opacity:0 / pointer-events:none，悬停或聚焦才出现。不先 hover
  *  就点，点击会被铺满整行的聊天锚点（.wb-session-copy-link::after）吃掉。 */
-async function rowAction(page: Page, title: string | RegExp, action: 'terminal' | 'terminal-control'): Promise<void> {
+async function rowAction(page: Page, title: string | RegExp): Promise<void> {
   const row = page.getByRole('option', { name: title });
   await row.waitFor();
   await row.hover();
-  await row.locator(`.wb-session-row-action.is-${action}`).click();
+  await row.locator('.wb-session-row-action.is-terminal').click();
+}
+
+/** 只读打开 + 面板标题栏接管。产品决策后接管只有标题栏这一个入口，会话行内的
+ *  「接管」捷径已移除，所以「打开并接管」在浏览器里也是两步。 */
+async function openAndTakeOver(page: Page, title: string | RegExp): Promise<void> {
+  await rowAction(page, title);
+  await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
 }
 
 try {
@@ -532,14 +539,15 @@ try {
     await page.goto(`${base}/?scenario=success&sdk=toggle-success`);
     await page.locator('.agent-workbench-page').waitFor();
     // 工作区默认收起（.wb-desktop-layout.is-terminal-closed 把它整块隐藏，列表铺满），
-    // 只有行内「终端 / 接管」才会把它开出来——所以路由切换也从行操作走。
+    // 只有行内「终端」才会把它开出来——所以路由切换也从行操作走。
     assert.equal(await page.locator('.wb-desktop-layout.is-terminal-closed').count(), 1);
-    await rowAction(page, /Secondary session for route switching/, 'terminal');
+    await rowAction(page, /Secondary session for route switching/);
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
     await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
-    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal-control');
+    // 会话行只剩「聊天 / 终端」：行内接管按钮已按产品决策移除，接管走标题栏。
+    assert.equal(await page.locator('.wb-session-row-action.is-terminal-control').count(), 0);
+    await openAndTakeOver(page, /Integrated Workbench browser scenario/);
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
-    // 「接管」= 开面板并自动请求写权限，不需要再点一次面板里的按钮。
     await page.locator('.wb-mode-chip.is-controlled').waitFor();
     await waitForText(page, '已接管，可键盘输入。');
     // 聊天必须是 target=_blank rel=noopener 的真锚点：脚本化打开（window.open /
@@ -550,17 +558,17 @@ try {
     assert.equal(await chatAnchor.getAttribute('rel'), 'noopener');
     assert.match(await chatAnchor.getAttribute('href') ?? '', /^https:\/\/applink\.feishu\.cn\/client\/chat\/open\?/);
     assert.deepEqual(await page.evaluate(() => window.__workbenchHarness?.sdkCalls), []);
-    // 行内「终端 / 接管」这两条**跨会话**与**降级**路径（#963 复审 P1-1、P1-2）：
-    // 面板标题栏那对按钮证明不了它们，回归时用户看到的正是「点另一行的终端，面板
-    // 直接没了」。
+    // 行内「终端」这两条**跨会话**与**降级**路径（#963 复审 P1-1、P1-2）：面板标题栏
+    // 那对按钮证明不了它们，回归时用户看到的正是「点另一行的终端，面板直接没了」。
     // ① A 的终端正接管着 → 点 B 行「终端」必须打开 B 的只读终端，不是关面板。
-    await rowAction(page, /Secondary session for route switching/, 'terminal');
+    await rowAction(page, /Secondary session for route switching/);
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
     assert.equal(await page.locator('.wb-terminal-pane').count(), 1);
-    // ② 回到 A 重新接管，接管态点行内「终端」= 降为只读且面板还在（再点一次才关）。
-    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal-control');
+    // ② 回到 A 重新接管（标题栏），接管态点行内「终端」= 降为只读且面板还在
+    //    （再点一次才关）。
+    await openAndTakeOver(page, /Integrated Workbench browser scenario/);
     await page.locator('.wb-mode-chip.is-controlled').waitFor();
-    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+    await rowAction(page, /Integrated Workbench browser scenario/);
     await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
     assert.equal(await page.locator('.wb-terminal-pane').count(), 1);
     // 接回写权限，下面那段既有断言从接管态开始。
@@ -579,8 +587,10 @@ try {
     const context = await authenticatedContext();
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=failure`);
-    await rowAction(page, /Workbench failure boundary/, 'terminal-control');
-    // 控制权接口 503 daemon_offline → 面板报错并停在只读，不会假装接管成功。
+    await rowAction(page, /Workbench failure boundary/);
+    // 控制权接口 503 daemon_offline → 面板停在只读；标题栏接管也只会报错，
+    // 不会假装接管成功。
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
     await waitForText(page, '所属 daemon 已离线');
     await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
     await context.close();
@@ -590,7 +600,7 @@ try {
     const context = await localContext({ width: 1280, height: 800 });
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=success&authenticated=false`);
-    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+    await rowAction(page, /Integrated Workbench browser scenario/);
     // 未登录只给只读，接管按钮根本不渲染——不是渲染出来再报错。
     await waitForText(page, '只读查看。登录 Dashboard 后可接管。');
     assert.equal(await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).count(), 0);
@@ -696,7 +706,7 @@ try {
     });
     assert.ok(metrics.hoverNone, 'wide touch context must report (hover: none)');
     assert.ok(metrics.width >= 44 && metrics.height >= 44, `row action below 44px: ${JSON.stringify(metrics)}`);
-    // 触屏下行内「接管」整体不渲染：那条通道只读（P1-17）。
+    // 行内接管按钮已整体移除（产品决策），触屏这条通道更是只读（P1-17）。
     assert.equal(await page.locator('.wb-session-row-action.is-terminal-control').count(), 0);
     assert.ok(await page.locator('.wb-session-row-action.is-terminal').count() > 0);
     await page.screenshot({ path: join(shotDir, 'wide-touch-ipad.png') });
@@ -721,7 +731,7 @@ try {
         await page.screenshot({ path: join(shotDir, `rail-collapsed-${viewport.width}.png`) });
         await expand.click();
         await page.locator('.wb-session-list').waitFor();
-        await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+        await rowAction(page, /Integrated Workbench browser scenario/);
         await page.locator('.wb-workspace-title strong')
           .filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
       } else {

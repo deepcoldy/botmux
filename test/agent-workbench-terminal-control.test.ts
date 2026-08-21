@@ -22,11 +22,14 @@ import type { WorkbenchSessionRow } from '../src/dashboard/web/agent-workbench-m
  *   1. 跨会话点「终端」：A 的终端开着，点 B 行的「终端」必须打开 B 的只读终端，
  *      不能因为「先选中把面板迁过去」而被判成同按钮二次点击、把面板关掉。
  *   2. 在途写与关闭/双击：POST 还没回来时关掉面板 → 服务端随后发出的写租约必须被
- *      精确补偿掉；快速双击「接管」只许发一次；15 秒观察轮询不许丢掉在途写的回执。
+ *      精确补偿掉；接管在途时连点只许发一次；15 秒观察轮询不许丢掉在途写的回执。
  *   3. release 失败：不许乐观宣称只读——保留最后一次权威读数、盖住可写 iframe、
  *      立刻 GET 复核。
- *   4. fixed / touch 的只读语义：恒可写身份行内收敛成一个开关且文案如实；触屏文案
+ *   4. fixed / touch 的只读语义：恒可写身份行内文案如实（不写「只读」）；触屏文案
  *      跟着这块 iframe 真实的写权限走。
+ *
+ * 接管的唯一入口是终端面板标题栏的「接管输入」——会话行内的「接管」捷径已按产品
+ * 决策移除，所以这一组里凡是需要写权限的步骤都走 {@link openAndTakeOver}。
  */
 
 const FULL_CAPABILITIES: WorkbenchCapabilities = { canLocate: true, canControl: true, canInteract: true };
@@ -115,25 +118,63 @@ async function settle(times = 3): Promise<void> {
   for (let index = 0; index < times; index += 1) await act(async () => {});
 }
 
+/** 行内终端入口。产品决策：会话行只留「聊天 / 终端」，接管一律走终端面板标题栏的
+ *  「接管输入」，所以这里不再有 `terminal-control` 这个 surface。 */
 function rowAction(
   renderer: TestRenderer.ReactTestRenderer,
   title: string,
-  surface: 'terminal' | 'terminal-control',
 ): ReactTestInstance | null {
   return renderer.root.findAll(node => node.type === 'button'
-    && node.props.className === `wb-session-row-action is-${surface}`
+    && node.props.className === 'wb-session-row-action is-terminal'
     && String(node.props['aria-label'] ?? '').endsWith(`— ${title}`))[0] ?? null;
 }
 
 async function clickRowAction(
   renderer: TestRenderer.ReactTestRenderer,
   title: string,
-  surface: 'terminal' | 'terminal-control',
 ): Promise<void> {
-  const button = rowAction(renderer, title, surface);
-  if (!button) throw new Error(`row action ${surface} for ${title} not rendered`);
+  const button = rowAction(renderer, title);
+  if (!button) throw new Error(`row action terminal for ${title} not rendered`);
   await act(async () => { button.props.onClick({ stopPropagation() {} }); });
   await settle();
+}
+
+/** 这一行此刻渲染出来的操作按钮文案（含「聊天」这个锚点）。 */
+function rowActionLabels(renderer: TestRenderer.ReactTestRenderer, title: string): string[] {
+  const actions = renderer.root.findAll(node => node.props.className === 'wb-session-row-actions'
+    && node.parent?.props['aria-label']?.startsWith?.(`${title}.`));
+  if (actions.length === 0) return [];
+  return actions[0].children
+    .filter((child): child is ReactTestInstance => typeof child !== 'string')
+    .map(child => textOf(child));
+}
+
+/** 终端面板标题栏的「接管输入 / 释放输入」——接管的**唯一**入口。 */
+function paneControl(
+  renderer: TestRenderer.ReactTestRenderer,
+  label: '接管输入' | '释放输入',
+): ReactTestInstance | null {
+  return renderer.root.findAll(node => node.type === 'button' && textOf(node) === label)[0] ?? null;
+}
+
+async function clickPaneControl(
+  renderer: TestRenderer.ReactTestRenderer,
+  label: '接管输入' | '释放输入',
+): Promise<void> {
+  const button = paneControl(renderer, label);
+  if (!button) throw new Error(`pane control ${label} not rendered`);
+  await act(async () => { button.props.onClick(); });
+  await settle();
+}
+
+/** 「打开终端并接管」现在是两步：行内「终端」只读打开，再在面板标题栏点接管。
+ *  （以前行内「接管」一键做完这两步，那个捷径已按产品决策移除。） */
+async function openAndTakeOver(
+  renderer: TestRenderer.ReactTestRenderer,
+  title: string,
+): Promise<void> {
+  await clickRowAction(renderer, title);
+  await clickPaneControl(renderer, '接管输入');
 }
 
 async function clickRow(renderer: TestRenderer.ReactTestRenderer, title: string): Promise<void> {
@@ -143,13 +184,15 @@ async function clickRow(renderer: TestRenderer.ReactTestRenderer, title: string)
   await settle();
 }
 
-/** 面板在不在、挂在哪个会话上。 */
-function pane(renderer: TestRenderer.ReactTestRenderer): { sessionId: string; autoTakeControl: boolean } | null {
+/** 面板在不在、挂在哪个会话上，以及它是带着什么开场意图挂上来的。
+ *  行内接管移除之后 `autoTakeControl` 恒为 false（只读打开）——留着这个字段正是
+ *  为了钉住这条不变量：外层永远不会替用户发起接管。 */
+function pane(renderer: TestRenderer.ReactTestRenderer): { sessionId: string; autoTakeControl: unknown } | null {
   const panes = renderer.root.findAllByType(TerminalPane);
   if (panes.length === 0) return null;
   return {
     sessionId: String(panes[0].props.session.sessionId),
-    autoTakeControl: panes[0].props.autoTakeControl === true,
+    autoTakeControl: panes[0].props.autoTakeControl,
   };
 }
 
@@ -246,17 +289,40 @@ function leaseApi(options: {
 
 afterEach(() => { vi.useRealTimers(); });
 
+// ─── ⓪ 行内操作集：只剩 聊天 / 终端 ─────────────────────────────────────────
+describe('会话行只保留「聊天 / 终端」两个操作', () => {
+  it('行内不再渲染「接管」按钮——接管统一走终端面板标题栏的「接管输入」', async () => {
+    // 产品决策（2026-08）：行内接管与标题栏接管做的是同一件事，却多一条状态更难
+    // 对齐的链路，因此收敛到面板标题栏这一个入口。这条用例就是那个决策的门禁。
+    const lease = leaseApi();
+    const renderer = await renderView(lease.api);
+
+    expect(rowActionLabels(renderer, 'Session A')).toEqual(['聊天', '终端']);
+    expect(rowActionLabels(renderer, 'Session B')).toEqual(['聊天', '终端']);
+    expect(renderer.root.findAll(node => typeof node.props.className === 'string'
+      && node.props.className.includes('is-terminal-control'))).toEqual([]);
+
+    // 行内唯一的终端入口就是只读打开；接管按钮在面板标题栏里等着。
+    await clickRowAction(renderer, 'Session A');
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(paneControl(renderer, '接管输入')).not.toBeNull();
+    expect(lease.calls.filter(call => call !== 'get')).toEqual([]);
+    act(() => renderer.unmount());
+  });
+});
+
 // ─── ① 跨会话点「终端」（P1-1）───────────────────────────────────────────────
 describe('跨会话点行内「终端」打开的是那一行的只读终端，不是把面板关掉', () => {
   it('A 的终端接管着，点 B 行「终端」→ B 的只读终端打开（回归时这里是 closed）', async () => {
     const lease = leaseApi();
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
-    expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: true });
+    await openAndTakeOver(renderer, 'Session A');
+    // 外层递进去的永远是只读意图（行内接管已移除）；可写是标题栏那一下的结果。
+    expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
     expect(paneMode(renderer)).toBe('controlled');
 
-    await clickRowAction(renderer, 'Session B', 'terminal');
+    await clickRowAction(renderer, 'Session B');
     // 回归的形状：先 selectSession 把面板迁到 B 并压成只读，紧接着的开关判断看到
     // 「B 且只读」= 这次点击的意图，于是被当成同按钮二次点击 → 面板被关掉。
     expect(pane(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: false });
@@ -270,10 +336,10 @@ describe('跨会话点行内「终端」打开的是那一行的只读终端，�
     const lease = leaseApi();
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
 
-    await clickRowAction(renderer, 'Session B', 'terminal');
+    await clickRowAction(renderer, 'Session B');
     expect(pane(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: false });
     act(() => renderer.unmount());
   });
@@ -282,9 +348,9 @@ describe('跨会话点行内「终端」打开的是那一行的只读终端，�
     const lease = leaseApi();
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).not.toBeNull();
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).toBeNull();
     act(() => renderer.unmount());
   });
@@ -293,7 +359,7 @@ describe('跨会话点行内「终端」打开的是那一行的只读终端，�
     const lease = leaseApi();
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     await clickRow(renderer, 'Session B');
     expect(pane(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: false });
     expect(paneMode(renderer)).toBe('readonly');
@@ -302,31 +368,35 @@ describe('跨会话点行内「终端」打开的是那一行的只读终端，�
   });
 });
 
-// ─── ①' 只读面板已经挂着 → 同一行点「接管」（用户实测报的那条）─────────────────
-describe('先开只读终端、再点同一行的「接管」，写权限必须真的到手', () => {
+// ─── ①' 只读面板已经挂着 → 标题栏点「接管输入」（用户实测报的那条）───────────────
+describe('先开只读终端、再点标题栏「接管输入」，写权限必须真的到手', () => {
   /**
-   * 用户实测报的形状：「直接点接管能输入；先点『终端』开只读，再点『接管』就打不了字」。
-   * 差别只在**面板已经挂着**：这一路要走完 readonly → taking-over → controlled 的
-   * 显式转换，只读那一拍留下的一次性「还回租约」意图也必须已经兑现完、不能反手把
-   * 用户刚按下的接管撤销掉。上面那组用例全是「面板还没挂 / 换会话 / 反方向降级」，
-   * 没有一条压住这条正向转换，所以单独钉在这里。
+   * 用户实测报的形状：「先点『终端』开只读，再接管就打不了字」。这一路要走完
+   * readonly → taking-over → controlled 的显式转换，只读那一拍留下的一次性
+   * 「还回租约」意图也必须已经兑现完、不能反手把用户刚按下的接管撤销掉。上面那组
+   * 用例全是「面板还没挂 / 换会话 / 反方向降级」，没有一条压住这条正向转换，所以
+   * 单独钉在这里。
+   *
+   * 产品决策后接管只剩标题栏这一个入口（会话行内的「接管」按钮已移除），所以这一组
+   * 的第二步统一改成点面板标题栏的「接管输入」——覆盖的转换和以前完全一样。
    */
-  it('只读面板挂着 → 点「接管」→ 换成带接管意图的面板，takeover 真的发出去且租约到手', async () => {
+  it('只读面板挂着 → 标题栏「接管输入」→ takeover 真的发出去且租约到手', async () => {
     const lease = leaseApi();
     const renderer = await renderView(lease.api);
 
     // ① 只读打开：面板挂上，服务端此刻没有发出任何写租约。
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
     expect(paneMode(renderer)).toBe('readonly');
     expect(lease.calls.filter(call => call.startsWith('takeover'))).toEqual([]);
     expect(lease.serverControlled()).toBe(false);
 
-    // ② 同一行再点「接管」。回归的形状是这里被判成「模式没变 → 什么都不做」或者
-    //    面板不重挂 → 一次性的开场接管意图早已消费掉 → 永远没有 takeover 发出去，
-    //    用户看着一个「只读」终端打不进字。
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
-    expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: true });
+    // ② 在这块已经挂着的只读面板上点标题栏「接管输入」。回归的形状是只读那一拍的
+    //    一次性「还回租约」意图反手把它撤销掉 → 用户看着一个「已接管」的终端却打
+    //    不进字。
+    await clickPaneControl(renderer, '接管输入');
+    // 面板还是同一块（不重挂），开场意图照旧是只读——可写是标题栏那一下的结果。
+    expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
     expect(paneMode(renderer)).toBe('controlled');
     expect(feedback(renderer)).toContain('已接管');
     expect(lease.calls.filter(call => call.startsWith('takeover'))).toEqual(['takeover:session-a']);
@@ -337,15 +407,14 @@ describe('先开只读终端、再点同一行的「接管」，写权限必须�
     act(() => renderer.unmount());
   });
 
-  it('接管之后再点「终端」→ 降回只读并真的把租约还回去（来回都完整）', async () => {
+  it('标题栏接管之后再点行内「终端」→ 降回只读并真的把租约还回去（来回都完整）', async () => {
     const lease = leaseApi();
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     expect(lease.serverControlled()).toBe(true);
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).toEqual({ sessionId: 'session-a', autoTakeControl: false });
     expect(paneMode(renderer)).toBe('readonly');
     // 「打开只读终端」名副其实：不真的 release，只读就只是外层记了一笔，面板照样可写。
@@ -358,10 +427,10 @@ describe('先开只读终端、再点同一行的「接管」，写权限必须�
     const lease = leaseApi({ hold: 'takeover' });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(paneMode(renderer)).toBe('readonly');
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await clickPaneControl(renderer, '接管输入');
     expect(lease.calls).toContain('takeover:session-a');
     expect(feedback(renderer)).toContain('正在接管输入');
 
@@ -376,14 +445,17 @@ describe('先开只读终端、再点同一行的「接管」，写权限必须�
 
 // ─── ② 在途写：双击、关闭补偿、轮询不许丢结果（P1-2）─────────────────────────
 describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
-  it('快速双击「接管」只发一次 takeover，面板也不会在 POST 回来前被关掉', async () => {
+  it('接管在途时快速双击只发一次 takeover，行内「终端」也不会在 POST 回来前把面板关掉', async () => {
     const lease = leaseApi({ hold: 'takeover' });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
-    // POST 还在飞：按钮此刻必须是禁用态，行为上也必须吞掉第二次点击。
-    expect(rowAction(renderer, 'Session A', 'terminal-control')?.props.disabled).toBe(true);
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
+    // POST 还在飞：标题栏的接管按钮禁用（浏览器据此吞掉连点），行内「终端」也跟着
+    // 禁用（回执把 busy 传回外层），而且**行为上**也必须吞掉这一下——不然面板被关
+    // 掉，第一条租约没人管。
+    expect(paneControl(renderer, '接管输入')?.props.disabled).toBe(true);
+    expect(rowAction(renderer, 'Session A')?.props.disabled).toBe(true);
+    await clickRowAction(renderer, 'Session A');
     expect(lease.calls.filter(call => call.startsWith('takeover'))).toEqual(['takeover:session-a']);
     expect(pane(renderer)).not.toBeNull();
 
@@ -400,7 +472,7 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
     const lease = leaseApi({ hold: 'takeover' });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     expect(lease.calls).toContain('takeover:session-a');
 
     // 工作区头部的「关闭终端」：这一步在 POST 回执之前发生。
@@ -424,7 +496,7 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
     const lease = leaseApi({ hold: 'takeover' });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     await clickRow(renderer, 'Session B');
     expect(pane(renderer)).toEqual({ sessionId: 'session-b', autoTakeControl: false });
 
@@ -448,12 +520,17 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
         api: lease.api,
         authenticated: true,
         capabilities: FULL_CAPABILITIES,
-        autoTakeControl: true,
         now: NOW,
         location: LOCATION,
       }));
     });
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    // 接管只由标题栏发起（行内接管捷径已按产品决策移除）。POST 被 hold 住，
+    // 面板停在「正在接管」，正好用来观察轮询会不会把它挤掉。
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
     expect(lease.calls).toContain('takeover:session-a');
 
     // 轮询在写还没回执时发了一发，读到的当然还是「写之前的世界」；面板照旧显示
@@ -475,12 +552,12 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
     lease.gate.hold();
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).not.toBeNull();
     // 还没有任何权威读数：此时的模式是 loading，不是「只读」。
     expect(feedback(renderer)).toContain('正在检查终端权限');
 
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).toBeNull();
     lease.gate.open();
     await settle();
@@ -494,12 +571,12 @@ describe('release 失败不许乐观宣称只读', () => {
     const lease = leaseApi({ hold: 'release' });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     expect(paneMode(renderer)).toBe('controlled');
     expect(lease.serverControlled()).toBe(true);
 
-    // 行内「终端」= 降为只读，面板会真的发一次 release；这一次让它失败。
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    // 行内「终端」= 把已接管的面板降回只读，面板会真的发一次 release；这一次让它失败。
+    await clickRowAction(renderer, 'Session A');
     expect(lease.calls).toContain('release:session-a');
     // 把随后的复核 GET 按住，好观察 unknown 这个中间态。
     lease.gate.hold();
@@ -526,7 +603,7 @@ describe('release 失败不许乐观宣称只读', () => {
     const lease = leaseApi({ hold: 'takeover' });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     expect(lease.calls).toContain('takeover:session-a');
     lease.gate.hold();
     await act(async () => { lease.held.reject(new WorkbenchApiError(500, 'terminal_unavailable')); });
@@ -545,28 +622,29 @@ describe('release 失败不许乐观宣称只读', () => {
 
 // ─── ④ fixed / touch 的只读语义（P1-4）──────────────────────────────────────
 describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
-  it('平台 owner：行内收敛成一个「终端」开关，文案不再写「只读」，也不发任何控制 POST', async () => {
+  it('平台 owner：行内只有一个「终端」开关，文案不再写「只读」，也不发任何控制 POST', async () => {
     const lease = leaseApi({ fixed: true });
     const renderer = await renderView(lease.api);
 
-    // 还不知道身份时两个入口都在（第一次点开之前没有任何依据）。
-    expect(rowAction(renderer, 'Session A', 'terminal-control')).not.toBeNull();
-
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    // 行内本来就只剩「终端」一个终端入口（产品决策：接管统一走面板标题栏），这条
+    // 用例原来还在断言「恒可写身份下那个多余的行内接管按钮要收敛掉」——按钮已经
+    // 整体移除，这一半自然消失，剩下的文案与「不发控制 POST」照旧钉住。
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).not.toBeNull();
     expect(paneMode(renderer)).toBe('controlled');
 
-    // 面板回执带回 fixed：这是身份级事实，整张列表都收敛成一个开关。
-    expect(rowAction(renderer, 'Session A', 'terminal-control')).toBeNull();
-    expect(rowAction(renderer, 'Session B', 'terminal-control')).toBeNull();
-    const toggle = rowAction(renderer, 'Session A', 'terminal')!;
+    // 恒可写身份连标题栏的接管/释放都不渲染：它没有租约可接管，也没有可释放的。
+    expect(paneControl(renderer, '接管输入')).toBeNull();
+    expect(paneControl(renderer, '释放输入')).toBeNull();
+
+    const toggle = rowAction(renderer, 'Session A')!;
     expect(toggle.props.title).toBe('打开终端（当前身份可直接输入）');
     expect(toggle.props.title).not.toContain('只读');
 
     // 一个按钮 = 一个开关：点一次关、再点一次开。
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).toBeNull();
-    await clickRowAction(renderer, 'Session A', 'terminal');
+    await clickRowAction(renderer, 'Session A');
     expect(pane(renderer)).not.toBeNull();
     expect(paneMode(renderer)).toBe('controlled');
 
@@ -654,12 +732,12 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
 });
 
 // ─── P2：别的会话正控制着终端时，「接管」要说话 ─────────────────────────────
-describe('另一个浏览器正握着租约时点「接管」不许静默吞掉', () => {
-  it('行内「接管」照发 POST，服务端 control_busy 原样显示给用户', async () => {
+describe('另一个浏览器正握着租约时点「接管输入」不许静默吞掉', () => {
+  it('标题栏「接管输入」照发 POST，服务端 control_busy 原样显示给用户', async () => {
     const lease = leaseApi({ busyElsewhere: true });
     const renderer = await renderView(lease.api);
 
-    await clickRowAction(renderer, 'Session A', 'terminal-control');
+    await openAndTakeOver(renderer, 'Session A');
     // 回归的形状：只在 mode === 'readonly' 时才发 POST，于是这个动作没有任何反馈。
     expect(lease.calls).toContain('takeover:session-a');
     await settle(4);

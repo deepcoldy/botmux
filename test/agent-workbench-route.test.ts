@@ -117,11 +117,13 @@ describe('Agent Workbench route and surface integration', () => {
 
     const view = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8');
     expect(view).toContain('props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined');
-    // P1-17：能力位仍是第一道闸，触屏只读是叠在它上面的第二道，恒可写身份（平台
-    // 所有者，没有租约可接管）是第三道（行为断言见 agent-workbench-components.test.ts
-    // 「触屏不给行内接管」与 agent-workbench-terminal-control.test.ts「平台 owner
-    // 行内收敛成一个开关」）。
-    expect(view).toContain('canControlTerminal={props.capabilities.canControl && !touch && !fixedTerminalIdentity}');
+    // 行内的接管捷径已按产品决策移除（会话行只剩 聊天 / 终端），所以这里不再有
+    // `canControlTerminal` 这条投影——接管入口只剩终端面板标题栏那一个，能力位在
+    // 面板里把关（下面 panes 的 `props.capabilities.canControl` 就是那道闸；行为
+    // 断言见 agent-workbench-components.test.ts「行内没有『接管』按钮」与
+    // agent-workbench-terminal-control.test.ts「会话行只保留『聊天 / 终端』」）。
+    expect(view).not.toContain('canControlTerminal');
+    expect(view).toContain('onOpenTerminal={openSessionTerminal}');
 
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('props.capabilities.canControl');

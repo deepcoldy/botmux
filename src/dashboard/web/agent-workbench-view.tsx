@@ -48,7 +48,6 @@ import {
 import { createWorkbenchApi, type WorkbenchApi } from './agent-workbench-api.js';
 import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 import { WorkbenchSessionList } from './agent-workbench-session-list.js';
-import { useTouchEnvironment } from './agent-workbench-touch.js';
 import {
   TerminalPane,
   WebPane,
@@ -208,22 +207,19 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   // layout, and chat opens through it rather than inside this document.
   const [terminal, setTerminal] = useState<WorkbenchTerminalIntent | null>(null);
   const terminalSessionId = terminal?.sessionId ?? null;
-  const terminalWantsControl = terminal?.wantsControl ?? false;
   /** 这个身份是不是**恒可写**（平台所有者：没有租约可接管，也就没有只读模式）。
    *  它是身份级的事实，不随会话变，所以一旦从任意一块面板的回执里学到，就对整张
-   *  列表生效：行内不再画那个对它毫无意义的「接管」按钮，「终端」的说明也不再写
-   *  「只读」（P1-4：不改服务端，但也不要留一句与实际能力相反的文案）。 */
+   *  列表生效：行内「终端」的说明不再写「只读」（P1-4：不改服务端，但也不要留一句
+   *  与实际能力相反的文案）。 */
   const [fixedTerminalIdentity, setFixedTerminalIdentity] = useState(false);
 
-  /** 只有行内的「终端 / 接管」按钮走这里 —— 接管意图只能由这条路产生。
-   *  没有 canControl 能力时把意图压回只读：既不该发出注定 403 的 takeover，
-   *  也不该让面板顶着一个实现不了的「接管中」状态。 */
-  const toggleTerminal = (sessionId: string, wantsControl: boolean) => {
-    const intent = wantsControl && props.capabilities.canControl;
-    setTerminal(current => toggleTerminalIntent(current, sessionId, intent));
+  /** 行内「终端」按钮：只读打开 / 再点关闭。这条路**不产生接管意图**——接管统一
+   *  走终端面板标题栏的「接管输入」（产品决策：行内不再提供接管捷径）。 */
+  const toggleTerminal = (sessionId: string) => {
+    setTerminal(current => toggleTerminalIntent(current, sessionId));
   };
 
-  /** 面板回执：把它真实的模式记回意图里。只改回执那几个字段，不动 wantsControl /
+  /** 面板回执：把它真实的模式记回意图里。只改回执那几个字段，不动 sessionId /
    *  generation —— 那两个决定面板的 key，被回执带着走就会无谓重挂，终端连接跟着断。 */
   const noteTerminalControlMode = useCallback((mode: TerminalPaneControlMode) => {
     if (mode.fixed) setFixedTerminalIdentity(true);
@@ -253,8 +249,6 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   // 外观（配色 / 明暗 / 终端渲染）挂载期间落到文档根上，离开工作台原样还回全站机制。
   const appearanceTermStyle = useWorkbenchAppearanceRoot().appearance.termStyle;
   const [appearanceSheetOpen, setAppearanceSheetOpen] = useState(false);
-  // 触屏与否决定终端走哪条鉴权通道，进而决定「接管」这类写入口该不该渲染（P1-17）。
-  const touch = useTouchEnvironment();
   const responsive = deriveResponsiveWorkbenchLayout(viewportWidth, layout);
   const chatSplitActive = responsive.chatMode === 'native-split' && layout.chatRequested;
   const forcedRailCollapsed = responsive.railCollapsed;
@@ -422,10 +416,10 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     setTerminal(current => followTerminalIntent(current, sessionId));
   };
 
-  /** 行内「终端 / 接管」：选中 + 打开指定 surface，一次原子更新。 */
-  const openSessionSurface = (sessionId: string, wantsControl: boolean) => {
+  /** 行内「终端」：选中 + 只读打开终端面板，一次原子更新。 */
+  const openSessionTerminal = (sessionId: string) => {
     commitSelection(sessionId);
-    toggleTerminal(sessionId, wantsControl);
+    toggleTerminal(sessionId);
     setMobilePage('workspace');
   };
 
@@ -520,17 +514,11 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       // P1-4：定位是 POST /locate 的入口，只有 canLocate 的身份才渲染（H5/平台
       // 身份的 capability 表没有 /locate，点了只会 401）。不传即整体不渲染按钮。
       onLocate={props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined}
-      // P1-17：触屏一并不渲染行内「接管」。那边的终端挂的是 viewToken 只读通道，
-      // 接管到手也送不进输入（面板早就跳过 auto-takeover 了），行里还摆着这个按钮
-      // 只会让人反复点一个注定没反应的入口。
-      // P1-4：恒可写身份（平台所有者）同样收敛成一个「终端」开关——它没有租约可
-      // 接管，两个按钮做的是同一件事，摆两个只会让人以为存在只读模式。
-      canControlTerminal={props.capabilities.canControl && !touch && !fixedTerminalIdentity}
       // 行内按钮的文案要跟这个身份真实的能力一致：恒可写身份点开就是可输入的终端，
       // 再写「打开只读终端」就是明着说反话。
       fixedTerminal={fixedTerminalIdentity}
-      // 有写在途时禁用这一行的终端按钮：连点只会再发一条 takeover/release，
-      // 第一条的租约反而没有任何面板在管。
+      // 有写在途时禁用这一行的终端按钮：标题栏的 takeover/release 还没回执时把
+      // 面板关掉，第一条的租约反而没有任何面板在管。
       terminalBusySessionId={terminal?.busy ? terminal.sessionId : null}
       // 手机上列表页就是首屏，外观入口在它的顶栏（桌面走工作区头部的 ⋯ 菜单）。
       onOpenAppearance={responsive.mode === 'mobile' ? () => setAppearanceSheetOpen(true) : undefined}
@@ -544,7 +532,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
           // 终端连接。
           setTerminal(current => (current && current.sessionId === sessionId
             ? current
-            : openTerminalIntent(sessionId, false)));
+            : openTerminalIntent(sessionId)));
           setMobilePage('workspace');
           // Chat is a full-screen page on a phone. Following the selection here
           // would hand the user to Feishu at the same moment they asked to open
@@ -555,7 +543,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         // Chat-follow rides the row's own anchor (a trusted click the client
         // honours with the standard panel); nothing to script from here.
       }}
-      onOpenSurface={(sessionId, surface) => openSessionSurface(sessionId, surface === 'terminal-control')}
+      onOpenTerminal={openSessionTerminal}
       onToggleCollapsed={railToggle}
     />
   );
@@ -588,17 +576,20 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       <div className="wb-pane-stack">
         {terminalSession ? (
           <TerminalPane
-            // generation 进 key：换模式必须真的重挂，面板里那个一次性的开场意图才会
-            // 重新兑现（只读意图靠它把还攥着的租约还回去）。回执刷新 controlled /
-            // fixed 时 key 不变，面板不重挂，终端连接也就不会被一次徽标更新打断。
-            key={`${terminalSession.sessionId}:${terminalWantsControl ? 'rw' : 'ro'}:${terminal?.generation ?? 0}`}
+            // generation 进 key：行内「终端」把一块已接管的面板降回只读时必须真的
+            // 重挂，面板里那个一次性的开场意图才会重新兑现（只读意图靠它把还攥着的
+            // 租约还回去）。回执刷新 controlled / fixed 时 key 不变，面板不重挂，
+            // 终端连接也就不会被一次徽标更新打断。
+            key={`${terminalSession.sessionId}:${terminal?.generation ?? 0}`}
             session={terminalSession}
             api={api}
             authenticated={props.authenticated}
             capabilities={props.capabilities}
             now={now}
             location={location}
-            autoTakeControl={terminalWantsControl}
+            // 行内打开一律是只读意图：面板挂上来时把上一轮标题栏接管留下的租约
+            // 还回去。接管只由标题栏的「接管输入」发起。
+            autoTakeControl={false}
             onControlModeChange={noteTerminalControlMode}
           />
         ) : (

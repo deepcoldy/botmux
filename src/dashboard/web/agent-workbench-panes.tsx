@@ -229,18 +229,19 @@ export type { TerminalPaneControlMode };
 
 export function TerminalPane(props: PaneCommonProps & {
   location: WorkbenchTerminalLocation | null;
-  /** 这块面板是按哪个意图挂起来的，**三态**：
-   *    true      行内「接管」的一键可写捷径 → 还没接管就接管；
-   *    false     行内「终端」的只读打开     → 还攥着租约就还回去；
+  /** 这块面板是按哪个意图挂起来的，**两态**：
+   *    false     行内「终端」的只读打开 → 还攥着租约就还回去；
    *    undefined 没有意图（分栏树里的面板、直接挂载的调用方）→ 一概不动控制权。
    *  「没意见」必须和「明确要只读」分开：把缺省也当成只读意图，任何一处顺手挂起
    *  的终端面板都会把用户正握着的写权限收走。
-   *  意图只在面板第一次拿到控制权读数时兑现一次，之后控制权只由标题栏的
+   *  没有 `true`：接管**只**由标题栏的「接管输入」发起（产品决策：会话行不再提供
+   *  接管捷径），一键接管的意图连同它那条分支一起删掉了，别再加回来。
+   *  只读意图只在面板第一次拿到控制权读数时兑现一次，之后控制权只由标题栏的
    *  「接管输入 / 释放输入」驱动。 */
-  autoTakeControl?: boolean;
+  autoTakeControl?: false;
   /** 控制权回执。面板是唯一知道自己真实模式的人——标题栏的接管/释放不经过外层，
-   *  恒可写身份更是从头到尾没发过任何请求——外层的行内「终端 / 接管」按钮要靠它
-   *  判断「再点一次 = 关掉」，断了回执就会把「降级为只读」误判成二次点击。 */
+   *  恒可写身份更是从头到尾没发过任何请求——外层的行内「终端」按钮要靠它判断
+   *  「再点一次 = 关掉还是降回只读」，断了回执就会把已接管的面板直接关掉。 */
   onControlModeChange?(mode: TerminalPaneControlMode): void;
   /** 测试注入点：组件测试环境里没有真 iframe 的 internals，注入一个假的读数源即可。
    *  生产默认走同源 contentWindow（`readTerminalFrameStatus`）。 */
@@ -355,17 +356,15 @@ export function TerminalPane(props: PaneCommonProps & {
     return () => controller.abort();
   }, [model.reconcileNonce, observe]);
 
-  // 开场意图只兑现一次，在这块面板第一次拿到**权威**读数的时候：
-  //   带接管意图 → 还没接管就接管（行内「接管」的一键可写捷径）；
-  //   只读意图   → 却发现自己还攥着上一轮留下的租约（标题栏接管过，或行内刚从
-  //                接管态切过来），就把它还回去。
-  // 后一半是「打开只读终端」名副其实的关键：不真的释放，只读就只是外层记了一笔，
+  // 开场只读意图只兑现一次，在这块面板第一次拿到**权威**读数的时候：发现自己还
+  // 攥着上一轮留下的租约（标题栏接管过，行内点「终端」把它降回只读），就把它还
+  // 回去。这是「打开只读终端」名副其实的关键：不真的释放，只读就只是外层记了一笔，
   // 面板照样可输入，用户点完「终端」看到的还是一个可写终端。
-  // 两者都必须是一次性的——兑现之后控制权只由标题栏的「接管输入 / 释放输入」驱动，
-  // 否则只读面板会把用户刚按下的接管在同一拍里撤销回去。
+  // 它必须是一次性的——兑现之后控制权只由标题栏的「接管输入 / 释放输入」驱动，
+  // 否则只读面板会把用户刚在标题栏按下的接管在同一拍里撤销回去。
   // 平台所有者（`fixed`）恒可写、既接管不了也释放不了，直接跳过；未登录 / 触屏 /
-  // canControl=false（平台 teammate/guest 等）同样跳过——那个 POST 只会 401/403
-  // （P1-4），触屏那边的 iframe 更是走 viewToken 只读通道，抢来的写权限用不上。
+  // canControl=false（平台 teammate/guest 等）同样跳过——它们压根没有租约可还，
+  // 那个 POST 只会 401/403（P1-4），触屏那边更是走 viewToken 只读通道。
   const openIntentApplied = useRef<string | null>(null);
   useEffect(() => {
     if (props.autoTakeControl === undefined) return;
@@ -375,14 +374,7 @@ export function TerminalPane(props: PaneCommonProps & {
     if (!control || control.fixed) return;
     if (openIntentApplied.current === sessionId) return;
     openIntentApplied.current = sessionId;
-    if (props.autoTakeControl) {
-      // 别人正握着租约（`controlled` 但不是 owned）时也要真的发出去：服务端答
-      // control_busy，用户才看得到「另一个浏览器正在控制该终端」。只在 mode ===
-      // 'readonly' 时才发，等于把这个动作静默吞掉（P2）。
-      if (!(control.mode === 'controlled' && control.owned)) void mutate('takeover');
-    } else if (control.mode === 'controlled' && control.owned) {
-      void mutate('release');
-    }
+    if (control.mode === 'controlled' && control.owned) void mutate('release');
   });
 
   const mutate = async (action: TerminalWriteAction) => {
