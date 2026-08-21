@@ -53,8 +53,18 @@ import {
   TerminalPane,
   WebPane,
   WorkbenchInfo,
-  type TerminalPaneControlMode,
 } from './agent-workbench-panes.js';
+// 行内「终端 / 接管」的开关语义住在状态机里（与面板侧共用一套模式词汇）：
+// 「选中会话 + 打开指定 surface」必须是一次原子更新，先迁移再判断会把跨会话的
+// 「终端」误判成同按钮二次点击，把面板关掉。
+import {
+  followTerminalIntent,
+  openTerminalIntent,
+  receiveTerminalIntentMode,
+  toggleTerminalIntent,
+  type TerminalPaneControlMode,
+  type WorkbenchTerminalIntent,
+} from './agent-workbench-terminal-control.js';
 
 export interface AgentWorkbenchViewProps {
   sessions: readonly WorkbenchSessionRow[];
@@ -85,38 +95,6 @@ export interface AgentWorkbenchViewProps {
 }
 
 type MobilePage = 'sessions' | 'workspace' | 'preview' | 'info';
-
-/**
- * 终端面板的完整意图：开在**哪个会话**上，以及这次开是否**带接管**。
- * 两者必须原子地一起变。拆成两个 state 时，「面板跟随选中切会话」只改了会话 id，
- * 接管意图原封不动留着 —— 于是在 A 行点过「接管」之后，普通点击选中 B 会把这份意图
- * 带过去，对 B 自动发起接管（用户从没为 B 要过写权限）。
- *
- * `wantsControl` 只记「当初用哪个按钮打开的」，它会过期：面板标题栏的「接管输入 /
- * 释放输入」不经过这里，恒可写的平台所有者更是从头到尾没发过请求。所以面板真实的
- * 模式另记一份 `controlled` / `fixed`，由面板回执刷新——行内按钮的开关语义只认它。
- */
-type WorkbenchTerminalIntent = {
-  sessionId: string;
-  wantsControl: boolean;
-  /** 面板此刻**真的**可输入吗（面板回执，不是打开意图）。 */
-  controlled: boolean;
-  /** 恒可写身份（平台所有者）：没有只读模式可切，行内两个入口都只是开/关。 */
-  fixed: boolean;
-  /** 每换一次模式 +1。面板 key 带上它，切模式才会真的重挂；重挂又会重置面板里
-   *  那个一次性的开场意图，「只读」才有机会把还攥着的租约真的还回去。 */
-  generation: number;
-};
-
-/** 一次新的打开/换模式。`controlled` 先按意图落座，面板的第一份回执马上会把它校正
- *  成真实值——中间那一小段不会被误判，因为此时点同一个按钮本来就该是「关掉」。 */
-function openTerminalIntent(
-  sessionId: string,
-  wantsControl: boolean,
-  generation = 0,
-): WorkbenchTerminalIntent {
-  return { sessionId, wantsControl, controlled: wantsControl, fixed: false, generation };
-}
 
 /** A drag emits a pointermove per pixel; only the resting value is worth a write. */
 const LAYOUT_SAVE_DEBOUNCE_MS = 250;
@@ -231,37 +209,18 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   const [terminal, setTerminal] = useState<WorkbenchTerminalIntent | null>(null);
   const terminalSessionId = terminal?.sessionId ?? null;
   const terminalWantsControl = terminal?.wantsControl ?? false;
-
   /** 只有行内的「终端 / 接管」按钮走这里 —— 接管意图只能由这条路产生。
    *  没有 canControl 能力时把意图压回只读：既不该发出注定 403 的 takeover，
    *  也不该让面板顶着一个实现不了的「接管中」状态。 */
   const toggleTerminal = (sessionId: string, wantsControl: boolean) => {
-    if (wantsControl && !props.capabilities.canControl) wantsControl = false;
-    setTerminal(current => {
-      // 比较用的是 updater 里的**最新**意图，不是这一帧的闭包快照：onOpenSurface
-      // 先调 selectSession 把面板跟过来（并压回只读），紧接着这次比较必须看到那一步
-      // 的结果，否则「A 接管中 → 点 B 的接管」会被误判成同一个按钮的二次点击而把面板
-      // 关掉。
-      if (!current || current.sessionId !== sessionId) return openTerminalIntent(sessionId, wantsControl);
-      // 恒可写身份（平台所有者）只有一种模式，切不出只读，两个入口都只是开/关。
-      // 不认这一点的话，「终端」永远和 controlled 不相等，面板就再也关不掉了。
-      if (current.fixed) return null;
-      // 关不关，看**面板此刻真实的模式**，不是当初用哪个按钮打开的。拿打开意图比较
-      // 时，标题栏「接管输入」之后再点行内「终端」会被当成同按钮二次点击 —— 用户想
-      // 切回只读，得到的却是面板被关掉。
-      if (current.controlled === wantsControl) return null;
-      return openTerminalIntent(sessionId, wantsControl, current.generation + 1);
-    });
+    const intent = wantsControl && props.capabilities.canControl;
+    setTerminal(current => toggleTerminalIntent(current, sessionId, intent));
   };
 
-  /** 面板回执：把它真实的模式记回意图里。只改这两个字段，不动 wantsControl /
+  /** 面板回执：把它真实的模式记回意图里。只改回执那几个字段，不动 wantsControl /
    *  generation —— 那两个决定面板的 key，被回执带着走就会无谓重挂，终端连接跟着断。 */
   const noteTerminalControlMode = useCallback((mode: TerminalPaneControlMode) => {
-    setTerminal(current => {
-      if (!current || current.sessionId !== mode.sessionId) return current;
-      if (current.controlled === mode.controlled && current.fixed === mode.fixed) return current;
-      return { ...current, controlled: mode.controlled, fixed: mode.fixed };
-    });
+    setTerminal(current => receiveTerminalIntentMode(current, mode));
   }, []);
 
   // Drop the pane if its session vanished during snapshot reconciliation.
@@ -427,27 +386,40 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     setLayoutEnvelope(current => ({ ...current, layout: nextLayout(current.layout, patch) }));
   };
 
-  const selectSession = (sessionId: string) => {
-    // 选中行 = 点开会话，未读在这里清掉。行内的「终端 / 接管」也走 onOpenSurface
-    // → selectSession，所以这一处就覆盖了所有会改变选中态的入口。
+  /** 选中这件事本身：未读、选中态、路由。**不碰终端面板** —— 面板怎么动由调用方
+   *  在同一次交互里一次性决定。
+   *
+   *  拆开是 P1-1 的修法：以前行内「终端」先调 selectSession（把面板迁到新会话并
+   *  压成只读）、再调 toggleTerminal 判断开关，于是「A 的终端开着 → 点 B 行的
+   *  终端」在第二步看到的已经是「B 且只读」，与这次点击的意图刚好相等，被判成同
+   *  按钮二次点击 → 面板被关掉。选中与面板意图必须一次落定，中间不留可被误读的
+   *  中间态。 */
+  const commitSelection = (sessionId: string) => {
     markSessionSeen(sessionId);
     setSelectedSessionId(sessionId);
+    const hash = buildWorkbenchHash('main', sessionId);
+    if (props.onRouteChange) props.onRouteChange(hash);
+    else if (typeof window !== 'undefined') window.history.replaceState(window.history.state, '', hash);
+  };
+
+  /** 普通选中（行点击 / j-k 键盘选择 / 路由选中）。 */
+  const selectSession = (sessionId: string) => {
+    commitSelection(sessionId);
     // The session list is the primary surface — picking a row must not navigate
     // away from it on narrow layouts. Only an explicit surface button moves to
     // the workspace.
     // An already-open terminal follows the selection instead of staying pinned
     // to the previous session —— 但只跟到**只读**。接管意图属于「你在那一行按下
-    // 接管」的那个会话，普通选中（行点击 / j-k 键盘选择 / 路由选中）不是要写权限的
-    // 表示；让它跟着漂到新会话，就等于替用户对一个他只是点开看看的会话发起接管。
-    // 同一个会话内重复选中不动意图：正在接管 A 时点 A 的行不该把自己的写权限收掉。
-    setTerminal(current => {
-      if (current === null) return null;
-      if (current.sessionId === sessionId) return current;
-      return openTerminalIntent(sessionId, false);
-    });
-    const hash = buildWorkbenchHash('main', sessionId);
-    if (props.onRouteChange) props.onRouteChange(hash);
-    else if (typeof window !== 'undefined') window.history.replaceState(window.history.state, '', hash);
+    // 接管」的那个会话，普通选中不是要写权限的表示；让它跟着漂到新会话，就等于替
+    // 用户对一个他只是点开看看的会话发起接管。
+    setTerminal(current => followTerminalIntent(current, sessionId));
+  };
+
+  /** 行内「终端 / 接管」：选中 + 打开指定 surface，一次原子更新。 */
+  const openSessionSurface = (sessionId: string, wantsControl: boolean) => {
+    commitSelection(sessionId);
+    toggleTerminal(sessionId, wantsControl);
+    setMobilePage('workspace');
   };
 
   const resizeRail = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -545,6 +517,9 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       // 接管到手也送不进输入（面板早就跳过 auto-takeover 了），行里还摆着这个按钮
       // 只会让人反复点一个注定没反应的入口。
       canControlTerminal={props.capabilities.canControl && !touch}
+      // 有写在途时禁用这一行的终端按钮：连点只会再发一条 takeover/release，
+      // 第一条的租约反而没有任何面板在管。
+      terminalBusySessionId={terminal?.busy ? terminal.sessionId : null}
       // 手机上列表页就是首屏，外观入口在它的顶栏（桌面走工作区头部的 ⋯ 菜单）。
       onOpenAppearance={responsive.mode === 'mobile' ? () => setAppearanceSheetOpen(true) : undefined}
       onSelect={sessionId => {
@@ -553,7 +528,11 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         // workspace independent so the list stays usable while reading a pane.
         if (responsive.mode === 'mobile') {
           // 钻进工作区是「打开看看」，不是要写权限：手机端一律只读打开。
-          setTerminal(openTerminalIntent(sessionId, false));
+          // 已经开在这个会话上就原样留着——重新开一次只会白白重挂 iframe、断掉
+          // 终端连接。
+          setTerminal(current => (current && current.sessionId === sessionId
+            ? current
+            : openTerminalIntent(sessionId, false)));
           setMobilePage('workspace');
           // Chat is a full-screen page on a phone. Following the selection here
           // would hand the user to Feishu at the same moment they asked to open
@@ -564,11 +543,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         // Chat-follow rides the row's own anchor (a trusted click the client
         // honours with the standard panel); nothing to script from here.
       }}
-      onOpenSurface={(sessionId, surface) => {
-        selectSession(sessionId);
-        toggleTerminal(sessionId, surface === 'terminal-control');
-        setMobilePage('workspace');
-      }}
+      onOpenSurface={(sessionId, surface) => openSessionSurface(sessionId, surface === 'terminal-control')}
       onToggleCollapsed={railToggle}
     />
   );

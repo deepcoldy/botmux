@@ -28479,6 +28479,10 @@ button.skills-issue-badge:hover {
 .wb-mode-chip.is-interactive { color: var(--ok); background: var(--wb-success-soft); }
 .wb-mode-chip.is-readonly,
 .wb-mode-chip.is-preview { color: var(--warn); background: var(--wb-warning-soft); }
+/* 「未知」是真的第三种状态，不是只读的一种说法：接管/释放的回执丢了，这一刻既不
+   能说已接管也不能说只读。用中性灰把它和两个确定态区分开，别借用 warn 的黄色—
+   那会让人以为界面已经给出了只读这个结论。 */
+.wb-mode-chip.is-unknown { color: var(--text-2); background: var(--bg-l3); }
 .wb-lease-time { color: var(--text-3); font-size: 11px; white-space: nowrap; }
 .wb-pane-feedback {
   overflow: hidden;
@@ -28577,6 +28581,24 @@ button.skills-issue-badge:hover {
 .wb-ws-blocked a:hover { color: var(--accent); }
 /* 末尾那句「⋯ 菜单」是补充说明，压一号字，别和上面的正文抢注意力 */
 .wb-ws-blocked p:last-of-type { font-size: 11px; }
+
+/* 控制权状态未知（接管/释放没拿到回执，复核 GET 还没回来）时盖在 iframe 上。
+   它不是提示而是**闸门**：这块终端可能仍然可写，盲输入会真的打进去。所以要不
+   透明、要吃掉指针事件，复核一回来就撤。 */
+.wb-control-unknown {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  border-radius: 0;
+  background: var(--bg-l1);
+}
+.wb-control-unknown button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-l3);
+}
 
 .wb-info-drawer {
   position: absolute;

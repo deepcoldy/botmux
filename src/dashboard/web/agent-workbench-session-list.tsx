@@ -149,6 +149,9 @@ export interface WorkbenchSessionListProps {
    *  canControl 能力的身份（平台 teammate/guest、触屏 H5）接管必 403。不传按
    *  旧行为渲染（dock 等不带能力投影的精简形态）。 */
   canControlTerminal?: boolean;
+  /** 这个会话的终端面板有写请求在途：两个终端按钮此刻禁用，连点不会再发一条
+   *  takeover/release，也不会在 POST 回执前把面板关掉。 */
+  terminalBusySessionId?: string | null;
   /** 话题会话专用：让 bot 在原话题里 @ 会话拥有者，用户点通知即可跳回话题。
    *  不传则不渲染定位按钮（dock 等精简形态就是这么用的）。 */
   onLocate?(sessionId: string): Promise<void>;
@@ -609,6 +612,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                           className={`wb-session-row-action is-${surface}`}
                           title={label}
                           aria-label={`${label} — ${title}`}
+                          disabled={props.terminalBusySessionId === session.sessionId}
                           onClick={event => {
                             // The row itself selects; without this the click would
                             // also bubble and fire a redundant selection.

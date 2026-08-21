@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type CSSProperties,
@@ -26,9 +27,19 @@ import {
 import {
   WorkbenchApiError,
   type PreviewInteractionState,
-  type TerminalControlState,
   type WorkbenchApi,
 } from './agent-workbench-api.js';
+// 控制权只有一份状态机（面板侧 + 外层意图），见该文件头部的注释。
+import {
+  initialTerminalControlModel,
+  terminalControlBusy,
+  terminalControlMode,
+  terminalControlNeedsMask,
+  terminalControlReducer,
+  terminalControlSettled,
+  type TerminalPaneControlMode,
+  type TerminalWriteAction,
+} from './agent-workbench-terminal-control.js';
 import type { WorkbenchCapabilities } from './agent-workbench-capabilities.js';
 // 触屏鉴权契约只有一份实现，终端面板和会话坞共用（P1-17）。
 import { useTerminalViewLink, useTouchEnvironment } from './agent-workbench-touch.js';
@@ -152,13 +163,9 @@ function apiErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 面板对外的一次控制权回执：它此刻真的可输入吗，以及这个身份是不是**恒可写**
- *  （平台所有者没有可接管/可释放的租约，也就没有只读模式可切）。 */
-export interface TerminalPaneControlMode {
-  sessionId: string;
-  controlled: boolean;
-  fixed: boolean;
-}
+/** 面板对外的一次控制权回执。形状与语义住在状态机文件里，这里只做转出，省得
+ *  调用方为了一个类型再多认一个模块。 */
+export type { TerminalPaneControlMode };
 
 export function TerminalPane(props: PaneCommonProps & {
   location: WorkbenchTerminalLocation | null;
@@ -179,12 +186,18 @@ export function TerminalPane(props: PaneCommonProps & {
    *  生产默认走同源 contentWindow（`readTerminalFrameStatus`）。 */
   readFrameStatus?: (frame: HTMLIFrameElement | null) => TerminalFrameStatus;
 }): JSX.Element {
-  const [control, setControl] = useState<TerminalControlState | null>(null);
-  const [phase, setPhase] = useState<'loading' | 'ready' | 'busy' | 'error'>('loading');
-  const [error, setError] = useState('');
-  const [frameGeneration, setFrameGeneration] = useState(0);
-  const controlRef = useRef<TerminalControlState | null>(null);
-  const requestGeneration = useRef(0);
+  // 控制权的唯一状态机。散着的 useState 版本让观察轮询和写操作共用一个
+  // generation，15 秒一发的轮询会把在途写的回执丢掉；失败又一律乐观压成只读。
+  const [model, dispatch] = useReducer(terminalControlReducer, undefined, initialTerminalControlModel);
+  /** 观察与写各自一份 epoch：写只被更新的写作废，轮询作废不了它。 */
+  const observeEpoch = useRef(0);
+  const writeEpoch = useRef(0);
+  /** 卸载后到达的写回执要走补偿路径，不能再 dispatch。 */
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const terminalUrl = workbenchTerminalHref(props.session, props.location);
   const externalTerminalUrl = workbenchExternalTerminalHref(props.session);
   // 触屏和桌面在鉴权方式上彻底分道，详见下面那段注释。
@@ -223,60 +236,63 @@ export function TerminalPane(props: PaneCommonProps & {
     ? viewLinkUrl
     : props.authenticated ? terminalUrl : viewLinkUrl;
 
-  const applyControl = useCallback((next: TerminalControlState, reloadOnDowngrade = true) => {
-    const previous = controlRef.current;
-    controlRef.current = next;
-    setControl(next);
-    if (reloadOnDowngrade
-      && previous?.mode === 'controlled' && previous.owned
-      && (next.mode !== 'controlled' || !next.owned)) {
-      setFrameGeneration(value => value + 1);
-    }
-  }, []);
+  const sessionId = props.session.sessionId;
 
-  const refresh = useCallback(async (source: 'load' | 'poll', signal?: AbortSignal) => {
-    const generation = ++requestGeneration.current;
+  /** 一次观察（首屏 / 15s 轮询 / 写失败后的复核）。回执带着自己的 epoch 回来，
+   *  过期的、或有写在途的，都在 reducer 里被丢掉。 */
+  const observe = useCallback(async (
+    source: 'load' | 'poll' | 'reconcile',
+    signal?: AbortSignal,
+  ) => {
     // Without a Dashboard cookie the control API can only 401, and taking over
     // is not on offer anyway — settle into read-only instead of surfacing an
     // authentication error the viewer cannot act on.
     if (!terminalUrl || externalTerminalUrl || !props.authenticated) {
-      setPhase('ready');
-      applyControl({ mode: 'readonly', owned: false });
+      dispatch({ type: 'settle-readonly' });
       return;
     }
-    if (source === 'load') setPhase('loading');
+    const epoch = ++observeEpoch.current;
+    dispatch({ type: 'observe-start', epoch, source });
     try {
-      const next = await props.api.getTerminalControl(props.session.sessionId, signal);
-      if (generation !== requestGeneration.current) return;
-      applyControl(next);
-      setError('');
-      setPhase('ready');
+      const next = await props.api.getTerminalControl(sessionId, signal);
+      dispatch({ type: 'observe-settled', epoch, control: next });
     } catch (cause) {
-      if (signal?.aborted || generation !== requestGeneration.current) return;
-      applyControl({ mode: 'readonly', owned: false });
-      setError(apiErrorText(cause));
-      setPhase('error');
+      if (signal?.aborted) return;
+      dispatch({ type: 'observe-failed', epoch, error: apiErrorText(cause) });
     }
-  }, [applyControl, externalTerminalUrl, props.api, props.authenticated, props.session.sessionId, terminalUrl]);
+  }, [externalTerminalUrl, props.api, props.authenticated, sessionId, terminalUrl]);
 
   useEffect(() => {
     const controller = new AbortController();
-    void refresh('load', controller.signal);
-    const timer = setInterval(() => { void refresh('poll', controller.signal); }, 15_000);
+    void observe('load', controller.signal);
+    const timer = setInterval(() => { void observe('poll', controller.signal); }, 15_000);
     return () => {
-      requestGeneration.current += 1;
+      // 换会话 / 卸载：作废在途观察。写不走这个计数器——它有自己的 epoch，
+      // 卸载后的写回执要留到补偿逻辑里处理，不能在这里"顺手"丢掉。
+      observeEpoch.current += 1;
       clearInterval(timer);
       controller.abort();
     };
-  }, [refresh]);
+  }, [observe]);
 
+  const leaseExpiresAt = model.authoritative?.expiresAt;
   useEffect(() => {
-    if (control?.mode !== 'controlled' || !control.owned || !control.expiresAt) return undefined;
-    const timer = setTimeout(() => { void refresh('poll'); }, Math.max(0, control.expiresAt - Date.now()) + 25);
+    if (model.phase !== 'controlled' || !leaseExpiresAt) return undefined;
+    const timer = setTimeout(() => { void observe('poll'); }, Math.max(0, leaseExpiresAt - Date.now()) + 25);
     return () => clearTimeout(timer);
-  }, [control?.expiresAt, control?.mode, control?.owned, refresh]);
+  }, [leaseExpiresAt, model.phase, observe]);
 
-  // 开场意图只兑现一次，在这块面板第一次拿到控制权读数的时候：
+  // 写失败 → 立刻复核一次。P1-3：release 失败绝不能乐观宣称只读，真实的写租约
+  // 可能还在服务端挂着；这一发 GET 是把 unknown 收敛回权威读数的唯一途径
+  // （期间可写 iframe 由下面那层遮罩挡住）。
+  useEffect(() => {
+    if (model.reconcileNonce === 0) return undefined;
+    const controller = new AbortController();
+    void observe('reconcile', controller.signal);
+    return () => controller.abort();
+  }, [model.reconcileNonce, observe]);
+
+  // 开场意图只兑现一次，在这块面板第一次拿到**权威**读数的时候：
   //   带接管意图 → 还没接管就接管（行内「接管」的一键可写捷径）；
   //   只读意图   → 却发现自己还攥着上一轮留下的租约（标题栏接管过，或行内刚从
   //                接管态切过来），就把它还回去。
@@ -290,43 +306,51 @@ export function TerminalPane(props: PaneCommonProps & {
   const openIntentApplied = useRef<string | null>(null);
   useEffect(() => {
     if (props.autoTakeControl === undefined) return;
-    if (!props.authenticated || !props.capabilities.canControl || touch || phase !== 'ready') return;
+    if (!props.authenticated || !props.capabilities.canControl || touch) return;
+    if (!terminalControlSettled(model)) return;
+    const control = model.authoritative;
     if (!control || control.fixed) return;
-    if (openIntentApplied.current === props.session.sessionId) return;
-    openIntentApplied.current = props.session.sessionId;
+    if (openIntentApplied.current === sessionId) return;
+    openIntentApplied.current = sessionId;
     if (props.autoTakeControl) {
-      if (control.mode === 'readonly') void mutate('takeover');
+      // 别人正握着租约（`controlled` 但不是 owned）时也要真的发出去：服务端答
+      // control_busy，用户才看得到「另一个浏览器正在控制该终端」。只在 mode ===
+      // 'readonly' 时才发，等于把这个动作静默吞掉（P2）。
+      if (!(control.mode === 'controlled' && control.owned)) void mutate('takeover');
     } else if (control.mode === 'controlled' && control.owned) {
       void mutate('release');
     }
   });
 
-  const mutate = async (action: 'takeover' | 'release') => {
-    const generation = ++requestGeneration.current;
-    setPhase('busy');
+  const mutate = async (action: TerminalWriteAction) => {
+    const epoch = ++writeEpoch.current;
+    dispatch({ type: 'write-start', epoch, action });
     try {
       const next = action === 'takeover'
-        ? await props.api.takeoverTerminal(props.session.sessionId)
-        : await props.api.releaseTerminal(props.session.sessionId);
-      if (generation !== requestGeneration.current) return;
-      applyControl(next, false);
-      setError('');
-      setFrameGeneration(value => value + 1);
-      setPhase('ready');
+        ? await props.api.takeoverTerminal(sessionId)
+        : await props.api.releaseTerminal(sessionId);
+      if (!mounted.current) {
+        // 面板已经没了，服务端却刚刚把写租约发给了这次调用（关面板 / 换会话 /
+        // 离开工作台都会走到这里）。精确补偿：只还**真的拿到手的接管**——释放成功
+        // 本来就没有东西要还，失败的接管也没有租约可还，恒可写身份更没有租约。
+        if (action === 'takeover' && next.mode === 'controlled' && next.owned && next.fixed !== true) {
+          void props.api.releaseTerminal(sessionId).catch(() => {});
+        }
+        return;
+      }
+      dispatch({ type: 'write-settled', epoch, control: next });
     } catch (cause) {
-      if (generation !== requestGeneration.current) return;
-      applyControl({ mode: 'readonly', owned: false });
-      setError(apiErrorText(cause));
-      setPhase('error');
+      if (!mounted.current) return;
+      dispatch({ type: 'write-failed', epoch, error: apiErrorText(cause) });
     }
   };
 
   const frameRef = useRef<HTMLIFrameElement | null>(null);
-  const frameKey = `${props.session.sessionId}-${frameGeneration}`;
+  const frameKey = `${sessionId}-${model.frameGeneration}`;
   const readFrameStatus = props.readFrameStatus ?? readTerminalFrameStatus;
   const frameWatch = useTerminalFrameWatch({
     enabled: touch,
-    sessionId: props.session.sessionId,
+    sessionId,
     frameKey,
     read: () => readFrameStatus(frameRef.current),
   });
@@ -346,21 +370,33 @@ export function TerminalPane(props: PaneCommonProps & {
     pushTermAppearance();
   }, [frameWatch, pushTermAppearance]);
 
-  // 触屏挂的是 viewToken 只读通道：控制权接口哪怕报「已接管」或平台所有者（fixed），这块
-  // iframe 也送不进输入，徽标必须跟着说只读，否则和下面那行反馈自相矛盾。
-  const controlled = !touch && control?.mode === 'controlled' && control.owned;
+  const control = model.authoritative;
+  const busy = terminalControlBusy(model);
   const fixed = !touch && control?.fixed === true;
-  const status = controlled ? '可输入' : '只读';
+  // 标题栏能不能切模式 —— 也就是这块面板有没有第二种状态可去。触屏（viewToken
+  // 通道没有租约可接管）、无 canControl 能力、恒可写身份、外部终端都没有。
+  const canSwitchMode = !externalTerminalUrl && !!terminalUrl && props.authenticated
+    && props.capabilities.canControl && !touch && !fixed;
+  // 用户眼里的模式。触屏挂的是 viewToken 只读通道：控制权接口哪怕报「已接管」，
+  // 这块 iframe 也送不进输入，徽标必须跟着说只读。
+  const paneMode = touch ? 'readonly' : terminalControlMode(model);
+  const controlled = paneMode === 'controlled';
+  const status = controlled ? '可输入' : paneMode === 'unknown' ? '未知' : '只读';
+  const chipClass = controlled ? 'is-controlled' : paneMode === 'unknown' ? 'is-unknown' : 'is-readonly';
+  const chipGlyph = controlled ? '◆' : paneMode === 'unknown' ? '◇' : '◌';
+  // 未知且这块 iframe 可能仍然可写 → 盖住它。这一刻既不能说「已接管」也不能说
+  // 「只读」，而盲输入会真的打进终端（P1-3）。复核 GET 回来后遮罩自动撤掉。
+  const masked = !touch && terminalControlNeedsMask(model);
 
   // 把徽标看到的这份结论原样回执给外层。回执的是**渲染出来的模式**（含触屏那层
   // 覆盖），不是接口原始读数——外层拿它决定行内按钮的开关语义，两边看到的必须是
   // 同一个「用户眼里的模式」。sessionId 一并带上：面板换会话是重挂，回执路上不该
   // 有把上一块面板的结论套到新会话头上的缝。
   const onControlModeChange = props.onControlModeChange;
-  const sessionId = props.session.sessionId;
+  const toggleOnly = !canSwitchMode;
   useEffect(() => {
-    onControlModeChange?.({ sessionId, controlled, fixed });
-  }, [controlled, fixed, onControlModeChange, sessionId]);
+    onControlModeChange?.({ sessionId, mode: paneMode, fixed, toggleOnly, busy });
+  }, [busy, fixed, onControlModeChange, paneMode, sessionId, toggleOnly]);
   const expires = controlled && control?.expiresAt
     ? formatWorkbenchRelativeTime(control.expiresAt, props.now, 'zh-CN')
     : null;
@@ -377,8 +413,8 @@ export function TerminalPane(props: PaneCommonProps & {
         <div className="wb-pane-identity">
           <span className="wb-pane-glyph" aria-hidden="true">›_</span>
           <strong>终端</strong>
-          <span className={`wb-mode-chip ${controlled ? 'is-controlled' : 'is-readonly'}`}>
-            <span aria-hidden="true">{controlled ? '◆' : '◌'}</span>{status}
+          <span className={`wb-mode-chip ${chipClass}`}>
+            <span aria-hidden="true">{chipGlyph}</span>{status}
           </span>
           {expires ? <span className="wb-lease-time">{`${expires}到期`}</span> : null}
         </div>
@@ -386,14 +422,14 @@ export function TerminalPane(props: PaneCommonProps & {
         <WorkbenchTermStyleSegment termStyle={appearance.termStyle} />
         <div className="wb-pane-actions">
           {frameUrl ? <a href={frameUrl} target="_blank" rel="noopener noreferrer">新标签页打开</a> : null}
-          {/* 触屏不给接管按钮：那边挂的是 viewToken 只读通道，接管到手也送不进输入，
+          {/* 触屏不给接管按钮：那边挂的是 viewToken 通道，没有租约可接管/可释放，
               摆出来只会让人反复点。canControl=false（平台 teammate/guest 等）同样不给：
-              那个入口点了只会 403（P1-4，服务端投影的最小能力集）。 */}
-          {!externalTerminalUrl && terminalUrl && props.authenticated
-            && props.capabilities.canControl && !touch && !control?.fixed ? (
+              那个入口点了只会 403（P1-4，服务端投影的最小能力集）。
+              busy 期间禁用：写在途时再点一次只会再发一条 POST，第一条的租约没人管。 */}
+          {canSwitchMode ? (
             controlled
-              ? <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('release')}>释放输入</button>
-              : <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('takeover')}>接管输入</button>
+              ? <button type="button" disabled={busy} onClick={() => void mutate('release')}>释放输入</button>
+              : <button type="button" disabled={busy} onClick={() => void mutate('takeover')}>接管输入</button>
           ) : null}
         </div>
       </header>
@@ -401,13 +437,19 @@ export function TerminalPane(props: PaneCommonProps & {
         {/* 触屏一句话说死，登录与否都一样：这块 iframe 挂的是 viewToken 只读通道，控制权
             接口报什么都改变不了这个事实，转述它反而误导。 */}
         {touch ? '只读查看中。手机端为只读视图，需要输入请在电脑上操作。'
-          : phase === 'loading' ? '正在检查终端权限…' : error || (control?.fixed
-            ? '平台所有者身份已登录，可直接输入。'
-            : controlled ? '已接管，可键盘输入。'
-              // 没有接管能力的身份别劝人去点一个根本没渲染的按钮。
-              : props.authenticated && props.capabilities.canControl ? '只读查看中，点「接管输入」可操作。'
-                : props.authenticated ? '只读查看中，当前身份不可接管输入。'
-                  : '只读查看。登录 Dashboard 后可接管。')}
+          : model.phase === 'loading' ? '正在检查终端权限…'
+            : model.phase === 'taking-over' ? '正在接管输入…'
+              : model.phase === 'releasing' ? '正在释放输入…'
+                // 失败要连着「现在怎么办」一起说：只报错不说状态，用户会以为界面
+                // 上写的只读就是真的（P1-3）。
+                : model.error ? `${model.error.text}${model.phase === 'unknown' ? '；控制权状态未知，正在重新确认…' : ''}`
+                  : model.phase === 'unknown' ? '控制权状态未知，正在重新确认…'
+                    : control?.fixed ? '平台所有者身份已登录，可直接输入。'
+                      : controlled ? '已接管，可键盘输入。'
+                        // 没有接管能力的身份别劝人去点一个根本没渲染的按钮。
+                        : props.authenticated && props.capabilities.canControl ? '只读查看中，点「接管输入」可操作。'
+                          : props.authenticated ? '只读查看中，当前身份不可接管输入。'
+                            : '只读查看。登录 Dashboard 后可接管。'}
       </div>
       <div className="wb-pane-frame-shell">
         {externalTerminalUrl ? (
@@ -443,6 +485,17 @@ export function TerminalPane(props: PaneCommonProps & {
                 <p>当前浏览器环境限制了非加密的实时连接（iOS 内常见）。可尝试用系统浏览器打开，或在电脑上查看。</p>
                 <a href={frameUrl} target="_blank" rel="noopener">在浏览器中打开</a>
                 <p>飞书内可通过右上角 ⋯ 菜单选择「在浏览器打开」。</p>
+              </div>
+            ) : null}
+            {/* 控制权状态未知、而这块 iframe 可能仍然可写（接管/释放的回执丢了）：
+                盖住它。乐观说一句「只读」再放任键盘打进去，是这轮复审里最实在的一
+                条风险；盖上之后复核 GET 一回来就撤（P1-3）。 */}
+            {masked ? (
+              <div className="wb-pane-empty wb-control-unknown" role="status">
+                <span aria-hidden="true">◇</span>
+                <strong>控制权状态未知</strong>
+                <p>刚才的接管 / 释放没有拿到确认，这块终端可能仍然可写。正在重新确认，确认前先挡住输入。</p>
+                <button type="button" onClick={() => void observe('reconcile')}>立即重试</button>
               </div>
             ) : null}
           </>
