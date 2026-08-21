@@ -152,11 +152,29 @@ function apiErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 面板对外的一次控制权回执：它此刻真的可输入吗，以及这个身份是不是**恒可写**
+ *  （平台所有者没有可接管/可释放的租约，也就没有只读模式可切）。 */
+export interface TerminalPaneControlMode {
+  sessionId: string;
+  controlled: boolean;
+  fixed: boolean;
+}
+
 export function TerminalPane(props: PaneCommonProps & {
   location: WorkbenchTerminalLocation | null;
-  /** Request control as soon as the pane is ready, for the row shortcut that
-   *  opens a writable terminal in one click. */
+  /** 这块面板是按哪个意图挂起来的，**三态**：
+   *    true      行内「接管」的一键可写捷径 → 还没接管就接管；
+   *    false     行内「终端」的只读打开     → 还攥着租约就还回去；
+   *    undefined 没有意图（分栏树里的面板、直接挂载的调用方）→ 一概不动控制权。
+   *  「没意见」必须和「明确要只读」分开：把缺省也当成只读意图，任何一处顺手挂起
+   *  的终端面板都会把用户正握着的写权限收走。
+   *  意图只在面板第一次拿到控制权读数时兑现一次，之后控制权只由标题栏的
+   *  「接管输入 / 释放输入」驱动。 */
   autoTakeControl?: boolean;
+  /** 控制权回执。面板是唯一知道自己真实模式的人——标题栏的接管/释放不经过外层，
+   *  恒可写身份更是从头到尾没发过任何请求——外层的行内「终端 / 接管」按钮要靠它
+   *  判断「再点一次 = 关掉」，断了回执就会把「降级为只读」误判成二次点击。 */
+  onControlModeChange?(mode: TerminalPaneControlMode): void;
   /** 测试注入点：组件测试环境里没有真 iframe 的 internals，注入一个假的读数源即可。
    *  生产默认走同源 contentWindow（`readTerminalFrameStatus`）。 */
   readFrameStatus?: (frame: HTMLIFrameElement | null) => TerminalFrameStatus;
@@ -258,19 +276,29 @@ export function TerminalPane(props: PaneCommonProps & {
     return () => clearTimeout(timer);
   }, [control?.expiresAt, control?.mode, control?.owned, refresh]);
 
-  // Fires once per session for the "open writable" shortcut. A platform owner
-  // (`fixed`) already writes, and an unauthenticated viewer cannot take over at
-  // all, so neither needs the request. 触屏也跳过：那边的 iframe 走 viewToken 只读通道，
-  // 抢来的写权限自己用不上，反而会把别人电脑上的输入权顶掉。canControl=false 的
-  // 身份（平台 teammate/guest 等）同样跳过——那个 POST 只会 403（P1-4）。
-  const autoTakeoverDone = useRef<string | null>(null);
+  // 开场意图只兑现一次，在这块面板第一次拿到控制权读数的时候：
+  //   带接管意图 → 还没接管就接管（行内「接管」的一键可写捷径）；
+  //   只读意图   → 却发现自己还攥着上一轮留下的租约（标题栏接管过，或行内刚从
+  //                接管态切过来），就把它还回去。
+  // 后一半是「打开只读终端」名副其实的关键：不真的释放，只读就只是外层记了一笔，
+  // 面板照样可输入，用户点完「终端」看到的还是一个可写终端。
+  // 两者都必须是一次性的——兑现之后控制权只由标题栏的「接管输入 / 释放输入」驱动，
+  // 否则只读面板会把用户刚按下的接管在同一拍里撤销回去。
+  // 平台所有者（`fixed`）恒可写、既接管不了也释放不了，直接跳过；未登录 / 触屏 /
+  // canControl=false（平台 teammate/guest 等）同样跳过——那个 POST 只会 401/403
+  // （P1-4），触屏那边的 iframe 更是走 viewToken 只读通道，抢来的写权限用不上。
+  const openIntentApplied = useRef<string | null>(null);
   useEffect(() => {
-    if (!props.autoTakeControl || !props.authenticated || !props.capabilities.canControl
-      || touch || phase !== 'ready') return;
-    if (!control || control.mode !== 'readonly' || control.fixed) return;
-    if (autoTakeoverDone.current === props.session.sessionId) return;
-    autoTakeoverDone.current = props.session.sessionId;
-    void mutate('takeover');
+    if (props.autoTakeControl === undefined) return;
+    if (!props.authenticated || !props.capabilities.canControl || touch || phase !== 'ready') return;
+    if (!control || control.fixed) return;
+    if (openIntentApplied.current === props.session.sessionId) return;
+    openIntentApplied.current = props.session.sessionId;
+    if (props.autoTakeControl) {
+      if (control.mode === 'readonly') void mutate('takeover');
+    } else if (control.mode === 'controlled' && control.owned) {
+      void mutate('release');
+    }
   });
 
   const mutate = async (action: 'takeover' | 'release') => {
@@ -321,7 +349,18 @@ export function TerminalPane(props: PaneCommonProps & {
   // 触屏挂的是 viewToken 只读通道：控制权接口哪怕报「已接管」或平台所有者（fixed），这块
   // iframe 也送不进输入，徽标必须跟着说只读，否则和下面那行反馈自相矛盾。
   const controlled = !touch && control?.mode === 'controlled' && control.owned;
+  const fixed = !touch && control?.fixed === true;
   const status = controlled ? '可输入' : '只读';
+
+  // 把徽标看到的这份结论原样回执给外层。回执的是**渲染出来的模式**（含触屏那层
+  // 覆盖），不是接口原始读数——外层拿它决定行内按钮的开关语义，两边看到的必须是
+  // 同一个「用户眼里的模式」。sessionId 一并带上：面板换会话是重挂，回执路上不该
+  // 有把上一块面板的结论套到新会话头上的缝。
+  const onControlModeChange = props.onControlModeChange;
+  const sessionId = props.session.sessionId;
+  useEffect(() => {
+    onControlModeChange?.({ sessionId, controlled, fixed });
+  }, [controlled, fixed, onControlModeChange, sessionId]);
   const expires = controlled && control?.expiresAt
     ? formatWorkbenchRelativeTime(control.expiresAt, props.now, 'zh-CN')
     : null;

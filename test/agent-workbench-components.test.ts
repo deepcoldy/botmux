@@ -1305,6 +1305,215 @@ describe('Agent Workbench 接管意图只属于按下「接管」的那一行', 
   });
 });
 
+/**
+ * 行内「终端」的开关判据必须是**面板此刻真实的模式**，不是当初用哪个按钮打开的。
+ *
+ * 回归的形状：外层只记了一个 `wantsControl`（打开意图）。面板标题栏的「接管输入」
+ * 把租约拿到手时，外层那份记录还停在「只读打开」，于是用户接着点行内「终端」想切
+ * 回只读，会被判成「同一个按钮又点了一次」→ 面板直接被关掉。恒可写的平台 owner
+ * （fixed，没有只读模式）走的是同一条错判。
+ */
+describe('Agent Workbench 接管态点「终端」应降为只读而不是关掉面板', () => {
+  const NOW = 1_900_000_002_000;
+  const terminalLocation = { protocol: 'http:', origin: 'http://dashboard.test', hostname: 'dashboard.test' };
+
+  function one(): WorkbenchSessionRow[] {
+    return [{
+      sessionId: 'session-a',
+      title: 'Session A',
+      status: 'working',
+      botName: 'Builder',
+      cliId: 'codex',
+      chatId: 'oc_a',
+      webPort: 7681,
+      proxyPort: 7682,
+      lastMessageAt: 1_800_000_002_000,
+    }];
+  }
+
+  /** 有状态的租约替身：接管/释放真的改变后续 getTerminalControl 的读数。
+   *  既有那份无状态替身（takeover 之后再读仍是 readonly）恰好把这个 bug 藏住了——
+   *  面板标题栏接管完，下一次读数又变回只读，外层记录也就"碰巧"对得上。 */
+  function leaseApi(options: { fixed?: boolean } = {}): {
+    api: WorkbenchApi;
+    calls: string[];
+  } {
+    const calls: string[] = [];
+    let controlled = options.fixed === true;
+    const snapshot = (): { mode: 'readonly' | 'controlled'; owned: boolean; fixed?: boolean } =>
+      (options.fixed
+        ? { mode: 'controlled', owned: true, fixed: true }
+        : controlled
+          ? { mode: 'controlled', owned: true }
+          : { mode: 'readonly', owned: false });
+    return {
+      calls,
+      api: {
+        ...api,
+        getTerminalControl: async () => snapshot(),
+        takeoverTerminal: async (sessionId: string) => {
+          calls.push(`takeover:${sessionId}`);
+          if (!options.fixed) controlled = true;
+          return snapshot();
+        },
+        releaseTerminal: async (sessionId: string) => {
+          calls.push(`release:${sessionId}`);
+          if (!options.fixed) controlled = false;
+          return snapshot();
+        },
+      },
+    };
+  }
+
+  async function render(paneApi: WorkbenchApi): Promise<TestRenderer.ReactTestRenderer> {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
+        sessions: one(),
+        online: true,
+        authenticated: true,
+        capabilities: FULL_CAPABILITIES,
+        initialSessionId: 'session-a',
+        viewportWidth: 1440,
+        now: NOW,
+        api: paneApi,
+        storage: null,
+        location: terminalLocation,
+        sdk: null,
+        h5Context: null,
+        onRouteChange: () => {},
+      }));
+    });
+    return renderer;
+  }
+
+  async function settle(): Promise<void> { await act(async () => {}); }
+
+  async function clickRowAction(
+    renderer: TestRenderer.ReactTestRenderer,
+    surface: 'terminal' | 'terminal-control',
+  ): Promise<void> {
+    const button = renderer.root.find(node => node.type === 'button'
+      && node.props.className === `wb-session-row-action is-${surface}`);
+    await act(async () => { button.props.onClick({ stopPropagation() {} }); });
+    await settle();
+    await settle();
+  }
+
+  /** 面板标题栏里的「接管输入 / 释放输入」——与行内按钮互不相通的第二个入口。 */
+  async function clickPaneAction(
+    renderer: TestRenderer.ReactTestRenderer,
+    label: '接管输入' | '释放输入',
+  ): Promise<void> {
+    const button = renderer.root.find(node => node.type === 'button' && node.props.children === label);
+    await act(async () => { button.props.onClick(); });
+    await settle();
+    await settle();
+  }
+
+  function paneOpen(renderer: TestRenderer.ReactTestRenderer): boolean {
+    return renderer.root.findAllByType(TerminalPane).length > 0;
+  }
+
+  function paneMode(renderer: TestRenderer.ReactTestRenderer): 'controlled' | 'readonly' | 'closed' {
+    const chips = renderer.root.findAll(node =>
+      typeof node.props.className === 'string' && node.props.className.startsWith('wb-mode-chip'));
+    if (chips.length === 0) return 'closed';
+    return String(chips[0].props.className).includes('is-controlled') ? 'controlled' : 'readonly';
+  }
+
+  it('面板标题栏接管之后，行内「终端」降为只读且面板还在', async () => {
+    const { api: paneApi, calls } = leaseApi();
+    const renderer = await render(paneApi);
+
+    // 只读打开：外层记下的意图是 ro。
+    await clickRowAction(renderer, 'terminal');
+    expect(paneMode(renderer)).toBe('readonly');
+
+    // 从**面板标题栏**接管——这一步外层完全不知情，它记的还是 ro。
+    await clickPaneAction(renderer, '接管输入');
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(calls).toEqual(['takeover:session-a']);
+
+    // 用户接着点行内「终端」想切回只读。回归时这里被判成「同按钮二次点击」→ 关掉面板。
+    await clickRowAction(renderer, 'terminal');
+    expect(paneOpen(renderer)).toBe(true);
+    expect(paneMode(renderer)).toBe('readonly');
+    // 只读不是「画面上写着只读」，是租约真的还回去了。
+    expect(calls).toEqual(['takeover:session-a', 'release:session-a']);
+    act(() => renderer.unmount());
+  });
+
+  it('行内「接管」之后，行内「终端」同样降为只读且面板还在', async () => {
+    const { api: paneApi, calls } = leaseApi();
+    const renderer = await render(paneApi);
+
+    await clickRowAction(renderer, 'terminal-control');
+    expect(paneMode(renderer)).toBe('controlled');
+
+    await clickRowAction(renderer, 'terminal');
+    expect(paneOpen(renderer)).toBe(true);
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(calls).toEqual(['takeover:session-a', 'release:session-a']);
+    act(() => renderer.unmount());
+  });
+
+  it('降到只读之后再点一次「终端」才是关闭：开关语义没丢', async () => {
+    const { api: paneApi } = leaseApi();
+    const renderer = await render(paneApi);
+
+    await clickRowAction(renderer, 'terminal-control');
+    await clickRowAction(renderer, 'terminal');
+    expect(paneMode(renderer)).toBe('readonly');
+
+    await clickRowAction(renderer, 'terminal');
+    expect(paneOpen(renderer)).toBe(false);
+    act(() => renderer.unmount());
+  });
+
+  it('没有打开意图的面板（分栏树 / 直接挂载）一概不动控制权', async () => {
+    // 「明确要只读」才释放；「没传意图」是另一回事——把缺省也当只读，任何一处顺手
+    // 挂起的终端面板都会把用户正握着的写权限收走。
+    const { api: paneApi, calls } = leaseApi();
+    await paneApi.takeoverTerminal('session-a');
+    expect(calls).toEqual(['takeover:session-a']);
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(TerminalPane, {
+        session: { sessionId: 'session-a', status: 'working', webPort: 7681, proxyPort: 7682 },
+        api: paneApi,
+        authenticated: true,
+        capabilities: FULL_CAPABILITIES,
+        now: NOW,
+        location: terminalLocation,
+      }));
+    });
+    await settle();
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(calls).toEqual(['takeover:session-a']);
+    act(() => renderer.unmount());
+  });
+
+  it('恒可写的平台 owner（fixed）：行内按钮就是开/关，不会无限重挂也不会漏关', async () => {
+    // fixed 身份没有可切的只读模式（面板标题栏同样不给接管/释放按钮）。
+    // 用「面板真实模式」判开关时，如果不认这一点，「终端」永远和 controlled 不相等，
+    // 面板就再也关不掉了。
+    const { api: paneApi, calls } = leaseApi({ fixed: true });
+    const renderer = await render(paneApi);
+
+    await clickRowAction(renderer, 'terminal-control');
+    expect(paneOpen(renderer)).toBe(true);
+    expect(paneMode(renderer)).toBe('controlled');
+
+    await clickRowAction(renderer, 'terminal');
+    expect(paneOpen(renderer)).toBe(false);
+    // 恒可写身份没有租约，别对它发注定 403 的 release。
+    expect(calls).toEqual([]);
+    act(() => renderer.unmount());
+  });
+});
+
 // ─── P1-4：操作入口按服务端最小能力集渲染（六类身份矩阵）─────────────────────
 //
 // workbenchAuthed 只决定观察级形态；三类操作入口各看服务端投影的对应布尔。

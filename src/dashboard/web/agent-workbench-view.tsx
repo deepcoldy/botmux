@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -52,6 +53,7 @@ import {
   TerminalPane,
   WebPane,
   WorkbenchInfo,
+  type TerminalPaneControlMode,
 } from './agent-workbench-panes.js';
 
 export interface AgentWorkbenchViewProps {
@@ -89,8 +91,32 @@ type MobilePage = 'sessions' | 'workspace' | 'preview' | 'info';
  * 两者必须原子地一起变。拆成两个 state 时，「面板跟随选中切会话」只改了会话 id，
  * 接管意图原封不动留着 —— 于是在 A 行点过「接管」之后，普通点击选中 B 会把这份意图
  * 带过去，对 B 自动发起接管（用户从没为 B 要过写权限）。
+ *
+ * `wantsControl` 只记「当初用哪个按钮打开的」，它会过期：面板标题栏的「接管输入 /
+ * 释放输入」不经过这里，恒可写的平台所有者更是从头到尾没发过请求。所以面板真实的
+ * 模式另记一份 `controlled` / `fixed`，由面板回执刷新——行内按钮的开关语义只认它。
  */
-type WorkbenchTerminalIntent = { sessionId: string; wantsControl: boolean };
+type WorkbenchTerminalIntent = {
+  sessionId: string;
+  wantsControl: boolean;
+  /** 面板此刻**真的**可输入吗（面板回执，不是打开意图）。 */
+  controlled: boolean;
+  /** 恒可写身份（平台所有者）：没有只读模式可切，行内两个入口都只是开/关。 */
+  fixed: boolean;
+  /** 每换一次模式 +1。面板 key 带上它，切模式才会真的重挂；重挂又会重置面板里
+   *  那个一次性的开场意图，「只读」才有机会把还攥着的租约真的还回去。 */
+  generation: number;
+};
+
+/** 一次新的打开/换模式。`controlled` 先按意图落座，面板的第一份回执马上会把它校正
+ *  成真实值——中间那一小段不会被误判，因为此时点同一个按钮本来就该是「关掉」。 */
+function openTerminalIntent(
+  sessionId: string,
+  wantsControl: boolean,
+  generation = 0,
+): WorkbenchTerminalIntent {
+  return { sessionId, wantsControl, controlled: wantsControl, fixed: false, generation };
+}
 
 /** A drag emits a pointermove per pixel; only the resting value is worth a write. */
 const LAYOUT_SAVE_DEBOUNCE_MS = 250;
@@ -212,15 +238,31 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
   const toggleTerminal = (sessionId: string, wantsControl: boolean) => {
     if (wantsControl && !props.capabilities.canControl) wantsControl = false;
     setTerminal(current => {
-      // Re-clicking the same button closes; switching mode or session keeps it
-      // open and applies the new intent. 比较用的是 updater 里的**最新**意图，不是
-      // 这一帧的闭包快照：onOpenSurface 先调 selectSession 把面板跟过来（并压回只
-      // 读），紧接着这次比较必须看到那一步的结果，否则「A 接管中 → 点 B 的接管」会
-      // 被误判成同一个按钮的二次点击而把面板关掉。
-      if (current && current.sessionId === sessionId && current.wantsControl === wantsControl) return null;
-      return { sessionId, wantsControl };
+      // 比较用的是 updater 里的**最新**意图，不是这一帧的闭包快照：onOpenSurface
+      // 先调 selectSession 把面板跟过来（并压回只读），紧接着这次比较必须看到那一步
+      // 的结果，否则「A 接管中 → 点 B 的接管」会被误判成同一个按钮的二次点击而把面板
+      // 关掉。
+      if (!current || current.sessionId !== sessionId) return openTerminalIntent(sessionId, wantsControl);
+      // 恒可写身份（平台所有者）只有一种模式，切不出只读，两个入口都只是开/关。
+      // 不认这一点的话，「终端」永远和 controlled 不相等，面板就再也关不掉了。
+      if (current.fixed) return null;
+      // 关不关，看**面板此刻真实的模式**，不是当初用哪个按钮打开的。拿打开意图比较
+      // 时，标题栏「接管输入」之后再点行内「终端」会被当成同按钮二次点击 —— 用户想
+      // 切回只读，得到的却是面板被关掉。
+      if (current.controlled === wantsControl) return null;
+      return openTerminalIntent(sessionId, wantsControl, current.generation + 1);
     });
   };
+
+  /** 面板回执：把它真实的模式记回意图里。只改这两个字段，不动 wantsControl /
+   *  generation —— 那两个决定面板的 key，被回执带着走就会无谓重挂，终端连接跟着断。 */
+  const noteTerminalControlMode = useCallback((mode: TerminalPaneControlMode) => {
+    setTerminal(current => {
+      if (!current || current.sessionId !== mode.sessionId) return current;
+      if (current.controlled === mode.controlled && current.fixed === mode.fixed) return current;
+      return { ...current, controlled: mode.controlled, fixed: mode.fixed };
+    });
+  }, []);
 
   // Drop the pane if its session vanished during snapshot reconciliation.
   const terminalSession = useMemo(
@@ -401,7 +443,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
     setTerminal(current => {
       if (current === null) return null;
       if (current.sessionId === sessionId) return current;
-      return { sessionId, wantsControl: false };
+      return openTerminalIntent(sessionId, false);
     });
     const hash = buildWorkbenchHash('main', sessionId);
     if (props.onRouteChange) props.onRouteChange(hash);
@@ -511,7 +553,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
         // workspace independent so the list stays usable while reading a pane.
         if (responsive.mode === 'mobile') {
           // 钻进工作区是「打开看看」，不是要写权限：手机端一律只读打开。
-          setTerminal({ sessionId, wantsControl: false });
+          setTerminal(openTerminalIntent(sessionId, false));
           setMobilePage('workspace');
           // Chat is a full-screen page on a phone. Following the selection here
           // would hand the user to Feishu at the same moment they asked to open
@@ -559,7 +601,10 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
       <div className="wb-pane-stack">
         {terminalSession ? (
           <TerminalPane
-            key={`${terminalSession.sessionId}:${terminalWantsControl ? 'rw' : 'ro'}`}
+            // generation 进 key：换模式必须真的重挂，面板里那个一次性的开场意图才会
+            // 重新兑现（只读意图靠它把还攥着的租约还回去）。回执刷新 controlled /
+            // fixed 时 key 不变，面板不重挂，终端连接也就不会被一次徽标更新打断。
+            key={`${terminalSession.sessionId}:${terminalWantsControl ? 'rw' : 'ro'}:${terminal?.generation ?? 0}`}
             session={terminalSession}
             api={api}
             authenticated={props.authenticated}
@@ -567,6 +612,7 @@ export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element 
             now={now}
             location={location}
             autoTakeControl={terminalWantsControl}
+            onControlModeChange={noteTerminalControlMode}
           />
         ) : (
           <div className="wb-pane-placeholder" role="status">
