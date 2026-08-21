@@ -14,7 +14,11 @@ vi.mock('../src/platform/secure-host-file.js', () => ({
 }));
 
 import { platformBrowserAuthorities } from '../src/platform/binding.js';
-import { managementUpgradeOrigin } from '../src/dashboard/control-csrf.js';
+import {
+  ControlCsrfTokens,
+  guardControlRequest,
+  managementUpgradeOrigin,
+} from '../src/dashboard/control-csrf.js';
 
 const MACHINE_ID = 'ff27a1b1e45b4504';
 function bindTo(platformUrl: string | null): void {
@@ -104,5 +108,54 @@ describe('#933 managementUpgradeOrigin 认平台子域', () => {
       host: '127.0.0.1:7891',
     });
     expect(verdict.ok).toBe(false);
+  });
+});
+
+/**
+ * 同一份 requestAuthorities 还喂着「有副作用 POST」的 CSRF/同源门，工作台行内
+ * 「接管」发出的 POST /api/sessions/:id/control/takeover 走的正是它。
+ *
+ * 之前这条腿没有用例：只钉住 WS 那半边的话，谁把平台 authority 收窄成「只给
+ * WS 升级用」都不会转红，而用户看到的会是「终端连上了、点接管却 403，面板停在
+ * 只读」——终端能看不能操作，比整片 disconnected 更难定位。
+ */
+describe('#933 平台子域下「接管」POST 的同源门', () => {
+  const AUTH_SESSION = 'platform:machine-scope:owner';
+  const tokens = new ControlCsrfTokens();
+  const csrf = tokens.mint(AUTH_SESSION);
+  /** 平台隧道裸桥接后 daemon 看到的请求形状：Host 已被改写成回环、无 XFH。 */
+  const headersFrom = (origin: string) => ({ origin, host: '127.0.0.1:7891', 'x-botmux-csrf': csrf });
+  const guard = (origin: string) => guardControlRequest({
+    headers: headersFrom(origin),
+    authSessionId: AUTH_SESSION,
+    tokens,
+  });
+
+  it('已绑定平台：m- 机器子域发起的接管 POST 判同源并放行', () => {
+    bindTo('https://botmux.example.com');
+    expect(guard(`https://m-${MACHINE_ID}.botmux.example.com`)).toEqual({ ok: true });
+  });
+
+  it('已绑定平台：t- 终端子域发起的接管 POST 同样放行', () => {
+    bindTo('https://botmux.example.com');
+    expect(guard(`https://t-${MACHINE_ID}.botmux.example.com`)).toEqual({ ok: true });
+  });
+
+  it('反向变异守卫：未绑定平台时同一 Origin 必 403（放行确实来自派生而非放水）', () => {
+    bindTo(null);
+    expect(guard(`https://m-${MACHINE_ID}.botmux.example.com`))
+      .toEqual({ ok: false, status: 403, error: 'control_origin_forbidden' });
+  });
+
+  it('负向：别的 machineId 的平台子域仍判跨站拒', () => {
+    bindTo('https://botmux.example.com');
+    expect(guard('https://m-deadbeefdeadbeef.botmux.example.com'))
+      .toEqual({ ok: false, status: 403, error: 'control_origin_forbidden' });
+  });
+
+  it('负向：本机 machineId 但挂在别的平台域名下仍判跨站拒', () => {
+    bindTo('https://botmux.example.com');
+    expect(guard(`https://m-${MACHINE_ID}.evil.example.com`))
+      .toEqual({ ok: false, status: 403, error: 'control_origin_forbidden' });
   });
 });
