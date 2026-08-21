@@ -4,7 +4,11 @@ import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js';
-import { TerminalPane, type TerminalFrameWrite } from '../src/dashboard/web/agent-workbench-panes.js';
+import {
+  TERMINAL_WRITE_TIMEOUT_MS,
+  TerminalPane,
+  type TerminalFrameWrite,
+} from '../src/dashboard/web/agent-workbench-panes.js';
 import {
   WorkbenchApiError,
   type TerminalControlState,
@@ -547,6 +551,11 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
       }));
     });
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    // 先走到离下一发轮询只差 200ms 的位置，再发起接管：这样轮询落在写的**在途窗口
+    // 内**，而写本身远没到硬超时（TERMINAL_WRITE_TIMEOUT_MS）。这条用例考的是
+    // 「观察 epoch 作废不了写 epoch」，不是「写可以永远挂着」——后者由超时那组用例
+    // 单独钉住。
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_900); });
     // 接管只由标题栏发起（行内接管捷径已按产品决策移除）。POST 被 hold 住，
     // 面板停在「正在接管」，正好用来观察轮询会不会把它挤掉。
     await act(async () => {
@@ -557,7 +566,8 @@ describe('在途 takeover 与关闭 / 双击 / 轮询互不抢状态', () => {
 
     // 轮询在写还没回执时发了一发，读到的当然还是「写之前的世界」；面板照旧显示
     // 「正在接管」，没有被这一发轮询挤掉。
-    await act(async () => { await vi.advanceTimersByTimeAsync(15_100); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(lease.calls.filter(call => call === 'get').length).toBeGreaterThan(1);
     expect(feedback(renderer)).toContain('正在接管输入');
 
     // 写的回执现在才到：它才是权威，绝不能因为「轮询更晚发起」而被丢掉。
@@ -856,6 +866,103 @@ describe('恒可写身份与触屏的只读语义与实际能力一致', () => {
     expect(worker).toContain('var hasToken=${hasWrite}');
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('{ hasToken?: unknown }');
+  });
+});
+
+// ─── ⑥ 写 POST 的硬超时：永久 pending 不许锁死面板 ───────────────────────────
+describe('写请求永久 pending 时不许把按钮和 busy 永久锁死', () => {
+  it('takeover 迟迟不回执 → 到点判超时：进未知 + 遮罩 + 复核，按钮重新可点', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    // hold 住的那个 promise 这条用例里**永远不 resolve**，正是线上会遇到的形状：
+    // 连接半开、代理吞掉回执，fetch 就那么挂着。
+    const lease = leaseApi({ hold: 'takeover' });
+    const renderer = await renderPane(lease.api);
+    expect(paneMode(renderer)).toBe('readonly');
+
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(lease.calls).toContain('takeover:session-a');
+    expect(feedback(renderer)).toContain('正在接管输入');
+    expect(paneControl(renderer, '接管输入')?.props.disabled).toBe(true);
+
+    // 复核 GET 先按住，好观察 unknown 这个中间态。
+    lease.gate.hold();
+    await act(async () => { await vi.advanceTimersByTimeAsync(TERMINAL_WRITE_TIMEOUT_MS + 100); });
+    // 回归的形状：这里会一直停在「正在接管输入…」，busy 恒为真、按钮恒禁用，
+    // 卸载补偿也永远等不到那个 promise。
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(maskShown(renderer)).toBe(true);
+    expect(feedback(renderer)).toContain('超时');
+    expect(feedback(renderer)).toContain('控制权状态未知');
+    // busy 解锁：用户还能再试一次，不是对着一个死掉的按钮干瞪眼。
+    expect(paneControl(renderer, '接管输入')?.props.disabled).toBe(false);
+
+    // 权威复核放行：服务端确实没有发出租约，这时才可以说只读，而且是有依据的。
+    await act(async () => {
+      lease.gate.open();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('readonly');
+    expect(maskShown(renderer)).toBe(false);
+    act(() => renderer.unmount());
+  });
+
+  it('release 同样有超时兜底：不会因为回执丢了就把「释放输入」永久禁用', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const lease = leaseApi();
+    const renderer = await renderPane(lease.api);
+    await act(async () => {
+      paneControl(renderer, '接管输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+
+    // 第二次写（release）挂死：把替身换成一个永不回执的实现。
+    const stuck = deferred<TerminalControlState>();
+    const stuckApi: WorkbenchApi = {
+      ...lease.api,
+      releaseTerminal: async () => stuck.promise,
+    };
+    await act(async () => {
+      renderer.update(React.createElement(TerminalPane, {
+        session: PAIR()[0],
+        api: stuckApi,
+        authenticated: true,
+        capabilities: FULL_CAPABILITIES,
+        now: NOW,
+        location: LOCATION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      paneControl(renderer, '释放输入')?.props.onClick();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(feedback(renderer)).toContain('正在释放输入');
+
+    // 复核 GET 按住，好观察 unknown 这个中间态。
+    lease.gate.hold();
+    await act(async () => { await vi.advanceTimersByTimeAsync(TERMINAL_WRITE_TIMEOUT_MS + 100); });
+    // 释放没拿到确认 → 绝不许乐观宣称只读：进未知、盖住可写 iframe、复核。
+    expect(paneMode(renderer)).toBe('unknown');
+    expect(maskShown(renderer)).toBe(true);
+    // busy 解锁：未知态下标题栏给的是「接管输入」（我们并不知道租约还在不在），
+    // 但它必须是可点的——不能因为回执丢了就把这块面板焊死。
+    expect(paneControl(renderer, '接管输入')?.props.disabled).toBe(false);
+    expect(lease.serverControlled()).toBe(true);
+
+    // 复核放行：释放确实没成，租约还在手上，收敛回「可输入」而不是假的只读。
+    await act(async () => {
+      lease.gate.open();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(paneMode(renderer)).toBe('controlled');
+    expect(maskShown(renderer)).toBe(false);
+    act(() => renderer.unmount());
   });
 });
 

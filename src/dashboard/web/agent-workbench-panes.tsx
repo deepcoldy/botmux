@@ -217,10 +217,54 @@ function apiErrorText(error: unknown): string {
       terminal_unavailable: '终端不可用',
       control_busy: '另一个浏览器正在控制该终端',
       preview_not_registered: '未注册网页预览',
+      control_request_timeout: '控制权请求超时',
     };
     return known[error.code] ?? error.code.replaceAll('_', ' ');
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 写请求（takeover / release）的硬超时。
+ *
+ * 没有它时，一个**永远不回执**的 POST 会把这块面板整个焊死：`pending` 一直挂着 →
+ * `busy` 恒为真 → 标题栏和行内按钮永久禁用；轮询读数一律被在途写丢弃，界面停在
+ * 「正在接管输入…」；连卸载补偿也等不到那个 promise。半开连接、被代理吞掉的回执
+ * 都是这个形状，而且它不会自己好。
+ *
+ * 到点就按失败处理：进 `unknown`（**不是**只读——服务端很可能已经受理了）、遮罩
+ * 挡住盲输入、立刻发一次权威复核 GET 把状态收敛回来。
+ */
+export const TERMINAL_WRITE_TIMEOUT_MS = 10_000;
+
+/**
+ * 跑一次写请求，超时就自己判负。
+ *
+ * 两件事一起做，缺一不可：
+ *   ① `abort()` 掐掉请求本身——不然这条 fetch 会带着一个没人看的写租约继续飞；
+ *   ② 竞速 reject——调用方拿到的必须是一个**会结束**的 promise。只靠 abort 不够：
+ *      注入的 api 替身（以及某些不认 signal 的 fetch polyfill）可能压根不理会
+ *      signal，那样 promise 依旧永久 pending，超时也就形同虚设。
+ */
+async function withWriteTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = TERMINAL_WRITE_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      try { controller.abort(); } catch { /* 环境不支持 abort：超时判定照旧成立 */ }
+      reject(new WorkbenchApiError(504, 'control_request_timeout'));
+    }, timeoutMs);
+  });
+  // 被丢下的那一半 promise 若稍后 reject，没人接就会冒成 unhandled rejection。
+  expiry.catch(() => {});
+  try {
+    return await Promise.race([run(controller.signal), expiry]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** 面板对外的一次控制权回执。形状与语义住在状态机文件里，这里只做转出，省得
@@ -381,9 +425,10 @@ export function TerminalPane(props: PaneCommonProps & {
     const epoch = ++writeEpoch.current;
     dispatch({ type: 'write-start', epoch, action });
     try {
-      const next = action === 'takeover'
-        ? await props.api.takeoverTerminal(sessionId)
-        : await props.api.releaseTerminal(sessionId);
+      // 硬超时：永久 pending 的 POST 会把 busy / 按钮 / 卸载补偿一起焊死。
+      const next = await withWriteTimeout(signal => (action === 'takeover'
+        ? props.api.takeoverTerminal(sessionId, signal)
+        : props.api.releaseTerminal(sessionId, signal)));
       if (!mounted.current) {
         // 面板已经没了，服务端却刚刚把写租约发给了这次调用（关面板 / 换会话 /
         // 离开工作台都会走到这里）。精确补偿：只还**真的拿到手的接管**——释放成功
