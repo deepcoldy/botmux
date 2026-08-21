@@ -29,7 +29,12 @@ import {
   mintPreviewContentCapability,
   verifyPreviewContentCapability,
 } from '../src/dashboard/preview-content-capability.js';
+import { terminalWriteFrame } from '../src/core/terminal-write-frame.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
+import {
+  matchTerminalControlRoute,
+  resolveTerminalControlAction,
+} from '../src/dashboard/terminal-control-route.js';
 import {
   centralViewLinkPath,
   mintTerminalViewCapability,
@@ -377,34 +382,30 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     return json(res, 200, { ok: true, url: link, expiresAt: minted.expiresAt });
   }
 
-  const controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
+  // 与生产同一份路由（dashboard/terminal-control-route.ts）。脚本这边只保留注入用的
+  // 故障开关，分发与查询参数解析一律不再另写一遍。
+  const controlMatch = matchTerminalControlRoute(url.pathname);
   if (controlMatch) {
     if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
-    const sessionId = decodeURIComponent(controlMatch[1]);
+    if (!controlMatch.ok) return json(res, 400, { ok: false, error: controlMatch.error });
+    const sessionId = controlMatch.sessionId;
     if (sessionId === 'browser-failure') return json(res, 503, { ok: false, error: 'daemon_offline' });
-    const action = controlMatch[2];
-    if (req.method === 'GET' && !action) {
-      if (controlReadsHang) { hungControlReads.add(res); return; }
-      return json(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
+    if (req.method === 'GET' && !controlMatch.action && controlReadsHang) {
+      hungControlReads.add(res);
+      return;
     }
     if (controlWritesFail && req.method === 'POST') {
       return json(res, 503, { ok: false, error: 'daemon_offline' });
     }
-    if (req.method === 'POST' && action === 'takeover') {
-      const result = terminalControl.takeover(requestIdentity, sessionId);
-      return json(res, result.ok ? 200 : 409, result.ok ? { ...result, owned: true } : { ok: false, error: result.error });
-    }
-    if (req.method === 'POST' && action === 'release') {
-      // `?expect=` 是补偿路径带来的 CAS 条件：只还「我这次接管拿到的那一把」。
-      // 缺省（用户手点「释放输入」）照旧是无条件释放。
-      const result = terminalControl.release(
-        requestIdentity,
-        sessionId,
-        url.searchParams.get('expect') ?? undefined,
-      );
-      return json(res, result.ok ? 200 : 403, result.ok ? { ...result, owned: false } : { ok: false, error: result.error });
-    }
-    return json(res, 405, { ok: false, error: 'method_not_allowed' });
+    const answer = resolveTerminalControlAction({
+      method: req.method ?? 'GET',
+      action: controlMatch.action,
+      sessionId,
+      search: url.searchParams,
+      identity: requestIdentity,
+      control: terminalControl,
+    });
+    return json(res, answer.status, answer.body);
   }
 
   const interactionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
@@ -497,7 +498,8 @@ front.on('upgrade', (req, socket, head) => {
   if (url.pathname === '/terminal-socket') {
     return terminalWss.handleUpgrade(req, socket, head, ws => {
       // 与 worker 同一串：终端页用生产代码把它从终端流里剥出来。
-      ws.send(`\u001b]1989;write;${terminalSocketWrite ? 1 : 0}\u0007`);
+      // 带外首帧（与 worker 同一份编码）：页面只在本连接第一帧上认它。
+      ws.send(terminalWriteFrame(terminalSocketWrite));
     });
   }
   if (url.pathname !== '/control-socket') return socket.destroy();
@@ -515,7 +517,7 @@ front.on('upgrade', (req, socket, head) => {
       return;
     }
     ws.send('controlled');
-    ws.once('close', () => terminalControl.disconnect(requestIdentity, sessionId, registered.leaseMarker));
+    ws.once('close', () => terminalControl.disconnect(requestIdentity, sessionId, registered.acquisition));
   });
 });
 const frontPort = await listen(front);
