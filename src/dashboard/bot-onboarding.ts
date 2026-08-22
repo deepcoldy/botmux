@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
 import {
   detectUnusableOwnerEntries,
   resolveScannerAllowedUser,
@@ -143,6 +143,7 @@ export interface BotOnboardingSnapshot {
 export interface BotOnboardingInput {
   /** 飞书应用名称；留空时按待追加的 bots.json 行号生成 botmux-N。 */
   appName?: string;
+  cloneSourceAppId?: string;
   /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
   registrationMode?: 'web' | 'compat';
   /**
@@ -1591,6 +1592,13 @@ export class BotOnboardingManager {
   }
 
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    const cloneSource = input.cloneSourceAppId
+      ? readBotsJsonOrEmpty(this.opts.botsJsonPath).find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
+      : undefined;
+    if (input.cloneSourceAppId && !cloneSource) {
+      this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
+      return;
+    }
     // Freeze the resolved name before any asynchronous work. Later bot list
     // changes must not make the name drift midway through onboarding.
     const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
@@ -1673,9 +1681,9 @@ export class BotOnboardingManager {
 
     // CLI / 工作目录 / model 来自前端表单 (dashboard 已用 resolveCliId +
     // invalidWorkingDirs 校验过). 留空回退到 setup 同款默认: claude-code / '~'.
-    const cliId: CliId = input.cliId ?? 'claude-code';
-    const workingDir = input.workingDir?.trim() || '~';
-    const bot: Record<string, any> = {
+    let cliId: CliId = input.cliId ?? 'claude-code';
+    let workingDir = input.workingDir?.trim() || '~';
+    let bot: Record<string, any> = {
       larkAppId: result.appId,
       larkAppSecret: result.appSecret,
       cliId,
@@ -1689,6 +1697,11 @@ export class BotOnboardingManager {
     // brand 落盘：只在国际版写字段，feishu 留空（向后兼容，见 normalizeBrand）。
     if (result.brand === 'lark') {
       bot.brand = 'lark';
+    }
+    if (cloneSource) {
+      bot = cloneBotConfig(cloneSource, bot);
+      cliId = bot.cliId ?? 'claude-code';
+      workingDir = bot.defaultWorkingDir ?? bot.workingDir ?? '~';
     }
     // 注意：此处 **不** 立刻把 bot 写进 bots.json。空 allowedUsers 的 bot 一旦落盘,
     // 就是一个「可被 botmux start/restart 读取、运行时按无白名单全开放」的 fail-open

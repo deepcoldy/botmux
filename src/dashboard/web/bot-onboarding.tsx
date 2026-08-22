@@ -4,6 +4,7 @@ import { DropdownMenu } from './dashboard-components.js';
 import { t } from './ui.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
+let cloneSourceAppId: string | undefined;
 
 type OnboardingStatus =
   | 'starting'
@@ -234,7 +235,8 @@ function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptions
   }, cliId, cliState);
 }
 
-export async function openBotOnboarding(): Promise<void> {
+export async function openBotOnboarding(sourceAppId?: string): Promise<void> {
+  cloneSourceAppId = sourceAppId;
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
 }
 
@@ -608,6 +610,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const close = useCallback(() => {
     stopPolling();
+    cloneSourceAppId = undefined;
     props.onClose();
   }, [props, stopPolling]);
 
@@ -707,6 +710,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
+          cloneSourceAppId,
         }),
       });
       const body = await res.json();
