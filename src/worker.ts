@@ -19006,10 +19006,30 @@ function cleanup(): void {
   releaseCodexAppPosixOwnerLease();
 }
 
-process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
-process.on('SIGINT', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+/**
+ * A shared existing-App-Server session owns this worker and its bmx-* remote
+ * TUI, but never owns the App Server/thread behind that TUI. On daemon
+ * restart, preserve the remote TUI so the replacement daemon can reattach it;
+ * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
+ * retain the historical killCli shutdown path.
+ */
+function shutdownWorkerForParentExit(reason: string): void {
+  stopScreenshotLoop();
+  if (lastInitConfig?.existingAppServerEndpoint) {
+    log(`Preserving existing-App-Server remote TUI during ${reason}`);
+    cleanup();
+    process.exit(0);
+    return;
+  }
+  killCli();
+  cleanup();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdownWorkerForParentExit('SIGTERM'));
+process.on('SIGINT', () => shutdownWorkerForParentExit('SIGINT'));
 // If parent daemon dies, IPC channel closes — clean up
-process.on('disconnect', () => { log('Daemon disconnected'); stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+process.on('disconnect', () => { log('Daemon disconnected'); shutdownWorkerForParentExit('IPC disconnect'); });
 
 // Watchdog: belt-and-braces parent-death detection. SIGTERM and 'disconnect'
 // should both reach us when the daemon dies, but if main thread is stuck in
@@ -19027,10 +19047,8 @@ setInterval(() => {
   const currentPpid = process.ppid;
   if (currentPpid !== ORIGINAL_PARENT_PID || currentPpid === 1) {
     log(`Watchdog: parent pid changed (${ORIGINAL_PARENT_PID} → ${currentPpid}) — daemon died, exiting`);
-    stopScreenshotLoop();
-    try { killCli(); } catch { /* best-effort */ }
-    try { cleanup(); } catch { /* best-effort */ }
-    process.exit(0);
+    try { shutdownWorkerForParentExit('parent watchdog'); }
+    catch { process.exit(0); /* best-effort exit if teardown itself faults */ }
   }
 }, 30_000).unref();
 
