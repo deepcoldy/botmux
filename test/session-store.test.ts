@@ -1412,3 +1412,163 @@ describe('mutateSessionRowOffline()', () => {
     expect(onDisk.s1.status).toBe('closed');
   });
 });
+
+// ─── Closed session pruning (restart crash regression) ────────────────────
+
+describe('closed session pruning on save', () => {
+  const THIRTY_ONE_DAYS_MS = 31 * 24 * 60 * 60 * 1000;
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+  function diskRows(): Record<string, any> {
+    return JSON.parse(readFileSync(join(tempDir, 'sessions.json'), 'utf-8'));
+  }
+
+  it('prunes closed sessions older than 30 days but keeps recent closed and active ones', () => {
+    const old = createSession('chat1', 'root1', 'Old closed');
+    const recent = createSession('chat2', 'root2', 'Recent closed');
+    const active = createSession('chat3', 'root3', 'Active');
+
+    closeSession(old.sessionId);
+    closeSession(recent.sessionId);
+
+    // Age the old session beyond the 30-day retention window.
+    const oldRow = getSession(old.sessionId)!;
+    oldRow.closedAt = new Date(Date.now() - THIRTY_ONE_DAYS_MS).toISOString();
+    updateSession(oldRow);
+
+    // Age the recent closed session to 7 days (within retention).
+    const recentRow = getSession(recent.sessionId)!;
+    recentRow.closedAt = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
+    updateSession(recentRow);
+
+    const onDisk = diskRows();
+    expect(onDisk[old.sessionId]).toBeUndefined();
+    expect(onDisk[recent.sessionId]).toBeDefined();
+    expect(onDisk[recent.sessionId].status).toBe('closed');
+    expect(onDisk[active.sessionId]).toBeDefined();
+    expect(onDisk[active.sessionId].status).toBe('active');
+
+    // In-memory map retains the pruned row — pruning only affects the durable
+    // file, so the dashboard and other in-process readers are unaffected.
+    expect(getSession(old.sessionId)).toBeDefined();
+  });
+
+  it('keeps closed sessions without closedAt (legacy rows)', () => {
+    const legacy = createSession('chat1', 'root1', 'Legacy closed');
+    closeSession(legacy.sessionId);
+
+    // Simulate a legacy closed row that predates the closedAt field.
+    const legacyRow = getSession(legacy.sessionId)!;
+    delete legacyRow.closedAt;
+    updateSession(legacyRow);
+
+    const onDisk = diskRows();
+    expect(onDisk[legacy.sessionId]).toBeDefined();
+    expect(onDisk[legacy.sessionId].status).toBe('closed');
+  });
+
+  it('keeps closed sessions with unparseable closedAt', () => {
+    const weird = createSession('chat1', 'root1', 'Weird closedAt');
+    closeSession(weird.sessionId);
+
+    const weirdRow = getSession(weird.sessionId)!;
+    weirdRow.closedAt = 'not-a-date';
+    updateSession(weirdRow);
+
+    const onDisk = diskRows();
+    expect(onDisk[weird.sessionId]).toBeDefined();
+  });
+
+  it('pruned rows stay gone after re-init (simulating restart)', () => {
+    const old = createSession('chat1', 'root1', 'Old closed');
+    closeSession(old.sessionId);
+    const oldRow = getSession(old.sessionId)!;
+    oldRow.closedAt = new Date(Date.now() - THIRTY_ONE_DAYS_MS).toISOString();
+    updateSession(oldRow);
+
+    // Simulate daemon restart: re-init and reload from disk.
+    init();
+    expect(getSession(old.sessionId)).toBeUndefined();
+    expect(listSessions().length).toBe(0);
+  });
+});
+
+// ─── Load failure safety (restart crash regression) ───────────────────────
+
+describe('load failure safety', () => {
+  it('rejects writes when load fails (corrupt JSON) without touching the durable file', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions.json');
+    const corruptPayload = '{ this is not valid json';
+    writeFileSync(fp, corruptPayload);
+
+    init(); // resets state; load() is lazy
+
+    // createSession triggers load() (fails → loadFailure set) and must throw
+    // SessionStoreUnavailableError instead of publishing the empty projection
+    // over the intact-on-disk data.
+    expect(() => createSession('chat1', 'root1', 'Test')).toThrow(SessionStoreUnavailableError);
+
+    // File must still contain the original corrupt payload, NOT '{}'.
+    expect(readFileSync(fp, 'utf-8')).toBe(corruptPayload);
+    // Compatibility reader stays degraded-but-crashed: empty projection.
+    expect(listSessions()).toEqual([]);
+  });
+
+  it('resumes normal saves after init reloads a repaired store', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '{ corrupt');
+
+    init();
+    expect(() => createSession('chat1', 'root1', 'Test')).toThrow(SessionStoreUnavailableError);
+
+    // Operator repairs the file, then the process restarts → init() clears
+    // loadFailure → strict writes work again.
+    writeFileSync(fp, '{}');
+    init();
+    const s2 = createSession('chat2', 'root2', 'Test2');
+    const onDisk = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(onDisk[s2.sessionId]).toBeDefined();
+  });
+});
+
+// ─── Serialization failure must propagate (transactional rollback) ────────
+
+describe('save serialization failure', () => {
+  // A circular reference makes JSON.stringify throw — the same failure class
+  // as the V8 ~536 MB string-length cap: a serialization error, not a write
+  // error. save() must propagate it so transactional callers roll back.
+  function circularTitle(): string {
+    const circular: Record<string, unknown> = {};
+    circular.loop = circular;
+    return circular as unknown as string;
+  }
+
+  it('propagates the error and leaves the durable file unchanged', () => {
+    const session = createSession('chat-serialize', 'root-serialize', 'Serialize Fail');
+    const fp = join(tempDir, 'sessions.json');
+    const beforeBytes = readFileSync(fp, 'utf-8');
+
+    const broken = { ...getSession(session.sessionId)!, title: circularTitle() };
+    expect(() => updateSession(broken)).toThrow();
+    // Disk content is untouched — no partial/empty write was published.
+    expect(readFileSync(fp, 'utf-8')).toBe(beforeBytes);
+  });
+
+  it('lets closeSession() roll back its transaction instead of committing closed side effects', () => {
+    const txSession = createSession('chat-tx', 'root-tx', 'Tx Rollback');
+    const fp = join(tempDir, 'sessions.json');
+    const beforeBytes = readFileSync(fp, 'utf-8');
+
+    // Poison only the in-memory row so save() fails at serialization, after
+    // closeSession already flipped status to 'closed'.
+    const txRow = getSession(txSession.sessionId)!;
+    (txRow as unknown as Record<string, unknown>).title = circularTitle();
+    expect(() => closeSession(txSession.sessionId)).toThrow();
+
+    // The transaction rolled back: disk is unchanged and the row stays active.
+    expect(readFileSync(fp, 'utf-8')).toBe(beforeBytes);
+    expect(getSession(txSession.sessionId)!.status).toBe('active');
+  });
+});

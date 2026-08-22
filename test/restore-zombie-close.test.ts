@@ -282,6 +282,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { getAllBots } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -1299,6 +1300,92 @@ describe('resumeSession — disk-only legacy anchor collision', () => {
     expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
     expect(map.get(sessionKey('om_resume_legacy_scratch', 'app_test'))?.session.sessionId)
       .toBe(target.sessionId);
+  });
+
+  it('caps recovery forks per-bot: one bot unlimited does not uncap another bot', async () => {
+    // Regression: the recovery budget used getAllBots()[0].maxLiveWorkers for
+    // ALL bots. If bot[0] set cap=0 (unlimited), the total budget became
+    // Infinity and bot[1]'s cap was ignored — multi-bot OOM risk.
+    const original = vi.mocked(getAllBots).getMockImplementation();
+    vi.mocked(getAllBots).mockImplementation(() => [
+      { config: { larkAppId: 'app_test', cliId: bot.cliId, maxLiveWorkers: 0 }, botName: 'Bot0', botOpenId: 'ou_0', resolvedAllowedUsers: [] },
+      { config: { larkAppId: 'app_bot1', cliId: bot.cliId, maxLiveWorkers: 5 }, botName: 'Bot1', botOpenId: 'ou_1', resolvedAllowedUsers: [] },
+    ] as any);
+    try {
+      // 3 sessions for bot[0] (unlimited) — all should fork.
+      for (let i = 0; i < 3; i++) {
+        makeActivePersistentSession(`om_bot0_${i}`);
+      }
+      // 10 sessions for bot[1] (cap=5) — only 5 should fork.
+      for (let i = 0; i < 10; i++) {
+        const s = makeActivePersistentSession(`om_bot1_${i}`);
+        s.larkAppId = 'app_bot1';
+        sessionStore.updateSession(s);
+      }
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      const bot0Forks = vi.mocked(forkWorker).mock.calls.filter(
+        ([ds]) => (ds as any).session.larkAppId === 'app_test',
+      );
+      const bot1Forks = vi.mocked(forkWorker).mock.calls.filter(
+        ([ds]) => (ds as any).session.larkAppId === 'app_bot1',
+      );
+      expect(bot0Forks).toHaveLength(3); // unlimited → all forked
+      expect(bot1Forks).toHaveLength(5); // capped at 5 despite bot[0] unlimited
+    } finally {
+      vi.mocked(getAllBots).mockImplementation(original!);
+    }
+  });
+
+  it('mixed protected + idle: protected owners fork untruncated, idle budget recomputed from remaining capacity', async () => {
+    // Regression: the idle budget was computed ONCE as max(0, cap - live)
+    // before the protected phase. Protected owners then forked untruncated
+    // (Infinity), but the idle phase reused the STALE budget. With cap=1 +
+    // 2 protected owners + 1 ordinary idle session this spawned 3 workers at
+    // restart — the avoidable cold idle spawn on top of the (necessary)
+    // protected spike. After the protected pass the idle budget must be
+    // recomputed from remaining capacity: cap=1, 2 protected forks accepted
+    // ⇒ idle budget 0 ⇒ the idle session stays worker-less.
+    const original = vi.mocked(getAllBots).getMockImplementation();
+    vi.mocked(getAllBots).mockImplementation(() => [
+      { config: { larkAppId: 'app_test', cliId: bot.cliId, maxLiveWorkers: 1 }, botName: 'Bot0', botOpenId: 'ou_0', resolvedAllowedUsers: [] },
+    ] as any);
+    try {
+      // Two durable activation heads (protected): queuedActivationPending.
+      const head1 = sessionStore.createSession('oc_head1', 'om_head1', 'Head 1');
+      head1.larkAppId = 'app_test';
+      head1.queuedActivationPending = true;
+      head1.queuedActivationInput = { content: 'head one' } as any;
+      head1.queuedActivationTurnId = 'turn-1';
+      sessionStore.updateSession(head1);
+      const head2 = sessionStore.createSession('oc_head2', 'om_head2', 'Head 2');
+      head2.larkAppId = 'app_test';
+      head2.queuedActivationPending = true;
+      head2.queuedActivationInput = { content: 'head two' } as any;
+      head2.queuedActivationTurnId = 'turn-2';
+      sessionStore.updateSession(head2);
+      // One ordinary idle session (tmux-backed, probe 'exists' by default).
+      const idle = makeActivePersistentSession('om_idle');
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      // Exactly 2 forks: both protected heads, NOT the idle session.
+      expect(forkWorker).toHaveBeenCalledTimes(2);
+      const forkedIds = vi.mocked(forkWorker).mock.calls.map(
+        ([ds]) => (ds as any).session.sessionId,
+      );
+      expect(forkedIds).toContain(head1.sessionId);
+      expect(forkedIds).toContain(head2.sessionId);
+      expect(forkedIds).not.toContain(idle.sessionId);
+      // The idle session stays worker-less (lazy cold-resume on next message).
+      expect(map.get(sessionKey('om_idle', 'app_test'))?.worker ?? null).toBeNull();
+    } finally {
+      vi.mocked(getAllBots).mockImplementation(original!);
+    }
   });
 });
 

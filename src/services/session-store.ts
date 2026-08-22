@@ -27,6 +27,27 @@ export class SessionStoreUnavailableError extends Error {
   }
 }
 
+// Closed sessions are never removed from the durable file — closeSession only
+// flips status. Every save() serializes the ENTIRE map, so the file grows
+// without bound and eventually hits V8's ~536 MB string-length cap, at which
+// point JSON.stringify / readFileSync(utf-8) throw and the daemon crash-loops
+// on restart. Prune closed rows older than this retention on every save so
+// the file stays bounded. Active sessions and recently closed ones (still
+// resumable via their closed-session card) are always kept.
+const CLOSED_SESSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * A closed session row is prunable when it carries a parseable closedAt
+ * older than the retention window. Rows without closedAt (legacy) or with an
+ * unparseable timestamp are kept — never prune what cannot be dated.
+ */
+function isPrunableClosedSession(session: Session, nowMs: number = Date.now()): boolean {
+  if (session.status !== 'closed' || !session.closedAt) return false;
+  const closedMs = Date.parse(session.closedAt);
+  if (!Number.isFinite(closedMs)) return false;
+  return (nowMs - closedMs) > CLOSED_SESSION_RETENTION_MS;
+}
+
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
 // no longer exist on Session and nothing reads them, but sessions persisted
 // before the removal still carry them on disk. Strip on write so the file
@@ -436,16 +457,29 @@ function save(): void {
   withFileLockSync(fp, () => {
     const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
     const obj: Record<string, Session> = {};
+    let pruned = 0;
     for (const [k, v] of sessions) {
+      if (isPrunableClosedSession(v)) { pruned++; continue; }
       stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
       obj[k] = v;
     }
+    // Serialization failures (V8 ~536 MB string-length cap, OOM) must
+    // propagate, never be swallowed: transactional callers (closeSession,
+    // Mojo close journal) snapshot the prior row, mutate, then roll back on
+    // throw. A soft skip would leave the durable file at `active` while the
+    // in-memory row and external side effects (bridge markers, frozen cards,
+    // prompt context) already committed to `closed`, breaking fail-closed.
+    // The 30-day pruning above keeps the projection bounded so this path
+    // should not fire in practice.
     const json = JSON.stringify(obj, null, 2);
     // The daemon fires several updateSession()/save() calls per inbound message
     // (activity bump, pid, stream-card state, …) and many leave the serialized
     // file byte-identical. Skipping the temp-file write + rename in that case
     // elides the bulk of the redundant disk I/O.
     if (json === existingRaw) return;
+    if (pruned > 0) {
+      logger.info(`Pruned ${pruned} closed session(s) older than ${Math.round(CLOSED_SESSION_RETENTION_MS / 86400000)} days from session store`);
+    }
     const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
     writeFileSync(tmpFp, json, 'utf-8');
     renameSync(tmpFp, fp);

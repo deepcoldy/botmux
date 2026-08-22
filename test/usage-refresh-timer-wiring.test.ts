@@ -105,7 +105,7 @@ describe('usage-refresh timer wiring (source lock)', () => {
     // The `ds.worker === worker` exit branch (dead generation) also clears.
     const exitIdx = src.indexOf("worker.on('exit'");
     expect(exitIdx).toBeGreaterThan(-1);
-    const exitBody = src.slice(exitIdx, exitIdx + 3000);
+    const exitBody = src.slice(exitIdx, exitIdx + 4000);
     expect(exitBody).toContain('clearUsageRefreshTimer(ds)');
   });
 
