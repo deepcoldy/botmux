@@ -22914,6 +22914,19 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 /* ─── Bot 配置：平台化表单控件 ───────────────────────────────────────────── */
+.bot-defaults-page .clone-bot-menu[open] {
+  z-index: 1000;
+}
+
+.bot-defaults-page .clone-bot-menu > .sect-sort-pop {
+  right: 0;
+  left: auto;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(340px, calc(100vw - 48px));
+  transform: none;
+}
+
 .bot-defaults-page .bd-detail,
 .bot-defaults-page .bd-card.bd-profile {
   background: transparent;
