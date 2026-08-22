@@ -12850,11 +12850,14 @@ function deliverFinalOutput(
       const feedbackRequesterSubjectId = recipientOpenId;
       const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      const localTurnTitle = msg.kind === 'local-turn-headless'
+        ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
+        : isExistingAppServerSharedAdoptPersistedSession(ds.session)
+          ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
+          : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
-            title: msg.kind === 'local-turn-headless'
-              ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
-              : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
+            title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
             assistantText: safeAssistantText,
             assistantLabel: storedSessionCliDisplayName(ds),

@@ -1265,6 +1265,7 @@ export const messages: Record<string, string> = {
   'card.adopt_last_round': '📜 Last exchange before /adopt',
   'card.local_turn_resumed': '🖥️ Local terminal turn resumed (model was mid-output during the daemon restart)',
   'card.local_turn': '🖥️ Local terminal turn (typed directly in the adopted pane, synced to Lark)',
+  'card.codex_app_shared_turn': '🖥️ Codex App shared turn (synced to Lark)',
 
   // Scheduler announcements
   'scheduler.task_started': '🕐 Scheduled task “{name}” started',
