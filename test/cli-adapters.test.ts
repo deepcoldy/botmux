@@ -1552,6 +1552,85 @@ describe('busyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
   });
+
+  it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
+    // Regression: a static capacity-queue screen matches readyPattern's
+    // `\d+% left` status-bar arm and survives the 2s quiescence window,
+    // flipping the card/Dashboard to Idle while the session is still waiting
+    // for capacity. The busyPattern must cover both the queue screen and the
+    // normal working indicator so the worker's deferPromptReadyWhileBusy
+    // backstop (and its idle probe) holds the session busy until a real
+    // terminal state.
+    //
+    // Every anchor below is extracted verbatim from the traex binary's
+    // compiled-in TUI string tables (verified across all 9 local releases,
+    // 0.201.1-alpha.5 … 0.201.2-alpha.2, both `traex` and
+    // `traex-code-mode-host`):
+    //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    //   working labels:  "Working…", "Thinking…", "Pondering…",
+    //                    "Working it out…" (full rotation in traex.ts)
+    //   queue strings:   "Queued for capacity",
+    //                    "Too many requests right now. You're in the queue."
+    //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
+    // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
+    // (0 hits across all releases + the 94MB TUI logs), so the Codex
+    // pattern's second anchor is invalid here.
+    const busy = createTraexAdapter('/bin/traex').busyPattern;
+    expect(busy).toBeDefined();
+    // Spinner-anchored working labels: "<braille frame> <label>".
+    expect(busy!.test('⠋ Working…')).toBe(true);
+    expect(busy!.test('⠹ Thinking…')).toBe(true);
+    expect(busy!.test('⠸ Pondering…')).toBe(true);
+    expect(busy!.test('⠼ Working it out…')).toBe(true);
+    // Spinner-prefixed queue state: the queue screen can render a frozen
+    // braille frame in front of the label, and the label is part of the
+    // compiled-in spinner string table.
+    expect(busy!.test('⠋ Queued for capacity')).toBe(true);
+    // Standalone capacity-queue strings — the queue screen may render
+    // statically (no animating spinner), so no frame anchor is required.
+    // Line-anchored: bare line, indented line, and `at position N` suffix
+    // all match.
+    expect(busy!.test('Queued for capacity')).toBe(true);
+    expect(busy!.test('  Queued for capacity')).toBe(true);
+    expect(busy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(busy!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(busy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Mid-sentence prose quotes must NOT match — the line anchor is the
+    // discriminator for the standalone arms (the braille frame for the
+    // spinner arms).
+    expect(busy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(busy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
+    // Idle composer must NOT match.
+    expect(busy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
+    // Prose must NOT match — the braille frame anchor is the discriminator.
+    expect(busy!.test('Working… on the fix')).toBe(false);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+
+  it('traex staticBusyPattern latches only on line-anchored queue evidence', () => {
+    // The pre-idle static latch (ZMX gap) consumes queue evidence straight
+    // from the PTY byte stream — see TRAEX_STATIC_BUSY_PATTERN in traex.ts.
+    // It must match every queue-screen shape (bare / indented / spinner-
+    // prefixed / at-position suffix / ANSI-stripped by IdleDetector) and
+    // must NOT match prose quotes or the idle composer.
+    const staticBusy = createTraexAdapter('/bin/traex').staticBusyPattern;
+    expect(staticBusy).toBeDefined();
+    expect(staticBusy!.test('Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('  Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(staticBusy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(staticBusy!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(staticBusy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Mid-sentence prose quotes must NOT latch.
+    expect(staticBusy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(staticBusy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
+    // Idle composer must NOT latch.
+    expect(staticBusy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
+    // Working labels without the queue string must NOT latch — the latch is
+    // queue-only; ordinary working turns are covered by the spinner guard.
+    expect(staticBusy!.test('⠋ Working…')).toBe(false);
+  });
 });
 
 describe('idleToBusyPattern', () => {
@@ -1572,6 +1651,26 @@ describe('idleToBusyPattern', () => {
     expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
     expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
     expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
+  });
+
+  it('traex opts into idle→busy recovery with the same strict active marker as busyPattern', () => {
+    // The capacity-queue screen can render AFTER a false idle was already
+    // published (readyPattern's `\d+% left` arm matched the status bar and
+    // quiescence fired). idleToBusyPattern must flip the session back to
+    // working when the queue marker or a working spinner label appears in
+    // the PTY stream. Strings are the same binary-extracted anchors as the
+    // busyPattern test above.
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.idleToBusyPattern).toBeDefined();
+    expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
+    // Spinner-anchored working labels.
+    expect(adapter.idleToBusyPattern!.test('⠋ Working…')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('⠙ Pondering…')).toBe(true);
+    // Standalone queue strings.
+    expect(adapter.idleToBusyPattern!.test('Queued for capacity')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    // Prose without the braille frame anchor must NOT flip idle→busy.
+    expect(adapter.idleToBusyPattern!.test('Working… on the fix')).toBe(false);
   });
 
   it.each([
