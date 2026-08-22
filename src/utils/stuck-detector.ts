@@ -122,6 +122,39 @@ export function matchHookReviewScreen(snapshot: string): 'hook review level 1' |
   return undefined;
 }
 
+/** Codex startup review is a separate three-choice screen from the detailed
+ * Hooks browser. It owns Enter/arrow keys, so normal BotMux input must not be
+ * pasted into it. Keep its signature strict and footer-anchored to avoid
+ * treating quoted discussion text as an active menu. */
+function isStartupHookReviewScreen(snapshot: string): boolean {
+  if (!snapshot) return false;
+  const viewport = snapshot
+    .split('\n')
+    .map(stripAnsi)
+    .slice(-VIEWPORT_LINES);
+  let end = viewport.length;
+  while (end > 0 && viewport[end - 1].trim() === '') end--;
+  if (end === 0) return false;
+  const trimmed = viewport.slice(0, end);
+  const lastLine = trimmed[trimmed.length - 1].trim();
+  if (!/^Press enter to confirm or esc to go back$/i.test(lastLine)) return false;
+  const region = trimmed.slice(Math.max(0, trimmed.length - 18)).join('\n');
+  return /^Hooks need review$/im.test(region)
+    && /^\d+\s+hooks?\s+are new or changed\.$/im.test(region)
+    && /^\s*1\.\s+Review hooks$/im.test(region)
+    && /^\s*>?\s*2\.\s+Trust all and continue$/im.test(region)
+    && /^\s*3\.\s+Continue without trusting \(hooks won't run\)$/im.test(region);
+}
+
+/** A Hook-review menu owns Enter/arrow keys instead of the normal Codex
+ * composer. Queue BotMux-originated input until the operator resolves it:
+ * otherwise a message submit can accidentally select "Trust all" or be lost
+ * before it reaches the model. Kept pure so the worker wiring is testable. */
+export function shouldHoldInputForHookReview(snapshot: string): boolean {
+  return matchHookReviewScreen(snapshot) !== undefined
+    || isStartupHookReviewScreen(snapshot);
+}
+
 export interface StuckDetectorCallbacks {
   /** Called when the timeout elapses. Return true to fire the warning; false
    *  to silently re-arm (e.g. the CLI just finished a long turn). */

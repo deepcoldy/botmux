@@ -10,7 +10,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { StuckDetector, matchHookReviewScreen } from '../src/utils/stuck-detector.js';
+import {
+  StuckDetector,
+  matchHookReviewScreen,
+  shouldHoldInputForHookReview,
+} from '../src/utils/stuck-detector.js';
 
 // Official Codex TUI snapshots read from fixture files (not inline constants)
 // so the classifier is tested against the real on-disk representation.
@@ -203,6 +207,34 @@ describe('StuckDetector', () => {
 
     expect(onStuck).toHaveBeenCalledTimes(1);
     detector.dispose();
+  });
+});
+
+describe('shouldHoldInputForHookReview', () => {
+  const STARTUP_REVIEW = [
+    'Hooks need review',
+    '13 hooks are new or changed.',
+    'Hooks can run outside the sandbox after you trust them.',
+    '',
+    '1. Review hooks',
+    '> 2. Trust all and continue',
+    '3. Continue without trusting (hooks won\'t run)',
+    '',
+    'Press enter to confirm or esc to go back',
+  ].join('\n');
+
+  it('holds input on the Codex startup review menu so Enter cannot trust all', () => {
+    expect(shouldHoldInputForHookReview(STARTUP_REVIEW)).toBe(true);
+  });
+
+  it('releases input on an ordinary Codex composer', () => {
+    expect(shouldHoldInputForHookReview('› Ask Codex to do anything')).toBe(false);
+  });
+
+  it('does not mistake quoted startup-review text for an active menu', () => {
+    expect(shouldHoldInputForHookReview(
+      `The terminal printed:\n${STARTUP_REVIEW}\n\n› Ask Codex to do anything`,
+    )).toBe(false);
   });
 });
 
