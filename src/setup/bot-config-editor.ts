@@ -426,6 +426,39 @@ export function parseBotSelection(
   return byProcessName >= 0 ? byProcessName : undefined;
 }
 
+/**
+ * 把源 Bot 的行为配置覆盖到刚创建的目标 Bot，同时保留目标应用自己的身份。
+ * Dashboard 与 CLI clone 共用这里，避免两条入口各维护一份排除字段。
+ */
+export function cloneBotConfig(
+  source: Record<string, any>,
+  target: Record<string, any>,
+): Record<string, any> {
+  const cloned: Record<string, any> = { ...target, ...source };
+
+  for (const key of [
+    'apiOnly',
+    'name',
+    'messageListeners',
+    'activationPending',
+    'activationDeactivating',
+    'activationStarting',
+    'activationCommitted',
+  ]) {
+    delete cloned[key];
+  }
+
+  for (const key of ['larkAppId', 'larkAppSecret', 'brand', 'allowedUsers', 'ownerOpenId']) {
+    if (Object.prototype.hasOwnProperty.call(target, key) && target[key] !== undefined) {
+      cloned[key] = target[key];
+    } else {
+      delete cloned[key];
+    }
+  }
+
+  return cloned;
+}
+
 export function removeBotConfig<T extends { larkAppId?: string; name?: unknown }>(
   bots: T[],
   selection: string,

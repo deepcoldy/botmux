@@ -711,6 +711,23 @@ export function BotDefaultsPage() {
         </div>
         <div className="page-heading-actions">
           <RefreshIconButton id="bd-refresh" label={tr('botDefaults.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void reload()} />
+          {ui.authed && bots.length > 0 ? (
+            <DropdownMenu<string>
+              className="clone-bot-menu"
+              ariaLabel={tr('botOnboarding.clone')}
+              disabled={onboardingBusy}
+              label={tr('botOnboarding.clone')}
+              value=""
+              options={bots.map(bot => ({
+                value: bot.larkAppId,
+                label: `${bot.botName ?? bot.larkAppId} · ${displayCliId(bot, cliIdOf(bot.larkAppId))}`,
+              }))}
+              onChange={sourceAppId => {
+                setOnboardingBusy(true);
+                void openBotOnboarding(sourceAppId).finally(() => setOnboardingBusy(false));
+              }}
+            />
+          ) : null}
           {ui.authed ? (
             <CreateActionButton
               className="page-primary-action add-bot-btn"
