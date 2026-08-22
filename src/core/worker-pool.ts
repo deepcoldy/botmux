@@ -13564,7 +13564,17 @@ export function killStalePids(
     try {
       // Check if process exists (signal 0 doesn't kill, just checks)
       process.kill(session.pid, 0);
-      // Process exists — kill its process group
+      // Existing-App-Server share: the worker and its BotMux-owned remote TUI
+      // can be in one process group. Reap only the stale worker PID; killing
+      // the group would also terminate `codex --remote`, even though the
+      // replacement daemon is expected to reattach that client. The external
+      // App Server itself is never ours to signal.
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) {
+        logger.info(`Killing stale shared-App-Server worker only (pid: ${session.pid}, session: ${session.sessionId})`);
+        try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
+        continue;
+      }
+      // Ordinary managed sessions own their complete process group.
       logger.info(`Killing stale CLI process (pid: ${session.pid}, session: ${session.sessionId})`);
       try {
         process.kill(-session.pid, 'SIGTERM');

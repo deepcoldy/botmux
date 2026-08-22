@@ -5723,6 +5723,21 @@ function codexBridgeFallbackActive(): boolean {
   return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
 }
 
+/** A Codex App shared-adopt starts a SECOND official `codex --remote` client
+ * against an external App Server/thread. It has the same transcript shape as
+ * terminal `/adopt`, but is deliberately NOT `adoptMode`: BotMux still owns
+ * the remote TUI and its normal Lark-input reliability rules. */
+function isExistingAppServerSharedBridge(): boolean {
+  return !!lastInitConfig?.existingAppServerEndpoint;
+}
+
+/** `/adopt`'s split-live attach is also required for the App Server share:
+ * existing history is absorbed while new, App-side turns after the attach
+ * boundary can be synthesised back into the Lark conversation. */
+function codexBridgeUsesSplitLiveAttach(): boolean {
+  return lastInitConfig?.adoptMode === true || isExistingAppServerSharedBridge();
+}
+
 /** Only drivers with a complete normal-final + interrupted-terminal contract
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
@@ -5887,8 +5902,9 @@ function codexBridgeStartTimer(): void {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
         // adding a file-backed CLI does not grow this if-tree.
-        // Adopt → split-live; non-adopt → fresh-empty (queue markTimeMs
-        // lower bound handles history without a split).
+        // Terminal `/adopt` and an existing-App-Server share both need
+        // split-live: absorb history before the attach boundary while keeping
+        // new local/App-side turns after it available for forwarding.
         const path = resolveFileBridgePath(lastInitConfig?.cliId, {
           sessionId: codexBridgePendingSessionId,
           cwd: lastInitConfig?.workingDir,
@@ -5916,7 +5932,7 @@ function codexBridgeStartTimer(): void {
           }
           codexBridgePendingSessionId = undefined;
           codexAdoptPendingPid = undefined;
-          const mode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+          const mode = codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty';
           codexBridgeAttach(path, mode);
         }
       }
@@ -6316,7 +6332,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
       const pid = currentCodexObservedPid();
       const next = resolveFileBridgePath('codex', { sessionId: cliSessionId });
       if (next && next !== codexBridgeRolloutPath) {
-        const attachMode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+        const attachMode = codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty';
         log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (pid ${pid} owns it); re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
@@ -6435,7 +6451,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  // Codex INITIAL attach (no prior rollout bound). The multi-fd adopt case
+  // Codex INITIAL attach (no prior rollout bound). The multi-fd terminal-adopt case
   // reaches here with codexBridgeRolloutPath still unset: findCodexRolloutByPid
   // returned undefined (ambiguous parent+sibling), so the adopt block armed the
   // poller instead of attaching. The cliSessionId is normally already
@@ -6473,7 +6489,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   });
   if (path) {
     codexBridgePendingSessionId = undefined;
-    codexBridgeAttach(path, 'fresh-empty');
+    codexBridgeAttach(
+      path,
+      codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty',
+    );
   } else {
     codexBridgePendingSessionId = cliSessionId;
     codexBridgeStartTimer();
@@ -7080,11 +7099,12 @@ function emitReadyCodexTurns(): void {
   // that flag to settle completed-with-empty; a bare `completed` terminal (e.g.
   // the RPC-hydration timeout path) must never be read as silence.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
-  const adoptMode = lastInitConfig?.adoptMode === true;
+  const terminalAdoptMode = lastInitConfig?.adoptMode === true;
+  const sharedAppServerBridge = isExistingAppServerSharedBridge();
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
   // should reach the thread. Skip marker IO entirely.
-  const markers = adoptMode ? [] : readSendMarkers();
+  const markers = terminalAdoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
   // Only a STARTED pending turn can bound the last ready turn's send window.
   // An unstarted turn hasn't been dequeued yet (its user event hasn't landed),
@@ -7099,6 +7119,13 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    // A shared App Server session still owns the BotMux remote TUI, so its
+    // Lark-originated turns retain normal send-marker deduplication. Only a
+    // turn synthesized from Codex App input is external/local: that side has
+    // no pending Lark fingerprint and must be forwarded like terminal
+    // `/adopt`, including both the App prompt and its final reply.
+    const adoptMode = terminalAdoptMode
+      || (sharedAppServerBridge && turn.isLocal === true);
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
@@ -15098,12 +15125,23 @@ async function spawnCli(
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
+    if (cfg.existingAppServerEndpoint) {
+      // A shared Codex App thread has two legitimate writers: the App and
+      // BotMux's official `codex --remote` client. Enable local-turn
+      // synthesis only from this share's attach boundary, so older thread
+      // history is absorbed while future App-side turns are mirrored to Lark.
+      codexAdoptStartMs = Date.now();
+      codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs);
+      log('Codex bridge enabled App Server shared-turn forwarding');
+    }
     if (effectiveCliSessionId) {
       const rolloutPath = findCodexRolloutBySessionId(effectiveCliSessionId);
       if (rolloutPath) {
         codexBridgeAttach(
           rolloutPath,
-          effectiveResume ? 'baseline-existing' : 'fresh-empty',
+          cfg.existingAppServerEndpoint
+            ? 'split-live'
+            : effectiveResume ? 'baseline-existing' : 'fresh-empty',
         );
       } else {
         codexBridgePendingSessionId = effectiveCliSessionId;
