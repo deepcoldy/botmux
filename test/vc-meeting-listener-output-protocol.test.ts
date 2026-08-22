@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseVcMeetingListenerOutput,
+  VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT,
   VC_MEETING_LISTENER_OUTPUT_CONTRACT,
   vcMeetingListenerOutputProtocolForInstructionVersion,
 } from '../src/services/vc-meeting-listener-output-protocol.js';
@@ -44,6 +45,11 @@ describe('VC meeting listener output protocol', () => {
     expect(VC_MEETING_LISTENER_OUTPUT_CONTRACT).toContain('time, owner, scope, status, or conclusion');
     expect(VC_MEETING_LISTENER_OUTPUT_CONTRACT).not.toContain('fingerprint');
     expect(VC_MEETING_LISTENER_OUTPUT_CONTRACT).not.toContain('debounce');
+  });
+
+  it('keeps direct listener-chat questions out of the automatic JSON transport protocol', () => {
+    expect(VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT).toContain('direct human question');
+    expect(VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT).toContain('natural-language Markdown only');
   });
 
   it('keeps pre-upgrade deliveries on plain output while enabling the v2 contract', () => {
