@@ -640,7 +640,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -673,10 +673,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 33 = current master command set (32) + /forklist.
+    // 34 = current master command set (32) + /forklist + /retry.
     // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(33);
+    expect(DAEMON_COMMANDS.size).toBe(34);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {

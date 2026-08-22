@@ -30,6 +30,8 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ 下半屏',
   'card.btn.send_custom': '📝 发送自定义回复',
   'card.btn.retry_last_task': '🔁 重发上一条任务',
+  'card.btn.stop': '⏹ 停止',
+  'card.btn.compact': '🗜️ 压缩',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
@@ -38,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',
   'card.status.stalled': '长时间无进展',
+  'card.status.interrupted': '已中断',
   'card.status.limited': '限额已达',
   'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
@@ -64,6 +67,10 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
   'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
+
+  // ─── 上下文余量指示 ──────────────────────────────────────────────────────
+  'card.context.indicator': '上下文 {pct}%',
+  'card.context.over_threshold': '上下文 {pct}% · 建议压缩',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -618,6 +625,12 @@ export const messages: Record<string, string> = {
   'help.repo_wt': '/repo wt <编号|项目名> [分支] - 基于远端默认分支新建 worktree 并打开（未指定分支时自动语义命名）',
   'help.rename': '/rename <标题> - 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',
+  'help.retry': '/retry      - 重试最近一个失败或被中断的 turn（10s 冷却）',
+  'cmd.retry.no_session': '当前话题没有活跃的会话，无法重试。',
+  'cmd.retry.no_failed_turn': '最近没有失败或被中断的 turn，无需重试。',
+  'cmd.retry.cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
+  'cmd.retry.success': '🔁 已重新提交上一条失败的任务（错误码：{errorCode}），请等待执行。',
+  'cmd.retry.submit_failed': '⚠️ 重试提交失败：worker 当前不接受输入，请稍后再试。',
   'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新；开了私密卡片则改发仅授权人可见的静态快照）',
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
@@ -830,6 +843,12 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
+  'card.action.stop_sent': '⏹ 已发送停止信号（^C），会话保留',
+  'card.action.stop_unsupported': '⚠️ 当前 CLI 模式不支持卡片停止（实验性 RPC 输入 / App Runner），请用 /close 关闭会话',
+  'card.action.stop_no_worker': '⚠️ CLI 未运行，无法停止',
+  'card.action.compact_sent': '🗜️ 已发送 /compact 到 {cliName}',
+  'card.action.compact_no_worker': '⚠️ CLI 未运行，无法压缩',
+  'card.action.compact_unsupported': '⚠️ 当前环境不支持卡片压缩，请直接发送 /compact',
   'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
   'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
   'card.action.no_output': '(当前无输出内容)',

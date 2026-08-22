@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -1338,6 +1338,72 @@ describe('Post message parsing', () => {
     };
     const result = parseApiMessage(makeMsg('post', post));
     expect(result.content).toBe('doc:\n[文件: spec.pdf]');
+  });
+});
+
+// ─── Audio (voice) messages: placeholder + metadata extraction ────────────
+
+describe('Audio message parsing', () => {
+  it('renders audio content as [语音] placeholder via parseApiMessage', () => {
+    const result = parseApiMessage(makeMsg('audio', { file_key: 'file_voice', duration: 2000 }));
+    expect(result.msgType).toBe('audio');
+    expect(result.content).toBe(AUDIO_PLACEHOLDER);
+    expect(result.content).toBe('[语音]');
+  });
+
+  it('renders audio content as [语音] placeholder via parseEventMessage', () => {
+    const event = {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_audio',
+        message_type: 'audio',
+        content: JSON.stringify({ file_key: 'file_voice', duration: 2000 }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    };
+    const { parsed, resources } = parseEventMessage(event);
+    expect(parsed.msgType).toBe('audio');
+    expect(parsed.messageId).toBe('om_audio');
+    expect(parsed.content).toBe('[语音]');
+    // audio 不进 extractResources 的图片/文件清单
+    expect(resources).toEqual([]);
+  });
+
+  it('never leaks raw file_key JSON into parsed content', () => {
+    const raw = JSON.stringify({ file_key: 'file_secret', duration: 5000 });
+    expect(parseApiMessage(makeMsg('audio', raw)).content).not.toContain('file_secret');
+  });
+});
+
+describe('extractAudioMeta', () => {
+  it('extracts file_key and durationMs from valid audio content', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: 'file_voice', duration: 2000 })))
+      .toEqual({ fileKey: 'file_voice', durationMs: 2000 });
+  });
+
+  it('returns durationMs undefined when duration is absent', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: 'file_voice' })))
+      .toEqual({ fileKey: 'file_voice', durationMs: undefined });
+  });
+
+  it('ignores non-number duration', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: 'file_voice', duration: '2s' })))
+      .toEqual({ fileKey: 'file_voice', durationMs: undefined });
+  });
+
+  it('returns null for invalid JSON', () => {
+    expect(extractAudioMeta('not json')).toBeNull();
+  });
+
+  it('returns null when file_key is missing', () => {
+    expect(extractAudioMeta(JSON.stringify({ duration: 2000 }))).toBeNull();
+  });
+
+  it('returns null when file_key is empty or not a string', () => {
+    expect(extractAudioMeta(JSON.stringify({ file_key: '' }))).toBeNull();
+    expect(extractAudioMeta(JSON.stringify({ file_key: 123 }))).toBeNull();
   });
 });
 

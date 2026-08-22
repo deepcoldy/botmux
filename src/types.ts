@@ -124,7 +124,11 @@ export interface VcMeetingConsumerConfig {
 /** Runtime status the worker derives from screen content. */
 export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited' | 'stalled';
 /** Status shown on a streaming card — adds the pre-spawn 'starting' phase. */
-export type StreamStatus = ScreenStatus | 'starting';
+// 'interrupted' 是纯卡片侧 transient 状态：仅 card-handler 在「停止当前轮」按钮
+// 点击后重渲染卡片时传入（橙色 header + 已中断文案）。worker 的 screen_update IPC
+// 仍只发 ScreenStatus（不含 'interrupted'），所以 worker-pool 的 patch 永远不会传此值，
+// ~2s 后下一次 screen_update 自然把卡片覆盖回真实状态。
+export type StreamStatus = ScreenStatus | 'starting' | 'interrupted';
 
 /** One human/bot who took part in a turn's window — the union of every folded
  *  message's sender and @-mentions (type-ahead follow-ups included), excluding
@@ -168,6 +172,22 @@ export interface ReplyTargetEntry {
    *  `botmux send` treats an incomplete window as ambiguous → forces an explicit
    *  --mention decision rather than risk auto-@-ing the wrong single counterpart. */
   participantsIncomplete?: boolean;
+}
+
+/** Record of the most recent failed/interrupted turn, persisted so `/retry`
+ *  can re-inject its exact CLI input. Written in the onTurnTerminal callback
+ *  (failed/ambiguous only); not cleared by new turn injection — only replaced
+ *  by a newer failed turn. */
+export interface FailedTurnRecord {
+  turnId: string;
+  userPrompt: string;
+  cliInput: string;
+  codexAppInput?: CodexAppTurnInput;
+  failedAt: string;        // ISO
+  errorCode?: string;
+  status: 'failed' | 'ambiguous';
+  retryCount: number;
+  lastRetryAt?: string;    // ISO
 }
 
 export interface Session {
@@ -507,6 +527,10 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** 最近一个失败或被中断的 turn 的记录，供 /retry 命令重注入。
+   *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
+   *  只被更新的失败 turn 覆盖。 */
+  lastFailedTurn?: FailedTurnRecord;
   /** Crash-safe Codex App accepted/prepared FIFO; daemon is the sole writer. */
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   /** Cumulative ACK boundary retained until a fresh runner retires the generation. */

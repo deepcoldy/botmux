@@ -86,6 +86,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -95,6 +96,7 @@ import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -5340,6 +5342,16 @@ const cardDeps: CardHandlerDeps = {
     }
     handlers.replayMessageEvent(data);
   },
+  // 卡片「🗜️ 压缩」按钮：等价于用户在话题里发 /compact——走已有的
+  // deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 生命周期）。
+  deliverPassthroughCommand: (ds, cmd, opts) =>
+    deliverPassthroughToExistingSession(ds, cmd, cmd, opts.anchor, ds.larkAppId, {
+      messageId: opts.messageId,
+      replyRootId: opts.replyRootId,
+      senderOpenId: opts.senderOpenId,
+      senderIsBot: opts.senderIsBot,
+      substitute: false,
+    }),
 };
 
 const LEGACY_WORKFLOW_API_RETIRED = {
@@ -17375,6 +17387,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
 
+  // 语音消息转写：下载 opus → ASR → 用转写文本替换 '[语音]' 占位符。
+  // 必须在 followupContent 之前——命令识别、标题生成、会话创建都读它。
+  // 转写失败（未配置/下载失败/空结果）已回复用户，直接返回不留孤儿会话。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
+
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
@@ -18747,6 +18778,24 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+
+  // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
+  // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      parsed.messageId ?? ctx.messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, anchor, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
 
   // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
   // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
@@ -21476,6 +21525,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
         });
+      }
+      // Record the failed/interrupted turn for /retry. Best-effort: a persist
+      // failure must not crash the worker IPC handler (same contract as the
+      // turn-completion enqueue above). The reply-target guard skips type-ahead
+      // scenarios where a newer turn already owns the captured prompt.
+      try {
+        // shouldRecordFailedTurn guarantees failed/ambiguous; re-narrow to the
+        // typed builder (property narrowing does not propagate to the argument).
+        const failedStatus = terminal.status === 'failed' || terminal.status === 'ambiguous'
+          ? terminal.status
+          : undefined;
+        if (failedStatus && shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)) {
+          const record = buildFailedTurnRecord(
+            { turnId: terminal.turnId, status: failedStatus, errorCode: terminal.errorCode },
+            {
+              userPrompt: ds.lastUserPrompt,
+              cliInput: ds.lastCliInput,
+              codexAppInput: ds.lastCodexAppInput,
+            },
+          );
+          if (record) {
+            ds.session.lastFailedTurn = record;
+            sessionStore.updateSession(ds.session);
+          }
+        }
+      } catch (err) {
+        logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {

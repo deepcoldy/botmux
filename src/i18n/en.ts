@@ -27,6 +27,8 @@ export const messages: Record<string, string> = {
   'card.btn.half_page_down': '⇟ Page ½ Down',
   'card.btn.send_custom': '📝 Send Custom Reply',
   'card.btn.retry_last_task': '🔁 Retry Last Task',
+  'card.btn.stop': '⏹ Stop',
+  'card.btn.compact': '🗜️ Compact',
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
@@ -35,6 +37,7 @@ export const messages: Record<string, string> = {
   'card.status.dormant': 'Dormant',
   'card.status.analyzing': 'Analyzing…',
   'card.status.stalled': 'No recent progress',
+  'card.status.interrupted': 'Interrupted',
   'card.status.limited': 'Limit reached',
   'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
@@ -61,6 +64,10 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
   'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
+
+  // ─── Context headroom indicator ──────────────────────────────────────────
+  'card.context.indicator': 'Context {pct}%',
+  'card.context.over_threshold': 'Context {pct}% · compact recommended',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -617,6 +624,12 @@ export const messages: Record<string, string> = {
   'help.repo_wt': '/repo wt <N|name> [branch] - Create a worktree off the remote default branch and open it (auto semantic name when branch is omitted)',
   'help.rename': '/rename <title> - Rename this Botmux session and sync the running Codex/Claude session name',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
+  'help.retry': '/retry      - Retry the most recent failed or interrupted turn (10s cooldown)',
+  'cmd.retry.no_session': 'No active session in this topic to retry.',
+  'cmd.retry.no_failed_turn': 'No recent failed or interrupted turn to retry.',
+  'cmd.retry.cooldown': '⏳ Retry cooldown active. Try again in {seconds}s.',
+  'cmd.retry.success': '🔁 Re-submitted the last failed task (error: {errorCode}). Waiting for execution.',
+  'cmd.retry.submit_failed': '⚠️ Retry submission failed: worker is not accepting input. Try again later.',
   'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates; with private-card mode on, sends a static snapshot visible only to authorized users instead)',
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
@@ -829,6 +842,12 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
+  'card.action.stop_sent': '⏹ Stop signal sent (^C), session kept alive',
+  'card.action.stop_unsupported': '⚠️ Card stop is not supported for this CLI mode (experimental RPC input / App Runner). Use /close to end the session.',
+  'card.action.stop_no_worker': '⚠️ CLI is not running; nothing to stop',
+  'card.action.compact_sent': '🗜️ /compact sent to {cliName}',
+  'card.action.compact_no_worker': '⚠️ CLI is not running; cannot compact',
+  'card.action.compact_unsupported': '⚠️ Card compact is not supported here; send /compact directly',
   'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
   'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',
   'card.action.no_output': '(no output yet)',
