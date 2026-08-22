@@ -105,11 +105,14 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
   // blocks first, then the wrapper. External prompts may discuss these tags
   // mid-text, but they don't start with this structural envelope.
   /^<user_message>[\s\S]*?<\/user_message>/,
+  // Routing is the stable first block, but the context blocks between it and
+  // the user envelope evolve over time. Match their ordering boundary instead
+  // of maintaining a whitelist that breaks whenever a new block is inserted.
+  /^<botmux_routing>[\s\S]*?<\/botmux_routing>[\s\S]*?<user_message>[\s\S]*?<\/user_message>/,
   // The optional <whiteboard> block sits between <botmux_reminder> and
   // <user_message> (new-topic prompts place it before <user_message> too), so
   // each reminder-bearing envelope makes it optional there to stay structural —
   // a botmux-generated prompt with <whiteboard> must still drop, not get adopted.
-  /^<botmux_routing>[\s\S]*?<\/botmux_routing>\s*(?:<identity>[\s\S]*?<\/identity>\s*)?<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
   /^<role\s+context="(?:team|group)"\s+chat_id="[^"]+">[\s\S]*?<\/role>\s*(?:<session_id>[^<]+<\/session_id>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
   /^<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
   /^<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*(?:<whiteboard\b[\s\S]*?<\/whiteboard>\s*)?<user_message>[\s\S]*?<\/user_message>/,
@@ -324,6 +327,37 @@ function cleanUserPromptForTitle(raw: string): string | null {
   return raw;
 }
 
+/** Extract text inputs from a Codex/TRAE persisted user response item. */
+function rawRolloutUserTexts(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((part) => {
+    const rec = asRecord(part);
+    const text = rec?.type === 'input_text' && typeof rec.text === 'string'
+      ? rec.text.trim()
+      : '';
+    return text ? [text] : [];
+  });
+}
+
+/** Codex persists startup context as role:user response items. These are not
+ *  human prompts and must not become /adopt titles. */
+const ROLLOUT_SYNTHETIC_USER_PATTERNS: readonly RegExp[] = [
+  /^# AGENTS\.md instructions(?:\s+for\b)?/,
+  /^<environment_context\b/,
+  /^<skills_instructions\b/,
+  /^<permissions instructions\b/,
+  /^<collaboration_mode\b/,
+  /^<apps_instructions\b/,
+  /^<plugins_instructions\b/,
+  /^<codex_internal_context\b/,
+  /^<turn_aborted\b/,
+];
+
+function cleanRolloutUserPromptForTitle(raw: string): string | null {
+  if (ROLLOUT_SYNTHETIC_USER_PATTERNS.some((re) => re.test(raw))) return null;
+  return raw;
+}
+
 export async function discoverClaudeFamilySessions(
   dataDir: string,
   limit: number,
@@ -340,10 +374,10 @@ export async function discoverClaudeFamilySessions(
 // ─── Codex / TRAE rollout (codex, traex) ─────────────────────────────────────
 
 /** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd;
- *  the first `event_msg`/`user_message` carries the user's first prompt (the
- *  `response_item` role:user entries include the synthetic
- *  <environment_context>/<permissions> preamble, so we prefer user_message).
- *  Streamed line by line, stopping once id + cwd + title are found. */
+ *  `event_msg`/`user_message` is the preferred title source. Codex Desktop may
+ *  persist user input only as `response_item` messages, so those are accepted
+ *  as an EOF fallback after filtering the synthetic startup context. Streamed
+ *  line by line; a legacy user_message can stop the scan early. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
@@ -352,7 +386,13 @@ async function parseRolloutTranscript(
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
-  const acc: { id: string | null; cwd: string | null; title: string; botmux: boolean } = { id: null, cwd: null, title: '', botmux: false };
+  const acc: { id: string | null; cwd: string | null; title: string; fallbackTitle: string; botmux: boolean } = {
+    id: null,
+    cwd: null,
+    title: '',
+    fallbackTitle: '',
+    botmux: false,
+  };
   let excluded = false;
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
@@ -367,11 +407,18 @@ async function parseRolloutTranscript(
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
       if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
+    } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+      for (const raw of rawRolloutUserTexts(payload.content)) {
+        if (isBotmuxInjected(raw)) { acc.botmux = true; return true; }
+        const clean = cleanRolloutUserPromptForTitle(raw);
+        if (!acc.fallbackTitle && clean) acc.fallbackTitle = truncateTitle(clean);
+      }
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  if (excluded || acc.botmux || !acc.id || !acc.cwd || !acc.title) return null;
-  return { cliSessionId: acc.id, cwd: acc.cwd, title: acc.title, lastActivityAt: mtimeMs };
+  const title = acc.title || acc.fallbackTitle;
+  if (excluded || acc.botmux || !acc.id || !acc.cwd || !title) return null;
+  return { cliSessionId: acc.id, cwd: acc.cwd, title, lastActivityAt: mtimeMs };
 }
 
 export async function discoverRolloutSessions(

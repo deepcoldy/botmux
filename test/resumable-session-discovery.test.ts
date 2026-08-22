@@ -302,6 +302,193 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     });
   });
 
+  it('discovers Codex Desktop rollouts whose real user input exists only as a response_item', async () => {
+    writeRollout('2026/08/14', 'rollout-codex-desktop-response-item.jsonl', [
+      {
+        type: 'session_meta',
+        payload: {
+          id: 'sid-codex-desktop-response-item',
+          cwd: '/root/desktop-project',
+          originator: 'Codex Desktop',
+          source: 'vscode',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: '# AGENTS.md instructions for /root/desktop-project\n\n<INSTRUCTIONS>...</INSTRUCTIONS>' },
+            { type: 'input_text', text: '<environment_context>\n  <cwd>/root/desktop-project</cwd>\n</environment_context>' },
+          ],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'index the uploaded knowledge bundle' }],
+        },
+      },
+    ]);
+
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      cliSessionId: 'sid-codex-desktop-response-item',
+      cwd: '/root/desktop-project',
+      title: 'index the uploaded knowledge bundle',
+    });
+  });
+
+  it('prefers the legacy user_message title when a rollout contains both formats', async () => {
+    writeRollout('2026/08/14', 'rollout-codex-mixed-user-formats.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-codex-mixed-user-formats', cwd: '/root/mixed-project' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'response-item fallback title' }],
+        },
+      },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'legacy event title' } },
+    ]);
+
+    expect((await discoverRolloutSessions(sessionsRoot, 10))[0]?.title).toBe('legacy event title');
+  });
+
+  it('keeps TRAE response_item rollouts discoverable through the shared parser', async () => {
+    writeRollout('2026/08/14', 'rollout-traex-response-item.jsonl', [
+      {
+        type: 'session_meta',
+        payload: {
+          id: 'sid-traex-response-item',
+          cwd: '/root/traex-project',
+          originator: 'TRAE',
+          source: 'traex',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'review the shared rollout parser' }],
+        },
+      },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([
+      expect.objectContaining({
+        cliSessionId: 'sid-traex-response-item',
+        cwd: '/root/traex-project',
+        title: 'review the shared rollout parser',
+      }),
+    ]);
+  });
+
+  it('skips persisted Codex runtime instructions before choosing a response_item title', async () => {
+    writeRollout('2026/08/15', 'rollout-codex-desktop-runtime-context.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-codex-runtime-context', cwd: '/root/context-project' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: '# AGENTS.md instructions\n\n<INSTRUCTIONS>...</INSTRUCTIONS>' },
+            { type: 'input_text', text: '<skills_instructions>...</skills_instructions>' },
+            { type: 'input_text', text: '<permissions instructions>...</permissions instructions>' },
+            { type: 'input_text', text: '<collaboration_mode>...</collaboration_mode>' },
+            { type: 'input_text', text: '<apps_instructions>...</apps_instructions>' },
+            { type: 'input_text', text: '<plugins_instructions>...</plugins_instructions>' },
+          ],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'the first prompt typed by the user' }],
+        },
+      },
+    ]);
+
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+
+    expect(out[0]?.title).toBe('the first prompt typed by the user');
+  });
+
+  it('does not discover a rollout whose only user item is Codex goal context', async () => {
+    writeRollout('2026/08/15', 'rollout-codex-goal-context-only.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-codex-goal-context-only', cwd: '/root/goal-project' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '<codex_internal_context source="goal">\nContinue pursuing the active goal.\n</codex_internal_context>',
+          }],
+        },
+      },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([]);
+  });
+
+  it('does not discover a rollout whose only user item is an aborted-turn marker', async () => {
+    writeRollout('2026/08/15', 'rollout-codex-turn-aborted-only.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-codex-turn-aborted-only', cwd: '/root/aborted-project' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '<turn_aborted>\nThe previous turn was interrupted by the user.\n</turn_aborted>',
+          }],
+        },
+      },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([]);
+  });
+
+  it('drops botmux-origin rollouts when the injected prompt exists only as a response_item', async () => {
+    writeRollout('2026/08/16', 'rollout-codex-botmux-response-item.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-codex-botmux-response-item', cwd: '/root/botmux-project' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '<environment_context>...</environment_context>' }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '<botmux_routing>\nreply with botmux send\n</botmux_routing>\n\n<botmux_builtin_skills>\nuse the built-in skills\n</botmux_builtin_skills>\n\n<identity>\n  <name>Codex Bot</name>\n  <open_id>ou_bot</open_id>\n</identity>\n\n<session_id>session-123</session_id>\n\n<user_message>\nfix the parser\n</user_message>',
+          }],
+        },
+      },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([]);
+  });
+
   it('drops botmux-origin rollouts (user_message carries the injected wrapper)', async () => {
     writeRollout('2026/06/12', 'rollout-bmx.jsonl', [
       { type: 'session_meta', payload: { id: 'sid-bmx', cwd: '/root/x' } },
