@@ -13822,6 +13822,11 @@ function cleanupPersistentBackendSessions(
     killManagedExactHerdrTargets(true);
     for (const session of activeSessions_) {
       if (!belongsToBackend(session)) continue;
+      // The remote TUI deliberately uses cliId=codex even when the Bot's
+      // default/new-session runtime remains codex-app. This is a shared-adopt
+      // binding, not a stale CLI selection, so keep its bmx-* client alive for
+      // the restore path. Explicit /detach remains responsible for cleanup.
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) continue;
       const sessionCliId = session.cliId;
       if (!sessionCliId || !session.larkAppId) continue;
       let botCliId: CliId | undefined;
