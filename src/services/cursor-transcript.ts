@@ -160,6 +160,47 @@ export interface CursorDrainResult {
   /** A line written without its terminating \n yet — informational; only
    *  complete lines produce events. */
   pendingTail: string;
+  /** Byte offset of the snapshot EOF (start + bytes actually read). Same
+   *  snapshot as the drain — no second statSync, so no TOCTOU. Used as the
+   *  attach baseline when the snapshot ends mid in-flight MESSAGE line: that
+   *  line is old output and must be skipped, restoring the old `size`
+   *  baseline semantics without the 64 KiB tail-window probe (which could
+   *  start mid-multibyte-char and drift the byte arithmetic). */
+  readEndOffset: number;
+  /** True when the drain read a complete, stable snapshot (bytesRead === len,
+   *  no I/O failure). False on a short read (file truncated between stat and
+   *  read) or any I/O failure — the caller must NOT commit a baseline from a
+   *  partial snapshot. Trivially true for no-op drains (size <= start). */
+  snapshotComplete: boolean;
+}
+
+/** Whether the cursor transcript fallback is disabled for this session.
+ *  The 30s fail-safe sets `disabled=true` when the baseline can't be
+ *  committed; this stops BOTH polling and mark attribution (not just
+ *  polling). Other CLIs are unaffected — only cursor has the per-session
+ *  disable switch. Pure function for testability. */
+export function isCursorFallbackDisabled(cliId: string | undefined, disabled: boolean): boolean {
+  return cliId === 'cursor' && disabled;
+}
+
+/** Classification of a pending-tail fragment (a partial JSON line at EOF)
+ *  for baseline selection at attach time. */
+export type CursorTailClass = 'message' | 'footer' | 'defer';
+
+/** Classify a pending-tail fragment by its PREFIX. Cursor's JSONL is compact
+ *  JSON: conversation messages start with `{"role":"user"` /
+ *  `{"role":"assistant"`; the turn_ended status footer starts with
+ *  `{"type":"turn_ended"`. Only a COMPLETE known discriminator classifies —
+ *  a half-written value, unknown type, or unexpected shape returns 'defer'
+ *  (the caller waits for the next tick rather than guessing). Cursor's
+ *  internal schema is not promised stable: a future conversation line could
+ *  carry a top-level `type`, so widening the match would reopen the
+ *  stale-replay hole. A parseable COMPLETE line is handled by the object
+ *  classifier (isStatusFooterObject) inside the drain, not here. */
+export function classifyCursorPendingTail(fragment: string): CursorTailClass {
+  if (fragment.startsWith('{"role":"user"') || fragment.startsWith('{"role":"assistant"')) return 'message';
+  if (fragment.startsWith('{"type":"turn_ended"')) return 'footer';
+  return 'defer';
 }
 
 /** Concatenate the text of all `type:'text'` blocks. Cursor uses the same
@@ -261,63 +302,96 @@ function isStatusFooterObject(obj: any): boolean {
  *  observed live on cursor-agent 2026.08.11). Leaving the offset at the
  *  footer's start costs a ~40-byte re-read per poll and re-parses to zero
  *  events, so no duplicates can result. */
-export function drainCursorTranscript(path: string, fromOffset: number): CursorDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: fromOffset, pendingTail: '' };
+/** Optional dependency injection for deterministic short-read / race
+ *  testing. Production callers omit this and use the real fs functions. */
+export interface CursorDrainDeps {
+  stat?: (path: string) => number;
+  read?: (fd: number, buf: Buffer, offset: number, length: number, position: number) => number;
+}
+
+export function drainCursorTranscript(path: string, fromOffset: number, deps: CursorDrainDeps = {}): CursorDrainResult {
+  const statSize = deps.stat ?? ((p: string) => statSync(p).size);
+  const readFn = deps.read ?? readSync;
+  const empty = (offset: number, complete = true): CursorDrainResult =>
+    ({ events: [], newOffset: offset, pendingTail: '', readEndOffset: offset, snapshotComplete: complete });
+  if (!existsSync(path)) return empty(fromOffset, false);
   let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
+  try { size = statSize(path); } catch { return empty(fromOffset, false); }
+  const start = fromOffset;
   // Cursor's mirror can briefly disappear / shrink while it rewrites. Do not
   // reset to 0 here: replaying the full history pollutes attribution state and
   // can wedge a live turn behind old events. Wait for the mirror to grow past
-  // the last consumed byte instead. (The footer rewind above keeps the
+  // the last consumed byte instead. (The footer rewind below keeps the
   // committed offset at the truncation point, so the equal-size no-op window
   // during a footer-truncate is expected and harmless.)
-  if (size < start) return { events: [], newOffset: fromOffset, pendingTail: '' };
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
+  if (size < start) return empty(fromOffset);
+  if (size === start) return empty(start);
 
   const len = size - start;
   const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  let pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  let newOffset = start + Buffer.byteLength(completeText, 'utf8');
+  let bytesRead = 0;
+  try {
+    const fd = openSync(path, 'r');
+    try { bytesRead = readFn(fd, buf, 0, len, start); } finally { closeSync(fd); }
+  } catch { return empty(fromOffset, false); }
+  // Capture the ACTUAL bytes read. If Cursor truncates the mirror between
+  // statSync and readSync, bytesRead < len and the buffer tail is zero-filled
+  // garbage — scanning it would push readEndOffset past the real data and
+  // ghost the next turn. snapshotComplete=false tells the caller to defer
+  // rather than commit a baseline from a partial snapshot.
+  const snapshotComplete = bytesRead === len;
+  const readEndOffset = start + bytesRead;
+  const data = buf.subarray(0, bytesRead);
 
+  // Walk raw newline (0x0a) positions instead of decoding the whole buffer
+  // and re-encoding per line. When `start` lands mid-multibyte-char (a
+  // baseline at the old `size` during a footer-truncate rewrite), the decoded
+  // string's byte length no longer maps 1:1 to file offsets, and the old
+  // `Buffer.byteLength(line, 'utf8') + 1` arithmetic drifts past the true
+  // line boundary. Raw 0x0a indices are always exact file offsets; the first
+  // segment after a mid-char start decodes with a U+FFFD prefix and fails
+  // JSON.parse (skipped), so no drift accumulates.
   const events: CodexBridgeEvent[] = [];
-  // Byte start of the current TRAILING run of parsed status/footer lines.
-  // Reset by any message line or unparseable fragment; blank lines don't
-  // break the run. When set after the scan, newOffset rewinds to it.
+  // Byte start (file-absolute) of the current TRAILING run of parsed
+  // status/footer lines. Reset by any message line or unparseable fragment;
+  // blank lines don't break the run. When set after the scan, newOffset
+  // rewinds to it.
   let trailingFooterStart: number | undefined;
-  // Track byte offset within the file so synthetic uuids are stable across
-  // re-drains (message lines are append-only; only the footer moves).
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1; // the \n after an empty line
-      continue;
+  let newOffset = start;
+  let segStart = 0; // data-relative start of the current line segment
+  let nlIdx = data.indexOf(0x0a);
+  while (nlIdx !== -1) {
+    const lineBuf = data.subarray(segStart, nlIdx); // excludes the \n
+    const lineFileStart = start + segStart;
+    newOffset = start + nlIdx + 1; // file-absolute, after the \n
+    if (lineBuf.length > 0) {
+      const line = lineBuf.toString('utf8');
+      let obj: any;
+      try { obj = JSON.parse(line); } catch {
+        trailingFooterStart = undefined;
+        segStart = nlIdx + 1;
+        nlIdx = data.indexOf(0x0a, segStart);
+        continue;
+      }
+      if (isStatusFooterObject(obj)) {
+        trailingFooterStart ??= lineFileStart;
+      } else {
+        trailingFooterStart = undefined;
+        // No per-event timestamp in Cursor's JSONL — stamp with the drain
+        // wall-clock. Combined with byte-offset baselining at attach, this
+        // keeps the CodexBridgeQueue freshness gates happy without a real
+        // timestamp.
+        const ev = eventFromLine(path, lineFileStart, obj, Date.now());
+        if (ev) events.push(ev);
+      }
     }
-    const lineByteLen = Buffer.byteLength(line, 'utf8') + 1; // include \n
-    const lineStart = cursor;
-    cursor += lineByteLen;
-    let obj: any;
-    try { obj = JSON.parse(line); } catch {
-      trailingFooterStart = undefined;
-      continue;
-    }
-    if (isStatusFooterObject(obj)) {
-      trailingFooterStart ??= lineStart;
-      continue;
-    }
-    trailingFooterStart = undefined;
-    // No per-event timestamp in Cursor's JSONL — stamp with the drain
-    // wall-clock. Combined with byte-offset baselining at attach, this keeps
-    // the CodexBridgeQueue freshness gates happy without a real timestamp.
-    const timestampMs = Date.now();
-    const ev = eventFromLine(path, lineStart, obj, timestampMs);
-    if (ev) events.push(ev);
+    segStart = nlIdx + 1;
+    nlIdx = data.indexOf(0x0a, segStart);
   }
+  // Pending tail: bytes after the last \n (or the whole buffer if no \n).
+  // Starts at a line boundary, so it decodes cleanly even when `start` was
+  // mid-char.
+  let pendingTail = data.subarray(segStart).toString('utf8');
 
   // Cursor frequently leaves the final JSON object at EOF without a trailing
   // newline until the next turn mutates the mirror. If the tail is already a
@@ -325,15 +399,15 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
   // it (status footer); otherwise keep it pending.
   if (pendingTail.length > 0) {
     try {
-      const lineStart = newOffset;
+      const lineFileStart = newOffset;
       const obj = JSON.parse(pendingTail);
       if (isStatusFooterObject(obj)) {
-        trailingFooterStart ??= lineStart;
+        trailingFooterStart ??= lineFileStart;
       } else {
         trailingFooterStart = undefined;
-        const ev = eventFromLine(path, lineStart, obj, Date.now());
+        const ev = eventFromLine(path, lineFileStart, obj, Date.now());
         if (ev) events.push(ev);
-        newOffset = size;
+        newOffset = readEndOffset;
       }
       pendingTail = '';
     } catch {
@@ -344,68 +418,5 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
     newOffset = trailingFooterStart;
     pendingTail = '';
   }
-  return { events, newOffset, pendingTail };
-}
-
-const BASELINE_FOOTER_PROBE_BYTES = 64 * 1024;
-
-/** Baseline offset for attaching to an EXISTING cursor transcript (resume /
- *  restart re-attach): the byte frontier future drains should start from.
- *  Like a plain size baseline this leaves all history (and any partial tail —
- *  old in-flight output) behind the offset, but REWINDS before a trailing run
- *  of status/footer lines so the next turn's footer-truncating rewrite (see
- *  drainCursorTranscript) starts exactly at the committed offset instead of
- *  behind it. Returns undefined when the file is missing/unreadable so the
- *  caller can keep its existing degrade path. */
-export function cursorBaselineOffset(path: string): number | undefined {
-  let size: number;
-  try {
-    if (!existsSync(path)) return undefined;
-    size = statSync(path).size;
-  } catch { return undefined; }
-  if (size === 0) return 0;
-
-  const len = Math.min(size, BASELINE_FOOTER_PROBE_BYTES);
-  const probeStart = size - len;
-  const buf = Buffer.alloc(len);
-  let read = 0;
-  try {
-    const fd = openSync(path, 'r');
-    try { read = readSync(fd, buf, 0, len, probeStart); } finally { closeSync(fd); }
-  } catch { return undefined; }
-  const probe = buf.subarray(0, read).toString('utf8');
-
-  // Walk the probe's line layout forward, tracking the same trailing-footer
-  // run the drain uses. The first probe segment may be a mid-line fragment
-  // (probe boundary), which safely resets the run via its parse failure.
-  const lastNl = probe.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? probe.slice(0, lastNl + 1) : '';
-  const tail = lastNl >= 0 ? probe.slice(lastNl + 1) : probe;
-  let trailingFooterStart: number | undefined;
-  let cursor = probeStart;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) { cursor += 1; continue; }
-    const lineStart = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-    let obj: any;
-    try { obj = JSON.parse(line); } catch {
-      trailingFooterStart = undefined;
-      continue;
-    }
-    if (isStatusFooterObject(obj)) trailingFooterStart ??= lineStart;
-    else trailingFooterStart = undefined;
-  }
-  if (tail.length > 0) {
-    // A parseable status-footer tail joins the run; a message tail (old
-    // in-flight output) or a still-being-written fragment is skipped like the
-    // plain size baseline does. Tail start is derived from completeText's byte
-    // length, NOT the loop cursor — the split's trailing empty segment would
-    // otherwise inflate the cursor by one.
-    const tailStart = probeStart + Buffer.byteLength(completeText, 'utf8');
-    try {
-      if (isStatusFooterObject(JSON.parse(tail))) trailingFooterStart ??= tailStart;
-      else trailingFooterStart = undefined;
-    } catch { trailingFooterStart = undefined; }
-  }
-  return trailingFooterStart ?? size;
+  return { events, newOffset, pendingTail, readEndOffset, snapshotComplete };
 }
