@@ -3518,6 +3518,7 @@ function SessionModeSection(props: {
     { value: 'shared', label: tr('botDefaults.regularGroupModeShared') },
   ];
   const mentionOptions: DropdownFieldOption<string>[] = [
+    { value: 'topic-group', label: tr('botDefaults.mentionModeTopicGroup') },
     { value: 'always', label: tr('botDefaults.mentionModeAlways') },
     { value: 'topic', label: tr('botDefaults.mentionModeTopic') },
     { value: 'never', label: tr('botDefaults.mentionModeNever') },
@@ -4318,9 +4319,9 @@ function regularGroupMode(bot: BotDefaultsRow): string {
 }
 
 function mentionMode(bot: BotDefaultsRow): string {
-  return bot.regularGroupMentionMode === 'topic' || bot.regularGroupMentionMode === 'never' || bot.regularGroupMentionMode === 'ambient'
+  return bot.regularGroupMentionMode === 'always' || bot.regularGroupMentionMode === 'topic' || bot.regularGroupMentionMode === 'never' || bot.regularGroupMentionMode === 'ambient'
     ? bot.regularGroupMentionMode
-    : 'always';
+    : 'topic-group';
 }
 
 function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {

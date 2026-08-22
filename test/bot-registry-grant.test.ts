@@ -184,11 +184,14 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg3', larkAppSecret: 's' }]))[0].regularGroupReplyMode).toBeUndefined();
   });
 
-  it('parses regularGroupMentionMode: keeps topic|never, drops always/invalid/absent to undefined', () => {
+  it('parses regularGroupMentionMode: keeps all four explicit tiers, drops invalid/absent to undefined', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm1', larkAppSecret: 's', regularGroupMentionMode: 'topic' }]))[0].regularGroupMentionMode).toBe('topic');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm1b', larkAppSecret: 's', regularGroupMentionMode: 'never' }]))[0].regularGroupMentionMode).toBe('never');
-    // 'always' is the default → normalized to undefined so bots.json stays clean.
-    for (const bad of ['always', 'bad', true, 1, undefined]) {
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm1c', larkAppSecret: 's', regularGroupMentionMode: 'ambient' }]))[0].regularGroupMentionMode).toBe('ambient');
+    // 'always' is now an explicit opt-out of the topic-group default → kept, not dropped.
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm1d', larkAppSecret: 's', regularGroupMentionMode: 'always' }]))[0].regularGroupMentionMode).toBe('always');
+    // Invalid values and absent → undefined (the resolved default is 'topic-group').
+    for (const bad of ['bad', true, 1, undefined]) {
       const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gm2', larkAppSecret: 's', regularGroupMentionMode: bad }]));
       expect(c[0].regularGroupMentionMode).toBeUndefined();
     }

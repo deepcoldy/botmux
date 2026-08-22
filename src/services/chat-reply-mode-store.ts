@@ -59,12 +59,18 @@ function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   }
 }
 
-export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
+export type GroupMentionMode = 'always' | 'topic' | 'topic-group' | 'never' | 'ambient';
 
 /**
- * Per-bot (bot-global) @-requirement policy for regular groups, default 'always'.
- *   • always  — @ required everywhere (incl. inside shared topics).
- *   • topic   — @ required at top level, but non-@ continues inside shared topics.
+ * Per-bot (bot-global) @-requirement policy for groups, default 'topic-group'.
+ *   • topic-group (default) — @ required at top level and inside 普通群 owned
+ *               topics; a non-@ reply INSIDE a 话题群 (chat_mode=topic) thread
+ *               the bot already owns continues without @. 新建话题的 agent 在
+ *               话题内免 @ 续话；普通群不受影响。
+ *   • always  — @ required everywhere (incl. inside shared topics). Explicit
+ *               opt-out of the topic-group default.
+ *   • topic   — @ required at top level, but non-@ continues inside owned
+ *               topics in ANY group (话题群 + 普通群 shared/new-topic threads).
  *   • never   — non-@ messages are always answered (where the bot has talk access).
  *   • ambient — like never, but stays quiet when the message @mentions another
  *               specific member (person/bot) without @ing this bot (redirect).
@@ -72,9 +78,9 @@ export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
 export function resolveGroupMentionMode(larkAppId: string): GroupMentionMode {
   try {
     const m = getBot(larkAppId).config.regularGroupMentionMode;
-    return m === 'topic' || m === 'never' || m === 'ambient' ? m : 'always';
+    return m === 'always' || m === 'topic' || m === 'never' || m === 'ambient' ? m : 'topic-group';
   } catch {
-    return 'always';
+    return 'topic-group';
   }
 }
 
