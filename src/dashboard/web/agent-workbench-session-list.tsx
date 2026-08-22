@@ -142,13 +142,17 @@ export interface WorkbenchSessionListProps {
   online?: boolean;
   onSelect(sessionId: string): void;
   onToggleCollapsed?(): void;
-  /** Row-level shortcuts: jump straight to a surface instead of selecting the
-   *  session and then hunting for the layout control. */
-  onOpenSurface?(sessionId: string, surface: 'terminal' | 'terminal-control' | 'chat'): void;
-  /** P1-4：显式传 false 时不渲染行内「接管」捷径（只留只读「终端」）——没有
-   *  canControl 能力的身份（平台 teammate/guest、触屏 H5）接管必 403。不传按
-   *  旧行为渲染（dock 等不带能力投影的精简形态）。 */
-  canControlTerminal?: boolean;
+  /** Row-level shortcut: jump straight to the session's terminal instead of
+   *  selecting the session and then hunting for the layout control. 行内只有
+   *  这一个终端入口（只读打开 / 再点关闭）——接管统一走终端面板标题栏的
+   *  「接管输入」，行内不再提供接管捷径。 */
+  onOpenTerminal?(sessionId: string): void;
+  /** 恒可写身份（平台所有者）：「终端」按钮点开就是可输入的终端，说明文案不能
+   *  再写「只读」（P1-4：宁可不提只读，也不留一句与实际能力相反的话）。 */
+  fixedTerminal?: boolean;
+  /** 这个会话的终端面板有写请求在途：行内「终端」此刻禁用，连点不会在 POST
+   *  回执前把面板关掉、留下一条没人管的写租约。 */
+  terminalBusySessionId?: string | null;
   /** 话题会话专用：让 bot 在原话题里 @ 会话拥有者，用户点通知即可跳回话题。
    *  不传则不渲染定位按钮（dock 等精简形态就是这么用的）。 */
   onLocate?(sessionId: string): Promise<void>;
@@ -502,7 +506,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
             const reason = attentionSummary(session) ?? (unread ? UNREAD_REASON : null);
             const selected = session.sessionId === props.selectedSessionId;
             const statusText = item.group === 'needs-you' ? '待你处理' : item.group === 'active' ? session.status : '最近';
-            const openSurface = props.onOpenSurface;
+            const openTerminal = props.onOpenTerminal;
             const chatHref = session.feishuChatLink
               || (session.chatId ? buildChatAppLink(session.chatId) : null);
             const kind = workbenchSessionKind(session);
@@ -549,7 +553,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                       >{copy}</FeishuChatAnchor>
                     );
                   })()}
-                  {openSurface ? (
+                  {openTerminal ? (
                     <span className="wb-session-row-actions">
                       {/* A real anchor, not a scripted open: handing the AppLink
                           to the browser lets the Feishu client claim it and place
@@ -595,28 +599,32 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                           >{located ? '已发送' : '定位'}</button>
                         );
                       })() : null}
-                      {([
-                        ['terminal', '打开只读终端', '终端'] as const,
-                        // 接管捷径只对有 canControl 能力的身份渲染（P1-4）；
-                        // undefined（dock/旧调用方）保持旧行为。
-                        ...(props.canControlTerminal !== false
-                          ? [['terminal-control', '打开终端并接管输入', '接管'] as const]
-                          : []),
-                      ]).map(([surface, label, text]) => (
-                        <button
-                          key={surface}
-                          type="button"
-                          className={`wb-session-row-action is-${surface}`}
-                          title={label}
-                          aria-label={`${label} — ${title}`}
-                          onClick={event => {
-                            // The row itself selects; without this the click would
-                            // also bubble and fire a redundant selection.
-                            event.stopPropagation();
-                            openSurface(session.sessionId, surface);
-                          }}
-                        >{text}</button>
-                      ))}
+                      {/* 行内只剩「终端」这一个终端入口（产品决策：接管统一走终端
+                          面板标题栏的「接管输入」，那条链路是唯一知道自己真实模式
+                          的地方；行内再摆一个接管捷径只是同一件事的第二条路）。 */}
+                      {(() => {
+                        // 恒可写身份点开就能输入，这里再写「只读」等于说反话；
+                        // 普通身份的「终端」确实是只读打开（面板会把攥着的租约
+                        // 还回去），照旧说清楚。
+                        const label = props.fixedTerminal
+                          ? '打开终端（当前身份可直接输入）'
+                          : '打开只读终端';
+                        return (
+                          <button
+                            type="button"
+                            className="wb-session-row-action is-terminal"
+                            title={label}
+                            aria-label={`${label} — ${title}`}
+                            disabled={props.terminalBusySessionId === session.sessionId}
+                            onClick={event => {
+                              // The row itself selects; without this the click would
+                              // also bubble and fire a redundant selection.
+                              event.stopPropagation();
+                              openTerminal(session.sessionId);
+                            }}
+                          >终端</button>
+                        );
+                      })()}
                     </span>
                   ) : null}
                 </div>

@@ -15,13 +15,13 @@ Authenticated GET /api/workbench/h5-context exposes enabled, appId, brand and en
 
 The client tracks local management authority separately from narrow Workbench authority. H5/platform identities can use the server-scoped Terminal and Preview leases without gaining Dashboard management controls; expected management 401s do not masquerade as an expired Workbench login.
 
-Operation entries render from the server-projected minimal capability set (GET /api/workbench/capabilities → canLocate/canControl/canInteract), parsed strictly with a fail-closed all-false fallback. `authenticated` alone never shows an operation button: 定位 follows canLocate, the row 接管 shortcut and the pane takeover button follow canControl, and the Preview unlock follows canInteract — layered on top of (not replacing) the existing touch read-only restrictions.
+Operation entries render from the server-projected minimal capability set (GET /api/workbench/capabilities → canLocate/canControl/canInteract), parsed strictly with a fail-closed all-false fallback. `authenticated` alone never shows an operation button: 定位 follows canLocate, the pane takeover button (接管输入 — the only takeover entry; the row-level shortcut was removed by product decision) follows canControl, and the Preview unlock follows canInteract — layered on top of (not replacing) the existing touch read-only restrictions.
 
 ## Components and state
 
 - agent-workbench-view.tsx owns the full appCenter surface: responsive derivation, rail resize and collapse, per-session layout plus rail/unread persistence, the single-terminal workspace and the mobile drill-down stack.
 - agent-workbench-dock-view.tsx owns the narrow sidebar helper and its summary and link actions.
-- agent-workbench-session-list.tsx implements six grouping dimensions, collapsible groups, search, unread markers, fixed-height virtualization (54px desktop rows, 84px touch rows, 30px group headers) and keyboard navigation; each row carries the chat anchor plus 定位/终端/接管 actions.
+- agent-workbench-session-list.tsx implements six grouping dimensions, collapsible groups, search, unread markers, fixed-height virtualization (54px desktop rows, 84px touch rows, 30px group headers) and keyboard navigation; each row carries the chat anchor plus 定位/终端 actions (no row-level takeover — that entry lives in the terminal pane titlebar).
 - agent-workbench-panes.tsx provides TerminalPane, WebPane and WorkbenchInfo. The desktop workspace hosts a single TerminalPane; WebPane and WorkbenchInfo render as mobile drill-down pages. Chat stays a Feishu-controlled external surface and is never drawn in-page.
 - agent-workbench-model.ts contains browser-safe routes, DTOs, grouping and attention/unread classification, layout clamps, responsive derivation and the terminal/preview href guards.
 - agent-workbench-storage.ts persists versioned browser-local primitives only: per-session layout, shared rail prefs, the seen/unread ledger, the grouping dimension and collapsed group keys.
@@ -33,7 +33,7 @@ The terminal pane is keyed by sessionId and control intent. Control and Preview 
 ## Layout
 
 - Rail: 300px default, 176–460px resize range, 40px collapsed width. Collapsing is the user's own choice at every desktop width (the toggle is offered at the ≥1280px full step); narrowing the window never force-collapses the list.
-- Workspace: at most one Terminal pane, opened from a row's 终端 (read-only) or 接管 (auto-takeover) button and closed from the workspace header; while it is closed the session list fills the page. There is no in-page split, layout-level badge, info drawer or chat widget.
+- Workspace: at most one Terminal pane, opened read-only from a row's 终端 button (which also demotes a taken-over pane back to read-only, then closes it) and closed from the workspace header; takeover happens in the pane titlebar (接管输入); while it is closed the session list fills the page. There is no in-page split, layout-level badge, info drawer or chat widget.
 - Web preview: WebPane renders on the mobile 网页 page only. Desktop reaches the same /preview/<encoded-session-id>/ URL through the Dock's 网页链接 action or by opening it directly; that URL is the dashboard-origin guard shell, which enforces the overlay and frames the agent app in an opaque-origin sandbox.
 - Desktop responsive steps full / rail-collapsed / focus / chat-jump derive at 1280/1120/960px and surface as data-responsive-step; with the single-terminal workspace and anchor-based chat they no longer change the page structure.
 - Below 620px: the mobile drill-down stack. The session list is the home level and always renders in full; tapping a row pushes a detail surface with 终端/网页/信息 segments (网页 only when the session has a registered preview) and an explicit ‹ 会话列表 back control.
@@ -48,7 +48,9 @@ Dock web_app AppLinks use mode=sidebar, min_width=350 and max_width=520. Full Wo
 
 ## Preview and Terminal
 
-Terminal starts READ ONLY (只读). 接管输入 calls the server-authoritative lease API; release, expiry or write-WebSocket disconnect returns it to read-only. Touch environments always use the read-only viewToken channel and hide the takeover control. The browser never receives a signed write grant.
+Terminal starts READ ONLY (只读). 接管输入 calls the server-authoritative lease API; release, expiry or write-WebSocket disconnect returns it to read-only. Control state is a single explicit machine — loading / taking-over / controlled / releasing / unknown — with separate epochs for observation polls and writes, so a 15s poll can never discard an in-flight write result, and a failed write lands in 未知 (masking the possibly-writable frame and re-reading the server) instead of optimistically claiming read-only.
+
+Touch environments use the viewToken channel and hide the takeover control, because that channel carries no lease to take over. It is not unconditionally read-only: a verified platform owner opening a viewToken link still receives the signed WRITE grant the front proxy mints for that identity (#960), so the pane reports what the framed terminal page's ESTABLISHED WebSocket actually got (`wsHasWrite`, latched from an out-of-band first frame) rather than asserting "phones are read-only" — and it says *unknown* until that socket has spoken, because the page's own HTTP verdict is a separate authorization that an iOS WebView routinely fails to reproduce on the upgrade. Trusted platform owners have a fixed, always-writable role instead of a lease, so their rows collapse to a single 终端 toggle and never claim to open a read-only terminal.
 
 Web accepts only the exact /preview/<encoded-session-id>/ descriptor for the selected session. It starts 预览 (PREVIEW), enters 可交互 (INTERACTIVE) only after explicit 开启交互, sends bounded activity updates and fails closed to Preview, relocking after 15 idle minutes. The visible security notice says the overlay prevents accidental interaction but is not an application security sandbox — the actual trust boundary is the opaque origin the app is framed in, which is what keeps it away from the dashboard DOM, cookies and management APIs.
 

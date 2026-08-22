@@ -49,6 +49,10 @@ import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRe
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
+import {
+  decodeTerminalWriteFrameSource,
+  terminalWriteFrame,
+} from './core/terminal-write-frame.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
@@ -16053,6 +16057,23 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
+      // The page only knows the verdict of its own HTTP GET. This upgrade was a
+      // SECOND, independent authorization — and an iOS WebView does not send
+      // cookies on it, so the very same page can be judged writable over HTTP
+      // and read-only here. Tell the page what THIS socket actually got: it
+      // stops forwarding input it knows will be dropped, and reports the truth
+      // up to whatever embeds it (the Workbench terminal pane reads it to label
+      // the channel).
+      //
+      // It used to ride the PTY byte stream as an OSC sequence, which the page
+      // then scanned for on EVERY frame — so any process running inside a
+      // read-only terminal could print the same bytes and flip the page's own
+      // write verdict (or DoS itself into read-only). It is now an out-of-band
+      // control frame that MUST be the first message on this socket, sent in the
+      // same synchronous tick that registered it: the page only ever decodes
+      // frame #1 of a connection as control, so PTY output can never be mistaken
+      // for it. Nothing awaits between `wsClients.add` above and this send.
+      try { ws.send(terminalWriteFrame(hasWrite)); } catch { /* already closing */ }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
       // delayed or bypassed, the worker independently removes any granted
@@ -16485,6 +16506,18 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}
 var hasToken=${hasWrite};
+// hasToken 是**这一次 HTTP GET** 的判定，只当初值。真正说了算的是下面这条：worker 在
+// WebSocket 握手完成时把「这条连接实际拿到什么权限」发下来（OSC 1989 write），落成
+// wsHasWrite。两者会不一致——iOS WebView 的 WS 升级不带 Cookie，页面 HTTP 判可写、
+// WS 却只读，照抄 hasToken 就会让人对着一个不收字的终端打字。null = 还没连上。
+var wsHasWrite=null;
+// 「这条连接拿到什么权限」的解码器 —— 与 worker 侧同一份实现，原样嵌进来（这段页面
+// 代码住在模板字符串里，import 不进来，所以只能一份源码两处跑）。
+// 规则：只在**本连接的第一帧**上尝试，且要求整帧精确匹配。PTY 里跑的进程打出一模
+// 一样的字节也翻不动权限——它永远不可能是第一帧。
+var _wbDecodeWriteFrame=${decodeTerminalWriteFrameSource};
+// 本连接还没消费过首帧。每次 connect() 重置：上一条连接的结论套不到新连接上。
+var _wbFirstFrame=true;
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
@@ -16562,6 +16595,39 @@ function _wbApplyAutoFontSize(){
   return true;
 }
 fit.fit();
+// 这条通道到底能不能写，以**已经建立的 WS** 为准（见页面顶部 wsHasWrite 那段注释）。
+// 结论一到手就做两件事：① 页面自己收起输入，别把注定被丢掉的字发出去；② 上抛给嵌入
+// 方（工作台终端面板据此显示「可输入 / 只读」，而不是照抄 HTTP 的 hasToken）。
+// 上抛的目标 origin 绝不用星号：优先取 location.ancestorOrigins（WebKit / Blink 都有，
+// iOS WebView 正是 WebKit），取不到就退回「父页给我们发外观消息时带的那个 origin」；
+// 两者都没有就不发——宁可不上抛，也不广播出去。
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+var _wbParentOrigin=null;
+try{
+  var _wbAo=window.location.ancestorOrigins;
+  if(_wbAo&&_wbAo.length&&_wbAo[0]&&_wbAo[0]!=='null')_wbParentOrigin=_wbAo[0];
+}catch(_e){}
+function _wbPostWrite(){
+  if(window.parent===window||!_wbParentOrigin)return;
+  // wsHasWrite===null 也要上抛：那是「这条连接退回未知」的一次明确通知（重连开始时
+  // 发），嵌入方据此把上一条连接的结论清掉，而不是继续显示一个过期的判定。
+  try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
+}
+function _wbSetWsWrite(v){
+  var changed=wsHasWrite!==v;
+  wsHasWrite=v;
+  if(changed){
+    var _wb=document.getElementById('readonly-banner');
+    // 页面以为自己可写、这条连接其实只读：把只读横幅亮出来。反过来（连上后确认可写）
+    // 就把它收掉，别留一条与事实相反的提示。null（未知）两边都不动：还没有依据。
+    if(_wb&&!platformReadonly){
+      if(v===false&&hasToken)_wb.classList.add('show');
+      else if(v===true)_wb.classList.remove('show');
+    }
+  }
+  _wbPostWrite();
+}
 // 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
 // iframe 里，父页换 class / 换 CSS 变量都传不进来，配色只能靠 postMessage 递过来。
 // 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
@@ -16585,17 +16651,22 @@ window.addEventListener('message',function(_ev){
   if(_ev.source===window||_ev.source!==window.parent)return;
   var _d=_ev.data;
   if(!_d||_d.type!=='botmux:wb-appearance')return;
+  // 这一条消息本身就证明了父页的 origin（来源已经校验过是 window.parent）。
+  // ancestorOrigins 拿不到时（Firefox）靠它补上，并把攒着的写权限结论补发一次。
+  if(!_wbParentOrigin&&_ev.origin&&_ev.origin!=='null'){_wbParentOrigin=_ev.origin;_wbPostWrite();}
   var _theme=_wbSanitizeTheme(_d.theme);
   if(!_theme)return;
   try{
     term.options.theme=_theme;
-    // 阅读风是大行距 1.3；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
+    // 阅读风走 1.15 的行距；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
     // 经典那套色值与上面写死的字面量逐色相同，所以没开阅读风的用户零变化。
     // 这两个数字的唯一出处是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts），
     // 接缝测试按那张表比对这一行的字面量：改一处必须两处一起改。
     // 曾经是 1.55，单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome（提示 + 输入框 +
-    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走。
-    term.options.lineHeight=_d.termStyle==='reader'?1.3:1;
+    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走，所以先降到 1.3。
+    // 1.3 对中文密集的 TUI 内容还是偏松：汉字撑满 em 框，行间空隙观感接近隔行，于是
+    // 再收一档到 1.15（单元格高约 18.2px），比经典松一成半，读起来才连成一段。
+    term.options.lineHeight=_d.termStyle==='reader'?1.15:1;
     // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
     fit.fit();
   }catch(_e){}
@@ -16781,10 +16852,17 @@ function _sendInput(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:
 var _MOTION_RE=/^(?:\\x1b\\[<(?:35|39|43|47|51|55|59|63);\\d+;\\d+[Mm])+$/;
 var _motionPend=null,_motionT=0;
 term.onData(function(d){
-  if(!hasToken){
+  // 只有已建立的 WS 明确回报「可写」(wsHasWrite===true) 才放行输入。null（还没确认，
+  // 含重连中）和 false（这条连接判成只读）一律不发——桌面也要等首帧。照抄 hasToken
+  // （这一次 HTTP GET 的判定）会在 WS 不带 Cookie 的 iOS WebView 上让人对着一个不收字
+  // 的终端打字，按键石沉大海最难自查（第 17 点）。
+  if(wsHasWrite!==true){
     // Mouse escape sequences are input too: a TUI can bind clicks or wheel
     // events to actions. View links never forward terminal bytes.
-    _showReadonlyToast();return;
+    // 已经确定只读（这条连接判 false，或 HTTP GET 本来就没给写）才弹只读提示；null 是
+    // 还没连上的短暂过渡，此时 ws 多半也没 OPEN，静默丢弃即可，别闪一条与事实相反的只读。
+    if(!hasToken||wsHasWrite===false)_showReadonlyToast();
+    return;
   }
   if(_MOTION_RE.test(d)){
     // Trailing throttle: keep only the LATEST motion, flush every 90ms. Hover
@@ -16845,6 +16923,10 @@ if(typeof ResizeObserver!=='undefined'){
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  // 新连接 = 新的一次鉴权。上一条连接拿到的权限说明不了这一条，先退回未知（并把这
+  // 个「未知」上抛给嵌入方），等这条连接自己的首帧说话。
+  _wbFirstFrame=true;
+  _wbSetWsWrite(null);
   // Force a resize on every (re)connect: clear the dedup memory first. On
   // reconnect the browser grid is usually unchanged, so without this the
   // dedup in sendResize() would suppress the resize — but a reconnect often
@@ -16854,6 +16936,14 @@ if(typeof ResizeObserver!=='undefined'){
   // (status-line update bleeds into the line below). Always re-assert size.
   ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
+    // 带外控制帧只可能是**本连接的第一帧**，而且必须整帧精确匹配（见页面顶部
+    // _wbDecodeWriteFrame 那段注释）。首帧一旦消费掉，这条连接上之后的每一个字节
+    // 就都只是 PTY 输出 —— 里面的进程再怎么打印控制帧的字面量也翻不动权限。
+    if(_wbFirstFrame){
+      _wbFirstFrame=false;
+      var _ctl=_wbDecodeWriteFrame(e.data,true);
+      if(_ctl!==null){_wbSetWsWrite(_ctl);return;}
+    }
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
     // mostly-overlapping full screen. Preserve the reader's anchor when older
@@ -16894,7 +16984,15 @@ if(typeof ResizeObserver!=='undefined'){
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
     term.write(data,_settleInitialBottom);
   };
-  ws.onclose=function(){ws_=null;el.textContent='disconnected';el.className='err';setTimeout(connect,2000)};
+  ws.onclose=function(){
+    ws_=null;el.textContent='disconnected';el.className='err';
+    // 关闭当下就把这条连接的写权限退回未知：先复位首帧标志（重连后要等新首帧才恢复
+    // 结论），再 _wbSetWsWrite(null) —— 它同时收起输入（term.onData/toolbar/_fwdScroll
+    // 的门禁都以 wsHasWrite===true 为准）并向嵌入方上抛 write:null。不这样做的话，断线
+    // 到 2 秒后重连的空窗里，页面仍以上一条连接的旧判定放行输入、父页也还显示旧的可写。
+    _wbFirstFrame=true;_wbSetWsWrite(null);
+    setTimeout(connect,2000);
+  };
   ws.onerror=function(){ws.close()};
 })();
 
@@ -16965,6 +17063,12 @@ function _cellAt(clientX,clientY){
 }
 function _fwdScroll(px,coord){
   if((!hasToken&&!readOnlyRemoteScroll)||!ws_||ws_.readyState!==1||!px)return;
+  // 写链路(hasToken)转发的是 type:'input'，与 term.onData / toolbar 同一条判据：只有已
+  // 建立的 WS 明确回报可写(wsHasWrite===true)才放行；null（未确认，含重连中）与 false
+  // （这条连接只读）一律不发——照抄 hasToken 会在 WS 不带 Cookie 时把输入打进一个原地
+  // 丢字的终端（第 17 点）。只读远程滚动(hasToken=false)发的是 type:'scroll'，不是输入，
+  // 不受这道门约束（服务端另有校验）。
+  if(hasToken&&wsHasWrite!==true)return;
   coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
   var dir=px<0?-1:1;
   if(_scrollBurstDir&&dir!==_scrollBurstDir){_scrollAccum=0;_scrollBurstTicks=0;}
@@ -17209,6 +17313,9 @@ if(isTouch&&hasToken){
     var press=null;
     function fire(){
       if(!ws_||ws_.readyState!==1)return;
+      // 与 term.onData 同一条判据：只有 WS 明确回报可写(wsHasWrite===true)才发；null
+      // （还没确认）与 false（只读）都不发，桌面也等首帧（第 17 点）。
+      if(wsHasWrite!==true){if(wsHasWrite===false)_showReadonlyToast();return;}
       var k=km[btn.getAttribute('data-k')];
       if(k)ws_.send(JSON.stringify({type:'input',data:k}));
     }

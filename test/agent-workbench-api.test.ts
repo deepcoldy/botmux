@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   WorkbenchApiError,
   createWorkbenchApi,
+  newTerminalAcquisitionId,
 } from '../src/dashboard/web/agent-workbench-api.js';
+import { isTerminalAcquisitionId } from '../src/dashboard/terminal-control.js';
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -25,6 +27,51 @@ afterEach(() => {
 });
 
 describe('Agent Workbench API integration contract', () => {
+  it('carries the client-minted acquisition on takeover and the CAS condition on release', async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${String(input)}`);
+      if (String(input).includes('/takeover')) {
+        return jsonResponse({
+          ok: true, mode: 'controlled', owned: true, expiresAt: 10_000, acquisition: 'acq-from-server',
+        });
+      }
+      return jsonResponse({ ok: true, mode: 'readonly', owned: false, released: true });
+    }) as typeof fetch;
+    const api = createWorkbenchApi(fetchImpl);
+
+    await expect(api.takeoverTerminal('s1', undefined, 'acq-mine-000001')).resolves.toEqual({
+      mode: 'controlled', owned: true, expiresAt: 10_000, acquisition: 'acq-from-server',
+    });
+    await api.releaseTerminal('s1', undefined, 'acq-mine-000001');
+    // 两个参数都只是不透明等值串，不是凭证；服务端只拿它们做等值比较。
+    expect(calls).toEqual([
+      'POST /api/sessions/s1/control/takeover?acq=acq-mine-000001',
+      'POST /api/sessions/s1/control/release?expect=acq-mine-000001',
+    ]);
+  });
+
+  it('rejects an acquisition the server echoes in a shape the CAS could not use', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      ok: true, mode: 'controlled', owned: true, expiresAt: 10_000, acquisition: 42,
+    })) as unknown as typeof fetch;
+    await expect(createWorkbenchApi(fetchImpl).takeoverTerminal('s1')).rejects.toMatchObject({
+      code: 'invalid_control_response',
+    });
+  });
+
+  it('mints acquisition ids the server is willing to bind', () => {
+    // 前后端各有一份判据（客户端生成、服务端校验）。生成的形状进不了服务端那道正则，
+    // 接管就会 400，而用户看到的只是「接管失败」——所以两边必须在测试里对上。
+    const ids = new Set<string>();
+    for (let index = 0; index < 200; index += 1) {
+      const id = newTerminalAcquisitionId();
+      expect(isTerminalAcquisitionId(id)).toBe(true);
+      ids.add(id);
+    }
+    expect(ids.size).toBe(200);
+  });
+
   it('keeps takeover/release ownership explicit and encodes the exact session id', async () => {
     const calls: Array<{ path: string; method: string }> = [];
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

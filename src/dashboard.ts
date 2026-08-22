@@ -29,6 +29,7 @@ import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connecti
 import { createDashboardEventsStream, type DashboardEventAudience } from './dashboard/events-sse.js';
 import {
   ControlCsrfTokens,
+  classifyManagementUpgrade,
   guardControlRequest,
   injectControlCsrfMeta,
   managementUpgradeOrigin,
@@ -109,6 +110,10 @@ import {
   TerminalControlManager,
   terminalControlTtlFromEnv,
 } from './dashboard/terminal-control.js';
+import {
+  matchTerminalControlRoute,
+  resolveTerminalControlAction,
+} from './dashboard/terminal-control-route.js';
 import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
 import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
 import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
@@ -741,6 +746,11 @@ aggregator.on(sessionPresentation.onEvent);
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
   getActiveToken: currentDashboardToken,
+  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
+  // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
+  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把裸 shell
+  // 开放给平台上的任何人。
+  isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -3526,50 +3536,41 @@ const server = createServer(async (req, res) => {
     // Server-authoritative terminal control lease. The API returns only mode
     // and timestamps; its signed read/write grant stays inside the central
     // proxy and is never placed in a URL or response body.
-    let controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
-    if (controlMatch) {
+    //
+    // The dispatch itself lives in dashboard/terminal-control-route.ts — the ONE
+    // implementation that the acceptance scripts drive as well. It used to be
+    // inlined here, and the copy in the scripts drifted: they read the `?expect=`
+    // compare-and-swap condition while this one did not, so conditional release
+    // never actually applied in production.
+    const terminalControlMatch = matchTerminalControlRoute(url.pathname);
+    if (terminalControlMatch) {
       if (!requestIdentity) {
         return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
       }
       if (!enforceControlCsrf(req, res, requestIdentity)) return;
-      let sessionId: string;
-      try { sessionId = decodeURIComponent(controlMatch[1]); }
-      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      if (!terminalControlMatch.ok) {
+        return dashboardControlJson(res, 400, { ok: false, error: terminalControlMatch.error });
+      }
+      const sessionId = terminalControlMatch.sessionId;
       const availability = terminalControlAvailability(sessionId);
       if (!availability.ok) {
         return dashboardControlJson(res, availability.status, { ok: false, error: availability.error });
       }
-      const action = controlMatch[2];
-      if (req.method === 'GET' && !action) {
-        return dashboardControlJson(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
-      }
-      if (requestIdentity.terminalCapability === 'readonly') {
-        return dashboardControlJson(res, 403, { ok: false, error: 'terminal_operation_forbidden' });
-      }
-      if (req.method === 'POST' && action === 'takeover') {
-        const result = terminalControl.takeover(requestIdentity, sessionId);
-        const status = result.ok ? 200 : result.error === 'control_busy' ? 409 : 401;
-        return dashboardControlJson(
-          res,
-          status,
-          result.ok ? { ...result, owned: true } : { ok: false, error: result.error },
-        );
-      }
-      if (req.method === 'POST' && action === 'release') {
-        const result = terminalControl.release(requestIdentity, sessionId);
-        return dashboardControlJson(
-          res,
-          result.ok ? 200 : 403,
-          result.ok ? { ...result, owned: false } : { ok: false, error: result.error },
-        );
-      }
-      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
+      const answer = resolveTerminalControlAction({
+        method: req.method ?? 'GET',
+        action: terminalControlMatch.action,
+        sessionId,
+        search: url.searchParams,
+        identity: requestIdentity,
+        control: terminalControl,
+      });
+      return dashboardControlJson(res, answer.status, answer.body);
     }
 
     // Preview interaction is separately scoped per authenticated browser
     // session. Default is always the visibly labelled preview overlay; unlock
     // and activity are explicit, and the server hard-relocks after 15m idle.
-    controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+    const controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
     if (controlMatch) {
       if (!requestIdentity) {
         return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
@@ -6835,7 +6836,12 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
     // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
     // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
-    const upgradeOrigin = managementUpgradeOrigin(req.headers);
+    //
+    // 判之前**先按 path 分流**可信来源档位：会话终端 `/s/*` 认平台 `m-`+`t-`（分享
+    // 出去的终端页就住在 `t-`），而 `/debug-terminal/*` 的另一头是宿主裸 bash，只认
+    // management 档。合在一起判的话，`t-` 就连带成了裸 bash 那条 WS 的可信 Origin。
+    const upgradeRoute = classifyManagementUpgrade(rawUrl);
+    const upgradeOrigin = managementUpgradeOrigin(req.headers, upgradeRoute.surface);
     if (!upgradeOrigin.ok) {
       const body = JSON.stringify({ ok: false, error: upgradeOrigin.error });
       clientSocket.end([
@@ -6849,8 +6855,8 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
       ].join('\r\n'));
       return;
     }
-    // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
-    if (rawUrl.startsWith('/debug-terminal/')) {
+    // 调试终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
+    if (upgradeRoute.route === 'debug-terminal') {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;

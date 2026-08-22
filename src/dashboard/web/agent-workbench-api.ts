@@ -8,6 +8,44 @@ export interface TerminalControlState {
   reused?: boolean;
   /** Trusted platform owners have a fixed role, not a releasable takeover lease. */
   fixed?: boolean;
+  /**
+   * Which acquisition the lease is currently on. Present only when this login
+   * owns a real lease.
+   *
+   * It carries no authority — it is an equality nonce for compare-and-swap
+   * release. The lease lives on (session x login), so a second pane of the SAME
+   * login reuses the very same lease: without naming the acquisition, a late
+   * compensation for a pane that is already gone would release the lease the
+   * user is actively typing into.
+   *
+   * The value is minted by THIS browser before the takeover goes out (see
+   * {@link newTerminalAcquisitionId}) — a server-minted one would only ever come
+   * back on a successful response, i.e. never in the one case that needs it.
+   */
+  acquisition?: string;
+}
+
+/**
+ * A fresh acquisition id for one takeover.
+ *
+ * Minted BEFORE the POST leaves, which is the whole point: if the response is
+ * lost the pane still knows exactly which acquisition it may have caused, and
+ * can compensate for that one and no other. Opaque and non-secret — the server
+ * only ever compares it for equality against the acquisition it bound.
+ */
+export function newTerminalAcquisitionId(): string {
+  const crypto = (globalThis as {
+    crypto?: { randomUUID?(): string; getRandomValues?(array: Uint8Array): Uint8Array };
+  }).crypto;
+  try {
+    if (typeof crypto?.randomUUID === 'function') return `a${crypto.randomUUID().replaceAll('-', '')}`;
+    if (typeof crypto?.getRandomValues === 'function') {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      return `a${[...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')}`;
+    }
+  } catch { /* 没有 WebCrypto 的宿主（老 WebView / 测试替身）走下面的回退 */ }
+  // 回退只在没有 WebCrypto 时用到。它不是凭证，唯一要求是「同一个登录内不撞车」。
+  return `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
 }
 
 export interface PreviewInteractionState {
@@ -19,8 +57,24 @@ export interface PreviewInteractionState {
 
 export interface WorkbenchApi {
   getTerminalControl(sessionId: string, signal?: AbortSignal): Promise<TerminalControlState>;
-  takeoverTerminal(sessionId: string, signal?: AbortSignal): Promise<TerminalControlState>;
-  releaseTerminal(sessionId: string, signal?: AbortSignal): Promise<TerminalControlState>;
+  /** `acquisitionId` names THIS takeover. The caller mints it before calling so
+   *  a lost response still leaves it able to compensate for exactly this
+   *  acquisition; the server binds it to the lease. */
+  takeoverTerminal(
+    sessionId: string,
+    signal?: AbortSignal,
+    acquisitionId?: string,
+  ): Promise<TerminalControlState>;
+  /** `expectedAcquisition` turns the release into a compare-and-swap: the server
+   *  only gives the lease up while it is still the acquisition the caller names,
+   *  and answers `control_lease_superseded` once somebody else has taken it over.
+   *  Compensation paths (a receipt that outlived its pane, a pane closing before
+   *  its socket ever bridged) must pass it. */
+  releaseTerminal(
+    sessionId: string,
+    signal?: AbortSignal,
+    expectedAcquisition?: string,
+  ): Promise<TerminalControlState>;
   getPreviewInteraction(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
   unlockPreview(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
   touchPreview(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
@@ -126,6 +180,12 @@ function terminalControlState(value: unknown, fallbackOwned?: boolean): Terminal
   if (reused !== undefined && typeof reused !== 'boolean') {
     throw new WorkbenchApiError(502, 'invalid_control_response');
   }
+  // Bounded opaque string; it only ever travels back out as a query parameter.
+  const acquisition = body.acquisition === undefined ? undefined : body.acquisition;
+  if (acquisition !== undefined
+    && (typeof acquisition !== 'string' || !acquisition || acquisition.length > 256)) {
+    throw new WorkbenchApiError(502, 'invalid_control_response');
+  }
   if (fixed === true && (body.mode !== 'controlled' || !owned || expiresAt !== undefined)) {
     throw new WorkbenchApiError(502, 'invalid_control_response');
   }
@@ -135,6 +195,7 @@ function terminalControlState(value: unknown, fallbackOwned?: boolean): Terminal
     ...(expiresAt === undefined ? {} : { expiresAt }),
     ...(reused === undefined ? {} : { reused }),
     ...(fixed === undefined ? {} : { fixed }),
+    ...(acquisition === undefined ? {} : { acquisition }),
   };
 }
 
@@ -192,8 +253,18 @@ function sameOriginViewLink(path: string): string {
   }
 }
 
-function controlPath(sessionId: string, action?: 'takeover' | 'release'): string {
-  return `/api/sessions/${encodeURIComponent(sessionId)}/control${action ? `/${action}` : ''}`;
+function controlPath(
+  sessionId: string,
+  action?: 'takeover' | 'release',
+  acquisition?: { param: 'acq' | 'expect'; value: string },
+): string {
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/control${action ? `/${action}` : ''}`;
+  // Neither parameter is a credential. `acq` names the acquisition this takeover
+  // is about to become; `expect` is the compare-and-swap condition naming the
+  // acquisition the caller is giving up. Both are compared for equality only.
+  return acquisition
+    ? `${path}?${acquisition.param}=${encodeURIComponent(acquisition.value)}`
+    : path;
 }
 
 function previewPath(sessionId: string, action?: 'unlock' | 'activity' | 'lock'): string {
@@ -205,12 +276,20 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
     getTerminalControl: async (sessionId, signal) => terminalControlState(
       await jsonRequest(fetchImpl, controlPath(sessionId), { signal }),
     ),
-    takeoverTerminal: async (sessionId, signal) => terminalControlState(
-      await jsonRequest(fetchImpl, controlPath(sessionId, 'takeover'), { method: 'POST', signal }),
+    takeoverTerminal: async (sessionId, signal, acquisitionId) => terminalControlState(
+      await jsonRequest(
+        fetchImpl,
+        controlPath(sessionId, 'takeover', acquisitionId ? { param: 'acq', value: acquisitionId } : undefined),
+        { method: 'POST', signal },
+      ),
       true,
     ),
-    releaseTerminal: async (sessionId, signal) => terminalControlState(
-      await jsonRequest(fetchImpl, controlPath(sessionId, 'release'), { method: 'POST', signal }),
+    releaseTerminal: async (sessionId, signal, expectedAcquisition) => terminalControlState(
+      await jsonRequest(
+        fetchImpl,
+        controlPath(sessionId, 'release', expectedAcquisition ? { param: 'expect', value: expectedAcquisition } : undefined),
+        { method: 'POST', signal },
+      ),
       false,
     ),
     getPreviewInteraction: async (sessionId, signal) => previewInteractionState(

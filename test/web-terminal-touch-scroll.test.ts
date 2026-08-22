@@ -167,6 +167,33 @@ describe('web terminal touch scrolling', () => {
     );
   });
 
+  it('_fwdScroll 发 type:input 前先过 wsHasWrite===true 门禁，null/false 不发（第 17 点）', () => {
+    // 触屏滚动转发也是输入：写链路(hasToken)本会发 type:'input'，必须与 term.onData /
+    // toolbar 同一条判据——只有已建立的 WS 明确回报可写(wsHasWrite===true)才放行；null
+    // （未确认，含重连中）与 false（这条连接只读）一律不发。回归的形状是照抄 hasToken
+    // 就发，WS 未确认可写时也把输入打进一个原地丢字的终端。
+    const start = workerSource.indexOf('function _fwdScroll(px,coord){');
+    expect(start).toBeGreaterThan(-1);
+    const body = workerSource.slice(start, workerSource.indexOf('\n}', start) + 2);
+    expect(body).toContain('if(hasToken&&wsHasWrite!==true)return;');
+    // 门必须排在真正 send 之前。
+    expect(body.indexOf('if(hasToken&&wsHasWrite!==true)return;'))
+      .toBeLessThan(body.indexOf('ws_.send('));
+    // 把这条门当真值函数跑，钉的是源码里真正那行判据，不是另写一份等价物。
+    const guard = /if\((hasToken&&wsHasWrite!==true)\)return;/.exec(body)?.[1];
+    expect(guard).toBe('hasToken&&wsHasWrite!==true');
+    // eslint-disable-next-line no-new-func
+    const blocks = new Function('hasToken', 'wsHasWrite', `return (${guard});`) as
+      (hasToken: boolean, wsHasWrite: boolean | null) => boolean;
+    expect(blocks(true, true)).toBe(false);   // WS 确认可写 → 放行发 input
+    expect(blocks(true, false)).toBe(true);   // 明确只读 → 拦
+    expect(blocks(true, null)).toBe(true);    // 还没确认（含重连中）→ 拦
+    // 只读远程滚动(hasToken=false)发的是 type:'scroll'，不是输入，不受这道门约束。
+    expect(blocks(false, null)).toBe(false);
+    // send 的 type 判定仍是 hasToken?'input':'scroll'（这道门只决定发不发，不改 type）。
+    expect(body).toContain("ws_.send(JSON.stringify({type:hasToken?'input':'scroll',data:data}))");
+  });
+
   it('does not advertise read-only remote scroll for zellij per-client attach', () => {
     const helperStart = workerSource.indexOf('function canHandleReadOnlyRemoteScroll(): boolean {');
     const helperEnd = workerSource.indexOf('\n}\n\nfunction wireHerdrWebTerminalRelays', helperStart) + 2;

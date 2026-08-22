@@ -89,6 +89,10 @@ import {
 } from '../src/dashboard/preview-content-capability.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
 import {
+  matchTerminalControlRoute,
+  resolveTerminalControlAction,
+} from '../src/dashboard/terminal-control-route.js';
+import {
   centralViewLinkPath,
   mintTerminalViewCapability,
   terminalViewCapabilityAuthSession,
@@ -435,22 +439,24 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     return json(res, 200, { ok: true, url: link, expiresAt: minted.expiresAt });
   }
 
-  const controlMatch = path.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
+  // 控制权路由走**生产那一份**（dashboard/terminal-control-route.ts）。脚本自己照抄
+  // 一份分发正是上一轮 `?expect=` 只在脚本里生效、生产从未读过的来源。
+  const controlMatch = matchTerminalControlRoute(path);
   if (controlMatch) {
-    const sessionId = decodeURIComponent(controlMatch[1]);
-    const action = controlMatch[2];
-    if (method === 'GET' && !action) return json(res, 200, { ok: true, ...terminalControl.state(identity, sessionId) });
-    const guard = guardControlRequest({ headers: req.headers, authSessionId: identity.authSessionId, tokens: csrfTokens });
-    if (!guard.ok) return json(res, guard.status, { ok: false, error: guard.error });
-    if (method === 'POST' && action === 'takeover') {
-      const result = terminalControl.takeover(identity, sessionId);
-      return json(res, result.ok ? 200 : 409, result.ok ? { ...result, owned: true } : { ok: false, error: result.error });
+    if (!controlMatch.ok) return json(res, 400, { ok: false, error: controlMatch.error });
+    if (method !== 'GET') {
+      const guard = guardControlRequest({ headers: req.headers, authSessionId: identity.authSessionId, tokens: csrfTokens });
+      if (!guard.ok) return json(res, guard.status, { ok: false, error: guard.error });
     }
-    if (method === 'POST' && action === 'release') {
-      const result = terminalControl.release(identity, sessionId);
-      return json(res, result.ok ? 200 : 403, result.ok ? { ...result, owned: false } : { ok: false, error: result.error });
-    }
-    return json(res, 405, { ok: false, error: 'method_not_allowed' });
+    const answer = resolveTerminalControlAction({
+      method,
+      action: controlMatch.action,
+      sessionId: controlMatch.sessionId,
+      search: url.searchParams,
+      identity,
+      control: terminalControl,
+    });
+    return json(res, answer.status, answer.body);
   }
 
   const interactionMatch = path.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);

@@ -12,6 +12,9 @@ declare global {
       scenario: string;
       sessionId: string;
     };
+    /** 终端 iframe 上抛的写权限回报（#963 复审 3）。由验收脚本注入的初始化脚本
+     *  填充，用来证明「面板看到的是 WS 的结论，而不是同源轮询蒙对的」。 */
+    __writeReports?: Array<{ write: boolean; origin: string }>;
   }
 }
 
