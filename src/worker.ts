@@ -207,7 +207,7 @@ import {
   isStructuredBridgeFallbackActive,
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
-import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { cursorBaselineOffset, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -5716,9 +5716,9 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 
 function codexBridgeFallbackActive(): boolean {
   // Transcript-backed CLIs whose final output can be harvested when the
-  // model forgets to call `botmux send`. Cursor is adopt-only — see
+  // model forgets to call `botmux send` — see
   // services/structured-bridge-clis.ts (single source of the allowlist).
-  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
+  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId);
 }
 
 /** Only drivers with a complete normal-final + interrupted-terminal contract
@@ -5866,6 +5866,18 @@ function codexBridgeStartTimer(): void {
           }
         }
         codexBridgeIngest();
+        // Cursor's mirror can flush THIS turn's user line as late as the end
+        // of the first assistant step (a tool-less reply flushes the whole
+        // turn at once, at the end). While the CLI is visibly busy the head's
+        // bounded attribution lease must not lapse waiting for that flush —
+        // refresh it each tick; the 20s countdown then effectively starts
+        // when the CLI goes idle, preserving the wedge protection for a
+        // swallowed Enter. Non-adopt only: adopt keeps its historical timing
+        // (an expired adopt mark degrades to local-turn synthesis, still
+        // visible in Lark).
+        if (!isPromptReady && !lastInitConfig?.adoptMode) {
+          codexBridgeQueue.refreshUnstartedHeadAttributionLease();
+        }
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -6156,8 +6168,14 @@ function cursorLateAttachMode(path: string): CursorAttachMode {
       // be ingested from byte 0 rather than swallowed as history.
       if (Number.isFinite(birthtimeMs) && birthtimeMs >= start - 5_000) return 'fresh-empty';
     } catch { /* fall back to history-safe baseline */ }
+    return 'baseline-existing';
   }
-  return 'baseline-existing';
+  // Non-adopt (botmux-spawned): a FRESH spawn's chatId is a brand-new UUID,
+  // so its JSONL can only contain THIS session's lines — always ingest from
+  // byte 0, even when the file appears (with the first turn already inside)
+  // before the poller attaches. A RESUME spawn's JSONL carries the prior
+  // run's history and must be baselined behind the tail.
+  return lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty';
 }
 
 /** Attach the Cursor adopt bridge. Cursor's JSONL has no per-event
@@ -6176,6 +6194,20 @@ function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-exi
     }
   }
   codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode);
+  if (mode === 'baseline-existing') {
+    // A transcript at rest ends with cursor's `turn_ended` status footer, and
+    // the next turn REWRITES from that footer's byte position. A plain size
+    // baseline would sit PAST it, so the next user line would start behind the
+    // committed offset and never be ingested (turn never starts, fallback
+    // ghosts). Rewind the baseline to the footer's start; the footer re-parses
+    // to zero events so nothing duplicates.
+    const rewound = cursorBaselineOffset(path);
+    if (rewound !== undefined && rewound < codexBridgeOffset) {
+      log(`Cursor bridge baseline rewound before trailing status footer: ${codexBridgeOffset} → ${rewound}`);
+      codexBridgeOffset = rewound;
+      codexBridgePendingTail = '';
+    }
+  }
 }
 
 /** Drop the current file-backed bridge attachment (watcher + path cursor).
@@ -10288,6 +10320,11 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       }
       persistCliSessionId(chatId);
       log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
+      // The chatId also names the agent-transcript JSONL — hand it to the
+      // structured bridge so a `botmux send`-less turn can be harvested.
+      // Safe when already attached (first-attach-wins) and when the JSONL
+      // doesn't exist yet (arms the 1s late-attach poller).
+      codexBridgeNotifyCliSessionId(chatId);
       return;
     }
     attempts++;
@@ -15119,6 +15156,24 @@ async function spawnCli(
       codexBridgePendingSessionId = sid;
       codexBridgeStartTimer();
     } else {
+      codexBridgeStartTimer();
+    }
+  } else if (cfg.cliId === 'cursor') {
+    // Cursor's chatId (= cliSessionId) is only discoverable from the CLI's
+    // open store.db fd, so a FRESH spawn has no id yet at this point —
+    // observeCursorCliSessionId's pid poll surfaces it and
+    // codexBridgeNotifyCliSessionId completes the attach. A RESUME spawn
+    // knows the chatId up front and can resolve the JSONL immediately (it
+    // persists from the prior run). Attach modes: resume → baseline behind
+    // the existing tail (history must not replay); fresh → ingest from byte
+    // 0 (the JSONL is chatId-scoped, so it can only hold this session).
+    const path = effectiveCliSessionId
+      ? resolveFileBridgePath('cursor', { sessionId: effectiveCliSessionId })
+      : undefined;
+    if (path) {
+      cursorBridgeAttach(path, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+    } else {
+      if (effectiveCliSessionId) codexBridgePendingSessionId = effectiveCliSessionId;
       codexBridgeStartTimer();
     }
   }
