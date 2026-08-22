@@ -20,6 +20,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/fork --create <new group name>` | Clone the current idle session into a newly-created group while leaving the source session untouched (Claude family / Codex terminal mode; invoke inside the source session's topic) |
 | `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
+| `/introduce` | Register the bots in the current chat with each other by open_id for precise collaboration mentions |
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
@@ -87,6 +88,10 @@ To allow more commands through, configure [`customPassthroughCommands`](/en/bots
 4. custom commands / skills / plugins auto-discovered from the `.claude` directory (project-level + `~/.claude` + plugin cache), shown in a paginated "command ｜ description" table, with a note of any detected MCP server names.
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
+
+Dashboard's **Bot Defaults → Security → Slash Commands** section also shows an app-wide native Lark command catalog. It presents botmux commands, the built-in passthrough allowlist, defaults explicitly declared by the current CLI adapter, and the bot's `customPassthroughCommands` as candidates, then marks each entry as synced, missing, or outdated. Since passthrough support and semantics may differ across CLIs, users decide what to register with each row's **Sync** action. Commands that only exist remotely are shown too and can be deleted one at a time. **Sync all to Lark** remains an explicit additive operation: it creates missing entries and updates descriptions, but never deletes implicitly. These operations use `application:app_slash_command:read` / `application:app_slash_command:write`. This capability is gated: users need Lark desktop 7.70+ and the FG allowlist.
+
+The native `/` panel may take about five minutes to refresh in Lark clients. Working-directory `.claude` discoveries, skills, plugins, and MCP prompts are not stable app-wide capabilities, so they remain visible only in botmux's `/slash` card and are not registered remotely.
 
 ## 📡 Session Onboarding
 

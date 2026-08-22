@@ -6717,6 +6717,114 @@ dialog.onboarding-dialog::backdrop {
   resize: vertical;
 }
 
+/* Native Lark slash-command inventory. The table stays compact inside the
+   security tile and scrolls independently instead of stretching the page. */
+.bot-defaults-page .bd-native-slash-note {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.bot-defaults-page .bd-native-slash-summary,
+.bot-defaults-page .bd-native-slash-permissions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.bot-defaults-page .bd-native-slash-summary > span {
+  padding: 2px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-muted);
+}
+.bot-defaults-page .bd-native-slash-summary > span.ok {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border-soft));
+}
+.bot-defaults-page .bd-native-slash-summary > span.warn {
+  color: var(--warning, #9a6700);
+  border-color: color-mix(in srgb, var(--warning, #9a6700) 35%, var(--border-soft));
+}
+.bot-defaults-page .bd-native-slash-actions {
+  align-items: center;
+  flex-wrap: wrap;
+}
+.bot-defaults-page .bd-native-slash-permissions {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning, #9a6700) 35%, var(--border-soft));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warning, #9a6700) 8%, transparent);
+}
+.bot-defaults-page .bd-native-slash-table {
+  max-height: 360px;
+  margin-top: 10px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+}
+.bot-defaults-page .bd-native-slash-row {
+  display: grid;
+  grid-template-columns: minmax(120px, .8fr) minmax(180px, 1.5fr) minmax(70px, auto) minmax(96px, auto);
+  gap: 12px;
+  align-items: center;
+  min-width: 560px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.bot-defaults-page .bd-native-slash-row.head {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  border-top: 0;
+  color: var(--muted);
+  background: var(--surface-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.bot-defaults-page .bd-native-slash-row > span:first-child {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.bot-defaults-page .bd-native-slash-row code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bot-defaults-page .bd-native-slash-row small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.bot-defaults-page .bd-native-slash-state {
+  justify-self: start;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  white-space: nowrap;
+}
+.bot-defaults-page .bd-native-slash-state.synced { color: var(--success); }
+.bot-defaults-page .bd-native-slash-state.missing,
+.bot-defaults-page .bd-native-slash-state.outdated { color: var(--warning, #9a6700); }
+.bot-defaults-page .bd-native-slash-state.remote-extra { color: var(--danger, #d1242f); }
+.bot-defaults-page .bd-native-slash-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.bot-defaults-page .bd-native-slash-row-actions button {
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 11px;
+}
+
 @media (max-width: 980px) {
   .app-shell {
     grid-template-columns: 1fr;

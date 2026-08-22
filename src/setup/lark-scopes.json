@@ -2,6 +2,8 @@
   "scopes": {
     "tenant": [
       "ai:llpp:task_execute",
+      "application:app_slash_command:read",
+      "application:app_slash_command:write",
       "application:application:self_manage",
       "application:bot.menu:write",
       "audio_video_ai:meeting_assistance",
