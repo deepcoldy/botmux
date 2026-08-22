@@ -542,13 +542,14 @@ describe('scanProjects', () => {
     expect(wt.branch).toBe('release/2026.05');
   });
 
-  // ─── Detached HEAD: tag / short-sha fallback ─────────────────────────────
+  // ─── Detached HEAD: always short-sha, never a tag describe ───────────────
 
-  it('should report the tag name when a worktree has detached HEAD pointing at a tag', () => {
+  it('should report the short SHA for a detached-HEAD worktree and NEVER run git describe --tags', () => {
     const mainPath = mkRepo('repo');
     const detachedPath = mkWorktreeGitlink('checkout-v1', '/some/.git/worktrees/x');
 
-    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+    let describeCalled = false;
+    mockedExecSync.mockImplementation((cmd: string, _opts?: any) => {
       const cmdStr = String(cmd);
       if (cmdStr.includes('rev-parse --git-common-dir')) {
         return `${mainPath}/.git\n`;
@@ -565,8 +566,11 @@ describe('scanProjects', () => {
           '',
         ].join('\n');
       }
-      if (cmdStr.includes('describe --tags --exact-match HEAD')) {
-        if (opts?.cwd === detachedPath) return 'v1.2.3\n';
+      // Even if HEAD sits exactly on a tag, we no longer pay the (2–6s on
+      // huge-tag repos) describe cost — the detached label is the short SHA.
+      if (cmdStr.includes('describe --tags')) {
+        describeCalled = true;
+        return 'v1.2.3\n';
       }
       return '';
     });
@@ -575,7 +579,8 @@ describe('scanProjects', () => {
     const wt = results.find(r => r.type === 'worktree')!;
 
     expect(wt.path).toBe(detachedPath);
-    expect(wt.branch).toBe('v1.2.3');
+    expect(wt.branch).toBe('bbbbbbb'); // short SHA from the porcelain HEAD line, not the tag
+    expect(describeCalled).toBe(false); // the expensive tag describe must be gone
   });
 
   it('should fall back to the short SHA when a worktree has detached HEAD not pointing at any tag', () => {

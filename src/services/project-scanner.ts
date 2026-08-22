@@ -87,19 +87,26 @@ export function describeProjectDir(dir: string): { name: string; branch: string 
 }
 
 /** `rev-parse --abbrev-ref HEAD` returns the literal string `HEAD` when
- *  detached — that's the signal to fall through to tag/SHA. */
+ *  detached — that's the signal to fall back to the short SHA.
+ *
+ *  We deliberately do NOT run `git describe --tags --exact-match HEAD` here:
+ *  it only returns something when HEAD sits exactly on a tagged commit (a rare
+ *  "checked out a release tag" case), yet to decide that it must load every tag
+ *  ref into a map first — on a repo with a huge tag count (~100k observed) that
+ *  single call costs 2–6s. The common detached case (a worktree parked on an
+ *  ordinary dev commit) matches no tag and pays that cost for nothing, then
+ *  falls back to the SHA anyway. So skip straight to the short SHA. */
 function getGitRef(dir: string): string {
   const branch = runGit('rev-parse --abbrev-ref HEAD', dir);
   if (branch && branch !== 'HEAD') return branch;
-  const tag = runGit('describe --tags --exact-match HEAD', dir);
-  if (tag) return tag;
   const sha = runGit('rev-parse --short HEAD', dir);
   return sha || 'unknown';
 }
 
-function describeDetachedHead(worktreePath: string, headSha: string): string {
-  const tag = runGit('describe --tags --exact-match HEAD', worktreePath);
-  if (tag) return tag;
+/** The worktree-list porcelain already hands us the detached HEAD's full SHA,
+ *  so return its short form directly — no `git` subprocess, and (same reasoning
+ *  as getGitRef) no expensive tag describe on huge-tag repos. */
+function describeDetachedHead(_worktreePath: string, headSha: string): string {
   return headSha ? headSha.slice(0, 7) : 'unknown';
 }
 
