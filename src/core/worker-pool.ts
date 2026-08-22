@@ -2,7 +2,7 @@
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
  */
-import { execSync, fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
@@ -26,6 +26,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { spawnWorker } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
@@ -457,8 +458,6 @@ import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
-
-type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
 type WorkerStartupState = {
   ready: boolean;
@@ -8907,9 +8906,6 @@ export function forkWorker(
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
   try {
-  // worker.js lives in the same directory as daemon.js (src/)
-  const workerPath = join(__dirname, '..', 'worker.js');
-
   // Per-turn authority is never inferred from mutable session state. Human
   // message routes pass their accepted Lark message id explicitly; restore,
   // scheduler, card retry and other system starts stay unattributed. Falling
@@ -9216,11 +9212,13 @@ export function forkWorker(
     sessionStore.updateSession(ds.session);
   }
 
-  worker = fork(workerPath, [], {
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    execArgv: workerForkExecArgv(),
+  // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
+  // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
+  worker = spawnWorker({
+    distDir: join(__dirname, '..'),
     cwd,
+    execArgv: workerForkExecArgv(),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     env: {
       ...forkEnv,
       PATH: pathWithBotmux,
@@ -9234,8 +9232,8 @@ export function forkWorker(
       // init-message larkAppSecret — the spawned CLI env carries it directly from
       // botCfg. Empty it here too so no secret reaches the worker/sandbox.
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
-    },
-  } as WindowsForkOptions);
+    } as NodeJS.ProcessEnv,
+  });
   spawnedWorker = worker;
   startupState = {
     ready: false, failureNotified: false,
@@ -13052,7 +13050,6 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   if (!canForkRegisteredSession(ds)) return;
   ds.workerReady = false;
   const cb = requireCallbacks();
-  const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
   const adopted = ds.adoptedFrom;
   if (!adopted) throw new Error('forkAdoptWorker called without adoptedFrom');
@@ -13112,11 +13109,13 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
   const forkEnv = workerForkEnv(process.env);
-  const worker = fork(workerPath, [], {
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    execArgv: workerForkExecArgv(),
+  // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
+  // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
+  const worker = spawnWorker({
+    distDir: join(__dirname, '..'),
     cwd: adoptCwd,
+    execArgv: workerForkExecArgv(),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     env: {
       ...forkEnv,
       CLAUDECODE: undefined,
@@ -13125,8 +13124,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       // Withhold the real secret from the adopt worker's CLI env for a
       // no-transport session — same rationale as forkWorker above.
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
-    },
-  } as WindowsForkOptions);
+    } as NodeJS.ProcessEnv,
+  });
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
 
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.

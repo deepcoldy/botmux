@@ -404,6 +404,93 @@ jobs:
           echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
           echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
           echo "If signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach."
+  bun-binaries:
+    # Build the self-contained Bun single-file executables (see
+    # scripts/build-bun-binary.mjs) and attach them to the GitHub Release. These
+    # let users run botmux with NO Node on the machine (one file, one runtime),
+    # sidestepping the "two Node versions each carry their own global botmux"
+    # breakage. npm remains the primary channel; these are an additional artifact.
+    #
+    # Runs on the tag-push path only. It does NOT gate npm/Release (needs only
+    # `release` so a Release exists to upload onto); if this job fails the npm
+    # package + Release are already live, and binaries can be re-attached later
+    # (mirrors the desktop-assets recovery model).
+    #
+    # WHY a per-OS matrix instead of one cross-compile job: node-pty's native
+    # `pty.node` (and macOS `spawn-helper`) must match the target OS. Bun can
+    # cross-compile the JS + runtime, but the embedded `.node` has to be the one
+    # `pnpm install` compiled ON that OS. So we build each OS's binaries on its
+    # own native runner (linux -> ubuntu, darwin -> macos-14), where build/Release
+    # is correct; each runner emits both of its architectures.
+    if: github.event_name == 'push' && needs.release.result == 'success'
+    needs: [release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: bun-linux-x64 bun-linux-arm64
+          - os: macos-14
+            targets: bun-darwin-x64 bun-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - run: npm install -g pnpm@9.5.0
+      # --frozen-lockfile + the platform's own install compiles node-pty's
+      # build/Release/pty.node for THIS OS/arch, which the embed plugin bundles.
+      - run: pnpm install --frozen-lockfile
+
+      - name: Sync version from git tag to package.json
+        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+
+      - run: pnpm build
+
+      - name: Compile Bun single-file executables
+        # Build each target this runner is responsible for. The script fails
+        # closed if a target's native (pty.node) is absent rather than shipping a
+        # broken binary.
+        run: |
+          mkdir -p dist-bin
+          for t in ${{ matrix.targets }}; do
+            bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+          done
+
+      - name: Smoke-test the host-arch binary
+        # Only the runner's OWN arch can execute here. Run it from a scratch dir
+        # (no node_modules) so a broken native embed is caught, not masked by a
+        # sibling node_modules. capabilities --json exercises the full cli graph.
+        run: |
+          HOST_ARCH="$(node -e 'process.stdout.write(process.arch)')"
+          HOST_OS="$(node -e 'process.stdout.write(process.platform==="darwin"?"darwin":"linux")')"
+          BIN="dist-bin/botmux-${HOST_OS}-${HOST_ARCH}"
+          if [ ! -x "$BIN" ]; then echo "host-arch binary $BIN not built on this runner"; exit 1; fi
+          tmp="$(mktemp -d)"
+          ( cd "$tmp" && "$GITHUB_WORKSPACE/$BIN" capabilities --json ) | grep -q '"schemaVersion"'
+          echo "✅ smoke OK: $BIN"
+
+      - name: Checksums
+        run: |
+          cd dist-bin
+          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Attach Bun binaries to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" dist-bin/botmux-* --clobber --repo "$GITHUB_REPOSITORY"
+
   attach-desktop-assets:
     # npm-first tail: once the parallel `desktop` job has signed+notarized the
     # macOS build AND the `release` job has created the GitHub Release, upload

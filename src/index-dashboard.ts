@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// PM2 entry point for the `botmux-dashboard` app (see ecosystemConfig in
-// cli.ts). It exists so the dashboard can load ~/.botmux/.env ITSELF —
-// in particular the Feishu H5 login family (BOTMUX_DASHBOARD_FEISHU_H5_*,
-// APP_SECRET included), which is deliberately NOT baked into the shared PM2 env
-// block (DAEMON_ENV_KEYS): baked there, the secret would reach every bot daemon
-// and persist on disk in ~/.botmux/ecosystem.config.json.
+// Dedicated entry point for the `botmux-dashboard` process. The fleet supervisor
+// spawns it as a supervised member (resolveDashboardSpec → the 'dashboard'
+// entry; under the Bun single binary via the `__dashboard` self-spawn token).
+// It exists so the dashboard can load ~/.botmux/.env ITSELF — in particular the
+// Feishu H5 login family (BOTMUX_DASHBOARD_FEISHU_H5_*, APP_SECRET included),
+// which is deliberately NOT baked into the shared daemon env block
+// (DAEMON_ENV_KEYS): baked there, the secret would reach every bot daemon.
 //
 // The load is ALLOWLISTED (utils/dashboard-env.ts), not a wholesale dotenv:
 // this process forks children that inherit its environment, so only keys with a

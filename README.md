@@ -44,6 +44,21 @@ botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作�
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
+<details>
+<summary>不想装 Node？单文件可执行（免 Node，一个文件搞定）</summary>
+
+用 `bun build --compile` 打出的自包含单二进制，**自带运行时、不依赖机器上的任何 Node**，也就不会有「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」的问题。macOS / Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+botmux setup
+botmux start
+```
+
+装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），自动按 OS/arch 拉对应二进制并校验 SHA-256。命令用法与 npm 版完全一致。Windows 仍走 `npm i -g botmux`（daemon 是 Unix-only）。
+
+</details>
+
 然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
 
 ## 核心场景

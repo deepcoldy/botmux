@@ -6,7 +6,8 @@ const pluginPage = readFileSync(new URL('../src/dashboard/web/plugin-page.tsx', 
 
 function restartFunctionSource(): string {
   const start = cliSource.indexOf('async function cmdRestart()');
-  const end = cliSource.indexOf('\n/**', start);
+  // cmdRestart is immediately followed by the StartBotLiveResult type export.
+  const end = cliSource.indexOf('\nexport type StartBotLiveResult', start);
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
   return cliSource.slice(start, end);
@@ -15,22 +16,22 @@ function restartFunctionSource(): string {
 describe('plugin service restart lifecycle', () => {
   it('preserves auto services by default and always ensures them after core starts', () => {
     const source = restartFunctionSource();
-    const stop = 'await stopPluginServicesForCli(undefined, { autoOnly: true });';
-    const transaction = 'runBoundedPm2StartTransaction(';
-    const coreStart = "runPm2(['start', cfg], true, PM2_HOME, timeoutMs);";
+    const stop = 'if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });';
+    // Post-pm2: the "core start" step is the supervisor restart, not a pm2 start
+    // transaction. The lifecycle invariant is unchanged — auto plugin services are
+    // (optionally) stopped before the core comes up, and ALWAYS reconciled after.
+    const coreStart = 'restartFleet()';
     const ensure = 'await reconcilePluginServicesForCli(undefined, { autoOnly: true });';
 
     expect(source).toContain(stop);
-    // Default restart still stops nothing: the autoOnly stop stays behind the
-    // explicit --with-plugin flag (include-pm2 has its own all-services stop).
-    expect(source).toContain('else if (includePluginServices) {');
-    expect(source).toContain(transaction);
     expect(source).toContain(coreStart);
     expect(source).toContain(ensure);
     expect(source).not.toContain(`if (includePluginServices) ${ensure}`);
     expect(source.indexOf(stop)).toBeLessThan(source.indexOf(coreStart));
-    expect(source.indexOf(transaction)).toBeLessThan(source.indexOf(coreStart));
     expect(source.indexOf(coreStart)).toBeLessThan(source.indexOf(ensure));
+    // The pm2 start transaction is gone from the restart path.
+    expect(source).not.toContain('runBoundedPm2StartTransaction(');
+    expect(source).not.toContain("runPm2(['start', cfg]");
   });
 
   it('explains the no-stop ensure behavior in Dashboard service metadata', () => {

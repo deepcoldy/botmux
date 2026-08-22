@@ -3,7 +3,7 @@ import {
   requestAttestedDaemonShutdown,
   requestAttestedDaemonShutdownBatch,
 } from '../src/cli/supervisor-shutdown-client.js';
-import type { AttestedPm2DaemonShutdownTarget } from '../src/cli/pm2-shutdown-capability.js';
+import type { AttestedPm2DaemonShutdownTarget } from '../src/cli/supervisor-shutdown-client.js';
 
 const target: AttestedPm2DaemonShutdownTarget = {
   name: 'botmux-a',

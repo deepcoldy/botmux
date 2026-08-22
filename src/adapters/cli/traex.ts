@@ -1,5 +1,5 @@
 import { existsSync, statSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -39,40 +39,19 @@ type StatementSyncLike = {
   all(...params: unknown[]): any[];
 };
 
-let sqliteModule: { DatabaseSync: new (path: string) => DatabaseSyncLike } | null = null;
-let sqliteLoadAttempted = false;
-
-function loadSqlite(): typeof sqliteModule {
-  if (sqliteLoadAttempted) return sqliteModule;
-  sqliteLoadAttempted = true;
-  // node:sqlite is the built-in experimental SQLite binding available in
-  // Node 22+. The runtime may still reject it (older Node without the
-  // feature); callers treat that as verification-unavailable and fail closed.
-  // 必须走 createRequire：本包是 ESM（"type":"module"），裸 require 是
-  // ReferenceError —— 之前就是被这里的 try/catch 吞掉，导致生产 dist 里
-  // SQLite 提交验证/会话反查整条链路静默失效。
-  try {
-    const req = createRequire(import.meta.url);
-    sqliteModule = req('node:sqlite') as typeof sqliteModule;
-  } catch {
-    sqliteModule = null;
-  }
-  return sqliteModule;
-}
-
 function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const mod = loadSqlite();
-  if (!mod) return null;
   const dbPath = traeStateDbPath();
   if (!existsSync(dbPath)) return null;
-  let db: DatabaseSyncLike | undefined;
+  // Runtime-agnostic open: node:sqlite on Node, bun:sqlite on the compiled
+  // binary. null → verification-unavailable, caller fails closed (unchanged).
+  const db = openDatabaseSyncNow(dbPath) as DatabaseSyncLike | null;
+  if (!db) return null;
   try {
-    db = new mod.DatabaseSync(dbPath);
     return fn(db);
   } catch {
     return null;
   } finally {
-    try { db?.close(); } catch { /* ignore */ }
+    try { db.close(); } catch { /* ignore */ }
   }
 }
 

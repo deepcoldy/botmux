@@ -24,6 +24,7 @@
     "workflow-core:build": "node scripts/build-workflow-core-package.mjs",
     "workflow-core:test": "pnpm workflow-core:build && node scripts/test-workflow-core-package.mjs",
     "workflow-core:pack": "pnpm workflow-core:build && node scripts/pack-workflow-core-package.mjs",
+    "build:bun": "bun scripts/build-bun-binary.mjs",
     "audit:domains": "node scripts/audit-public-domains.mjs",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "dashboard:watch": "node scripts/build-dashboard.mjs --watch",
