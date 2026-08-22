@@ -822,6 +822,19 @@ export function BotDefaultsPage() {
         </div>
         <div className="page-heading-actions">
           <RefreshIconButton id="bd-refresh" label={tr('botDefaults.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void reload()} />
+          {ui.authed && selectedBot ? (
+            <button
+              type="button"
+              className="btn-link clone-bot-btn"
+              disabled={onboardingBusy}
+              onClick={() => {
+                setOnboardingBusy(true);
+                void openBotOnboarding(selectedBot.larkAppId).finally(() => setOnboardingBusy(false));
+              }}
+            >
+              {tr('botOnboarding.clone')}
+            </button>
+          ) : null}
           {ui.authed ? (
             <CreateActionButton
               className="page-primary-action add-bot-btn"

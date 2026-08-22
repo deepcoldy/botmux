@@ -4780,6 +4780,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
       let parsed: {
         appName?: unknown;
+        cloneSourceAppId?: unknown;
         registrationMode?: unknown;
         sessionMode?: unknown;
         expectedIdentity?: unknown;
@@ -4871,6 +4872,9 @@ const server = createServer(async (req, res) => {
       }
       const job = botOnboarding.start({
         appName,
+        ...(typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()
+          ? { cloneSourceAppId: parsed.cloneSourceAppId.trim() }
+          : {}),
         registrationMode,
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
         cliId,
