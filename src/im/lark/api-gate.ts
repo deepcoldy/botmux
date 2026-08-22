@@ -363,7 +363,8 @@ export async function executeWithLarkGate<T>(
       }
       return result;
     } catch (err) {
-      if (isRetryableLarkError(err) && attempt < cfg.retryMaxAttempts) {
+      const retryable = isRetryableLarkError(err);
+      if (retryable && attempt < cfg.retryMaxAttempts) {
         const backoffMs = computeBackoffMs(cfg, attempt, err);
         attempt += 1;
         logger.warn(`[lark-gate] ${larkAppId} retry ${attempt}/${cfg.retryMaxAttempts} op=${op} backoff=${backoffMs}ms`);
@@ -371,7 +372,9 @@ export async function executeWithLarkGate<T>(
         await sleep(backoffMs, signal);
         continue;
       }
-      recordFailure(circuit, larkAppId, op, cfg, Date.now());
+      // 熔断器只对瞬态错误（429/5xx/网络）计数：确定性错误（密钥错误、参数
+      // 错误）重试无意义，也不该影响电路——否则调用方注入的失败会误跳闸。
+      if (retryable) recordFailure(circuit, larkAppId, op, cfg, Date.now());
       throw err;
     }
   }
