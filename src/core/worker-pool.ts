@@ -12240,14 +12240,19 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // A dead worker can no longer refresh its card/usage view.
+      clearUsageRefreshTimer(ds);
+      // A worker owns the terminal HTTP listener. Persisting its former port
+      // after exit leaves the Dashboard proxy routing `/terminal/<session>` to
+      // a dead socket until some later ready event overwrites it. Clear both
+      // durable and aggregated state now so a persistent backend can be
+      // re-attached on demand instead of returning a stale 502.
+      ds.session.webPort = undefined;
       // A queued suspend for THIS generation is now moot — the worker it was
       // about is gone. Leaving it set would suspend the replacement on its
       // first idle (the deferred checkpoint's own "worker gone" branch cannot
       // help: it only runs on a screen update that will never arrive).
       clearPendingSuspendClaim(ds, 'worker exited');
-      // Dead worker generation — stop the periodic usage refresh immediately
-      // instead of waiting a tick for it to self-clear on !workerHasInitialized.
-      clearUsageRefreshTimer(ds);
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
@@ -12278,6 +12283,13 @@ function setupWorkerHandlers(
       const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
       sessionStore.updateSession(ds.session);
       if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: ds.session.sessionId,
+          patch: { webPort: null, workerPid: null },
+        },
+      });
     }
     if (!transferRetirement) {
       try {
