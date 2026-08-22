@@ -256,6 +256,19 @@ describe('resumeSession', () => {
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
+    it('returns adopt_unsupported for a disconnected existing App Server adopt', async () => {
+      const s = sessionStore.createSession('oc_chat', 'om_root', 'Codex App: shared thread');
+      s.cliId = 'codex';
+      s.cliSessionId = '019e-existing-app-server-thread';
+      s.existingAppServerEndpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+      sessionStore.updateSession(s);
+      sessionStore.closeSession(s.sessionId);
+
+      const r = await resumeSession(s.sessionId, new Map());
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
     it('rejects manual resume for a closed dedicated VC receiver without mutating its state or routing map', async () => {
       const receiver = makeClosedSession({
         chatId: 'oc_listener',

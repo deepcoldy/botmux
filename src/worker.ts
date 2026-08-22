@@ -104,6 +104,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -8708,6 +8709,13 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // row; never let its selection marker reach the first-prompt idle detector.
   if (dismissAidenCodexUpdateDialog(data)) return true;
 
+  // An existing App Server viewer shares the user's Codex App trust context.
+  // Never auto-accept an interactive trust prompt here: it can include
+  // project/plugin hooks owned outside BotMux. The operator can safely choose
+  // "Continue without trusting" through the Web Terminal when Codex presents
+  // its Hooks review menu.
+  if (lastInitConfig?.existingAppServerEndpoint) return false;
+
   if (trustHandled) return false;
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
   if (!TRUST_DIALOG_PATTERN.test(stripped)) return false;
@@ -12055,6 +12063,30 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   const spawnGeneration = ++cliSpawnGeneration;
+  // Experimental external App Server attachment: BotMux owns only this TUI
+  // client, never the server or its JSON-RPC input stream. Re-establish the
+  // remote argv state on EVERY spawn because killCli() deliberately clears the
+  // generic RPC remote variables before a restart.
+  if (cfg.existingAppServerEndpoint !== undefined) {
+    if (cfg.cliId !== 'codex') {
+      throw new Error('existing App Server attachment requires cliId "codex"');
+    }
+    if (!cfg.cliSessionId) {
+      throw new Error('existing App Server attachment requires an already-selected Codex thread id');
+    }
+    if (cfg.codexRpcInput === true) {
+      throw new Error('existing App Server attachment cannot enable BotMux codexRpcInput');
+    }
+    if (codexRpcEngine) {
+      throw new Error('existing App Server attachment cannot share a BotMux-owned Codex RPC engine');
+    }
+    remoteWsUrl = normalizeExistingAppServerEndpoint(
+      cfg.existingAppServerEndpoint,
+      `worker existingAppServerEndpoint for session ${cfg.sessionId}`,
+    );
+    remoteThreadId = cfg.cliSessionId;
+    log(`External Codex App Server attach prepared for thread ${cfg.cliSessionId.substring(0, 12)}`);
+  }
   // Prefer force-clear so a half-finished rename cannot block the new generation.
   forceClearSessionRenameInFlight();
   currentCliCredentialIsolated = false;
@@ -14862,6 +14894,13 @@ async function spawnCli(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  if (cfg.existingAppServerEndpoint !== undefined) {
+    // The local `codex --remote` client does not own the selected rollout fd;
+    // writeInput must accept only the explicitly bound remote thread in the
+    // shared history.jsonl instead of applying its normal local-PID ownership
+    // filter (which would reject the correct App Server submission).
+    (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
+  }
   publishLocalProcessAttestation(cliPid ?? undefined);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -15763,8 +15802,8 @@ async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
-  if (lastInitConfig?.adoptMode) {
-    log(`Restart ignored in adopt mode (${reason})`);
+  if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
+    log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
   }
   // Invalidate queued/deferred callbacks before async teardown begins. Waiting

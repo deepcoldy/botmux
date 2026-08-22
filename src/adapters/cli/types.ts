@@ -29,6 +29,13 @@ export interface PtyHandle {
    *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
    *  current session id (which can rotate on resume / mid-session). */
   cliPid?: number;
+  /**
+   * An explicitly selected remote Codex App Server thread. When set, Codex
+   * history-submit verification accepts only this session id instead of
+   * checking rollout ownership through the local `codex --remote` client's
+   * PID—the rollout belongs to the external App Server, not the viewer.
+   */
+  expectedCodexSessionId?: string;
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;

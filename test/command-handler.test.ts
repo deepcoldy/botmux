@@ -1854,6 +1854,31 @@ describe('handleCommand', () => {
   // ─── /close ─────────────────────────────────────────────────────────────
 
   describe('/close', () => {
+    it('treats an existing App Server adopt as a BotMux-only disconnect', async () => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('App Server 和 Codex App 会话仍在运行'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -4600,6 +4625,101 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已继续 Codex App 对话');
       expect(replyContent).toContain('Fix botmux');
+    });
+
+    it('attaches a Codex App bot to an existing App Server thread without changing its default runtime', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        if (id === CODEX_APP_ID) {
+          return {
+            botName: 'Codex Remote',
+            config: {
+              larkAppId: CODEX_APP_ID,
+              larkAppSecret: 'secret-1',
+              // Existing BotMux Codex App topics keep this default. Only the
+              // explicitly selected /adopt thread switches to the official
+              // `codex --remote` client below.
+              cliId: 'codex-app' as const,
+              existingAppServer: {
+                endpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+              },
+              workingDir: '~/projects',
+              workingDirs: ['~/projects'],
+            },
+          };
+        }
+        return defaultGetBot(id);
+      }) as any);
+      vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
+        {
+          threadId: '019e-remote-thread',
+          name: 'Continue GUI thread',
+          preview: 'fallback preview',
+          cwd: '/repo/remote-codex',
+          updatedAtMs: 1780000000000,
+        },
+      ]);
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({
+          cliId: 'codex-app' as any,
+          // A temporary topic shell might have frozen an old launcher; the
+          // remote attach must clear it before the new fork.
+          wrapperCli: 'old-wrapper codex',
+          agentFrozen: true,
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt 019e-remote-thread'), deps, CODEX_APP_ID);
+
+      expect(discoverAdoptableSessions).not.toHaveBeenCalled();
+      expect(ds.session.cliId).toBe('codex');
+      expect(ds.session.cliSessionId).toBe('019e-remote-thread');
+      expect(ds.session.existingAppServerEndpoint)
+        .toBe('unix:///home/testuser/.codex/app-server-control/app-server-control.sock');
+      expect(ds.session.wrapperCli).toBeUndefined();
+      expect(ds.session.agentFrozen).toBeUndefined();
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('已共享接入现有 Codex App 对话');
+      expect(replyContent).toContain('不会新建或停止开发机 App Server');
+    });
+
+    it('does not let an existing App Server shared topic adopt a second thread', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        if (id === CODEX_APP_ID) {
+          return {
+            botName: 'Codex Remote',
+            config: {
+              larkAppId: CODEX_APP_ID,
+              larkAppSecret: 'secret-1',
+              cliId: 'codex-app' as const,
+              existingAppServer: {
+                endpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+              },
+              workingDir: '~/projects',
+              workingDirs: ['~/projects'],
+            },
+          };
+        }
+        return defaultGetBot(id);
+      }) as any);
+      const ds = makeDaemonSession({
+        larkAppId: CODEX_APP_ID,
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-already-attached',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt'), deps, CODEX_APP_ID);
+
+      expect(listCodexAppThreads).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1])
+        .toContain('本话题已共享接入一条 Codex App 对话');
     });
   });
 

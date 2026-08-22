@@ -23,6 +23,10 @@ import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
+import {
+  normalizeExistingAppServerConfig,
+  type ExistingAppServerConfig,
+} from './core/existing-app-server.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
@@ -1320,6 +1324,14 @@ export interface BotConfig {
    * codex's terminal re-init. No effect on non-codex bots.
    */
   codexRpcInput?: boolean;
+  /**
+   * Experimental local-only attachment mode for an already-running Codex App
+   * Server. This does not make BotMux an app-server owner: after the operator
+   * explicitly selects an existing thread via `/adopt`, BotMux launches the
+   * official `codex --remote <endpoint> resume <thread>` TUI as a second
+   * client. New threads are deliberately not auto-created in this mode.
+   */
+  existingAppServer?: ExistingAppServerConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -2659,6 +2671,24 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
+    const existingAppServer = normalizeExistingAppServerConfig(
+      entry.existingAppServer,
+      `Bot config [${i}].existingAppServer`,
+    );
+    if (existingAppServer) {
+      if (entryCliId !== 'codex' && entryCliId !== 'codex-app') {
+        throw new Error(`Bot config [${i}]: existingAppServer is supported only for cliId "codex" or "codex-app"`);
+      }
+      if (entry.codexRpcInput === true) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with codexRpcInput`);
+      }
+      if (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with wrapperCli`);
+      }
+      if (entry.sandbox === true || entry.readIsolation === true) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with sandbox or readIsolation`);
+      }
+    }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
     let workingDirs = entry.workingDirs;
@@ -2928,6 +2958,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
+      existingAppServer,
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {

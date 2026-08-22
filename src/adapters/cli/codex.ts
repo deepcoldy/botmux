@@ -317,22 +317,22 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
 
-      // Ownership filter for the shared global history.jsonl. When we know the
-      // Codex PID, only accept a same-text history line whose session id is one
-      // THIS pid currently holds open — so a concurrent sibling pane's identical
-      // text (same CODEX_HOME) can't hand us its foreign session id. Re-fetch the
-      // open-rollout set on EVERY match attempt (not once at baseByte): the owned
-      // rollout fd for a just-started session can appear slightly after its
-      // history line, and a snapshot would permanently reject it. When the pid is
-      // unknown (no PtyHandle.cliPid) or its rollout set can't be read, fall back
-      // to accept-first — preserving the original submit-confirmation semantics
-      // for single-pane sessions and no-pid callers; the worker-side attach gate
-      // is the backstop there.
+      // Ownership filter for the shared global history.jsonl. An external App
+      // Server viewer cannot own the rollout fd: `codex --remote` is merely a
+      // second client and the existing App Server holds the actual thread. For
+      // that explicit mode accept ONLY its already-selected thread id. Normal
+      // local terminal sessions keep the PID/rollout ownership filter below.
       const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
         ? pty.cliPid
         : undefined;
-      const acceptSid: HistorySidFilter | undefined = cliPid
-        ? (sid) => {
+      const expectedRemoteSid = typeof pty.expectedCodexSessionId === 'string'
+        && pty.expectedCodexSessionId.trim()
+        ? pty.expectedCodexSessionId.trim()
+        : undefined;
+      const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
             if (!sid) return false;
             const owned = findCodexRolloutSetByPid(cliPid);
             // set unavailable (enumeration failed) → don't block the submit
@@ -340,7 +340,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
             if (!owned) return true;
             return owned.has(sid.toLowerCase());
           }
-        : undefined;
+          : undefined;
 
       try {
         if (pty.pasteText) {
