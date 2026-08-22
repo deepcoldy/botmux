@@ -27,7 +27,14 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain('const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
     expect(source).toContain('codexAppText: ds.pendingCodexAppText');
-    expect(block.match(/forkReservedInitialSession\(ds, availableBots, trustedCaller\)/g)).toHaveLength(2);
+    // Pinned (oncall/inherited/default-dir) new topics still fork immediately via
+    // forkReservedInitialSession(ds, availableBots, trustedCaller). The no-project
+    // fork now happens off the critical path: repo scanning is async, so an empty
+    // scan folds into commitRepoSelection inside the detached scan-completion
+    // handler rather than a second inline forkReservedInitialSession call.
+    expect(block.match(/forkReservedInitialSession\(ds, availableBots, trustedCaller\)/g)).toHaveLength(1);
+    expect(block).toContain('await commitRepoSelection(');
+    expect(block).toContain('scanMultipleProjectsAsync(scanDirs');
   });
 
   it('retains VC lifecycle context in rewritten legacy prompts without demoting it to untrusted', () => {

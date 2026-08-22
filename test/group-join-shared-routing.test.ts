@@ -336,9 +336,167 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       expect.any(String),
       'interactive',
       true,
-      undefined,
+      expect.stringMatching(/^repo-picker:[0-9a-f-]{36}$/),
       expect.anything(),
     );
+  });
+
+  it('仓库卡遇到陈旧连接时让出事件循环，再使用同一个 UUID 重发', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_repo_card_retry';
+    const chatId = 'oc_join_repo_card_retry';
+    const scanDir = tempDir('scan-repo-card-retry');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    let staleSocketsDrained = false;
+    mocks.replyMessage
+      .mockImplementationOnce(async () => {
+        setTimeout(() => { staleSocketsDrained = true; }, 0);
+        throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+      })
+      .mockImplementationOnce(async () => {
+        if (!staleSocketsDrained) {
+          throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+        }
+        return 'om_repo_retry';
+      });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.repoCardMessageId).toBe('om_repo_retry');
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(2);
+    expect(mocks.replyMessage.mock.calls[0]?.[5]).toMatch(/^repo-picker:[0-9a-f-]{36}$/);
+    expect(mocks.replyMessage.mock.calls[1]?.[5]).toBe(mocks.replyMessage.mock.calls[0]?.[5]);
+    expect(mocks.replyMessage.mock.calls.every(call => call[3] === 'interactive')).toBe(true);
+  });
+
+  it('仓库卡退避期间待选状态被消费时不再发送陈旧卡片', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_repo_card_retry_consumed';
+    const chatId = 'oc_join_repo_card_retry_consumed';
+    const scanDir = tempDir('scan-repo-card-retry-consumed');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage.mockImplementationOnce(async () => {
+      setTimeout(() => {
+        const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+        if (ds) ds.pendingRepo = false;
+      }, 0);
+      throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('仓库卡两次传输失败后保留待选输入，并在后续消息中给出文本恢复路径', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_repo_card_failure';
+    const chatId = 'oc_join_repo_card_failure';
+    const scanDir = tempDir('scan-repo-card-failure');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      .mockResolvedValueOnce('om_recovery_text');
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.pendingPrompt).toContain('开始排查');
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.replyMessage.mock.calls[1]?.[5]).toBe(mocks.replyMessage.mock.calls[0]?.[5]);
+    expect(String(mocks.replyMessage.mock.calls[2]?.[2])).toContain('/repo <项目名|路径>');
+
+    const followUpMessageId = 'om_after_repo_card_failure';
+    await daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: followUpMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '继续补充约束' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: followUpMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: followUpMessageId,
+        larkAppId: appId,
+      },
+    );
+
+    // The card send failed but the session was already durably admitted with an
+    // opening, so a same-anchor follow-up joins master's durable queued-activation
+    // tail (replayed once the repo-selected opening forks) — not the legacy
+    // in-memory pendingFollowUps buffer. The follow-up is retained durably and no
+    // resend is advised (the turn is accepted, not dropped).
+    const tailHasFollowUp = (ds?.session.queuedActivationTail ?? []).some(
+      (entry: any) => typeof entry?.userPrompt === 'string' && entry.userPrompt.includes('继续补充约束'),
+    );
+    const followUpsHas = ds?.pendingFollowUps?.some(item => item.includes('继续补充约束')) ?? false;
+    expect(tailHasFollowUp || followUpsHas).toBe(true);
+    const followUpRecovery = String(mocks.replyMessage.mock.calls.at(-1)?.[2]);
+    expect(followUpRecovery).not.toContain('系统错误');
+    // Durably admitted → the message is queued, not lost; never advise a resend.
+    expect(followUpRecovery).not.toContain('重新发送');
   });
 
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
