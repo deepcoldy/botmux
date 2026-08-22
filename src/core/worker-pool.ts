@@ -11198,6 +11198,44 @@ function setupWorkerHandlers(
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
+        if (msg.codexAppActiveWriter === true && effectiveCliId === 'codex-app') {
+          // `thread/resume` was explicitly rejected because another Codex
+          // app-server currently owns the persisted thread. This is a safe,
+          // expected handoff conflict — never spend restart budget or let the
+          // generic second-restart policy drop cliSessionId and create a fresh
+          // context. Park the logical Botmux session so its next message
+          // retries the SAME thread after the external writer releases it.
+          const thread = ds.session.cliSessionId ?? ds.session.sessionId;
+          logger.warn(
+            `[${t}] Codex App resume blocked by external active writer; preserving `
+            + `thread ${thread.substring(0, 12)}`,
+          );
+          const suspended = suspendWorker(ds, 'codex_app_active_writer');
+          if (!suspended) {
+            // The runner process already exited and there is no safe live
+            // backend suspension path. Retire only this Node worker; never
+            // destroy the external app-server that owns the thread.
+            retireWorkerProcessOnly(ds, 'codex_app_active_writer');
+            ds.hasHistory = true;
+            ds.session.suspendedColdResume = true;
+            sessionStore.updateSession(ds.session);
+          }
+          if (!suppressExitUi) {
+            const threadLabel = `${thread.substring(0, 16)}…`;
+            const message = loc === 'zh'
+              ? `⚠️ Codex App 历史会话（${threadLabel}）当前正由另一个 Codex App / app-server 持有。`
+                + 'BotMux 已保留原上下文，不会新建空会话；请在 App 侧释放该会话后，再发送一条消息重试恢复。'
+              : `⚠️ Codex App thread (${threadLabel}) is currently held by another Codex App / app-server writer. `
+                + 'BotMux preserved the original context and did not create a fresh session; release it in the App, then send another message to retry.';
+            try {
+              await scopedReply(message, 'text', msg.turnId);
+            } catch (replyErr) {
+              logger.error(`[${t}] Failed to report Codex App active-writer conflict: ${replyErr}`);
+            }
+          }
+          break;
+        }
+
         // Do NOT auto-restart in adopt mode — there's nothing to restart
         if (ds.adoptedFrom) {
           logger.info(`[${t}] Adopted session ended`);

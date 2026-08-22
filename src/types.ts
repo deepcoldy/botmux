@@ -1162,7 +1162,17 @@ export type WorkerToDaemon =
       reasoningEffort: string | null;
     }
   | { type: 'native_session_title_generated'; title: string }
-  | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
+  | {
+    type: 'claude_exit';
+    code: number | null;
+    signal: string | null;
+    logTail?: string;
+    canParkDiagnostic?: boolean;
+    /** A Codex App thread is still owned by another app-server writer. */
+    codexAppActiveWriter?: boolean;
+    turnId?: string;
+    dispatchAttempt?: number;
+  }
   /** Worker-side close handler has crossed the point where it will no longer
    * read bridge send markers or emit transcript fallback for this session. */
   | { type: 'session_close_ready'; sessionId: string }
