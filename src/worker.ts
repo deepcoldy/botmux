@@ -16508,13 +16508,15 @@ window.addEventListener('message',function(_ev){
   if(!_theme)return;
   try{
     term.options.theme=_theme;
-    // 阅读风是大行距 1.3；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
+    // 阅读风走 1.15 的行距；经典保持 xterm 默认的 1，「经典 = 原样」的一部分。
     // 经典那套色值与上面写死的字面量逐色相同，所以没开阅读风的用户零变化。
     // 这两个数字的唯一出处是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts），
     // 接缝测试按那张表比对这一行的字面量：改一处必须两处一起改。
     // 曾经是 1.55，单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome（提示 + 输入框 +
-    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走。
-    term.options.lineHeight=_d.termStyle==='reader'?1.3:1;
+    // 状态条）就要占掉约 196px —— 一屏四分之一全是 chrome，正文被挤走，所以先降到 1.3。
+    // 1.3 对中文密集的 TUI 内容还是偏松：汉字撑满 em 框，行间空隙观感接近隔行，于是
+    // 再收一档到 1.15（单元格高约 18.2px），比经典松一成半，读起来才连成一段。
+    term.options.lineHeight=_d.termStyle==='reader'?1.15:1;
     // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
     fit.fit();
   }catch(_e){}

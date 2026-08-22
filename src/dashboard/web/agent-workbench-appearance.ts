@@ -312,13 +312,16 @@ export function workbenchTermTheme(
  * 字符串，没法 import）必须照抄同样的数字，接缝测试按这张表比对它的字面量；
  * `.wb-term-classic / .wb-term-reader` 的 `--term-line-height` 同样按这张表对齐。
  *
- * 阅读风从 1.55 降到 1.3：1.55 下单元格高 ≈24.5px，CLI 的底部 chrome（提示 + 输入框 +
- * 状态条，固定占 8 个终端行）就要吃掉约 196px —— 900 高的窗口里四分之一屏全是 chrome。
- * 1.3 仍比经典的 1.0 松三成，正文呼吸感在，chrome 收回约 16%、可视行数多出两成。
+ * 阅读风的行距一路在收：1.55 → 1.3 → 1.15。1.55 下单元格高 ≈24.5px，CLI 的底部 chrome
+ * （提示 + 输入框 + 状态条，固定占 8 个终端行）就要吃掉约 196px —— 900 高的窗口里四分
+ * 之一屏全是 chrome，所以先降到 1.3（≈20.5px），chrome 收回约 16%、可视行数多出两成。
+ * 1.3 对英文正文够用，可中文密集的 TUI 内容仍偏松：汉字字形本来就撑满 em 框，1.3 留出
+ * 的行间空隙观感已经接近隔行，一段中文反而更难顺着往下读（用户连续反馈过）。于是再收
+ * 一档到 1.15（≈18.2px）：比经典的 1.0 还松一成半，中英文都留着呼吸感，行与行不再散开。
  * `classic` 恒为 1 = xterm 默认，「经典 = 原样」的一部分。
  */
 export const WORKBENCH_TERM_LINE_HEIGHTS: Record<WorkbenchTermStyle, number> = {
-  reader: 1.3,
+  reader: 1.15,
   classic: 1,
 };
 

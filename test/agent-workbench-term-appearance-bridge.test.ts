@@ -129,11 +129,12 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
     }
   });
 
-  it('阅读风走大行距 1.3，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
-    // 1.3 而不是最初的 1.55：1.55 下单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome
-    // （提示 + 输入框 + 状态条）要吃掉约 196px，一屏四分之一全是 chrome。1.3 仍比经典
-    // 的 1.0 松三成，正文呼吸感还在，chrome 收回约 16%。
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBe(1.3);
+  it('阅读风走 1.15 的行距，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
+    // 1.15 是第三档。最初 1.55：单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome
+    // （提示 + 输入框 + 状态条）要吃掉约 196px，一屏四分之一全是 chrome，所以降到 1.3。
+    // 1.3 对中文密集的 TUI 内容仍偏松（汉字撑满 em 框，行间空隙观感接近隔行），再收到
+    // 1.15 ≈ 18.2px：比经典的 1.0 松一成半，呼吸感在，行与行不再散开。
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBe(1.15);
     expect(WORKBENCH_TERM_LINE_HEIGHTS.classic).toBe(1);
 
     const reader = bootTerminalPage();

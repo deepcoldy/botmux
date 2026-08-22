@@ -401,7 +401,7 @@ Workbench-only 身份按能力根本不请求 `/api/schedules`（`scheduleReques
 
 - 一条 localStorage 记录 `botmux.agent-workbench.appearance.v1` 存三件事——`skin`（4 选 1）、`mode`（system/light/dark）、`termStyle`（reader/classic），永远一起读一起写。
 - 4 套配色：`ink`（墨黑）、`slate-blue`（蓝灰，默认）、`warm-graphite`（石墨）、`light-frost`（冷白）。浅色族只有 light-frost 一套，`mode` 落到 light 时恒用它。
-- 终端双渲染：`reader`（阅读，低饱和 + 行距 1.3，配色跟随当前 skin）与 `classic`（经典，Tokyo Night 原样 + 行距 1.0，默认）。
+- 终端双渲染：`reader`（阅读，低饱和 + 行距 1.15，配色跟随当前 skin）与 `classic`（经典，Tokyo Night 原样 + 行距 1.0，默认）。
 - 旧偏好自动迁移：首版命名 `orca-ink` / `orca` 读到时静默换成 `ink` / `reader`，normalize 是唯一入口（load / save / 跨 tab storage 事件三路一致）。
 - 生效值写到文档根 `data-skin` / `data-theme`，CSS 侧靠属性选择器整体换档；工作台挂载期间接管这两个属性，卸载时把进来之前的值原样还回全站机制。
 - 跨 tab 同步靠 `storage` 事件；跟随系统靠 `matchMedia('(prefers-color-scheme: dark)')` 的 change；系统明暗变化时幂等盖回自己的解析结果，不额外重绘。
