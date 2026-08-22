@@ -78,7 +78,7 @@ describe('staggeredRecoveryFork', () => {
       },
       5,
       0,
-    )).resolves.toBeUndefined();
+    )).resolves.toBe(1);
     expect(forked).toEqual(['healthy']);
   });
 
@@ -111,5 +111,75 @@ describe('staggeredRecoveryFork', () => {
     );
 
     expect(forked).toEqual(['a']);
+  });
+
+  it('caps total recovery forks at maxForks so a box with hundreds of sessions does not spawn hundreds of workers', async () => {
+    const sessions = Array.from({ length: 20 }, (_, i) => ds(`s${i}`));
+    const forked: string[] = [];
+    await staggeredRecoveryFork(
+      sessions,
+      (d) => forked.push(d.session.sessionId),
+      5,
+      0,
+      undefined,
+      3, // maxForks
+    );
+    expect(forked).toHaveLength(3);
+    expect(forked).toEqual(['s0', 's1', 's2']);
+  });
+
+  it('does not count sessions that already have a live worker toward the maxForks cap', async () => {
+    const sessions = [
+      ds('a'),
+      ds('live', { pid: 1 }), // already has a worker — skipped, not counted
+      ds('b'),
+      ds('c'),
+      ds('d'),
+    ];
+    const forked: string[] = [];
+    await staggeredRecoveryFork(
+      sessions,
+      (d) => forked.push(d.session.sessionId),
+      5,
+      0,
+      undefined,
+      3, // maxForks
+    );
+    // 'live' is skipped (has worker); a/b/c forked (3 = cap); d stays worker-less
+    expect(forked).toEqual(['a', 'b', 'c']);
+  });
+
+  it('defaults to unlimited forks when maxForks is not passed', async () => {
+    const sessions = Array.from({ length: 10 }, (_, i) => ds(`s${i}`));
+    const forked: string[] = [];
+    await staggeredRecoveryFork(
+      sessions,
+      (d) => forked.push(d.session.sessionId),
+      5,
+      0,
+    );
+    expect(forked).toHaveLength(10);
+  });
+
+  it('does not count refused forks (forkWorker returned false) against the maxForks cap', async () => {
+    // A quarantined tail-only owner whose promotion still fails makes
+    // forkWorker return false — no worker was spawned, so no budget slot was
+    // used. Such candidates must not starve later healthy sessions.
+    const sessions = [ds('quarantined'), ds('a'), ds('b'), ds('c')];
+    const forked: string[] = [];
+    await staggeredRecoveryFork(
+      sessions,
+      (d) => {
+        if (d.session.sessionId === 'quarantined') return false; // refused: no worker
+        forked.push(d.session.sessionId);
+        return true;
+      },
+      5,
+      0,
+      undefined,
+      3, // maxForks
+    );
+    // The refused fork consumed no budget: a/b/c all forked (3 = cap).
+    expect(forked).toEqual(['a', 'b', 'c']);
   });
 });

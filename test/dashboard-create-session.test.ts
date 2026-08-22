@@ -1193,3 +1193,41 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(ds?.worker).toBeNull();
   });
 });
+
+describe('restoreActiveSessions — protected owners bypass the idle-reattach budget', () => {
+  it('resumes BOTH durable activation heads when maxLiveWorkers=1', async () => {
+    // Bot with a hard cap of 1 live worker.
+    vi.mocked(getAllBots).mockReturnValue([
+      { config: { larkAppId: APP, cliId: 'claude-code', defaultWorkingDir: '/tmp', maxLiveWorkers: 1 } } as any,
+    ]);
+
+    // Two durable activation heads: queuedActivationPending means an opening
+    // was durably accepted but the worker died before submitting it. Both must
+    // resume eagerly even though the cap is 1 — leaving one worker-less would
+    // silently stall a task whose next message may never arrive.
+    const head1 = sessionStore.createSession('oc_head1', 'om_root1', 'Head 1');
+    head1.larkAppId = APP;
+    head1.queuedActivationPending = true;
+    head1.queuedActivationInput = { content: 'head one' } as any;
+    head1.queuedActivationTurnId = 'turn-1';
+    sessionStore.updateSession(head1);
+
+    const head2 = sessionStore.createSession('oc_head2', 'om_root2', 'Head 2');
+    head2.larkAppId = APP;
+    head2.queuedActivationPending = true;
+    head2.queuedActivationInput = { content: 'head two' } as any;
+    head2.queuedActivationTurnId = 'turn-2';
+    sessionStore.updateSession(head2);
+
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+
+    // Both heads were forked despite cap=1.
+    expect(forkWorkerMock).toHaveBeenCalledTimes(2);
+    const forkedIds = forkWorkerMock.mock.calls.map(
+      c => (c[0] as DaemonSession).session.sessionId,
+    );
+    expect(forkedIds).toContain(head1.sessionId);
+    expect(forkedIds).toContain(head2.sessionId);
+  });
+});

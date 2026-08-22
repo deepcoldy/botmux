@@ -112,6 +112,8 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { logger } from '../src/utils/logger.js';
+import { updateSession } from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -491,5 +493,51 @@ describe('worker-pool lifecycle hook integration', () => {
       workerGeneration: 1,
       disposition: 'queued_removed',
     });
+  });
+
+  it('exit handler isolates sessionStore.updateSession failures without skipping reconciliation', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // Simulate a file-lock timeout on a huge sessions file (the crash vector:
+    // the daemon has no global uncaughtException trap, so a throwing exit
+    // handler would take down every other session).
+    vi.mocked(updateSession).mockImplementationOnce(() => {
+      throw new Error('file-lock timeout waiting for sessions.json.lock');
+    });
+
+    // The emit must NOT throw — the narrow try/catch around the persistence
+    // write isolates the failure and logs it instead of propagating.
+    expect(() => worker.emit('exit', 1, null)).not.toThrow();
+    await flush();
+
+    // The persistence failure was logged at the narrow catch site.
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to persist worker exit generation'),
+    );
+    // Durable-exit reconciliation still ran exactly once despite the write failure.
+    expect(onWorkerExit).toHaveBeenCalledTimes(1);
+    expect(onWorkerExit).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', code: 1 }),
+    );
+    // Dashboard exited event and session.exit lifecycle hook still fired once.
+    expect(dashboardEventBus.publish).toHaveBeenCalledTimes(1);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session.exited' }),
+    );
+    expect(emitHookEventMock).toHaveBeenCalledWith(
+      'session.exit',
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', reason: 'exit_code_1' }),
+    );
   });
 });
