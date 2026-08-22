@@ -225,10 +225,10 @@ describe('dsh worker final_output integration', () => {
       expect(finals).toHaveLength(1);
       expect(finals[0].content).toContain('你好，我是 dsh。');
 
-      // The vendored config and session JSONL must land in the REAL HOME,
-      // not in a throwaway tmpfs that dies with the sandbox.
-      expect(existsSync(join(root, '.botmux', 'dsh', 'cordis.yml'))).toBe(true);
-      expect(existsSync(join(root, '.botmux', 'dsh', 'sessions', sessionId))).toBe(true);
+      // The generated composition and session JSONL must land in the REAL
+      // HOME's native dsh dir, not in a throwaway tmpfs that dies with the sandbox.
+      expect(existsSync(join(root, '.dsh', 'botmux', 'cordis.yml'))).toBe(true);
+      expect(existsSync(join(root, '.dsh', 'sessions', 'botmux', sessionId))).toBe(true);
     } finally {
       await stopChild(child);
     }

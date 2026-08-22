@@ -185,6 +185,7 @@ function handleLine(line) {
     return;
   }
   if (msg.method === 'initialize') {
+    if (logPath) appendFileSync(logPath, JSON.stringify({ initialize: msg.params }) + '\n');
     if (scenario === 'bad-initialize') {
       send({ jsonrpc: '2.0', id: msg.id, result: {} });
       return;
