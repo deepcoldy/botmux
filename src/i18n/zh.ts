@@ -420,6 +420,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用。',
   'cmd.detach.success': '⏏ 已断开，原 CLI 会话不受影响',
   'cmd.detach.existing_app_server_success': '⏏ 已断开飞书侧的 Codex 远程客户端；开发机 App Server 和 Codex App 会话仍在运行。',
+  'cmd.detach.failed': '⚠️ 未能安全断开 BotMux 共享入口；原 Codex App 会话未受影响，请稍后重试。',
+  'cmd.detach.residual': '⚠️ BotMux 共享入口未能确认完全断开；原 Codex App 会话未受影响，请检查会话状态后重试。',
   'cmd.detach.not_adopted': '本话题不是 /adopt 接入的会话，/detach 不适用。要结束 botmux 会话用 /close（会一并结束 CLI 进程）。',
   'cmd.codex_app_adopt.no_threads': '未发现可继续的 Codex App 对话',
   'cmd.codex_app_adopt.thread_not_found': '未找到 Codex App 对话 {threadId}',

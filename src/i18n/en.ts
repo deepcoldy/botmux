@@ -419,6 +419,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use.',
   'cmd.detach.success': '⏏ Disconnected. The original CLI session is untouched.',
   'cmd.detach.existing_app_server_success': '⏏ Disconnected BotMux’s remote Codex client. The development-machine App Server and Codex App conversation are still running.',
+  'cmd.detach.failed': '⚠️ BotMux could not safely disconnect this shared entry. The original Codex App conversation is unaffected; please retry shortly.',
+  'cmd.detach.residual': '⚠️ BotMux could not confirm this shared entry fully disconnected. The original Codex App conversation is unaffected; check the session and retry.',
   'cmd.detach.not_adopted': 'This topic is not an /adopt session; /detach does not apply. Use /close to end the botmux session (which also kills the CLI).',
   'cmd.codex_app_adopt.no_threads': 'No resumable Codex App conversation found.',
   'cmd.codex_app_adopt.thread_not_found': 'Codex App conversation not found: {threadId}',

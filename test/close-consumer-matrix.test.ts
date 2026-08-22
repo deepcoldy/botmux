@@ -76,9 +76,10 @@ const CONSUMERS: Record<string, Rule> = {
   // ── user surfaces: must render refusal AND residual ──────────────────────
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
-    why: '/close: close_refused message and closed_with_residual warning, never the '
-      + 'ordinary closed card.',
-    count: 3,
+    why: '/close and shared-adopt disconnect both branch on refused/residual '
+      + 'results; neither reports an ordinary close/disconnect while cleanup is '
+      + 'unproven.',
+    count: 4,
   },
   'core/command-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
@@ -86,8 +87,10 @@ const CONSUMERS: Record<string, Rule> = {
   },
   'im/lark/card-handler.ts::handleCardAction::closeSession': {
     category: 'user_surface',
-    why: 'Close button: warning toast on refusal/residual, no closed card.',
-    count: 2,
+    why: 'Close/disconnect cards branch on refusal/residual, including stale '
+      + 'shared-adopt close cards; they never report disconnect success while '
+      + 'cleanup is unproven.',
+    count: 3,
   },
   'im/lark/card-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',

@@ -2501,14 +2501,27 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const current = [...activeSessions.values()].find(
             candidate => candidate.session.sessionId === targetSessionId,
           );
-          if (!current || !isSharedAdoptSession(current)) return false;
-          const result = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
-          return result.ok;
+          if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+          try {
+            const result = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
+            if (!result.ok) return 'refused' as const;
+            return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+          } catch {
+            return 'refused' as const;
+          }
         });
-        if (!disconnected) {
+        const locDs = localeForBot(ds.larkAppId);
+        if (disconnected === 'missing') {
           return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
         }
-        const locDs = localeForBot(ds.larkAppId);
+        if (disconnected === 'refused') {
+          await sessionReply(rootId, t('cmd.detach.failed', undefined, locDs));
+          return;
+        }
+        if (disconnected === 'residual') {
+          await sessionReply(rootId, t('cmd.detach.residual', undefined, locDs));
+          return;
+        }
         await sessionReply(
           rootId,
           t(
@@ -2727,14 +2740,28 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const current = [...activeSessions.values()].find(
           candidate => candidate.session.sessionId === targetSessionId,
         );
-        if (!current) return undefined;
-        await closeWorkerPoolSession(targetSessionId);
-        return current;
+        if (!current) return 'missing' as const;
+        try {
+          const result = await closeWorkerPoolSession(targetSessionId);
+          if (!result.ok) return 'refused' as const;
+          return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+        } catch {
+          return 'refused' as const;
+        }
       });
-      if (!disconnected) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (disconnected === 'missing') {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
-      await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
+      if (disconnected === 'refused') {
+        await sessionReply(rootId, t('cmd.detach.failed', undefined, locDs));
+        return;
+      }
+      if (disconnected === 'residual') {
+        await sessionReply(rootId, t('cmd.detach.residual', undefined, locDs));
+        return;
+      }
+      await sessionReply(rootId, t('card.action.disconnected', undefined, locDs));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);
     }
 
