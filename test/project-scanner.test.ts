@@ -604,9 +604,8 @@ describe('scanProjects', () => {
           '',
         ].join('\n');
       }
-      if (cmdStr.includes('describe --tags --exact-match HEAD')) {
-        throw new Error('fatal: no tag exactly matches HEAD');
-      }
+      // No `describe --tags` mock here: the detached label now comes straight
+      // from the porcelain HEAD SHA, so the scanner never shells out to describe.
       return '';
     });
 
