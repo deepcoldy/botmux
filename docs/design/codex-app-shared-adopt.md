@@ -59,8 +59,6 @@ Codex App GUI
         │ codex --remote <endpoint> resume <thread>
         │
 BotMux worker ──────── IM / group / direct message
-        │
-        └───────────── optional web terminal
 ```
 
 共享接入的关键不变量：
@@ -106,7 +104,7 @@ adopt/terminal 行为或明确失败，不退化为对未知 thread 的强行恢
 ### 5.2 IM → Codex App
 
 BotMux 将 IM 输入交给 remote client；Codex App GUI 与该 thread 的其它客户端都能看到
-同一上下文推进。已有的输入确认、队列、去重和 hook-review 菜单保护仍然生效。
+同一上下文推进。已有的输入确认、队列和去重语义保持生效。
 
 ### 5.3 Codex App → IM
 
