@@ -206,6 +206,13 @@ describe('dashboard skills install panel', () => {
     expect(root.findAllByProps({ className: 'skills-candidate-row' })).toHaveLength(2);
   });
 
+  it('keeps long install candidate lists scrollable inside the bounded dialog body', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(css).toMatch(/\.skills-install-selection-body\s*>\s*\.skills-candidate-list\s*\{[^}]*min-height:\s*0;[^}]*max-height:\s*100%;[^}]*overflow-y:\s*auto;/s);
+    expect(css).toMatch(/\.skills-install-selection-body\s*>\s*\.skills-candidate-list\s*\{[^}]*overscroll-behavior:\s*contain;[^}]*-webkit-overflow-scrolling:\s*touch;/s);
+  });
+
   it('echoes the recognized source type and deploy-host requirements before installation', () => {
     const renderer = renderInstallPanel({
       installSource: 'npm_config_registry="https://registry.example.com" npx -y agentbuddy@latest skill add skills.example.com/team/health',

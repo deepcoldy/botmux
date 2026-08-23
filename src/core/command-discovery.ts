@@ -77,7 +77,10 @@ function readFrontmatter(file: string): { name?: string; description?: string } 
   const block = text.slice(3, end);
   const out: { name?: string; description?: string } = {};
   for (const line of block.split(/\r?\n/)) {
-    const m = /^\s*(name|description)\s*:\s*(.+?)\s*$/.exec(line);
+    // Column-0 keys only: an indented `name:`/`description:` is a nested
+    // mapping key and must not clobber the top-level value (same fix as
+    // core/skills/frontmatter.ts).
+    const m = /^(name|description)\s*:\s*(.+?)\s*$/.exec(line);
     if (!m) continue;
     let v = m[2].trim();
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {

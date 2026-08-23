@@ -30,6 +30,8 @@ import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
 import { createReasonixAdapter } from './reasonix.js';
+import { createDshAdapter } from './dsh.js';
+import { createMojoAdapter } from './mojo.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -70,7 +72,27 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // API-backed; no local executable is required.
   riff: undefined,
   reasonix: 'reasonix',
+  // The adapter itself launches a bundled Node runner; dsh-jsonrpc-agent is
+  // its real second-stage dependency.
+  dsh: 'dsh-jsonrpc-agent',
+  // The worker never spawns this (MojoBackend shells out per turn), but the
+  // binary DOES have to exist locally — unlike riff/mira, which are pure HTTP.
+  // Declaring it lets `botmux setup` fail fast on a missing install instead of
+  // letting the first IM message die with ENOENT.
+  mojo: 'mojo',
 };
+
+/**
+ * Every known CLI id, derived from the closed `Record<CliId, …>` above rather
+ * than re-typed by hand.
+ *
+ * A hand-maintained duplicate of this list in dashboard.ts silently went stale
+ * twice (it was missing both `reasonix` and `mojo`), because a plain
+ * `CliId[]` literal is only checked for *bad* members — never for missing ones.
+ * Deriving it means adding a CLI to RAW_CLI_EXECUTABLES (which tsc forces) is
+ * enough, and no consumer can drift again.
+ */
+export const ALL_CLI_IDS: readonly CliId[] = Object.keys(RAW_CLI_EXECUTABLES) as CliId[];
 
 /** Return the unresolved command without constructing an adapter or spawning a
  * shell.  This is deliberately safe for synchronous UI option enumeration. */
@@ -169,7 +191,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createMojoAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -200,6 +222,8 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);
     case 'reasonix': return createReasonixAdapter(pathOverride);
+    case 'dsh': return createDshAdapter(pathOverride);
+    case 'mojo': return createMojoAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

@@ -47,7 +47,12 @@ export function readSkillFrontmatter(text: string): SkillFrontmatter {
   const out: SkillFrontmatter = {};
 
   for (let i = 0; i < lines.length; i += 1) {
-    const m = /^\s*(name|description|version|displayName|tags)\s*:\s*(.*?)\s*$/.exec(lines[i]);
+    // Top-level keys only (column 0). An indented `name:`/`description:` is a
+    // NESTED mapping key (e.g. a JSON-schema property under `metadata:`) and
+    // previously clobbered the real value — an agentbuddy skill with
+    // `name: { type: string }` inside its input_schema failed install with
+    // `invalid_skill_name:{ type: string }`.
+    const m = /^(name|description|version|displayName|tags)\s*:\s*(.*?)\s*$/.exec(lines[i]);
     if (!m) continue;
     const key = m[1];
     let value = m[2];

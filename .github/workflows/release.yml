@@ -134,6 +134,10 @@ jobs:
       # 永远不显示(即便 squash 出的新 commit 能从 tag 到达也不行)。此权限用于发一条
       # 可见的时间线评论作为 squash 兼容的替代。
       pull-requests: write
+      # id-token: write —— npm Trusted Publishing (OIDC) 要求 GitHub 能为本 job 签发
+      # OIDC token，npm CLI 用它向 registry 证明「确实是从已授权的 workflow 发布」，
+      # 无需存储长期 npm token。发布前须在 npmjs.com 上为两个包配置 Trusted Publisher。
+      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -146,6 +150,13 @@ jobs:
 
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
+
+      - name: Upgrade npm for Trusted Publishing
+        # npm Trusted Publishing (OIDC) 要求 npm CLI >= 11.5.1（需 Node >= 22.14.0）。
+        # Node 22 自带的 npm 可能不够新，这里升级到固定的 11.19.0（2026-07-28 的最新
+        # 11.x）。不用 npm@latest —— floating latest 可能跳到 npm 12 并在 tag-push 发版
+        # 时引入破坏性改动；固定版本确保发版流程可预测。
+        run: npm install -g npm@11.19.0
 
       - name: Sync version from git tag to package.json
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
@@ -240,14 +251,14 @@ jobs:
       - run: pnpm workflow-core:test
 
       - name: Publish workflow core to npm
+        # npm Trusted Publishing (OIDC) 流程:actions/setup-node 已配置 registry-url,
+        # npm CLI 检测到 id-token 权限后会自动向 GitHub OIDC Provider 请求 token 并用
+        # 它向 registry 认证,无需 NODE_AUTH_TOKEN。不传 NODE_AUTH_TOKEN 环境变量是
+        # 必需的 —— 若该变量存在,npm 会优先用它做传统认证而跳过 OIDC 流程。
         run: node scripts/publish-npm-if-missing.mjs ./packages/workflow-core "${{ steps.dist_tag.outputs.tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
 
       - name: Publish botmux to npm
         run: node scripts/publish-npm-if-missing.mjs . "${{ steps.dist_tag.outputs.tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
 
       - name: Generate changelog
         id: changelog

@@ -47,3 +47,6 @@ src/desktop/assets/*.png
 /platform/
 /mcp-gateway/
 .gdpa
+
+# OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
+.omo/

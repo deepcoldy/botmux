@@ -32,12 +32,13 @@
   --modal-backdrop: rgba(10, 14, 18, 0.48);
   --qr-surface: #ffffff;
   --shadow: 0 18px 44px rgba(15, 23, 42, 0.08);
-  --radius-xs: 12px;
-  --radius-sm: 12px;
-  --radius-md: 12px;
-  --radius-lg: 12px;
-  --radius-xl: 12px;
+  /* 圆角三档 + full，档位定义见下面第二个 :root（那份才是最终生效的）。 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
   --radius-full: 999px;
+  --radius-xs: var(--radius-sm);
+  --radius-xl: var(--radius-lg);
   --radius: var(--radius-md);
   --button-height: 34px;
   --button-compact-height: 34px;
@@ -8055,12 +8056,19 @@ dialog.onboarding-dialog::backdrop {
   --accent: #565ee4;
   --accent-strong: var(--brand-accent-strong);
   --accent-soft: rgba(100, 108, 234, 0.12);
-  --radius-xs: 12px;
-  --radius-sm: 12px;
-  --radius-md: 12px;
-  --radius-lg: 12px;
-  --radius-xl: 12px;
+  /* 圆角三档 + full：每档 1.4–1.7× 递进，肉眼分得出档位。五级全是 12px 的旧体系
+     等于没有尺度——小徽标读成药丸、大面板读成方角。取档按「半径 ≈ 高度 / 3.5」：
+     ≤30px 取 sm（徽标 / chip / 分段控件）· 31–47px 取 md（按钮 / 输入框 / 下拉）·
+     ≥48px 取 lg（卡片 / 面板 / 浮层 / 弹窗）。full 只给正圆（状态点、分栏握把、
+     头像、滚动条 thumb），不许用在矩形上。
+     旧的 xs / xl 不再是独立档位，按就近取档并进 sm / lg —— 全站 200+ 处引用照常
+     工作，非工作台组件的位移不超过 2px。 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
   --radius-full: 999px;
+  --radius-xs: var(--radius-sm);
+  --radius-xl: var(--radius-lg);
   --radius: var(--radius-md);
   --sidebar-width: 190px;
   --topbar-height: 60px;
@@ -11434,6 +11442,15 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   max-height: 460px;
 }
 
+.skills-install-selection-body > .skills-candidate-list {
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+
 .skills-local-discovery-panel {
   justify-content: space-between;
   padding: 10px;
@@ -12962,6 +12979,34 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--fg);
   font: 12px/1.5 var(--mono);
 }
+
+.bd-feedback-advanced {
+  margin-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 10px;
+}
+.bd-feedback-advanced > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+.bd-feedback-advanced > summary:hover { color: var(--fg); }
+.bd-feedback-advanced-body { padding-top: 4px; }
+.bd-tile textarea.bd-feedback-json {
+  min-height: 112px;
+  max-height: 320px;
+  resize: vertical;
+}
+.bd-feedback-chat-override {
+  margin-top: 16px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 14px;
+}
+.bd-feedback-chat-override > h4 { margin: 0 0 4px; }
+.bd-feedback-chat-override > .hint { margin: 0; }
 :root[data-theme="dark"] .bd-tile textarea,
 :root[data-theme="dark"] .bd-tile input[type=text],
 :root[data-theme="dark"] .bd-tile input[type=number] {
@@ -23592,6 +23637,24 @@ dialog select[multiple]:hover:not(:disabled) {
   resize: vertical;
 }
 
+.bot-defaults-page .bd-owner-reminder-states {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.bot-defaults-page .bd-owner-reminder-states label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+@media (max-width: 620px) {
+  .bot-defaults-page .bd-owner-reminder-states { grid-template-columns: 1fr; }
+}
+
 .bot-defaults-page .bd-tile input[type="text"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]),
 .bot-defaults-page .bd-tile input[type="number"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
   width: 100%;
@@ -23987,6 +24050,60 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-field-menu[open] {
   position: relative;
   z-index: 1300;
+}
+
+/* ── ModelPickerField：下拉候选 + 自定义输入（defaults 页与 onboarding 共用） ── */
+.bd-model-picker {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 自定义模式：输入框与返回按钮并排，输入框占满剩余宽度 */
+.bd-model-custom {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.bd-model-custom > input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.bd-model-back {
+  flex: none;
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+}
+
+/* live 探测进行中：控件下方小转圈（无文案，避免再增 i18n key） */
+.bd-model-busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.bd-model-spinner {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 2px solid color-mix(in srgb, currentColor 34%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: page-loading-rotate 0.8s linear infinite;
+}
+
+/* 探测结果提示（「已探测 N 个可用模型」） */
+.bd-model-detected {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
 }
 
 .bot-defaults-page :where(.bd-section, .bd-subsection) > .actions,
@@ -27633,3 +27750,1980 @@ button.skills-issue-badge:hover {
 .feedback-more { margin-top: 12px; }
 @media (max-width: 1100px) { .feedback-kpis { grid-template-columns: repeat(3, 1fr); } .feedback-deliveries > div { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .feedback-kpis, .feedback-grid { grid-template-columns: 1fr; } }
+/* Agent Workbench — reader-flavoured terminal surface: no gradients, no decorative
+   rules, and independent from the Dashboard card/aurora vocabulary.
+   段内三条硬约束，改之前先读：
+   ① 实线只给白名单五类（内容区↔固定工具条的功能性边界、chip 的 1px 亮环、脱离
+      文档流的浮层外圈、:focus-visible 焦点环、选中态的 accent 内投影），颜色只能
+      取 var(--border-keep)；其余一律 border: 0，分层交给 --bg-l0..l3 的色差和留白。
+   ② 每一个 border-radius 只能是 var(--radius-sm|md|lg|full) / 0 / 50%，裸像素值
+      是漂移 bug，样式契约测试（test/agent-workbench-style.test.ts）会拦。
+   ③ 段内零渐变、零装饰阴影；只有浮层用 --shadow-pop。 */
+.workbench-route-host,
+.workbench-route-host > #root {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* #root inherits the Dashboard route padding (12px 32px 24px 0) plus a -32px
+   right margin, which inset the Workbench and left it short of the viewport.
+   The Workbench draws its own edges, so clear both inside this host only. */
+.workbench-route-host > #root,
+.workbench-route-host .agent-workbench-page,
+.workbench-route-host .agent-workbench-dock {
+  padding: 0;
+  margin: 0;
+}
+
+/* 配色令牌 = 四层底 + 三档文字 + 语义色。四层底之间的亮度差控制在 1.08–1.5：
+   低于 1.02 看不见，高于 1.6 就读成「块」而不是「层」。
+   L0 页面底 · L1 侧栏 / 顶栏 · L2 卡片 / 面板 / 浮层 / 按钮组底板 · L3 选中 & 悬浮。
+   hover 与 selected 共用 L3，靠 accent 竖条和标题色区分，不再引入第五档灰。
+   --term-bg 是第五个特例层：与 L0 同色相再暗一档，且 L0 ↔ term-bg 对比度必须 ≥1.15
+   —— 面板不画描边，边界全靠「留白 + 圆角 + 画布底色」表达，这条不达标就等于没有边界。
+   三档文字在 L0/L1/L2/L3 四个底上全部 ≥4.5:1（WCAG AA）。
+   本块是深色族默认皮肤 slate-blue，没有 data-skin 时也自洽。 */
+.agent-workbench-page,
+.agent-workbench-dock {
+  --bg-l0: #141922;
+  --bg-l1: #19212c;
+  --bg-l2: #202a36;
+  --bg-l3: #333f4e;
+  --text-1: #e4ebf2;
+  --text-2: #afbecd;
+  --text-3: #a2b2c3;
+  --accent: #6fcbf7;
+  --ok: #63d6a0;
+  --warn: #edb95c;
+  --err: #f58a94;
+  /* 白名单之外一律 border: 0，这一个色只给白名单五类线用（见下面的实线白名单）。 */
+  --border-keep: #2e3a48;
+  --on-accent: #141922;
+  --term-bg: #030407;
+  --badge-todo: #e6edf4;
+  /* 浮层是唯一保留阴影的东西：它会盖在任意背景上，没有阴影就和背景粘住。
+     面板 / 卡片一律无阴影 —— 深色底上的黑阴影只糊边、出不了层次。 */
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .5);
+  color-scheme: dark;
+
+  /* —— 历史令牌 → 上面这套的映射 ——
+     段内还有约 50 处样式读 --wb-*，映射之后换皮肤只改上面一段，不会漏掉任何一处，
+     也不用把 1200 行样式逐条改写。新写的规则一律直接读新令牌。
+     三档线（--wb-border / -strong / --wb-divider）并成一档并已无引用：删线之后剩下的
+     都是白名单里的功能线，不需要「更重 / 更轻」的分级；--wb-surface* 同理，分层统一
+     由 --bg-l0..l3 表达。两组名字都不再保留。
+     语义色的 *-soft 底改成 12% 透明叠加：固定的深色 soft 值换皮肤时会撞色相。 */
+  --wb-bg: var(--bg-l0);
+  --wb-text: var(--text-1);
+  --wb-muted: var(--text-2);
+  --wb-faint: var(--text-3);
+  --wb-accent: var(--accent);
+  --wb-success: var(--ok);
+  --wb-success-soft: color-mix(in srgb, var(--ok) 12%, transparent);
+  --wb-warning: var(--warn);
+  --wb-warning-soft: color-mix(in srgb, var(--warn) 12%, transparent);
+  --wb-danger: var(--err);
+  --wb-focus: var(--accent);
+  /* 圆角改读全站统一的三档 + full（见 :root 的 --radius-*）：原来工作台自带的四级
+     令牌（4/8/10/12）尺度差太小、视觉读数差很大，一屏之内四个值肉眼像随机；10 与 12
+     的差别更是分不出来，只制造不确定感。工作台段内已无 --wb-radius-* 的引用。 */
+  /* 触控目标下限：桌面 28px，(hover: none) 下整体提到 44px。尺寸只写一次，
+     媒体查询只改这个令牌的值，避免同一个高度被四处规则反复重定义。 */
+  --touch-target: 28px;
+  /* 终端渲染风格的三个可继承变量，由 .wb-term-classic / .wb-term-reader 覆盖；
+     挂在任意祖先上都生效（继承），iframe 内的取值由 TS 侧读这里再 postMessage 下发。
+     默认取 classic（现状渲染）。 */
+  --term-pad: 4px 8px 8px 8px;
+  --term-line-height: 1;
+  --term-font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg-l0);
+  font: 12px/1.4 var(--mono);
+}
+
+/* 浅色族：分层方向反转但规则不变 —— L0 最灰、L2 纯白（卡片浮起）、L3 带蓝调向下沉
+   （浅色里「被按下」必须变暗才有语义）。--term-bg 是唯一不跟着反转的令牌：终端内容是
+   彩色 ANSI，浅底会毁掉前景色可读性，业界通行做法就是留深色画布。 */
+:root[data-theme="light"] .agent-workbench-page,
+:root[data-theme="light"] .agent-workbench-dock {
+  --bg-l0: #e8ecf1;
+  --bg-l1: #f3f6f9;
+  --bg-l2: #ffffff;
+  --bg-l3: #c9d7e8;
+  --text-1: #131820;
+  --text-2: #3b4855;
+  --text-3: #46525f;
+  --accent: #0b5f8f;
+  --ok: #0f6141;
+  --warn: #6b4904;
+  --err: #9e2531;
+  --border-keep: #c2cdda;
+  --on-accent: #ffffff;
+  --term-bg: #16202b;
+  --badge-todo: #1b2430;
+  /* 浅色下阴影带蓝调，纯黑阴影在白底上会发灰。 */
+  --shadow-pop: 0 8px 24px rgba(20, 30, 45, .16);
+  color-scheme: light;
+}
+
+/* 四套皮肤。分工：mode（现有的明暗机制）决定明暗族，data-skin 决定族内配色；
+   light-frost 属 light 族，其余三套属 dark 族，跟随系统时在「用户最后选的深色皮肤」
+   与 light-frost 之间切换。
+   皮肤只重定义上面那组工作台令牌，不动全站任何变量，也不写 data-theme —— 明暗仲裁
+   仍归 ui.ts 的 applyTheme 管，工作台再插一手必打架。
+   放在浅色块之后：两者特异性相同，显式选中的皮肤要赢过「浅色族」的兜底。 */
+:root[data-skin="ink"] .agent-workbench-page,
+:root[data-skin="ink"] .agent-workbench-dock {
+  /* 完全中性的灰阶外壳，彩色预算只服务状态与身份。L1↔L3 只有 1.46：L3 被 --text-3
+     的 AA 4.53 顶死，抬不动，四套里只有这套付这个代价。 */
+  --bg-l0: #181818;
+  --bg-l1: #212121;
+  --bg-l2: #2b2b2b;
+  --bg-l3: #3c3c3c;
+  --text-1: #ededed;
+  --text-2: #b8b8b8;
+  --text-3: #a6a6a6;
+  --accent: #ff8b63;
+  --ok: #3ed598;
+  --warn: #efc260;
+  --err: #ff8c8f;
+  --border-keep: #3f3f3f;
+  --on-accent: #181818;
+  --term-bg: #030303;
+  --badge-todo: #eaeaea;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .55);
+  color-scheme: dark;
+}
+
+:root[data-skin="slate-blue"] .agent-workbench-page,
+:root[data-skin="slate-blue"] .agent-workbench-dock {
+  /* 默认皮肤：保留产品现有的蓝黑品牌感，只收紧色相、按新分层重排台阶、把 meta
+     文字提到 AA。与上面的基准块同值，显式选中时也要能压过浅色兜底。 */
+  --bg-l0: #141922;
+  --bg-l1: #19212c;
+  --bg-l2: #202a36;
+  --bg-l3: #333f4e;
+  --text-1: #e4ebf2;
+  --text-2: #afbecd;
+  --text-3: #a2b2c3;
+  --accent: #6fcbf7;
+  --ok: #63d6a0;
+  --warn: #edb95c;
+  --err: #f58a94;
+  --border-keep: #2e3a48;
+  --on-accent: #141922;
+  --term-bg: #030407;
+  --badge-todo: #e6edf4;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .5);
+  color-scheme: dark;
+}
+
+:root[data-skin="warm-graphite"] .agent-workbench-page,
+:root[data-skin="warm-graphite"] .agent-workbench-dock {
+  /* 灰阶往暖里偏（色相约 40°、极低饱和），长时间盯屏比纯中性灰舒服。
+     accent 与 --warn 同族，所以 warn 状态在这套里要靠形状而不只是颜色区分。 */
+  --bg-l0: #1b1912;
+  --bg-l1: #24211a;
+  --bg-l2: #2e2b22;
+  --bg-l3: #443e34;
+  --text-1: #f0ebe1;
+  --text-2: #c2baac;
+  --text-3: #b3aa9c;
+  --accent: #f2a33c;
+  --ok: #5fce9b;
+  --warn: #eac14f;
+  --err: #ff9186;
+  --border-keep: #453f35;
+  --on-accent: #1b1912;
+  --term-bg: #040402;
+  --badge-todo: #f2ede3;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .55);
+  color-scheme: dark;
+}
+
+:root[data-skin="light-frost"] .agent-workbench-page,
+:root[data-skin="light-frost"] .agent-workbench-dock {
+  /* 浅色族唯一的一套。选中台阶做到 1.35（现行浅色只有 1.14，几乎等于没有）。 */
+  --bg-l0: #e8ecf1;
+  --bg-l1: #f3f6f9;
+  --bg-l2: #ffffff;
+  --bg-l3: #c9d7e8;
+  --text-1: #131820;
+  --text-2: #3b4855;
+  --text-3: #46525f;
+  --accent: #0b5f8f;
+  --ok: #0f6141;
+  --warn: #6b4904;
+  --err: #9e2531;
+  --border-keep: #c2cdda;
+  --on-accent: #ffffff;
+  --term-bg: #16202b;
+  --badge-todo: #1b2430;
+  --shadow-pop: 0 8px 24px rgba(20, 30, 45, .16);
+  color-scheme: light;
+}
+
+.agent-workbench-page *,
+.agent-workbench-dock * { box-sizing: border-box; }
+
+/* 删线的前置：Dashboard 的全局裸元素规则（`button, .btn-link { border: 1px … }`、
+   给所有 select 塞箭头槽的那条）特异性只有 (0,0,1)，会直接漏进工作台 —— 只删
+   .wb-* 自己的描边，线不会消失。这条 reset 用 :where() 保持 0 特异性外壳，选择器
+   实际权重与那些全局规则相同、位置更靠后，于是稳压一头，而任何 .wb-* 规则（≥0,1,0）
+   都能照常覆盖它。 */
+:where(.agent-workbench-page, .agent-workbench-dock) :is(button, select, input, textarea) {
+  border: 0;
+  border-radius: var(--radius-md);
+  min-height: 0;
+  box-shadow: none;
+}
+
+.agent-workbench-page button,
+.agent-workbench-page input,
+.agent-workbench-page a,
+.agent-workbench-dock button,
+.agent-workbench-dock input,
+.agent-workbench-dock a {
+  font: inherit;
+}
+
+/* 控件基线：所有按钮和链接一律 10px（md 档）。更小的徽标 / chip 在下面单独降到
+   6px，面板级容器升到 14px。过渡放在这里统一给：底色、描边、文字三者一起走
+   140ms ease-out，悬浮态不再是瞬间跳变；prefers-reduced-motion 那条 !important
+   会整体关掉。 */
+.agent-workbench-page button,
+.agent-workbench-dock button,
+.agent-workbench-page a,
+.agent-workbench-dock a {
+  border-radius: var(--radius-md);
+  transition: background-color .14s ease-out, border-color .14s ease-out, color .14s ease-out;
+}
+
+.agent-workbench-page button:focus-visible,
+.agent-workbench-page a:focus-visible,
+.agent-workbench-page input:focus-visible,
+.agent-workbench-dock button:focus-visible,
+.agent-workbench-dock a:focus-visible,
+.agent-workbench-dock input:focus-visible {
+  outline: 2px solid var(--wb-focus);
+  outline-offset: -1px;
+}
+
+.wb-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The page is a single full-height region: the brand/status bar that used to
+   own the first row is gone, and the live/offline dot moved into the session
+   list heading. */
+.agent-workbench-page {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wb-desktop-layout {
+  display: grid;
+  grid-template-columns: var(--wb-rail-width) 6px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wb-desktop-layout.is-rail-collapsed {
+  grid-template-columns: var(--wb-rail-width) minmax(0, 1fr);
+}
+
+.wb-session-rail {
+  display: grid;
+  grid-template-rows: 38px 38px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  /* 分栏不画竖线：会话栏是 L1、终端画布是 term-bg，中间隔一条 6px 透明握把带，
+     靠底色差 + 留白分区。原来这里一条 border-right、握把带一整条实色、面板再一圈
+     描边，7 个 CSS 像素里挤了三条不同灰度的竖线。 */
+  border: 0;
+  background: var(--bg-l1);
+  overflow: hidden;
+}
+
+.wb-session-rail.is-collapsed {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  width: 40px;
+}
+
+.wb-rail-expand {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border: 0;
+  color: var(--wb-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.wb-rail-expand:hover { color: var(--text-1); background: var(--bg-l3); }
+.wb-rail-expand:not(button) { cursor: default; }
+.wb-rail-vertical-label { writing-mode: vertical-rl; letter-spacing: .14em; font-size: 11px; }
+/* 待办计数：近白实心 + L1 深字，不再是一圈红描边。计数徽章只分两档 —— 待办用这套
+   实心，中性计数用 --bg-l3 底 + --text-3 字，中间不设第三档。 */
+.wb-rail-count {
+  position: absolute;
+  right: 6px;
+  bottom: 8px;
+  min-width: 18px;
+  padding: 2px 3px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--bg-l1);
+  background: var(--badge-todo);
+  font-weight: 600;
+  text-align: center;
+}
+
+/* 栏头不画下沿线：它落在 L1 上、列表也在 L1 上，靠 12px 留白和字重分层就够。
+   窄屏上通栏线的线长 / 屏宽比接近 1，一条线就横断整个视野。 */
+.wb-rail-heading {
+  display: flex;
+  align-items: center;
+  /* 左组紧凑排列，只把收起按钮推到最右。原来 space-between 与 .wb-group-dim 自己的
+     margin-left:auto 两套分配机制叠加，中间挂出约 90px 死空白。 */
+  justify-content: flex-start;
+  gap: 8px;
+  /* 左 22 与组头箭头、行状态标同一条线：栏头的 live 圆点原来在 12px，比列表里所有
+     首字形都往左突出 10px，会话栏左缘于是有 12 / 22 两条参差的线。栏头没有圆角底板、
+     不受裁切，但既然是同一列的首字形，就该落在同一条基线上。 */
+  padding: 0 12px 0 22px;
+  border: 0;
+}
+
+/* 「标题 + 计数」是一个短语，不是两端对齐的表格行：计数紧贴标题 6px。 */
+.wb-rail-heading > div { display: flex; align-items: center; gap: 6px; letter-spacing: .08em; }
+.wb-rail-heading > div > span { color: var(--text-3); }
+.wb-rail-heading > button:last-child { margin-left: auto; }
+/* Live/last-snapshot state now rides the list heading instead of a page-wide
+   status bar. */
+.wb-rail-heading .is-online { color: var(--wb-success); }
+.wb-rail-heading .is-offline { color: var(--wb-danger); }
+.wb-rail-heading button,
+.wb-session-search button {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  background: transparent;
+  cursor: pointer;
+}
+/* 图标按钮的可点性靠一小块 hover 底色表达，不靠描边变色。 */
+.wb-rail-heading button:hover,
+.wb-session-search button:hover { color: var(--text-1); background: var(--bg-l3); }
+
+/* 搜索框改填充式：整圈描边换成 L2 填充，聚焦时才画 2px accent 环（焦点环属白名单）。 */
+.wb-session-search {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  /* 左缘对齐：外边距收到 8px，与会话行 / 组头两块 ::before 底板的 8px 内缩线重合
+     （列表左侧只留一条容器线）；内边距 14px 让 ⌕ 落在 22px 基线上，且 14 ≥ 圆角
+     半径 --radius-md(10)，字形永远咬不到填充块的弧线。 */
+  margin: 6px 8px 4px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-3);
+  background: var(--bg-l2);
+}
+
+.wb-session-search:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; }
+.wb-session-search input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  color: var(--wb-text);
+  background: transparent;
+}
+.wb-session-search input::placeholder { color: var(--wb-faint); }
+
+.wb-session-list {
+  position: relative;
+  min-height: 0;
+  overflow: auto;
+  outline: 0;
+  contain: strict;
+}
+.wb-session-list:focus-visible { outline: 2px solid var(--wb-focus); outline-offset: -2px; }
+.wb-session-list-space { position: relative; width: 100%; }
+.wb-session-group,
+.wb-session-row { position: absolute; left: 0; width: 100%; }
+.wb-session-group {
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  align-items: center;
+  gap: 4px;
+  /* 组头的折叠箭头必须和它下面那些行的状态标共用一条竖直基线，所以左右内边距跟着
+     .wb-session-row 走（22 / 14），不再是自己的一份 9px。
+     ⚠️ 组头**渲染时永远带 .wb-session-group-toggle**，真正生效的是下面那条
+     `.wb-session-group.wb-session-group-toggle`（特异性 0,2,0 压过这里的 0,1,0）。
+     改内边距必须两处一起改，只改这里等于什么都没改 —— 上一轮就是这么漏的，
+     agent-workbench-style.test.ts 现在按「两条规则的左右内边距必须相等」钉住。 */
+  padding: 5px 14px 3px 22px;
+  color: var(--text-3);
+  font-size: 11px;
+  letter-spacing: .09em;
+}
+.wb-session-group-needs-you { color: var(--wb-danger); }
+.wb-session-group-active { color: var(--wb-success); }
+
+.wb-session-row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  /* 左内边距 22 = 高亮底板左缘（::before 的 inset 左 8）+ 圆角半径（--radius-lg 14）。
+     原来是 8px，正好等于底板左缘 —— 状态标那一格距底板左缘 0px，字形直接压在圆角
+     边界上，选中态那条 2px accent 内影更是从字形上横穿过去，读起来就是「行首被切掉
+     一块」。规范的既有结论是「文字左内边距 ≥ 圆角半径」，这里把它补齐。
+     右 14 同理留出弧线余量：meta 行的时间戳贴在右内边距上，它的字形底部落在底板下方
+     圆角的水平带里，8px 已经只剩 5.6px 净空，再窄就会啃到弧线。
+     上下 5（原 6）：省出来的 2px 给标题撑行框用，算式见下面
+     `.wb-session-row .wb-session-title`。行总高仍是 54px，虚拟滚动契约不受影响；
+     内容在行里是 align-items:center 居中的，少 1px 内边距不改变它的视觉位置。 */
+  padding: 5px 14px 5px 22px;
+  /* 每行一条通栏横线原本一屏 18 条，还横穿圆角高亮底板，把药丸上下切平。整条删掉，
+     行间关系交给留白节奏（项间留白 ÷ 项内行距 ≥ 2.5）+ 分组组头 + 选中底板。
+     选中态的 accent 竖条也不再是 border-left（方头、和圆角底板中间夹 5px 缝），
+     并进 ::before 的 inset box-shadow，跟着 14px 圆角走。 */
+  border: 0;
+  color: var(--wb-text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+/* Hover is the row's only affordance now that the title no longer underlines,
+   so it has to be legible on its own: surface-3 is a clear step up from the
+   rail's own surface, where surface-2 was almost invisible against it. Hover
+   stays neutral grey and selection stays the accent blue plus the left bar, so
+   the two states never read as the same thing. */
+/* 高亮不再铺满整行：::before 是一块四周留白的圆角底板，行本身始终保持透明。
+   四点说明，动之前先读：
+   ① inset 是相对行的 padding box 量的，所以底板天然让开左侧 2px 的选中条和底部
+      1px 的分隔线，两者不会被圆角切到；
+   ② z-index:-1 让底板落到内容之下。.wb-session-list 的 contain:strict 本身就是
+      层叠上下文，负层只会压在这个列表自己的（透明）底色之上，掉不到会话栏的
+      --wb-surface 背景后面去，所以高亮照常可见；
+   ③ 刻意不给 .wb-session-row 加 position/z-index —— .wb-session-copy-link::after
+      那层撑满整行的点击区拿它当包含块，动一下整行可点就没了；
+   ④ 行高（54 / 84）、padding、grid 列都没动，底板只是画上去的一层，虚拟滚动的
+      摆放模型完全不受影响。 */
+.wb-session-row::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 2px 8px;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  transition: background-color .14s ease-out;
+}
+/* hover 与 selected 共用 L3：区分靠形状和颜色（accent 竖条 + accent 标题），
+   不靠又一个几乎相同的灰。多一档而不可辨 = 噪声。 */
+.wb-session-row:hover::before { background: var(--bg-l3); }
+.wb-session-row.is-selected::before {
+  background: var(--bg-l3);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.wb-session-row.is-selected .wb-session-title { color: var(--accent); }
+.wb-session-row-needs-you .wb-session-state-mark { color: var(--wb-danger); }
+.wb-session-row-active .wb-session-state-mark { color: var(--wb-success); }
+.wb-session-row-recent .wb-session-state-mark { color: var(--wb-faint); }
+.wb-session-copy { display: grid; min-width: 0; gap: 4px; }
+/* Row-as-link: same cell, but a real anchor so chat-follow opens on the
+   user's own trusted click instead of a scripted one. The ::after overlay
+   stretches the anchor's hit area across the whole row (state dot and blank
+   space included); the action buttons sit above it and keep working.
+   The row reads as a list item, not as body copy with a hyperlink in it, so it
+   never underlines: hover is carried entirely by .wb-session-row:hover's
+   background. Keep the anchor undecorated in every state — the UA underlines
+   a[href] by default, and the Dashboard's global chrome adds `… a:hover`
+   rules that would otherwise reach in here. */
+.wb-session-copy-link { color: inherit; text-decoration: none; cursor: pointer; }
+.wb-session-copy-link::after { content: ''; position: absolute; inset: 0; }
+.wb-session-copy-link:link,
+.wb-session-copy-link:visited,
+.wb-session-copy-link:hover,
+.wb-session-copy-link:focus,
+.wb-session-copy-link:active,
+.wb-session-copy-link * { text-decoration: none; }
+.wb-session-copy-link:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
+/* ⚠️ 单行省略号截断 = overflow:hidden，而 hidden 是按**盒子**裁的，连字形一起裁。
+   一行文字的内容盒高度就是行框（line-height），字形却按字体自己的 em 盒画：实测
+   （Chromium + 中文回退字体）12px 字号下 fontBoundingBoxAscent 11px + Descent 3px
+   = 14px，而「查 / 看 / 后」这类汉字的 actualBoundingBoxAscent 就是 11px —— 墨迹
+   顶到 em 盒上沿，一格不剩。line-height 只有 1.3（15.6px）时半行距 (15.6−14)/2 =
+   0.8px，逐像素扫出来的净空更是只剩 0.13px：字形上沿的横笔画正压在裁切线上。
+   换成 em 盒更高的中文字体（PingFang SC ≈ 1.4em = 16.8px > 15.6px）半行距直接变负，
+   上沿被整齐削平 —— 线上反馈的「查看」被切就是这个。
+   所以本段所有截断文字统一两件事：① 行框放宽到 ≥ 1.4em；② 再各留 1px 上下内边距。
+   内边距是关键：它把**裁切框**（padding box）撑得比行框大，净空不再取决于字体度量，
+   换任何一套中文字体都还剩 ≥1px。改这些数之前先跑 glyphscan 逐像素体检。 */
+.wb-session-title { overflow: hidden; color: var(--wb-text); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.wb-session-meta { display: flex; justify-content: space-between; gap: 6px; min-width: 0; color: var(--text-3); font-size: 11px; }
+/* meta 行每一格都是 flex 拉伸项，高度由行里最高的那个（徽标 18px）定；给它们加
+   1px 上下内边距只是把行框在**既有高度内**往里缩，meta 行总高不变，不吃预算。 */
+.wb-session-meta > span:not(.wb-session-kind) {
+  overflow: hidden;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-session-meta time { flex: none; padding-block: 1px; }
+.wb-session-reason { color: var(--wb-warning); }
+.wb-session-empty { position: absolute; inset: 60px 8px auto; color: var(--wb-faint); text-align: center; }
+
+/* 分栏带整条透明，只留中间一颗握把。原来这 5px 是一条实色带（比会话栏底色还亮，
+   读起来是「凸起的亮带」而不是分隔线），注释说已经改成细带 + 握把，代码没跟上。
+   握把就是原来那个 ⋮ span（父级 color 已经是 transparent，字形本来就不显示），
+   给它固定尺寸当色块用，不新增任何 DOM。 */
+.wb-rail-separator {
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 6px;
+  min-width: 6px;
+  padding: 0;
+  border: 0;
+  color: transparent;
+  background: transparent;
+  cursor: col-resize;
+}
+.wb-rail-separator > span {
+  display: block;
+  width: 3px;
+  height: 28px;
+  border-radius: var(--radius-full);
+  background: var(--border-keep);
+  overflow: hidden;
+  transition: background-color .14s ease-out;
+}
+.wb-rail-separator:hover,
+.wb-rail-separator:focus-visible { color: transparent; background: transparent; }
+.wb-rail-separator:hover > span,
+.wb-rail-separator:focus-visible > span { background: var(--text-3); }
+
+/* Two children, two rows: the header and the pane stack. Leaving the old
+   toolbar/chat-contract rows in place pushed the stack into an `auto` track,
+   which is why the terminal iframe collapsed to its 150px intrinsic height. */
+.wb-workspace {
+  position: relative;
+  display: grid;
+  grid-template-rows: 46px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--wb-bg);
+}
+.wb-workspace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 16px;
+  /* 保留线①（白名单第 1 类）：线两侧一边会滚动、一边不会，这个语义色差表达不了。
+     必须满出血、左右不缩进 —— 缩进的线会读成装饰。 */
+  border: 0;
+  border-bottom: 1px solid var(--border-keep);
+  background: var(--bg-l0);
+}
+.wb-workspace-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.wb-workspace-title > span:last-child { display: grid; min-width: 0; }
+/* 工作区头部的会话名与副行：同样是单行省略号截断，同样按裁切框留净空。
+   副行 small 只有 10px 字号、行框 14px，是全段最挤的一处（实测上沿净空 0.44px），
+   所以除了 1px 内边距还把行框显式提到 1.5。头部高 46px，两行加起来 34.5px，够。 */
+.wb-workspace-title strong {
+  overflow: hidden;
+  max-width: 58vw;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-workspace-title small {
+  overflow: hidden;
+  padding-block: 1px;
+  color: var(--wb-muted);
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-bot-mark {
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  flex: none;
+  border: 0;
+  /* 25px 的身份方块按「圆角图标」处理，比徽标再圆一档；描边换成 L3 底。 */
+  border-radius: var(--radius-md);
+  background: var(--bg-l3);
+  color: var(--accent);
+  font-weight: 800;
+}
+/* 标签的 1px 亮环（白名单第 2 类）：在无边框环境里，chip 靠这圈比填充更亮的环
+   跳出来，不靠底色。字号不低于 11px。 */
+.wb-layout-level {
+  flex: none;
+  padding: 2px 6px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: 11px;
+  letter-spacing: .04em;
+}
+
+.wb-pane-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 4px 7px;
+  border: 0;
+  background: var(--bg-l2);
+  overflow-x: auto;
+}
+.wb-toolbar-group { display: inline-flex; gap: 2px; padding-right: 5px; border: 0; }
+.wb-toolbar-spacer { flex: 1; }
+.wb-pane-toolbar button,
+.wb-pane-actions button,
+.wb-pane-actions a,
+.wb-dock-action-grid button,
+.wb-dock-action-grid a,
+.wb-dock-action-grid span,
+.wb-primary-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 25px;
+  padding: 2px 8px;
+  /* 次级按钮一律裸排：无描边、无常态底色，只有 hover 才显 L3 底。三个描边框并排的
+     视觉重量之和会超过唯一的主行动按钮，主次就此失守。 */
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.wb-pane-toolbar button:hover,
+.wb-pane-actions button:hover,
+.wb-pane-actions a:hover,
+.wb-dock-action-grid button:hover,
+.wb-dock-action-grid a:hover { color: var(--text-1); background: var(--bg-l3); }
+.wb-pane-toolbar button.is-active { color: var(--accent); background: var(--bg-l3); }
+.wb-pane-toolbar button:disabled,
+.wb-pane-actions button:disabled { opacity: .5; cursor: not-allowed; }
+
+.wb-chat-contract {
+  display: grid;
+  grid-template-columns: 14px max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  color: var(--text-3);
+  font-size: 11px;
+  overflow: hidden;
+}
+/* 单行截断同样留净空（理由见 .wb-session-title 那条长注释）。 */
+.wb-chat-contract > span:last-child { overflow: hidden; padding-block: 1px; text-overflow: ellipsis; white-space: nowrap; }
+.wb-chat-contract .is-open { color: var(--wb-success); }
+
+.wb-pane-region { min-width: 0; min-height: 0; padding: 5px; overflow: hidden; }
+.wb-pane,
+.wb-pane-split { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+/* 终端不再是「工作台里的一块卡片」，而是一块屏幕：描边、圆角、外留白、阴影全部去掉，
+   --term-bg 从标题栏以下一路铺到窗口右缘和下缘，最像本机 tmux / iTerm。
+   原来的「上圆 12px、下方 4px」是同一圈边上下不一致的病根，注释里给的理由（终端页
+   有 4px 内边距）本身就不成立 —— 工作台 iframe 加载的是 /s/<sessionId>，那个页面
+   内边距是 0。去掉圆角之后隐患从根上消失。
+   第二行（反馈行）改 auto：内容为空时整行折叠，省下 25px 和一条线；有内容时照旧。 */
+.wb-pane {
+  display: grid;
+  grid-template-rows: 34px auto minmax(0, 1fr);
+  border: 0;
+  border-radius: 0;
+  /* 与外壳同一个变量：面板骨架露出来的那几像素也不能是第二种黑。 */
+  background: var(--term-canvas-bg, var(--term-bg));
+  box-shadow: none;
+  overflow: hidden;
+}
+.wb-pane-split { display: flex; overflow: hidden; }
+.wb-pane-split.is-horizontal { flex-direction: row; }
+.wb-pane-split.is-horizontal > :first-child { flex: 0 0 calc(var(--wb-split-first) - 3px); }
+.wb-pane-split.is-horizontal > :last-child { flex: 0 0 calc(var(--wb-split-second) - 3px); }
+.wb-pane-split.is-vertical { flex-direction: column; }
+.wb-pane-split.is-vertical > :first-child { flex: 0 0 calc(var(--wb-split-first) - 3px); }
+.wb-pane-split.is-vertical > :last-child { flex: 0 0 calc(var(--wb-split-second) - 3px); }
+.wb-pane-separator {
+  display: grid;
+  place-items: center;
+  flex: 0 0 6px;
+  padding: 0;
+  border: 0;
+  color: var(--wb-faint);
+  background: var(--wb-bg);
+}
+.wb-pane-split.is-horizontal > .wb-pane-separator { cursor: col-resize; }
+.wb-pane-split.is-vertical > .wb-pane-separator { cursor: row-resize; }
+.wb-pane-separator:hover,
+.wb-pane-separator:focus-visible { color: var(--wb-text); background: var(--wb-accent); }
+
+/* 标题栏贴 L1 上、满出血、无下边线：它与终端画布靠 L1 ↔ term-bg 的色差分层，
+   这个对比比 L0 ↔ term-bg 更大，四套配色天然满足。模式标签、风格切换、权限说明
+   都挂在它上面，所以它不能删。 */
+.wb-pane-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 0;
+  background: var(--bg-l1);
+}
+.wb-pane-identity,
+.wb-pane-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wb-pane-glyph { color: var(--wb-accent); font-weight: 800; }
+/* 模式标签的 1px 亮环（白名单第 2 类）。字号从 9px 提到 11px —— 11px 以下不用。 */
+.wb-mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  letter-spacing: .06em;
+}
+/* 语义态只改字色和 12% 底，不改那圈环的颜色：白名单里的线只允许取 --border-keep，
+   状态由字色 + 填充说，一处一个说法。 */
+.wb-mode-chip.is-controlled,
+.wb-mode-chip.is-interactive { color: var(--ok); background: var(--wb-success-soft); }
+.wb-mode-chip.is-readonly,
+.wb-mode-chip.is-preview { color: var(--warn); background: var(--wb-warning-soft); }
+/* 「未知」是真的第三种状态，不是只读的一种说法：接管/释放的回执丢了，这一刻既不
+   能说已接管也不能说只读。用中性灰把它和两个确定态区分开，别借用 warn 的黄色—
+   那会让人以为界面已经给出了只读这个结论。 */
+.wb-mode-chip.is-unknown { color: var(--text-2); background: var(--bg-l3); }
+/* 「检查中」= 首屏权威读数还没回来。和「未知」同属「没有结论」，但它是**正在收敛**
+   的一拍，不是失败态，所以用同一套中性色、不另起一种视觉语言。 */
+.wb-mode-chip.is-checking { color: var(--text-3); background: var(--bg-l3); }
+.wb-lease-time { color: var(--text-3); font-size: 11px; white-space: nowrap; }
+.wb-pane-feedback {
+  overflow: hidden;
+  padding: 4px 8px;
+  border: 0;
+  color: var(--text-2);
+  background: var(--bg-l1);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 没有反馈文案时整行让位：grid 的第二轨是 auto，display:none 之后它收成 0。 */
+.wb-pane-feedback:empty { display: none; }
+/* 终端画布。三件事：
+   ① 底色读 --term-canvas-bg：那是**这一刻真正渲染出来的 xterm 底色**，由 TS 侧的
+      workbenchTermCanvasStyle() 把 workbenchTermTheme() 的 background 写成内联变量
+      （同一份 theme 也在往终端 iframe 里推，所以外壳和画布永远同源同色）。
+      只读 --term-bg 的老写法在经典渲染下必然露边：经典 xterm 的底是它自己的
+      #1a1b26，皮肤令牌是 #030407 一类，画布外那圈安全边距就成了一道更黑的框。
+      变量没设上时回落 --term-bg，与改动前完全一致（网页预览面板走的就是这条）。
+   ② 左安全边距 8px 由这层的 padding 给 —— 外壳和 iframe 同底色，视觉上就是终端本色
+      铺满，但第 0 列字形不会贴在会话栏色块的交界上被抗锯齿吃掉半个。这条与是否有
+      圆角要内切无关：没有圆角要躲，不等于可以归零；
+   ③ position: relative 是 .wb-ws-blocked 的定位基准（实时连接被拦时盖在 iframe 上
+      的那层提示），别去掉。
+   状态条是 CLI 写进终端缓冲区的 TTY 输出，不是工作台自绘 chrome：不加上沿线、不加
+   底色，跟着画布走。 */
+.wb-pane-frame-shell {
+  position: relative;
+  min-height: 0;
+  padding: var(--term-pad);
+  background: var(--term-canvas-bg, var(--term-bg));
+  overflow: hidden;
+}
+.wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: var(--term-canvas-bg, var(--term-bg)); }
+
+/* 网页预览面板复用同一套 .wb-pane 骨架，但它装的是普通网页不是终端：底色回到 L2，
+   也不需要为字形留安全边距。 */
+.wb-web-pane,
+.wb-web-pane > .wb-pane-frame-shell { padding: 0; background: var(--bg-l2); }
+.wb-web-pane .wb-pane-frame { background: var(--bg-l2); }
+
+/* 终端渲染风格：两套容器 class 只负责几何（行距 / 内边距 / 字号），配色由 TS 侧的
+   两套 xterm theme 预设承担。class 挂在工作台根或终端面板上都行 —— 下面三个变量是
+   可继承的，落到 .wb-pane-frame-shell 和 iframe 下发通道上都读得到。
+   classic = 现状渲染（存量零变化），reader（「阅读」）= 规范里更松的行距与更大的呼吸。
+   两套都保留 8px 左安全边距，这条不因风格而失效。
+   ⚠️ --term-line-height 是 WORKBENCH_TERM_LINE_HEIGHTS（agent-workbench-appearance.ts）
+   的 CSS 侧副本：真正落到 xterm 上的是终端页那行 term.options.lineHeight，这里只做
+   声明与查阅。两处必须一字不差，agent-workbench-style.test.ts 按那张表比对。 */
+.wb-term-classic {
+  --term-pad: 4px 8px 8px 8px;
+  --term-line-height: 1;
+  --term-font-size: 12px;
+}
+.wb-term-reader {
+  --term-pad: 6px 8px 8px 8px;
+  --term-line-height: 1.15;
+  --term-font-size: 12px;
+}
+.wb-pane-empty {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 100%;
+  padding: 20px;
+  color: var(--wb-muted);
+  text-align: center;
+}
+.wb-pane-empty > span { color: var(--wb-faint); font-size: 22px; }
+.wb-pane-empty p { max-width: 460px; margin: 0; color: var(--wb-faint); }
+.wb-pane-empty a { color: var(--wb-accent); }
+
+/* 手机端（尤其飞书 iOS 内嵌浏览器）会拦掉 http 页面里 JS 发起的 ws:// 连接：iframe 照常
+   加载，实时通道却永远连不上，终端区域一片黑。这一层盖在 iframe 上说明情况，iframe 不
+   卸载，页面自己重连成功后这层就撤掉。底色要不透明，否则下面的黑屏透出来会显得像没盖住。 */
+.wb-ws-blocked {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  /* 这层是不透明的，铺满 .wb-pane-frame-shell。面板已经不带圆角，它跟着收成方角。 */
+  border-radius: 0;
+  background: var(--bg-l1);
+}
+.wb-ws-blocked a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-l3);
+}
+.wb-ws-blocked a:hover { color: var(--accent); }
+/* 末尾那句「⋯ 菜单」是补充说明，压一号字，别和上面的正文抢注意力 */
+.wb-ws-blocked p:last-of-type { font-size: 11px; }
+
+/* 控制权状态未知（回执丢了、首屏读不到）时**顶替**终端 iframe 的那一屏——不是盖在
+   它上面：盖层只吃指针事件，焦点已经在 iframe 里时键盘照旧打得进去（真实 Chromium
+   里量过）。所以 TSX 那边直接不挂 iframe，这里铺满整块画布区，复核一回来就撤。 */
+.wb-control-unknown {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  border-radius: 0;
+  background: var(--bg-l1);
+}
+.wb-control-unknown button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-l3);
+}
+
+/* 首屏控制权还在确认：与「未知」同一种「先不接入终端画面」的处理，只是文案更平静
+   （这是正常的等待，不是出了岔子），所以不给重试按钮。 */
+.wb-control-checking {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  border-radius: 0;
+  background: var(--bg-l1);
+}
+
+.wb-info-drawer {
+  position: absolute;
+  top: 106px;
+  right: 0;
+  bottom: 0;
+  z-index: 8;
+  width: min(330px, 42%);
+  /* 脱离文档流的浮层（白名单第 3 类）：它会盖在任意背景上，底色差不可控，
+     必须有确定的边缘 + --shadow-pop。 */
+  border: 0;
+  border-left: 1px solid var(--border-keep);
+  /* 抽屉从右边推出来，只有左侧两角露在外面，圆右侧等于圆到屏幕外。 */
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+  overflow: auto;
+}
+.wb-info-drawer > header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 34px;
+  padding: 0 8px;
+  /* 抽屉内部「会滚动的内容 ↔ 不滚动的固定头」的功能性边界，白名单第 1 类。 */
+  border: 0;
+  border-bottom: 1px solid var(--border-keep);
+  background: var(--bg-l2);
+}
+.wb-info-drawer > header button { width: 25px; height: 25px; border: 0; color: var(--text-1); background: transparent; }
+.wb-info-drawer > header button:hover { background: var(--bg-l3); }
+.wb-info-content { padding: 12px; }
+.wb-info-content h2 { margin: 0 0 12px; color: var(--text-1); font-size: 14px; overflow-wrap: anywhere; }
+/* 键值表靠留白分行，不靠每行一条线。 */
+.wb-info-content dl { display: grid; margin: 0; border: 0; }
+.wb-info-content dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 0; border: 0; }
+.wb-info-content dt { color: var(--text-3); }
+/* 单行截断同样留净空（理由见 .wb-session-title 那条长注释）。 */
+.wb-info-content dd { margin: 0; overflow: hidden; padding-block: 1px; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
+.wb-info-note { padding-left: 8px; border: 0; color: var(--text-3); }
+
+.wb-no-selection {
+  display: grid;
+  grid-template-rows: auto;
+  place-content: center;
+  justify-items: center;
+  color: var(--wb-muted);
+  text-align: center;
+}
+.wb-no-selection > span { color: var(--wb-accent); font-size: 34px; }
+.wb-no-selection h2 { margin: 8px 0 3px; color: var(--wb-text); font-size: 15px; }
+.wb-no-selection p { margin: 0; color: var(--wb-faint); }
+
+/* Drill-down, not tabs: the stack renders exactly one in-flow child — the session
+   list at the home level, or .wb-mobile-detail once a session is pushed.
+   .wb-mobile-nav was removed from the component, so the old 38px nav row had no
+   owner and would have parked that single child on it, leaving the 1fr row
+   empty. One row, and the child gets the full height. */
+.wb-mobile-stack { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; overflow: hidden; }
+.wb-mobile-nav { display: grid; grid-template-columns: repeat(3, 1fr); border: 0; background: var(--bg-l1); }
+.wb-mobile-nav button { border: 0; color: var(--text-2); background: transparent; }
+.wb-mobile-nav button[aria-current="page"] { color: var(--accent); background: var(--bg-l3); }
+.wb-mobile-stack .wb-session-rail { width: 100%; border-right: 0; }
+.wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+.wb-mobile-info { overflow: auto; }
+
+.agent-workbench-dock {
+  display: grid;
+  grid-template-rows: 40px minmax(220px, 1fr) auto 24px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.wb-dock-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  /* 顶栏不画下沿线：顶栏是 L1、内容区是 L0，色差已经分了区。 */
+  border: 0;
+  background: var(--bg-l1);
+}
+.wb-dock-header > div { display: flex; gap: 4px; align-items: center; }
+.wb-dock-header > div > span { color: var(--wb-accent); }
+.wb-dock-header .is-online { color: var(--wb-success); }
+.wb-dock-header .is-offline { color: var(--wb-danger); }
+.agent-workbench-dock .wb-session-rail { width: 100%; border-right: 0; }
+/* 保留线①（白名单第 1 类）：内容区 ↔ 固定操作条的功能性边界，满出血。 */
+.wb-dock-actions { display: grid; gap: 8px; padding: 12px; border: 0; border-top: 1px solid var(--border-keep); background: var(--bg-l1); }
+.wb-dock-selected { display: grid; min-width: 0; }
+/* 截断两行同样按裁切框留净空（理由见会话行标题那条）；这一格在 grid 的 auto 轨道
+   里，多出来的 2px 由轨道自己吸收，不碰 dock 的 40/220/24 三条固定轨。 */
+.wb-dock-selected strong,
+.wb-dock-selected span {
+  overflow: hidden;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-dock-selected span { color: var(--wb-muted); }
+/* 页面唯一的主行动改实心：描边式的主按钮压不住下面三个次级按钮的重量之和。 */
+.wb-primary-action {
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--on-accent);
+  background: var(--accent);
+  font-weight: 600;
+}
+.wb-primary-action:hover { color: var(--on-accent); background: var(--accent); }
+/* 三个次级按钮本来就是一组同类操作，走「全裸同行」：等宽、同高、同色、gap 4px、
+   谁都没有底板 —— 这已经读成一组。给它们加容器底会把刚压下去的重量原样抬回来。 */
+.wb-dock-action-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.wb-dock-action-grid > * { min-width: 0; min-height: 40px; white-space: normal; text-align: center; }
+.wb-dock-action-grid span[aria-disabled="true"] { color: var(--text-3); cursor: not-allowed; }
+.wb-dock-actions p { margin: 0; color: var(--text-3); }
+.agent-workbench-dock > footer { padding: 6px 12px; border: 0; color: var(--text-3); font-size: 11px; text-align: center; }
+
+@media (max-width: 767px) {
+  /* No hard floor: a Feishu side panel can be narrower than 320px, and forcing
+     a minimum here just pushed the row's right edge (and its actions) out of
+     view instead of letting the layout compress. */
+  .agent-workbench-page { min-width: 0; }
+  .wb-workspace-title strong { max-width: 62vw; }
+  .wb-pane-toolbar { gap: 3px; }
+  .wb-pane-toolbar button { padding-inline: 5px; }
+  .wb-pane-region { padding: 3px; }
+  .wb-pane-titlebar { flex-wrap: wrap; height: auto; min-height: 34px; }
+  .wb-lease-time { display: none; }
+  .wb-info-content dl > div { grid-template-columns: 78px minmax(0, 1fr); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-workbench-page *,
+  .agent-workbench-dock * { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+
+/* Row-level surface shortcuts. The actions are an overlay rather than a column,
+   so the row itself stays two cells: state mark + copy. Kept alongside the base
+   rule as the appended section's record of that layout. */
+.wb-session-row { grid-template-columns: 14px minmax(0, 1fr); }
+.wb-session-row-action {
+  width: 20px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-session-row-action:hover { color: var(--accent); background: var(--bg-l3); }
+.wb-session-row-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* The Dashboard's global control rule is `input:not(...)` seven times over,
+   which outranks any plain `.wb-… input` selector and was re-skinning the
+   Workbench search box into a 34px pill with its own background — the floating
+   overlay reported from the Feishu client. Match that specificity inside the
+   Workbench scope so the flat terminal styling wins without !important. */
+.agent-workbench-page input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]),
+.agent-workbench-dock input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  min-height: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--wb-text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: none;
+}
+
+/* Panes accumulate left-to-right; each keeps its own scroll and close control. */
+.wb-pane-stack {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.wb-stacked-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 320px;
+  min-height: 0;
+  border: 0;
+}
+.wb-stacked-pane > .wb-pane { flex: 1; min-height: 0; }
+.wb-pane-close {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  z-index: 2;
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: var(--bg-l2);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-pane-close:hover { color: var(--text-1); background: var(--bg-l3); }
+.wb-pane-placeholder {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--wb-faint);
+  font-size: 12px;
+}
+.wb-pane-placeholder span { font-size: 20px; }
+
+/* The toolbar and chat-contract rows were removed; the workspace is exactly a
+   header plus the pane stack, and the stack must land on the 1fr track or the
+   terminal iframe falls back to its 150px intrinsic height. */
+.wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+.wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+
+/* The close control floats over the pane's own titlebar; reserve room so it
+   never lands on top of the Take control / Open tab actions. */
+.wb-stacked-pane .wb-pane-titlebar { padding-right: 32px; }
+
+/* Single terminal fills the workspace: the row button is a toggle, and Feishu —
+   not this document — owns any multi-column arrangement. */
+.wb-pane-stack { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.wb-pane-stack > .wb-pane { flex: 1; min-height: 0; }
+.wb-terminal-toggle {
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  cursor: pointer;
+}
+.wb-terminal-toggle:hover { color: var(--text-1); background: var(--bg-l3); }
+
+/* Terminal closed: the rail is the whole product surface, so it takes the full
+   width and the workspace column disappears entirely. In the Feishu side panel
+   this is the "session list + native chat" arrangement — chat lives in Feishu's
+   own column, so we simply stop reserving space we are not drawing into. */
+.wb-desktop-layout.is-terminal-closed { grid-template-columns: minmax(0, 1fr); }
+.wb-desktop-layout.is-terminal-closed > .wb-rail-separator,
+.wb-desktop-layout.is-terminal-closed > .wb-workspace { display: none; }
+/* With the terminal closed the rail is the only thing we draw. Cap it so the
+   page stops claiming width it does not need — in a Feishu column that surplus
+   is what squeezes the native chat next to it. */
+.wb-desktop-layout.is-terminal-closed .wb-session-rail {
+  width: 100%;
+  max-width: var(--wb-rail-width);
+}
+
+/* The chat control is an anchor so the client receives a genuine link
+   activation; it still has to read as one of the row buttons. */
+a.wb-session-row-action { text-decoration: none; }
+
+/* Virtualisation positions every row from a fixed 54px estimate (see
+   workbenchListItemHeight in agent-workbench-model.ts — the two numbers must
+   move together), so a row that grows — a wrapping title, or action buttons
+   pushed to a second line in a narrow rail — desynchronises the scroll model
+   from what is painted. That drift is what let the list keep scrolling past its
+   own top. Pin the height and let the contents clip instead.
+   54 = 6px + 6px padding + 1px bottom border + 41px content, and the content is
+   one 15.6px title line + 4px gap + a 14px meta line = 33.6px. Touch layouts
+   keep their taller rows; see the 620px block above. */
+.wb-session-row {
+  height: 54px;
+  overflow: hidden;
+}
+.wb-session-row .wb-session-copy { min-width: 0; overflow: hidden; }
+
+/* Keep wheel momentum inside the list: at the boundary it would otherwise chain
+   to the host document, which in the Feishu WebView reads as endless scrolling. */
+.wb-session-list { overscroll-behavior: contain; }
+
+/* Terminal closed: use the whole column we were given rather than leaving a
+   dead band beside a 300px rail — the session list is the entire product here. */
+.wb-desktop-layout.is-terminal-closed .wb-session-rail {
+  width: 100%;
+  max-width: none;
+}
+
+/* Fit the row's contents inside that fixed height: one title line plus one meta
+   line; the actions float above them rather than taking a column.
+   The title is a single ellipsised line — the base .wb-session-title sets
+   white-space: nowrap, and the -webkit-line-clamp:2 that used to sit here was
+   inert anyway (clamping needs display:-webkit-box, which was never set), so the
+   row has always painted one line. Keep it that way at 54px and let the full
+   name come from the element's own title= tooltip.
+   行框（第三次修，这次是**竖直方向**）：原来 line-height:1.3 = 15.6px，正好等于
+   标题的内容盒高度，而 overflow:hidden 就贴着这个盒子裁 —— 12px 中文字形的墨迹高
+   14px 且顶满 em 盒上沿，逐像素扫出来上沿净空只剩 0.13px，「查 / 看」的第一横被
+   削平。前两轮改的是 padding-left（左缘），跟这条完全无关，所以没修到。
+   现在 1.5（18px）+ 上下各 1px 内边距 → 裁切框 20px，字形上下各留 ≥3px（换 em 盒
+   1.4em 的中文字体也还有 1.6px）。
+   54px 的虚拟滚动契约没动，靠行内重新分配吸收：
+     54 = 5 上内边距 + 42 内容 + 5 下内边距 + 2 余量
+     内容 42 = 标题 20（18 行框 + 2 内边距）+ 4 间距 + meta 18
+   行的上下内边距从 6 收到 5（本条下面 .wb-session-row 的四值 padding），这 2px 就是
+   标题多出来的高度的来源；左右两个数一个没动，左缘那两轮修复原样保留。 */
+.wb-session-row .wb-session-title {
+  line-height: 1.5;
+  padding-block: 1px;
+}
+.wb-session-row .wb-session-meta {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Row actions are secondary to the title: in a ~600px column three bordered
+   boxes read as the loudest thing in the row. Drop to bare labels inside the
+   overlay and let each button's own surface appear only on hover/focus, so they
+   stay reachable without competing with the session name. Each label is two
+   characters of text, so the width follows the copy instead of a fixed square. */
+.wb-session-row-action {
+  width: auto;
+  height: 20px;
+  /* The Dashboard's global `button, .btn-link { min-height: 32px }` outranks a
+     bare `height` (min-height wins over height in the used-value calculation),
+     so the three <button> actions inflated to 32px while the <a> "chat" action
+     stayed at 20px — the row's actions rendered top-aligned and bottom-ragged.
+     Zero the floor here so `height` is what actually decides the box. */
+  min-height: 0;
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.wb-session-row-action:hover,
+.wb-session-row-action:focus-visible {
+  background: var(--bg-l3);
+}
+
+.wb-workspace-controls { display: flex; align-items: center; gap: 6px; }
+
+/* The rail must never push the row wider than the column it was given. */
+.wb-session-rail, .wb-session-list { max-width: 100%; overflow-x: hidden; }
+
+/* The Dashboard sets body { min-width: 320px } for its own multi-column pages.
+   A Feishu side panel can be narrower than that, and the floor made the whole
+   document overflow rather than letting the rail compress. Lift it only while a
+   Workbench surface is mounted. */
+body:has(.workbench-route-host) { min-width: 0; }
+
+/* Mobile workspace header: title and the terminal toggle cannot always sit on
+   one 390px line. Let it wrap and keep the controls reachable. */
+@media (max-width: 620px) {
+  .wb-workspace-header { flex-wrap: wrap; gap: 4px; padding: 6px 8px; height: auto; }
+  .wb-workspace-controls { flex-wrap: wrap; }
+  .wb-workspace-title { min-width: 0; flex: 1 1 100%; }
+  .wb-layout-level { font-size: 11px; padding: 2px 6px; }
+}
+
+/* Mobile: the page switcher belongs under the thumb, not at the top of a phone
+   held one-handed. Content first, nav last, and the bar keeps clear of the home
+   indicator. Targets go to 44px — the row actions are 20px tall on desktop,
+   fine for a mouse and too small for a fingertip. */
+@media (max-width: 620px) {
+  .wb-mobile-stack {
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas: "content" "nav";
+  }
+  .wb-mobile-stack > .wb-mobile-nav {
+    grid-area: nav;
+    border: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .wb-mobile-stack > :not(.wb-mobile-nav) { grid-area: content; min-height: 0; }
+  .wb-mobile-nav button { min-height: 44px; font-size: 12px; }
+
+  .wb-session-row-action { height: 34px; padding: 0 8px; font-size: 12px; }
+  .wb-session-search input { height: 34px; font-size: 13px; }
+}
+
+/* Mobile drill-down chrome: back control, session name, and a compact segment
+   for the surfaces inside one session. */
+/* 下钻容器按「盖上来的一张卡」处理：只圆上两角，下面是贴底的导航/终端，圆了会露缝。 */
+/* 只保留一层圆角：外层是 bottom-sheet 的形状语义，内层的终端画布直接铺满，不再
+   套第二个同心圆角（原来两层 12px 圆角贴在一起，容器自己又没有底色，顶角裁出来
+   的是页面底色 —— 首屏顶部就露出两个小缺角）。 */
+.wb-mobile-detail {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: var(--bg-l1);
+  overflow: hidden;
+}
+.wb-mobile-detail .wb-pane { border-radius: 0; }
+.wb-mobile-detail-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  /* 不画下沿线：这条边界由 L1 ↔ term-bg 的色差表达。 */
+  border: 0;
+  background: var(--bg-l1);
+}
+.wb-mobile-back {
+  min-height: 44px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--accent);
+  background: transparent;
+  font-size: 13px;
+  cursor: pointer;
+}
+.wb-mobile-back:hover { background: var(--bg-l3); }
+.wb-mobile-detail-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  /* 同会话行标题：截断靠 hidden，净空靠内边距。这条 bar 的高度由 44px 的返回按钮
+     定，标题多 2px 完全在里面，手机端行高不受影响。 */
+  padding-block: 1px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--wb-text);
+  font-size: 12px;
+}
+/* 分段控件走「共享底板」：一块容器底 + overflow:hidden，圆角完全由容器裁，
+   子项恒为方角 —— 每个元素四角同值仍然成立，不需要 `10px 0 0 10px` 那种四值写法。 */
+.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 0; border-radius: var(--radius-md); background: var(--bg-l2); overflow: hidden; }
+.wb-mobile-detail-seg button {
+  min-height: 36px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 0;
+  color: var(--text-3);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.wb-mobile-detail-seg button:hover { background: var(--bg-l3); }
+/* 选中段：字色 + 字重 + 2px accent 内底线，不引入第五档灰做 thumb。 */
+.wb-mobile-detail-seg button[aria-current="page"] {
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* Fingertip targets for the row actions on touch layouts.
+   行高 84 → 60：84px 里只装「标题 + meta」两行，竖直方向约 24px 是空的。60px 仍是
+   两行（12 padding + 18 标题 + 4 + 14 meta + 12 padding），把空掉的那 24px 换成密度
+   —— 390×844 下同一块列表区从 5 条变成 8 条。
+   ⚠️ 行高是虚拟滚动的硬契约：这个数必须和 workbenchListItemHeight 的触屏分支
+   （agent-workbench-model.ts）一字不差，对不上列表就会滚过自己的末尾。 */
+@media (max-width: 620px) {
+  .wb-session-row-action { height: 44px; padding: 0 10px; font-size: 13px; }
+  .wb-session-row { height: 60px; }
+  .wb-session-row .wb-session-copy { gap: 4px; }
+}
+
+/* P1-17：指尖目标按「指针类型」补齐，不再只按视口宽度。
+   44px 那套原先只写在 max-width: 620px 里，横屏 iPad（1024–1366px 且 hover: none）
+   于是两头落空，拿到的还是给鼠标做的 18–25px 目标：终端/接管、坞里的三个动作、
+   收起后的会话栏，手指都够不着。
+   这里刻意不动 .wb-session-row 的行高——虚拟滚动按 workbenchListItemHeight 摆放每
+   一行，行高只能跟着那份宽度契约走（54 / 84）。行操作是绝对定位的浮层，把按钮撑到
+   44px 不参与任何一行的摆放，所以两者不冲突。 */
+@media (hover: none) {
+  /* 触控尺寸只在这里改一个令牌，具体元素的下限由 var(--touch-target) 读它。
+     下面那几条 44px 的字面量是历史契约（单测按它们钉住指尖目标），保留。 */
+  .agent-workbench-page,
+  .agent-workbench-dock { --touch-target: 44px; }
+  .wb-session-row-action { min-width: 44px; height: 44px; padding: 0 10px; font-size: 13px; }
+  .wb-appearance-btn,
+  .wb-more-btn { min-width: 44px; min-height: 44px; }
+  .wb-pane-toolbar button,
+  .wb-pane-actions button,
+  .wb-pane-actions a,
+  .wb-dock-action-grid button,
+  .wb-dock-action-grid a,
+  .wb-dock-action-grid span,
+  .wb-primary-action { min-height: 44px; padding-inline: 10px; }
+  .wb-mobile-detail-seg button { min-height: 44px; }
+  /* 收起的会话栏是把列表叫回来的唯一入口（P1-18）：40px 的窄条在触屏上本来就难点，
+     栏宽和它所在的网格列要一起放宽，否则按钮撑不满、右边露一道缝。
+     终端关着的时候栏本来就铺满整页（.is-terminal-closed，那时它是唯一要画的东西），
+     那条更宽的规则不能被这里改窄——否则触屏反而只剩 44px 可点。 */
+  .wb-desktop-layout.is-rail-collapsed:not(.is-terminal-closed) { grid-template-columns: 44px minmax(0, 1fr); }
+  .wb-session-rail.is-collapsed { width: 44px; }
+}
+
+/* Mobile detail already shows the session name and its surface switcher, so the
+   workspace's own header would repeat both and cost ~46px of the little height
+   a phone terminal has. One bar, not two.
+
+   The header is display:none at this breakpoint, so it is out of flow and takes
+   no grid cell at all — .wb-pane-stack is the workspace's only in-flow child.
+   The template therefore has to be a single row. A leading auto row would eat
+   the stack (it lands on row 1, ~61px) and leave the 1fr row empty, which
+   collapses .wb-pane-frame-shell → .wb-pane-frame to 0 height and renders
+   no terminal on a phone. */
+@media (max-width: 620px) {
+  .wb-mobile-detail .wb-workspace-header { display: none; }
+  .wb-mobile-detail .wb-workspace { grid-template-rows: minmax(0, 1fr); }
+  .wb-mobile-detail-bar { padding: 4px 8px; gap: 6px; }
+  .wb-mobile-back { min-height: 40px; padding: 0 6px; }
+}
+
+.wb-mobile-preview { display: flex; min-height: 0; overflow: hidden; }
+.wb-mobile-preview > .wb-pane { flex: 1; min-height: 0; }
+
+/* 行操作浮层：平时隐藏，悬停/聚焦出现，垂直居中不与时间戳抢位 */
+.wb-session-row-actions {
+  position: absolute;
+  top: 50%;
+  /* 和行的右内边距对齐：浮层自己带边和阴影，压在底板圆角上会看出两层圆弧不同心。 */
+  right: 14px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  padding: 2px 4px;
+  /* 脱离文档流的浮层（白名单第 3 类）：底色差不可控，必须有确定的边缘 + 阴影。
+     外壳比里面的按钮（10px）再大一档，包住时圆弧才是同心的。 */
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+  transform: translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .14s ease-out;
+}
+.wb-session-row:hover .wb-session-row-actions,
+.wb-session-row:focus-within .wb-session-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* 触屏无 hover：点选中的行显示浮层 */
+@media (hover: none) {
+  .wb-session-row.is-selected .wb-session-row-actions { opacity: 1; pointer-events: auto; }
+}
+
+/* 会话类型徽标（话题 / 群 / 单聊）。挤在 meta 行里，所以行高由 line-height 锁死，
+   总高 16px < meta 行本身的高度，不会把虚拟滚动算好的行高撑开。 */
+/* chip 的 1px 亮环（白名单第 2 类）：在无边框环境里，chip 靠这圈比填充更亮的环
+   跳出来。字号提到 11px，总高仍小于 meta 行本身，撑不开虚拟滚动算好的行高。 */
+.wb-session-kind {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 16px;
+  /* 徽标刻意**不**跟 meta 行其它格一起开 overflow:hidden（见上面那条 :not() 选择
+     器）。它是 flex:none + 一两个字的固定文案（话题 / 群 / 单聊），永远没有要截断
+     的内容，开了 hidden 等于白架一把裁刀 —— 16px 行框装 11px 中文，遇到 em 盒高的
+     中文字体半行距只剩 0.3px，「话」字上沿就被自己这圈框削平了。
+     不裁之后，它的字形只受 meta 行那层裁切管，而 1px 亮环天然把内容又让进 1px，
+     净空恒 ≥1px。nowrap 仍要保留：两个字的徽标不能折行。 */
+  white-space: nowrap;
+}
+/* meta 行是 space-between 的两栏（描述 | 时间）。插进徽标就变成三栏，自由空间
+   会被均分到徽标和描述之间。让描述吃掉剩余空间，恢复「左对齐 + 时间靠右」。 */
+.wb-session-kind + span { margin-right: auto; }
+
+/* 定位成功后的短暂确认态 */
+.wb-session-row-action.is-locate.is-located { color: var(--ok); }
+
+/* 未读点：时间戳左边一颗 8px 实心圆，accent 蓝在深浅两套主题下都够显眼。
+   flex:none 保证 meta 行被挤窄时它不会被压扁成一条线。
+   标题颜色刻意不动：标题本来就是 --wb-text + 700，两套主题里都没有「更重」的余地，
+   未读全靠这颗点 + 进「待你处理」组 + 行内「有新回复」三件事表达。 */
+.wb-unread-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  /* 它也是 .wb-session-meta 的直接子 span，会吃到上面那条「截断文字留 1px 上下
+     内边距」的规则。这颗点是纯色块不是文字，尺寸只由 width/height 说了算：
+     全站 box-sizing:border-box 下 8×8 本来就不会变形，这里显式归零，免得哪天
+     谁把 border-box 撤了，圆点被撑成椭圆。 */
+  padding: 0;
+  border-radius: 50%;
+  background: var(--wb-accent);
+}
+/* meta 行原本靠 space-between 撑成「描述 | 时间」两栏，插进未读点就成了三栏，
+   没有类型徽标的行会把点甩到行中间。让第一栏（没有徽标时就是描述本身）吃掉
+   剩余空间，点和时间就永远贴在右边。有徽标的行由上面的 .wb-session-kind + span
+   规则负责，两条规则互斥，任何一行都只会有一个 auto 外边距。 */
+.wb-session-meta > span:first-child:not(.wb-session-kind) { margin-right: auto; }
+
+/* 分组维度下拉：和栏头的收起按钮同一套线条语言（透明底 + 1px 描边 + 24px 高）。
+   全站的 select 基线规则（min-height 34px / padding 7px 11px / 右侧 30px 留给箭头）
+   特异性只有 0,0,1，这里逐条压掉；箭头沿用那条规则里的默认 SVG，不自绘。
+   margin-left:auto 把它推到收起按钮旁边，栏头保持「左标题 · 右控件」。 */
+.wb-group-dim {
+  height: 24px;
+  min-height: 0;
+  max-width: 96px;
+  padding: 0 16px 0 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background-color: transparent;
+  background-position: right 3px center;
+  font: inherit;
+  font-size: 11px;
+  line-height: 24px;
+  cursor: pointer;
+}
+.wb-group-dim:hover { color: var(--text-1); background-color: var(--bg-l3); }
+/* 展开的选项列表由浏览器绘制，只保证它跟随当前主题的底色和字色。 */
+.wb-group-dim option { color: var(--text-1); background: var(--bg-l2); }
+
+/* 分组组头 = 折叠开关。它就是原来那个 .wb-session-group 元素本身，只是标签换成了
+   <button>，于是全站的按钮基线（min-height 32px / 1px 描边 / raised 底色 / 居中
+   文字）会突然罩进来。组头高度是虚拟滚动算好后写死在 style 上的 30px，min-height
+   在 used value 上压过 height，不清零就会撑成 32px、和滚动模型差 2px 一路累积。
+   选择器故意用两个类：全局的 `.agent-workbench-page button { font: inherit }`
+   特异性是 (0,1,1)，单靠 .wb-session-group 的 font-size:10px (0,1,0) 压不住，
+   组头字号会被顶回 12px。
+   这里一个字都不提 color —— 待你处理的红、进行中的绿由 .wb-session-group-needs-you
+   / -active 负责，写了 color 就会被这条更特异的规则洗掉。 */
+.wb-session-group.wb-session-group-toggle {
+  width: 100%;
+  min-height: 0;
+  /* 左缘对齐（第二次修）：这条规则比 .wb-session-group 特异性高，组头**实际生效的**
+     内边距一直是这里的 `2px`，上一轮改在 .wb-session-group 上的 22px 从来没落到过
+     渲染上——组头下面那块 hover 底板（::before，inset 1px 8px、圆角 14）左缘在 8px，
+     折叠箭头却坐在 2px，整个字形落在底板**外面**、离会话栏左边缘只剩 3.7px，读起来
+     就是「箭头贴边被切」。
+     现在四列写成「箭头列 = 行的状态标列」：左内边距 22（= 底板左缘 8 + 圆角 14）后
+     箭头占 22–36，与 .wb-session-row 的状态标格逐像素重合；第二列 14px 的组图标落在
+     40，正好是行标题的起点。整条列表左侧只剩 22 / 40 两条线。 */
+  grid-template-columns: 14px 14px minmax(0, 1fr) auto;
+  padding: 5px 14px 3px 22px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 11px;
+  /* 1.4 → 1.5：组头自己也是 overflow:hidden，11px 中文在 15.4px 行框里半行距归零，
+     组名上沿会被这层裁切削平。组头高 30px、上下内边距 5/3，内容区有 22px，
+     16.5px 的行框加组名那 2px 内边距（下一条）也才 18.5px，装得下。 */
+  line-height: 1.5;
+  letter-spacing: .09em;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+}
+/* 组头的 hover 底色和会话行走同一套：::before 是圆角内缩底板，按钮本身保持透明、
+   保持方角（它的 overflow:hidden 按方角裁，裁不到内缩的底板）。
+   同样用 z-index:-1 落到内容之下，理由见 .wb-session-row::before 的注释。 */
+.wb-session-group.wb-session-group-toggle::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  /* 与会话行底板同一条 8px 内缩线：两块底板左右对齐，列表左侧只剩一条对齐线。 */
+  inset: 1px 8px;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  transition: background-color .14s ease-out;
+}
+.wb-session-group-caret { text-align: center; }
+/* 长组名（会话名、仓库名都是自由文本）截断，别压到右边的计数上。
+   自己开了 overflow:hidden 就要自己留净空，理由同标题那条。 */
+.wb-session-group-toggle > strong {
+  min-width: 0;
+  overflow: hidden;
+  padding-block: 1px;
+  text-overflow: ellipsis;
+}
+/* hover：中性组提亮文字；语义色的两组只加底色，一 hover 就把红/绿洗成前景色会丢语义。 */
+.wb-session-group-toggle:hover { color: var(--wb-text); }
+.wb-session-group-toggle:hover::before { background: var(--bg-l3); }
+.wb-session-group-toggle.wb-session-group-needs-you:hover { color: var(--wb-danger); }
+.wb-session-group-toggle.wb-session-group-active:hover { color: var(--wb-success); }
+
+/* 拖动会话栏宽度期间：iframe 不抢指针事件，页面不选中文字 */
+.agent-workbench-page.is-rail-dragging { user-select: none; }
+.agent-workbench-page.is-rail-dragging iframe { pointer-events: none; }
+
+/* ───────────────────────────────────────────────────────────────────────────
+   按钮成组：同组操作 = 一个视觉对象
+   分组关系用「共享底板」或「统一裸排」表达，绝不用「每人一块小板」表达。
+   一排各自带圆角、各自带底色、中间还留缝的按钮，读起来是几个互不相干的东西，
+   而不是同一个对象的几个操作 —— 这是本段要从语法上堵死的形态。
+   合法形态只有两种：
+   (a) 共享底板 = 下面的 .wb-action-group；
+   (b) 全裸同行 = 谁都没有底板、同高同色等距（dock 三个次级按钮、⋯ 菜单项、
+       外观面板里的 4 枚色板都走这种，不需要额外的类）。
+   单按钮不成组：给一个按钮套一个盒子只是多一块噪声。
+   ─────────────────────────────────────────────────────────────────────────── */
+.wb-action-group,
+.wb-seg {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  /* 组落在 L0 / L1 上取 L2；落在 L2 上的组加 .on-l2 往亮走一档，永远与父层拉开一档。 */
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: none;
+  /* 组内子项的圆角全靠它裁 */
+  overflow: hidden;
+}
+.wb-action-group.on-l2,
+.wb-seg.on-l2 { background: var(--bg-l3); }
+/* 选择器带上 .agent-workbench-* 前缀不是啰嗦：工作台的控件基线是
+   `.agent-workbench-page button`（0,1,1），比裸的 `.wb-action-group > *`（0,1,0）更特异，
+   不加前缀的话组内子项会被那条规则重新塞回 10px 圆角，「圆角全由容器裁」当场失效。 */
+.agent-workbench-page .wb-action-group > *,
+.agent-workbench-dock .wb-action-group > *,
+.agent-workbench-page .wb-seg-item,
+.agent-workbench-dock .wb-seg-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0 10px;
+  border: 0;
+  /* 恒为 0：两端的圆角由容器裁出来，每个元素仍然四角同值 */
+  border-radius: 0;
+  color: var(--text-2);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.wb-action-group > *:hover,
+.wb-action-group > *[aria-selected="true"],
+.wb-action-group > *[aria-current="page"],
+.wb-seg-item:hover,
+.wb-seg-item.is-on { background: var(--bg-l3); }
+.wb-action-group.on-l2 > *:hover,
+.wb-action-group.on-l2 > *[aria-selected="true"],
+.wb-action-group.on-l2 > *[aria-current="page"],
+.wb-seg.on-l2 > .wb-seg-item:hover,
+.wb-seg.on-l2 > .wb-seg-item.is-on { background: var(--bg-l2); }
+
+/* 组内分线是「按需开」，不是默认开：只允许挂在「≥3 项 且 容器高 ≥40px」的组上。
+   用伪元素而不是 box-shadow —— 分线必须上下各内缩 10px，满高的线会在组的上下边缘
+   顶到容器圆角上，看起来就像组被切成了几块，又回到独立浮块。
+   `> * + *` 本身就保证第一项不画线，也就保证线永远不会出现在组的外缘。 */
+.wb-action-group.has-dividers > * + * { position: relative; }
+.wb-action-group.has-dividers > * + *::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  background: var(--border-keep);
+}
+
+/* 破坏性 / 不可逆动作留在组内，靠字色和字重区分，不靠隔离 —— 距离表达的是「不同类」，
+   而这几个操作恰恰是同一类，只是后果轻重不同。轻重是强调问题，强调用字色和字重。
+   用 accent 而不是 err：err 已经被「会话状态点 = 需要你处理」占了语义。 */
+.wb-action-group .is-danger { color: var(--accent); font-weight: 600; }
+.wb-action-group .is-danger:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+/* 分段控件（阅读 / 经典、跟随系统 / 浅色 / 深色）：容器 24px 高，按自身高度取档 → sm。
+   选中段 = 字色 + 600 字重 + 2px accent 内底线，不引入第五档灰做 thumb。
+   只有 2 项、或容器高 < 40px 的组一律不画组内分线（白名单第 6 类第 ③④ 条）。 */
+.wb-seg,
+.wb-action-group.is-segmented {
+  height: 24px;
+  border-radius: var(--radius-sm);
+}
+.agent-workbench-page .wb-seg-item,
+.agent-workbench-dock .wb-seg-item,
+.agent-workbench-page .wb-action-group.is-segmented > *,
+.agent-workbench-dock .wb-action-group.is-segmented > * {
+  min-width: 40px;
+  min-height: 0;
+  padding: 0 8px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.wb-seg-item.is-on,
+.wb-action-group.is-segmented > *[aria-selected="true"],
+.wb-action-group.is-segmented > *[aria-current="page"] {
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+/* 「跟随系统」比另外两段长，给模式分段一个更宽的下限，三段仍然等宽。 */
+.wb-appearance-mode-seg > .wb-seg-item { min-width: 56px; }
+
+/* 触屏露出的操作组：一块 156×56 的板，不是三块。
+   156 = 3 × 52，每个动作 52 × 56，宽高都超过 44px 的指尖下限；56 = 行卡底板高
+   （60px 行高减去上下各 2px inset），与行卡等高。
+   组的右缘与行卡的 8px 内缩落在同一条线上：贴屏边会让滑出的这一行比其余每一行都
+   多探出 8px，静态图上一眼看得出跑偏。
+   选择器只写 `.wb-session-row-actions`：行操作那个 <span> 从来只有这一个类，
+   原来写的 `.wb-session-row-actions.wb-action-group` 一次都没匹配上，整段是死的。
+   也不能反过来去 TSX 上补 `wb-action-group` —— 那个类在本文件里排得更后、特异性
+   相同，会把桌面浮层的 1px 描边和投影一并抹掉（浮层归白名单第 3 类，必须有边有影）。
+   `overflow` 与子项的 `border-radius: 0` 本来由 `.wb-action-group` 提供，这里就地
+   补上：组的圆角由容器裁，子项四角同值，才读得成一个对象。 */
+@media (hover: none) {
+  .wb-session-row-actions {
+    right: 8px;
+    gap: 0;
+    width: 156px;
+    height: 56px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-lg);
+    background: var(--bg-l2);
+    box-shadow: none;
+    overflow: hidden;
+  }
+  .agent-workbench-page .wb-session-row-actions > *,
+  .agent-workbench-dock .wb-session-row-actions > * {
+    flex: 1;
+    width: 52px;
+    min-width: 52px;
+    height: 56px;
+    padding: 0;
+    border-radius: 0;
+    font-size: 12px;
+  }
+}
+
+/* ⋯ 菜单：`⋯` 是单按钮，不套容器底板 —— 给一个按钮加一个盒子只是多一块噪声。
+   下拉浮层走白名单第 3 类（1px --border-keep + --shadow-pop）；里面的菜单项走形态
+   (b)：全裸列表项，等高等距，谁都没有自己的底板，hover 才显满宽 L3 底。 */
+.wb-more { position: relative; display: inline-flex; }
+.wb-more-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-more-btn:hover,
+.wb-more-btn[aria-expanded="true"] { color: var(--text-1); background: var(--bg-l3); }
+.wb-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  min-width: 156px;
+  padding: 4px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+}
+/* 同样带前缀压过 `.agent-workbench-page button` 的 10px 基线（见上）。 */
+.agent-workbench-page .wb-more-item,
+.agent-workbench-dock .wb-more-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.wb-more-item + .wb-more-item { margin-top: 2px; }
+.wb-more-item:hover { color: var(--text-1); background: var(--bg-l3); }
+/* 破坏性动作（接管）固定在列表最末，靠字色和字重标识，不加分组线、不额外留缝。 */
+.wb-more-item.is-danger { color: var(--accent); font-weight: 600; }
+
+/* ───────────────────────────────────────────────────────────────────────────
+   外观面板：主题（4 枚色板）+ 明暗（分段控件）+ 终端渲染（分段控件）
+   桌面是下拉浮层，移动是底部 sheet；两处入口、一个状态源。
+   ─────────────────────────────────────────────────────────────────────────── */
+/* H5 列表页顶栏那枚 ◐：与右邻的收起按钮各是一个单按钮 —— 等高等色、都没有底板，
+   也不套共享底板（一个管外观、一个管会话，不是同一组操作）。 */
+.wb-appearance-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-2);
+  background: transparent;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-appearance-btn:hover { color: var(--text-1); background: var(--bg-l3); }
+
+/* 桌面：挂在 ⋯ 按钮下方的下拉浮层（白名单第 3 类）。宽 260px：
+   4 枚 28px 色板 + 3×12px 间距 + 2×12px 内边距 = 172px，装得下。 */
+.wb-appearance-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  width: 260px;
+  padding: 12px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-lg);
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+}
+/* 移动：同一块内容改底部 sheet。顶角与下钻容器同形、贴屏底不圆下两角 —— 这是
+   「一个元素四角同值」唯一的例外。 */
+.wb-appearance-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: flex-end;
+  background: var(--modal-backdrop, rgba(10, 14, 18, .48));
+}
+.wb-appearance-sheet {
+  width: 100%;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: var(--bg-l2);
+  box-shadow: var(--shadow-pop);
+}
+.wb-appearance-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--text-1);
+  font-size: 13px;
+}
+.wb-appearance-head button {
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-3);
+  background: transparent;
+  cursor: pointer;
+}
+.wb-appearance-head button:hover { color: var(--text-1); background: var(--bg-l3); }
+/* 两组之间 16px 留白 + 组标题，不画分组线（白名单里没有「面板内分组线」这一类）。 */
+.wb-appearance-group { display: grid; gap: 8px; justify-items: start; }
+.wb-appearance-group + .wb-appearance-group { margin-top: 16px; }
+.wb-appearance-group-label { color: var(--text-3); font-size: 11px; }
+.wb-appearance-note { margin: 0; color: var(--text-3); font-size: 11px; line-height: 16px; }
+
+/* 常驻链接弹层：定位/描边/投影完全由 .wb-appearance-pop 那一份负责（同一族浮层，
+   不另起一套），这里只排里面的三样东西——只读链接框、复制按钮、说明。
+   链接是一长串等宽字符，宽一点才不至于一眼全是省略号。 */
+.wb-standing-link-pop { width: 300px; }
+.wb-standing-link-body { display: grid; gap: 8px; }
+/* 只读文本框而不是 <code>：能整条选中、能用系统的复制手势，是自动复制被浏览器
+   策略拦掉时唯一还管用的退路。折行显示——链接有六七十个字符，单行框里只看得见
+   开头一截，而这块弹层的用途就是把**完整**链接摆出来。 */
+.wb-standing-link-url {
+  width: 100%;
+  min-height: var(--touch-target);
+  padding: 6px 8px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  background: var(--bg-l1);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  line-height: 17px;
+  word-break: break-all;
+  resize: none;
+}
+.wb-standing-link-copy,
+.wb-standing-link-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--touch-target);
+  padding: 0 12px;
+  border: 1px solid var(--border-keep);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  background: var(--bg-l2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.wb-standing-link-copy:hover,
+.wb-standing-link-open:hover { background: var(--bg-l3); }
+/* sheet 里那枚入口占满一行：底部 sheet 的其余控件都是整行节奏。 */
+.wb-standing-link-open { width: 100%; }
+.wb-standing-link-status { margin: 0; color: var(--text-3); font-size: 12px; }
+.wb-standing-link-note { margin-top: 12px; }
+
+/* 4 枚色板走形态 (b)：它们是单选项不是操作按钮，四枚等距同尺寸本身已经读成一组。
+   给色板加一块容器底反而会干扰对色相的判读 —— 底色会影响对色相的感知。 */
+.wb-skin-swatches { display: flex; gap: 12px; }
+.wb-skin-swatch {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+/* 三色缩影：左 2/3 = 该套的 L1、右上 1/3 = L3、右下 1/3 = accent，一眼看出色相和
+   accent，不用点进去试。三块纯色由两个伪元素叠出来，刻意不用渐变（段内零渐变）。
+   三个色值由 TS 侧按皮肤内联下发（--sw-bg / --sw-raise / --sw-accent）：色板画的是
+   「目标皮肤」的颜色，当前页的令牌给不了。 */
+.wb-skin-swatch-chip {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--sw-bg);
+  overflow: hidden;
+}
+.wb-skin-swatch-chip::before,
+.wb-skin-swatch-chip::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  width: 33.33%;
+  height: 50%;
+}
+.wb-skin-swatch-chip::before { top: 0; background: var(--sw-raise); }
+.wb-skin-swatch-chip::after { bottom: 0; background: var(--sw-accent); }
+/* 选中标识：外圈 2px accent 环（与焦点环同族画法，但常驻） */
+.wb-skin-swatch.is-active .wb-skin-swatch-chip { box-shadow: 0 0 0 2px var(--accent); }
+.wb-skin-swatch-name { color: var(--text-3); font-size: 11px; line-height: 14px; white-space: nowrap; }
+.wb-skin-swatch.is-active .wb-skin-swatch-name { color: var(--text-1); font-weight: 600; }

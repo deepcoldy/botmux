@@ -152,6 +152,7 @@ describe('Riff explicit close', () => {
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: false,
       known: true,
     });
@@ -187,6 +188,7 @@ describe('Riff explicit close', () => {
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: false,
       known: true,
     });
@@ -220,7 +222,7 @@ describe('Riff explicit close', () => {
       status: 'active',
       riffParentTaskId: 'task-riff-123',
     });
-    expect(fixture.ds.riffCloseState).toBeUndefined();
+    expect(fixture.ds.remoteCloseState).toBeUndefined();
   });
 
   it('refuses an unprepared generic retirement of a live Riff worker', () => {
@@ -238,7 +240,7 @@ describe('Riff explicit close', () => {
 
   it('refuses explicit close while the daemon shutdown fence owns the Riff worker', async () => {
     const fixture = createFixture({ liveWorker: true });
-    fixture.ds.riffShutdownState = {
+    fixture.ds.remoteShutdownState = {
       phase: 'preparing',
       requestId: 'shutdown-riff',
       taskId: 'task-riff-123',
@@ -247,7 +249,7 @@ describe('Riff explicit close', () => {
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: false,
       alreadyClosed: false,
-      error: 'riff_shutdown_fence_in_progress',
+      error: 'remote_shutdown_fence_in_progress',
       retryable: true,
       taskId: 'task-riff-123',
     });
@@ -260,7 +262,7 @@ describe('Riff explicit close', () => {
 
   it('shows a localized close-in-progress notice instead of leaking the i18n key', async () => {
     const fixture = createFixture({ liveWorker: true });
-    fixture.ds.riffCloseState = {
+    fixture.ds.remoteCloseState = {
       phase: 'preparing',
       requestId: 'close-riff',
       taskId: 'task-riff-123',
@@ -279,7 +281,7 @@ describe('Riff explicit close', () => {
     );
     expect(sessionReplyMock).not.toHaveBeenCalledWith(
       expect.anything(),
-      'worker.riff_close_in_progress',
+      'worker.remote_close_in_progress',
       expect.anything(),
       expect.anything(),
       expect.anything(),

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { updateAndRestartBotmux } from '../src/dashboard/web/update-action.js';
+import { updateAndRestartBotmux, updateResponseNeedsRestart } from '../src/dashboard/web/update-action.js';
 
 function json(status: number, body: unknown): Response {
   return Response.json(body, { status });
@@ -116,10 +116,54 @@ describe('dashboard update and restart action', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('flags bootstrap-required when the fleet predates the shutdown protocol', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(json(200, {
+        ok: true,
+        oldVersion: '3.0.0',
+        newVersion: '3.1.0',
+        changed: true,
+      }))
+      .mockResolvedValueOnce(json(409, {
+        ok: false,
+        error: 'bootstrap_shutdown_protocol_required',
+        unsafeDaemons: ['botmux-local', 'botmux-relay'],
+      }));
+
+    await expect(updateAndRestartBotmux(fetchImpl)).resolves.toEqual({
+      oldVersion: '3.0.0',
+      newVersion: '3.1.0',
+      changed: true,
+      restarted: false,
+      bootstrapRequired: true,
+      unsafeDaemons: ['botmux-local', 'botmux-relay'],
+    });
+    // Distinct from a generic restart failure: no restartError is surfaced,
+    // so the UI shows the actionable bootstrap message instead.
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects a malformed successful update response', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(json(200, { ok: true }));
 
     await expect(updateAndRestartBotmux(fetchImpl)).rejects.toThrow('Invalid update response');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('updateResponseNeedsRestart', () => {
+  it('requires a restart when the version changed (generic npm/pnpm/bun path)', () => {
+    expect(updateResponseNeedsRestart({ changed: true })).toBe(true);
+  });
+
+  it('requires a restart when restartRequired is set even if changed is false', () => {
+    // The core local-dev regression: a build-only update (HEAD unchanged →
+    // changed:false) still regenerated dist/ and MUST restart to apply it.
+    expect(updateResponseNeedsRestart({ changed: false, restartRequired: true })).toBe(true);
+  });
+
+  it('does not restart when nothing changed and no restart is required', () => {
+    expect(updateResponseNeedsRestart({ changed: false })).toBe(false);
+    expect(updateResponseNeedsRestart({})).toBe(false);
   });
 });

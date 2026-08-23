@@ -1,3 +1,4 @@
+import type { ParsedCloseResidual } from '../core/close-residual.js';
 export const IDLE_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
 export type IdleCleanupHours = typeof IDLE_CLEANUP_HOUR_OPTIONS[number];
 
@@ -53,6 +54,8 @@ export interface IdleCleanupCloseResult {
   sessionId: string;
   ok: boolean;
   error?: string;
+  /** Closed locally, but its remote session survived and needs manual cleanup. */
+  residual?: ParsedCloseResidual;
 }
 
 export interface IdleCleanupResult {
@@ -62,6 +65,8 @@ export interface IdleCleanupResult {
   matched: number;
   closed: number;
   failed: number;
+  /** Subset of `closed` whose remote session was NOT cancelled. */
+  residual: number;
   results: IdleCleanupCloseResult[];
 }
 
@@ -78,6 +83,9 @@ export async function cleanupIdleSessions<T extends IdleCleanupSessionRow>(
   }
   const closed = results.filter(r => r.ok).length;
   const failed = results.length - closed;
+  // Counted, never folded into `closed`: an idle/workerless mojo row can carry a
+  // parked lineage, so "closed N, failed 0" would otherwise hide live remotes.
+  const residual = results.filter(r => r.ok && r.residual).length;
   return {
     ok: failed === 0,
     olderThanHours: hours,
@@ -85,6 +93,7 @@ export async function cleanupIdleSessions<T extends IdleCleanupSessionRow>(
     matched: candidates.length,
     closed,
     failed,
+    residual,
     results,
   };
 }

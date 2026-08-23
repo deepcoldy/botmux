@@ -1,12 +1,12 @@
 import {
   createServer,
-  request as httpRequest,
   type Server,
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { logger } from '../utils/logger.js';
+import { requestLiteralLoopback } from './loopback-target.js';
 
 /**
  * Single fixed reverse-proxy port per daemon. Each session's xterm.js web
@@ -81,8 +81,9 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
       res.end('session not running');
       return;
     }
-    const upstream = httpRequest(
-      { host: '127.0.0.1', port, method: req.method, path: parsed.rest, headers: req.headers },
+    const upstream = requestLiteralLoopback(
+      { host: '127.0.0.1', port },
+      { method: req.method, path: parsed.rest, headers: req.headers },
       (up) => {
         res.writeHead(up.statusCode ?? 502, up.headers);
         up.pipe(res);
@@ -105,9 +106,7 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
     resolvePortMaybeWake(parsed.sessionId).then((port) => {
     if (!port) return clientSocket.destroy();
 
-    const upstream = httpRequest({
-      host: '127.0.0.1',
-      port,
+    const upstream = requestLiteralLoopback({ host: '127.0.0.1', port }, {
       method: req.method,
       path: parsed.rest,
       headers: req.headers,

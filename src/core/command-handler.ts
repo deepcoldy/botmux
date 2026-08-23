@@ -7,14 +7,15 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
+import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -25,7 +26,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -43,7 +44,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -86,7 +87,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker, CodexAppTurnInput } from '../types.js';
+import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -97,10 +98,13 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { rehomeReplyTargetState } from './reply-target.js';
+import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -190,6 +194,16 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
  * App Server rather than an interactive TUI; slash-looking text must use the
  * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI:
+ * raw slash passthrough would bypass the turn ledger and the runner rejects
+ * non-frame input. Both the routing and the /list-slash-command display must
+ * agree on this set. */
+const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh']);
+
+export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
+  return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
+}
+
 export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
@@ -211,7 +225,11 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // ledger; the model still completes the text as an ordinary turn, but the
   // worker has no pending dispatch to attribute that final to and the session
   // remains stuck. Keep these messages on the normal structured turn path.
-  if (effectiveCliId === 'codex-app') return new Set();
+  // Runner adapters (codex-app/mira/mir/dsh) speak a framed stdin protocol,
+  // not an interactive TUI: a slash command through raw_input bypasses the
+  // turn ledger and the runner rejects non-frame input, wedging the session.
+  // Keep these messages on the normal structured turn path.
+  if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
   }
@@ -436,9 +454,12 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
+  /** Immutable Lark placement captured by the daemon for this slash-command
+   * invocation. Unlike session state, it remains valid after close/replace. */
+  invocationReplyTarget?: FrozenSessionReplyTarget;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
 }
@@ -1326,6 +1347,49 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
+          // Shared adopts never own the source conversation. Keep /close
+          // backwards-compatible as the quick "leave this BotMux share" action,
+          // but never present it as terminating the source App Server / tmux CLI.
+          if (isSharedAdoptSession(ds)) {
+            const targetSessionId = ds.session.sessionId;
+            const detached = await withBotTurnMutation(ds.larkAppId, async () => {
+              const current = [...activeSessions.values()].find(
+                candidate => candidate.session.sessionId === targetSessionId,
+              );
+              if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+              try {
+                const result = await closeWorkerPoolSession(targetSessionId);
+                if (!result.ok) return 'refused' as const;
+                return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+              } catch {
+                return 'refused' as const;
+              }
+            });
+            if (detached === 'missing') {
+              await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+              break;
+            }
+            if (detached === 'refused') {
+              await sessionReply(rootId, t('cmd.detach.failed', undefined, loc));
+              break;
+            }
+            if (detached === 'residual') {
+              await sessionReply(rootId, t('cmd.detach.residual', undefined, loc));
+              break;
+            }
+            await sessionReply(
+              rootId,
+              t(
+                ds.session.existingAppServerEndpoint
+                  ? 'cmd.detach.existing_app_server_success'
+                  : 'cmd.detach.success',
+                undefined,
+                loc,
+              ),
+            );
+            logger.info(`[${logTag}] /close treated as shared-adopt disconnect`);
+            break;
+          }
           const targetSessionId = ds.session.sessionId;
           const closed = await withBotTurnMutation(ds.larkAppId, async () => {
             // Re-resolve the exact session after all peer admissions drain. A
@@ -1339,14 +1403,34 @@ export async function handleCommand(
             // Capture the closed-session card BEFORE closeWorkerPoolSession —
             // it reads the live session's identity off `current`.
             const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            let closeResult;
             try {
               // closeWorkerPoolSession proves fail-closed backing teardown
               // before mutating any registry/store state, throwing when it
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
-              await closeWorkerPoolSession(targetSessionId);
+              closeResult = await closeWorkerPoolSession(targetSessionId);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
+            }
+            // A remote backend (riff / mojo) that could not prove its remote
+            // session was cancelled RETURNS a retryable failure rather than
+            // throwing, and deliberately leaves the row active. Reporting
+            // "closed" here is exactly the lie that fix meant to remove: the
+            // remote session would still be running and holding the credential.
+            if (!closeResult.ok) {
+              return { status: 'close_refused' as const, result: closeResult };
+            }
+            if (closeResult.outcome === 'closed_with_residual') {
+              // Local row IS closed, so this is not a failure — but a remote
+              // session was deliberately left running, and the ordinary "closed"
+              // card would imply everything is gone.
+              return {
+                status: 'closed_with_residual' as const,
+                current,
+                card,
+                residual: closeResult.residual,
+              };
             }
             return { status: 'closed' as const, current, card };
           });
@@ -1362,15 +1446,53 @@ export async function handleCommand(
             );
             break;
           }
-          // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
-          // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
-          // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
+          if (closed.status === 'closed_with_residual') {
+            const isLocal = closeResidualIsLocal(closed.residual);
+            logger.warn(
+              `[${logTag}] session closed locally with residual (${closed.residual.reason}); `
+              + `${isLocal ? 'local host subtree unproven' : `remote lineage ${closed.residual.taskId} NOT cancelled`}; `
+              + 'manual cleanup required',
+            );
+            await sessionReply(
+              rootId,
+              isLocal
+                ? '✅ 会话已在本地关闭，远端会话已取消。\n'
+                  + '⚠️ 但**本机可能残留带凭证的子进程未确认终止**'
+                  + `（${describeCloseResidual(closed.residual)}）——**请人工核查该主机进程**。`
+                  + 'device-isolation 会保留隔离直到主机重启或 `botmux mojo-containment revoke`。'
+                : '✅ 会话已在本地关闭。\n'
+                  + `⚠️ 但远端会话 \`${closed.residual.taskId}\` **未被取消** —— 它的控制面无法验证`
+                  + '（quarantined），盲目取消可能打到别的租户，因此保留下来。**需要人工清理**，'
+                  + '否则它会继续占用云端沙箱并持有已注入的凭据。',
+            );
+            break;
+          }
+          if (closed.status === 'close_refused') {
+            logger.error(
+              `[${logTag}] Refused /close: remote session cancellation not proven `
+              + `(${closed.result.error}); active record kept for retry`,
+            );
+            await sessionReply(
+              rootId,
+              closed.result.taskId
+                ? t('cmd.close.refused_with_task', {
+                    error: closed.result.error,
+                    taskId: closed.result.taskId,
+                  }, loc)
+                : t('cmd.close.refused', { error: closed.result.error }, loc),
+            );
+            break;
+          }
+          // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
+          // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
+          // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
           await deliverEphemeralOrReply(
             closed.current,
             message.senderId,
             closed.card,
             'interactive',
             () => sessionReply(rootId, closed.card, 'interactive'),
+            deps.invocationReplyTarget,
           );
           logger.info(`[${logTag}] Session closed by /close command`);
         } else {
@@ -1406,14 +1528,17 @@ export async function handleCommand(
 
       case '/detach':
       case '/disconnect': {
-        // 文字版的"⏏ 断开"按钮：仅 adopt 会话适用——botmux 只是观察用户原本在
-        // 跑的 CLI，断开只清掉 botmux 这一侧的 worker / polling，绝不结束 CLI
-        // 进程本身。等价于 card-handler 里 `actionType === 'disconnect'` 那段。
+        // 文字版的"⏏ 断开"按钮：共享接入会话适用。
+        //   - tmux adopt：BotMux 停止观察外部终端，不结束原 CLI；
+        //   - existing App Server adopt：BotMux 停止自己的 `codex --remote`
+        //     第二客户端，不结束 Codex App 或开发机上的 App Server。
+        // 两种模式都只移除 BotMux 这一侧，不接管来源会话。
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        if (!ds.adoptedFrom) {
+        const existingAppServerAdopt = !!ds.session.existingAppServerEndpoint;
+        if (!isSharedAdoptSession(ds)) {
           await sessionReply(rootId, t('cmd.detach.not_adopted', undefined, loc));
           break;
         }
@@ -1422,7 +1547,7 @@ export async function handleCommand(
           const current = [...activeSessions.values()].find(
             candidate => candidate.session.sessionId === closedSessionId,
           );
-          if (!current || !current.adoptedFrom) return false;
+          if (!current || !isSharedAdoptSession(current)) return false;
           await closeWorkerPoolSession(closedSessionId);
           return true;
         });
@@ -1430,20 +1555,35 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
-        logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);
+        await sessionReply(
+          rootId,
+          t(
+            existingAppServerAdopt
+              ? 'cmd.detach.existing_app_server_success'
+              : 'cmd.detach.success',
+            undefined,
+            loc,
+          ),
+        );
+        logger.info(
+          `[${logTag}] Detached ${existingAppServerAdopt ? 'existing App Server' : 'terminal'} adopt by ${cmd} command`,
+        );
         break;
       }
 
       case '/restart': {
         if (ds) {
-          if (ds.adoptedFrom) {
+          if (isSharedAdoptSession(ds)) {
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
             break;
           }
-          if (isRiffBackendSession(ds)) {
-            logger.info(`[${logTag}] Rejected /restart for Riff backend session`);
-            await sessionReply(rootId, t('cmd.restart.riff_unsupported', undefined, loc));
+          // ALL remote backends: destroy-and-respawn severs or replaces the
+          // remote lineage. The riff-only guard let mojo /restart through to
+          // restartCliProcess, which cancels the remote session and cold-boots
+          // a context-less replacement (third-round review, gate 4).
+          if (isRemoteBackendSession(ds)) {
+            logger.info(`[${logTag}] Rejected /restart for remote backend session`);
+            await sessionReply(rootId, t('cmd.restart.remote_unsupported', undefined, loc));
             break;
           }
           // Codex App: an accepted-but-unsettled dispatch still owns the turn
@@ -1489,12 +1629,14 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
-        // A live Riff worker owns a remote task rooted in its original cwd.
-        // killWorker/restart deliberately refuse to replace that generation,
-        // so persisting a new cwd here would report success while the remote
-        // task keeps running in the old directory.
-        if (isRiffBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+        // A live remote worker (Riff OR Mojo) owns a remote lineage rooted in
+        // its original cwd. killWorker refuses unprepared live retirement for
+        // EVERY remote backend, so persisting a new cwd here would report
+        // success while the live generation keeps running against the old
+        // directory — the exact split brain the riff-only guard used to allow
+        // for mojo (P1-a).
+        if (isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
           break;
         }
         // Cheap preflight avoids creating a requested directory when the
@@ -1584,13 +1726,15 @@ export async function handleCommand(
         break;
       }
       case '/repo': {
-        // A live Riff generation must finish the explicit /close protocol before
-        // its anchor can be reused.  The generic repo-switch path closes and
-        // immediately reforks; if remote cancellation fails, that would fall
-        // through to the double-fork kill and orphan the remote task.
-        if (ds && !ds.pendingRepo && isRiffBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
-          logger.warn(`[${logTag}] Repo switch refused: Riff session requires explicit close before replacement`);
+        // A live REMOTE generation (Riff or Mojo) must finish the explicit
+        // /close protocol before its anchor can be reused. The generic
+        // repo-switch path closes and immediately reforks; if remote
+        // cancellation fails, that would fall through to the double-fork kill
+        // and orphan the remote task — the guard's own rationale, which the
+        // riff-only predicate left open for mojo (third-round review, gate 4).
+        if (ds && !ds.pendingRepo && isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
+          logger.warn(`[${logTag}] Repo switch refused: remote session requires explicit close before replacement`);
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
@@ -1824,7 +1968,24 @@ export async function handleCommand(
                 }
                 const closedCard = buildClosedSessionCard(current, loc);
                 const oldSession = current.session;
-                await closeWorkerPoolSession(targetSessionId);
+                const closeResult = await closeWorkerPoolSession(targetSessionId);
+                // A refused close (remote cancellation unproven) leaves the row
+                // ACTIVE on purpose. Continuing would delete it from the registry
+                // anyway, stranding an active row with no owner — a ghost — while
+                // the remote session keeps running. Abort the replacement instead.
+                if (!closeResult.ok) {
+                  return { ok: false as const, error: 'close_refused' as const };
+                }
+                if (closeResult.outcome === 'closed_with_residual') {
+                  // The user asked to switch directory, not to consent to leaving a
+                  // remote session running. Stop here and tell them, rather than
+                  // quietly spawning a replacement on top of the residual.
+                  return {
+                    ok: false as const,
+                    error: 'close_residual' as const,
+                    residual: closeResult.residual,
+                  };
+                }
                 // The key lock excludes every sanctioned creator. A direct
                 // lifecycle callback may still have published unexpectedly;
                 // fail closed instead of overwriting that first owner.
@@ -1853,6 +2014,7 @@ export async function handleCommand(
                 session.ownerOpenId = oldSession.ownerOpenId;
                 session.creatorOpenId = oldSession.creatorOpenId;
                 session.lastCallerOpenId = oldSession.lastCallerOpenId;
+                rehomeReplyTargetState(current);
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
                 activeSessions.set(key, current);
@@ -1871,6 +2033,29 @@ export async function handleCommand(
                   rootId,
                   '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
                 );
+              } else if (switched.error === 'close_residual') {
+                const isLocal = closeResidualIsLocal(switched.residual);
+                logger.warn(`[${logTag}] Repo switch stopped: old session closed with `
+                  + `${isLocal ? 'an unproven local host subtree' : 'an uncancelled remote lineage'}`);
+                await sessionReply(
+                  rootId,
+                  isLocal
+                    ? '⚠️ 原会话已在本地关闭、远端会话已取消，但**本机可能残留带凭证的子进程未确认终止**'
+                      + `（${describeCloseResidual(switched.residual)}），请人工核查该主机进程。\n`
+                      + '**未创建新会话** —— 请先确认该子进程已终止，再重新切换仓库。'
+                    : '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+                      + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+                      + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
+                );
+              } else if (switched.error === 'close_refused') {
+                // Silence here would be the worst outcome: the old session is
+                // still active AND its remote session is still running, but the
+                // user asked for a switch and would see nothing at all.
+                logger.error(`[${logTag}] Repo switch aborted: old session's remote cancellation was not proven`);
+                await sessionReply(
+                  rootId,
+                  '⚠️ 无法切换仓库：原会话的远端会话未能确认取消，已保留原会话以便重试。请稍后重试。',
+                );
               } else {
                 logger.warn(`[${logTag}] Repo switch aborted because the session was replaced`);
               }
@@ -1882,6 +2067,7 @@ export async function handleCommand(
               switched.closedCard,
               'interactive',
               () => sessionReply(rootId, switched.closedCard, 'interactive'),
+              deps.invocationReplyTarget,
             );
             await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
             if (switched.cardToWithdraw) {
@@ -2299,6 +2485,29 @@ export async function handleCommand(
           await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
           break;
         }
+        // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
+        // im:feed_group_v1 scope（与 /subscribe-lark-doc 的专项 scope 同款模式，
+        // 不污染通用 /login）。授权完成后 feed-group 标签模式全自动挂载。
+        if (subCmd === 'tags' || subCmd === 'tag' || subCmd === '标签') {
+          const { authUrl: tagAuthUrl } = generateAuthUrl(
+            botCfg2.larkAppId,
+            botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand),
+            FEED_GROUP_OAUTH_SCOPES,
+          );
+          await sessionReply(rootId, [
+            t('cmd.login.tags_title', undefined, loc),
+            '',
+            t('cmd.login.step1', undefined, loc),
+            tagAuthUrl,
+            '',
+            t('cmd.login.step2', undefined, loc),
+            t('cmd.login.step3', undefined, loc),
+            '',
+            t('cmd.login.tags_footer', undefined, loc),
+          ].join('\n'));
+          break;
+        }
         const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));
         await sessionReply(rootId, [
           t('cmd.login.title', undefined, loc),
@@ -2660,6 +2869,10 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
+        if (ds?.session.existingAppServerEndpoint) {
+          await sessionReply(rootId, t('cmd.codex_existing_app_server_adopt.already_attached', undefined, loc));
+          break;
+        }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
           const cliName = sessionCliDisplayName(ds);
@@ -2669,7 +2882,7 @@ export async function handleCommand(
           break;
         }
         const botCfgForAdopt = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : undefined);
-        if (botCfgForAdopt?.cliId === 'codex-app') {
+        if (botCfgForAdopt?.cliId === 'codex-app' || botCfgForAdopt?.existingAppServer) {
           if (!ds) {
             await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
             break;
@@ -2771,6 +2984,12 @@ export async function handleCommand(
 
         if (!appId || !chatId) {
           await sessionReply(rootId, t('cmd.oncall.need_group', undefined, loc));
+          break;
+        }
+
+        // 会话群的 oncall 绑定在出生时由 bot 自动写入，禁止手改（冲突隔离）。
+        if (isSessionGroup(chatId)) {
+          await sessionReply(rootId, t('sg.cmd_unsupported', { cmd: '/oncall' }, loc));
           break;
         }
 
@@ -3185,12 +3404,14 @@ export async function handleCommand(
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
           // ── Ephemeral (仅邀请者可见) picker ────────────────────────────────
           // The picker exposes session metadata — title + source-chat name — to
-          // everyone who can see the message. When the bot runs in privateCard
-          // mode we hide it: send the picker as an ephemeral card visible only to
-          // the invoker.
+          // everyone who can see the message. There is NO benefit to showing it
+          // publicly: the invoker is always the owner (每张菜单 owner-only，别人点
+          // 会被拒), so a public picker only leaks his session list to the whole
+          // group. We therefore default it to private — decoupled from the
+          // `privateCard` config, which continues to gate ONLY /card & /close.
           //
-          // Gate on group + privateCard + **chat-scope**. The chat-scope clause
-          // is load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
+          // Gate on group + **chat-scope**. The chat-scope clause is
+          // load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
           // `chat_id` only — it has NO thread/root anchor — so a thread-scope
           // target (话题群 / 话题 inside a 普通群 / new-topic·shared) can't keep the
           // card in its 话题. A 话题群 rejects with 18053 (→ fall back below), but
@@ -3199,12 +3420,11 @@ export async function handleCommand(
           // guards against with a REGRESSION test; PR #164 was the original live
           // fix. Per 申晗 (2026-07-29): 话题内公开可接受 — so thread-scope pickers
           // stay on the visible in-thread reply (public card in the 话题), and
-          // ephemeral is scoped to flat 普通群 only, mirroring /card & /close
-          // private cards. p2p has no ephemeral option; an unexpected reject
-          // (18053 etc.) still falls back to the visible reply below.
+          // ephemeral is scoped to flat 普通群 only. p2p has no ephemeral option;
+          // an unexpected reject (18053 etc.) still falls back to the visible
+          // reply below.
           const privatePicker = targetChatType === 'group'
-            && targetScope === 'chat'
-            && getBot(myAppId).config.privateCard === true;
+            && targetScope === 'chat';
           const card = buildRelayPickerCard(
             entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
             targetScope, targetChatType, privatePicker ? 'private' : 'public',
@@ -3260,7 +3480,7 @@ export async function handleCommand(
         // pendingRepo too, but only after createGroupWithBots has already
         // built a new chat. Failing here keeps relay clean and avoids
         // orphan-chat garbage when the operation can't possibly succeed.
-        if (ds.session.adoptedFrom) {
+        if (isSharedAdoptSession(ds)) {
           await sessionReply(rootId, t('cmd.relay.adopt_not_relayable', undefined, loc));
           break;
         }
@@ -3619,7 +3839,7 @@ export async function handleCommand(
 
         // Front guards (fork needs a clean, real, idle source — same as relay).
         // These MUST run before creating either a topic root or a new group.
-        if (ds.session.adoptedFrom) {
+        if (isSharedAdoptSession(ds)) {
           await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
           break;
         }
@@ -3763,7 +3983,12 @@ export async function handleCommand(
         // is empty by construction, so no target-anchor conflict. Source is
         // never touched.
         const { forkSession } = await import('./worker-pool.js');
-        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat');
+        // forkTaskText = the group name (the human-readable intent for this
+        // fork), so /forklist can label the child row instead of falling back to
+        // the raw session title.
+        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat', {
+          forkTaskText: forkGroupName,
+        });
         if (!forkResult.ok) {
           // Residual-orphan cleanup: the front guards already ran before
           // createGroupWithBots, so this only fires on a narrow TOCTOU race
@@ -3800,8 +4025,55 @@ export async function handleCommand(
           break;
         }
 
-        await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        // Persist the child on the SOURCE session's lineage BEFORE any
+        // user-visible send. The sub-topic fork path also records lineage; the
+        // --create (new-group) path historically skipped it entirely, leaving
+        // forkChildSessionIds permanently empty and /forklist always reporting
+        // "no forks".
+        //
+        // Ordering is load-bearing: the "created" notice below is a reply to the
+        // parent session's root message, i.e. the SAME message whose expiry
+        // (HTTP 400) this PR's other fix addresses. If that reply threw while it
+        // still ran first, control would unwind to handleCommand's outer catch
+        // (log-only) and the lineage write would be skipped — so in the very
+        // "root expired" scenario this change targets, /forklist would stay
+        // empty. Writing lineage first makes it independent of the notify path;
+        // the notice and panel refresh are best-effort afterwards.
+        if (!ds.session.forkChildSessionIds?.includes(forkResult.childSessionId)) {
+          ds.session.forkChildSessionIds = [
+            ...(ds.session.forkChildSessionIds ?? []),
+            forkResult.childSessionId,
+          ];
+          try {
+            sessionStore.updateSession(ds.session);
+          } catch (err) {
+            logger.warn(
+              `[${logTag}] /fork --create parent lineage update failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+        // User-visible notice + panel refresh: best-effort, AFTER lineage is
+        // durable. A failure here (e.g. the root-message 400) must not undo the
+        // lineage write, so swallow locally instead of letting it reach the
+        // outer catch.
+        try {
+          await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        } catch (err) {
+          logger.warn(
+            `[${logTag}] /fork --create created-notice send failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        try {
+          await upsertForkPanelCard(ds, loc, { preferredReplyToMessageId: message.messageId });
+        } catch (err) {
+          logger.warn(
+            `[${logTag}] /fork --create panel refresh failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         break;
       }
 
@@ -3810,7 +4082,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
           break;
         }
-        await upsertForkPanelCard(ds, loc, { allowEmpty: true });
+        await upsertForkPanelCard(ds, loc, { allowEmpty: true, preferredReplyToMessageId: message.messageId });
         break;
       }
 
@@ -3860,18 +4132,19 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
         const workingDir = getSessionWorkingDir(ds);
-        // Codex App routes everything through the structured turn lane, so it has
-        // NO passthrough surface at all — mirror resolvePassthroughCommands's
-        // early empty return here and skip filesystem discovery (its PTY is the
-        // App Server runner, not an interactive TUI that would honor those).
-        const isCodexApp = effectiveCliId === 'codex-app';
-        const builtin = isCodexApp ? [] : [...PASSTHROUGH_COMMANDS];
-        const adapterDefaults = isCodexApp ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
+        // Runner adapters route everything through the structured turn lane,
+        // so they have NO passthrough surface at all — mirror
+        // resolvePassthroughCommands's early empty return here and skip
+        // filesystem discovery (their PTY is the runner, not an interactive
+        // TUI that would honor those).
+        const noPassthrough = cliHasNoRawPassthroughSurface(effectiveCliId);
+        const builtin = noPassthrough ? [] : [...PASSTHROUGH_COMMANDS];
+        const adapterDefaults = noPassthrough ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
         // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
         // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
         // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
         // Codex App 无透传面，custom 也不生效 → 与路由一致清空。
-        const custom = isCodexApp ? [] : [...new Set(
+        const custom = noPassthrough ? [] : [...new Set(
           (botCfg?.customPassthroughCommands ?? [])
             .map(normalizePassthroughCommand)
             .filter((c): c is string => !!c),
@@ -3880,7 +4153,7 @@ export async function handleCommand(
         // cliPathOverride（它属于另一个 CLI）。Codex App 直接跳过发现。
         const adapterPathOverride = effectiveCliId === botCfg?.cliId ? botCfg?.cliPathOverride : undefined;
         let cliAdapter;
-        if (!isCodexApp) {
+        if (!noPassthrough) {
           try {
             cliAdapter = createCliAdapterSync(effectiveCliId, adapterPathOverride);
           } catch (err) {
@@ -3961,10 +4234,16 @@ export async function handleCommand(
           t('help.login', undefined, loc),
           t('help.login_status', undefined, loc),
           t('help.pair', undefined, loc),
-          '',
-          t('help.heading_workflow', undefined, loc),
-          t('help.workflow_run', undefined, loc),
-          t('help.workflow_cancel', undefined, loc),
+          // Workflow help section — omitted when the machine-wide workflow
+          // switch is off, so `/help` never advertises a disabled feature.
+          ...(isWorkflowFeatureEnabled()
+            ? [
+              '',
+              t('help.heading_workflow', undefined, loc),
+              t('help.workflow_run', undefined, loc),
+              t('help.workflow_cancel', undefined, loc),
+            ]
+            : []),
           '',
           t('help.heading_role', undefined, loc),
           t('help.role_show', undefined, loc),
@@ -4110,10 +4389,12 @@ async function blockRiffTakeover(
   ds: DaemonSession,
   sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
 ): Promise<boolean> {
-  if (!isRiffBackendSession(ds)) return false;
+  // Historical name, remote-wide guard: takeover/import replaces the live
+  // generation, which every remote backend forbids outside prepare/commit.
+  if (!isRemoteBackendSession(ds)) return false;
   const loc = localeForBot(ds.larkAppId);
-  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.riff_unsupported', undefined, loc));
-  logger.warn(`[${tag(ds)}] Takeover refused: Riff session requires explicit close before replacement`);
+  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.remote_unsupported', undefined, loc));
+  logger.warn(`[${tag(ds)}] Takeover refused: remote session requires explicit close before replacement`);
   return true;
 }
 
@@ -4126,6 +4407,8 @@ export async function startCodexAppThreadSession(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const botCfg = getBot(ds.larkAppId).config;
+  const existingAppServerEndpoint = botCfg.existingAppServer?.endpoint;
   const title = codexAppThreadTitle(thread);
   if (isSessionTransferring(ds)) {
     await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
@@ -4153,8 +4436,24 @@ export async function startCodexAppThreadSession(
     current.lastScreenStatus = undefined;
     current.session.workingDir = thread.cwd;
     current.session.title = `Codex App: ${title}`;
-    current.session.cliId = 'codex-app';
+    current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
+    if (existingAppServerEndpoint) {
+      // Do not reuse a possibly frozen runner/wrapper from the temporary
+      // BotMux shell this topic started with. The next fork freezes the current
+      // `cliId: codex` bot configuration and starts ONLY the official remote
+      // TUI. The endpoint itself is copied onto the session so later edits to
+      // bots.json cannot redirect an already-bound conversation.
+      current.session.existingAppServerEndpoint = existingAppServerEndpoint;
+      delete current.session.cliRuntime;
+      delete current.session.cliPathOverride;
+      delete current.session.wrapperCli;
+      delete current.session.model;
+      delete current.session.reasoningEffort;
+      delete current.session.agentFrozen;
+    } else {
+      delete current.session.existingAppServerEndpoint;
+    }
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
@@ -4171,7 +4470,16 @@ export async function startCodexAppThreadSession(
     );
     return;
   }
-  await sessionReply(switched.anchor, t('cmd.codex_app_adopt.success', { title }, loc));
+  await sessionReply(
+    switched.anchor,
+    t(
+      existingAppServerEndpoint
+        ? 'cmd.codex_existing_app_server_adopt.success'
+        : 'cmd.codex_app_adopt.success',
+      { title },
+      loc,
+    ),
+  );
 }
 
 export async function startAdoptSession(
@@ -4558,7 +4866,7 @@ export async function startForkSubtopicSession(
 async function upsertForkPanelCard(
   parentDs: DaemonSession,
   loc: Locale,
-  opts?: { allowEmpty?: boolean },
+  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string },
 ): Promise<void> {
   const appId = parentDs.larkAppId;
   const chatId = parentDs.chatId;
@@ -4569,9 +4877,13 @@ async function upsertForkPanelCard(
     .map(session => ({
       instruction: session.forkTaskText ?? session.title,
       status: (session.status === 'active' ? 'active' : 'closed') as 'active' | 'closed',
+      // Link to the child's OWN chat: a sub-topic fork shares the parent chat and
+      // carries a larkThreadId (deep-link into that topic); a --create fork lives
+      // in its own new group (different chatId, no thread) so the link must use
+      // the child's chatId, not the parent's, or it would point back here.
       link: session.larkThreadId
-        ? threadAppLink(chatId, session.larkThreadId, brand)
-        : chatAppLink(chatId, brand),
+        ? threadAppLink(session.chatId ?? chatId, session.larkThreadId, brand)
+        : chatAppLink(session.chatId ?? chatId, brand),
     }));
   if (children.length === 0 && !opts?.allowEmpty) return;
 
@@ -4585,17 +4897,65 @@ async function upsertForkPanelCard(
     }
   }
 
-  try {
-    const cardId = await replyMessage(
-      appId,
-      parentDs.session.rootMessageId,
-      buildForkPanelCard(children, loc),
-      'interactive',
-      true,
-    );
+  // Post the panel. Primary: reply-in-thread to the session's root message so
+  // the panel anchors to this conversation. Fallback: if that reply fails (the
+  // most common cause is the root message aging past Lark's reply window —
+  // surfaces as HTTP 400 — but also covers a withdrawn root), post the card flat
+  // to the chat instead. The panel IS the user-visible output of /forklist, so a
+  // swallowed failure looks like the command silently did nothing; the flat send
+  // keeps it visible. Only if BOTH transports fail do we give up (and warn).
+  const cardBody = buildForkPanelCard(children, loc);
+  // Reply targets are tried in order, then a flat send as the last resort:
+  //   1) the FRESH triggering command message (when /forklist or /fork passes
+  //      it) — a just-arrived message is never past Lark's reply window, and in
+  //      a 话题群 it keeps the panel inside the current topic;
+  //   2) the session root message — the historical target, but it can age past
+  //      the reply window (HTTP 400) or be withdrawn;
+  //   3) a flat chat sendMessage — always delivers, though in a 话题群 it starts
+  //      a new sibling topic rather than threading. The panel is the user-visible
+  //      output of /forklist, so a visible-but-flat panel beats silent nothing.
+  const replyTargets: string[] = [];
+  if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);
+  if (parentDs.session.rootMessageId
+    && parentDs.session.rootMessageId !== opts?.preferredReplyToMessageId) {
+    replyTargets.push(parentDs.session.rootMessageId);
+  }
+  let cardId: string | undefined;
+  for (const target of replyTargets) {
+    try {
+      cardId = await replyMessage(appId, target, cardBody, 'interactive', true);
+      break;
+    } catch (replyErr) {
+      logger.warn(
+        `[fork-panel] reply to ${target} failed `
+        + `(${replyErr instanceof Error ? replyErr.message : replyErr})`,
+      );
+    }
+  }
+  if (!cardId) {
+    logger.warn('[fork-panel] all reply targets failed; falling back to a flat chat message');
+    try {
+      cardId = await sendMessage(appId, chatId, cardBody, 'interactive');
+    } catch (sendErr) {
+      logger.warn(
+        `[fork-panel] failed to post panel card via both reply and flat send: `
+        + `${sendErr instanceof Error ? sendErr.message : sendErr}`,
+      );
+    }
+  }
+  if (cardId) {
+    // Local guard: a write-store failure here must not bubble to /forklist's
+    // outer catch (which would look like the command errored even though the
+    // panel already posted). Losing only the stale-card id just means the next
+    // /forklist can't delete the previous panel — a benign duplicate at worst.
     parentDs.session.forkPanelCardId = cardId;
-    sessionStore.updateSession(parentDs.session);
-  } catch (err) {
-    logger.warn(`[fork-panel] failed to post panel card: ${err instanceof Error ? err.message : err}`);
+    try {
+      sessionStore.updateSession(parentDs.session);
+    } catch (err) {
+      logger.warn(
+        `[fork-panel] persist forkPanelCardId failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }

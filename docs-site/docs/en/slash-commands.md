@@ -23,6 +23,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
+| `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
 | `/t [<text>]` `/topic [<text>]` | Force a new topic inside a regular group; text becomes the first task (starting after repository selection when needed), while the bare command opens topic setup |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |
@@ -41,13 +42,14 @@ These forms create the topic and select a repository or create a worktree direct
 
 Controls how the bot opens a session when @mentioned. No argument (or `status`) shows the current mode; changing it needs `canOperate`, viewing needs `canTalk`. In group chats you must @ the target bot (in multi-bot groups, @ the specific bot). Only regular groups and 1:1 DMs are supported; topic groups need no setting (they're already topics) and the command is rejected there.
 
-**DM (1:1)** — the mode applies to **all of this bot's DMs** (bot-level global config, not per-chat), but different users' DMs with the bot still keep isolated sessions. Only `chat` / `topic` exist (`new-topic` is a compat alias of `topic`):
+**DM (1:1)** — the mode applies to **all of this bot's DMs** (bot-level global config, not per-chat), but different users' DMs with the bot still keep isolated sessions. The modes are `chat` / `topic` / `group` (`new-topic` is a compat alias of `topic`):
 
 | Command | Description |
 |------|------|
 | `/reply-mode` `/reply-mode status` | Show the current DM session mode |
 | `/reply-mode chat` | Each 1:1 DM is one flat continuous session — all messages in that DM share one session (**default**) |
 | `/reply-mode topic` `/reply-mode new-topic` | Each **top-level** DM opens its own session/thread; replies inside an existing thread continue that thread's session |
+| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; returning to the group resumes the session — see `p2pMode=group`) |
 
 `shared` / `chat-topic` rely on native group topics and are rejected in DMs.
 
@@ -100,6 +102,7 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 |------|------|
 | `/login` | Lark user authorization; once authorized, you can download third-party card images and call cloud docs/calendar and other APIs as yourself |
 | `/login status` | View authorization status |
+| `/login tags` | Session-group tag authorization (feed-group scopes); once granted, new session groups auto-join your sidebar feed group (for p2pMode=group with the feed-group tag mode — the default) |
 | `/pair <pairing code>` | Pair a Web/Dashboard-side session with your Lark identity (get the pairing code on the web side, then send `/pair <code>` in the topic to claim it) |
 
 ## 🎭 Roles (Personas)

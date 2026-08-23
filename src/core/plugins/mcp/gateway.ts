@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { createConnection } from 'node:net';
+import { createConnection, type Socket as NetSocket } from 'node:net';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -49,6 +50,7 @@ import {
 } from './session-runtime.js';
 import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
+import type { TrustedCaller } from '../../../types.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -96,6 +98,21 @@ interface ResourceRoute {
   exposedUri: string;
   template?: UriTemplate;
 }
+
+export interface GatewayTrustedTurnIdentity {
+  caller?: TrustedCaller;
+  turnId?: string;
+  dispatchAttempt?: number;
+}
+
+export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
+
+const BOTMUX_META_RESERVED_PREFIX = 'botmux';
+const BOTMUX_TRUSTED_HEADER_PREFIX = 'x-botmux-trusted-';
+const BOTMUX_TURN_HEADERS = [
+  'x-botmux-turn-id',
+  'x-botmux-dispatch-attempt',
+] as const;
 
 export interface McpGatewayDiagnostic {
   pluginId: string;
@@ -279,6 +296,7 @@ function allocateName(
 export class PluginMcpGateway {
   readonly server: Server;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -289,8 +307,13 @@ export class PluginMcpGateway {
   private resourceRoutes = new Map<string, ResourceRoute>();
   private resourceTemplateRoutes: ResourceRoute[] = [];
 
-  constructor(pluginIds?: string[], env: NodeJS.ProcessEnv = process.env) {
+  constructor(
+    pluginIds?: string[],
+    env: NodeJS.ProcessEnv = process.env,
+    opts: { trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider } = {},
+  ) {
     this.env = env;
+    this.trustedTurnIdentity = opts.trustedTurnIdentity;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -378,8 +401,13 @@ export class PluginMcpGateway {
           stderr: 'inherit',
         });
       } else {
+        const staticHeaders = descriptor.server.headers;
         transport = new StreamableHTTPClientTransport(new URL(descriptor.server.url), {
-          requestInit: descriptor.server.headers ? { headers: descriptor.server.headers } : undefined,
+          requestInit: staticHeaders ? { headers: staticHeaders } : undefined,
+          fetch: (input, init) => fetch(input, {
+            ...init,
+            headers: this.httpHeaders(init?.headers, staticHeaders),
+          }),
         });
       }
 
@@ -470,6 +498,62 @@ export class PluginMcpGateway {
         },
       }),
     };
+  }
+
+  private trustedTurnMeta(): Record<string, unknown> | undefined {
+    const identity = this.trustedTurnIdentity?.();
+    const caller = identity?.caller;
+    if (!caller && !identity?.turnId) return undefined;
+    return {
+      ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
+      ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
+      ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+      ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    };
+  }
+
+  private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(params: T): T {
+    const trusted = this.trustedTurnMeta();
+    const cleanedMeta = Object.fromEntries(
+      Object.entries(params._meta ?? {})
+        .filter(([key]) => !key.toLowerCase().startsWith(BOTMUX_META_RESERVED_PREFIX)),
+    );
+    if (!trusted) {
+      return Object.keys(cleanedMeta).length > 0
+        ? { ...params, _meta: cleanedMeta }
+        : { ...params, _meta: undefined };
+    }
+    return {
+      ...params,
+      _meta: {
+        ...cleanedMeta,
+        botmuxTrustedCaller: trusted,
+      },
+    };
+  }
+
+  private httpHeaders(
+    initHeaders: HeadersInit | undefined,
+    staticHeaders: Record<string, string> | undefined,
+  ): Headers {
+    const headers = new Headers(staticHeaders);
+    if (initHeaders) {
+      new Headers(initHeaders).forEach((value, key) => headers.set(key, value));
+    }
+    for (const key of Array.from(headers.keys())) {
+      const lower = key.toLowerCase();
+      if (lower.startsWith(BOTMUX_TRUSTED_HEADER_PREFIX) || (BOTMUX_TURN_HEADERS as readonly string[]).includes(lower)) {
+        headers.delete(key);
+      }
+    }
+    const trusted = this.trustedTurnMeta();
+    if (trusted?.requestUserOpenId) headers.set('x-botmux-trusted-open-id', String(trusted.requestUserOpenId));
+    if (trusted?.requestUserUnionId) headers.set('x-botmux-trusted-union-id', String(trusted.requestUserUnionId));
+    if (trusted?.requestLarkAppId) headers.set('x-botmux-trusted-app-id', String(trusted.requestLarkAppId));
+    if (trusted?.turnId) headers.set('x-botmux-turn-id', String(trusted.turnId));
+    if (trusted?.dispatchAttempt !== undefined) headers.set('x-botmux-dispatch-attempt', String(trusted.dispatchAttempt));
+    return headers;
   }
 
   private capable(capability: keyof ServerCapabilities): GatewayConnection[] {
@@ -604,7 +688,7 @@ export class PluginMcpGateway {
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
       return route.connection.client.callTool(
-        { ...request.params, name: route.originalName },
+        this.withTrustedTurnMeta({ ...request.params, name: route.originalName }),
         undefined,
         this.requestOptions(request, extra),
       );
@@ -698,13 +782,12 @@ export async function runMcpGateway(): Promise<void> {
   const env = resolveGatewayEnvironment();
   const socketPath = env[MCP_GATEWAY_SOCKET_ENV]?.trim();
   if (socketPath) {
-    let authToken: string;
     try {
-      authToken = readMcpGatewayAuthToken(socketPath);
+      readMcpGatewayAuthToken(socketPath);
     } catch {
       throw new Error('Botmux MCP Gateway authentication token is unavailable; restart this Botmux session');
     }
-    await relayMcpGateway(socketPath, authToken);
+    await runReconnectingMcpRelay(socketPath, { env });
     return;
   }
   if (env[MCP_GATEWAY_REQUIRED_ENV] === '1') {
@@ -730,40 +813,294 @@ export async function runMcpGateway(): Promise<void> {
   await connectPromise;
 }
 
-/** Byte-for-byte stdio relay from a CLI-native MCP launcher to the trusted
- * worker-side Gateway. No plugin metadata or credentials are loaded here. */
-export async function relayMcpGateway(
-  socketPath: string,
-  authToken: string,
-  input: NodeJS.ReadableStream = process.stdin,
-  output: NodeJS.WritableStream = process.stdout,
-): Promise<void> {
+/** Single connection attempt: connect + authenticate. The caller owns the
+ * socket lifecycle after this resolves. */
+async function connectMcpGatewaySocket(socketPath: string): Promise<NetSocket> {
+  // The token is re-read on EVERY attempt: the replacement host rotates it
+  // (atomically) before listening, so a reconnecting relay must never pin the
+  // token it read at process start.
+  const authToken = readMcpGatewayAuthToken(socketPath);
   const socket = createConnection({ path: socketPath });
   socket.setNoDelay(true);
-  await new Promise<void>((resolve, reject) => {
-    const onConnect = () => {
-      socket.off('error', onInitialError);
-      resolve();
-    };
-    const onInitialError = (error: Error) => {
-      socket.off('connect', onConnect);
-      reject(new Error(`Botmux MCP Gateway relay connection failed: ${error.message}`));
-    };
-    socket.once('connect', onConnect);
-    socket.once('error', onInitialError);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onConnect = () => {
+        socket.off('error', onInitialError);
+        resolve();
+      };
+      const onInitialError = (error: Error) => {
+        socket.off('connect', onConnect);
+        reject(new Error(`Botmux MCP Gateway relay connection failed: ${error.message}`));
+      };
+      socket.once('connect', onConnect);
+      socket.once('error', onInitialError);
+    });
+    await sendMcpGatewayHandshake(socket, authToken);
+    return socket;
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
+}
+
+interface RelayTuning {
+  /** First-ever connect must succeed within this window (the host normally
+   *  exists before the CLI spawns, so this only smooths startup races). */
+  initialBudgetMs: number;
+  /** After a disconnect the relay retries for this long before exiting. The
+   *  default is UNBOUNDED: the CLI owns the relay's lifetime (stdin close →
+   *  exit), the reattach decision in the worker assumes a surviving pane's
+   *  relay is still alive, and a capped-backoff unix connect attempt every few
+   *  seconds is free — whereas giving up would silently strand the pane's MCP
+   *  client after a long daemon outage (most CLIs never restart a dead MCP
+   *  server mid-session). Env override exists for tests. */
+  reconnectBudgetMs: number;
+  /** First retry delay; doubles per attempt, capped at maxBackoffMs. */
+  backoffMs: number;
+  maxBackoffMs: number;
+}
+
+function relayTuning(env: NodeJS.ProcessEnv): RelayTuning {
+  const num = (key: string, fallback: number): number => {
+    const parsed = Number(env[key]);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  };
+  const backoffMs = num('BOTMUX_MCP_RELAY_BACKOFF_MS', 250);
+  return {
+    initialBudgetMs: num('BOTMUX_MCP_RELAY_INITIAL_BUDGET_MS', 15_000),
+    reconnectBudgetMs: num('BOTMUX_MCP_RELAY_RECONNECT_BUDGET_MS', Number.POSITIVE_INFINITY),
+    backoffMs,
+    maxBackoffMs: Math.max(backoffMs, num('BOTMUX_MCP_RELAY_MAX_BACKOFF_MS', 5_000)),
+  };
+}
+
+/** Cap on client lines buffered while the Gateway is unreachable. MCP traffic
+ *  is small JSON messages; hitting this means something is badly wrong and the
+ *  relay should die visibly rather than balloon. */
+const RELAY_OUTAGE_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
+
+/** Newline-framed stdio relay from a CLI-native MCP launcher to the trusted
+ * worker-side Gateway that SURVIVES host replacement. No plugin metadata or
+ * credentials are loaded here.
+ *
+ * Why not a byte pipe: the worker-side Gateway host dies with the worker on
+ * every daemon restart/upgrade, and the CLI process (in a persistent tmux/zmx
+ * pane) lives on with this relay as its MCP server. A single-shot pipe forced
+ * the worker to kill the surviving pane ("cold-resume") just to refresh the
+ * MCP plumbing — interrupting whatever turn the CLI was executing. Instead the
+ * relay:
+ *   1. frames both directions as newline-delimited JSON (the MCP stdio
+ *      framing), buffering client lines while the Gateway is unreachable;
+ *   2. reconnects to the SAME deterministic socket path with backoff, re-reads
+ *      the rotated auth token per attempt;
+ *   3. replays the captured `initialize` request + `notifications/initialized`
+ *      on the fresh Gateway connection (each host connection is a brand-new
+ *      MCP server that expects the handshake), swallowing the replayed
+ *      response iff the client already saw the original one — the client
+ *      never re-initializes and must not receive a duplicate response id.
+ * Requests in flight across a disconnect lose their responses; the client's
+ * own MCP timeout surfaces those as failed tool calls, which is the honest
+ * outcome. */
+export async function runReconnectingMcpRelay(
+  socketPath: string,
+  opts: {
+    input?: NodeJS.ReadableStream;
+    output?: NodeJS.WritableStream;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<void> {
+  const input = opts.input ?? process.stdin;
+  const output = opts.output ?? process.stdout;
+  const tuning = relayTuning(opts.env ?? process.env);
+
+  let socket: NetSocket | null = null;
+  let connected = false;
+  let everConnected = false;
+  let inputEnded = false;
+  let settled = false;
+  const destroySocket = (): void => { socket?.destroy(); };
+
+  // Client → server lines held while the Gateway is unreachable (or while an
+  // initialize replay is in flight, to preserve ordering).
+  const pendingClientLines: string[] = [];
+  let pendingBytes = 0;
+
+  // Captured MCP handshake for replay onto fresh Gateway connections.
+  let initializeLine: string | undefined;
+  let initializeId: string | number | null | undefined;
+  let initializeSentToServer = false;
+  let initializeResponseForwarded = false;
+  let initializedNotificationLine: string | undefined;
+
+  // Replay-in-progress state for the current connection.
+  let replayAwaitingResponse = false;
+
+  let finish!: () => void;
+  let fatal!: (error: Error) => void;
+  const done = new Promise<void>((resolve, reject) => {
+    finish = () => { if (!settled) { settled = true; resolve(); } };
+    fatal = (error: Error) => { if (!settled) { settled = true; reject(error); } };
   });
 
-  try {
-    await sendMcpGatewayHandshake(socket, authToken);
-    input.pipe(socket);
-    socket.pipe(output, { end: false });
-    await new Promise<void>((resolve, reject) => {
-      socket.once('close', resolve);
-      socket.once('error', reject);
+  const tryParse = (line: string): any => {
+    try { return JSON.parse(line); } catch { return undefined; }
+  };
+  const idEquals = (a: unknown, b: unknown): boolean => a !== undefined && b !== undefined && a === b;
+
+  const writeServerLine = (line: string): void => {
+    socket?.write(`${line}\n`);
+    const parsed = tryParse(line);
+    if (parsed?.method === 'initialize' && idEquals(parsed.id, initializeId)) {
+      initializeSentToServer = true;
+    }
+  };
+
+  const bufferClientLine = (line: string): void => {
+    pendingBytes += Buffer.byteLength(line) + 1;
+    if (pendingBytes > RELAY_OUTAGE_BUFFER_MAX_BYTES) {
+      fatal(new Error('Botmux MCP Gateway relay buffered too much during a Gateway outage'));
+      return;
+    }
+    pendingClientLines.push(line);
+  };
+
+  const flushPendingClientLines = (): void => {
+    while (pendingClientLines.length > 0 && connected && !replayAwaitingResponse) {
+      const line = pendingClientLines.shift()!;
+      pendingBytes -= Buffer.byteLength(line) + 1;
+      writeServerLine(line);
+    }
+  };
+
+  const onClientLine = (line: string): void => {
+    if (line.trim().length === 0) return;
+    const parsed = tryParse(line);
+    if (parsed?.method === 'initialize' && parsed.id !== undefined && initializeLine === undefined) {
+      initializeLine = line;
+      initializeId = parsed.id;
+    } else if (parsed?.method === 'notifications/initialized') {
+      initializedNotificationLine = line;
+    }
+    if (connected && !replayAwaitingResponse) writeServerLine(line);
+    else bufferClientLine(line);
+  };
+
+  const onServerLine = (line: string): void => {
+    if (line.trim().length === 0) return;
+    const parsed = tryParse(line);
+    const isInitializeResponse = parsed !== undefined
+      && parsed.method === undefined
+      && idEquals(parsed.id, initializeId);
+    if (replayAwaitingResponse && isInitializeResponse) {
+      replayAwaitingResponse = false;
+      // Forward the replayed response only when the client never saw the
+      // original (disconnect raced the first response); otherwise a duplicate
+      // response id would corrupt the client's MCP session.
+      if (!initializeResponseForwarded) {
+        initializeResponseForwarded = true;
+        output.write(`${line}\n`);
+      }
+      if (initializedNotificationLine !== undefined) writeServerLine(initializedNotificationLine);
+      flushPendingClientLines();
+      return;
+    }
+    if (isInitializeResponse) initializeResponseForwarded = true;
+    output.write(`${line}\n`);
+  };
+
+  const attachSocket = (fresh: NetSocket): void => {
+    socket = fresh;
+    connected = true;
+    everConnected = true;
+    const decoder = new StringDecoder('utf8');
+    let tail = '';
+    fresh.on('data', (chunk: Buffer) => {
+      tail += decoder.write(chunk);
+      for (;;) {
+        const newline = tail.indexOf('\n');
+        if (newline < 0) break;
+        const line = tail.slice(0, newline).replace(/\r$/, '');
+        tail = tail.slice(newline + 1);
+        onServerLine(line);
+      }
     });
+    fresh.on('error', () => { /* surfaced via 'close' */ });
+    fresh.once('close', () => {
+      if (socket !== fresh) return;
+      socket = null;
+      connected = false;
+      replayAwaitingResponse = false;
+      if (inputEnded || settled) {
+        finish();
+        return;
+      }
+      void reconnectLoop(false);
+    });
+    if (initializeSentToServer && initializeLine !== undefined) {
+      // Fresh Gateway connection = fresh MCP server: replay the handshake the
+      // client already performed. Pending client lines stay queued until the
+      // replayed response arrives so the server never sees requests
+      // pre-initialize.
+      replayAwaitingResponse = true;
+      fresh.write(`${initializeLine}\n`);
+    } else {
+      flushPendingClientLines();
+    }
+  };
+
+  const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+  const reconnectLoop = async (initial: boolean): Promise<void> => {
+    const budgetMs = initial && !everConnected ? tuning.initialBudgetMs : tuning.reconnectBudgetMs;
+    const startedAt = Date.now();
+    let delayMs = tuning.backoffMs;
+    for (;;) {
+      if (inputEnded || settled) { finish(); return; }
+      try {
+        attachSocket(await connectMcpGatewaySocket(socketPath));
+        return;
+      } catch (error) {
+        if (Date.now() - startedAt + delayMs > budgetMs) {
+          fatal(new Error(
+            `Botmux MCP Gateway unreachable for ${Math.round(budgetMs / 1000)}s `
+            + `(${error instanceof Error ? error.message : String(error)}); giving up`,
+          ));
+          return;
+        }
+        await sleep(delayMs);
+        delayMs = Math.min(delayMs * 2, tuning.maxBackoffMs);
+      }
+    }
+  };
+
+  const inputDecoder = new StringDecoder('utf8');
+  let inputTail = '';
+  input.on('data', (chunk: Buffer | string) => {
+    inputTail += typeof chunk === 'string' ? chunk : inputDecoder.write(chunk);
+    for (;;) {
+      const newline = inputTail.indexOf('\n');
+      if (newline < 0) break;
+      const line = inputTail.slice(0, newline).replace(/\r$/, '');
+      inputTail = inputTail.slice(newline + 1);
+      onClientLine(line);
+    }
+  });
+  input.once('end', () => {
+    inputEnded = true;
+    if (socket) socket.destroy();
+    else finish();
+  });
+  input.once('error', () => {
+    inputEnded = true;
+    if (socket) socket.destroy();
+    else finish();
+  });
+  input.resume?.();
+
+  await reconnectLoop(true);
+  try {
+    await done;
   } finally {
-    input.unpipe(socket);
-    socket.unpipe(output);
-    socket.destroy();
+    destroySocket();
   }
 }

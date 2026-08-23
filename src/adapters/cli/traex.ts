@@ -1,7 +1,10 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { traeStateDbPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
@@ -154,6 +157,128 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
   '~/.trae/.coco-rollouts-migrated',
   '~/.trae/.coco-migrated',
 ] as const;
+
+/**
+ * TraeX active-turn busy marker. Every anchor below is extracted verbatim
+ * from the traex binary's compiled-in TUI string tables and verified across
+ * all 9 local releases (0.201.1-alpha.5 … 0.201.2-alpha.2, both `traex` and
+ * `traex-code-mode-host`):
+ *
+ *  - Spinner frames: the contiguous string "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+ *    (braille rotation compiled into every release).
+ *  - Spinner label set 1 (thinking/working rotation): "Thinking longer…",
+ *    "Deep in thought…", "Almost there…", "Running command…",
+ *    "Command in flight…", "Chugging along…", "Finishing up…", "Executing…",
+ *    "Hang tight…", "Waiting for response…", "Any second now…",
+ *    "Poking the model…", "On its way…", "Shh, it's thinking…",
+ *    "Thinking…", "Reasoning through it…", "Mulling it over…",
+ *    "Pondering…", "Working it out…", "Piecing it together…".
+ *  - Spinner label set 2 (approval/working/queue): "Reviewing approval
+ *    request", "Working…", "Working on it…", "Queued for capacity".
+ *  - Standalone queue notice: "Too many requests right now. You're in the
+ *    queue."
+ *
+ * TraeX forked from Codex and DELETED the "esc to interrupt" footer hint —
+ * `grep -a -c "esc to interrupt"` returns 0 across every local release and
+ * the 94MB TUI logs — so the Codex pattern's second anchor is invalid here.
+ *
+ * Three branches:
+ *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
+ *     never appears in transcript prose, so assistant output like
+ *     "Working… on the fix" cannot revive a completed card. Covers the
+ *     working/thinking rotation AND the spinner-prefixed queue state
+ *     ("⠋ Queued for capacity" — the queue screen can render a frozen
+ *     spinner frame in front of the label).
+ *  2. Standalone capacity-queue strings, line-anchored
+ *     (`(?:^|[\n\r])[ \t]*…`): "Queued for capacity" and the full queue
+ *     notice. The queue screen can render statically (no animating spinner),
+ *     so the frame anchor must not be required for it. The line anchor keeps
+ *     assistant prose quoting the string mid-sentence ("…says Queued for
+ *     capacity whenever…") from registering as busy.
+ *  3. (staticBusyPattern below) the same queue evidence as a pre-idle latch
+ *     inside IdleDetector — see TRAEX_STATIC_BUSY_PATTERN.
+ *
+ * Both states must be covered: the worker's busy-pattern idle probe marks
+ * the prompt ready as soon as the marker leaves the viewport, so matching
+ * only the queue strings would flash Idle the moment the queue resolves
+ * into a real working turn.
+ */
+const TRAEX_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+
+const TRAEX_SPINNER_LABELS = [
+  // Set 1 — thinking/working rotation (compiled-in spinner string table).
+  'Thinking longer…',
+  'Deep in thought…',
+  'Almost there…',
+  'Running command…',
+  'Command in flight…',
+  'Chugging along…',
+  'Finishing up…',
+  'Executing…',
+  'Hang tight…',
+  'Waiting for response…',
+  'Any second now…',
+  'Poking the model…',
+  'On its way…',
+  "Shh, it's thinking…",
+  'Thinking…',
+  'Reasoning through it…',
+  'Mulling it over…',
+  'Pondering…',
+  'Working it out…',
+  'Piecing it together…',
+  // Set 2 — approval/working/queue.
+  'Reviewing approval request',
+  'Working…',
+  'Working on it…',
+  'Queued for capacity',
+] as const;
+
+/** Line-anchored standalone capacity-queue strings. Shared by the active
+ *  busy pattern and the pre-idle static latch (see below). */
+const TRAEX_QUEUE_STATIC_ARMS = [
+  'Queued for capacity',
+  "Too many requests right now\\. You're in the queue",
+];
+
+const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
+  [
+    `[${TRAEX_SPINNER_FRAMES}][ \\t]?(?:${TRAEX_SPINNER_LABELS.join('|')})`,
+    ...TRAEX_QUEUE_STATIC_ARMS.map((arm) => `(?:^|[\\n\\r])[ \\t]*${arm}`),
+  ].join('|'),
+  'i',
+);
+
+/**
+ * Pre-idle static-busy latch for the capacity-queue screen (ZMX gap).
+ *
+ * busyPattern/idleToBusyPattern cannot cover the FIRST static queue on ZMX:
+ *  - busyPattern is a viewport probe; deferPromptReadyWhileBusy() and the
+ *    idle probe bail when backendScreenEvidenceIsAuthoritativeForMutation()
+ *    is false (ZMX history is not a trustworthy current viewport).
+ *  - idleToBusyPattern only self-heals an ALREADY-published idle, and only
+ *    from fresh PTY bytes; a static queue screen emits none.
+ *
+ * This pattern is consumed inside IdleDetector from the raw PTY byte stream
+ * (the same trust level as readyPattern/completionPattern — NOT the
+ * forbidden screen-capture snapshot): a chunk carrying queue evidence latches
+ * "static busy" and suppresses screen-derived idle until a chunk with
+ * readyPattern evidence but no queue string redraws (the real composer).
+ * Includes the spinner-prefixed queue form: a frozen braille frame in front
+ * of the label would otherwise only buy the 3s spinner guard, after which
+ * the static screen would still false-idle.
+ */
+const TRAEX_STATIC_BUSY_PATTERN = new RegExp(
+  [
+    `[${TRAEX_SPINNER_FRAMES}][ \\t]?Queued for capacity`,
+    ...TRAEX_QUEUE_STATIC_ARMS.map((arm) => `(?:^|[\\n\\r])[ \\t]*${arm}`),
+  ].join('|'),
+  'i',
+);
+
+/** traex / codex / coco 的 `debug models` 输出同构，解析逻辑抽到
+ *  model-catalog-json.js 共享；旧名 re-export 保持既有引用（含测试）可用。 */
+export { parseDebugModelsJson as parseTraexModelsJson };
 
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
@@ -329,6 +454,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    // Active-turn busy marker — spinner-anchored working/thinking labels plus
+    // standalone capacity-queue strings. See the TRAEX_ACTIVE_BUSY_PATTERN
+    // comment for the binary-extracted evidence and why both states are
+    // required.
+    busyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
+    idleToBusyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
+    // Pre-idle latch for the static capacity-queue screen — holds the session
+    // busy before the first idle on backends (ZMX) where the busyPattern
+    // viewport probe is forbidden from mutating state. See the
+    // TRAEX_STATIC_BUSY_PATTERN comment.
+    staticBusyPattern: TRAEX_STATIC_BUSY_PATTERN,
+    // Clear the static-busy latch only on real composer evidence (line-start
+    // ›/❯, excluding numbered selector rows). The broad readyPattern also
+    // matches `\d+% left` (status bar), which the queue screen itself
+    // carries — using it to clear the latch would re-open the ZMX false-idle
+    // bug when queue and status bar arrive in separate chunks.
+    staticBusyClearPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/,
     // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
     // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
     // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
@@ -361,6 +503,28 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       'DeepSeek-V4-Pro',
       'kimi-k2.6',
     ],
+    // Live 模型枚举：`traex debug models` 输出单行 JSON（全量目录 24+ 个模型，
+    // 每条带长 description，整包可达数百 KB），故 maxBuffer 给到 16MB、8s 超时
+    // 兜底。仅 dashboard 在用户选中 traex 时按需调用，不在 daemon/worker 启动
+    // 路径上；任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，
+    // picker 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
     // RPC mode bridges native AskUserQuestion directly. Keep the normal
     // botmux-ask skill available too: TraeX sessions can fail closed to a
     // standard PTY when RPC is unavailable, where native questions cannot

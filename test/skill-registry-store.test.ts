@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { buildSkillInstallAuditSummary, discoverLocalSkillCandidates, installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills } from '../src/services/skill-registry-store.js';
+import { __testOnly_setStoreTreeRemovalOps, buildSkillInstallAuditSummary, discoverLocalSkillCandidates, installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills, sweepStoreTrash } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -22,6 +22,7 @@ describe('skill registry store', () => {
   });
 
   afterEach(() => {
+    __testOnly_setStoreTreeRemovalOps(undefined);
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
     rmSync(src, { recursive: true, force: true });
@@ -153,6 +154,86 @@ describe('skill registry store', () => {
     expect(readSkillRegistry().skills).toEqual({});
     expect(() => readFileSync(join(copied.rootDir, 'SKILL.md'), 'utf-8')).toThrow();
     expect(readFileSync(join(linked.rootDir, 'SKILL.md'), 'utf-8')).toContain('name: linked');
+  });
+
+  it('frees the skill rootDir synchronously (rename) and unlinks the tree in the background', async () => {
+    write(join(src, 'bulky', 'SKILL.md'), '---\nname: bulky\n---\n# Bulky');
+    // A few files so the tree is more than an empty dir — the point is that the
+    // caller returns before these are unlinked.
+    write(join(src, 'bulky', 'a', 'one.txt'), 'one');
+    write(join(src, 'bulky', 'a', 'two.txt'), 'two');
+    const pkg = installLocalSkill(join(src, 'bulky'), { link: false });
+    const storeDir = join(home, '.botmux', 'skills', 'store');
+
+    const result = removeInstalledSkill('bulky');
+
+    // Synchronous guarantees: registry entry gone AND rootDir no longer resolves
+    // (renamed away) the instant removeInstalledSkill returns.
+    expect(result).toEqual({ ok: true });
+    expect(readSkillRegistry().skills.bulky).toBeUndefined();
+    expect(() => readFileSync(join(pkg.rootDir, 'SKILL.md'), 'utf-8')).toThrow();
+
+    // The tree is briefly a `.trash-*` sibling, then the background unlink drains
+    // it. Poll rather than assume timing.
+    await vi.waitFor(() => {
+      const leftovers = readdirSync(storeDir);
+      expect(leftovers.filter(name => name.startsWith('.trash-'))).toEqual([]);
+      expect(leftovers).toEqual([]);
+    }, { timeout: 2000, interval: 25 });
+  });
+
+  it('sweepStoreTrash reclaims a leftover .trash-* dir from an interrupted unlink', async () => {
+    const storeDir = join(home, '.botmux', 'skills', 'store');
+    // Simulate an interrupted background unlink: a `.trash-*` dir left on disk.
+    const orphan = join(storeDir, '.trash-deadbeefdeadbeef');
+    write(join(orphan, 'video', 'big.bin'), 'x'.repeat(4096));
+
+    sweepStoreTrash();
+
+    await vi.waitFor(() => {
+      expect(existsSync(orphan)).toBe(false);
+    }, { timeout: 2000, interval: 25 });
+    // A real installed skill (no .trash- prefix) must never be swept.
+    write(join(src, 'keeper', 'SKILL.md'), '---\nname: keeper\n---\n# Keeper');
+    const kept = installLocalSkill(join(src, 'keeper'), { link: false });
+    sweepStoreTrash();
+    await new Promise(r => setTimeout(r, 50));
+    expect(readFileSync(join(kept.rootDir, 'SKILL.md'), 'utf-8')).toContain('name: keeper');
+  });
+
+  it('keeps the registry and tree intact when staging rename fails', () => {
+    write(join(src, 'bulky', 'SKILL.md'), '---\nname: bulky\n---\n# Bulky');
+    const pkg = installLocalSkill(join(src, 'bulky'), { link: false });
+    const renameError = new Error('rename denied');
+    __testOnly_setStoreTreeRemovalOps({
+      rename: () => { throw renameError; },
+      removeAsync: async () => undefined,
+    });
+
+    expect(removeInstalledSkill('bulky')).toEqual({ ok: false, reason: 'skill_tree_remove_failed' });
+    expect(readSkillRegistry().skills.bulky).toBeDefined();
+    expect(readFileSync(join(pkg.rootDir, 'SKILL.md'), 'utf-8')).toContain('name: bulky');
+  });
+
+  it('rolls back earlier staged trees when a later batch rename fails', () => {
+    write(join(src, 'one', 'SKILL.md'), '---\nname: one\n---\n# One');
+    write(join(src, 'two', 'SKILL.md'), '---\nname: two\n---\n# Two');
+    const one = installLocalSkill(join(src, 'one'), { link: false });
+    const two = installLocalSkill(join(src, 'two'), { link: false });
+    let forwardRenames = 0;
+    __testOnly_setStoreTreeRemovalOps({
+      rename: (from, to) => {
+        if (!from.includes('.trash-') && ++forwardRenames === 2) throw new Error('second rename denied');
+        renameSync(from, to);
+      },
+      removeAsync: async () => undefined,
+    });
+
+    expect(removeInstalledSkills(['one', 'two'])).toEqual({ ok: false, reason: 'skill_tree_remove_failed' });
+    expect(readSkillRegistry().skills.one).toBeDefined();
+    expect(readSkillRegistry().skills.two).toBeDefined();
+    expect(readFileSync(join(one.rootDir, 'SKILL.md'), 'utf-8')).toContain('name: one');
+    expect(readFileSync(join(two.rootDir, 'SKILL.md'), 'utf-8')).toContain('name: two');
   });
 
   it('keeps the whole batch when any requested skill is missing', () => {

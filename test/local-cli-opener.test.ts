@@ -80,7 +80,9 @@ describe('local-cli-opener', () => {
         session: { ...ds().session, cliId, cliSessionId: 'ses_nativeid' },
       }), {
         mode: 'resume',
-        adapterFactory: (id) => createCliAdapterSync(id, '/bin/echo'),
+        adapterFactory: (id) => id === 'oh-my-pi'
+          ? ({ buildResumeCommand: () => "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'" })
+          : createCliAdapterSync(id, '/bin/echo'),
       });
 
       expect(supportsLocalCliOpen(cliId)).toBe(true);
@@ -108,6 +110,39 @@ describe('local-cli-opener', () => {
       ok: true,
       command: "cd '/tmp/project'\\''s dir' && codex resume 'native'\\''id'",
     });
+  });
+
+  it('accepts only the exact shell-quoted OMP resume command shape', () => {
+    const session = ds({
+      session: { ...ds().session, cliId: 'oh-my-pi', cliSessionId: undefined },
+    });
+    const valid = "omp --resume '/tmp/omp/turn'\\''s.jsonl' --session-dir '/tmp/omp/session'\\''s'";
+    const accepted = buildLocalCliOpenCommand(session, {
+      mode: 'resume',
+      adapterFactory: () => ({ buildResumeCommand: () => valid }),
+    });
+    expect(accepted).toEqual({
+      ok: true,
+      command: `cd '/tmp/project'\\''s dir' && ${valid}`,
+    });
+
+    for (const raw of [
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'; touch /tmp/pwn",
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'\ntouch /tmp/pwn",
+      "omp --resume '/tmp/omp/turn.jsonl'",
+      "omp --session-dir '/tmp/omp' --resume '/tmp/omp/turn.jsonl'",
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp' --model extra",
+      "omp --resume /tmp/omp/turn.jsonl --session-dir '/tmp/omp'",
+      "omp --resume '/tmp/omp/turn.jsonl' --session-dir /tmp/omp",
+      "omp --resume 'tmp/omp/turn.jsonl' --session-dir '/tmp/omp'",
+      "omp --resume '$HOME/.omp/turn.jsonl' --session-dir '/tmp/omp'",
+    ]) {
+      const rejected = buildLocalCliOpenCommand(session, {
+        mode: 'resume',
+        adapterFactory: () => ({ buildResumeCommand: () => raw }),
+      });
+      expect(rejected).toMatchObject({ ok: false, error: 'missing_resume_id' });
+    }
   });
 
   it('uses the frozen configured Codex executable for local resume', () => {
@@ -442,7 +477,7 @@ describe('local-cli-opener', () => {
     expect(isLocalCliOpenReady(pending, { mode: 'resume', adapterFactory })).toBe(true);
   });
 
-  it('treats adopted ids and oh-my-pi continue as ready resume targets', () => {
+  it('treats adopted ids and oh-my-pi exact transcript paths as ready resume targets', () => {
     const adopted = ds({
       adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/repo', sessionId: 'adopt-native' },
       workingDir: undefined,
@@ -458,7 +493,9 @@ describe('local-cli-opener', () => {
     });
     expect(isLocalCliOpenReady(ohMyPi, {
       mode: 'resume',
-      adapterFactory: () => ({ buildResumeCommand: () => 'omp --continue' }),
+      adapterFactory: () => ({
+        buildResumeCommand: () => "omp --resume '/tmp/omp/turn.jsonl' --session-dir '/tmp/omp'",
+      }),
     })).toBe(true);
   });
 

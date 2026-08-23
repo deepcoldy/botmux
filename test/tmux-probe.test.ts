@@ -78,6 +78,29 @@ describe('TmuxBackend.probeSession', () => {
     expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
   });
 
+  it('returns "unknown" on a clean CONNECTION-level failure (server stall ⇒ instant ECONNREFUSED), NOT "missing"', () => {
+    // Linux fails unix-socket connect() with an instant clean ECONNREFUSED when
+    // the shared server's accept backlog overflows — the client never reached
+    // the server, so the clean exit-1 proves nothing about this session.
+    // (2026-08-20: misreading this as 'missing' made kill-verify / liveness
+    // consumers treat dozens of live sessions as gone simultaneously.)
+    const stderr = Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)');
+    bothThrow({ status: 1, signal: null, stderr }, { status: 1, signal: null, stderr });
+    expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
+  });
+
+  it('returns "unknown" when the connection died mid-command (lost server)', () => {
+    const stderr = Buffer.from('lost server');
+    bothThrow({ status: 1, signal: null, stderr }, { status: 1, signal: null, stderr });
+    expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
+  });
+
+  it('keeps "no server running" as authoritative "missing" (a down server provably has no sessions)', () => {
+    const stderr = Buffer.from('no server running on /tmp/tmux-0/default');
+    bothThrow({ status: 1, signal: null, stderr }, { status: 1, signal: null, stderr });
+    expect(TmuxBackend.probeSession(NAME)).toBe('missing');
+  });
+
   it('hasSession() stays a conservative boolean wrapper (false on unknown)', () => {
     bothThrow({ status: 127, signal: null }, { code: 'ENOENT', status: null, signal: null });
     expect(TmuxBackend.hasSession(NAME)).toBe(false);

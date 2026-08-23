@@ -99,10 +99,10 @@ describe('registration loser command handoff', () => {
     expect(claimCalls).toBeGreaterThanOrEqual(2);
     expect(src).toContain("if (registration.reason !== 'existing_owner') return;");
     expect(src).toContain(
-      'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId)',
+      'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId)',
     );
     expect(src).toContain(
-      'await handleCommand(cmd, anchor, cmdMessage, commandDeps, larkAppId)',
+      'await handleCommand(cmd, anchor, cmdMessage, invocationDeps, larkAppId)',
     );
   });
 

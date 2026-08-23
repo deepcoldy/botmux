@@ -20,7 +20,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand } from '../hook-command.js';
+import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
@@ -744,8 +744,10 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
-    // alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体版本；具体 ID 锁版本。
-    modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+    // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
+    // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
+    // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
+    modelChoices: ['fable', 'opus', 'sonnet', 'haiku', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
   }, pathOverride ?? 'claude');
 }
 
@@ -1192,7 +1194,18 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
+      // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
+      // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
+      // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。
+      // 仅 claude-code 安装 UserPromptSubmit hook；seed/relay 等共享 adapter 的
+      // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
+      // 装了也是每轮空跑一个子进程）。
+      userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
     },
+    // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
+    // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的
+    // developer message，不适用本机制。
+    supportsInvisiblePromptHook: variant.id === 'claude-code',
     asksViaHook: true,
   };
 }

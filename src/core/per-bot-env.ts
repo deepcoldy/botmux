@@ -65,6 +65,16 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'CLAUDE_PID',
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
+  // lark-cli keystore data root (Linux): `<value>/lark-cli` holds THIS bot's
+  // appsecret + the shared master key. The file sandbox freezes the keystore path
+  // from the worker's OWN process env value and denies the store (carving out only
+  // this bot's keys); a per-bot inject would (a) NOT reach a sandboxed child anyway
+  // (bwrap uses a --setenv allowlist that excludes it + the worker re-pins it), so
+  // it would be silently overridden — confusing — and (b) if it DID take effect on a
+  // non-sandboxed path, relocate the keystore out from under the frozen policy. So a
+  // per-bot `env` must not set it: reserve it (rejected + diagnosable), not silently
+  // accepted-then-ignored. The authoritative value is the worker's env.
+  'LARKSUITE_CLI_DATA_DIR',
   // Grok data root: daemon installs hooks/skills and drains transcripts under
   // the process-level GROK_HOME. A per-bot inject would only reach the child
   // CLI and split-brain path resolution (see grok-paths header).

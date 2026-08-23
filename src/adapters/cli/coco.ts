@@ -1,7 +1,10 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
@@ -302,6 +305,29 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       'Doubao-Seed-Code',
       'Gemini-3.1-Pro-Preview',
     ],
+    // Live 模型枚举：coco 与 traex 共用同一 traecli 二进制（见 coco.ts 顶部
+    // 说明），`coco debug models` 输出与 `traex debug models` 同构的 JSON 目录，
+    // 复用共享解析。整包可达数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。
+    // 仅 dashboard 在用户选中 coco 时按需调用，不在 daemon/worker 启动路径上；
+    // 任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，picker
+    // 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

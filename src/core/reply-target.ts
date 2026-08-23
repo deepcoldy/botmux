@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { FrozenSessionReplyContext, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -86,6 +86,37 @@ export type SessionReplyTarget =
   | { mode: 'plain'; chatId: string }
   | { mode: 'thread'; rootMessageId: string }
   | { mode: 'quote'; rootMessageId: string };
+
+/** Stable key for one visible Lark destination. Keep the reply mode in the key:
+ * a quoted top-level reply and a reply inside that message's thread share the
+ * same message id but are different visible surfaces. */
+export function replyTargetKey(target: FrozenSessionReplyTarget): string {
+  return target.mode === 'plain'
+    ? `plain:${target.chatId}`
+    : `${target.mode}:${target.rootMessageId}`;
+}
+
+/** Freeze the visible Lark destination for one inbound turn before any
+ * lifecycle mutation can replace or remove its session. `replyRootId` is
+ * supplied only for a real chat-scope thread fold-back; quote-only turns keep
+ * the same root but use ordinary reply semantics instead of reply_in_thread. */
+export function resolveInboundReplyTarget(args: {
+  scope: 'chat' | 'thread';
+  chatId: string;
+  threadRootId: string;
+  replyRootId?: string;
+  quoteOnly?: boolean;
+}): SessionReplyTarget {
+  if (args.scope === 'chat') {
+    if (args.replyRootId) {
+      return args.quoteOnly
+        ? { mode: 'quote', rootMessageId: args.replyRootId }
+        : { mode: 'thread', rootMessageId: args.replyRootId };
+    }
+    return { mode: 'plain', chatId: args.chatId };
+  }
+  return { mode: 'thread', rootMessageId: args.threadRootId };
+}
 
 /** Bound on `Session.replyTargets`: long-lived sessions could otherwise grow
  * without limit. An evicted turn may use a legacy slot only when its turnId
@@ -237,13 +268,13 @@ export function beginReplyTargetTurn(
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
   // mention-back participant record below; both are written per turn.
-  const exactTarget: SessionReplyTarget = ds.scope === 'chat'
-    ? replyRootId
-      ? opts?.quoteOnly
-        ? { mode: 'quote', rootMessageId: replyRootId }
-        : { mode: 'thread', rootMessageId: replyRootId }
-      : { mode: 'plain', chatId: ds.chatId }
-    : { mode: 'thread', rootMessageId: ds.session.rootMessageId };
+  const exactTarget = resolveInboundReplyTarget({
+    scope: ds.scope,
+    chatId: ds.chatId,
+    threadRootId: ds.session.rootMessageId,
+    replyRootId,
+    quoteOnly: opts?.quoteOnly,
+  });
   const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
   // Re-insertion keeps the newest turn at the end for deterministic bounding.
   delete exactContexts[turnId];
@@ -410,4 +441,61 @@ export function syncReplyTargetState(ds: DaemonSession, s?: Session): void {
   const source = s ?? ds.session;
   ds.replyThreadAliases = source.replyThreadAliases;
   ds.currentReplyTarget = source.currentReplyTarget;
+}
+
+/**
+ * Rebind reply metadata after a live DaemonSession is moved to another Lark
+ * destination or assigned a replacement Session record. Source-chat message
+ * ids must never survive as routing authority in the new destination.
+ *
+ * Per-turn sender/participant attribution is retained for buffered inputs, but
+ * every visible target is rewritten to the session's new canonical surface.
+ * Callers detach/clear the old live card before invoking this helper, so its
+ * persisted destination key is cleared as part of the same lifecycle boundary.
+ */
+export function rehomeReplyTargetState(ds: DaemonSession): void {
+  const target = resolveInboundReplyTarget({
+    scope: ds.scope,
+    chatId: ds.chatId,
+    threadRootId: ds.session.rootMessageId,
+  });
+
+  if (ds.session.turnReplyContexts) {
+    const contexts: NonNullable<Session['turnReplyContexts']> = {};
+    for (const [turnId, context] of Object.entries(ds.session.turnReplyContexts)) {
+      contexts[turnId] = {
+        target,
+        ...(context.replyTargetSenderOpenId
+          ? { replyTargetSenderOpenId: context.replyTargetSenderOpenId }
+          : {}),
+        ...(context.replyTargetSenderIsBot !== undefined
+          ? { replyTargetSenderIsBot: context.replyTargetSenderIsBot }
+          : {}),
+      };
+    }
+    ds.session.turnReplyContexts = contexts;
+  }
+
+  if (ds.session.replyTargets) {
+    const targets: NonNullable<Session['replyTargets']> = {};
+    for (const [turnId, entry] of Object.entries(ds.session.replyTargets)) {
+      targets[turnId] = {
+        updatedAt: entry.updatedAt,
+        ...(entry.senderOpenId ? { senderOpenId: entry.senderOpenId } : {}),
+        ...(entry.participants?.length ? { participants: entry.participants } : {}),
+        ...(entry.participantsIncomplete ? { participantsIncomplete: true } : {}),
+      };
+    }
+    ds.session.replyTargets = targets;
+  }
+
+  ds.replyThreadAliases = undefined;
+  ds.currentReplyTarget = undefined;
+  ds.session.replyThreadAliases = undefined;
+  ds.session.currentReplyTarget = undefined;
+  ds.session.quoteTargetId = undefined;
+  ds.session.quoteTargetSenderOpenId = undefined;
+  ds.session.quoteTargetSenderIsBot = undefined;
+  ds.streamCardReplyTargetKey = undefined;
+  ds.session.streamCardReplyTargetKey = undefined;
 }

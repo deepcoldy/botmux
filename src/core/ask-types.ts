@@ -168,7 +168,11 @@ export type AskClickOutcome =
   /** Ask already settled (race winner exists or timed out). */
   | 'already_settled'
   /** 多选累积：用户勾选/取消某项，尚未 submit——不触发 settle。 */
-  | 'toggled';
+  | 'toggled'
+  /** 空提交二次确认：鉴权 + nonce 校验都通过，但当前一个选项都没勾、且每个问题
+   *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
+   *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */
+  | 'needs_empty_confirm';
 
 /** 旧单选语义兼容：仅当"单问且恰好选 1 个"时返回该 key，否则 null。
  *  `botmux ask buttons` 子命令与其测试据此保持单选行为不变。 */

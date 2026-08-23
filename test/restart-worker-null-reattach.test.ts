@@ -45,21 +45,33 @@ describe('P1 shouldDestroyPaneBeforeRestart (pure decision)', () => {
 
   it('destroys the pane for an ordinary owned session', async () => {
     const { shouldDestroyPaneBeforeRestart } = await import('../src/core/worker-pool.js');
-    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: false } as any, adoptedFrom: undefined }))
+    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: false } as any, adoptedFrom: undefined, session: {} as any }))
       .toBe(true);
-    expect(shouldDestroyPaneBeforeRestart({ initConfig: undefined, adoptedFrom: undefined }))
+    expect(shouldDestroyPaneBeforeRestart({ initConfig: undefined, adoptedFrom: undefined, session: {} as any }))
       .toBe(true);
   });
 
   it('NEVER destroys an adopted user pane (bridge invariant)', async () => {
     const { shouldDestroyPaneBeforeRestart } = await import('../src/core/worker-pool.js');
     // adoptMode frozen on the live init config
-    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: true } as any, adoptedFrom: undefined }))
+    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: true } as any, adoptedFrom: undefined, session: {} as any }))
       .toBe(false);
     // adoptedFrom stamped on the daemon session (restored adopt session)
     expect(shouldDestroyPaneBeforeRestart({
       initConfig: undefined,
       adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'claude-code', cwd: '/tmp' } as any,
+      session: {} as any,
+    })).toBe(false);
+  });
+
+  it('NEVER destroys the source of an existing App Server shared adopt', async () => {
+    const { shouldDestroyPaneBeforeRestart } = await import('../src/core/worker-pool.js');
+    expect(shouldDestroyPaneBeforeRestart({
+      initConfig: undefined,
+      adoptedFrom: undefined,
+      session: {
+        existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+      } as any,
     })).toBe(false);
   });
 });
@@ -73,8 +85,10 @@ describe('P1 requestSessionRestart wiring', () => {
     const body = workerPoolSource.slice(fn, workerPoolSource.indexOf('\n}', fn) + 2);
 
     // Live-worker branch still sends the in-worker restart IPC — now also
-    // carrying the latest per-bot env (dashboard edits apply on /restart).
-    expect(body).toContain("ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) }");
+    // carrying the latest per-bot env AND model (config edits apply on /restart).
+    expect(body).toContain(
+      "ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) }",
+    );
 
     // No-worker branch: pane teardown MUST precede forkWorker.
     const destroy = body.indexOf('destroyLivePaneBeforeRestart(ds)');
@@ -227,10 +241,11 @@ describe('P2 worker onTaskDone generation fence', () => {
     expect(mark).toBeGreaterThan(fence);
   });
 
-  it('all three async backend ready/exit callbacks in setupBackendHandlers carry the generation fence', () => {
-    // Within setupBackendHandlers the herdr onAgentStatus, the riff onTaskDone,
-    // and the backend onExit all guard on `backend !== observedBackend` so a
-    // superseded generation can neither re-arm prompt-ready nor tear down the
+  it('every async backend ready/exit callback in setupBackendHandlers carries the generation fence', () => {
+    // Within setupBackendHandlers the herdr onAgentStatus, the riff/mojo
+    // onTaskDone, the mojo onTurnFinal and the backend onExit all guard on
+    // `backend !== observedBackend` so a superseded generation can neither
+    // re-arm prompt-ready, post into the current turn, nor tear down the
     // replacement. Anchored on the setupBackendHandlers occurrences (the adopt
     // observe-paths use a different, non-fenced onExit by design).
     const setup = workerSource.indexOf('const observedBackend = backend;');
@@ -240,18 +255,21 @@ describe('P2 worker onTaskDone generation fence', () => {
     );
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(handlersStart).toBeGreaterThan(setup);
-    const region = workerSource.slice(setup, setup + 6000);
+    const region = workerSource.slice(setup, setup + 7500);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
     const taskDone = region.indexOf('backend.onTaskDone?.(()');
+    const turnFinal = region.indexOf('backend.onTurnFinal?.((text)');
     const onExit = region.indexOf('backend.onExit((code, signal)');
     expect(agentStatus, 'onAgentStatus').toBeGreaterThanOrEqual(0);
     expect(taskDone, 'onTaskDone').toBeGreaterThanOrEqual(0);
+    expect(turnFinal, 'onTurnFinal').toBeGreaterThanOrEqual(0);
     expect(onExit, 'onExit').toBeGreaterThanOrEqual(0);
 
     for (const [name, start] of [
       ['onAgentStatus', agentStatus],
       ['onTaskDone', taskDone],
+      ['onTurnFinal', turnFinal],
       ['onExit', onExit],
     ] as const) {
       // 900-char window (matches the sibling onTaskDone test above): the merged

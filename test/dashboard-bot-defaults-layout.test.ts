@@ -69,6 +69,7 @@ describe('bot defaults focused layout', () => {
     // 会话后端 stays under 高级; 启动环境(Shell+env) stays under 高级 too.
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');
+    expect(advanced).toContain('<SessionOwnerReminderSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
@@ -78,25 +79,61 @@ describe('bot defaults focused layout', () => {
     expect(runtimeEnv).toContain('<LaunchShellSection');
   });
 
+  it('hides the backend picker for EVERY remote CLI, not just riff', () => {
+    // reconcileRiffBackendType rewrites backendType to the CLI's own name for
+    // any isRemoteBackendId(cliId), so offering pty/tmux to a remote bot renders
+    // a choice the spawn layer silently overwrites. Gate on the shared set so a
+    // third remote CLI cannot reintroduce the phantom control.
+    expect(page).toContain("import { isRemoteCliId } from '../../core/remote-cli-ids.js';");
+    expect(page).toMatch(/\{!isRemoteCliId\(bot\.cliId\) \? \(\s*<section className="bd-tile"><BackendTypeSection/);
+    // No open-coded riff-only gate may guard the backend picker again.
+    expect(page).not.toMatch(/bot\.cliId !== 'riff' \? \(\s*<section className="bd-tile"><BackendTypeSection/);
+  });
+
+  it('keeps the file sandbox visible for mojo while hiding it for riff', () => {
+    // Not symmetric with the backend picker on purpose: riff executes only in a
+    // remote sandbox, but a mojo turn can spawn LOCALLY (cloud optional), so its
+    // file-sandbox settings still bite. Treating "remote" as "no local exec"
+    // here would silently drop isolation.
+    expect(page).toMatch(/bot\.cliId !== 'riff' \? \(\s*<section className="bd-tile"><SandboxSection/);
+    expect(page).not.toMatch(/isRemoteCliId\(bot\.cliId\)[^\n]*<SandboxSection/);
+  });
+
   it('ships localized labels for every task category', () => {
     for (const key of ['tabCommon', 'tabSessions', 'tabSecurity', 'tabCards', 'tabAdvanced']) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
     }
   });
 
-  it('adds duration without replacing the familiar full-width quota editor', () => {
+  it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');
-    expect(page).toContain('data-action="save-grant-defaults"');
+    expect(page).not.toContain('data-action="save-grant-defaults"');
+    expect(page).not.toContain('data-action="reset-grant-defaults"');
+    expect(page).toContain('onBlur={saveQuota}');
+    expect(page).toContain('onChange={saveDuration}');
     expect(page).toContain('className="bd-row bd-grant-duration"');
     expect(page).toContain('className="bd-row bd-quota"');
     expect(page).not.toContain('data-action="toggle-grant-quota-oncall"');
-    expect(page).not.toContain('data-action="reset-grant-defaults"');
-    expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝授权卡每人 3 条'");
-    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
+    expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝内置默认：授权卡每人 {count} 条'");
+    expect(i18n).toContain("'botDefaults.quotaDefault': '消息额度覆盖'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前内置默认：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentCustom': '当前自定义：{duration} · 每人 {count} 条（授权卡与 Oncall）'");
+    expect(i18n).not.toContain("'botDefaults.grantDefaultsReset'");
+    expect(i18n).not.toContain('点击“恢复默认限制”');
     expect(i18n).not.toContain('产品默认 3 条');
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
     expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
+  });
+
+  it('offers granular Session owner reminder controls in advanced settings', () => {
+    expect(page).toContain('function SessionOwnerReminderSection');
+    for (const state of ['idle', 'dormant', 'pending_repo', 'tui_prompt', 'agent_attention', 'limited']) {
+      expect(page).toContain(`value: '${state}'`);
+    }
+    for (const key of ['ownerReminderTitle', 'ownerReminderInterval', 'ownerReminderText', 'ownerReminderStates']) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
   });
 });

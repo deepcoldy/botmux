@@ -141,6 +141,24 @@ export function bareShellLaunchKind(leafComm: string, expectedShell: string): 't
   return expectedShell && leafComm !== expectedShell ? 'trampoline' : 'stuck';
 }
 
+export interface BareShellLaunchGuidance {
+  rcFileHint: string;
+  manualTerminalGuard: string;
+}
+
+export function bareShellLaunchGuidance(leafComm: string, expectedShell: string): BareShellLaunchGuidance {
+  if (expectedShell === 'fish') {
+    return {
+      rcFileHint: '~/.config/fish/config.fish',
+      manualTerminalGuard: `status is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec ${leafComm}`,
+    };
+  }
+  return {
+    rcFileHint: expectedShell ? `~/.${expectedShell}rc` : 'shell rc file',
+    manualTerminalGuard: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec ${leafComm}`,
+  };
+}
+
 /** A configured Codex-compatible runtime opts discovery into an exact binary
  * identity. Without one, callers stay on the legacy static comm map. */
 function customCodexExecutableName(filterCliId?: CliId, filterExecutable?: string): string | undefined {

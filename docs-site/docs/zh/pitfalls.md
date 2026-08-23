@@ -13,8 +13,8 @@
 
 ## 环境变量丢失（高频）
 
-- **bash 用户把变量写在 `.bash_profile` 拿不到**：新 worker 用 `bash -i` 启动，`bash -i` 只读 `.bashrc`。→ 在 `.bashrc` 里 `source ~/.bash_profile`，或直接把变量写进 `.bashrc`（zsh 用户写 `.zshrc`）。这是 `API Error 403` / 网关 token 报错的常见根因。
-- **root 下 Claude 拒绝 `--dangerously-skip-permissions`**：报 "cannot be used with root/sudo privileges"。→ `export IS_SANDBOX=1`（zsh 写 `.zshrc`、bash 写 `.bashrc`；PM2 / systemd / Docker 场景配在对应启动环境）。新版已自动对 root 场景注入。
+- **bash 用户把变量写在 `.bash_profile` 拿不到**：新 worker 用 `bash -i` 启动，`bash -i` 只读 `.bashrc`。→ 在 `.bashrc` 里 `source ~/.bash_profile`，或直接把变量写进 `.bashrc`（zsh 用户写 `.zshrc`，fish 用户写 `~/.config/fish/config.fish`）。这是 `API Error 403` / 网关 token 报错的常见根因。
+- **root 下 Claude 拒绝 `--dangerously-skip-permissions`**：报 "cannot be used with root/sudo privileges"。→ `export IS_SANDBOX=1`（zsh 写 `.zshrc`、bash 写 `.bashrc`、fish 写 `~/.config/fish/config.fish`；PM2 / systemd / Docker 场景配在对应启动环境）。新版已自动对 root 场景注入。
 
 ## 自定义 wrapper / 网关接入
 

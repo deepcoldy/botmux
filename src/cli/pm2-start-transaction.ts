@@ -77,6 +77,34 @@ function isOnlineAndLive(
     && isAlive(entry.pid);
 }
 
+/** Pure predicate: does this PM2 row prove signal-death autorestart? A daemon
+ * is only safe to signal when PM2 will auto-restart it after a graceful exit,
+ * i.e. autorestart=true AND stop_exit_codes is exactly the reserved sentinel.
+ * `stop_exit_codes:[0]` would suppress restart after PM2 normalizes
+ * SIGKILL/OOM to exit_code 0, so anything but the exact sentinel is unsafe. */
+export function fleetEntryProvesSignalDeathAutorestart(entry: FleetProcessEntry): boolean {
+  const codes = entry.stopExitCodes;
+  const exactSentinel = Array.isArray(codes)
+    && codes.length === 1
+    && (codes[0] === DAEMON_GRACEFUL_EXIT_CODE
+      || codes[0] === String(DAEMON_GRACEFUL_EXIT_CODE));
+  const restartEnabled = entry.autorestart === true || entry.autorestart === 'true';
+  return exactSentinel && restartEnabled;
+}
+
+/** Non-throwing sibling of assertDaemonPm2GracefulExitPolicy. Returns the
+ * daemon rows that still run an old PM2 policy (missing the signal-death
+ * autorestart proof). A non-empty result means a normal stop/restart will
+ * fail closed and the operator must run the one-time
+ * `--bootstrap-shutdown-protocol` upgrade. Read-only surfaces (e.g. the
+ * dashboard update endpoint) use this to detect the boundary *before* firing
+ * a detached restart that would otherwise die silently. */
+export function daemonRowsMissingSignalDeathAutorestart(
+  entries: FleetProcessEntry[],
+): FleetProcessEntry[] {
+  return entries.filter(entry => !fleetEntryProvesSignalDeathAutorestart(entry));
+}
+
 /** The in-memory shutdown capability is insufficient when PM2 still owns an
  * old registry policy. In particular `stop_exit_codes:[0]` suppresses restart
  * after PM2 normalizes SIGKILL/OOM to exit_code 0. Require the exact daemon
@@ -85,15 +113,7 @@ export function assertDaemonPm2GracefulExitPolicy(
   operation: string,
   entries: FleetProcessEntry[],
 ): void {
-  const unsafe = entries.filter(entry => {
-    const codes = entry.stopExitCodes;
-    const exactSentinel = Array.isArray(codes)
-      && codes.length === 1
-      && (codes[0] === DAEMON_GRACEFUL_EXIT_CODE
-        || codes[0] === String(DAEMON_GRACEFUL_EXIT_CODE));
-    const restartEnabled = entry.autorestart === true || entry.autorestart === 'true';
-    return !exactSentinel || !restartEnabled;
-  });
+  const unsafe = daemonRowsMissingSignalDeathAutorestart(entries);
   if (unsafe.length > 0) {
     throw new Error(
       `[${operation}] daemon PM2 policy does not prove signal-death autorestart `

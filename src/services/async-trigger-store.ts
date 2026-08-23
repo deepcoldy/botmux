@@ -34,11 +34,15 @@ export interface PersistedAsyncTriggerResult {
   completedAt?: number;
   content?: string;
   /** Set only when status==='failed'. `dispatch_unknown` is the at-most-once
-   *  ambiguous-crash outcome written by the idempotency reconcile/barrier: a
-   *  turn whose dispatch may or may not have executed and must NOT be re-run. */
+   *  ambiguous-crash outcome written by the idempotency reconcile/barrier;
+   *  `turn_terminal` is an explicit failed/ambiguous terminal emitted by the
+   *  still-live worker. */
   failedAt?: number;
-  errorCode?: 'no_output';
-  reason?: 'dispatch_unknown';
+  errorCode?: 'no_output' | 'trigger_failed';
+  reason?: 'dispatch_unknown' | 'turn_terminal';
+  /** Original structured worker terminal code retained for programmatic
+   *  callers without widening TriggerResponse.errorCode with provider values. */
+  terminalErrorCode?: string;
   /** Per-turn token usage captured at completion (codex-app). Optional — omitted
    *  when the turn produced no coherent usage. */
   usage?: {
@@ -99,9 +103,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *  into "absent". Present-but-malformed → THROWS (fail-closed).
  *
  *  Validates the STATUS-CONDITIONAL fields too (codex #818 strict-schema): a
- *  `failed` result the store writes ALWAYS carries `reason:'dispatch_unknown'` +
- *  `errorCode:'no_output'` (recordFailedStrict is the sole writer and hard-codes
- *  both). A `failed` hit with a missing/other `reason` is therefore CORRUPT — and
+ *  `failed` result must be one of the two writer-owned shapes below. A failed
+ *  hit with a missing/other `reason` is therefore CORRUPT — and
  *  must throw here rather than pass `status`/`createdAt` only, because a
  *  downstream reader that gates on `reason==='dispatch_unknown'` (the recovery
  *  fence) would otherwise silently treat it as "not the terminal I care about"
@@ -113,10 +116,16 @@ function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerR
   if (status !== 'pending' && status !== 'completed' && status !== 'failed') return false;
   if (typeof value.createdAt !== 'number') return false;
   if (status === 'failed') {
-    // The only shape recordFailedStrict ever persists. Anything else is corrupt.
-    if (value.reason !== 'dispatch_unknown') return false;
-    if (value.errorCode !== 'no_output') return false;
     if (typeof value.failedAt !== 'number') return false;
+    if (value.reason === 'dispatch_unknown') {
+      if (value.errorCode !== 'no_output') return false;
+      if (value.terminalErrorCode !== undefined) return false;
+    } else if (value.reason === 'turn_terminal') {
+      if (value.errorCode !== 'trigger_failed') return false;
+      if (typeof value.terminalErrorCode !== 'string' || value.terminalErrorCode.length === 0) return false;
+    } else {
+      return false;
+    }
   }
   if (status === 'completed' && typeof value.completedAt !== 'number') return false;
   return true;
@@ -259,6 +268,10 @@ export function recordFailedStrict(
     }
     const prev = file.results[triggerId];
     if (prev?.status === 'completed') return 'already_completed'; // completed is stronger — keep it
+    // An explicit worker terminal is stronger than a later worker-exit
+    // `dispatch_unknown`; keep the precise failure while reporting terminal
+    // convergence to the caller.
+    if (prev?.status === 'failed' && prev.reason === 'turn_terminal') return 'written_failed';
     file.ownerLarkAppId = ownerLarkAppId;
     file.results[triggerId] = {
       status: 'failed',
@@ -269,6 +282,42 @@ export function recordFailedStrict(
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
     saveStrict(sessionId, file); // durable + throws
+    return 'written_failed';
+  });
+}
+
+/** Persist an explicit failed/ambiguous worker terminal for an async trigger.
+ * Uses the same owner-proofed, durable, completed-wins transaction as
+ * recordFailedStrict, while retaining the structured terminal code so polling
+ * returns an immediate provider failure rather than a generic no-output state. */
+export function recordTerminalFailureStrict(
+  sessionId: string,
+  triggerId: string,
+  failedAt: number,
+  ownerLarkAppId: string,
+  terminalErrorCode: string,
+): RecordFailedStrictOutcome {
+  if (!ownerLarkAppId) throw new Error('recordTerminalFailureStrict requires ownerLarkAppId');
+  if (!terminalErrorCode) throw new Error('recordTerminalFailureStrict requires terminalErrorCode');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`recordTerminalFailureStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
+    const prev = file.results[triggerId];
+    if (prev?.status === 'completed') return 'already_completed';
+    file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = {
+      status: 'failed',
+      createdAt: prev?.createdAt ?? failedAt,
+      failedAt,
+      errorCode: 'trigger_failed',
+      reason: 'turn_terminal',
+      terminalErrorCode,
+    };
+    if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    saveStrict(sessionId, file);
     return 'written_failed';
   });
 }

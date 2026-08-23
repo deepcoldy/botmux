@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
+import { scrubPm2CallerEnv } from '../../cli/pm2-env.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
 
 const require = createRequire(import.meta.url);
@@ -34,9 +35,21 @@ function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   // the plugin service is an arbitrary long-lived process that could launch a
   // foreground botmux, which would then exit 90 on a clean stop. See
   // stripPm2GracefulExitMarker.
-  const inherited = stripPm2GracefulExitMarker(process.env);
-  delete inherited.kill_timeout;
-  return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
+  const merged = stripPm2GracefulExitMarker({ ...process.env, ...(extra ?? {}) });
+  delete merged.kill_timeout;
+  // Plugin PM2 shares the God's PM2_HOME, so this boundary both persists the
+  // caller's env into plugin apps AND can create the shared God itself. It
+  // therefore applies the SAME caller hygiene as the core pm2 entry
+  // (scrubPm2CallerEnv: CLI home pointers, Claude session markers, workflow
+  // identity, dashboard H5 credentials — a raw copy would hand that secret to
+  // an arbitrary third-party plugin service — plus invoker terminal
+  // fingerprints and turn-scoped session identity, with the TERM re-pin), and
+  // applies it AFTER the manifest env merge, so a plugin manifest cannot
+  // revive a scrubbed key (a service needing its own data root must resolve
+  // it internally, not via CLAUDE_CONFIG_DIR/CODEX_HOME).
+  scrubPm2CallerEnv(merged);
+  merged.PM2_HOME = PLUGIN_PM2_HOME;
+  return merged;
 }
 
 export function runPluginPm2(args: string[], opts: { inherit?: boolean; timeoutMs?: number; env?: Record<string, string> } = {}): void {

@@ -305,7 +305,10 @@ function codexFailureLeaf(error: unknown): unknown {
   return current;
 }
 
-function safeFailureSummary(error: unknown): string | undefined {
+/** Bounded, redacted user-facing summary of a structured task_complete error.
+ *  Exported for the TRAE drainer, which mirrors the Codex error→failed
+ *  terminal mapping on the same payload shape. */
+export function safeFailureSummary(error: unknown): string | undefined {
   const leaf = codexFailureLeaf(error);
   let message = '';
   let code = '';
@@ -389,7 +392,11 @@ function safeFailureSummary(error: unknown): string | undefined {
     : summary;
 }
 
-function codexTaskFailureCode(error: unknown): string {
+/** Classify a structured task_complete error into a stable failure code.
+ *  Shared with the TRAE drainer (traex-transcript.ts), whose task_complete
+ *  error payloads use the same Codex-family shape — keep one classifier so
+ *  both bridges map e.g. connection failures to the same code. */
+export function codexTaskFailureCode(error: unknown): string {
   let serialized = '';
   try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
   const normalized = serialized.toLowerCase();
@@ -735,7 +742,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       continue;
     }
     // turn_context carries the executor model/effort on every turn (latest-wins,
-    // since /model and /effort change independently). Published via the same
+    // since Codex can change them independently). Published via the same
     // active_runtime channel TRAE uses.
     const runtime = runtimeFromCodexEntry(obj);
     if (runtime) {
@@ -815,9 +822,9 @@ function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined
   const serviceTier = raw?.service_tier;
   if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
   const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
-  // Effort follows an in-session `/effort` switch. Codex records it both at the
-  // top level and under collaboration_mode.settings; take the top-level value
-  // first, matching the model precedence above.
+  // Effort follows in-session changes made through Codex's own model controls.
+  // Codex records it both at the top level and under collaboration_mode.settings;
+  // take the top-level value first, matching the model precedence above.
   const rawEffort = raw?.reasoning_effort
     ?? raw?.collaboration_mode?.settings?.reasoning_effort;
   const reasoningEffort = typeof rawEffort === 'string' && rawEffort.trim()

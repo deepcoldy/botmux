@@ -122,9 +122,14 @@ describe('worker structured-turn status wiring', () => {
 
   it('settles terminals after optional output and preserves the empty-completed fallback', () => {
     const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
-    const emptyFallback = emit.indexOf('shouldEmitEmptyCompletedBridgeFallback');
+    // The empty-completed fallback is still wired before the output guard —
+    // now via the extracted structuredFallbackKind decision, whose
+    // 'empty_completed' branch posts emptyCompletedBridgeFallbackContent().
+    const fallbackKind = emit.indexOf('structuredFallbackKind');
+    const emptyFallback = emit.indexOf('emptyCompletedBridgeFallbackContent()', fallbackKind);
     const outputGuard = emit.indexOf('if (!content) continue;', emptyFallback);
     const terminalLoop = emit.indexOf('for (const turn of ready)', outputGuard);
+    expect(fallbackKind).toBeGreaterThanOrEqual(0);
     expect(emptyFallback).toBeGreaterThanOrEqual(0);
     expect(outputGuard).toBeGreaterThan(emptyFallback);
     expect(terminalLoop).toBeGreaterThan(outputGuard);
@@ -481,7 +486,7 @@ describe('worker structured-turn status wiring', () => {
     expect(tickPrune).toBeGreaterThan(finallyBlock);
   });
 
-  it('routes Pi external idle through the busy-viewport guard; ZMX stays fail-open', () => {
+  it('routes Pi and OMP external idle through the busy-viewport guard; ZMX stays fail-open', () => {
     const callback = source.slice(
       source.indexOf('idleDetector.onIdle(async (evidenceSource)'),
       source.indexOf('drainBridgesThenMarkReady(evidenceSource);'),
@@ -490,7 +495,7 @@ describe('worker structured-turn status wiring', () => {
     // Working... — an external idle landing while the authoritative viewport
     // still shows busy must defer exactly like a screen idle.
     expect(callback).toContain("evidenceSource === 'screen'");
-    expect(callback).toContain("evidenceSource === 'external' && structuredBridgeIsPi()");
+    expect(callback).toContain('structuredBridgeIsPi() || structuredBridgeIsOmp()');
     expect(callback).toContain('deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)');
 
     // The guard fail-opens on non-authoritative screens (ZMX) BEFORE testing
@@ -509,6 +514,28 @@ describe('worker structured-turn status wiring', () => {
     // so a deferred ZMX turn can never be pinned by the probe loop.
     const probe = functionSlice('scheduleBusyPatternIdleProbe', 'spawnCli');
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+  });
+
+  it('flushes an OMP trailing candidate only after a complete quiet tick and non-busy viewport', () => {
+    const quiet = functionSlice('maybeFlushOmpTrailingFinalOnQuietTick', 'maybeEmitCodexStructuredRateLimit');
+    const arm = quiet.indexOf('ompQuietCandidateCompleteOffset = codexBridgeOffset');
+    const tailGate = quiet.indexOf('codexBridgePendingTail', arm);
+    const lifecycleGate = quiet.indexOf('hasStructuredLifecycleBlock()', arm);
+    const authoritativeGate = quiet.indexOf('backendScreenEvidenceIsAuthoritativeForMutation()', arm);
+    const capture = quiet.indexOf('captureBackendScreen(backend)', authoritativeGate);
+    const busy = quiet.indexOf('cliAdapter.busyPattern.test(busyProbeRegion(screen))', capture);
+    const flush = quiet.indexOf('codexBridgeIngest({ flushOmpTrailingFinal: true })', busy);
+    expect(arm).toBeGreaterThanOrEqual(0);
+    expect(tailGate).toBeGreaterThan(arm);
+    expect(lifecycleGate).toBeGreaterThan(arm);
+    expect(authoritativeGate).toBeGreaterThan(arm);
+    expect(capture).toBeGreaterThan(authoritativeGate);
+    expect(busy).toBeGreaterThan(capture);
+    expect(flush).toBeGreaterThan(busy);
+
+    const ticker = functionSlice('codexBridgeStartTimer', 'hermesBridgeAttach');
+    expect(ticker.indexOf('codexBridgeIngest()'))
+      .toBeLessThan(ticker.indexOf('maybeFlushOmpTrailingFinalOnQuietTick()'));
   });
 
   it('publishes first-turn working from the projected status for argv-baked prompts, as a pure publisher', () => {
@@ -568,6 +595,40 @@ describe('worker structured-turn status wiring', () => {
     expect(armWorking).toBeGreaterThan(busyArm);
   });
 
+
+  it('scopes the argv turn-start evidence machinery and its flush side effect to Pi', () => {
+    // The transcript-evidence latch lives on the GENERIC codexBridgeIngest
+    // path, which also serves Grok (argv-baked + structured bridge +
+    // type-ahead). Its flush side effect must be Pi-gated, or Grok would gain
+    // a new startup-window write whose first ready is owned by the
+    // SessionStart busy arm instead.
+    const note = functionSlice('noteSpawnArgvTurnStartTranscriptEvidence', 'stopSpawnArgvTurnStartFailOpen');
+    const piGuard = note.indexOf('if (!structuredBridgeIsPi()) return;');
+    const latch = note.indexOf('spawnArgvTurnStartEvidenceSeen = true');
+    const flush = note.indexOf('flushQueuedInputAfterTurnStartEvidence()');
+    expect(piGuard).toBeGreaterThanOrEqual(0);
+    expect(latch).toBeGreaterThan(piGuard);
+    expect(flush).toBeGreaterThan(latch);
+
+    const gate = functionSlice('spawnArgvTurnStartGateHolds', 'noteSpawnArgvTurnStartTranscriptEvidence');
+    expect(gate).toContain('structuredBridgeIsPi()');
+
+    // markPromptReady branch boundary: the no-evidence gate must NOT re-kick
+    // (startup input protection — the TUI may not accept input yet); the
+    // lifecycle-block branch must re-kick (turn-start evidence exists there).
+    // functionSlice('markPromptReady', …) starts at markPromptReadyFromPty
+    // (prefix match) and also spans the helper definitions, so anchor on the
+    // literal markPromptReady body before locating the two gate branches.
+    const body = functionSlice('markPromptReady', 'persistCliSessionId');
+    const markStart = body.indexOf('function markPromptReady(): void');
+    expect(markStart).toBeGreaterThanOrEqual(0);
+    const evidenceGate = body.indexOf('if (spawnArgvTurnStartGateHolds()) {', markStart);
+    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {', markStart);
+    expect(evidenceGate).toBeGreaterThanOrEqual(0);
+    expect(lifecycleGate).toBeGreaterThan(evidenceGate);
+    expect(body.slice(evidenceGate, lifecycleGate)).not.toContain('flushQueuedInputAfterTurnStartEvidence');
+    expect(body.slice(lifecycleGate)).toContain('flushQueuedInputAfterTurnStartEvidence()');
+  });
 
   it('carries the structured mark through adopt submit confirmation and exception cleanup', () => {
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');

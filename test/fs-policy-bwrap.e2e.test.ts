@@ -22,12 +22,13 @@
  * file- vs dir-shaped denies, mode-000 the empty sources, pre-create missing
  * mask mountpoints, then invoke bwrap.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
+import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
 
 const bwrapUsable = process.platform === 'linux'
   && spawnSync('sh', ['-c', 'command -v bwrap'], { stdio: 'ignore' }).status === 0
@@ -50,7 +51,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
   // Build the bwrap argv the SAME way the worker does (deny masks: mode-000
   // empty sources, missing mountpoints pre-created). Returns the created-mask
   // list too so cleanup tests can assert rmdir-if-empty.
-  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }) {
+  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string } = {}) {
     const emptiesDir = join(S, 'sbx/empties');
     const emptyDir = join(S, 'sbx/empty');
     mkdirSync(emptiesDir, { recursive: true });
@@ -60,10 +61,12 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       platform: 'linux', homeDir: canonical(homedir()),
       botmuxHome: join(S, 'botmux-home'), sessionDataDir: join(S, 'botmux-home/data'),
       sessionId: 'e2e-session',
-      workingDir: join(S, 'proj'), currentAppId: 'cli_e2e', botHome: join(S, 'botmux-home/bots/cli_e2e'),
+      workingDir: join(S, 'proj'), currentAppId: 'cli_e2e', botHome: opts.botHome ?? join(S, 'botmux-home/bots/cli_e2e'),
       redirectedCliData: true,
       execPaths: [dirname(canonical(process.execPath))],
       userPaths: { readOnly: [join(S, 'ref'), ...(userPaths.readOnly ?? [])], readWrite: userPaths.readWrite, deny: userPaths.deny },
+      larkCliLinuxStore: opts.larkCliLinuxStore,
+      larkTransportEnabled: opts.larkTransportEnabled,
       net: true, writeRegexes: [],
     });
     policy.rules = policy.rules.filter(r => r.access === 'deny' || existsSync(r.path));
@@ -224,6 +227,59 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     rmSync(denied, { recursive: true, force: true });
   });
 
+  it('OMP state stays writable while only the current transcript directory is carved through the sessions mask', () => {
+    const realHome = join(S, 'omp-real-home');
+    const linkedHome = join(S, 'omp-linked-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkedHome, 'dir');
+    vi.stubEnv('HOME', linkedHome);
+    try {
+      const agentRoot = join(realpathSync(realHome), '.omp', 'agent');
+      const sessionsRoot = join(agentRoot, 'sessions');
+      const own = ompSessionDir('self');
+      const sibling = join(sessionsRoot, 'botmux/sibling');
+      const terminalSessions = join(agentRoot, 'terminal-sessions');
+      const siblingTranscript = join(sibling, 'secret.jsonl');
+      const breadcrumb = join(terminalSessions, 'pane');
+      expect(own).toBe(join(sessionsRoot, 'botmux/self'));
+      const adapterArgs = createOhMyPiAdapter('/usr/bin/omp').buildArgs({ sessionId: 'self', resume: false });
+      expect(adapterArgs[adapterArgs.indexOf('--session-dir') + 1]).toBe(own);
+
+      mkdirSync(own, { recursive: true });
+      mkdirSync(sibling, { recursive: true });
+      mkdirSync(terminalSessions, { recursive: true });
+      writeFileSync(join(agentRoot, 'agent.db'), 'state');
+      writeFileSync(join(agentRoot, 'agent.db-wal'), 'wal');
+      writeFileSync(join(agentRoot, 'config.yml'), 'config');
+      writeFileSync(siblingTranscript, 'SIBLING_SECRET');
+      writeFileSync(breadcrumb, `${join(S, 'proj')}\n${siblingTranscript}\nfresh\n`);
+
+      const { args } = build({
+        readWrite: [agentRoot, own],
+        deny: [sessionsRoot],
+      });
+      expect(args).toContain(own);
+
+      expect(run(args, `printf updated >> ${JSON.stringify(join(agentRoot, 'agent.db'))}`).status).toBe(0);
+      expect(readFileSync(join(agentRoot, 'agent.db'), 'utf8')).toContain('updated');
+      expect(run(args, `printf own > ${JSON.stringify(join(own, 'new.jsonl'))}`).status).toBe(0);
+      expect(readFileSync(join(own, 'new.jsonl'), 'utf8')).toBe('own');
+
+      const breadcrumbRead = run(args, `cat ${JSON.stringify(breadcrumb)}`);
+      expect(breadcrumbRead.status).toBe(0);
+      expect(breadcrumbRead.out).toContain(siblingTranscript);
+      const siblingRead = run(args, `cat ${JSON.stringify(siblingTranscript)}`);
+      expect(siblingRead.status).not.toBe(0);
+      expect(siblingRead.out).not.toContain('SIBLING_SECRET');
+
+      const other = join(sessionsRoot, 'botmux/other');
+      expect(run(args, `mkdir ${JSON.stringify(other)}`).status).not.toBe(0);
+      expect(existsSync(other)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('deny → allow → deny (4 layers): the DEEPEST deny is masked, secret unreadable+unwritable, middle carve-out still works', () => {
     // Security regression: an ancestor deny must NOT make a deeper deny look
     // redundant when an allow re-exposed the tree between them. outer denied,
@@ -262,5 +318,76 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(r.out).not.toContain('INNERSECRET');
     expect(r.out).toContain('---'); // process actually ran
     rmSync(a, { recursive: true, force: true });
+  });
+
+  it('LINUX lark-cli keystore (KERNEL-level): own key readable, SIBLING ciphertext + master.key hidden, store not writable', () => {
+    // The whole point of the fix, proven at the kernel (not just accessForPath):
+    // the store sits under a read-only parent (production: baseline ro(~/.local/share)),
+    // is DENIED, and ONLY this bot's own master.key + appsecret_<self>.enc are carved
+    // back read-only. A sandboxed bot must NOT be able to read a sibling's appsecret
+    // or the shared master.key — that was the cross-bot impersonation leak. This is a
+    // white-in-black shape (ro parent → deny store → ro own-keys), so it exercises the
+    // tmpfs-mask + deferred --remount-ro carve-out path at the mount level.
+    const xdg = join(S, 'xdg');            // exposed read-only parent (stands in for ~/.local/share)
+    const store = join(xdg, 'lark-cli');
+    mkdirSync(store, { recursive: true });
+    writeFileSync(join(store, 'master.key'), 'MASTERKEY');
+    writeFileSync(join(store, 'appsecret_cli_e2e.enc'), 'OWNSECRET');       // this bot
+    writeFileSync(join(store, 'appsecret_cli_other.enc'), 'SIBLINGSECRET'); // a sibling bot
+    writeFileSync(join(store, 'cli_other_ou_x.enc'), 'SIBLINGTOKEN');       // a sibling user token
+    // parent is user-readOnly (mirrors baseline ro(~/.local/share)); store path is
+    // frozen via larkCliLinuxStore so the policy denies it + carves out own keys.
+    const { args } = build({ readOnly: [xdg] }, { larkCliLinuxStore: store });
+
+    // own appsecret + master.key ARE readable (needed to authenticate)
+    expect(run(args, `cat ${JSON.stringify(join(store, 'appsecret_cli_e2e.enc'))}`).out).toContain('OWNSECRET');
+    expect(run(args, `cat ${JSON.stringify(join(store, 'master.key'))}`).out).toContain('MASTERKEY');
+    // SIBLING ciphertext + token are HIDDEN at the kernel level (the leak)
+    const sib = run(args, `cat ${JSON.stringify(join(store, 'appsecret_cli_other.enc'))}`);
+    expect(sib.status).not.toBe(0);
+    expect(sib.out).not.toContain('SIBLINGSECRET');
+    const tok = run(args, `cat ${JSON.stringify(join(store, 'cli_other_ou_x.enc'))}`);
+    expect(tok.status).not.toBe(0);
+    expect(tok.out).not.toContain('SIBLINGTOKEN');
+    // a directory listing must not surface the sibling files either (the carve-out
+    // exposes ONLY the two own-key files; the rest of the store is a masked tmpfs)
+    const ls = run(args, `ls -A ${JSON.stringify(store)} 2>&1`);
+    expect(ls.out).not.toContain('appsecret_cli_other.enc');
+    expect(ls.out).not.toContain('cli_other_ou_x.enc');
+    // own carve-out files are read-ONLY (the CLI never rewrites the keystore in-sandbox)
+    expect(run(args, `echo x > ${JSON.stringify(join(store, 'master.key'))} && echo WROTE`).out).not.toContain('WROTE');
+    // and the store dir itself is not writable — no planting a fake sibling secret
+    expect(run(args, `echo x > ${JSON.stringify(join(store, 'appsecret_cli_evil.enc'))} && echo WROTE`).out).not.toContain('WROTE');
+    expect(existsSync(join(store, 'appsecret_cli_evil.enc'))).toBe(false);
+    rmSync(xdg, { recursive: true, force: true });
+  });
+
+  it('LINUX keystore NESTED in BOT_HOME + no-transport + hostile user RW (KERNEL-level): master.key/siblings STILL hidden (nested-authority regression)', () => {
+    // The reproduced escape at the kernel level: LARKSUITE_CLI_DATA_DIR=<BOT_HOME> so the
+    // store is <BOT_HOME>/lark-cli, under a no-transport turn, with a hostile user RW
+    // grant directly targeting master.key. Old logic exempted everything under BOT_HOME
+    // → master.key was RW (readable+writable) inside the sandbox. The per-root BOT_HOME
+    // exception must keep it denied — proven by real bubblewrap, not just accessForPath.
+    const botHome = join(S, 'botmux-home/bots/cli_e2e');
+    const store = join(botHome, 'lark-cli');
+    mkdirSync(store, { recursive: true });
+    writeFileSync(join(store, 'master.key'), 'NESTEDMASTER');
+    writeFileSync(join(store, 'appsecret_cli_other.enc'), 'NESTEDSIBLING');
+    const { args } = build(
+      { readWrite: [join(store, 'master.key'), store] },     // hostile user RW straight at the secret
+      { larkCliLinuxStore: store, larkTransportEnabled: false, botHome },
+    );
+    // master.key: real content NOT readable + NOT writable (the reproduced leak, sealed)
+    const rd = run(args, `cat ${JSON.stringify(join(store, 'master.key'))}`);
+    expect(rd.status).not.toBe(0);
+    expect(rd.out).not.toContain('NESTEDMASTER');
+    expect(run(args, `echo x > ${JSON.stringify(join(store, 'master.key'))} && echo WROTE`).out).not.toContain('WROTE');
+    // sibling appsecret also hidden
+    const sib = run(args, `cat ${JSON.stringify(join(store, 'appsecret_cli_other.enc'))}`);
+    expect(sib.status).not.toBe(0);
+    expect(sib.out).not.toContain('NESTEDSIBLING');
+    // BOT_HOME scratch OUTSIDE the nested store is still writable (carve-out intact there)
+    expect(run(args, `echo ok > ${JSON.stringify(join(botHome, 'scratch.txt'))} && echo WROTE`).out).toContain('WROTE');
+    rmSync(store, { recursive: true, force: true });
   });
 });

@@ -28,8 +28,8 @@ async function spawnChild(opts: { holdStdoutMs?: number } = {}): Promise<ChildPr
     // (but not our IPC 'disconnect') — the fd-inheritance scenario.
     cp.spawn(process.execPath, ['-e', 'setTimeout(()=>{}, ${opts.holdStdoutMs})'], { stdio: ['ignore', 'inherit', 'ignore'] });
     ` : ''}
-    process.send && process.send({ ready: true });
     setInterval(() => {}, 100000);
+    process.send && process.send({ ready: true });
   `;
   const child = spawn(process.execPath, ['-e', src], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   kids.push(child);

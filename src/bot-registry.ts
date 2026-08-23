@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
+import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
@@ -22,9 +23,18 @@ import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
+import {
+  normalizeExistingAppServerConfig,
+  type ExistingAppServerConfig,
+} from './core/existing-app-server.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import {
+  normalizeSessionOwnerReminderConfig,
+  type SessionOwnerReminderConfig,
+} from './core/session-owner-reminder.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -64,6 +74,29 @@ export const LARK_REQUEST_TIMEOUT_MS = 15_000;
  * no daemon admission/mutation lock, so the interactive timeout's protective
  * purpose does not apply to them. Give uploads a far looser ceiling. */
 export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * Upper bound for a per-bot dsh runner turn timeout. Node's `setTimeout` delay
+ * is a 32-bit signed int of milliseconds; a larger value silently wraps to ~1ms
+ * and emits `TimeoutOverflowWarning`, so any timeout the runner will actually
+ * arm must fit here. Config parsing, the dashboard IPC, and the dashboard UI all
+ * validate against this single bound.
+ */
+export const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Normalize an untrusted `turnTimeoutMs` value: a positive integer within the
+ * arm-able bound is kept, anything else (≤0, non-integer, over the bound,
+ * non-number, absent) collapses to `undefined` (= use the runner default).
+ */
+export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value > 0
+    && value <= MAX_TURN_TIMEOUT_MS
+    ? value
+    : undefined;
+}
 
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
@@ -996,6 +1029,15 @@ function normalizeMessageListeners(raw: unknown, botIndex: number): Record<strin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * A bots.json row may omit `cliId`. Historically that means claude-code, and such
+ * a row can still carry a legacy `cliPathOverride`. Anything that derives a
+ * selection from a RAW row must apply this same default, otherwise the selection
+ * looks changed and preservation logic is skipped. Exported so there is exactly
+ * one definition of the legacy default.
+ */
+export const LEGACY_DEFAULT_CLI_ID = 'claude-code';
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -1101,6 +1143,67 @@ export interface VcMeetingRealtimeVoiceConfig {
   testSpeakOnStartText?: string;
 }
 
+/**
+ * Per-bot settings for p2pMode='group' session groups (each top-level DM
+ * message births a dedicated 1-user+1-bot group hosting the conversation).
+ * Everything is optional; effective defaults in parentheses.
+ */
+export interface SessionGroupConfig {
+  /** Group-name generation. */
+  naming?: {
+    /**
+     * 'ai-summary' (default): create with a truncated placeholder name, then
+     * asynchronously ask the bot's own CLI (one-shot headless call) for a
+     * short title and rename the chat when it lands. Falls back to the
+     * placeholder on failure/timeout.
+     * 'truncate': placeholder only — zero cost, zero delay.
+     */
+    mode?: 'ai-summary' | 'truncate';
+    /** Max title length in characters for the AI summary (12). */
+    maxLen?: number;
+  };
+  /**
+   * Optional fixed group-name prefix. Empty/undefined (default) = no prefix.
+   * Only needed as the match key for the rule-based feed-group mode (PR2).
+   */
+  namePrefix?: string;
+  /** Template working dir bound to each new session group (defaultWorkingDir). */
+  workingDir?: string;
+  /** Send a DM receipt linking the freshly-created group (true). */
+  dmReceipt?: boolean;
+  /**
+   * What to do with the group when its session is closed:
+   * 'keep' (default) — leave the group and registry entry; a later message in
+   * the group resumes the closed session (same-group resume). 'disband' /
+   * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
+   */
+  onClose?: 'keep' | 'disband' | 'archive';
+  /**
+   * Session-group tagging.
+   * 'feed-group' (default) — the owner's personal sidebar 消息分组 (feed
+   *   group). Needs a one-time user OAuth (im:feed_group_v1), auto-refreshed
+   *   afterwards; works on any tenant — no tenant scope catalog involved.
+   * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
+   *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
+   *   some tenants' scope catalogs don't offer at all (hence not the default).
+   * 'off' — no tagging.
+   */
+  tag?: {
+    mode?: 'chat-tag' | 'feed-group' | 'off';
+    /** Tag / feed-group display name (default: Botmux群会话). */
+    name?: string;
+  };
+  /**
+   * Distinctive built-in group avatar for session groups — the zero-permission
+   * visual marker (works on tenants without the chat-tag catalog).
+   * 'auto' (default) applies it at birth; 'off' keeps Feishu's default avatar.
+   */
+  avatar?: 'auto' | 'off';
+  /** Reserved (PR3): auto-dispose after N idle days; 0/undefined = off. */
+  idleDays?: number;
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -1167,14 +1270,14 @@ export interface BotConfig {
   /**
    * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
-   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
-   * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose
+   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`fish`/`sh`) or an absolute path
+   * (`/usr/bin/fish`). The escape hatch for a login `$SHELL` (e.g. bash) whose
    * rcfile `exec`-trampolines into another shell: that trampoline replaces the
    * launch shell before it can `exec` the CLI, leaving a bare shell the first
-   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: zsh`
-   * launches under zsh directly and bypasses the bash `.bashrc`. CAVEAT:
-   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (e.g.
-   * `.zshrc`/`.zprofile`), not the bypassed one. Ignored by the pty backend
+   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: fish`
+   * launches under fish directly and bypasses the bash `.bashrc`. CAVEAT:
+   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (for
+   * example `.zshrc`/`.zprofile` or `~/.config/fish/config.fish`), not the bypassed one. Ignored by the pty backend
    * (which `exec`s the CLI directly, no shell wrapper, so it's trampoline-immune).
    */
   launchShell?: string;
@@ -1188,6 +1291,16 @@ export interface BotConfig {
    */
   model?: string;
   /**
+   * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
+   * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
+   * default (`DEFAULT_TURN_TIMEOUT_MS` in dsh-runner.ts). Positive integer
+   * only; unset/≤0/non-integer → runner default. Only affects the `dsh` CLI
+   * adapter; other adapters ignore the field.
+   */
+  turnTimeoutMs?: number;
+  /** Default Codex reasoning effort for newly created sessions. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
    */
@@ -1198,12 +1311,27 @@ export interface BotConfig {
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
   /**
+   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
+   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
+   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
+   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
+   */
+  envelopeInjection?: 'auto' | 'off';
+  /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
    * attached to a botmux-owned app-server thread, so input can't be dropped by
    * codex's terminal re-init. No effect on non-codex bots.
    */
   codexRpcInput?: boolean;
+  /**
+   * Experimental local-only attachment mode for an already-running Codex App
+   * Server. This does not make BotMux an app-server owner: after the operator
+   * explicitly selects an existing thread via `/adopt`, BotMux launches the
+   * official `codex --remote <endpoint> resume <thread>` TUI as a second
+   * client. New threads are deliberately not auto-created in this mode.
+   */
+  existingAppServer?: ExistingAppServerConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -1251,6 +1379,14 @@ export interface BotConfig {
    * selection, and auth settings for riff's HTTP API.
    */
   riff?: RiffBackendConfig;
+
+  /**
+   * Configuration for the mojo backend (@byted/mojo headless CLI). Optional
+   * even when `backendType` is `'mojo'`: every field has a working default
+   * (`mojo` on PATH + an ambient login is a valid setup). Use it to pin the
+   * model, inject a JWT, or force `--cloud` execution.
+   */
+  mojo?: MojoConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -1263,6 +1399,9 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /** Periodically @ the persisted Session owner while selected actionable
+   * runtime states remain unchanged. Missing means disabled. */
+  sessionOwnerReminder?: SessionOwnerReminderConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -1361,6 +1500,20 @@ export interface BotConfig {
    * 不影响群：群里仍按 allowedUsers / allowedChatGroups / oncall / grants 判定。
    */
   p2pOpen?: boolean;
+  /**
+   * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
+   * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
+   *
+   * 关掉后，来自 bot 发送方的 slash 命令不进 passthrough / daemon-command 路由，
+   * 退化为普通消息（与任何非 bot-slash 消息一样按 talk 门处理）——给 owner 一个
+   * 「不让别的 bot 清我上下文 / 敲我 CLI」的逃生阀。对**真人**发送方无影响
+   * （真人在飞书直接打字发 /clear 仍照常）。
+   *
+   * 安全边界不变：daemon 管理命令（/close /restart 等）从 bot 来**仍只认
+   * allowedUsers**（canOperate），本开关只控制「是否接受 bot 的 slash 进入路由」，
+   * 不放宽任何 operate 权限。
+   */
+  acceptSlashFromBots?: boolean;
   /**
    * 消息额度覆盖配置：
    *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
@@ -1502,9 +1655,19 @@ export interface BotConfig {
    *     keeps 1:1 chatter out of one long-running CLI process.
    *   - 'chat': route DMs as one flat, continuous chat-scoped session (all
    *     messages share the same context, similar to Hermes/OpenClaw).
-   * Editable at runtime via `/botconfig p2pMode chat|thread` (owner/admin).
+   *   - 'group': every top-level DM message births a dedicated 1-user+1-bot
+   *     "session group" that hosts the conversation (the bot keeps chat
+   *     ownership; the group is registered in session-groups-store and the
+   *     session lands chat-scope inside it). Falls back to 'thread' behavior
+   *     when group creation fails.
+   * Editable at runtime via `/botconfig p2pMode chat|thread|group` (owner/admin).
    */
-  p2pMode?: 'thread' | 'chat';
+  p2pMode?: 'thread' | 'chat' | 'group';
+  /**
+   * Settings for p2pMode='group' session groups. All fields optional; see
+   * SessionGroupConfig for defaults. Ignored under other p2pModes.
+   */
+  sessionGroup?: SessionGroupConfig;
   /** chat_id list: chats where the live streaming card is suppressed (status falls back to master's pending-card morph). Written by `/card off|on`. */
   noCardChats?: string[];
   /**
@@ -2178,6 +2341,15 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
 }
 
 /**
+ * 该 bot 是否接受**其他 bot** 发来的原生斜杠命令（--slash）。默认开：只有
+ * 配置里显式 `acceptSlashFromBots: false` 才关。未知 bot（无注册项）→ 默认开
+ * （与其它 default-on 开关一致，缺配置不 fail-closed 成"全拒"）。
+ */
+export function botAcceptsSlashFromBots(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.acceptSlashFromBots !== false;
+}
+
+/**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
@@ -2439,6 +2611,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
+    // Validate the `mojo` block through the SHARED normalizer, so a hand-edited
+    // bots.json is held to exactly the same rules as `/config set mojo`.
+    //
+    // Fail CLOSED, and on types as well as names: `localDaemon: "false"` used to
+    // satisfy the sandbox check's `!== true` (bypassing local isolation) while
+    // being truthy in buildEnv (enabling host execution) — isolation off AND
+    // local execution on. A typo like `cluod: true` would likewise leave the
+    // cloud sandbox silently disabled.
+    if (entry.mojo !== undefined) {
+      const normalized = normalizeMojoConfig(entry.mojo);
+      if (!normalized.ok) {
+        throw new Error(`Bot config [${i}]: ${normalized.errors.join('; ')}`);
+      }
+    }
     // apiOnly (core-only) bots drive purely over the HTTP control API and never
     // connect to Feishu, so a real app secret is not required. larkAppId is still
     // mandatory (daemon identity + dashboard routing + cachedLarkAppId gate); use
@@ -2469,7 +2655,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // also persist an exactly-equal path shadow so a rollback to an older
     // BotMux still launches the same distribution. Any unequal pair would make
     // old and new versions disagree, so it fails closed below.
-    const entryCliId = entry.cliId ?? 'claude-code';
+    const entryCliId = entry.cliId ?? LEGACY_DEFAULT_CLI_ID;
     if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
       throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
     }
@@ -2484,6 +2670,24 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     }
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
+    }
+    const existingAppServer = normalizeExistingAppServerConfig(
+      entry.existingAppServer,
+      `Bot config [${i}].existingAppServer`,
+    );
+    if (existingAppServer) {
+      if (entryCliId !== 'codex' && entryCliId !== 'codex-app') {
+        throw new Error(`Bot config [${i}]: existingAppServer is supported only for cliId "codex" or "codex-app"`);
+      }
+      if (entry.codexRpcInput === true) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with codexRpcInput`);
+      }
+      if (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with wrapperCli`);
+      }
+      if (entry.sandbox === true || entry.readIsolation === true) {
+        throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with sandbox or readIsolation`);
+      }
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
@@ -2740,9 +2944,21 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      // Positive integer within the arm-able bound only; anything else → undefined
+      // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
+      turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
+      reasoningEffort: isConfigurableReasoningCliId(entryCliId)
+        && isCodexReasoningEffort(entry.reasoningEffort)
+        && cliModelSupportsReasoningEffort(
+          entryCliId,
+          typeof entry.model === 'string' ? entry.model : undefined,
+          entry.reasoningEffort,
+        )
+        ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
+      existingAppServer,
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -2758,11 +2974,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
+      mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -2797,6 +3015,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // Default is ON (accept bot-sent slash), so only explicit false persists.
+      acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
       canTalkDaemonCommands,
       tuiSlashAllow,
@@ -2822,10 +3042,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.receivedReactionEmoji.trim() : undefined,
       doneReactionEmoji: typeof entry.doneReactionEmoji === 'string' && entry.doneReactionEmoji.trim()
         ? entry.doneReactionEmoji.trim() : undefined,
-      // Default is now 'chat' (flat continuous DM session). Only 'thread' is
-      // meaningful and persists; 'chat' (and anything else) normalizes to
-      // undefined so bots.json stays clean.
-      p2pMode: entry.p2pMode === 'thread' ? 'thread' : undefined,
+      // Default is now 'chat' (flat continuous DM session). Only 'thread' and
+      // 'group' are meaningful and persist; 'chat' (and anything else)
+      // normalizes to undefined so bots.json stays clean.
+      p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
+      sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
+        ? entry.sessionGroup as SessionGroupConfig
+        : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,

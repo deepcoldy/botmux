@@ -79,6 +79,7 @@ describe('dashboard idle session cleanup selection', () => {
       matched: 2,
       closed: 1,
       failed: 1,
+      residual: 0,
       results: [
         { sessionId: 'old-idle', ok: true },
         { sessionId: 'fails', ok: false, error: 'close_failed' },
@@ -122,6 +123,7 @@ describe('dashboard idle session cleanup selection', () => {
       matched: 2,
       closed: 2,
       failed: 0,
+      residual: 0,
       results: [
         { sessionId: 'a', ok: true },
         { sessionId: 'b', ok: true },
@@ -140,7 +142,33 @@ describe('dashboard idle session cleanup selection', () => {
       matched: 0,
       closed: 0,
       failed: 0,
+      residual: 0,
       results: [],
+    });
+  });
+
+
+  it('counts a residual close separately from a clean one', () => {
+    // An idle/workerless mojo row can carry a parked lineage, so this path really
+    // does produce residuals. Folding them into `closed` reports "closed N,
+    // failed 0" while remote sessions keep running with their credential.
+    const rows = [
+      row('a', { lastMessageAt: NOW - 30 * hour }),
+      row('b', { lastMessageAt: NOW - 40 * hour }),
+    ];
+    const result = cleanupIdleSessions(rows, 24, async candidate => (
+      candidate.sessionId === 'a'
+        ? { sessionId: 'a', ok: true }
+        : {
+          sessionId: 'b',
+          ok: true,
+          residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        }
+    ), NOW);
+    return result.then(r => {
+      expect(r.closed).toBe(2);
+      expect(r.failed).toBe(0);
+      expect(r.residual).toBe(1);
     });
   });
 });

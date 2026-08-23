@@ -18,6 +18,12 @@ export interface PlatformBotInfo {
   /** bot 自己的租户稳定 union_id（自家消息回声学到，见 bot-union-ids-store）。
    *  平台按团队聚合成 roster 随 team-sync 下发，成员机器据此免 /grant 互信。 */
   unionId?: string;
+  /** 团队维度 Agent 互查（additive，交接契约）：owner 预配的专长标签，
+   *  发现/拉群的匹配依据。**agent 自报 → 仅展示、不可信**，绝不当能力凭据。
+   *  不报 = 空默认值（平台侧 additive 接受）。 */
+  specialties?: string[];
+  /** 是否有飞书传输身份能被 @（core-only/apiOnly → false）。**自报 → 仅展示、不可信**。 */
+  mentionable?: boolean;
 }
 
 /** 平台 team-sync 下发的原始负载（校验/落盘在 platform-team-store）。 */

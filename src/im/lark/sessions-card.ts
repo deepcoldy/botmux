@@ -25,6 +25,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { config } from '../../config.js';
 import { formatUrlHost } from '../../core/dashboard-url.js';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import { terminalMultiUrl } from './card-builder.js';
@@ -806,8 +807,7 @@ export async function handleSessionsCardAction(
 
     // Synthesize the closed-state row from the pre-POST snapshot. Merge
     // closedAt/cliResumeCommand from the close response if the upstream
-    // ever surfaces them (defensive — current closeSession returns only
-    // `{ ok, alreadyClosed }`, but the proxy may evolve).
+    // ever surfaces them (defensive — the proxy may evolve).
     const body = (resp.body ?? {}) as Record<string, unknown>;
     const synthClosedAt: number | undefined =
       typeof body.closedAt === 'number' && Number.isFinite(body.closedAt)
@@ -824,6 +824,12 @@ export async function handleSessionsCardAction(
       webPort: null,
       proxyPort: undefined,
     };
+    // The close may have succeeded LOCALLY while leaving a remote session running
+    // (a quarantined mojo lineage cannot be cancelled safely). The daemon reports
+    // that as `outcome: 'closed_with_residual'`; rendering the ordinary closed card
+    // would tell the operator everything is gone. This seam is JSON, so only an
+    // explicit read preserves it.
+    const residual = parseCloseResidual(body);
     const detail = composeDetail(synth, now());
     const cardJson = buildSessionsDetailCard(detail, {
       invokerOpenId: operatorOpenId,
@@ -836,7 +842,28 @@ export async function handleSessionsCardAction(
       terminalUrl: buildSessionTerminalUrl(synth),
       feishuChatLink: synth.feishuChatLink ?? null,
     });
-    return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
+    const card = JSON.parse(cardJson) as Record<string, unknown>;
+    if (residual) {
+      // Card-only success path (deliberately no toast, to avoid double render), so
+      // the warning has to ride on the card itself.
+      const elements = Array.isArray((card as { elements?: unknown }).elements)
+        ? (card as { elements: unknown[] }).elements
+        : undefined;
+      elements?.unshift({
+        tag: 'markdown',
+        // locale-aware: an English bot must not receive a Chinese warning.
+        // A LOCAL residual is a host subtree, not a remote session — a distinct
+        // key so the operator is not sent after a nonexistent remote id.
+        content: t(
+          closeResidualIsLocal(residual)
+            ? 'card.dashboard.sessions.close_residual_local'
+            : 'card.dashboard.sessions.close_residual',
+          { taskId: describeCloseResidual(residual) },
+          locale,
+        ),
+      });
+    }
+    return { card: { type: 'raw', data: card } };
   }
 
   // ─── 3b2) LOCATE — POST + toast-only (thread-scope only) ────────────

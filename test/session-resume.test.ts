@@ -55,6 +55,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   // Default: promotion succeeds. A specific test overrides this to false to
   // exercise the restore-time transient-failure quarantine path.
   promoteQueuedActivationTail: vi.fn(() => true),
@@ -115,7 +116,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     const store = await import('../src/services/session-store.js');
     const s = store.getSession(sid);
     if (s && s.status !== 'closed') store.closeSession(sid);
-    return { ok: true, alreadyClosed: false };
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
   }),
 }));
 
@@ -175,6 +176,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
 import {
   closeSession,
+  ensureOrdinaryTurnRecoveryAttached,
   forkAdoptWorker,
   killStalePids,
   promoteQueuedActivationTail,
@@ -194,6 +196,7 @@ beforeEach(() => {
   sessionStore.init();
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
   vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
 });
@@ -248,6 +251,19 @@ describe('resumeSession', () => {
       s.adoptedFrom = { tmuxTarget: 'foo', originalCliPid: 1, cwd: '/tmp' };
       sessionStore.updateSession(s);
       sessionStore.closeSession(s.sessionId);
+      const r = await resumeSession(s.sessionId, new Map());
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it('returns adopt_unsupported for a disconnected existing App Server adopt', async () => {
+      const s = sessionStore.createSession('oc_chat', 'om_root', 'Codex App: shared thread');
+      s.cliId = 'codex';
+      s.cliSessionId = '019e-existing-app-server-thread';
+      s.existingAppServerEndpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+      sessionStore.updateSession(s);
+      sessionStore.closeSession(s.sessionId);
+
       const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
@@ -479,7 +495,7 @@ describe('resumeSession', () => {
         cleanupStarted();
         await paused;
         sessionStore.closeSession(sid);
-        return { ok: true, alreadyClosed: false } as any;
+        return { ok: true, outcome: 'closed', alreadyClosed: false } as any;
       });
 
       const resuming = resumeSession(closed.sessionId, map);
@@ -567,6 +583,36 @@ describe('resumeSession', () => {
       expect(restored?.session.sessionId).toBe(materialized.sessionId);
       expect(restored?.session.rootMessageId).toBe('om_materialized_root');
       expect(restored?.session.replyThreadAliases?.om_materialized_root).toBeDefined();
+    });
+
+    it('re-attaches persisted ordinary-turn recovery only after the winning owner is restored', async () => {
+      const recovering = sessionStore.createSession(
+        'oc_recovery',
+        'om_recovery',
+        'recovering turn',
+        'group',
+      );
+      recovering.larkAppId = 'app_test';
+      recovering.scope = 'thread';
+      recovering.cliId = 'claude-code';
+      recovering.workingDir = '/tmp/proj';
+      recovering.ordinaryTurnRecovery = {
+        logicalTurnId: 'om_original',
+        currentTurnId: 'om_original',
+        continuationsStarted: 0,
+        status: 'backoff',
+        nextAttemptAt: Date.now() + 2_000,
+        lastErrorCode: 'provider_unexpected_eof',
+      };
+      sessionStore.updateSession(recovering);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_recovery', 'app_test'));
+      expect(restored?.session.sessionId).toBe(recovering.sessionId);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledTimes(1);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(restored);
     });
 
     it.each([

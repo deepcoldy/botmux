@@ -221,9 +221,10 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
 
         expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
         const result = await client.callTool({ name: 'echo', arguments: { value: 1 } });
-        expect((result.content[0] as { text: string }).text).toContain(
-          `alpha:echo:{"value":1}:session=${sessionId}:token=host-only-token`,
-        );
+        const echoed = (result.content[0] as { text: string }).text;
+        // #917 fixture 回显 `_meta`，不再与 session 字段连成一段。
+        expect(echoed).toContain('alpha:echo:{"value":1}');
+        expect(echoed).toContain(`session=${sessionId}:token=host-only-token`);
       } finally {
         if (client) await client.close().catch(() => undefined);
         else if (transport) await transport.close().catch(() => undefined);

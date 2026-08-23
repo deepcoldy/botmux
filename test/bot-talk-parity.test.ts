@@ -111,8 +111,10 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       + '否则恶意成员把真人 union 报成 bot 就能继承 bot 信任。所以人侧不命中不是 parity 缺口，而是这条腿的定义。',
   },
   teamMember: {
-    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（CHAT 是其协作群、
-    // MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中 reason:'teamMember'。
+    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（本 bot APP 在其 bots
+    // roster、MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中
+    // reason:'teamMember'。teamMember 腿现在锚在「本 bot ∈ 同队 bots」，不看 chatId，
+    // 所以 CHAT 在不在 groupChatIds 都免 grant（此处仍列 CHAT 是为了 bot 侧的团队拉群腿）。
     //
     // bot 侧同样放行，但走的是**另一条腿**：平台协作群会被镜像成团队拉群
     // （applyPlatformTeamSync → team-groups），故 evaluateBotTalk 经团队拉群腿命中
@@ -122,7 +124,7 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       restricted();
       applyPlatformTeamSync(tempDir, {
         rev: 'rev-1',
-        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [] }],
+        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [{ appId: APP }] }],
       });
     },
     humanMemberUnionId: MEMBER_UNION,

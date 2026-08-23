@@ -110,9 +110,10 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
+    expect(texts[0]).not.toContain('Session ID:');
   });
 
-  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+  it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],
       'om_root',
@@ -121,10 +122,23 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
-    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
     expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('distinguishes otherwise identical history candidates without showing their session ids', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', [
+      { cliSessionId: 'hidden-one', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+      { cliSessionId: 'hidden-two', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+    ]));
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain('Candidate: #1');
+    expect(texts[1]).toContain('Candidate: #2');
+    expect(JSON.stringify(texts)).not.toContain('hidden-one');
+    expect(JSON.stringify(texts)).not.toContain('hidden-two');
   });
 
   it('uses a configured runtime name for both live and resume rows', () => {
@@ -1664,6 +1678,34 @@ describe('buildSessionClosedCard', () => {
     expect(md).not.toMatch(/```/);
   });
 
+  it('warns that resume starts a FRESH session when resumeStartsFresh is set', () => {
+    // Copilot/Kimi without a persisted cliSessionId: resuming reactivates the
+    // topic route, but the next spawn starts a fresh session — the card must
+    // not imply history is restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-fresh', 'om_root', 'topic', 'copilot', undefined, null, 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('新起干净会话');
+    expect(md).toContain('重新激活');
+    // The generic "可在飞书内 resume" line must NOT appear — it implies the
+    // CLI history comes back.
+    expect(md).not.toContain('可在飞书内 resume');
+    expect(md).not.toMatch(/```/);
+  });
+
+  it('does not show the fresh-session warning when a precise resume command exists', () => {
+    // resumeStartsFresh is only meaningful in the no-command branch; with a
+    // precise command the history really will be restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-cmd', 'om_root', 'topic', 'cursor', undefined,
+      'cursor-agent --resume chat-1', 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('cursor-agent --resume chat-1');
+    expect(md).not.toContain('新起干净会话');
+  });
+
   it('emits a Resume button targeting the closed sessionId', () => {
     const card = parse(buildSessionClosedCard(
       'sess-4', 'om_root_X', 'topic', 'claude-code', undefined,
@@ -2116,4 +2158,34 @@ describe('buildPrivateSnapshotCard', () => {
     const note = card.elements.find((e: any) => e.tag === 'note');
     expect(JSON.stringify(note)).toContain('🔒');
   });
+});
+
+describe('remote backends get no PTY quick-action keys', () => {
+  /** The 11 quick-action buttons only make sense with a local terminal. */
+  const KEY_LABELS = ['Esc', '^C', 'Tab', '␣ Space', '↵ Enter', '←', '↑', '↓', '→'];
+
+  function keysIn(cliId: 'claude-code' | 'riff' | 'mojo'): string[] {
+    const card = buildStreamingCard(
+      'sid-1', 'om-1', '', 'title', 'screen', 'idle' as never,
+      cliId as never,
+      'screenshot' as never,
+    );
+    return KEY_LABELS.filter(l => card.includes(`"content":"${l}"`));
+  }
+
+  it('renders them for a local CLI', () => {
+    // Guards the negative assertions below: if the buttons stopped being rendered
+    // at all, those would pass for the wrong reason.
+    expect(keysIn('claude-code')).toEqual(KEY_LABELS);
+  });
+
+  for (const cliId of ['riff', 'mojo'] as const) {
+    it(`hides them for ${cliId}`, () => {
+      // A remote backend has no terminal to drive, so these clicks are silently
+      // inert. The gate was hardcoded to `cliId !== 'riff'`, so adding mojo left
+      // it rendering all 11 buttons; it now consults the REMOTE_CLI_IDS leaf, so
+      // the next remote CLI cannot regress this the same way.
+      expect(keysIn(cliId)).toEqual([]);
+    });
+  }
 });

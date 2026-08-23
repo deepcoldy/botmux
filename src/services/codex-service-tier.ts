@@ -3,7 +3,7 @@ import type { CliId } from '../adapters/cli/types.js';
 /** Executor-confirmed settings copied from Codex's rollout. */
 export interface CodexThreadSettings {
   model?: string;
-  /** Executor-confirmed reasoning effort; follows in-session `/effort`. */
+  /** Executor-confirmed reasoning effort; follows Codex's in-session model controls. */
   reasoningEffort?: string;
   serviceTier: string;
 }
