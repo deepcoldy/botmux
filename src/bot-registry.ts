@@ -98,6 +98,16 @@ export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
     : undefined;
 }
 
+/**
+ * Normalize an untrusted `dshRuntime` value: only the two known variants are
+ * kept; anything else (typo, unknown string, wrong type) collapses to
+ * `undefined` (= official runner). The field is dsh-only; non-dsh CLIs drop
+ * it at the call site (same pattern as turnTimeoutMs).
+ */
+export function normalizeDshRuntime(value: unknown): 'official' | 'tui' | undefined {
+  return value === 'official' || value === 'tui' ? value : undefined;
+}
+
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
     ?.httpInstance?.defaults;
@@ -1298,6 +1308,14 @@ export interface BotConfig {
    * adapter; other adapters ignore the field.
    */
   turnTimeoutMs?: number;
+  /**
+   * Per-bot dsh runtime variant. Only meaningful when `cliId === 'dsh'`:
+   *   - `'official'` (default): the headless JSON-RPC runner (dsh-runner.ts).
+   *   - `'tui'`: the interactive dsh-tui Ink TUI, driven via PTY (dsh-tui adapter).
+   * Non-dsh CLIs always drop the field. Selected via the dashboard "dsh 运行时"
+   * toggle; the worker resolves the effective adapter at spawn time.
+   */
+  dshRuntime?: 'official' | 'tui';
   /** Default Codex reasoning effort for newly created sessions. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
@@ -2947,6 +2965,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Positive integer within the arm-able bound only; anything else → undefined
       // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
       turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
+      // dsh-only runtime variant; non-dsh CLIs drop it (same pattern as turnTimeoutMs).
+      dshRuntime: entryCliId === 'dsh' ? normalizeDshRuntime(entry.dshRuntime) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
         && cliModelSupportsReasoningEffort(

@@ -50,6 +50,7 @@ import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
+import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
@@ -111,7 +112,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -656,6 +657,65 @@ describe('dsh buildArgs (runner model)', () => {
     const decoded = JSON.parse(Buffer.from(line.slice('::botmux-dsh:'.length).trim(), 'base64').toString('utf8'));
     expect(decoded.content).toBe('hello dsh');
     expect(decoded.replyTurnId).toBe('turn-1');
+  });
+});
+
+describe('dsh-tui buildArgs (PTY TUI model)', () => {
+  const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+
+  it('spawns the dsh-tui binary directly (no runner)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
+    expect(adapter.resolvedBin).toBe('/opt/dsh-tui/bin/dsh-tui');
+    // No runner script — the TUI is spawned directly with no args on fresh boot.
+    expect(args.some(a => /runner\.js$/.test(a))).toBe(false);
+  });
+
+  it('passes --resume for session resume', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+    expect(args).toContain('--resume');
+    expect(args).toContain('abc-123');
+  });
+
+  it('passes bare --resume (no session id) to read resume.txt', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true });
+    expect(args).toEqual(['--resume']);
+  });
+
+  it('omits --resume on fresh spawn', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('has no portable copy-paste resume command (session id not tracked)', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 's', cliSessionId: 'abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the TUI prompt char', () => {
+    expect(adapter.readyPattern?.test('❯ ')).toBe(true);
+  });
+
+  it('defers the first prompt until the TUI composer is ready', () => {
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+  });
+
+  it('does not type ahead', () => {
+    expect(adapter.supportsTypeAhead).not.toBe(true);
+  });
+
+  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    expect(adapter.authPaths).toContain('~/.dsh-tui');
+  });
+
+  it('writeInput types text and presses Enter', async () => {
+    const sent: string[] = [];
+    const keys: string[][] = [];
+    const pty = {
+      sendText: (t: string) => { sent.push(t); return true; },
+      sendSpecialKeys: (...k: string[]) => { keys.push(k); return true; },
+    } as unknown as PtyHandle;
+    await adapter.writeInput!(pty, 'hello tui');
+    expect(sent).toEqual(['hello tui']);
+    expect(keys).toEqual([['Enter']]);
   });
 });
 

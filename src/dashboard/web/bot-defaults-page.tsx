@@ -1589,6 +1589,11 @@ export function BotAgentSection(props: {
   const [turnTimeoutMin, setTurnTimeoutMin] = useState(turnTimeoutMinFromMs(bot.turnTimeoutMs));
   const [turnTimeoutTouched, setTurnTimeoutTouched] = useState(false);
   const [turnTimeoutError, setTurnTimeoutError] = useState<string | null>(null);
+  // dsh runtime variant: 'official' (JSON-RPC runner) or 'tui' (dsh-tui PTY).
+  // Defaults to 'official' so a bot that never touched the toggle stays on the
+  // headless runner. `touched` gates whether a save sends the field at all.
+  const [dshRuntime, setDshRuntime] = useState<'official' | 'tui'>(bot.dshRuntime === 'tui' ? 'tui' : 'official');
+  const [dshRuntimeTouched, setDshRuntimeTouched] = useState(false);
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1606,6 +1611,8 @@ export function BotAgentSection(props: {
     setTurnTimeoutMin(turnTimeoutMinFromMs(bot.turnTimeoutMs));
     setTurnTimeoutTouched(false);
     setTurnTimeoutError(null);
+    setDshRuntime(bot.dshRuntime === 'tui' ? 'tui' : 'official');
+    setDshRuntimeTouched(false);
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1616,6 +1623,7 @@ export function BotAgentSection(props: {
     bot.model,
     bot.reasoningEffort,
     bot.turnTimeoutMs,
+    bot.dshRuntime,
     runtimeConfigKey,
     bot.wrapperCli,
     bot.skillInjection,
@@ -1726,6 +1734,9 @@ export function BotAgentSection(props: {
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
         ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
+        // dsh-only runtime variant: only send when touched, same semantics as
+        // turnTimeoutMs. 'official' clears a stored 'tui' selection.
+        ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
@@ -1770,6 +1781,7 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           reasoningEffort: res.body.reasoningEffort ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
+          dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
         // Re-sync the minutes input from the authoritative saved ms and clear
@@ -1779,6 +1791,7 @@ export function BotAgentSection(props: {
         ));
         setTurnTimeoutTouched(false);
         setTurnTimeoutError(null);
+        setDshRuntimeTouched(false);
         setRuntimeTouched(false);
         if (cliRuntime) {
           const probe = res.body.runtimeProbe;
@@ -2098,6 +2111,36 @@ export function BotAgentSection(props: {
               {suggestions.map(item => <option value={item} key={item} />)}
             </datalist>
           </label>
+        </div>
+      )}
+      {isDsh && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.dshRuntimeHelp')}>{tr('botDefaults.dshRuntimeTitle')}</FieldTitle>
+            <div className="bd-runtime-mode" role="group" aria-label={tr('botDefaults.dshRuntimeTitle')}>
+              <button
+                type="button"
+                data-action="dsh-runtime-official"
+                aria-pressed={dshRuntime === 'official'}
+                disabled={agentBusy}
+                onClick={() => { setDshRuntime('official'); setDshRuntimeTouched(true); }}
+              >
+                {tr('botDefaults.dshRuntimeOfficial')}
+              </button>
+              <button
+                type="button"
+                data-action="dsh-runtime-tui"
+                aria-pressed={dshRuntime === 'tui'}
+                disabled={agentBusy}
+                onClick={() => { setDshRuntime('tui'); setDshRuntimeTouched(true); }}
+              >
+                {tr('botDefaults.dshRuntimeTui')}
+              </button>
+            </div>
+            <p className="bd-runtime-note">
+              {tr(dshRuntime === 'tui' ? 'botDefaults.dshRuntimeTuiNote' : 'botDefaults.dshRuntimeOfficialNote')}
+            </p>
+          </div>
         </div>
       )}
       {isDsh && (

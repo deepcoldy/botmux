@@ -20,6 +20,8 @@ export interface DashboardBotDescriptor {
   reasoningEffort?: string;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
   turnTimeoutMs?: number;
+  /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
+  dshRuntime?: 'official' | 'tui' | null;
 }
 
 /**
@@ -63,6 +65,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
+    ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
     // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
     // （aiden×claude / ttadk×codex 等）据此才能高亮回对应选项，否则前端回落到裸
     // cliId、丢失 wrapper 语义（重载后下拉复位、再保存会把 wrapper 剥掉）。

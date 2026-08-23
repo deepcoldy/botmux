@@ -78,6 +78,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'riff': 'Riff',
   'reasonix': 'Reasonix',
   'dsh': 'DeepSeek Harness',
+  'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
 };
 

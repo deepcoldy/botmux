@@ -3845,6 +3845,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
   let turnTimeoutMs: number | null = null;
+  // dsh runtime variant ('official' | 'tui'). Only meaningful for the dsh CLI;
+  // exposed so the dashboard can render the dsh 运行时 toggle.
+  let dshRuntime: 'official' | 'tui' | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3864,6 +3867,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
       ? cfg.turnTimeoutMs
       : null;
+    dshRuntime = cfg.dshRuntime === 'tui' ? 'tui' : null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
@@ -3943,6 +3947,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     model,
     reasoningEffort,
     turnTimeoutMs,
+    dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -4287,8 +4292,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -4322,6 +4327,18 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_turn_timeout_ms' });
     }
     nextTurnTimeoutMs = n;
+  }
+  // dsh-only runtime variant (official JSON-RPC runner vs dsh-tui PTY TUI).
+  // Same present/absent semantics as turnTimeoutMs: absent preserves, present
+  // writes/clears, non-dsh always drops.
+  const supportsDshRuntime = selected.cliId === 'dsh';
+  const dshRuntimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'dshRuntime');
+  let nextDshRuntime: 'official' | 'tui' | undefined;
+  if (dshRuntimeFieldPresent && body.dshRuntime !== null && body.dshRuntime !== '') {
+    if (body.dshRuntime !== 'official' && body.dshRuntime !== 'tui') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_runtime' });
+    }
+    nextDshRuntime = body.dshRuntime;
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
@@ -4360,6 +4377,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     wrapperCli: selected.wrapperCli,
     cliPathOverride: effectivePath,
   });
+  // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
+  // separately so a missing dsh-tui install surfaces as a save-time warning
+  // rather than a spawn-time ENOENT crash-loop.
+  let dshTuiAvailability: { available: boolean; command?: string; reason?: string } | undefined;
+  if (supportsDshRuntime && nextDshRuntime === 'tui') {
+    dshTuiAvailability = checkCliAvailability({ cliId: 'dsh-tui' });
+  }
   let runtimeProbe: { version: string; updateProvider: string } | undefined;
   if (runtimeFieldPresent && nextRuntime) {
     if (!availability.available) {
@@ -4390,9 +4414,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   // Existing Bot edits remain saveable (operators may intentionally configure
   // first and install second), but the response is explicit so Dashboard never
   // claims a missing Agent was saved successfully without qualification.
-  const availabilityWarning = availability.available
+  let availabilityWarning = availability.available
     ? undefined
     : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
+  if (dshTuiAvailability && !dshTuiAvailability.available) {
+    const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
+    availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
+  }
 
   return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation and may also
@@ -4454,6 +4482,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
       else delete entry.turnTimeoutMs;
     }
+    // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
+    if (!supportsDshRuntime) delete entry.dshRuntime;
+    else if (dshRuntimeFieldPresent) {
+      if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
+      else delete entry.dshRuntime;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
@@ -4494,6 +4528,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // takes the parsed value, dsh without the field preserves the existing one.
     if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
     else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
+    // dsh-only runtime variant: same mirror semantics as turnTimeoutMs.
+    if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
+    else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
@@ -4515,6 +4552,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       model: model || null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
+      dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
       selectionKey,
       // Number kept for compatibility with an older dashboard bundle; the residual
       // count rides alongside so a hot CLI switch cannot silently strand a remote
