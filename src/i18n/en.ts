@@ -65,6 +65,11 @@ export const messages: Record<string, string> = {
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
   'card.repo.placeholder_switch': 'Pick a repo to switch to',
+  'card.repo.search_placeholder': 'Search by project, branch, or path',
+  'card.repo.search_button': 'Search',
+  'card.repo.search_no_match': 'No project matched “{query}”. Try another search.',
+  'card.repo.search_empty': 'There are no projects to search.',
+  'card.repo.search_result': 'Showing {count} matching project(s).',
   'card.repo.manual_placeholder': 'Enter any working directory, e.g. /path/to/project or ~/projects/foo',
   'card.repo.manual_empty': 'Please enter a working directory path',
   'card.repo.worktree_empty': 'Please select at least one repo',
@@ -72,12 +77,14 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_child_conflict': 'Multiple repos would map to the same worktree child directory: {names}. Rename the project first or create one worktree at a time.',
   'card.repo.current_active': 'Current working directory:',
   'card.repo.current_marker': ' ← current',
+  'card.repo.list_limited': 'Many projects were found, so the dropdowns show a subset (switch {shown}/{total}, new worktree {worktreeShown}/{worktreeTotal}). Search above for omitted projects, enter a path manually, or use a `/repo` command.',
   'card.repo.note': 'You can also reply `/repo <N>` (e.g. `/repo 1`), or `/repo <path|name>` directly (e.g. `/repo botmux`, `/repo ~/projects/foo`) to skip this card. `/repo wt <N|name> [branch]` opens a fresh worktree off the remote default branch.',
   'card.repo.placeholder_worktree': '🌿 Open a repo as a new worktree',
   'card.repo.placeholder_worktree_multi': '🌿 Select one or more repos for new worktrees',
   'card.repo.worktree_now_multi': 'Multi-repo picker on (default for this bot’s future sessions)',
   'card.repo.toast_worktree_mode_switched': 'Switched to the multi-repo picker; default for this bot’s future sessions (tap again to switch back).',
   'card.repo.toast_worktree_mode_switched_back': 'Switched back to the single-repo picker; default for this bot’s future sessions (tap again for multi).',
+  'card.repo.refresh_failed': 'The picker could not be refreshed. Reply `/repo <name|path>` to choose a repository, or reply `/repo` to continue.',
   'card.repo.worktree_rolled_back': 'Worktree creation failed on {repo}: {error}. Rolled back {count} worktree(s) already created in this batch.',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
@@ -936,6 +943,8 @@ export const messages: Record<string, string> = {
   'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
+  'daemon.repo_scan_in_progress': 'Scanning repositories now. Your message is queued; the picker will appear or work will start automatically when the scan finishes. No need to @ me again.',
+  'daemon.repo_card_unavailable': 'The repository picker card is unavailable, but your message is still queued. Reply `/repo <name|path>` to choose a repository, or reply `/repo` to continue in the current working directory.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────

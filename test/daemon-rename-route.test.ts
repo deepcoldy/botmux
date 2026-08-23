@@ -86,6 +86,7 @@ const mocks = vi.hoisted(() => {
     discoverRolloutSessions: vi.fn(() => [] as any[]),
     discoverAntigravitySessions: vi.fn(() => [] as any[]),
     scanMultipleProjects: vi.fn(() => [] as any[]),
+    scanMultipleProjectsAsync: vi.fn(async () => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
   };
@@ -172,6 +173,11 @@ vi.mock('../src/services/project-scanner.js', async () => {
   const actual = await vi.importActual<any>('../src/services/project-scanner.js');
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
 });
+
+vi.mock('../src/services/project-scanner-async.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  scanMultipleProjectsAsync: (...args: any[]) => mocks.scanMultipleProjectsAsync(...args),
+}));
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
@@ -1378,7 +1384,9 @@ describe('/rename production routing — must not pre-create a session (review P
       makeCtx('om_workflow_new', 'om_workflow_new'),
     );
 
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // Repo scan is async (detached child): the empty-scan fork happens off the
+    // critical path via commitRepoSelection, so wait for it to land.
+    await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ turnId: 'om_workflow_new' }));
     const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
     expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
@@ -1669,7 +1677,10 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     const owner = activeSessions.get(sessionKey(anchor, APP))!;
-    expect(mocks.scanMultipleProjects).toHaveBeenCalled();
+    // Repo scan is async: the empty-scan opening fork lands off the critical
+    // path. Wait for it before asserting the queued-activation contract.
+    await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    expect(mocks.scanMultipleProjectsAsync).toHaveBeenCalled();
     expect(owner.pendingRepo).toBe(false);
     expect(owner.initialStartPending).toBe(true);
     expect(owner.session.queuedActivationToken).toBe(openingToken);

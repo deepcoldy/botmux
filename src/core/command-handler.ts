@@ -12,7 +12,8 @@ import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
-import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
+import { scanProjects, describeProjectDir } from '../services/project-scanner.js';
+import { scanMultipleProjectsAsync, scanMultipleProjectsAsyncDetailed, resolveRepoSelectionAsync } from '../services/project-scanner-async.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
@@ -274,50 +275,17 @@ export { validateWorkingDir };
  *      level).
  * Returns null when nothing resolves to an existing directory.
  */
-export function resolveRepoSelection(
+export async function resolveRepoSelection(
   repoArg: string,
   scanDirs: string[],
-): { path: string; displayName: string } | null {
-  const isExplicitPath =
-    repoArg.startsWith('/') ||
-    repoArg.startsWith('~') ||
-    repoArg.startsWith('.') ||
-    repoArg.includes('/');
-
-  const candidates: string[] = [];
-  if (repoArg.startsWith('/') || repoArg.startsWith('~')) {
-    candidates.push(resolve(expandHome(repoArg)));
-  } else {
-    for (const d of scanDirs) candidates.push(resolve(d, repoArg));
-    candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
-  }
-
-  // Direct candidates must win before any recursive scan. Besides avoiding
-  // unnecessary traversal (especially a legacy HOME fallback), describing just
-  // the selected directory preserves the same "name (branch)" label for repos.
-  for (const cand of candidates) {
-    try {
-      if (!statSync(cand).isDirectory()) continue;
-    } catch {
-      continue; // missing / not a dir — try next candidate
-    }
-    const desc = describeProjectDir(cand);
-    return desc
-      ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
-      : { path: cand, displayName: basename(cand) };
-  }
-
-  // Explicit and relative paths have no basename-search semantics: when their
-  // concrete candidates do not exist, a recursive project scan cannot resolve
-  // them. Bare names alone may refer to a repo nested below a scan root.
-  if (isExplicitPath) return null;
-
-  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
-  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
-  const byName = projects.find((p) => p.name === repoArg);
-  if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
-
-  return null;
+): Promise<{ path: string; displayName: string } | null> {
+  // The whole resolution — candidate statSync, the git describe/ref lookups
+  // behind describeProjectDir, AND the recursive basename scan — runs in the
+  // isolated, watchdog-bounded child scanner. None of it touches the daemon
+  // event loop, so a hung mount / slow-git repo (the exact hazard this PR
+  // targets) cannot wedge the daemon here, no matter which candidate path or
+  // fallback the resolution takes.
+  return resolveRepoSelectionAsync(repoArg, scanDirs);
 }
 
 /**
@@ -1346,6 +1314,7 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
+          const scanCardToWithdraw = ds.repoScanCardMessageId;
           const targetSessionId = ds.session.sessionId;
           const closed = await withBotTurnMutation(ds.larkAppId, async () => {
             // Re-resolve the exact session after all peer admissions drain. A
@@ -1402,6 +1371,29 @@ export async function handleCommand(
             );
             break;
           }
+          if (closed.status === 'close_refused') {
+            logger.error(
+              `[${logTag}] Refused /close: remote session cancellation not proven `
+              + `(${closed.result.error}); active record kept for retry`,
+            );
+            await sessionReply(
+              rootId,
+              closed.result.taskId
+                ? t('cmd.close.refused_with_task', {
+                    error: closed.result.error,
+                    taskId: closed.result.taskId,
+                  }, loc)
+                : t('cmd.close.refused', { error: closed.result.error }, loc),
+            );
+            break;
+          }
+          // The session is actually closed now (plain or closed_with_residual),
+          // so retire its inert scan progress card too.
+          ds.repoScanCardMessageId = undefined;
+          if (scanCardToWithdraw) {
+            void deleteMessage(ds.larkAppId, scanCardToWithdraw)
+              .catch(err => logger.debug(`[${logTag}] Repo scan card withdraw after /close failed: ${err}`));
+          }
           if (closed.status === 'closed_with_residual') {
             const isLocal = closeResidualIsLocal(closed.residual);
             logger.warn(
@@ -1420,22 +1412,6 @@ export async function handleCommand(
                   + `⚠️ 但远端会话 \`${closed.residual.taskId}\` **未被取消** —— 它的控制面无法验证`
                   + '（quarantined），盲目取消可能打到别的租户，因此保留下来。**需要人工清理**，'
                   + '否则它会继续占用云端沙箱并持有已注入的凭据。',
-            );
-            break;
-          }
-          if (closed.status === 'close_refused') {
-            logger.error(
-              `[${logTag}] Refused /close: remote session cancellation not proven `
-              + `(${closed.result.error}); active record kept for retry`,
-            );
-            await sessionReply(
-              rootId,
-              closed.result.taskId
-                ? t('cmd.close.refused_with_task', {
-                    error: closed.result.error,
-                    taskId: closed.result.taskId,
-                  }, loc)
-                : t('cmd.close.refused', { error: closed.result.error }, loc),
             );
             break;
           }
@@ -1818,9 +1794,11 @@ export async function handleCommand(
             current.pendingCodexAppFollowUpGateAccepted = undefined;
             current.pendingTurnId = undefined;
             const cardToWithdraw = current.repoCardMessageId;
+            const scanCardToWithdraw = current.repoScanCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;
-            return { current, cardToWithdraw };
+            current.repoScanCardMessageId = undefined;
+            return { current, cardToWithdraw, scanCardToWithdraw };
           });
           if (!started) return false;
           try {
@@ -1832,6 +1810,9 @@ export async function handleCommand(
             if (started.cardToWithdraw) {
               try { await deleteMessage(started.current.larkAppId, started.cardToWithdraw); }
               catch { /* best-effort */ }
+            }
+            if (started.scanCardToWithdraw) {
+              try { await deleteMessage(started.current.larkAppId, started.scanCardToWithdraw); } catch { /* best-effort */ }
             }
           } finally {
             started.current.pendingRepoCommitInFlight = false;
@@ -2050,7 +2031,7 @@ export async function handleCommand(
             }
             repoPath = cached[repoIndex - 1]!.path;
           } else {
-            const resolved = resolveRepoSelection(targetArg!, getProjectScanDirs(ds));
+            const resolved = await resolveRepoSelection(targetArg!, getProjectScanDirs(ds));
             if (!resolved) {
               await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: targetArg! }, loc));
               break;
@@ -2166,7 +2147,7 @@ export async function handleCommand(
         // Non-numeric arg → a path (relative/absolute) or first-level project
         // name under workingDir; resolve it directly and skip the card.
         if (repoArg && ds) {
-          const resolved = resolveRepoSelection(repoArg, getProjectScanDirs(ds));
+          const resolved = await resolveRepoSelection(repoArg, getProjectScanDirs(ds));
           if (!resolved) {
             await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: repoArg }, loc));
             break;
@@ -2213,11 +2194,17 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
-        let scanBudgetHit = false;
-        const projects = scanMultipleProjects(validDirs, 3, {
-          ...repoPickerScanOptions(),
-          onBudgetExceeded: () => { scanBudgetHit = true; },
-        });
+        // Bare `/repo` rebuilds the picker over every scan root. Use the
+        // isolated, watchdog-bounded child scanner so this (the recovery text's
+        // "safe" fallback) can't wedge the daemon event loop on a slow/hung
+        // mount. The child reports whether it bailed at the scan budget (the
+        // onBudgetExceeded callback can't cross IPC), preserving the partial /
+        // narrow-the-root UX.
+        const { projects, budgetHit: scanBudgetHit } = await scanMultipleProjectsAsyncDetailed(
+          validDirs,
+          3,
+          repoPickerScanOptions(),
+        );
         if (projects.length === 0) {
           // Distinguish "genuinely no repos here" from "we bailed at the scan
           // budget before we could find them" — the latter is actionable

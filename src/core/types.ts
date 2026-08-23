@@ -155,10 +155,14 @@ export interface DaemonSession {
    *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
   spawnCommand?: string;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
+  /** The initial repo list is being prepared outside the daemon process. */
+  repoScanInFlight?: boolean;
   /** One in-memory owner is preparing the pending repo's first worker. Kept
    *  separate from worktreeCreating because plain select, skip, and /repo can
    *  also await prompt context before the fork. */
   pendingRepoCommitInFlight?: boolean;
+  /** Inert progress card shown while the initial repository scan is running. */
+  repoScanCardMessageId?: string;
   /** A fresh live-route owner has been published but its opening input has not
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
