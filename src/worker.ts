@@ -2223,7 +2223,7 @@ function refreshHookReviewInputHold(snapshot: string): void {
   }
   hookReviewInputHoldNotified = false;
   log('Hook review menu cleared — releasing queued input');
-  if (pendingMessages.length > 0) queueMicrotask(() => { void flushPending(); });
+  if (hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
 }
 
 function notifyHookReviewInputHold(): void {
@@ -2492,6 +2492,16 @@ let pendingSessionRename: string | null = null;
 let nativeSessionTitleSyncInFlight: string | undefined;
 let nativeSessionTitleAppliedThreadId: string | undefined;
 let nativeSessionTitleRevision = 0;
+
+/** Every user-controlled input class that flushPending can deliver. Keep this
+ * shared with review-menu release handling so a queued raw command, adopt
+ * message, or native rename is not stranded after the menu disappears. */
+function hasPendingInputForFlush(): boolean {
+  return pendingMessages.length > 0
+    || pendingAdoptMessages.length > 0
+    || pendingRawInputs.length > 0
+    || pendingSessionRename !== null;
+}
 let nativeSessionTitleResumeUpdatedAt: number | undefined;
 let nativeSessionTitleCurrentGenerationResume = false;
 const nativeSessionTitleSyncAbortControllers = new Set<AbortController>();
@@ -10708,7 +10718,7 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
-  if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
+  if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   // 注入进行中不得并发写 PTY（用户消息留在 pendingMessages，注入完成后的下一次
@@ -18179,12 +18189,22 @@ process.on('message', async (raw: unknown) => {
       // shell。bareShellCheckInProgress 覆盖“检查进行中”、bareShellLaunchBlocked
       // 覆盖“仍停在裸 shell 的安全 hold”两种状态，一并入队；若该进程随后出现
       // 真实 PTY prompt 且 leaf 已变为非 shell，markPromptReady 会恢复排空。
+      // Hook-review menus are another direct-write hazard: raw_input normally
+      // preserves busy delivery, but its Enter/arrow sequence must never drive
+      // the menu's current selection.
+      refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
-        || bareShellCheckInProgress || bareShellLaunchBlocked) {
+        || bareShellCheckInProgress || bareShellLaunchBlocked
+        || hookReviewInputHold) {
         freshnessInputQueue.enqueueRaw(msg);
-        log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
+        if (hookReviewInputHold) {
+          notifyHookReviewInputHold();
+          log(`Deferred passthrough slash command while Hook review is visible: ${msg.content}`);
+        } else {
+          log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
+        }
       } else {
         await deliverRawInput(msg);
       }
