@@ -21,6 +21,10 @@ import {
 const FIXTURES = join(__dirname, 'fixtures');
 const LEVEL_1_SNAPSHOT = readFileSync(join(FIXTURES, 'codex-hooks-browser-level1.snap'), 'utf-8');
 const LEVEL_2_SNAPSHOT = readFileSync(join(FIXTURES, 'codex-hooks-browser-level2.snap'), 'utf-8');
+const STARTUP_HOOKS_REVIEW_SNAPSHOT = readFileSync(
+  join(FIXTURES, 'codex-startup-hooks-review-rust-v0.147.0.snap'),
+  'utf-8',
+);
 
 describe('StuckDetector', () => {
   beforeEach(() => {
@@ -211,20 +215,16 @@ describe('StuckDetector', () => {
 });
 
 describe('shouldHoldInputForHookReview', () => {
-  const STARTUP_REVIEW = [
-    'Hooks need review',
-    '13 hooks are new or changed.',
-    'Hooks can run outside the sandbox after you trust them.',
-    '',
-    '1. Review hooks',
-    '> 2. Trust all and continue',
-    '3. Continue without trusting (hooks won\'t run)',
-    '',
-    'Press enter to confirm or esc to go back',
-  ].join('\n');
+  it('holds input on the official Codex startup review snapshot so Enter cannot trust all', () => {
+    expect(shouldHoldInputForHookReview(STARTUP_HOOKS_REVIEW_SNAPSHOT)).toBe(true);
+  });
 
-  it('holds input on the Codex startup review menu so Enter cannot trust all', () => {
-    expect(shouldHoldInputForHookReview(STARTUP_REVIEW)).toBe(true);
+  it('accepts the singular count and a selection arrow on any option', () => {
+    const singularWithThirdSelected = STARTUP_HOOKS_REVIEW_SNAPSHOT
+      .replace('2 hooks are new or changed.', '1 hook is new or changed.')
+      .replace('› 1. Review hooks', '  1. Review hooks')
+      .replace('  3. Continue without trusting (hooks won\'t run)', '› 3. Continue without trusting (hooks won\'t run)');
+    expect(shouldHoldInputForHookReview(singularWithThirdSelected)).toBe(true);
   });
 
   it('releases input on an ordinary Codex composer', () => {
@@ -233,7 +233,7 @@ describe('shouldHoldInputForHookReview', () => {
 
   it('does not mistake quoted startup-review text for an active menu', () => {
     expect(shouldHoldInputForHookReview(
-      `The terminal printed:\n${STARTUP_REVIEW}\n\n› Ask Codex to do anything`,
+      `The terminal printed:\n${STARTUP_HOOKS_REVIEW_SNAPSHOT}\n\n› Ask Codex to do anything`,
     )).toBe(false);
   });
 });

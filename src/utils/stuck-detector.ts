@@ -124,8 +124,14 @@ export function matchHookReviewScreen(snapshot: string): 'hook review level 1' |
 
 /** Codex startup review is a separate three-choice screen from the detailed
  * Hooks browser. It owns Enter/arrow keys, so normal BotMux input must not be
- * pasted into it. Keep its signature strict and footer-anchored to avoid
- * treating quoted discussion text as an active menu. */
+ * pasted into it. The patterns below follow the official `rust-v0.147.0`
+ * snapshot: every rendered line has a left margin and `›` may mark ANY
+ * selected option. Keep the signature strict and footer-anchored to avoid
+ * treating quoted discussion text as an active menu.
+ *
+ * The footer is rendered from the active keymap. Like the existing detailed
+ * Hooks-browser detector, this recognises Codex's default keymap wording; a
+ * custom keymap that changes the hint fails open rather than guessing. */
 function isStartupHookReviewScreen(snapshot: string): boolean {
   if (!snapshot) return false;
   const viewport = snapshot
@@ -139,11 +145,11 @@ function isStartupHookReviewScreen(snapshot: string): boolean {
   const lastLine = trimmed[trimmed.length - 1].trim();
   if (!/^Press enter to confirm or esc to go back$/i.test(lastLine)) return false;
   const region = trimmed.slice(Math.max(0, trimmed.length - 18)).join('\n');
-  return /^Hooks need review$/im.test(region)
-    && /^\d+\s+hooks?\s+are new or changed\.$/im.test(region)
-    && /^\s*1\.\s+Review hooks$/im.test(region)
-    && /^\s*>?\s*2\.\s+Trust all and continue$/im.test(region)
-    && /^\s*3\.\s+Continue without trusting \(hooks won't run\)$/im.test(region);
+  return /^\s*Hooks need review$/im.test(region)
+    && /^\s*\d+\s+hooks?\s+(?:is|are) new or changed\.$/im.test(region)
+    && /^\s*[›>]?\s*1\.\s+Review hooks$/im.test(region)
+    && /^\s*[›>]?\s*2\.\s+Trust all and continue$/im.test(region)
+    && /^\s*[›>]?\s*3\.\s+Continue without trusting \(hooks won't run\)$/im.test(region);
 }
 
 /** A Hook-review menu owns Enter/arrow keys instead of the normal Codex
