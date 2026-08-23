@@ -27,6 +27,15 @@ describe('existing Codex App Server endpoint validation', () => {
     expect(() => normalizeExistingAppServerEndpoint(endpoint)).toThrow();
   });
 
+  it.each([
+    'unix:///tmp/codex.sock\u0000',
+    'unix:///tmp/codex.sock\u001b',
+    'unix:///tmp/codex.sock\u007f',
+    'ws://127.0.0.1:9931\n',
+  ])('rejects endpoint control characters before URL normalization', (endpoint) => {
+    expect(() => normalizeExistingAppServerEndpoint(endpoint)).toThrow(/control characters/);
+  });
+
   it('requires exactly an endpoint object when the feature is configured', () => {
     expect(normalizeExistingAppServerConfig(undefined)).toBeUndefined();
     expect(normalizeExistingAppServerConfig({

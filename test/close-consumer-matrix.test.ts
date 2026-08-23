@@ -76,9 +76,9 @@ const CONSUMERS: Record<string, Rule> = {
   // ── user surfaces: must render refusal AND residual ──────────────────────
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
-    why: '/close and shared-adopt disconnect both branch on refused/residual '
-      + 'results; neither reports an ordinary close/disconnect while cleanup is '
-      + 'unproven.',
+    why: '/close plus shared-adopt /detach and /disconnect all branch on '
+      + 'refused/residual results; none report an ordinary close/disconnect while '
+      + 'cleanup is unproven.',
     count: 4,
   },
   'core/command-handler.ts::commitRepoSelection::closeSession': {

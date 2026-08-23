@@ -1329,7 +1329,9 @@ export interface BotConfig {
    * Server. This does not make BotMux an app-server owner: after the operator
    * explicitly selects an existing thread via `/adopt`, BotMux launches the
    * official `codex --remote <endpoint> resume <thread>` TUI as a second
-   * client. New threads are deliberately not auto-created in this mode.
+   * client. For the `cliId: "codex"` shared-adopt path, new remote threads are
+   * deliberately not auto-created; `cliId: "codex-app"` retains its existing
+   * new-session workflow until the operator explicitly selects a shared thread.
    */
   existingAppServer?: ExistingAppServerConfig;
   /**

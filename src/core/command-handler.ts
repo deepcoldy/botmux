@@ -1547,12 +1547,25 @@ export async function handleCommand(
           const current = [...activeSessions.values()].find(
             candidate => candidate.session.sessionId === closedSessionId,
           );
-          if (!current || !isSharedAdoptSession(current)) return false;
-          await closeWorkerPoolSession(closedSessionId);
-          return true;
+          if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+          try {
+            const result = await closeWorkerPoolSession(closedSessionId);
+            if (!result.ok) return 'refused' as const;
+            return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+          } catch {
+            return 'refused' as const;
+          }
         });
-        if (!detached) {
+        if (detached === 'missing') {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (detached === 'refused') {
+          await sessionReply(rootId, t('cmd.detach.failed', undefined, loc));
+          break;
+        }
+        if (detached === 'residual') {
+          await sessionReply(rootId, t('cmd.detach.residual', undefined, loc));
           break;
         }
         await sessionReply(

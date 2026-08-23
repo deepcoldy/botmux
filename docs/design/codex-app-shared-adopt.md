@@ -35,7 +35,6 @@ thread，而不是创建第二个服务端或取得/伪造 writer lock。
 - GUI 发起的新 turn 可以同步到 IM；IM 发起的 turn 可以在 GUI 上连续可见。
 - 断开 BotMux 只移除 IM 入口，不关闭原 App Server thread。
 - BotMux daemon 重启后可重新接入保留的远程 TUI，不杀掉已有 App Server。
-- Web 终端可作为独立的诊断/手工操作入口，并在 worker 重启后不代理到死端口。
 
 ### 非目标
 
@@ -136,7 +135,9 @@ BotMux 对共享 thread 使用 split-live 边界：
 共享 adopt 的 remote TUI 与原 App Server 是不同生命周期：
 
 - BotMux daemon 重启不应停止已有 App Server；
-- 已保留的 tmux/remote TUI 可被新 worker 重新 attach；
+- tmux 等持久后端中，已保留的 remote TUI 可被新 worker 重新 attach；
+- `pty` 后端的 daemon 重启会带走 remote TUI 进程，但 BotMux 不会主动关闭
+  server-side thread；后续连接会创建新的官方 remote client；
 - worker 关闭时需要保留远程 TUI，避免把 GUI 仍依赖的会话误杀。
 
 ## 7. 兼容性与影响范围

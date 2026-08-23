@@ -30,6 +30,12 @@ export function normalizeExistingAppServerEndpoint(
   if (typeof raw !== 'string' || !raw.trim()) {
     throw endpointError(label, 'must be a non-empty string');
   }
+  // URL parsing and String#trim may silently discard some trailing C0 controls.
+  // Reject them before normalization so every caller sees one unambiguous,
+  // printable endpoint value.
+  if (/[\u0000-\u001F\u007F]/.test(raw)) {
+    throw endpointError(label, 'must not contain control characters');
+  }
   const endpoint = raw.trim();
   if (/\s/.test(endpoint)) {
     throw endpointError(label, 'must not contain whitespace');

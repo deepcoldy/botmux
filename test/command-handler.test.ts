@@ -1904,6 +1904,59 @@ describe('handleCommand', () => {
       expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
     });
 
+    it.each([
+      {
+        command: '/detach',
+        close: {
+          ok: true,
+          outcome: 'closed',
+          alreadyClosed: false,
+          known: true,
+        },
+        expected: 'App Server 和 Codex App 会话仍在运行',
+      },
+      {
+        command: '/detach',
+        close: {
+          ok: false,
+          alreadyClosed: false,
+          error: 'remote_close_unproven',
+          retryable: true,
+        },
+        expected: '未能安全断开',
+      },
+      {
+        command: '/disconnect',
+        close: {
+          ok: true,
+          outcome: 'closed_with_residual',
+          residual: { reason: 'local_subtree_boundary_unproven' },
+          alreadyClosed: false,
+          known: true,
+        },
+        expected: '未能确认完全断开',
+      },
+    ])('maps shared $command close outcomes without claiming an unverified detach', async ({ command, close, expected }) => {
+      const ds = makeDaemonSession({
+        session: makeSession({
+          cliId: 'codex' as any,
+          cliSessionId: '019e-existing-app-server-thread',
+          existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+        }),
+      });
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce(close as never);
+
+      await handleCommand(command, ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain(expected);
+      if ((close as { outcome?: string }).outcome !== 'closed') {
+        expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+      }
+    });
+
     it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
