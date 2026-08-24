@@ -73,6 +73,7 @@ import {
   type RoleProfileEntry,
   type RoleProfileSummary,
 } from './roles.js';
+import { confirm } from './confirm-modal.js';
 import { botAvatarHtml, loadNameMaps } from './ui.js';
 
 type RolesTab = 'groups' | 'profiles';
@@ -497,7 +498,7 @@ function RolesPage(props: { tab: RolesTab }) {
 
   async function handleDeleteRole(): Promise<void> {
     if (!selectedGroupId || !selectedBotId) return;
-    if (!confirm(tr('roles.confirmDelete'))) return;
+    if (!await confirm({ title: '删除角色', message: tr('roles.confirmDelete'), danger: true })) return;
     setRoleDeleting(true);
     try {
       const ok = await deleteRole(selectedBotId, selectedGroupId);
@@ -823,7 +824,7 @@ function RolesPage(props: { tab: RolesTab }) {
 
   async function handleDeleteListener(confirmFirst = true): Promise<void> {
     if (!selectedGroupId || !selectedBotId) return;
-    if (confirmFirst && !confirm(tr('roles.listenerConfirmDelete'))) return;
+    if (confirmFirst && !await confirm({ title: '删除监听器', message: tr('roles.listenerConfirmDelete'), danger: true })) return;
     setListenerDeleting(true);
     try {
       const ok = await deleteMessageListener(selectedBotId, selectedGroupId);
@@ -918,7 +919,7 @@ function RolesPage(props: { tab: RolesTab }) {
 
   async function handleDeleteProfileEntry(): Promise<void> {
     if (!selectedProfileId || !selectedProfileBotId) return;
-    if (!confirm(tr('roles.confirmDeleteProfileEntry'))) return;
+    if (!await confirm({ title: '删除配置项', message: tr('roles.confirmDeleteProfileEntry'), danger: true })) return;
     setProfileDeleting(true);
     try {
       await deleteProfileEntry(selectedProfileId, selectedProfileBotId);

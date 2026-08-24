@@ -5,6 +5,7 @@ import {
   removeMonitorRoomSessionId,
   writeMonitorRoomAutoActive,
 } from './monitor-room-store.js';
+import { confirm } from './confirm-modal.js';
 import { sessionTerminalHref } from './session-terminal.js';
 import { store } from './store.js';
 import { botAvatarHtml, botDisplayName, escapeHtml, loadNameMaps, relTime, stripMentionPrefix, t } from './ui.js';
@@ -412,8 +413,8 @@ export function renderMonitorRoomPage(root: HTMLElement): () => void {
     render();
   });
 
-  clearBtn.addEventListener('click', () => {
-    if (!confirm(t('monitorRoom.clearConfirm'))) return;
+  clearBtn.addEventListener('click', async () => {
+    if (!await confirm({ title: '清空', message: t('monitorRoom.clearConfirm'), danger: true })) return;
     clearMonitorRoomSessionIds();
     render();
   });

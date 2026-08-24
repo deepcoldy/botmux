@@ -101,7 +101,115 @@ function piTranscriptRecord(role: 'user' | 'assistant', text: string, stopReason
   }) + '\n';
 }
 
+function ompTranscriptRecord(
+  id: string,
+  parentId: string | null,
+  role: 'user' | 'assistant',
+  content: string,
+  stopReason?: string,
+): string {
+  return JSON.stringify({
+    type: 'message',
+    id,
+    parentId,
+    timestamp: new Date().toISOString(),
+    message: {
+      role,
+      content: content ? [{ type: 'text', text: content }] : [],
+      ...(stopReason ? { stopReason } : {}),
+    },
+  }) + '\n';
+}
+
 describe('worker argv reaction status', () => {
+  it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    const sessionId = 'sid-worker-omp-quiet-final';
+    const transcriptDir = join(root, '.omp', 'agent', 'sessions', 'botmux', sessionId);
+    const transcriptPath = join(transcriptDir, 'session.jsonl');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(transcriptPath, '');
+
+    const fakeOmp = join(root, 'fake-omp');
+    writeFileSync(fakeOmp, `#!/usr/bin/env node
+process.stdout.write('OMP ready\\n');
+process.stdin.on('data', () => {
+  process.stdout.write('\\r\\u001b[2KWorking...');
+  setTimeout(() => process.stdout.write('\\r\\u001b[2KOMP ready\\n'), 3_000);
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeOmp, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'error') logs.push(`worker error: ${message.message}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'oh-my-pi',
+      cliPathOverride: fakeOmp,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    await waitForPromptReady(child, messages, logs);
+    child.send({
+      type: 'message',
+      content: 'ordinary OMP turn',
+      turnId: 'om_omp_turn',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Writing to PTY (flush): "ordinary OMP turn');
+
+    appendFileSync(transcriptPath,
+      ompTranscriptRecord('u1', null, 'user', 'ordinary OMP turn')
+      + ompTranscriptRecord('a1', 'u1', 'assistant', 'OMP final answer', 'stop'));
+
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 2_200));
+    expect(messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_omp_turn')).toBe(false);
+
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && !messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_omp_turn')) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+    }
+    const finals = messages.filter(message =>
+      message.type === 'final_output' && message.turnId === 'om_omp_turn');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ content: 'OMP final answer' });
+    expect(logs.join('')).toContain('Codex bridge fresh-empty:');
+  }, 20_000);
+
   it('keeps an argv-baked Pi turn working until its viewport loses Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-busy-'));
     tempDirs.add(root);

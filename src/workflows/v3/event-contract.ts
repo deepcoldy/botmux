@@ -30,12 +30,14 @@ export type GoalAnswer =
 export type V3ErrorClass =
   | 'workerError'
   | 'manifestInvalid'
+  | 'artifactContractInvalid'
   | 'resultInvalid'
   | 'timeout'
   | 'gateRejected'
   | 'cancelled';
 
 export type V3RunFailureReason = 'allSinksSkipped';
+export type V3BlockedRecovery = 'retry' | 'reviseWorkflow';
 
 export interface V3UncertainHostEffect {
   nodeId: string;
@@ -149,6 +151,7 @@ export type V3Event =
       errorClass: V3ErrorClass;
       errorCode?: string;
       message?: string;
+      recovery?: V3BlockedRecovery;
       ask?: GoalAsk;
       revisitTo?: string;
     }

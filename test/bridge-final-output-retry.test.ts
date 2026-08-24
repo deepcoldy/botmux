@@ -410,6 +410,33 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
   });
 
+  it('keeps the terminal-local title for a traditional adopted local turn', async () => {
+    const sessionReply = vi.fn(async () => 'om_terminal_local_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('终端本地对话（在 adopted pane 中直接输入，已同步至飞书）');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('Codex App 共享对话');
+  });
+
+  it('labels a Codex App shared local turn without calling it an adopted pane', async () => {
+    const sessionReply = vi.fn(async () => 'om_codex_app_shared_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.existingAppServerEndpoint = 'unix:///tmp/codex-app-server.sock';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('Codex App 共享对话（已同步至飞书）');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('在 adopted pane 中直接输入');
+  });
+
   it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

@@ -1061,6 +1061,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
   it('management/config reads stay behind the token even in publicReadOnly', () => {
     for (const pathname of [
       '/api/connectors',
+      '/api/autostart',
       '/api/connectors/stats',
       '/api/webhook-secrets',
       '/api/trigger-logs',

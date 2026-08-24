@@ -2329,6 +2329,8 @@ export interface AdoptPickerEntry {
   target?: string;
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
+  /** One-based position among history candidates, for same-screen disambiguation. */
+  candidateNumber?: number;
 }
 
 /** Deterministic key for a live adoptable session (tmux/herdr/zellij).
@@ -2381,18 +2383,19 @@ export function buildAdoptEntries(
       timeMs: s.startedAt,
     };
   });
-  const resume: AdoptPickerEntry[] = resumable.map((r) => {
+  const resume: AdoptPickerEntry[] = resumable.map((r, index) => {
     const project = r.cwd.split('/').pop() || r.cwd;
     return {
       key: `resume:${r.cliSessionId}`,
       kind: 'resume' as const,
       cliId: resumeCliId,
       ...(customName ? { cliDisplayName: customName } : {}),
-      title: r.title || r.cliSessionId.slice(0, 8),
+      title: r.title || project,
       project,
       cwd: r.cwd,
       sessionId: r.cliSessionId,
       timeMs: r.lastActivityAt || undefined,
+      candidateNumber: index + 1,
     };
   });
   return [...live, ...resume];
@@ -2513,7 +2516,7 @@ export function buildAdoptSelectCard(
   const labelKind    = t('card.adopt.field_kind',    undefined, locale);
   const labelCli     = t('card.adopt.field_cli',     undefined, locale);
   const labelDir     = t('card.adopt.field_dir',     undefined, locale);
-  const labelSession = t('card.adopt.field_session', undefined, locale);
+  const labelCandidate = t('card.adopt.field_candidate', undefined, locale);
   const labelTarget  = t('card.adopt.field_target',  undefined, locale);
   const selectedTag  = t('card.adopt.selected_tag',  undefined, locale);
   const selectedEntry = selectedKey ? filtered.find(e => e.key === selectedKey) : undefined;
@@ -2540,8 +2543,8 @@ export function buildAdoptSelectCard(
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
       `${labelDir}: \`${escapeMd(e.cwd)}\``,
-      `${labelSession}: \`${escapeMd(e.sessionId || sessionUnknown)}\``,
     ];
+    if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
     if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({

@@ -46,7 +46,8 @@ export interface PlatformTeamSyncTeam {
   groupChatIds: string[];
   bots: PlatformTeamBot[];
   /** Team members' (people's) union_ids — the human talk-免grant leg: a member
-   *  is trusted to TALK (never operate) inside this team's group chats. */
+   *  is trusted to TALK (never operate) to any bot on the SAME team, in any chat
+   *  they share with it (not scoped to this team's group chats). */
   memberUnionIds: string[];
 }
 
@@ -166,24 +167,31 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
   return false;
 }
 
-/** Is `unionId` a HUMAN member of a platform team AND is `chatId` one of that
- *  team's group chats? The talk-免grant leg for people: a teammate speaking in
- *  the team's own group is trusted to TALK without /grant — but scoped to those
- *  groups (not everywhere), and TALK only (operate stays allowedUsers-gated, the
- *  caller must never route this predicate into canOperate). Both conditions must
- *  hold on the SAME team so cross-team leakage is impossible. */
-export function isPlatformTeamMemberChat(
+/** Is `unionId` a HUMAN member of a platform team that THIS bot (`botAppId`)
+ *  also belongs to? The talk-免grant leg for people: a teammate is trusted to
+ *  TALK to a bot on their own team without /grant, in ANY chat they share —
+ *  not just platform-拉群 groups. The scope anchor is TEAM CO-MEMBERSHIP
+ *  (bot ∈ team.bots ∧ sender ∈ team.memberUnionIds on the SAME team), not the
+ *  chat: this is what lets a手动/原生 invite 群 work at parity with拉群 groups
+ *  (those 群 never enter groupChatIds; keying on the chat left them 要 /grant).
+ *
+ *  Cross-team leakage stays impossible because both predicates must hold on the
+ *  SAME team, and the bot only ever sees teams it is itself opted into (platform
+ *  team-sync is pushed per member machine; a bot not in team T never appears in
+ *  T.bots, so T's members can't reach it here). TALK only — operate stays
+ *  allowedUsers-gated; the caller must never route this predicate into canOperate. */
+export function isPlatformTeamMember(
   dataDir: string,
-  chatId: string | undefined,
+  botAppId: string | undefined,
   unionId: string | undefined,
 ): boolean {
-  const cid = (chatId ?? '').trim();
+  const appId = (botAppId ?? '').trim();
   const uid = (unionId ?? '').trim();
-  if (!cid || !uid) return false;
+  if (!appId || !uid) return false;
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    if (t.memberUnionIds.includes(uid) && t.groupChatIds.includes(cid)) return true;
+    if (t.memberUnionIds.includes(uid) && t.bots.some((b) => b.appId === appId)) return true;
   }
   return false;
 }

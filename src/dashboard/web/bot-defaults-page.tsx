@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { openBotOnboarding } from './bot-onboarding.js';
 import {
@@ -9,7 +9,9 @@ import {
   fallbackCliOptionsState,
   fetchBotDefaults,
   fetchCliOptions,
+  fetchDetectedModels,
   fmtSince,
+  mergeModelCandidates,
   modelSuggestionsForOption,
   resolveSubstituteTarget,
   selectedCliOption,
@@ -373,7 +375,8 @@ function statusClass(status: StatusMessage, extra = ''): string {
 }
 
 function StatusSpan(props: { status: StatusMessage; attr?: Record<string, string> }) {
-  return <span role="status" aria-live="polite" className={statusClass(props.status)} {...(props.attr ?? {})}>{props.status?.text ?? ''}</span>;
+  // key 随文案变化：成功状态 1.5s 后 CSS 淡出，新消息到达时重挂载以重启动画
+  return <span key={props.status?.text ?? ''} role="status" aria-live="polite" className={statusClass(props.status)} {...(props.attr ?? {})}>{props.status?.text ?? ''}</span>;
 }
 
 function InfoTip(props: { children: ReactNode }) {
@@ -424,6 +427,114 @@ function DropdownField<T extends string>(props: {
       />
       <input type="hidden" data-input={props.dataInput} value={props.value} readOnly />
     </>
+  );
+}
+
+const MODEL_PICKER_CUSTOM = '__custom__';
+
+/**
+ * 模型选择器：下拉候选（静态精选 + live 探测合并，由调用方 mergeModelCandidates 算好）
+ * + 「自定义模型…」自由输入。模型列表会过期，候选永不锁死。
+ * - value='' 表示跟随 CLI 默认，菜单显示 defaultLabel；
+ * - value 非空但不在候选中时，把当前值作为额外选项插在最前（旧配置/自定义值可见）；
+ * - 选中 customLabel 切到自定义输入模式（datalist 仍挂全部候选做自动补全），
+ *   返回按钮切回下拉模式；
+ * - busy（live 探测进行中）只在控件下方显示小转圈，不禁用选择。
+ */
+export function ModelPickerField(props: {
+  value: string;
+  onChange(next: string): void;
+  options: readonly string[];
+  disabled?: boolean;
+  busy?: boolean;
+  dataInput: string;
+  ariaLabel: string;
+  defaultLabel: string;
+  customLabel: string;
+  detectedCount?: number;
+  detectedLabel?: string;
+  /** 下拉菜单样式类：defaults 页传 bd-field-menu，onboarding 传 onboarding-menu。 */
+  menuClassName?: string;
+}): React.JSX.Element {
+  const tr = useT();
+  const [customMode, setCustomMode] = useState(false);
+  const datalistId = useId();
+  const current = props.value;
+  const dropdownOptions = useMemo(() => {
+    const opts: { value: string; label: ReactNode }[] = [];
+    if (current && !props.options.includes(current)) {
+      opts.push({ value: current, label: current });
+    }
+    for (const item of props.options) opts.push({ value: item, label: item });
+    opts.push({ value: MODEL_PICKER_CUSTOM, label: props.customLabel });
+    return opts;
+  }, [current, props.options, props.customLabel]);
+
+  return (
+    <span className="bd-model-picker">
+      {customMode ? (
+        <span className="bd-model-custom">
+          <input
+            type="text"
+            data-input={props.dataInput}
+            list={datalistId}
+            value={current}
+            placeholder={props.defaultLabel}
+            disabled={props.disabled}
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            onChange={event => props.onChange(event.currentTarget.value)}
+          />
+          <button
+            type="button"
+            className="bd-model-back"
+            disabled={props.disabled}
+            onClick={() => setCustomMode(false)}
+          >
+            {tr('botDefaults.modelPickerBack')}
+          </button>
+          <datalist id={datalistId}>
+            {props.options.map(item => <option value={item} key={item} />)}
+          </datalist>
+        </span>
+      ) : (
+        <>
+          <DropdownMenu<string>
+            id={`bd-menu-${props.dataInput}`}
+            className={['bd-model-menu', props.menuClassName].filter(Boolean).join(' ')}
+            ariaLabel={props.ariaLabel}
+            disabled={props.disabled}
+            label={current || props.defaultLabel}
+            value={current}
+            options={dropdownOptions}
+            searchable
+            searchPlaceholder={tr('common.dropdownSearch')}
+            searchEmptyLabel={tr('common.dropdownSearchEmpty')}
+            onChange={next => {
+              if (next === MODEL_PICKER_CUSTOM) {
+                setCustomMode(true);
+                return;
+              }
+              props.onChange(next);
+            }}
+          />
+          {/* 与 DropdownField 同款 data-input 锚点：既有测试/自动化经它读写当前值 */}
+          <input
+            type="hidden"
+            data-input={props.dataInput}
+            value={current}
+            onChange={event => props.onChange(event.currentTarget.value)}
+          />
+        </>
+      )}
+      {props.busy
+        ? <small className="bd-model-busy"><span className="bd-model-spinner" aria-hidden="true" /></small>
+        : null}
+      {typeof props.detectedCount === 'number' && props.detectedCount > 0 && props.detectedLabel
+        ? <small className="bd-model-detected">{props.detectedLabel}</small>
+        : null}
+    </span>
   );
 }
 
@@ -1626,11 +1737,26 @@ export function BotAgentSection(props: {
   const option = selectedCliOption(cliState.options, cliKey);
   const suggestions = modelSuggestionsForOption(option, cliState);
   const modelDisabledByCli = option?.gateway === 'ttadk' && option.acceptsModel === false;
-  const modelPlaceholder = modelDisabledByCli
-    ? tr('botOnboarding.modelTtadkCocoPlaceholder')
-    : option?.gateway === 'ttadk'
-      ? tr('botOnboarding.modelTtadkPlaceholder').replace('{model}', cliState.ttadkModelDefault)
-      : tr('botDefaults.agentModelPlaceholder');
+  // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
+  const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
+  const [detectingModels, setDetectingModels] = useState(false);
+  useEffect(() => {
+    if (option?.gateway === 'ttadk') {
+      setDetectedModels(null);
+      setDetectingModels(false);
+      return;
+    }
+    // stale 标志防卸载/竞态：cliKey 快速切换时旧响应不得覆盖新 CLI 的候选。
+    let stale = false;
+    setDetectingModels(true);
+    fetchDetectedModels(cliKey)
+      .then(result => { if (!stale) setDetectedModels(result); })
+      .finally(() => { if (!stale) setDetectingModels(false); });
+    return () => { stale = true; };
+    // 只按 cliKey 重新探测；cliState 刷新带来的静态候选经 suggestions 合入，无需重探。
+  }, [cliKey]);
+  const modelCandidates = mergeModelCandidates(suggestions, detectedModels?.models ?? null);
+  const detectedLiveCount = detectedModels?.source === 'live' ? detectedModels.models.length : 0;
 
   function updateCli(nextKey: string): void {
     const previousKey = cliKey;
@@ -2085,18 +2211,23 @@ export function BotAgentSection(props: {
         <div className="bd-row">
           <label>
             <FieldTitle help={tr('botDefaults.agentHelp')}>{tr('botDefaults.agentModel')}</FieldTitle>
-            <input
-              type="text"
-              data-input="agentModel"
-              list={`agent-model-suggestions-${bot.larkAppId}`}
-              placeholder={modelPlaceholder}
+            <ModelPickerField
+              key={cliKey}
               value={model}
+              onChange={setModel}
+              options={modelCandidates}
               disabled={agentBusy || modelDisabledByCli}
-              onChange={event => setModel(event.currentTarget.value)}
+              busy={detectingModels}
+              dataInput="agentModel"
+              ariaLabel={tr('botDefaults.agentModel')}
+              defaultLabel={tr('botDefaults.modelPickerDefault')}
+              customLabel={tr('botDefaults.modelPickerCustom')}
+              menuClassName="bd-field-menu"
+              detectedCount={detectedLiveCount || undefined}
+              detectedLabel={detectedLiveCount > 0
+                ? tr('botDefaults.modelPickerDetected', { count: detectedLiveCount })
+                : undefined}
             />
-            <datalist id={`agent-model-suggestions-${bot.larkAppId}`}>
-              {suggestions.map(item => <option value={item} key={item} />)}
-            </datalist>
           </label>
         </div>
       )}
@@ -4049,6 +4180,13 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Remote-callback paste fallback (mirrors groups-page / sessions-page): when
+  // set, the overlay is shown so a browser that can't reach the daemon's
+  // 127.0.0.1:9768 loopback (远程 VM / 中心化平台 m-* 子域访问) can still finish
+  // by pasting the callback URL. authUrl also drives the "跳转飞书授权" retry button.
+  const [authUrl, setAuthUrl] = useState('');
+  const [callbackUrl, setCallbackUrl] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const lifecycle = useRef({ generation: 0, mounted: true });
 
   const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
@@ -4071,6 +4209,9 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     setAuthBusy(false);
     setModeBusy(false);
     setErr(null);
+    setAuthUrl('');
+    setCallbackUrl('');
+    setSubmitting(false);
     void fetchStatus(generation);
     return () => {
       lifecycle.current.mounted = false;
@@ -4106,6 +4247,7 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
+    setCallbackUrl('');
     try {
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
       // A bot switch while the POST was in flight must neither surface the old
@@ -4115,15 +4257,34 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
         setErr(responseErrorText(res));
         return;
       }
-      window.open(res.body.authUrl, '_blank', 'noopener');
-      // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
+      const url = String(res.body.authUrl);
+      // Show the paste overlay up front (mirrors groups-page / sessions-page):
+      // same-machine browsers finish via the 127.0.0.1:9768 loopback and the
+      // poll below auto-closes it; remote browsers (远程 VM / 中心化平台 m-* 子
+      // 域) can't reach that loopback, so they finish by pasting the callback URL.
+      setAuthUrl(url);
+      window.open(url, '_blank', 'noopener');
+      // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。轮询到 authorized
+      // 即收起弹窗；远程场景轮询不会命中，弹窗保持打开等用户手动粘贴，超时不报错。
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 3000));
         if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
-        if (await fetchStatus(generation)) return;
-      }
-      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
-        setErr(tr('botDefaults.sgTagAuthTimeout'));
+        if (await fetchStatus(generation)) {
+          if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+            // 本机 loopback 已完成授权（state 一次即焚、pending 文件已删）。bump
+            // generation 丢弃任何在途的 completeAuth——否则用户几乎同时点了「完成
+            // 授权」，其 POST 会因 pending 已消费而失败，在绿徽标旁弹出假红错。
+            lifecycle.current.generation += 1;
+            setAuthUrl('');
+            setCallbackUrl('');
+            setSubmitting(false);
+            setAuthBusy(false);
+            // 清掉可能残留的 not-confirmed 提示：completeAuth 曾因 status GET 瞬时
+            // 失败弹过提示，此刻轮询自愈翻绿，别把旧提示留在绿徽标旁。
+            setErr(null);
+          }
+          return;
+        }
       }
     } catch (e: any) {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
@@ -4131,6 +4292,57 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       }
     } finally {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
+    }
+  }
+
+  // Remote-callback fallback: POST the pasted 127.0.0.1 callback URL to the
+  // dashboard's cross-process exchanger. The pending OAuth state (and the
+  // resulting token) are disk-backed, so the exchange completes and the daemon's
+  // status endpoint reflects it regardless of which process minted the auth URL.
+  async function completeAuth(): Promise<void> {
+    const generation = lifecycle.current.generation;
+    const trimmed = callbackUrl.trim();
+    if (!trimmed) return;
+    setSubmitting(true);
+    setErr(null);
+    // Shared closer for both the success path and the "already authorized"
+    // recovery below: bump generation to stop startAuth's in-flight poll, then
+    // clear the overlay.
+    const finish = () => {
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      lifecycle.current.generation += 1;
+      setAuthUrl('');
+      setCallbackUrl('');
+      setSubmitting(false);
+      setAuthBusy(false);
+    };
+    try {
+      const res = await sendJson('POST', '/api/feed-groups/oauth-callback', { callbackUrl: trimmed });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      if (!res.ok || !res.body.ok) {
+        // Narrow race: the same-machine loopback may have consumed this one-shot
+        // state moments earlier (pending file deleted) while the poll hasn't
+        // ticked yet — the exchange then fails with "state 不匹配". Re-check
+        // status before surfacing a red error next to what is really a success.
+        if (await fetchStatus(generation)) return void finish();
+        if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+          // 服务端消息自带 ❌/✅ 前缀，剥掉——行内 err 渲染已统一加 ✗，否则双 emoji 叠加。
+          const raw = String(res.body?.message || responseErrorText(res));
+          setErr(raw.replace(/^[❌✅]\s*/u, ''));
+        }
+        return;
+      }
+      // 换 token 成功≠已授予 feed-group scope，且紧跟的 status GET 可能瞬时失败。
+      // 只有复查确认 authorized 才 finish 关弹窗；否则保留弹窗+提示，让用户能重试，
+      // 或看清「登录成功但没给标签权限」(与 groups-page 刷新失败保留弹窗同款)。
+      if (await fetchStatus(generation)) return void finish();
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(tr('botDefaults.sgTagAuthNotConfirmed'));
+      }
+    } catch (e: any) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setErr(caughtErrorText(e));
+    } finally {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setSubmitting(false);
     }
   }
 
@@ -4178,6 +4390,64 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           {err && <span className="status-error">✗ {err}</span>}
         </div>
       </div>
+      {authUrl && typeof document !== 'undefined' ? (
+        // Portal 到 body:此弹层内联渲染在 .page 页面容器的 DOM 里,而 .page 有
+        // `animation: dashboard-page-enter … both`——fill-mode:both 使动画结束后
+        // computed transform 持续为 identity matrix(而非关键字 none),会为后代
+        // position:fixed 建立包含块,于是 .feed-group-auth-overlay 虽写了
+        // fixed+inset:0 却相对 .page 而非视口定位,被约束进页面几何(表现为弹窗
+        // 不全屏、偏挂在按钮附近)。挂到 body 顶层逃出该包含块,与 FeishuLoginModal /
+        // auth-expired-overlay 一致,稳定全屏居中。
+        createPortal(
+          <div className="feed-group-auth-overlay">
+            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="sg-tag-auth-title">
+              <h3 id="sg-tag-auth-title">{tr('botDefaults.sgTagAuthTitle')}</h3>
+              <p>{tr('botDefaults.sgTagAuthHint')}</p>
+              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(authUrl, '_blank', 'noopener')}>
+                {tr('botDefaults.sgTagAuthOpen')}
+              </button>
+              <label>
+                <span>{tr('botDefaults.sgTagAuthPasteLabel')}</span>
+                <input
+                  type="url"
+                  data-input="sessionGroupTagCallbackUrl"
+                  value={callbackUrl}
+                  placeholder="http://127.0.0.1:9768/callback?code=…&state=…"
+                  onChange={event => setCallbackUrl(event.currentTarget.value)}
+                />
+              </label>
+              <div className="actions">
+                <button
+                  type="button"
+                  data-action="session-group-tag-cancel"
+                  onClick={() => {
+                    // 取消不仅关弹窗，还要停掉 startAuth 里仍在跑的 60 次轮询——否则
+                    // authBusy 一直为 true，「一键授权」卡在禁用态最长 3 分钟。bump
+                    // generation 让在途轮询的守卫失配即退出。
+                    lifecycle.current.generation += 1;
+                    setAuthUrl('');
+                    setCallbackUrl('');
+                    setSubmitting(false);
+                    setAuthBusy(false);
+                  }}
+                >
+                  {tr('botDefaults.sgTagAuthCancel')}
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  data-action="session-group-tag-complete"
+                  disabled={!callbackUrl.trim() || submitting}
+                  onClick={() => void completeAuth()}
+                >
+                  {submitting ? tr('botDefaults.sgTagAuthSubmitting') : tr('botDefaults.sgTagAuthComplete')}
+                </button>
+              </div>
+            </section>
+          </div>,
+          document.body,
+        )
+      ) : null}
     </div>
   );
 }

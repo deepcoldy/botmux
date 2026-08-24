@@ -119,6 +119,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -2185,7 +2186,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const target = resumable.find(r => r.cliSessionId === cliSessionId);
       if (!target) {
-        await pickerReply(t('cmd.adopt.resume_not_found', { id: cliSessionId }, localeForBot(ds.larkAppId)));
+        await pickerReply(t('cmd.adopt.resume_not_found', undefined, localeForBot(ds.larkAppId)));
         clearAdoptCandidates(rootId);
         if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
         return;
@@ -2425,8 +2426,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // already omits the restart button when adoptMode=true, but a stale
       // pre-fix card or a malformed action payload could still arrive.
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
-        logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
+      if (isSharedAdoptSession(ds)) {
+        logger.warn(`[${tag(ds)}] Rejected restart on shared adopt — would replace the source conversation client`);
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
@@ -2490,6 +2491,49 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // 会话已不在 activeSessions（已关过 / 卡片过期 / daemon 重启丢失）——点「关闭
         // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
+      // Historical cards can still carry the old `close` action. A shared
+      // adopt must never interpret it as permission to terminate the source
+      // conversation; treat it as "disconnect BotMux" just like /close does.
+      if (isSharedAdoptSession(ds)) {
+        const targetSessionId = ds.session.sessionId;
+        const disconnected = await withBotTurnMutation(ds.larkAppId, async () => {
+          const current = [...activeSessions.values()].find(
+            candidate => candidate.session.sessionId === targetSessionId,
+          );
+          if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+          try {
+            const result = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
+            if (!result.ok) return 'refused' as const;
+            return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+          } catch {
+            return 'refused' as const;
+          }
+        });
+        const locDs = localeForBot(ds.larkAppId);
+        if (disconnected === 'missing') {
+          return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+        }
+        if (disconnected === 'refused') {
+          await sessionReply(rootId, t('cmd.detach.failed', undefined, locDs));
+          return;
+        }
+        if (disconnected === 'residual') {
+          await sessionReply(rootId, t('cmd.detach.residual', undefined, locDs));
+          return;
+        }
+        await sessionReply(
+          rootId,
+          t(
+            ds.session.existingAppServerEndpoint
+              ? 'cmd.detach.existing_app_server_success'
+              : 'cmd.detach.success',
+            undefined,
+            locDs,
+          ),
+        );
+        logger.info(`[${tag(ds)}] Historical close action treated as shared-adopt disconnect`);
+        return;
       }
       const targetSessionId = ds.session.sessionId;
       const closed = await withBotTurnMutation(ds.larkAppId, async () => {
@@ -2696,14 +2740,28 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const current = [...activeSessions.values()].find(
           candidate => candidate.session.sessionId === targetSessionId,
         );
-        if (!current) return undefined;
-        await closeWorkerPoolSession(targetSessionId);
-        return current;
+        if (!current) return 'missing' as const;
+        try {
+          const result = await closeWorkerPoolSession(targetSessionId);
+          if (!result.ok) return 'refused' as const;
+          return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+        } catch {
+          return 'refused' as const;
+        }
       });
-      if (!disconnected) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (disconnected === 'missing') {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
-      await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
+      if (disconnected === 'refused') {
+        await sessionReply(rootId, t('cmd.detach.failed', undefined, locDs));
+        return;
+      }
+      if (disconnected === 'residual') {
+        await sessionReply(rootId, t('cmd.detach.residual', undefined, locDs));
+        return;
+      }
+      await sessionReply(rootId, t('card.action.disconnected', undefined, locDs));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);
     }
 
@@ -2779,7 +2837,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'hidden',
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           locDs,
           undefined,
@@ -3109,7 +3167,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.session.title || getCliDisplayName(effectiveCliId),
           effectiveCliId,
           true, // showManageButtons — write-link card includes restart & close
-          !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+          isSharedAdoptSession(ds), // shared adopt — disconnect, never close the source conversation
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
@@ -3175,7 +3233,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               next,
               ds.streamCardNonce,
               ds.currentImageKey,
-              !!ds.adoptedFrom,
+              isSharedAdoptSession(ds),
               false,
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
@@ -3221,7 +3279,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           next,
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3265,7 +3323,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           next,
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3334,7 +3392,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3386,7 +3444,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3602,7 +3660,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!selected.threadId) return;
 
     const botCfg = getBot(ds.larkAppId).config;
-    if (botCfg.cliId !== 'codex-app') return;
+    if (botCfg.cliId !== 'codex-app' && !botCfg.existingAppServer) return;
 
     const { listCodexAppThreads } = await import('../../services/codex-app-threads.js');
     let threads: Awaited<ReturnType<typeof listCodexAppThreads>>;

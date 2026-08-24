@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
+import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import {
   CodexAppControlFinalAssembler,
   CodexAppControlLineDecoder,
@@ -2184,6 +2185,38 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(requests.filter(request => request.method === 'thread/resume')).toHaveLength(1);
       expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(0);
       expect(harness.stdout).not.toContain('Codex App connected.');
+      expect(control.states).toEqual([]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a thread owned by another app-server writer instead of starting a fresh thread', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-active-writer-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.147.0',
+      'resume-active-writer',
+      control.bootstrap.path,
+      { threadId: 'thread-existing' },
+    );
+    try {
+      const exitCode = await new Promise<number | null>(resolvePromise => harness.child.once('exit', resolvePromise));
+      const requests = readRequests(logPath);
+      expect(exitCode).toBe(CODEX_APP_ACTIVE_WRITER_EXIT_CODE);
+      expect(requests.filter(request => request.method === 'thread/resume')).toHaveLength(1);
+      expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(0);
+      expect(harness.stderr).toContain('currently owned by another app-server writer');
       expect(control.states).toEqual([]);
     } finally {
       await stopChild(harness.child);

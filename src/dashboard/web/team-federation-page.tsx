@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CreateActionButton, DropdownMenu, SectionHeader, dropdownLabel } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { confirm } from './confirm-modal.js';
 import {
   autoBindIdentity,
   botMatchesTeamFilters,
@@ -217,7 +218,7 @@ function TeamHomePage() {
   }
 
   async function handleRemoveMember(teamId: string, deploymentId: string, name: string): Promise<void> {
-    if (!confirm(tr('team.removeMemberConfirm', { name }))) return;
+    if (!await confirm({ title: '移除成员', message: tr('team.removeMemberConfirm', { name }), danger: true })) return;
     await removeHostedTeamMember(teamId, deploymentId);
     if (!alive.current) return;
     void loadLocal();
@@ -728,7 +729,7 @@ function TeamManagePage() {
   }
 
   async function handleDelete(teamId: string, name: string): Promise<void> {
-    if (!confirm(tr('team.delConfirm', { name }))) return;
+    if (!await confirm({ title: '删除团队', message: tr('team.delConfirm', { name }), danger: true })) return;
     await deleteHostedTeam(teamId);
     if (!alive.current) return;
     void loadManageList();

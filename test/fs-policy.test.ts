@@ -24,6 +24,7 @@ import {
 } from '../src/adapters/cli/fs-policy.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -108,6 +109,49 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it('isolates OMP transcripts while keeping shared agent state and only the current sid writable', () => {
+    const adapter = createOhMyPiAdapter('/usr/bin/omp');
+    const sessionsRoot = '/home/u/.omp/agent/sessions';
+    const ownSessionDir = `${sessionsRoot}/botmux/self`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+      mandatoryDenyPaths: [sessionsRoot],
+      extraWritePaths: [ownSessionDir],
+    }));
+
+    for (const path of [
+      '/home/u/.omp/agent/agent.db',
+      '/home/u/.omp/agent/agent.db-wal',
+      '/home/u/.omp/agent/config.yml',
+      '/home/u/.omp/agent/terminal-sessions/pane',
+      `${ownSessionDir}/turn.jsonl`,
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+    expect(accessForPath(p.rules, sessionsRoot).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sessionsRoot}/botmux/sibling/secret.jsonl`).access).toBe('deny');
+
+    const { args } = compileToBwrap(p, {
+      emptyDir: '/sbx/empty',
+      emptiesDir: '/sbx/empties',
+      chdir: '/home/u/proj',
+    });
+    const mask = args.indexOf(sessionsRoot);
+    const carve = args.indexOf(ownSessionDir);
+    expect(args[mask - 1]).toBe('--tmpfs');
+    expect(carve).toBeGreaterThan(mask);
+    expect(args[carve - 1]).toBe('--bind');
+    expect(args.lastIndexOf(sessionsRoot)).toBeGreaterThan(carve);
+    expect(args[args.lastIndexOf(sessionsRoot) - 1]).toBe('--remount-ro');
+  });
+
   it('reasonix state root is read-write so identity, sessions, leases and skills persist in sandbox', () => {
     const adapter = createReasonixAdapter('/usr/bin/reasonix');
     const p = buildFsPolicy(ctx({
@@ -607,6 +651,19 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     // (the #605 P1 namespace bug — canonical vs lexical divergence under symlinked $HOME).
     expect(src).not.toMatch(/declaredAuthPaths:\s*\[\.\.\.\(cliAdapter\.authPaths[\s\S]*?\)\]\.map\(expandTilde\)(?!Lexical)/);
     expect(src).not.toMatch(/isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
+  });
+
+  it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");
+    expect(src).toMatch(/ompCurrentSessionDir\s*=\s*cliAdapter\.id === 'oh-my-pi'[\s\S]*?ompSessionDir\(effectiveAdapterSessionId\)/);
+    const precreate = src.indexOf('if (ompCurrentSessionDir) mkdirSync(ompCurrentSessionDir');
+    const policyAssembly = src.indexOf('const fsPolicyCtx =', precreate);
+    expect(precreate).toBeGreaterThan(-1);
+    expect(policyAssembly).toBeGreaterThan(precreate);
+    expect(src).toContain("relative(canonicalOmpSessionsRoot, canonicalOmpSessionDir) !== join('botmux', effectiveAdapterSessionId)");
+    expect(src).toContain('mandatoryDenyPaths.push(canonicalOmpSessionsRoot)');
+    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalOmpSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {

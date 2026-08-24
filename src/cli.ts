@@ -242,6 +242,7 @@ import {
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import {
@@ -311,6 +312,9 @@ import {
 {
   const cfg = readGlobalConfig();
   if (cfg.lang) setDefaultLocale(cfg.lang);
+  // Wire user prompt-key overrides into t() so CLI-side prompt building (e.g.
+  // `botmux skill show`, catalog rendering) honours customizations. Idempotent.
+  registerPromptOverrideResolver();
 }
 
 // CLI subcommands (send/thread/bots/list/etc) print JSON to stdout for
@@ -13257,6 +13261,15 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgrade', 'update']);
+if (
+  ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')
+  && process.argv.slice(3).some(arg => arg === '--help' || arg === '-h')
+) {
+  showHelp();
+  process.exit(0);
+}
+
 // Workflow safety gate (Slice C0): a CLI invoked inside a workflow
 // subagent worker (BOTMUX_WORKFLOW=1, set by v3/ephemeral-pool) must not
 // trigger chat-facing effects, schedule mutations, or recursively authorize /
@@ -14140,6 +14153,14 @@ switch (command) {
   case 'skills': {
     const { runSkillsAdminCommand } = await import('./core/skills/cli-admin-command.js');
     const result = runSkillsAdminCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exitCode = result.code;
+    break;
+  }
+  case 'customize': {
+    const { runCustomizeCommand } = await import('./core/skills/customize-command.js');
+    const result = runCustomizeCommand(process.argv.slice(3));
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exitCode = result.code;

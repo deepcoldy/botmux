@@ -80,6 +80,9 @@ async function main() {
     const { setDefaultLocale } = await import('./i18n/index.js');
     const cfg = readGlobalConfig();
     if (cfg.lang) setDefaultLocale(cfg.lang);
+    // Wire user prompt-key overrides into t() before any prompt is built.
+    const { registerPromptOverrideResolver } = await import('./skills/effective-builtins.js');
+    registerPromptOverrideResolver();
   }
 
   // Dynamic import so config.ts reads env vars AFTER dotenv has loaded them

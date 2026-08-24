@@ -347,6 +347,25 @@ describe('parseBotConfigsFromText — brand', () => {
     }]))).toThrow(/cannot be combined with wrapperCli/);
   });
 
+  it('accepts existingAppServer on a Codex App bot but rejects unrelated CLIs', () => {
+    const endpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-share',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      existingAppServer: { endpoint },
+    }]));
+    expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.existingAppServer).toEqual({ endpoint });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-app-server-cli',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      existingAppServer: { endpoint },
+    }]))).toThrow(/only for cliId "codex" or "codex-app"/);
+  });
+
   it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([
       {

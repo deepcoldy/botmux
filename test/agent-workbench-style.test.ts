@@ -387,8 +387,9 @@ describe('Agent Workbench visual contract', () => {
       expect(value, `.wb-term-${style} 的 --term-line-height`).toBeDefined();
       expect(Number(value), `.wb-term-${style} 的 --term-line-height`).toBe(expected);
     }
-    // 阅读风明显比经典松（正文呼吸感），但不至于把底部 chrome 撑到占屏。
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBeGreaterThan(WORKBENCH_TERM_LINE_HEIGHTS.classic * 1.2);
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBeLessThanOrEqual(1.35);
+    // 阅读风比经典松（正文呼吸感），但两头都不能过：往上不能把底部 chrome 撑到占屏，
+    // 往下也不能松到中文行之间散成隔行 —— 1.3 就是因为后者才收到 1.15 的。
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBeGreaterThan(WORKBENCH_TERM_LINE_HEIGHTS.classic * 1.1);
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBeLessThanOrEqual(1.2);
   });
 });

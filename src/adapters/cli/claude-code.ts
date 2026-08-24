@@ -744,8 +744,10 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
-    // alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体版本；具体 ID 锁版本。
-    modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+    // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
+    // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
+    // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
+    modelChoices: ['fable', 'opus', 'sonnet', 'haiku', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
   }, pathOverride ?? 'claude');
 }
 

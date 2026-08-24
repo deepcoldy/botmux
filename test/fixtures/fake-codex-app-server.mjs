@@ -379,6 +379,10 @@ function handle(request) {
       reject(request.id, -32001, `thread ${request.params.threadId} not found`);
       return;
     }
+    if (behavior === 'resume-active-writer') {
+      reject(request.id, -32600, `thread ${request.params.threadId} already has an active writer`);
+      return;
+    }
     respond(request.id, { thread: { id: request.params.threadId } });
     return;
   }

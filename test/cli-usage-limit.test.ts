@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   detectCliUsageLimit,
+  detectScreenUsageLimit,
+  isActiveWorkRuntimeStatus,
   HARD_RATE_LIMIT_COOLDOWN_MS,
   usageLimitStateKey,
   structuredRateLimitState,
@@ -310,5 +312,98 @@ describe('isStructuredRateLimitAuthoritative — structured-emit CLIs only, not 
     expect(isStructuredRateLimitAuthoritative(null)).toBe(false);
     expect(isStructuredRateLimitAuthoritative(undefined)).toBe(false);
     expect(isStructuredRateLimitAuthoritative({})).toBe(false);
+  });
+});
+
+describe('isActiveWorkRuntimeStatus', () => {
+  it('is true only for working/analyzing', () => {
+    expect(isActiveWorkRuntimeStatus('working')).toBe(true);
+    expect(isActiveWorkRuntimeStatus('analyzing')).toBe(true);
+    for (const s of ['idle', 'stalled', 'limited', 'starting', '', undefined, null]) {
+      expect(isActiveWorkRuntimeStatus(s)).toBe(false);
+    }
+  });
+});
+
+describe('detectScreenUsageLimit — runtime-status gate (误报根治)', () => {
+  const now = new Date(2026, 4, 19, 17, 30);
+  // The exact false-positive class from the 2026-08 reports: the CLI's own
+  // output (model answer / tool output quoting a business 429) sitting on
+  // screen while the CLI is still actively working.
+  const business429Screen = [
+    'TOS 返回 429 Too Many Requests，排查结论：',
+    'status: 429 是服务端限流，不是 LLM 侧限额',
+    'exceeded retry limit 后已降级处理',
+  ].join('\n');
+
+  it('suppresses the verdict while the CLI is working', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'working', now).limited).toBe(false);
+  });
+
+  it('suppresses the verdict while the CLI is analyzing', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'analyzing', now).limited).toBe(false);
+  });
+
+  it('still detects a genuine block when the CLI is idle', () => {
+    const result = detectScreenUsageLimit(business429Screen, 'idle', now);
+    expect(result.limited).toBe(true);
+    if (!result.limited) return;
+    expect(result.kind).toBe('rate');
+    expect(result.retryLabel).toBe('5-10 min');
+  });
+
+  it('does not suppress for stalled sessions (a stalled CLI may be genuinely blocked)', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'stalled', now).limited).toBe(true);
+  });
+
+  it('treats an undefined status as non-working (detection proceeds)', () => {
+    expect(detectScreenUsageLimit(business429Screen, undefined, now).limited).toBe(true);
+  });
+
+  it('suppresses usage-quota text on a working screen too', () => {
+    const text = "You've hit your usage limit. Try again at 10:36 PM.";
+    // The pure text classifier still flags it (no status context there);
+    // the screen-frame gate is what prevents the false positive.
+    expect(detectCliUsageLimit(text, now).limited).toBe(true);
+    expect(detectScreenUsageLimit(text, 'working', now).limited).toBe(false);
+  });
+
+  it('keeps suppressRateKind semantics on top of the status gate', () => {
+    // Claude family: rate suppressed even when idle; usage still detected.
+    expect(detectScreenUsageLimit(business429Screen, 'idle', now, { suppressRateKind: true }).limited).toBe(false);
+    const usage = detectScreenUsageLimit(
+      "You've hit your usage limit. Try again at 10:36 PM.",
+      'idle',
+      now,
+      { suppressRateKind: true },
+    );
+    expect(usage.limited).toBe(true);
+  });
+
+  it('working + outputActive=false still detects a blocking 429 (non-structured CLI parked at error screen)', () => {
+    // A non-structured CLI (codex/grok/traex/pi) whose rate-limit error screen
+    // does not render its configured ready prompt never transitions the idle
+    // detector to idle, so the projected status stays `working` forever (only
+    // Codex App projects `stalled`). `working` alone does not prove output is
+    // progressing — with outputActive=false (PTY quiescent) the gate must not
+    // suppress, or a genuine blocking 429 is hidden indefinitely and the limit
+    // card / backoff path never runs.
+    const result = detectScreenUsageLimit(business429Screen, 'working', now, { outputActive: false });
+    expect(result.limited).toBe(true);
+    if (!result.limited) return;
+    expect(result.kind).toBe('rate');
+    expect(result.retryLabel).toBe('5-10 min');
+  });
+
+  it('working + outputActive=true keeps suppressing (output progressing = CLI own output)', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'working', now, { outputActive: true }).limited).toBe(false);
+  });
+
+  it('analyzing + outputActive=false also detects', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'analyzing', now, { outputActive: false }).limited).toBe(true);
+  });
+
+  it('omitting outputActive keeps the conservative suppress-on-working default', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'working', now).limited).toBe(false);
   });
 });

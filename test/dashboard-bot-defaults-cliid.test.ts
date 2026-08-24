@@ -161,6 +161,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -189,6 +192,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -260,6 +266,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -290,6 +299,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -324,6 +336,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -360,6 +375,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       const body = JSON.parse(init?.body ?? '{}');
       requests.push(body);
       return {
@@ -391,6 +409,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
     });
@@ -416,6 +437,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
     });
@@ -441,6 +465,9 @@ describe('Codex-compatible runtime editor', () => {
     const requests: any[] = [];
     const legacyPath = '/opt/legacy/bin/legacy-codex';
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -675,6 +702,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -721,6 +751,9 @@ describe('Codex-compatible runtime editor', () => {
       update: { provider: 'none' },
     };
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -781,6 +814,9 @@ describe('Codex-compatible runtime editor', () => {
     const requests: any[] = [];
     const runtime = { id: 'forge-codex', executable: 'forge-codex', update: { provider: 'none' } };
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,
@@ -822,6 +858,7 @@ describe('Codex-compatible runtime editor', () => {
       update: { provider: 'npm', packageName: '@forge/codex' },
     };
     (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push({ url: String(url), body: JSON.parse(init?.body ?? '{}') });
       return {
         ok: true,
@@ -870,6 +907,9 @@ describe('Codex-compatible runtime editor', () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      // 模型下拉的 on-demand 探测请求（GET /api/cli-options/models）与本测试
+      // 断言的 save 请求无关：返回空静态结果且不记入 requests，避免污染断言。
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
       return {
         ok: true,

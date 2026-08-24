@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, readFileSync } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
@@ -29,7 +29,12 @@ import {
   mintPreviewContentCapability,
   verifyPreviewContentCapability,
 } from '../src/dashboard/preview-content-capability.js';
+import { decodeTerminalWriteFrameSource, terminalWriteFrame } from '../src/core/terminal-write-frame.js';
 import { TerminalControlManager, type TerminalDashboardActor } from '../src/dashboard/terminal-control.js';
+import {
+  matchTerminalControlRoute,
+  resolveTerminalControlAction,
+} from '../src/dashboard/terminal-control-route.js';
 import {
   centralViewLinkPath,
   mintTerminalViewCapability,
@@ -47,7 +52,65 @@ const resultPath = join(root, 'docs', 'assets', 'agent-workbench-browser-results
  *  用 BOTMUX_WORKBENCH_SHOT_DIR 可以指到别处。 */
 const shotDir = process.env.BOTMUX_WORKBENCH_SHOT_DIR?.trim() || join(tmpdir(), 'botmux-workbench-shots');
 const pageHtml = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Workbench browser harness</title><link rel="stylesheet" href="/style.css"><style>html,body,#root{width:100%;height:100%;margin:0;overflow:hidden}</style></head><body><div id="root"></div><script type="module" src="/fixture.js"></script></body></html>';
-const terminalHtml = '<!doctype html><html><body style="margin:0;background:#070a0e;color:#d8e2ed;font:13px monospace;padding:16px">LOCAL TERMINAL · READ/CONTROL CONTRACT</body></html>';
+/**
+ * 终端页的**真代码**，从 src/worker.ts 的模板字符串里原样抠出来。
+ *
+ * 这一段（父页 origin 探针 + 写权限回报 + 外观监听器）是生产终端页里跑的那份；夹具
+ * 只补一层 WebSocket 胶水，好让真浏览器里真的走一遍「WS 握手判出只读/可写 → 页面上抛
+ * → 工作台面板据此改文案」。抄一份等价实现只能证明夹具自洽，证明不了生产链路。
+ */
+function terminalPageReporter(): string {
+  const source = readFileSync(join(root, 'src', 'worker.ts'), 'utf8');
+  const start = source.indexOf('var _wbParentOrigin=');
+  const anchor = source.indexOf("window.addEventListener('message'", start);
+  const end = source.indexOf('\n});', anchor);
+  assert.ok(start > -1 && anchor > start && end > anchor, 'worker.ts 里找不到终端页的 postMessage 管道');
+  return source.slice(start, end + '\n});'.length);
+}
+
+/**
+ * 夹具终端页。三件事都是为了让浏览器里的断言有落点：
+ *   ① 记录真实按键（`#typed`）——「盖层出现后键盘还能不能打进这块 iframe」只有真按键
+ *      量得出来；
+ *   ② 落下 hasToken / wsHasWrite 两个全局，与生产同名（面板同源读的就是它们）；
+ *   ③ 接一条 WS，收 worker 那条**带外写权限首帧**，用生产解码器（terminal-write-frame.ts
+ *      那一份，与 worker 内嵌的同源）剥出结论并上抛。
+ */
+function terminalPage(options: { sessionId: string; hasToken: boolean; label: string }): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head>
+<body tabindex="0" style="margin:0;background:#070a0e;color:#d8e2ed;font:13px monospace;padding:16px">
+<div id="label">${options.label}</div>
+<div>typed: <span id="typed"></span></div>
+<script>
+var hasToken=${options.hasToken};
+var wsHasWrite=null;
+var platformReadonly=false;
+var term={options:{}},fit={fit:function(){}};
+${terminalPageReporter()}
+// 带外写权限首帧的解码器：与 worker 内嵌的同一份源码（terminal-write-frame.ts），只认
+// 本连接第一帧、整帧精确匹配，之后一律当普通终端数据，绝不改判权限。
+var _wbDecodeWriteFrame=${decodeTerminalWriteFrameSource};
+var _wbFirstFrame=true;
+var _typed='';
+document.addEventListener('keydown',function(e){
+  if(e.key&&e.key.length===1){_typed+=e.key;document.getElementById('typed').textContent=_typed;}
+});
+document.body.focus();
+try{
+  var _ws=new WebSocket(location.origin.replace('http','ws')+'/terminal-socket?session=${options.sessionId}');
+  _ws.onmessage=function(e){
+    // 与 worker 的 onmessage 同构：首帧是带外写权限控制帧，用生产解码器剥出结论并上抛；
+    // 解不出来（或非首帧）就当普通终端数据。
+    if(_wbFirstFrame){
+      _wbFirstFrame=false;
+      var _ctl=_wbDecodeWriteFrame(e.data,true);
+      if(_ctl!==null){_wbSetWsWrite(_ctl);return;}
+    }
+  };
+}catch(_e){}
+</script>
+</body></html>`;
+}
 const previewHtml = '<!doctype html><html><body style="margin:0;background:#101722;color:#d8e2ed;font:14px system-ui;padding:18px"><h1>Local preview target</h1><p id="preview-ready">HTTP and WebSocket preview harness is ready.</p></body></html>';
 
 class MemoryAudit implements ControlAuditSink {
@@ -268,6 +331,16 @@ const previewGuard = createPreviewGuardPage({
   canInteract: req => actor(req) !== null,
 });
 const controlWss = new WebSocketServer({ noServer: true });
+/** 终端页那条 WS 的夹具端。生产里 worker 在握手完成时把「这条连接实际拿到什么权限」
+ *  发下来（OSC 1989 write）；这里发的是同一串，页面用生产代码解析。 */
+const terminalWss = new WebSocketServer({ noServer: true });
+/** 这条 WS 判给终端页什么权限。默认可写：#960 的那条路正是「HTTP 只读 / WS 可写」。 */
+let terminalSocketWrite = true;
+/** 打开后所有控制权写 POST 一律 503：用来把面板逼进 unknown 态。 */
+let controlWritesFail = false;
+/** 打开后控制权 GET 挂起不回：unknown 才停得住，好在真浏览器里量焦点。 */
+let controlReadsHang = false;
+const hungControlReads = new Set<ServerResponse>();
 
 async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -310,22 +383,30 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     return json(res, 200, { ok: true, url: link, expiresAt: minted.expiresAt });
   }
 
-  const controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
+  // 与生产同一份路由（dashboard/terminal-control-route.ts）。脚本这边只保留注入用的
+  // 故障开关，分发与查询参数解析一律不再另写一遍。
+  const controlMatch = matchTerminalControlRoute(url.pathname);
   if (controlMatch) {
     if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
-    const sessionId = decodeURIComponent(controlMatch[1]);
+    if (!controlMatch.ok) return json(res, 400, { ok: false, error: controlMatch.error });
+    const sessionId = controlMatch.sessionId;
     if (sessionId === 'browser-failure') return json(res, 503, { ok: false, error: 'daemon_offline' });
-    const action = controlMatch[2];
-    if (req.method === 'GET' && !action) return json(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
-    if (req.method === 'POST' && action === 'takeover') {
-      const result = terminalControl.takeover(requestIdentity, sessionId);
-      return json(res, result.ok ? 200 : 409, result.ok ? { ...result, owned: true } : { ok: false, error: result.error });
+    if (req.method === 'GET' && !controlMatch.action && controlReadsHang) {
+      hungControlReads.add(res);
+      return;
     }
-    if (req.method === 'POST' && action === 'release') {
-      const result = terminalControl.release(requestIdentity, sessionId);
-      return json(res, result.ok ? 200 : 403, result.ok ? { ...result, owned: false } : { ok: false, error: result.error });
+    if (controlWritesFail && req.method === 'POST') {
+      return json(res, 503, { ok: false, error: 'daemon_offline' });
     }
-    return json(res, 405, { ok: false, error: 'method_not_allowed' });
+    const answer = resolveTerminalControlAction({
+      method: req.method ?? 'GET',
+      action: controlMatch.action,
+      sessionId,
+      search: url.searchParams,
+      identity: requestIdentity,
+      control: terminalControl,
+    });
+    return json(res, answer.status, answer.body);
   }
 
   const interactionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
@@ -339,6 +420,17 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     if (req.method === 'POST' && action === 'activity') return json(res, 200, { ok: true, ...previewInteraction.activity(requestIdentity, sessionId) });
     if (req.method === 'POST' && action === 'lock') return json(res, 200, { ok: true, ...previewInteraction.lock(requestIdentity, sessionId) });
     return json(res, 405, { ok: false, error: 'method_not_allowed' });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/harness/control-mode') {
+    if (!requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
+    controlWritesFail = url.searchParams.get('writesFail') === '1';
+    controlReadsHang = url.searchParams.get('readsHang') === '1';
+    if (!controlReadsHang) {
+      for (const pending of hungControlReads) json(pending, 200, { ok: true, mode: 'readonly', owned: false });
+      hungControlReads.clear();
+    }
+    return json(res, 200, { ok: true, controlWritesFail, controlReadsHang });
   }
 
   if (req.method === 'POST' && url.pathname === '/harness/advance-preview') {
@@ -381,7 +473,13 @@ async function handleFront(req: IncomingMessage, res: ServerResponse): Promise<v
     );
     if (!grantedAuthSession && !requestIdentity) return json(res, 401, { ok: false, error: 'authentication_required' });
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(grantedAuthSession ? terminalHtml.replace('READ/CONTROL CONTRACT', 'READ-ONLY VIEW CAPABILITY') : terminalHtml);
+    // viewToken 通道的 HTTP 判定就是只读（hasToken=false）；这一页随后会从 WS 那边
+    // 拿到**真正**的结论，两者刻意不一致正是 #960 要验的那条路。
+    res.end(terminalPage({
+      sessionId,
+      hasToken: !grantedAuthSession,
+      label: grantedAuthSession ? 'READ-ONLY VIEW CAPABILITY' : 'READ/CONTROL CONTRACT',
+    }));
     return;
   }
 
@@ -398,6 +496,13 @@ const front = createServer((req, res) => {
 front.on('upgrade', (req, socket, head) => {
   if (previewProxy.handleUpgrade(req, socket as Duplex, head)) return;
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  if (url.pathname === '/terminal-socket') {
+    return terminalWss.handleUpgrade(req, socket, head, ws => {
+      // 与 worker 同一串：终端页用生产代码把它从终端流里剥出来。
+      // 带外首帧（与 worker 同一份编码）：页面只在本连接第一帧上认它。
+      ws.send(terminalWriteFrame(terminalSocketWrite));
+    });
+  }
   if (url.pathname !== '/control-socket') return socket.destroy();
   const requestIdentity = actor(req);
   const sessionId = url.searchParams.get('session') ?? '';
@@ -413,7 +518,7 @@ front.on('upgrade', (req, socket, head) => {
       return;
     }
     ws.send('controlled');
-    ws.once('close', () => terminalControl.disconnect(requestIdentity, sessionId, registered.leaseMarker));
+    ws.once('close', () => terminalControl.disconnect(requestIdentity, sessionId, registered.acquisition));
   });
 });
 const frontPort = await listen(front);
@@ -457,11 +562,18 @@ async function waitForText(page: Page, text: string): Promise<void> {
 
 /** 行操作浮层平时是 opacity:0 / pointer-events:none，悬停或聚焦才出现。不先 hover
  *  就点，点击会被铺满整行的聊天锚点（.wb-session-copy-link::after）吃掉。 */
-async function rowAction(page: Page, title: string | RegExp, action: 'terminal' | 'terminal-control'): Promise<void> {
+async function rowAction(page: Page, title: string | RegExp): Promise<void> {
   const row = page.getByRole('option', { name: title });
   await row.waitFor();
   await row.hover();
-  await row.locator(`.wb-session-row-action.is-${action}`).click();
+  await row.locator('.wb-session-row-action.is-terminal').click();
+}
+
+/** 只读打开 + 面板标题栏接管。产品决策后接管只有标题栏这一个入口，会话行内的
+ *  「接管」捷径已移除，所以「打开并接管」在浏览器里也是两步。 */
+async function openAndTakeOver(page: Page, title: string | RegExp): Promise<void> {
+  await rowAction(page, title);
+  await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
 }
 
 try {
@@ -532,14 +644,15 @@ try {
     await page.goto(`${base}/?scenario=success&sdk=toggle-success`);
     await page.locator('.agent-workbench-page').waitFor();
     // 工作区默认收起（.wb-desktop-layout.is-terminal-closed 把它整块隐藏，列表铺满），
-    // 只有行内「终端 / 接管」才会把它开出来——所以路由切换也从行操作走。
+    // 只有行内「终端」才会把它开出来——所以路由切换也从行操作走。
     assert.equal(await page.locator('.wb-desktop-layout.is-terminal-closed').count(), 1);
-    await rowAction(page, /Secondary session for route switching/, 'terminal');
+    await rowAction(page, /Secondary session for route switching/);
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
     await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
-    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal-control');
+    // 会话行只剩「聊天 / 终端」：行内接管按钮已按产品决策移除，接管走标题栏。
+    assert.equal(await page.locator('.wb-session-row-action.is-terminal-control').count(), 0);
+    await openAndTakeOver(page, /Integrated Workbench browser scenario/);
     await page.locator('.wb-workspace-title strong').filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
-    // 「接管」= 开面板并自动请求写权限，不需要再点一次面板里的按钮。
     await page.locator('.wb-mode-chip.is-controlled').waitFor();
     await waitForText(page, '已接管，可键盘输入。');
     // 聊天必须是 target=_blank rel=noopener 的真锚点：脚本化打开（window.open /
@@ -550,6 +663,22 @@ try {
     assert.equal(await chatAnchor.getAttribute('rel'), 'noopener');
     assert.match(await chatAnchor.getAttribute('href') ?? '', /^https:\/\/applink\.feishu\.cn\/client\/chat\/open\?/);
     assert.deepEqual(await page.evaluate(() => window.__workbenchHarness?.sdkCalls), []);
+    // 行内「终端」这两条**跨会话**与**降级**路径（#963 复审 P1-1、P1-2）：面板标题栏
+    // 那对按钮证明不了它们，回归时用户看到的正是「点另一行的终端，面板直接没了」。
+    // ① A 的终端正接管着 → 点 B 行「终端」必须打开 B 的只读终端，不是关面板。
+    await rowAction(page, /Secondary session for route switching/);
+    await page.locator('.wb-workspace-title strong').filter({ hasText: 'Secondary session for route switching' }).waitFor();
+    assert.equal(await page.locator('.wb-terminal-pane').count(), 1);
+    // ② 回到 A 重新接管（标题栏），接管态点行内「终端」= 降为只读且面板还在
+    //    （再点一次才关）。
+    await openAndTakeOver(page, /Integrated Workbench browser scenario/);
+    await page.locator('.wb-mode-chip.is-controlled').waitFor();
+    await rowAction(page, /Integrated Workbench browser scenario/);
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
+    assert.equal(await page.locator('.wb-terminal-pane').count(), 1);
+    // 接回写权限，下面那段既有断言从接管态开始。
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
+    await page.locator('.wb-mode-chip.is-controlled').waitFor();
     await page.locator('.wb-terminal-pane').getByRole('button', { name: '释放输入' }).click();
     await page.locator('.wb-mode-chip.is-readonly').waitFor();
     // 关掉面板，工作区收回，列表重新铺满。
@@ -559,14 +688,124 @@ try {
     await context.close();
   });
 
+  // #963 复审 5：控制权未知时，「盖一层」是挡不住键盘的——焦点已经落在 iframe 里时，
+  // 父文档的 absolute 盖层只吃指针事件。这条用真按键量：先证明键盘确实打得进这块
+  // iframe，再把面板逼进 unknown，然后量「iframe 还在不在、焦点落在哪」。
+  await scenario('control_unknown_unloads_writable_frame', async () => {
+    const context = await authenticatedContext();
+    const page = await context.newPage();
+    await page.goto(`${base}/?scenario=success`);
+    await rowAction(page, /Integrated Workbench browser scenario/);
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
+    await page.locator('.wb-mode-chip.is-controlled').waitFor();
+
+    // ① 基线：焦点进 iframe，真按键真的落进去了。没有这一步，后面的「打不进去」
+    //    可能只是因为这个环境本来就送不出按键。
+    // 同源，所以直接读子文档：`#typed` 空着的时候是零高度、locator 会判成不可见，
+    // 但「有没有收到按键」看的正是它从空变成有字这一刻。
+    const typedInFrame = () => page.waitForFunction(expected => {
+      const frame = document.querySelector('.wb-terminal-pane iframe.wb-pane-frame') as HTMLIFrameElement | null;
+      return frame?.contentDocument?.getElementById('typed')?.textContent === expected;
+    }, 'abc');
+    await page.waitForFunction(() => {
+      const frame = document.querySelector('.wb-terminal-pane iframe.wb-pane-frame') as HTMLIFrameElement | null;
+      return Boolean(frame?.contentDocument?.getElementById('typed'));
+    });
+    await page.locator('.wb-terminal-pane iframe.wb-pane-frame').focus();
+    await page.keyboard.type('abc');
+    await typedInFrame();
+    const focusedBefore = await page.evaluate(() => document.activeElement?.tagName ?? '');
+    assert.equal(focusedBefore, 'IFRAME', '基线：焦点必须真的在终端 iframe 上');
+    await page.screenshot({ path: join(shotDir, 'r2a-unknown-before-typed.png') });
+
+    // ② 写 POST 一律失败 + 复核 GET 挂起：面板停在 unknown。
+    await page.evaluate(async () => {
+      await fetch('/harness/control-mode?writesFail=1&readsHang=1', { method: 'POST' });
+    });
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '释放输入' }).click();
+    await page.locator('.wb-control-unknown').waitFor();
+
+    // ③ 判据一：那块可能可写的 iframe 已经不在 DOM 里了（键盘连落点都没有）。
+    assert.equal(await page.locator('.wb-terminal-pane iframe.wb-pane-frame').count(), 0);
+    // 判据二：焦点被遮罩接走，不再挂在任何 iframe 上。
+    const focusedAfter = await page.evaluate(() => ({
+      tag: document.activeElement?.tagName ?? '',
+      className: document.activeElement?.className ?? '',
+    }));
+    assert.equal(focusedAfter.tag, 'DIV', `未知态焦点仍在 ${focusedAfter.tag}`);
+    assert.match(focusedAfter.className, /wb-control-unknown/);
+    // 判据三：这一刻敲键盘，既没有终端 iframe 收，焦点也没被抢回去。
+    await page.keyboard.type('rm -rf /');
+    assert.equal(await page.locator('.wb-terminal-pane iframe.wb-pane-frame').count(), 0);
+    assert.equal(await page.frameLocator('.wb-terminal-pane iframe.wb-pane-frame').locator('#typed').count(), 0);
+    await page.screenshot({ path: join(shotDir, 'r2a-unknown-masked.png') });
+
+    // ④ 复核放行 → 收敛回权威读数，iframe 重新挂上（遮罩不是死胡同）。
+    await page.evaluate(async () => {
+      await fetch('/harness/control-mode', { method: 'POST' });
+    });
+    await page.locator('.wb-terminal-pane iframe.wb-pane-frame').waitFor();
+    assert.equal(await page.locator('.wb-control-unknown').count(), 0);
+    await page.screenshot({ path: join(shotDir, 'r2a-unknown-recovered.png') });
+    await context.close();
+  });
+
+  // #963 复审 3：触屏那条通道能不能写，判据是**已经建立的 WS**，不是页面那次 HTTP GET。
+  // 夹具刻意造出两者相反的一幕：viewToken 页面 HTTP 判只读（hasToken=false），WS 却
+  // 判可写（前置代理给平台所有者补 WRITE grant 的那条路）。面板必须跟 WS 走。
+  await scenario('touch_write_follows_established_socket', async () => {
+    const context = await browser.newContext({ ...devices['iPhone 13'] });
+    await context.addInitScript({ content: 'globalThis.__name = (target) => target;' });
+    await context.addCookies([{ name: 'dashboard', value: 'ok', url: base, httpOnly: true, sameSite: 'Lax' }]);
+    const page = await context.newPage();
+    // 父页这边记下收到的回报：证明子页真的 postMessage 上来了，而且带的是**具体
+    // origin**（不是星号广播），不是靠同源轮询蒙对的。
+    await context.addInitScript({
+      content: `window.__writeReports = [];
+window.addEventListener('message', function (event) {
+  if (event.data && event.data.type === 'botmux:wb-terminal-write') {
+    window.__writeReports.push({ write: event.data.write, origin: event.origin });
+  }
+});`,
+    });
+    await page.goto(`${base}/?scenario=success`);
+    await page.locator('.agent-workbench-page[data-responsive-step="mobile-stack"]').waitFor();
+    await page.getByRole('option', { name: /Integrated Workbench browser scenario/ }).click();
+    await page.locator('.wb-terminal-pane').waitFor();
+    const frameSrc = await page.locator('.wb-terminal-pane iframe.wb-pane-frame').getAttribute('src') ?? '';
+    assert.ok(frameSrc.includes('viewToken='), `触屏必须走 viewToken 通道: ${frameSrc}`);
+    // HTTP 那次判的是只读——单看它，UI 会写死「手机端为只读视图」。
+    assert.equal(
+      await page.frameLocator('.wb-terminal-pane iframe.wb-pane-frame')
+        .locator('#label').innerText(),
+      'READ-ONLY VIEW CAPABILITY',
+    );
+    // WS 判了可写 → 面板如实说可输入。
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-controlled').waitFor();
+    await waitForText(page, '手机端也可直接输入');
+    const reports = await page.evaluate(() => window.__writeReports ?? []);
+    assert.deepEqual(reports, [{ write: true, origin: new URL(base).origin }], JSON.stringify(reports));
+    await page.screenshot({ path: join(shotDir, 'r2a-touch-ws-write.png') });
+    await context.close();
+  });
+
   await scenario('workbench_failure', async () => {
     const context = await authenticatedContext();
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=failure`);
-    await rowAction(page, /Workbench failure boundary/, 'terminal-control');
-    // 控制权接口 503 daemon_offline → 面板报错并停在只读，不会假装接管成功。
+    await rowAction(page, /Workbench failure boundary/);
+    // 控制权接口 503 daemon_offline。这里**不能**落成「只读」：租约挂在
+    // （会话 × 登录）上，同一个登录先前留下的写租约仍可能让这块 iframe 真的能打字
+    // （#963 复审 2）。读不到就照实说未知，并把可能可写的画面撤下来。
     await waitForText(page, '所属 daemon 已离线');
-    await page.locator('.wb-terminal-pane .wb-mode-chip.is-readonly').waitFor();
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-unknown').waitFor();
+    await page.locator('.wb-control-unknown').waitFor();
+    assert.equal(await page.locator('.wb-terminal-pane iframe.wb-pane-frame').count(), 0);
+    await page.screenshot({ path: join(shotDir, 'r2a-first-load-unknown.png') });
+    // 标题栏接管照样只会报错，不会假装接管成功。
+    await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).click();
+    await waitForText(page, '所属 daemon 已离线');
+    await page.locator('.wb-terminal-pane .wb-mode-chip.is-unknown').waitFor();
     await context.close();
   });
 
@@ -574,7 +813,7 @@ try {
     const context = await localContext({ width: 1280, height: 800 });
     const page = await context.newPage();
     await page.goto(`${base}/?scenario=success&authenticated=false`);
-    await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+    await rowAction(page, /Integrated Workbench browser scenario/);
     // 未登录只给只读，接管按钮根本不渲染——不是渲染出来再报错。
     await waitForText(page, '只读查看。登录 Dashboard 后可接管。');
     assert.equal(await page.locator('.wb-terminal-pane').getByRole('button', { name: '接管输入' }).count(), 0);
@@ -680,7 +919,7 @@ try {
     });
     assert.ok(metrics.hoverNone, 'wide touch context must report (hover: none)');
     assert.ok(metrics.width >= 44 && metrics.height >= 44, `row action below 44px: ${JSON.stringify(metrics)}`);
-    // 触屏下行内「接管」整体不渲染：那条通道只读（P1-17）。
+    // 行内接管按钮已整体移除（产品决策），触屏这条通道更是只读（P1-17）。
     assert.equal(await page.locator('.wb-session-row-action.is-terminal-control').count(), 0);
     assert.ok(await page.locator('.wb-session-row-action.is-terminal').count() > 0);
     await page.screenshot({ path: join(shotDir, 'wide-touch-ipad.png') });
@@ -705,7 +944,7 @@ try {
         await page.screenshot({ path: join(shotDir, `rail-collapsed-${viewport.width}.png`) });
         await expand.click();
         await page.locator('.wb-session-list').waitFor();
-        await rowAction(page, /Integrated Workbench browser scenario/, 'terminal');
+        await rowAction(page, /Integrated Workbench browser scenario/);
         await page.locator('.wb-workspace-title strong')
           .filter({ hasText: 'Integrated Workbench browser scenario' }).waitFor();
       } else {
@@ -884,6 +1123,7 @@ try {
   await browser.close();
   await new Promise<void>(resolve => upstreamWss.close(() => resolve()));
   await new Promise<void>(resolve => controlWss.close(() => resolve()));
+  await new Promise<void>(resolve => terminalWss.close(() => resolve()));
   await closeServer(front);
   await closeServer(upstream);
 }

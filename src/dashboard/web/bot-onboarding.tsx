@@ -1,6 +1,9 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
+import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
+import { ModelPickerField } from './bot-defaults-page.js';
+import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
@@ -58,6 +61,8 @@ type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  /** 静态模型候选（与 bot-defaults.ts 的 CliOption 对齐）。 */
+  modelChoices?: readonly string[];
 };
 
 type CliOptionsState = {
@@ -195,7 +200,13 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
           }
         : { status: 'scan_required', ...(typeof body?.webSession?.reason === 'string' ? { reason: body.webSession.reason } : {}) };
       return {
-        options: body.options as CliOption[],
+        options: (body.options as any[]).map((o: any) => ({
+          ...o,
+          // 容错：缺失/非数组 → []，与 bot-defaults.ts 的 fetchCliOptions 对齐。
+          modelChoices: Array.isArray(o?.modelChoices)
+            ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
+            : [],
+        })) as CliOption[],
         ttadkModelDefault,
         ttadkModelSuggestions,
         suggestedAppName,
@@ -424,11 +435,26 @@ function OnboardingForm(props: {
   onClose(): void;
 }): React.JSX.Element {
   const selectedCli = props.cliState.options.find(option => option.id === props.form.cliId);
-  const acceptsModel = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel !== false;
   const modelDisabled = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel === false;
-  const modelPlaceholder = acceptsModel
-      ? t('botOnboarding.modelTtadkPlaceholder').replace('{model}', props.cliState.ttadkModelDefault)
-      : t('botOnboarding.modelPlaceholder');
+  // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
+  const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
+  const cliId = props.form.cliId;
+  useEffect(() => {
+    if (selectedCli?.gateway === 'ttadk') {
+      setDetectedModels(null);
+      return;
+    }
+    // stale 标志防卸载/竞态：cliId 快速切换时旧响应不得覆盖新 CLI 的候选。
+    let stale = false;
+    fetchDetectedModels(cliId).then(result => { if (!stale) setDetectedModels(result); });
+    return () => { stale = true; };
+    // 只按 cliId 重新探测；cliState 刷新的静态候选经 modelSuggestionsForOption 合入。
+  }, [cliId]);
+  const modelCandidates = mergeModelCandidates(
+    modelSuggestionsForOption(selectedCli, props.cliState),
+    detectedModels?.models ?? null,
+  );
+  const detectedLiveCount = detectedModels?.source === 'live' ? detectedModels.models.length : 0;
   const dirLabel = props.form.dirMode === 'card' ? t('botOnboarding.dirLabelCard') : t('botOnboarding.dirLabelFixed');
   const dirPlaceholder = props.form.dirMode === 'card'
     ? t('botOnboarding.dirPlaceholderCard')
@@ -546,24 +572,26 @@ function OnboardingForm(props: {
           onChange={event => props.onFormChange({ ...props.form, workingDir: event.currentTarget.value })}
         />
       </label>
-      {!modelDisabled ? <label className="onboarding-field">
-        <span>{t('botOnboarding.modelLabel')}</span>
-        <input
-          id="ob-model"
-          type="text"
-          list={acceptsModel ? 'ob-model-suggestions' : undefined}
-          placeholder={modelPlaceholder}
-          autoComplete="off"
-          spellCheck={false}
-          value={props.form.model}
-          onChange={event => props.onFormChange({ ...props.form, model: event.currentTarget.value })}
-        />
-        {acceptsModel ? (
-          <datalist id="ob-model-suggestions">
-            {props.cliState.ttadkModelSuggestions.map(model => <option value={model} key={model} />)}
-          </datalist>
-        ) : null}
-      </label> : null}
+      {!modelDisabled ? (
+        <div className="onboarding-field">
+          <span>{t('botOnboarding.modelLabel')}</span>
+          <ModelPickerField
+            key={props.form.cliId}
+            value={props.form.model}
+            onChange={model => props.onFormChange({ ...props.form, model })}
+            options={modelCandidates}
+            dataInput="ob-model"
+            ariaLabel={t('botOnboarding.modelLabel')}
+            defaultLabel={t('botDefaults.modelPickerDefault')}
+            customLabel={t('botDefaults.modelPickerCustom')}
+            menuClassName="onboarding-menu"
+            detectedCount={detectedLiveCount || undefined}
+            detectedLabel={detectedLiveCount > 0
+              ? t('botDefaults.modelPickerDetected', { count: detectedLiveCount })
+              : undefined}
+          />
+        </div>
+      ) : null}
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
@@ -730,9 +758,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     void startOnboarding('web');
   }, [startOnboarding]);
 
-  const retry = useCallback((registrationMode: 'web' | 'compat') => {
+  const retry = useCallback(async (registrationMode: 'web' | 'compat') => {
     if (registrationMode === 'compat') {
-      const accepted = window.confirm(t('botOnboarding.compatibilityConfirm'));
+      const accepted = await confirm({ title: '兼容性确认', message: t('botOnboarding.compatibilityConfirm'), danger: false });
       if (!accepted) return;
     }
     const requiresFreshLogin = registrationMode === 'web'

@@ -220,6 +220,19 @@ describe('built-in botmux-handoff skill', () => {
     expect(skill!.content).toContain('mentionable');
     expect(skill!.content).toContain('/introduce');
     expect(skill!.content).toContain('botmux send --mention');
+    expect(skill!.content).toContain('单 bot 接力留在当前话题');
+    expect(skill!.content).toContain('botmux dispatch --into');
+    expect(skill!.content).toContain('不要为单个接手者运行不带 `--into` 的 `botmux dispatch`');
+  });
+});
+
+describe('built-in botmux-orchestrate skill', () => {
+  it('keeps a single-specialist handoff in the current topic', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('单个专项交给一个 bot');
+    expect(skill!.content).toContain('botmux-handoff');
+    expect(skill!.content).toContain('留在当前话题');
   });
 });
 

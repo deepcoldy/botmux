@@ -3976,6 +3976,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
+    summaryMemory: cardPrefs.summaryMemory,
+    summaryMemoryPath: cardPrefs.summaryMemoryPath,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     p2pOpen: grantPrefs.p2pOpen,
@@ -4552,8 +4554,9 @@ ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
 });
 
 // POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。
-// state 存本 daemon 进程内存，回调必须经由上面的 /api/oauth-callback 回到
-// 同一进程完成，故链接生成与回调处理都放 IPC 侧。
+// pending state 由 generateAuthUrl 落盘（~/.botmux/data/oauth-pending/），回调既可
+// 经本进程 /api/oauth-callback、也可经 dashboard 的 /api/feed-groups/oauth-callback
+// 跨进程完成换 token（远程浏览器粘贴兜底正依赖这条跨进程路径）。
 ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {

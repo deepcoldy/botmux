@@ -1,7 +1,10 @@
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 
@@ -67,6 +70,31 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
       pushOpt(args, '--reasoning-effort', reasoningEffort);
       return args;
+    },
+
+    // 与 codex CLI 同一模型目录（app-server 后端就是 codex binary）：静态列表是
+    // `codex debug models` visibility=list 的快照，live 探测补充目录增量。
+    modelChoices: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'],
+    // Live 模型枚举：直接 spawn 被 wrap 的 codex binary 跑 `debug models`
+    // （resolvedBin 是 node runner 不是 codex，故这里用懒解析的 cachedCodexBin）。
+    // 8s 超时、16MB maxBuffer、fail-soft → null，picker 回退上面的静态快照。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const codexBin = (cachedCodexBin ??= resolveCommand(rawCodexBin));
+        const { stdout } = await execFileAsync(codexBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
     },
 
     buildResumeCommand() {

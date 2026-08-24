@@ -273,6 +273,10 @@ const evilTargetOwner = evilOwner.proof;
 // ── Dashboard 前门：真 guard shell + 真 preview proxy + 真 debug terminal ──────
 const debugTerminals = createDebugTerminalManager({
   getActiveToken: () => DASHBOARD_TOKEN,
+  // 生产里这条是「解析出 legacy-dashboard 管理身份」。本 harness 没有平台绑定、也不注入
+  // X-Botmux-Role，等价物就是 owner cookie 本身——这条链要证的是「预览 origin 隔离把
+  // 攻击链断死」，所以真 owner 那条正常路径必须照常通，不能被这里顺手一起堵上。
+  isLegacyManagementRequest: (req) => ownerCookiePresent(req),
   defaultWorkingDirs: () => [root],
 });
 

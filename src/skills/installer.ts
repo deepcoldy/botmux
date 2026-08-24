@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WORKFLOW_FEATURE_SKILLS, ASK_SKILL, ASK_SKILL_NAME, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from './definitions.js';
+import { effectiveBuiltinSkills } from './effective-builtins.js';
 
 // This module only manages botmux-owned bridge/ask skills. User-defined skills
 // live in src/core/skills/* and services/skill-registry-store.ts so their
@@ -200,7 +201,13 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
   const dir = expandHome(skillsDir);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
 
-  for (const skill of BUILTIN_SKILLS) {
+  // Apply user overrides: replaced bodies + user-disabled skills removed. When
+  // nothing is customized this equals BUILTIN_SKILLS, so the on-disk files are
+  // byte-identical to the pre-feature baseline.
+  const effective = effectiveBuiltinSkills([...BUILTIN_SKILLS]);
+  const effectiveNames = new Set(effective.map((s) => s.name));
+
+  for (const skill of effective) {
     const skillDir = join(dir, skill.name);
     const skillFile = join(skillDir, 'SKILL.md');
     try {
@@ -214,6 +221,21 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
       logger.info(`[skills] Installed ${skill.name} for ${cliId} → ${skillFile}`);
     } catch (err: any) {
       logger.warn(`[skills] Failed to install ${skill.name} for ${cliId}: ${err.message}`);
+    }
+  }
+
+  // Remove a built-in skill's dir when the user has DISABLED it (present in the
+  // shipped set but dropped from the effective set). Without this, a global-mode
+  // CLI would keep injecting a skill the user turned off (stale file on disk).
+  for (const shipped of BUILTIN_SKILLS) {
+    if (effectiveNames.has(shipped.name)) continue;
+    const disabledDir = join(dir, shipped.name);
+    if (!existsSync(disabledDir)) continue;
+    try {
+      rmSync(disabledDir, { recursive: true, force: true });
+      logger.info(`[skills] Removed user-disabled built-in skill ${shipped.name} for ${cliId}`);
+    } catch (err: any) {
+      logger.warn(`[skills] Failed to remove disabled skill ${shipped.name} for ${cliId}: ${err.message}`);
     }
   }
 

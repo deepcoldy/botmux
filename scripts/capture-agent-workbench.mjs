@@ -54,7 +54,7 @@ const pageHtml = '<!doctype html><html lang="en"><head><meta charset="utf-8"><me
 // 终端 iframe 里放的是一段合成的会话内容，只为让截图里的终端面板看起来像真的在
 // 干活。刻意不印任何测试通过数——验收结果的唯一出处是同目录的
 // agent-workbench-browser-results.json，截图里再抄一份数字只会各自过期。
-const terminalHtml = '<!doctype html><html><head><meta charset="utf-8"><style>html,body{height:100%;margin:0;background:#070a0e;color:#cad5df;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}body{padding:15px 17px;box-sizing:border-box}.dim{color:#5f7182}.cyan{color:#67c7f5}.green{color:#6fd29b}.amber{color:#e2b35c}.cursor{display:inline-block;width:7px;height:13px;background:#67c7f5;vertical-align:-2px}</style></head><body><div class="dim">botmux@workbench  ~/work/botmux  feat/agent-workbench</div><br><div><span class="cyan">❯</span> 把会话列表的行操作收敛成四个：聊天 / 定位 / 终端 / 接管</div><br><div class="dim">读取 agent-workbench-session-list.tsx</div><div class="dim">读取 agent-workbench-view.tsx</div><div><span class="green">●</span> 行操作浮层改为悬停显示，行高锁在 54px 与虚拟滚动对齐</div><div><span class="green">●</span> 组头改成可折叠按钮（▾ / ▸），折叠状态存本地</div><br><div><span class="amber">?</span> 「定位」只对话题会话可见，群聊/单聊要不要也给一个入口？</div><div><span class="cyan">❯</span> <span class="cursor"></span></div></body></html>';
+const terminalHtml = '<!doctype html><html><head><meta charset="utf-8"><style>html,body{height:100%;margin:0;background:#070a0e;color:#cad5df;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}body{padding:15px 17px;box-sizing:border-box}.dim{color:#5f7182}.cyan{color:#67c7f5}.green{color:#6fd29b}.amber{color:#e2b35c}.cursor{display:inline-block;width:7px;height:13px;background:#67c7f5;vertical-align:-2px}</style></head><body><div class="dim">botmux@workbench  ~/work/botmux  feat/agent-workbench</div><br><div><span class="cyan">❯</span> 把会话列表的行操作收敛成三个：聊天 / 定位 / 终端</div><br><div class="dim">读取 agent-workbench-session-list.tsx</div><div class="dim">读取 agent-workbench-view.tsx</div><div><span class="green">●</span> 行操作浮层改为悬停显示，行高锁在 54px 与虚拟滚动对齐</div><div><span class="green">●</span> 组头改成可折叠按钮（▾ / ▸），折叠状态存本地</div><br><div><span class="amber">?</span> 「定位」只对话题会话可见，群聊/单聊要不要也给一个入口？</div><div><span class="cyan">❯</span> <span class="cursor"></span></div></body></html>';
 
 const server = createServer((request, response) => {
   const path = new URL(request.url || '/', 'http://127.0.0.1').pathname;
@@ -100,13 +100,15 @@ try {
   // 否则点击会被铺满整行的聊天锚点（.wb-session-copy-link::after）吃掉。
   await selectedRow.hover();
   // 工作区默认是收起的（.wb-desktop-layout.is-terminal-closed 把它整块隐藏，
-  // 会话列表铺满）。终端面板由行内「接管」按钮打开，截图要拍的就是它打开之后的样子。
-  await selectedRow.locator('.wb-session-row-action.is-terminal-control').click();
+  // 会话列表铺满）。终端面板由行内「终端」按钮只读打开，再在面板标题栏点「接管输入」
+  // 拿写权限（行内已无接管捷径）——截图要拍的就是接管之后的样子。
+  await selectedRow.locator('.wb-session-row-action.is-terminal').click();
   await page.locator('.wb-terminal-pane').waitFor();
+  await page.locator('.wb-terminal-pane .wb-pane-actions button', { hasText: '接管输入' }).click();
   await page.locator('.wb-mode-chip.is-controlled').waitFor();
   await page.locator('.wb-pane-frame').waitFor();
   // 面板打开后列表收窄，指针已经不在原来那行上了。重新悬停，让截图里同时留下
-  // 行操作（聊天/定位/终端/接管）这条契约。
+  // 行操作（聊天/定位/终端）这条契约。
   await selectedRow.hover();
   await page.locator('.wb-session-row.is-selected .wb-session-row-actions').waitFor();
   await page.screenshot({ path: output, fullPage: false });

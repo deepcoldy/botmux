@@ -113,14 +113,26 @@ export function platformMachineBaseUrl(): string | null {
  * 每次调用都重读 `platform.json`(不缓存):`botmux bind|unbind` 热重载不重启 daemon
  * (见 worker.ts 亦每请求 uncached 读),缓存会在解绑+machineToken 吊销后仍放行 stale
  * 平台 authority = fail-open;每请求读天然 fail-closed(解绑→文件没了→空数组)。
+ *
+ * **两个子域不是一个用途**,所以按 surface 分开给:
+ *   • `terminal-upgrade`(终端 WebSocket 升级)= `m-` + `t-`。业务上就是这一条需要
+ *     `t-`:平台分享出去的终端页挂在 `t-` 子域下,它的 WS 握手 Origin 就是 `t-`
+ *     (#933/#960 修的正是这条)。
+ *   • `management`(有副作用的管理类 POST:接管/释放、预览解锁、locate)= 只给 `m-`。
+ *     Dashboard SPA 只在 `m-` 子域下渲染,CSRF 票据也只注入到那张壳页里;`t-` 上的
+ *     终端页既没有票据、也没有任何管理请求要发。把它一并算作「同源」只会让一条本
+ *     不需要的子域凭空具备发起写操作的资格——收窄不影响任何现有链路,却把面缩小。
  */
-export function platformBrowserAuthorities(): string[] {
+export type PlatformBrowserSurface = 'management' | 'terminal-upgrade';
+
+export function platformBrowserAuthorities(surface: PlatformBrowserSurface = 'management'): string[] {
   const b = readPlatformBinding();
   if (!b) return [];
   try {
     const host = new URL(b.platformUrl).host;
     if (!host) return [];
-    return [`m-${b.machineId}.${host}`, `t-${b.machineId}.${host}`];
+    const machine = `m-${b.machineId}.${host}`;
+    return surface === 'terminal-upgrade' ? [machine, `t-${b.machineId}.${host}`] : [machine];
   } catch {
     return [];
   }

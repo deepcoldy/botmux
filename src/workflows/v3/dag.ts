@@ -13,6 +13,10 @@
  */
 
 import { collectV3HostBindingRefs, V3HostBindingError } from './host-bindings.js';
+import {
+  normalizeArtifactOutputs,
+  type V3ArtifactOutputs,
+} from './artifact-contract-declarations.js';
 
 // ─── Schema ──────────────────────────────────────────────────────────────
 
@@ -82,6 +86,8 @@ export interface V3InputRef {
    *  at dispatch time is surfaced to the agent via `GoalInputs.omitted`
    *  (reason 'selectorMiss') — absence reads as a contract gap, not silence. */
   select?: { name?: string; path?: string };
+  /** schemaVersion 2 stable public-output key. */
+  output?: string;
 }
 
 /**
@@ -249,6 +255,8 @@ export interface V3Node {
   override?: V3CapabilityOverride;
   /** Upstream products to thread in as inputs (every `from` ⊆ `depends`). */
   inputs: V3InputRef[];
+  /** schemaVersion 2 public products addressable by downstream output keys. */
+  outputs?: V3ArtifactOutputs;
   /** Wall-clock budget in seconds; falls back to DEFAULT_NODE_TIMEOUT_SEC. */
   timeoutSec?: number;
   /** Optional human approval gate, evaluated *before* the node's work runs. */
@@ -347,6 +355,8 @@ export function loopInstanceId(loopId: string, iteration: number, bodyNodeId: st
 }
 
 export interface V3Dag {
+  /** Missing means legacy v1. Newly authored DAGs use schemaVersion 2. */
+  schemaVersion?: 1 | 2;
   /** Stable id for this run; used as the runDir name, so path-segment safe. */
   runId: string;
   nodes: V3Node[];
@@ -389,6 +399,10 @@ export function validateDag(raw: unknown): V3Dag {
 
   if (!isObject(raw)) {
     throw new DagValidationError(['root must be a JSON object']);
+  }
+  const schemaVersion = raw.schemaVersion === undefined ? 1 : raw.schemaVersion;
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    problems.push(`schemaVersion must be 1 or 2 (got ${JSON.stringify(raw.schemaVersion)})`);
   }
   if (typeof raw.runId !== 'string' || !SEGMENT_RE.test(raw.runId)) {
     problems.push(`runId must be a path-safe string matching ${SEGMENT_RE} (got ${JSON.stringify(raw.runId)})`);
@@ -433,10 +447,10 @@ export function validateDag(raw: unknown): V3Dag {
 
     const triggerRule = normTriggerRule(n.triggerRule, depends.length, `node "${id}"`, problems);
 
-    const inputs = normInputs(n.inputs, id, problems);
+    const inputs = normInputs(n.inputs, id, problems, schemaVersion === 2 ? 2 : 1);
 
     if (type === 'loop') {
-      const loopFields = normLoopFields(n, id, problems);
+      const loopFields = normLoopFields(n, id, problems, schemaVersion === 2 ? 2 : 1);
       if (loopFields) {
         nodes.push({
           id,
@@ -454,6 +468,7 @@ export function validateDag(raw: unknown): V3Dag {
     }
 
     if (type === 'host') {
+      if (n.outputs !== undefined) problems.push(`host node "${id}".outputs is not supported`);
       if (n.goal !== undefined) problems.push(`host node "${id}".goal is not supported`);
       if (n.bot !== undefined) problems.push(`host node "${id}".bot is not supported — host nodes do not spawn a CLI`);
       if (n.override !== undefined) problems.push(`host node "${id}".override is not supported`);
@@ -549,6 +564,12 @@ export function validateDag(raw: unknown): V3Dag {
     const override = normOverride(n.override, `node "${id}"`, problems);
 
     const revisitTo = normRevisitTo(n.revisitTo, id, problems);
+    if (schemaVersion !== 2 && n.outputs !== undefined) {
+      problems.push(`goal node "${id}".outputs requires schemaVersion 2`);
+    }
+    const outputs = schemaVersion === 2
+      ? normalizeArtifactOutputs(n.outputs, `goal node "${id}"`, problems)
+      : undefined;
 
     nodes.push({
       id,
@@ -559,6 +580,7 @@ export function validateDag(raw: unknown): V3Dag {
       triggerRule,
       override,
       inputs,
+      outputs,
       timeoutSec,
       humanGate,
       resultSchema,
@@ -576,6 +598,16 @@ export function validateDag(raw: unknown): V3Dag {
         problems.push(`node "${node.id}".inputs references unknown node "${inp.from}"`);
       } else if (!node.depends.some((d) => d.from === inp.from)) {
         problems.push(`node "${node.id}".inputs.from "${inp.from}" must also be in depends`);
+      } else if (inp.output !== undefined) {
+        const source = nodes.find((candidate) => candidate.id === inp.from);
+        const outputs = source?.type === 'loop'
+          ? source.body?.nodes.find((bodyNode) => bodyNode.id === source.output?.from)?.outputs
+          : source?.outputs;
+        if (!outputs || !Object.prototype.hasOwnProperty.call(outputs, inp.output)) {
+          problems.push(
+            `node "${node.id}".inputs output ${JSON.stringify(inp.output)} is not declared by source "${inp.from}"`,
+          );
+        }
       }
     }
     if (node.type === 'host') {
@@ -681,7 +713,11 @@ export function validateDag(raw: unknown): V3Dag {
 
   if (problems.length > 0) throw new DagValidationError(problems);
 
-  const dag: V3Dag = { runId: raw.runId as string, nodes };
+  const dag: V3Dag = {
+    ...(raw.schemaVersion !== undefined ? { schemaVersion: schemaVersion as 1 | 2 } : {}),
+    runId: raw.runId as string,
+    nodes,
+  };
   // Cycle detection: topologicalOrder throws on a cycle.  Run it here so
   // loadDag rejects a cyclic DAG up front rather than mid-run.
   topologicalOrder(dag);
@@ -1100,6 +1136,7 @@ function normLoopFields(
   n: Record<string, unknown>,
   id: string,
   problems: string[],
+  schemaVersion: 1 | 2,
 ): Pick<V3LoopNode, 'maxIterations' | 'body' | 'exit' | 'feedback' | 'output' | 'onExhausted' | 'sessionPolicy'> | undefined {
   const where = `loop node "${id}"`;
   const before = problems.length;
@@ -1178,10 +1215,16 @@ function normLoopFields(
     const bFromList = bdepends.map((d) => d.from);
     if (bFromList.includes(bid)) problems.push(`${where}.body node "${bid}" depends on itself`);
     if (new Set(bFromList).size !== bFromList.length) problems.push(`${where}.body node "${bid}".depends has duplicates`);
-    const binputs = normInputs(b.inputs, `${id}.body.${bid}`, problems);
+    const binputs = normInputs(b.inputs, `${id}.body.${bid}`, problems, schemaVersion);
     const btimeout = normTimeoutSec(b.timeoutSec, `${where}.body node "${bid}"`, problems);
     const bschema = normResultSchema(b.resultSchema, `${id}.body.${bid}`, problems);
     const boverride = normOverride(b.override, `${where}.body node "${bid}"`, problems);
+    if (schemaVersion !== 2 && b.outputs !== undefined) {
+      problems.push(`${where}.body node "${bid}".outputs requires schemaVersion 2`);
+    }
+    const boutputs = schemaVersion === 2
+      ? normalizeArtifactOutputs(b.outputs, `${where}.body node "${bid}"`, problems)
+      : undefined;
     bodyNodes.push({
       id: bid,
       type: 'goal',
@@ -1190,6 +1233,7 @@ function normLoopFields(
       depends: bdepends,
       override: boverride,
       inputs: binputs,
+      outputs: boutputs,
       timeoutSec: btimeout,
       humanGate: null,
       resultSchema: bschema,
@@ -1205,6 +1249,14 @@ function normLoopFields(
         problems.push(`${where}.body node "${bn.id}".inputs references unknown body node "${inp.from}"`);
       } else if (!bn.depends.some((d) => d.from === inp.from)) {
         problems.push(`${where}.body node "${bn.id}".inputs.from "${inp.from}" must also be in depends`);
+      } else if (inp.output !== undefined) {
+        const source = bodyNodes.find((candidate) => candidate.id === inp.from);
+        if (!source?.outputs || !Object.prototype.hasOwnProperty.call(source.outputs, inp.output)) {
+          problems.push(
+            `${where}.body node "${bn.id}".inputs output ${JSON.stringify(inp.output)} ` +
+            `is not declared by source "${inp.from}"`,
+          );
+        }
       }
     }
   }
@@ -1465,7 +1517,7 @@ function normResultSchema(v: unknown, id: string, problems: string[]): V3ResultS
   return schema;
 }
 
-function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
+function normInputs(v: unknown, id: string, problems: string[], schemaVersion: 1 | 2): V3InputRef[] {
   if (v === undefined) return [];
   if (!Array.isArray(v)) {
     problems.push(`node "${id}".inputs must be an array`);
@@ -1478,9 +1530,29 @@ function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
       problems.push(`node "${id}".inputs[${j}] must be { from: <nodeId>, select? }`);
       continue;
     }
-    const extra = Object.keys(inp).filter((k) => k !== 'from' && k !== 'select');
+    const extra = Object.keys(inp).filter((k) => k !== 'from' && k !== 'select' && k !== 'output');
     if (extra.length > 0) {
-      problems.push(`node "${id}".inputs[${j}] has unsupported key(s): ${extra.join(', ')} (allowed: from, select)`);
+      problems.push(`node "${id}".inputs[${j}] has unsupported key(s): ${extra.join(', ')} (allowed: from, select/output)`);
+      continue;
+    }
+    if (schemaVersion === 2) {
+      if (inp.select !== undefined) {
+        problems.push(`node "${id}".inputs[${j}].select is legacy-only; schemaVersion 2 must use output`);
+        continue;
+      }
+      if (inp.output === undefined) {
+        out.push({ from: inp.from });
+        continue;
+      }
+      if (typeof inp.output !== 'string' || !SEGMENT_RE.test(inp.output)) {
+        problems.push(`node "${id}".inputs[${j}].output must be a stable key matching ${SEGMENT_RE}`);
+        continue;
+      }
+      out.push({ from: inp.from, output: inp.output });
+      continue;
+    }
+    if (inp.output !== undefined) {
+      problems.push(`node "${id}".inputs[${j}].output requires schemaVersion 2`);
       continue;
     }
     if (inp.select === undefined) {

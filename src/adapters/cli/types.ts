@@ -29,6 +29,13 @@ export interface PtyHandle {
    *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
    *  current session id (which can rotate on resume / mid-session). */
   cliPid?: number;
+  /**
+   * An explicitly selected remote Codex App Server thread. When set, Codex
+   * history-submit verification accepts only this session id instead of
+   * checking rollout ownership through the local `codex --remote` client's
+   * PID—the rollout belongs to the external App Server, not the viewer.
+   */
+  expectedCodexSessionId?: string;
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;
@@ -350,6 +357,29 @@ export interface CliAdapter {
    *  contain old busy text; existing adapters remain opt-out by default. */
   readonly idleToBusyPattern?: RegExp;
 
+  /** Opt-in PRE-idle busy latch for static busy screens that emit no further
+   *  PTY bytes after the initial render (e.g. a capacity-queue notice drawn
+   *  alongside a readyPattern status bar). Unlike busyPattern — a viewport
+   *  probe that only runs on backends whose screen cache is authoritative for
+   *  mutation — this consumes raw PTY evidence inside IdleDetector, so it also
+   *  holds on backends where screen capture must not mutate state (ZMX):
+   *  while latched, screen-derived idle is suppressed until a PTY chunk with
+   *  explicit composer evidence (staticBusyClearPattern) redraws AFTER the
+   *  last queue marker. The latch is set from the rolling outputTail (queue
+   *  markers can be split across chunks); clear is decided by the LAST
+   *  static/clear evidence position within the current chunk. reset() rebases
+   *  it. External structured completion (fireIdle) bypasses the latch — it is
+   *  authoritative independently of the screen observer. */
+  readonly staticBusyPattern?: RegExp;
+
+  /** Opt-in CLEAR pattern for the pre-idle static-busy latch. Matches the
+   *  real composer prompt (e.g. line-start ›/❯) so the latch can clear when
+   *  the queue screen redraws into the composer. Must NOT match the status
+   *  bar (e.g. `\d+% left`) — the queue screen itself carries a status bar,
+   *  so the broad readyPattern can never clear the latch. Only tested against
+   *  the CURRENT chunk (fresh composer evidence), not the rolling tail. */
+  readonly staticBusyClearPattern?: RegExp;
+
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
    *  until this pattern appears in the PTY output.  Checked every cycle (reset
@@ -464,6 +494,20 @@ export interface CliAdapter {
    *  presented as-is; the setup prompt always appends an "Other / custom"
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
+
+  /** Optional live model discovery: enumerate the models this CLI can actually
+   *  use right now (e.g. `traex debug models` prints its full catalogue as
+   *  JSON). The dashboard model picker invokes it on demand for the SELECTED
+   *  CLI only — never in a scan over all adapters — and merges the result with
+   *  `modelChoices`. Contract:
+   *  - MUST be fail-soft: return null on any error, timeout, or unparseable
+   *    output, never throw (the caller falls back to `modelChoices`);
+   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
+   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
+   *    JSON can be hundreds of KB;
+   *  - absent = the CLI cannot enumerate its models; the picker shows
+   *    `modelChoices` only. */
+  readonly detectModels?: () => Promise<readonly string[] | null>;
 
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,

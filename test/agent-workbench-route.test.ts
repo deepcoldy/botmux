@@ -51,8 +51,14 @@ describe('Agent Workbench route and surface integration', () => {
 
   it('projects explicit ownership from terminal mutations and keeps H5 context private', () => {
     const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboard).toContain("result.ok ? { ...result, owned: true }");
-    expect(dashboard).toContain("result.ok ? { ...result, owned: false }");
+    // 控制权分发已经收进 dashboard/terminal-control-route.ts（生产与验收脚本共用的
+    // 那一份，行为断言在 test/terminal-control-route.test.ts）。这里只钉「接的是同
+    // 一根线」——上一轮正是因为脚本各写一份，`?expect=` 条件释放只在脚本里生效。
+    expect(dashboard).toContain('resolveTerminalControlAction({');
+    expect(dashboard).toContain('matchTerminalControlRoute(url.pathname)');
+    const route = readFileSync(join(process.cwd(), 'src/dashboard/terminal-control-route.ts'), 'utf8');
+    expect(route).toContain('{ ...result, owned: true }');
+    expect(route).toContain('{ ...result, owned: false }');
     expect(dashboard).toContain("url.pathname === '/api/workbench/h5-context'");
   });
 
@@ -61,7 +67,9 @@ describe('Agent Workbench route and surface integration', () => {
     // P1-7 之后门禁选择与身份判定共用同一处结论，dashboard.ts 只负责接线；
     // 语义断言在下面，用共享函数直接跑，而不是比对源码字符串。
     expect(dashboard).toContain('resolveDashboardRequestGate({');
-    expect(dashboard).toContain("requestIdentity.terminalCapability === 'readonly'");
+    // 只读身份的写入口门禁住在共享路由里（生产与验收脚本同一份）。
+    const controlRoute = readFileSync(join(process.cwd(), 'src/dashboard/terminal-control-route.ts'), 'utf8');
+    expect(controlRoute).toContain("identity.terminalCapability === 'readonly'");
     // 预览写操作的角色门禁改用共享判据（与 canInteract 投影、guard 壳的解锁按钮
     // 同一个函数），语义矩阵在 test/preview-interaction.test.ts 里逐身份跑。
     expect(dashboard).toContain('!previewInteractionWriteAllowed(requestIdentity)');
@@ -117,9 +125,13 @@ describe('Agent Workbench route and surface integration', () => {
 
     const view = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8');
     expect(view).toContain('props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined');
-    // P1-17：能力位仍是第一道闸，触屏只读是叠在它上面的第二道（行为断言见
-    // agent-workbench-components.test.ts「触屏不给行内接管」）。
-    expect(view).toContain('canControlTerminal={props.capabilities.canControl && !touch}');
+    // 行内的接管捷径已按产品决策移除（会话行只剩 聊天 / 终端），所以这里不再有
+    // `canControlTerminal` 这条投影——接管入口只剩终端面板标题栏那一个，能力位在
+    // 面板里把关（下面 panes 的 `props.capabilities.canControl` 就是那道闸；行为
+    // 断言见 agent-workbench-components.test.ts「行内没有『接管』按钮」与
+    // agent-workbench-terminal-control.test.ts「会话行只保留『聊天 / 终端』」）。
+    expect(view).not.toContain('canControlTerminal');
+    expect(view).toContain('onOpenTerminal={openSessionTerminal}');
 
     const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
     expect(panes).toContain('props.capabilities.canControl');

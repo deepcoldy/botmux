@@ -9,6 +9,7 @@ import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
+import { toast } from './toast.js';
 
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -390,14 +391,14 @@ export async function openWriteLink(s: any, btn?: HTMLButtonElement): Promise<vo
     const body = await r.json().catch(() => ({}));
     if (!r.ok || body?.ok === false || !body?.url) {
       tab?.close();
-      if (r.status !== 401) alert(`${t('sessions.writeLinkFail')}: ${body?.error ?? r.status}`);
+      if (r.status !== 401) toast(`${t('sessions.writeLinkFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       return;
     }
     if (tab) tab.location.href = body.url;
     else window.open(body.url, '_blank', 'noopener');
   } catch (e) {
     tab?.close();
-    alert(`${t('sessions.writeLinkFail')}: ${e}`);
+    toast(`${t('sessions.writeLinkFail')}: ${e}`, { kind: 'error' });
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -413,7 +414,7 @@ export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise
     const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/spawn-command`);
     const body = await r.json().catch(() => ({}));
     if (!r.ok || body?.ok === false || !body?.command) {
-      if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
+      if (r.status !== 401) toast(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       return;
     }
     if (await copyText(body.command, t('sessions.copyCommand'))) {
@@ -424,7 +425,7 @@ export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise
       }
     }
   } catch (e) {
-    alert(`${t('sessions.copyCommandFail')}: ${e}`);
+    toast(`${t('sessions.copyCommandFail')}: ${e}`, { kind: 'error' });
   } finally {
     if (btn) btn.disabled = false;
   }

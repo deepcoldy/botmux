@@ -45,21 +45,33 @@ describe('P1 shouldDestroyPaneBeforeRestart (pure decision)', () => {
 
   it('destroys the pane for an ordinary owned session', async () => {
     const { shouldDestroyPaneBeforeRestart } = await import('../src/core/worker-pool.js');
-    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: false } as any, adoptedFrom: undefined }))
+    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: false } as any, adoptedFrom: undefined, session: {} as any }))
       .toBe(true);
-    expect(shouldDestroyPaneBeforeRestart({ initConfig: undefined, adoptedFrom: undefined }))
+    expect(shouldDestroyPaneBeforeRestart({ initConfig: undefined, adoptedFrom: undefined, session: {} as any }))
       .toBe(true);
   });
 
   it('NEVER destroys an adopted user pane (bridge invariant)', async () => {
     const { shouldDestroyPaneBeforeRestart } = await import('../src/core/worker-pool.js');
     // adoptMode frozen on the live init config
-    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: true } as any, adoptedFrom: undefined }))
+    expect(shouldDestroyPaneBeforeRestart({ initConfig: { adoptMode: true } as any, adoptedFrom: undefined, session: {} as any }))
       .toBe(false);
     // adoptedFrom stamped on the daemon session (restored adopt session)
     expect(shouldDestroyPaneBeforeRestart({
       initConfig: undefined,
       adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'claude-code', cwd: '/tmp' } as any,
+      session: {} as any,
+    })).toBe(false);
+  });
+
+  it('NEVER destroys the source of an existing App Server shared adopt', async () => {
+    const { shouldDestroyPaneBeforeRestart } = await import('../src/core/worker-pool.js');
+    expect(shouldDestroyPaneBeforeRestart({
+      initConfig: undefined,
+      adoptedFrom: undefined,
+      session: {
+        existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+      } as any,
     })).toBe(false);
   });
 });

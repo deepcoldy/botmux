@@ -21,7 +21,7 @@ function tmp(prefix: string): string {
 
 const jsonl = (...lines: unknown[]): string => lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
 
-describe('discoverClaudeFamilySessions', () => {
+describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
   let dataDir: string;
   beforeEach(() => { dataDir = tmp('bmx-claude-'); });
 
@@ -46,11 +46,108 @@ describe('discoverClaudeFamilySessions', () => {
     });
   });
 
+  it('prefers a customTitle that appears after the first user prompt', async () => {
+    writeSession('-root-proj', 'rename-after-prompt', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'fix the parser bug' } },
+      { type: 'assistant', message: { role: 'assistant', content: 'ok' } },
+      { type: 'custom-title', customTitle: '  Parser reliability  ' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Parser reliability');
+  });
+
+  it('uses the latest valid customTitle across multiple renames', async () => {
+    writeSession('-root-proj', 'multiple-renames', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'initial prompt' } },
+      { type: 'custom-title', customTitle: 'First name' },
+      { type: 'custom-title', customTitle: 'Latest name' },
+      { type: 'custom-title', customTitle: '   ' },
+      { type: 'custom-title', customTitle: null },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Latest name');
+  });
+
+  // Regression: Claude-family / Genius append `custom-title` records after
+  // the transcript's initial metadata. The bounded head scan must not hide a
+  // valid rename that lands beyond its 5,000-line safety window.
+  it('finds a customTitle appended after line 5000', async () => {
+    const lines: unknown[] = [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'initial prompt' } },
+    ];
+    for (let i = 0; i < 5_001; i++) {
+      lines.push({ type: 'assistant', message: { role: 'assistant', content: `filler ${i}` } });
+    }
+    lines.push({ type: 'custom-title', customTitle: 'Late parser title' });
+    writeSession('-root-proj', 'rename-after-head-cap', lines);
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Late parser title');
+  });
+
+  it('does not skip a customTitle that starts exactly at the tail boundary', async () => {
+    const tailBytes = 4 * 1024 * 1024;
+    const assistantLine = (content: string): string => JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content },
+    }) + '\n';
+    const prefix = JSON.stringify({
+      type: 'user',
+      cwd: '/root/boundary',
+      message: { role: 'user', content: 'initial prompt' },
+    }) + '\n';
+    const customTitleLine = JSON.stringify({
+      type: 'custom-title',
+      customTitle: 'Boundary title',
+    }) + '\n';
+    const fillerBytes = tailBytes - Buffer.byteLength(customTitleLine);
+    const emptyAssistantBytes = Buffer.byteLength(assistantLine(''));
+    expect(fillerBytes).toBeGreaterThanOrEqual(emptyAssistantBytes);
+    const fillerLine = assistantLine('x'.repeat(fillerBytes - emptyAssistantBytes));
+    expect(Buffer.byteLength(customTitleLine + fillerLine)).toBe(tailBytes);
+
+    const dir = join(dataDir, 'projects', '-root-boundary');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'tail-boundary.jsonl'), prefix + customTitleLine + fillerLine);
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Boundary title');
+  });
+
+  it('skips a genuinely truncated tail line before reading the next title', async () => {
+    const dir = join(dataDir, 'projects', '-root-truncated');
+    mkdirSync(dir, { recursive: true });
+    const oversizedAssistant = JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: 'x'.repeat(4 * 1024 * 1024) },
+    });
+    writeFileSync(join(dir, 'truncated-tail.jsonl'), [
+      JSON.stringify({ type: 'user', cwd: '/root/truncated', message: { role: 'user', content: 'prompt' } }),
+      oversizedAssistant,
+      JSON.stringify({ type: 'custom-title', customTitle: 'After truncated line' }),
+      '',
+    ].join('\n'));
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('After truncated line');
+  });
+
+  it('falls back to the first real user prompt when customTitle is absent or invalid', async () => {
+    writeSession('-root-proj', 'rename-fallback', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'the fallback prompt' } },
+      { type: 'custom-title', customTitle: '' },
+      { type: 'custom-title', customTitle: 123 },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('the fallback prompt');
+  });
+
   it('skips sidechain entries and slash-command meta lines when picking a title', async () => {
     writeSession('-root-proj', 'bbbb2222-0000-0000-0000-000000000002', [
       { type: 'user', cwd: '/root/proj', isSidechain: true, message: { role: 'user', content: 'subagent noise' } },
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: '<command-name>/clear</command-name>' } },
       { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'the real first question' } },
+      { type: 'custom-title', isSidechain: true, customTitle: 'subagent title noise' },
     ]);
     const out = await discoverClaudeFamilySessions(dataDir, 10);
     expect(out[0]?.title).toBe('the real first question');
@@ -84,7 +181,7 @@ describe('discoverClaudeFamilySessions', () => {
     expect(out.map((s) => s.cliSessionId).sort()).toEqual(['ext-discuss-1', 'ext-discuss-2']);
   });
 
-  // Regression (whiteboard /adopt leak): Claude-family CLIs with
+  // Regression (whiteboard /adopt leak): Claude-family / Genius CLIs with
   // injectsSessionContext=true get routing/identity/session_id via system
   // prompt, so when no team/group role is configured the botmux prompt STARTS
   // with the <whiteboard> block directly. No ^-anchored pattern matched that
@@ -104,7 +201,7 @@ describe('discoverClaudeFamilySessions', () => {
 
   // The ^<whiteboard>-opening pattern matches ANY board id (id="[^"]+"), not
   // just the default `wb_` prefix — a user-created board (`create --id
-  // <custom>`) bound to a Claude-family + role-less session also opens with
+  // <custom>`) bound to a Claude-family / Genius + role-less session also opens with
   // <whiteboard id="<custom>"> and must be dropped from /adopt.
   it('drops botmux-origin Claude sessions opening with a custom-id <whiteboard>', async () => {
     writeSession('-root-wb', 'wb-custom-1', [

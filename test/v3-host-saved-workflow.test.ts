@@ -53,6 +53,7 @@ function hostNode(
 
 function sendDag(input: Record<string, unknown> = {}): V3DagTemplate {
   return {
+    schemaVersion: 2,
     nodes: [hostNode('send', 'feishu-send', {
       larkAppId: { $ref: 'context.larkAppId' },
       chatId: { $ref: 'context.chatId' },

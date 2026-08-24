@@ -251,10 +251,13 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       const historyPath = grokPromptHistoryPath(cwd);
       const baseByte = grokFileSize(historyPath);
 
-      // Paste text once; retries only re-send Enter (codex/coco parity).
-      // Re-pasting the full body on retry double-submits when the first Enter
-      // actually landed but prompt_history was slow, or doubles composer text
-      // when Enter was dropped but the paste stuck.
+      // Paste text once, then a single Enter. Do not retry Enter: while a
+      // turn is running, an empty composer plus a queued follow-up makes
+      // Grok treat the next Enter as send-now (cancel-and-send). Slow
+      // prompt_history is not proof the first Enter dropped.
+      // Re-pasting the full body would double-submit when the first Enter
+      // landed but prompt_history was slow, or double composer text when
+      // Enter was dropped but the paste stuck.
       // TmuxPipeBackend (adopt) returns false on failed writes instead of
       // throwing — treat false as definite failure.
       const trySendEnter = (): boolean => {
@@ -294,20 +297,17 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
         return matchGrokPromptAppend(historyPath, base, content, { preferSessionId });
       };
 
+      // Keep polling for a late history append. A dropped first Enter is
+      // recovered by the worker's deferred recheck, not by a second Enter.
       const deadline = Date.now() + scaleMs(4_000);
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const waitUntil = Math.min(deadline, Date.now() + scaleMs(800));
-        while (Date.now() < waitUntil) {
-          const hit = probe();
-          if (hit.found) {
-            return hit.cliSessionId
-              ? { submitted: true, cliSessionId: hit.cliSessionId }
-              : { submitted: true };
-          }
-          await delay(scaleMs(100));
+      while (Date.now() < deadline) {
+        const hit = probe();
+        if (hit.found) {
+          return hit.cliSessionId
+            ? { submitted: true, cliSessionId: hit.cliSessionId }
+            : { submitted: true };
         }
-        if (Date.now() >= deadline) break;
-        if (!trySendEnter()) return { submitted: false };
+        await delay(scaleMs(100));
       }
 
       const late = probe();

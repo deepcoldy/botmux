@@ -46,6 +46,7 @@ src/desktop/assets/*.png
 # 静默忽略，`git add` 只报一行提示，很容易漏提交。
 /platform/
 /mcp-gateway/
+.gdpa
 
 # OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
 .omo/

@@ -1,6 +1,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { SectionHeader } from './dashboard-components.js';
+import { confirm } from './confirm-modal.js';
 import { useT } from './react-hooks.js';
 import { ui } from './ui.js';
 import { cancelV3Run, fetchV3RunDetail, fetchV3Runs } from './v3-api.js';
@@ -205,7 +206,7 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
 
   const cancelRun = useCallback(async () => {
     if (!view || terminal || cancelling) return;
-    if (!window.confirm(tr('workflow.v3.cancelConfirm', { runId: props.runId }))) return;
+    if (!await confirm({ title: '取消运行', message: tr('workflow.v3.cancelConfirm', { runId: props.runId }), danger: true })) return;
     setCancelBusy(true);
     setCancelNotice(null);
     try {

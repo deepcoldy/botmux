@@ -430,7 +430,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -5599,6 +5599,7 @@ workflowDaemonMutationRoute('retry', async (reply, params, body, identity) => {
         outcome.reason === 'missing' ? 'unknown_run'
         : outcome.reason === 'loop-node' ? 'loop_node_use_grant'
         : outcome.reason === 'host-effect-uncertain' ? 'host_effect_reconcile_required'
+        : outcome.reason === 'revise-workflow-required' ? 'workflow_revision_required'
         : 'not_blocked',
     });
   }
@@ -18648,18 +18649,28 @@ async function handleBotAdded(
 
 export const __testOnly_handleBotAdded = handleBotAdded;
 
-/** Reverse-lookup a foreign bot's display name for a sender open_id observed on
- *  this app's WS events. Priority:
+/** Reverse-lookup a foreign bot's display name for a sender observed on this
+ *  app's WS events. Priority:
+ *    0) union_id → current sibling name — rename-proof. The sender's tenant-
+ *       stable union_id (stamped on the event) maps to the one locally-configured
+ *       sibling that learned it, whose bots-info.json botName is rewritten by its
+ *       OWN daemon on every rename. This is the only source that reflects a rename
+ *       when the renamed bot merely SENDS to us (no @ of it flows through us, so
+ *       the by-name cross-ref below never refreshes on that event).
  *    1) bot-openids-${larkAppId}.json — per-app cross-ref populated by
  *       updateBotOpenIdCrossRef when @mentions go through us. Open_id is
  *       per-app scoped, so this is the authoritative map for this larkAppId.
+ *       (The writer now evicts pre-rename aliases, so a stale name here self-heals
+ *       the next time that bot is @-mentioned by its new name.)
  *    2) bots-info.json — fallback for bots not yet in our cross-ref but
  *       registered as botmux peers (matches by their self-reported open_id;
  *       only works when the peer's app id space coincides with ours).
- *  Returns "Bot" if neither lookup hits — keeps the prefix readable rather
- *  than blocking the message.
+ *  Returns "Bot" if nothing hits — keeps the prefix readable rather than
+ *  blocking the message.
  */
-function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
+function lookupForeignBotName(senderOpenId: string, larkAppId: string, senderUnionId?: string): string {
+  const currentName = resolveSiblingBotNameByUnionId(config.session.dataDir, larkAppId, senderUnionId);
+  if (currentName) return currentName;
   for (const [name, openId] of Object.entries(readPeerCrossRef(config.session.dataDir, larkAppId))) {
     if (openId === senderOpenId) return name;
   }
@@ -18774,7 +18785,8 @@ async function handleThreadReplyAdmitted(
     senderOpenIdForPrefix !== selfBotOpenId &&
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
-  const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId) : undefined;
+  const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
+  const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';

@@ -10,6 +10,8 @@ export type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
+  modelChoices?: readonly string[];
 };
 
 export type CliOptionsState = {
@@ -174,7 +176,51 @@ export function selectedCliOption(options: CliOption[], key: string): CliOption 
 
 export function modelSuggestionsForOption(opt: CliOption | undefined, cliState: CliOptionsState): string[] {
   if (opt?.gateway === 'ttadk' && opt.acceptsModel !== false) return cliState.ttadkModelSuggestions;
-  return [];
+  return [...(opt?.modelChoices ?? [])];
+}
+
+/**
+ * 合并模型候选：detected（后端已合并静态+live 去重）优先；detected 缺失时回退 static。
+ * 两份列表再做一次去重保序，防御后端合并遗漏。纯函数，供单测。
+ */
+export function mergeModelCandidates(
+  staticChoices: readonly string[],
+  detected: readonly string[] | null | undefined,
+): string[] {
+  const primary = detected ?? staticChoices;
+  const extra = detected ? staticChoices : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of primary) {
+    if (typeof item !== 'string' || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  for (const item of extra) {
+    if (typeof item !== 'string' || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * 按需探测某个 CLI 当前可用的模型列表（静态精选 + live 探测合并去重）。
+ * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
+ */
+export async function fetchDetectedModels(
+  key: string,
+): Promise<{ models: string[]; source: 'live' | 'static' } | null> {
+  try {
+    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}`);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body || !Array.isArray(body.models)) return null;
+    const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
+    const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
+    return { models, source };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -250,9 +296,15 @@ export async function fetchCliOptions(): Promise<CliOptionsState> {
     const r = await fetch('/api/cli-options');
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !Array.isArray(body?.options)) return fallbackCliOptionsState;
-    const options = body.options.filter((o: any): o is CliOption =>
-      o && typeof o.id === 'string' && typeof o.label === 'string',
-    );
+    const options: CliOption[] = body.options
+      .filter((o: any) => o && typeof o.id === 'string' && typeof o.label === 'string')
+      .map((o: any) => ({
+        ...o,
+        // 容错：缺失/非数组 → []，候选合并走 mergeModelCandidates。
+        modelChoices: Array.isArray(o.modelChoices)
+          ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
+          : [],
+      }));
     const ttadkModelDefault = typeof body.ttadkModelDefault === 'string' && body.ttadkModelDefault.trim()
       ? body.ttadkModelDefault.trim()
       : fallbackCliOptionsState.ttadkModelDefault;

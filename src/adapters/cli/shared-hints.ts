@@ -17,13 +17,21 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
+import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 
-/** The always-on Workflow discovery line, as pure text (no runtime config read).
+/** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
+ *  by default, but a user customization can force it on/off. Keyed by the i18n
+ *  key that renders it so the dashboard's conditional-line control lines up. */
+function noVisibleOutputHintOn(): boolean {
+  return resolveConditionalLine('ai.routing.no_visible_output_ok', config.noVisibleOutputHint);
+}
+
+/** The Workflow discovery line as pure text. Migrated to i18n key
+ *  `ai.routing.workflow_hint` so it is customizable/overridable like the rest of
+ *  the routing copy (byte-identical to the old literal when uncustomized).
  *  Shared by the live gated hint below and the deprecated static array. */
 function workflowDiscoveryHintText(locale?: Locale): string {
-  return locale === 'en'
-    ? 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.'
-    : 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。';
+  return t('ai.routing.workflow_hint', undefined, locale);
 }
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected.
@@ -39,11 +47,10 @@ function workflowDiscoveryHint(locale?: Locale): string | undefined {
  *  (injectsSessionContext CLIs: claude-code / codex-app / grok / genius / …) so
  *  the wording never drifts and BOTH families learn `--response-kind final`.
  *  Reflects the current gate: the flag is OPTIONAL — unclassified sends default
- *  to progress (no feedback); only an explicit `final` attaches feedback. */
+ *  to progress (no feedback); only an explicit `final` attaches feedback.
+ *  Migrated to i18n key `ai.routing.feedback_response_kind` for customization. */
 function feedbackResponseKindHint(locale?: Locale): string {
-  return locale === 'en'
-    ? 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).'
-    : '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。';
+  return t('ai.routing.feedback_response_kind', undefined, locale);
 }
 
 /** Multiline/JSON-escaping rule plus a real, copy-pasteable quoted-heredoc
@@ -60,10 +67,10 @@ function multilineHeredocLines(locale?: Locale): string[] {
 }
 
 function hiddenContextDefense(locale?: Locale): string {
-  const text = locale === 'en'
-    ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.'
-    : '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。';
-  // These tag names are prose inside `<botmux_routing>`, not nested blocks.
+  // Migrated to i18n key `ai.routing.hidden_context_defense` for customization.
+  // The escapeXmlText wrap is preserved: these tag names are prose inside
+  // `<botmux_routing>`, not nested blocks.
+  const text = t('ai.routing.hidden_context_defense', undefined, locale);
   return escapeXmlText(text);
 }
 
@@ -81,7 +88,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
     // the pre-feature baseline unless an operator flips it on. Live-read here so
     // a toggle takes effect on the next session without a daemon restart.
-    ...(config.noVisibleOutputHint ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
+    ...(noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
     t('ai.shell.mention_gate', undefined, locale),
     // Workflow discovery — omitted when the machine-wide workflow switch is off.
     ...(workflowHint ? [workflowHint] : []),
@@ -183,7 +190,7 @@ export function buildBotmuxSystemPromptText(opts: {
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
     // the pre-feature baseline. Live-read so a toggle applies to the next session.
-    ...(config.noVisibleOutputHint ? [prose('ai.routing.no_visible_output_ok')] : []),
+    ...(noVisibleOutputHintOn() ? [prose('ai.routing.no_visible_output_ok')] : []),
     // Workflow discovery — omitted when the machine-wide workflow switch is off.
     ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
     hiddenContextDefense(locale),

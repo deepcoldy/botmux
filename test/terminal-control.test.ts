@@ -95,12 +95,12 @@ describe('terminal server-side takeover lifecycle', () => {
     expect(manager.state(owner, 's1')).toEqual({ mode: 'readonly', owned: false });
 
     expect(manager.takeover(owner, 's1')).toEqual({
-      ok: true, mode: 'controlled', expiresAt: 11_000, reused: false,
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: false, acquisition: expect.any(String),
     });
     const firstGrant = manager.grantFor(owner, 's1');
     now = 2_000;
     expect(manager.takeover(owner, 's1')).toEqual({
-      ok: true, mode: 'controlled', expiresAt: 11_000, reused: true,
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: true, acquisition: expect.any(String),
     });
     expect(manager.grantFor(owner, 's1')).toBe(firstGrant);
     expect(manager.takeover(actor('ou_other'), 's1')).toEqual({ ok: false, error: 'control_busy' });
@@ -109,6 +109,75 @@ describe('terminal server-side takeover lifecycle', () => {
       'terminal.takeover', 'terminal.takeover_reused',
     ]);
     expect(JSON.stringify(audit.records)).not.toContain(firstGrant);
+  });
+
+  it('binds the CLIENT-minted acquisition id and refuses a superseded release', () => {
+    // Why this exists: the Workbench compensates a takeover whose receipt arrived
+    // after its pane had already gone (tab closed, session switched). Releasing
+    // "whatever lease this session has" is wrong — a NEWER pane under the same
+    // login reuses the very same lease, so the blind release would silently strip
+    // write from the pane the user is actually looking at.
+    //
+    // The id is minted by the CALLER before its request goes out, which is what
+    // makes the hard case work: when the response is lost the caller still knows
+    // exactly which acquisition it may have caused. A server-minted marker only
+    // travels back on success, and asking for the current one afterwards returns
+    // whoever holds it NOW.
+    let now = 1_000;
+    const audit = new MemoryAudit();
+    const manager = new TerminalControlManager({
+      secret: SECRET,
+      audit,
+      ttlMs: 10_000,
+      now: () => now,
+    });
+    const owner = actor('ou_owner');
+    const first = manager.takeover(owner, 's1', 'acq-pane-one');
+    expect(first).toEqual({
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: false, acquisition: 'acq-pane-one',
+    });
+    // The acquisition is a plain equality nonce, NOT the signed grant's internal
+    // id — that one must never reach a browser.
+    expect(manager.grantFor(owner, 's1')).not.toContain('acq-pane-one');
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, acquisition: 'acq-pane-one',
+    });
+
+    // A second pane under the same login takes over: same lease, new acquisition.
+    now = 2_000;
+    expect(manager.takeover(owner, 's1', 'acq-pane-two')).toEqual({
+      ok: true, mode: 'controlled', expiresAt: 11_000, reused: true, acquisition: 'acq-pane-two',
+    });
+
+    // The first pane's late compensation names its own acquisition, and must be
+    // refused rather than deleting the lease pane two is actively using.
+    expect(manager.release(owner, 's1', 'acq-pane-one')).toEqual({ ok: false, error: 'control_lease_superseded' });
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, acquisition: 'acq-pane-two',
+    });
+    // Naming the current acquisition still releases; so does an unconditional one.
+    expect(manager.release(owner, 's1', 'acq-pane-two')).toEqual({ ok: true, mode: 'readonly', released: true });
+    expect(manager.state(owner, 's1')).toEqual({ mode: 'readonly', owned: false });
+    // Conditional release is re-entrant: the lease is already gone, so saying so
+    // is the honest answer rather than an error (a pane's unmount cleanup and its
+    // socket close can both fire for the same acquisition).
+    expect(manager.release(owner, 's1', 'acq-pane-two')).toEqual({ ok: true, mode: 'readonly', released: false });
+    // Another auth session's guess never leaks the lease either.
+    manager.takeover(owner, 's1', 'acq-pane-three');
+    expect(manager.release(actor('ou_other'), 's1', 'acq-pane-three')).toEqual({
+      ok: false, error: 'control_owned_by_another_session',
+    });
+    // A malformed id fails closed: minting one silently would hand back a lease
+    // whose CAS id the caller does not know, i.e. one it can never compensate.
+    expect(manager.takeover(actor('ou_fresh'), 's9', 'short')).toEqual({
+      ok: false, error: 'invalid_acquisition',
+    });
+    expect(manager.state(actor('ou_fresh'), 's9')).toEqual({ mode: 'readonly', owned: false });
+    // A trusted platform owner has no lease at all, hence nothing to compare.
+    const platform = { ...actor('platform-owner'), terminalCapability: 'owner' as const };
+    const platformTakeover = manager.takeover(platform, 's2');
+    expect(platformTakeover.ok).toBe(true);
+    expect('acquisition' in platformTakeover).toBe(false);
   });
 
   it('explicit release destroys writable sockets and returns the next connection to read-only', () => {
@@ -129,25 +198,38 @@ describe('terminal server-side takeover lifecycle', () => {
     }));
   });
 
-  it('binds a proxy WebSocket to the exact lease generation across an async handshake', () => {
+  it('binds a proxy WebSocket to the exact acquisition across an async handshake', () => {
     const audit = new MemoryAudit();
     const manager = new TerminalControlManager({ secret: SECRET, audit, ttlMs: 10_000, now: () => 1_000 });
     const owner = actor('ou_owner');
-    manager.takeover(owner, 's1');
+    manager.takeover(owner, 's1', 'acq-first-lease');
     const stale = manager.grantForProxy(owner, 's1');
-    expect(stale).toMatchObject({ scope: 'write', leaseMarker: expect.any(String) });
+    expect(stale).toMatchObject({ scope: 'write', acquisition: 'acq-first-lease' });
 
     manager.release(owner, 's1');
-    manager.takeover(owner, 's1');
+    manager.takeover(owner, 's1', 'acq-second-lease');
     const current = manager.grantForProxy(owner, 's1');
-    expect(current.leaseMarker).not.toBe(stale.leaseMarker);
+    expect(current.acquisition).toBe('acq-second-lease');
 
     const staleSocket = { destroyed: false, destroy() { this.destroyed = true; } };
-    expect(manager.registerWritableSocket(owner, 's1', staleSocket, stale.leaseMarker)).toEqual({ registered: false });
-    expect(manager.state(owner, 's1')).toEqual({ mode: 'controlled', owned: true, expiresAt: 11_000 });
+    expect(manager.registerWritableSocket(owner, 's1', staleSocket, stale.acquisition)).toEqual({ registered: false });
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, acquisition: 'acq-second-lease',
+    });
 
     const currentSocket = { destroyed: false, destroy() { this.destroyed = true; } };
-    expect(manager.registerWritableSocket(owner, 's1', currentSocket, current.leaseMarker).registered).toBe(true);
+    expect(manager.registerWritableSocket(owner, 's1', currentSocket, current.acquisition).registered).toBe(true);
+
+    // Reuse under the SAME login rotates the acquisition without reissuing the
+    // signed grant. The older pane's socket closing must NOT tear down the lease
+    // the newer pane just acquired — its own bridge may not even exist yet.
+    manager.takeover(owner, 's1', 'acq-third-lease');
+    expect(manager.disconnect(owner, 's1', current.acquisition)).toBe(false);
+    expect(manager.state(owner, 's1')).toEqual({
+      mode: 'controlled', owned: true, expiresAt: 11_000, acquisition: 'acq-third-lease',
+    });
+    expect(manager.disconnect(owner, 's1', 'acq-third-lease')).toBe(true);
+    expect(manager.state(owner, 's1')).toEqual({ mode: 'readonly', owned: false });
   });
 
   it('prioritizes revocation and socket teardown when teardown audit storage fails', () => {
@@ -190,7 +272,7 @@ describe('terminal server-side takeover lifecycle', () => {
     const socket = { destroyed: false, destroy() { this.destroyed = true; } };
     const registered = manager.registerWritableSocket(owner, 's1', socket);
     socket.destroyed = true;
-    expect(manager.disconnect(owner, 's1', registered.leaseMarker)).toBe(true);
+    expect(manager.disconnect(owner, 's1', registered.acquisition)).toBe(true);
     expect(manager.state(owner, 's1')).toEqual({ mode: 'readonly', owned: false });
     expect(audit.records.at(-1)).toEqual(expect.objectContaining({ action: 'terminal.disconnected' }));
   });

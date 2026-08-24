@@ -21,8 +21,15 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 - **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。
 - **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、卡片签名、**默认角色**等）。
 - **Workflows 管控面**：Run List 轮询；Run Detail 看 summary / dangling 红区 / node-activity / event timeline / 并发执行 timeline；可直接 **cancel run**。
+- **设置 / 系统与维护**：已认证管理员可管理「开机启动 botmux 后台服务」。
 
 > **两件事在 Dashboard 之外**：v3 workflow 的 **humanGate 批准 / 拒绝** 走**飞书审批卡**（不在 Dashboard 上点）；带参触发 workflow 目前是**接入点（Webhook）** 那条路径（见 [接入点](/webhook)），Dashboard 没有「Workflow Catalog 带参触发」页。Dashboard 的 Workflows 面板专注观测与 cancel。
+
+## 后台服务开机启动
+
+已认证管理员可在「设置 → 系统与维护」中管理 botmux 后台服务的开机自启；匿名用户不能查看或修改这项设置。
+
+该开关复用现有 `botmux autostart` 能力，只管理下次开机/登录时使用的启动项，不会启动、停止或重启当前 daemon。
 
 ## 对外只读查询
 

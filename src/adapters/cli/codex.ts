@@ -1,7 +1,10 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
@@ -317,22 +320,22 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
 
-      // Ownership filter for the shared global history.jsonl. When we know the
-      // Codex PID, only accept a same-text history line whose session id is one
-      // THIS pid currently holds open — so a concurrent sibling pane's identical
-      // text (same CODEX_HOME) can't hand us its foreign session id. Re-fetch the
-      // open-rollout set on EVERY match attempt (not once at baseByte): the owned
-      // rollout fd for a just-started session can appear slightly after its
-      // history line, and a snapshot would permanently reject it. When the pid is
-      // unknown (no PtyHandle.cliPid) or its rollout set can't be read, fall back
-      // to accept-first — preserving the original submit-confirmation semantics
-      // for single-pane sessions and no-pid callers; the worker-side attach gate
-      // is the backstop there.
+      // Ownership filter for the shared global history.jsonl. An external App
+      // Server viewer cannot own the rollout fd: `codex --remote` is merely a
+      // second client and the existing App Server holds the actual thread. For
+      // that explicit mode accept ONLY its already-selected thread id. Normal
+      // local terminal sessions keep the PID/rollout ownership filter below.
       const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
         ? pty.cliPid
         : undefined;
-      const acceptSid: HistorySidFilter | undefined = cliPid
-        ? (sid) => {
+      const expectedRemoteSid = typeof pty.expectedCodexSessionId === 'string'
+        && pty.expectedCodexSessionId.trim()
+        ? pty.expectedCodexSessionId.trim()
+        : undefined;
+      const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
             if (!sid) return false;
             const owned = findCodexRolloutSetByPid(cliPid);
             // set unavailable (enumeration failed) → don't block the submit
@@ -340,7 +343,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
             if (!owned) return true;
             return owned.has(sid.toLowerCase());
           }
-        : undefined;
+          : undefined;
 
       try {
         if (pty.pasteText) {
@@ -449,7 +452,31 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // skill's description is tightly bound to "当前飞书话题", so implicit
     // mis-fire risk is negligible.
     get skillsDir(): string { return join(codexHome(), 'skills'); },
-    modelChoices: ['gpt-5', 'gpt-5-codex', 'o3', 'o3-mini'],
+    // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
+    // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
+    modelChoices: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'],
+    // Live 模型枚举：`codex debug models`（官方支持，"Render the raw model
+    // catalog as JSON"）输出与 traex 同构的 JSON 目录，复用共享解析。整包可达
+    // 数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。仅 dashboard 在用户选中
+    // codex 时按需调用，不在 daemon/worker 启动路径上；任何异常（spawn 失败/
+    // 超时/输出非法）一律 fail-soft 返回 null，picker 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

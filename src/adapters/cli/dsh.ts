@@ -37,11 +37,13 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   let cachedDshBin: string | undefined;
   return {
     id: 'dsh',
-    // The runner writes its vendored cordis.yml and session JSONL under
-    // ~/.botmux/dsh/. Keep the whole dir REAL under the file sandbox so
-    // both survive (see adapters CLAUDE.md sandbox notes). Pre-created in
-    // buildArgs so the sandbox's keepExisting filter doesn't drop it.
-    authPaths: ['~/.botmux/dsh'],
+    // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
+    // its generated composition + sessions under ~/.dsh/botmux/ and
+    // ~/.dsh/sessions/botmux/. Keep the whole native dsh home REAL under the
+    // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
+    // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't
+    // drop it.
+    authPaths: ['~/.dsh'],
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the real dsh runtime is spawned
@@ -54,10 +56,14 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs }) {
-      // Pre-create the persistent dsh dir in the real HOME before the worker
-      // enters the sandbox: the sandbox's keepExisting filter drops authPaths
-      // that don't exist yet, and the runner can't create them from inside.
-      mkdirSync(join(homedir(), '.botmux', 'dsh'), { recursive: true });
+      // Pre-create the native dsh home + botmux subdirs in the real HOME
+      // before the worker enters the sandbox: the sandbox's keepExisting
+      // filter drops authPaths that don't exist yet, and the runner can't
+      // create them from inside.
+      const dshHome = join(homedir(), '.dsh');
+      mkdirSync(dshHome, { recursive: true });
+      mkdirSync(join(dshHome, 'botmux'), { recursive: true });
+      mkdirSync(join(dshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
         runnerPath(),
         '--session-id', sessionId,

@@ -50,6 +50,9 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('/r/spec.md');
     expect(goal).toContain('dag.json');
     expect(goal).toContain('architect-notes.md');
+    expect(goal).toContain('$BOTMUX_GOAL_OUTPUT_DIR');
+    expect(goal).toContain('$BOTMUX_GOAL_MANIFEST_PATH');
+    expect(goal).toMatch(/relative to.*BOTMUX_GOAL_OUTPUT_DIR/i);
     expect(goal).toContain('Do not start or run the workflow');
     expect(goal).toContain('The host will validate dag.json');
   });
@@ -79,6 +82,15 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('every workflow worker requires CLI bypass permissions');
     expect(goal).toContain('never emit `permissionMode`');
     expect(goal).toContain('systemPromptAppend');
+  });
+
+  it('只生成 schemaVersion 2，并用稳定 output key 编排公开产物', () => {
+    const goal = buildArchitectGoal('/r/spec.md', '/r/spec.json');
+    expect(goal).toContain('"schemaVersion": 2');
+    expect(goal).toContain('"outputs"');
+    expect(goal).toContain('"output": "<stable-output-key>"');
+    expect(goal).toContain('Do not emit legacy `select.name` or `select.path`');
+    expect(goal).toContain('artifact contract table');
   });
 });
 

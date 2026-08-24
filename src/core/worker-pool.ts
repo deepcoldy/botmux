@@ -51,6 +51,12 @@ import {
   type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
+import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
+import {
+  isExistingAppServerSharedAdoptPersistedSession,
+  isSharedAdoptPersistedSession,
+  isSharedAdoptSession,
+} from './shared-adopt.js';
 import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -391,6 +397,7 @@ import type {
   DisplayMode,
   StreamStatus,
   QueuedActivationTailEntry,
+  ScreenStatus,
 } from '../types.js';
 import {
   appendAcceptedCodexAppDispatch,
@@ -416,7 +423,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
-import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
@@ -835,7 +842,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -888,7 +895,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -940,7 +947,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -1013,7 +1020,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
@@ -1100,7 +1107,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -1139,9 +1146,7 @@ function ordinaryTurnRecoveryEligible(
 ): boolean {
   return sessionCliId(ds, botCfg) === 'claude-code'
     && ds.session.status === 'active'
-    && !ds.adoptedFrom
-    && !ds.session.adoptedFrom
-    && ds.initConfig?.adoptMode !== true
+    && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
     && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
 }
@@ -1687,7 +1692,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     ds.usageLimit,
@@ -1747,6 +1752,35 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ds.usageLimit = usageLimit;
   persistStreamCardState(ds);
   armUsageLimitRetryTimer(ds, previous);
+}
+
+/**
+ * Resolve the daemon-side screen status in the presence of a usage limit.
+ *
+ * Limit state is intentionally sticky across ticks that carry no fresh verdict
+ * (the worker re-emits only while the limit text stays on screen; screenshot
+ * ticks arrive every 10s), so a recorded limit survives ordinary idle frames
+ * and the cooldown card stays up until the user retries. But it must
+ * self-heal on evidence of active work: a blocked CLI does not produce
+ * `working`/`analyzing` frames, so a limit that survives such a frame was a
+ * false positive (a flicker-frame screen scan, or a structured emit the CLI
+ * recovered from). Without this the card keeps showing 「限额已达」 for the
+ * rest of the turn even though the CLI is demonstrably still running — the
+ * reported 误报. The worker-side status gate (detectScreenUsageLimit) prevents
+ * the detection while active; this is the daemon-side net for limits recorded
+ * during an idle flicker before work resumed.
+ */
+function resolveUsageAwareScreenStatus(
+  ds: DaemonSession,
+  workerStatus: ScreenStatus,
+  freshUsageLimit: CliUsageLimitState | undefined,
+): ScreenStatus {
+  if (freshUsageLimit) return 'limited';
+  if (ds.usageLimit && isActiveWorkRuntimeStatus(workerStatus)) {
+    clearUsageLimitState(ds);
+    return workerStatus;
+  }
+  return ds.usageLimit ? 'limited' : workerStatus;
 }
 
 const WORKER_ERROR_MARKER = '[botmux-worker-error]';
@@ -1891,7 +1925,7 @@ function bumpStreamCardStatusRevision(ds: DaemonSession): void {
 /** Re-render a just-created starting card when a newer worker status arrived
  * during its POST. The turn id is forwarded to scheduleCardPatch so a late
  * patch from turn N cannot overwrite turn N+1's card. */
-function reconcilePostedStartingCard(ds: DaemonSession, turnId: string, revisionAtPost: number): void {
+function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefined, revisionAtPost: number): void {
   if ((ds.streamCardStatusRevision ?? 0) === revisionAtPost) return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return;
   const botCfg = getBot(ds.larkAppId).config;
@@ -1908,7 +1942,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string, revision
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     status === 'limited' ? ds.usageLimit : undefined,
@@ -1972,7 +2006,7 @@ export async function postTurnStartingCard(
     ds.displayMode ?? 'hidden',
     nonce,
     undefined,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     ds.usageLimit,
@@ -2104,7 +2138,7 @@ export async function postFreshStreamingCard(
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
@@ -2288,7 +2322,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       ds.session.title || sessionCliDisplayName(ds, botCfg),
       effectiveCliId,
       true,
-      !!ds.adoptedFrom,
+      isSharedAdoptSession(ds),
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
@@ -2305,7 +2339,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     ds.session.title || sessionCliDisplayName(ds, botCfg),
     effectiveCliId,
     true,             // showManageButtons — write-link card includes restart & close
-    !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+    isSharedAdoptSession(ds), // shared adopt — disconnect, never close the source conversation
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
@@ -2394,7 +2428,7 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     ds.session.title || sessionCliDisplayName(ds, botCfg),
     effectiveCliId,
     true,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
@@ -2617,8 +2651,14 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 const skillsInstalledCliIds = new Set<string>();
 
 /**
- * Ensure built-in skills are installed for a given CLI.
- * Synchronous and idempotent — runs once per CLI per daemon lifecycle.
+ * Ensure built-in skills are installed for a given CLI. Synchronous and
+ * idempotent. Two cadences:
+ *   - Skill FILES (whiteboard / workflow family / built-in skills) are
+ *     re-evaluated on EVERY spawn, before the `skillsInstalledCliIds` gate, so
+ *     runtime switches (whiteboard, workflow) and user customization (skill body
+ *     override / disable) take effect on the next session without a restart.
+ *   - Hook install + botmux-ask fallback do not vary at runtime, so they run
+ *     once per CLI per daemon lifecycle (behind the gate).
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
@@ -2640,8 +2680,14 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
     // 关闭时删除已装的三个 skill，下一个会话即生效。
     ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
-    if (skillsInstalledCliIds.has(cliId)) return;
+    // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
+    // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
+    // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
+    // 重启才生效，和自定义页「下一个会话即生效」不符。ensureSkills 幂等（内容相同
+    // 则跳过），每次 spawn 的代价只是几个小文件的读比对。
     ensurePluginSkills(cliId, adapter.pluginDir);
+    if (skillsInstalledCliIds.has(cliId)) return;
+    // Hook 接管与 botmux-ask 兜底 skill 不随自定义变化 → 每个 daemon 生命周期装一次即可。
     if (adapter.hookInstall) {
       try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
       catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
@@ -2675,11 +2721,14 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
   ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());
   if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
+  // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
+  // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同
+  // 则跳过），停用的 skill 目录会被 ensureSkills 内部清掉，下一个会话即生效。
+  if (globalInstall) ensureSkills(cliId, skillsDir);
 
   if (skillsInstalledCliIds.has(cliId)) return;
-  // 安装是稳定动作，留在 once-cache 里跑一次即可（幂等，内容相同不重写）。
-  if (globalInstall) ensureSkills(cliId, skillsDir);
-  // askUserQuestion 接管策略与 skill 文件无关：hook 该装还得装（Codex 无 hook，
+  // 以下都不随自定义变化 → 每个 daemon 生命周期装一次即可。
+  // askUserQuestion 接管策略与 skill 文件无关：hook 该装还得装（Codex 无 hook,
   // 靠 botmux-ask skill / catalog 兜底）。
   if (adapter.hookInstall) {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
@@ -3066,9 +3115,9 @@ export async function detachWorkerForTransfer(
  * adopt-skip decision is unit-testable without spawning a worker.
  */
 export function shouldDestroyPaneBeforeRestart(
-  ds: Pick<DaemonSession, 'initConfig' | 'adoptedFrom'>,
+  ds: Pick<DaemonSession, 'initConfig' | 'adoptedFrom' | 'session'>,
 ): boolean {
-  return !ds.initConfig?.adoptMode && !ds.adoptedFrom;
+  return !isSharedAdoptSession(ds);
 }
 
 /**
@@ -3399,7 +3448,12 @@ function destroyOrphanedBackingSession(
     skipRemoteCancel?: boolean;
   } = {},
 ): void {
-  if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
+  // Traditional `/adopt` observes a user-owned tmux/zellij/Herdr target and
+  // must never destroy it. An App Server shared adopt is different: its
+  // persistent bmx-* pane is BotMux's own `codex --remote` client, so reclaim
+  // that pane while leaving the external App Server untouched.
+  if (!isExistingAppServerSharedAdoptPersistedSession(ds.session)
+      && isSharedAdoptSession(ds)) return;
   reclaimParkedCrashDiagnostic(ds);
   // Riff cancellation is asynchronous and cannot be made safe from this
   // synchronous best-effort helper. The authoritative closeSession path awaits
@@ -4169,7 +4223,10 @@ async function prepareRiffExplicitClose(
     };
   }
   if (backendType !== 'riff') return { ok: true };
-  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  if (
+    (ds && isSharedAdoptSession(ds))
+    || isSharedAdoptPersistedSession(session)
+  ) return { ok: true };
 
   if (ds?.worker && !ds.worker.killed) {
     if (!stored || stored.status !== 'active') {
@@ -4274,7 +4331,10 @@ async function prepareMojoExplicitClose(
 ): Promise<RemoteClosePreparation> {
   const session = ds?.session ?? stored;
   if (!session) return { ok: true };
-  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  if (
+    (ds && isSharedAdoptSession(ds))
+    || isSharedAdoptPersistedSession(session)
+  ) return { ok: true };
   // A row whose lineage was PARKED (restore-time quarantine moves the id here and
   // clears the active slot) still has a remote session running. It is reported as
   // a residual on every close of this row, including replays of an already-closed
@@ -5158,9 +5218,8 @@ function teardownAuthoritativePersistentBackingBeforeCloseImpl(
   const backendType = ds ? getSessionPersistentBackendType(ds) : session.backendType;
   if (
     backendType !== 'zmx'
-    || ds?.initConfig?.adoptMode
-    || ds?.adoptedFrom
-    || session.adoptedFrom
+    || (ds && isSharedAdoptSession(ds))
+    || isSharedAdoptPersistedSession(session)
     || session.queued
     || session.status === 'closed'
   ) return;
@@ -5197,7 +5256,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
     ds.currentImageKey,
-    !!ds.adoptedFrom,
+    isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
     cardUsageLimit(ds),
@@ -5327,9 +5386,8 @@ export async function closeSession(
   const stored = sessionStore.getOwnedSession(sessionId);
   const closeFrozenBackendType = ds?.initConfig?.backendType
     ?? ds?.session.backendType ?? stored?.backendType;
-  const isOwnedClose = !ds?.initConfig?.adoptMode
-    && !ds?.adoptedFrom
-    && !stored?.adoptedFrom;
+  const isOwnedClose = !(ds && isSharedAdoptSession(ds))
+    && !(stored && isSharedAdoptPersistedSession(stored));
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
   const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
@@ -6267,7 +6325,7 @@ function shouldTrackOrdinaryImDelivery(
     && (message.turnId.startsWith('om_') || message.turnId.startsWith('bmx-recovery-'))
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
-    && !ds.adoptedFrom
+    && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
     && Number.isSafeInteger(ds.workerGeneration)
     && (ds.workerGeneration ?? 0) > 0
@@ -6750,7 +6808,7 @@ export async function transferSession(
   // Adopt sessions wrap a CLI process that botmux didn't spawn — the user
   // owns it inside their own tmux pane, so moving routing here would be
   // surprising and we don't control the tmux session's lifecycle. Refuse.
-  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_relayable' };
+  if (isSharedAdoptSession(ds)) return { ok: false, error: 'adopt_not_relayable' };
 
   // Busy worker: refuse immediately rather than waiting. An idle-wait loop
   // (previously 60s) created an asymmetry with the peer-dispatch HTTP
@@ -7041,6 +7099,11 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const botCfg = getBot(ds.larkAppId).config;
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
+  // An external App Server thread is not a local rollout. `codex fork` would
+  // resolve against the terminal client's own CODEX_HOME and could fork an
+  // unrelated/empty local session, so refuse rather than claiming a copy was
+  // made. A future server-side thread/fork primitive can add an explicit path.
+  if (ds.session.existingAppServerEndpoint) return false;
   // Codex terminal mode is forkable; Codex under Hybrid RPC input is not (the
   // thread is an app-server live session, no local rollout to `codex fork`).
   //
@@ -7108,7 +7171,7 @@ export async function forkSession(
   if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_forkable' };
   if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
   if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
-  if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_forkable' };
+  if (isSharedAdoptSession(ds)) return { ok: false, error: 'adopt_not_forkable' };
   if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
   const st = ds.lastScreenStatus;
   if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
@@ -8817,6 +8880,45 @@ export function forkWorker(
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  if (
+    botCfg.existingAppServer
+    && botCfg.cliId === 'codex'
+    && ds.session.existingAppServerEndpoint === undefined
+  ) {
+    throw new Error(
+      'this BotMux bot attaches only to an existing Codex App conversation; '
+      + 'use /adopt to select the thread before sending task input',
+    );
+  }
+  let existingAppServerEndpoint: string | undefined;
+  if (ds.session.existingAppServerEndpoint !== undefined) {
+    existingAppServerEndpoint = normalizeExistingAppServerEndpoint(
+      ds.session.existingAppServerEndpoint,
+      `session ${ds.session.sessionId} existingAppServerEndpoint`,
+    );
+    if (ds.session.cliId !== 'codex') {
+      throw new Error(
+        'existing Codex App Server session must use cliId "codex"; '
+        + 'refusing to launch another CLI against this thread',
+      );
+    }
+    if (!ds.session.cliSessionId) {
+      throw new Error(
+        'existing Codex App Server session has no selected thread id; '
+        + 'use /adopt to select a Codex App conversation first',
+      );
+    }
+    if (ds.session.sandbox === true || botCfg.readIsolation === true) {
+      throw new Error(
+        'existing Codex App Server attachment cannot run under sandbox/readIsolation; '
+        + 'the external app-server would remain outside that boundary',
+      );
+    }
+    // Remote TUI attach always resumes the explicitly selected remote thread.
+    // Never let later cold-resume/restart policy demote it into a new local
+    // Codex session.
+    resume = true;
+  }
   // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
   // model turn. Starting its CLI with an empty prompt must not mint a queued
   // activation token: the worker has nothing to submit and could never ACK it.
@@ -8968,7 +9070,7 @@ export function forkWorker(
   // worker left parked but couldn't clean (hard-killed while parked, daemon
   // still alive → next message reforks here). The fresh CLI spawns under the
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
-  if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
+  if (!isSharedAdoptSession(ds)) reclaimParkedCrashDiagnostic(ds);
 
   agentCfg = sessionAgentConfig(ds, botCfg);
   if (!initTurnId && prompt.length > 0 && agentCfg.cliId === 'codex-app') {
@@ -8977,7 +9079,7 @@ export function forkWorker(
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
-  if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
+  if (agentCfg.cliId === 'codex' && !isSharedAdoptSession(ds)) {
     const isFreshNativeSession = !resume && !ds.session.cliSessionId;
     const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
       promptPayload.codexAppInput?.text ?? prompt,
@@ -9299,7 +9401,13 @@ export function forkWorker(
     // takes effect on the next worker fork without recreating the session.
     turnTimeoutMs: botCfg.turnTimeoutMs,
     disableCliBypass: botCfg.disableCliBypass === true,
-    codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    // Existing App Server attachment owns neither an app-server nor a JSON-RPC
+    // input channel. It is a normal official remote TUI, so all user input goes
+    // through its terminal and must never trigger BotMux's self-owned RPC engine.
+    codexRpcInput: existingAppServerEndpoint
+      ? false
+      : botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -9834,7 +9942,7 @@ function setupWorkerHandlers(
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
-  const isAdopt = !!ds.adoptedFrom;
+  const isAdopt = isSharedAdoptSession(ds);
   const showTakeover = false;
 
   worker.on('message', async (msg: WorkerToDaemon) => {
@@ -10188,8 +10296,10 @@ function setupWorkerHandlers(
         // in-flight. In that case CARD_POSTING_SENTINEL is already set — don't
         // POST a second card; the in-flight POST becomes this turn's card.
         if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
+        const pendingNewTurn = !!ds.streamCardPending;
         const postingGeneration = ds.streamCardTurnGeneration ?? 0;
         const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
+        const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -10197,7 +10307,9 @@ function setupWorkerHandlers(
           // See PATCH-branch comment above re: lastScreenStatus preference.
           // For relay (kill+fork with surviving tmux/CLI), this avoids the
           // jarring "启动中" right after the M1 "已接力" announcement.
-          const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+          const initStatus = pendingNewTurn
+            ? turnStartingCardStatus(ds, effectiveCliId)
+            : (ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting'));
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
@@ -10259,6 +10371,9 @@ function setupWorkerHandlers(
           // resume where the CLI kept running), arm here — same authorized arm
           // point as the reuse branch, now that streamCardId is the real id.
           syncUsageRefreshTimer(ds);
+          if (!superseded) {
+            reconcilePostedStartingCard(ds, cardReplyTarget.turnId, statusRevisionAtPost);
+          }
           if (superseded && ds.streamCardPendingTurnId) {
             void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
           }
@@ -10284,7 +10399,7 @@ function setupWorkerHandlers(
               ds.session.title || sessionCliDisplayName(ds, botCfg),
               effectiveCliId,
               undefined,
-              !!ds.adoptedFrom,
+              isSharedAdoptSession(ds),
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
@@ -10303,7 +10418,7 @@ function setupWorkerHandlers(
                 ds.session.title || sessionCliDisplayName(ds, botCfg),
                 effectiveCliId,
                 undefined,
-                !!ds.adoptedFrom,
+                isSharedAdoptSession(ds),
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
@@ -10505,7 +10620,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         bumpStreamCardStatusRevision(ds);
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
@@ -10733,7 +10848,7 @@ function setupWorkerHandlers(
         if (ds.streamCardPending) break;
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         bumpStreamCardStatusRevision(ds);
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
@@ -11146,9 +11261,47 @@ function setupWorkerHandlers(
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
+        if (msg.codexAppActiveWriter === true && effectiveCliId === 'codex-app') {
+          // `thread/resume` was explicitly rejected because another Codex
+          // app-server currently owns the persisted thread. This is a safe,
+          // expected handoff conflict — never spend restart budget or let the
+          // generic second-restart policy drop cliSessionId and create a fresh
+          // context. Park the logical Botmux session so its next message
+          // retries the SAME thread after the external writer releases it.
+          const thread = ds.session.cliSessionId ?? ds.session.sessionId;
+          logger.warn(
+            `[${t}] Codex App resume blocked by external active writer; preserving `
+            + `thread ${thread.substring(0, 12)}`,
+          );
+          const suspended = suspendWorker(ds, 'codex_app_active_writer');
+          if (!suspended) {
+            // The runner process already exited and there is no safe live
+            // backend suspension path. Retire only this Node worker; never
+            // destroy the external app-server that owns the thread.
+            retireWorkerProcessOnly(ds, 'codex_app_active_writer');
+            ds.hasHistory = true;
+            ds.session.suspendedColdResume = true;
+            sessionStore.updateSession(ds.session);
+          }
+          if (!suppressExitUi) {
+            const threadLabel = `${thread.substring(0, 16)}…`;
+            const message = loc === 'zh'
+              ? `⚠️ Codex App 历史会话（${threadLabel}）当前正由另一个 Codex App / app-server 持有。`
+                + 'BotMux 已保留原上下文，不会新建空会话；请在 App 侧释放该会话后，再发送一条消息重试恢复。'
+              : `⚠️ Codex App thread (${threadLabel}) is currently held by another Codex App / app-server writer. `
+                + 'BotMux preserved the original context and did not create a fresh session; release it in the App, then send another message to retry.';
+            try {
+              await scopedReply(message, 'text', msg.turnId);
+            } catch (replyErr) {
+              logger.error(`[${t}] Failed to report Codex App active-writer conflict: ${replyErr}`);
+            }
+          }
+          break;
+        }
+
         // Do NOT auto-restart in adopt mode — there's nothing to restart
-        if (ds.adoptedFrom) {
-          logger.info(`[${t}] Adopted session ended`);
+        if (isSharedAdoptSession(ds)) {
+          logger.info(`[${t}] Shared adopted session ended`);
           // Freeze the streaming card
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
             const readUrl = readableTerminalUrlFor(ds);
@@ -12188,14 +12341,19 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // A dead worker can no longer refresh its card/usage view.
+      clearUsageRefreshTimer(ds);
+      // A worker owns the terminal HTTP listener. Persisting its former port
+      // after exit leaves the Dashboard proxy routing `/terminal/<session>` to
+      // a dead socket until some later ready event overwrites it. Clear both
+      // durable and aggregated state now so a persistent backend can be
+      // re-attached on demand instead of returning a stale 502.
+      ds.session.webPort = undefined;
       // A queued suspend for THIS generation is now moot — the worker it was
       // about is gone. Leaving it set would suspend the replacement on its
       // first idle (the deferred checkpoint's own "worker gone" branch cannot
       // help: it only runs on a screen update that will never arrive).
       clearPendingSuspendClaim(ds, 'worker exited');
-      // Dead worker generation — stop the periodic usage refresh immediately
-      // instead of waiting a tick for it to self-clear on !workerHasInitialized.
-      clearUsageRefreshTimer(ds);
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
@@ -12226,6 +12384,13 @@ function setupWorkerHandlers(
       const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
       sessionStore.updateSession(ds.session);
       if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: ds.session.sessionId,
+          patch: { webPort: null, workerPid: null },
+        },
+      });
     }
     if (!transferRetirement) {
       try {
@@ -12697,11 +12862,14 @@ function deliverFinalOutput(
       const feedbackRequesterSubjectId = recipientOpenId;
       const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      const localTurnTitle = msg.kind === 'local-turn-headless'
+        ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
+        : isExistingAppServerSharedAdoptPersistedSession(ds.session)
+          ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
+          : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
-            title: msg.kind === 'local-turn-headless'
-              ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
-              : tr('card.local_turn', undefined, localeForBot(ds.larkAppId)),
+            title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
             assistantText: safeAssistantText,
             assistantLabel: storedSessionCliDisplayName(ds),
@@ -13411,7 +13579,17 @@ export function killStalePids(
     try {
       // Check if process exists (signal 0 doesn't kill, just checks)
       process.kill(session.pid, 0);
-      // Process exists — kill its process group
+      // Existing-App-Server share: the worker and its BotMux-owned remote TUI
+      // can be in one process group. Reap only the stale worker PID; killing
+      // the group would also terminate `codex --remote`, even though the
+      // replacement daemon is expected to reattach that client. The external
+      // App Server itself is never ours to signal.
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) {
+        logger.info(`Killing stale shared-App-Server worker only (pid: ${session.pid}, session: ${session.sessionId})`);
+        try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
+        continue;
+      }
+      // Ordinary managed sessions own their complete process group.
       logger.info(`Killing stale CLI process (pid: ${session.pid}, session: ${session.sessionId})`);
       try {
         process.kill(-session.pid, 'SIGTERM');
@@ -13669,6 +13847,11 @@ function cleanupPersistentBackendSessions(
     killManagedExactHerdrTargets(true);
     for (const session of activeSessions_) {
       if (!belongsToBackend(session)) continue;
+      // The remote TUI deliberately uses cliId=codex even when the Bot's
+      // default/new-session runtime remains codex-app. This is a shared-adopt
+      // binding, not a stale CLI selection, so keep its bmx-* client alive for
+      // the restore path. Explicit /detach remains responsible for cleanup.
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) continue;
       const sessionCliId = session.cliId;
       if (!sessionCliId || !session.larkAppId) continue;
       let botCliId: CliId | undefined;

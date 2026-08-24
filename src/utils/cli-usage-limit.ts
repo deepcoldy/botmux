@@ -116,6 +116,70 @@ export interface DetectUsageLimitOptions {
    * unaffected — it has no structured equivalent yet.
    */
   suppressRateKind?: boolean;
+  /**
+   * Whether the CLI is demonstrably producing output (PTY activity within the
+   * caller's freshness window). The active-work gate in detectScreenUsageLimit
+   * only suppresses the verdict while this is true. `working`/`analyzing`
+   * alone do not prove output is progressing — `working` is the default
+   * projection whenever promptReady === false — so a non-structured CLI
+   * blocked at a rate/quota error screen that never renders its configured
+   * ready prompt stays `working` forever (only Codex App projects `stalled`),
+   * and a genuine blocking 429 would be suppressed indefinitely. Pass `false`
+   * when PTY output has been quiescent past the window so the detector still
+   * runs on a parked error screen. Omit (or pass `true`) to keep the
+   * conservative suppress-on-working behavior.
+   */
+  outputActive?: boolean;
+}
+
+/**
+ * Whether a runtime screen status proves the CLI is actively doing work.
+ *
+ * The screen-scan detector cannot tell a live limit block from limit-shaped
+ * text the CLI itself put on screen — a model answer quoting a business 429,
+ * tool output, docs, test fixtures. The runtime status disambiguates: a
+ * rate/usage limit blocks the CLI, and a blocked CLI sits at an error/prompt
+ * screen (`idle`/`stalled`); it does not keep producing output. So while the
+ * CLI is `working`/`analyzing`, any "429 / rate limit / usage limit" text on
+ * screen is the CLI's own output or a transient retry it is handling
+ * internally, and a screen-scan verdict must be suppressed. Root cause of the
+ * "CLI 还在跑却提示限额已达" false reports (Codex/Hermes, 2026-08).
+ *
+ * Caveat (refined by detectScreenUsageLimit's `outputActive` option): in this
+ * worker `working` is the DEFAULT projection whenever promptReady === false,
+ * not proof that output is progressing. A non-structured CLI blocked at a
+ * rate-limit error screen that never renders its ready prompt stays `working`
+ * forever (only Codex App projects `stalled`), so the status alone is not a
+ * safe suppression gate — pair it with an output-activity signal.
+ */
+export function isActiveWorkRuntimeStatus(status: string | null | undefined): boolean {
+  return status === 'working' || status === 'analyzing';
+}
+
+/**
+ * Screen-frame detection: `detectCliUsageLimit` gated on the frame's runtime
+ * status. The worker's per-frame classify path goes through here so a single
+ * choke point owns the "active work suppresses the verdict" policy — keeping
+ * it out of the pure text classifier, whose existing callers (turn-start
+ * stale-banner snapshot) have no fresh status context.
+ *
+ * The suppression requires BOTH an active-work status AND actively progressing
+ * output (`outputActive !== false`). When `outputActive` is `false` the CLI is
+ * parked (PTY quiescent) even though the status says `working` — a blocked
+ * non-structured CLI's error screen — so the detector must still run. Callers
+ * that cannot assess output activity omit the hint and keep suppressing on
+ * working/analyzing (the conservative default).
+ */
+export function detectScreenUsageLimit(
+  text: string,
+  status: string | null | undefined,
+  now: Date = new Date(),
+  opts: DetectUsageLimitOptions = {},
+): CliUsageLimitDetection {
+  if (isActiveWorkRuntimeStatus(status) && opts.outputActive !== false) {
+    return { limited: false };
+  }
+  return detectCliUsageLimit(text, now, opts);
 }
 
 /**

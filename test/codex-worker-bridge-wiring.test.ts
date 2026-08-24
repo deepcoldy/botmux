@@ -22,7 +22,7 @@ describe('Codex worker structured-bridge wiring', () => {
     expect(codex).toContain('codexSessionIdFromRolloutPath(codexBridgeRolloutPath)');
     expect(codex).toContain("resolveFileBridgePath('codex', { sessionId: cliSessionId })");
     expect(codex.indexOf('codexBridgeDetachFile();')).toBeLessThan(codex.indexOf('codexBridgeAttach(next, attachMode);'));
-    expect(codex).toContain("lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty'");
+    expect(codex).toContain("codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty'");
     expect(codex).toContain('codexBridgePendingSessionId = cliSessionId;');
   });
 

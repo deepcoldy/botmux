@@ -41,6 +41,7 @@ const IDS = {
 
 function revisionDraft(goal = '研究并输出报告', sourceRunId = 'source-run'): SavedWorkflowRevisionDraft {
   const dagTemplate: V3DagTemplate = {
+    schemaVersion: 2,
     nodes: [{
       id: 'research',
       type: 'goal',

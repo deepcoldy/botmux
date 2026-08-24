@@ -41,7 +41,11 @@ async function hardKillWorkerOnly(child: ChildProcess): Promise<void> {
 function waitForChildExit(
   child: ChildProcess,
   logs: string[],
-  timeoutMs = 10_000,
+  // The tmux-pipe lifecycle watcher now backs off its pane probes (1s→3s→9s),
+  // so a genuinely dead managed pane is torn down after ~13s worst-case
+  // (3 backed-off misses + lenient confirm) instead of the old ~3-4s. Give the
+  // worker-exit wait enough headroom to observe that teardown.
+  timeoutMs = 30_000,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
