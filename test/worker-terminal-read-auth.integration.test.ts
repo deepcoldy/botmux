@@ -208,6 +208,23 @@ setInterval(() => {}, 1_000);
     expect(viewHtml).toContain('var hasToken=false');
     // The browser must carry the view capability into its WS connection too.
     expect(viewHtml).toContain("base+'/'+location.search");
+    // 无平台提示头时按本地只读渲染（readonly 横幅，不是 SSO 登录引导）。
+    expect(viewHtml).toContain('var platformReadonly=false');
+
+    // #933 回归修复：中央前门剥掉平台注入的 Cookie/Role 后，用展示层提示头把「平台
+    // 认证过的只读访客」带过来 → 页面渲染 SSO 登录引导（platformReadonly=true），
+    // 而读/写授权判定不受它影响（仍是只读：hasToken=false）。
+    const platformHintView = await fetch(`${base}/?viewToken=${encodeURIComponent(ready.viewToken!)}`, {
+      headers: { 'x-botmux-platform-readonly': '1' },
+    });
+    expect(platformHintView.status).toBe(200);
+    const platformHintHtml = await platformHintView.text();
+    expect(platformHintHtml).toContain('var hasToken=false');
+    expect(platformHintHtml).toContain('var platformReadonly=true');
+    // 提示头绝不能把写权限带出来：伪造它 + 错误 token 仍被整体拒绝。
+    expect((await fetch(`${base}/?token=wrong-token`, {
+      headers: { 'x-botmux-platform-readonly': '1' },
+    })).status).toBe(403);
 
     // Every historically issued stable view token fails closed on this worker.
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);

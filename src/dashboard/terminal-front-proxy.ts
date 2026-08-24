@@ -7,6 +7,7 @@ import {
 import type { Duplex } from 'node:stream';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
 import { TERMINAL_VIEW_FORWARD_HEADER } from '../core/terminal-control-grant.js';
+import { TERMINAL_PLATFORM_READONLY_HINT_HEADER } from '../core/terminal-write-auth.js';
 import type {
   TerminalControlManager,
   TerminalDashboardActor,
@@ -231,6 +232,16 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     // Set AFTER the header build, which drops every client-supplied `x-botmux-*`
     // on this path: a browser can never smuggle its own forward proof through.
     if (viewForwardProof) headers[TERMINAL_VIEW_FORWARD_HEADER] = viewForwardProof;
+    // #933 回归修复：`terminalCapability === 'readonly'` 只可能来自平台注入身份
+    // （teammate/guest —— legacy/H5 都是 'controlled'，平台 owner 是 'owner'）。上面
+    // 两条路都已把平台注入的 Cookie / X-Botmux-Role 剥掉（P1-6 strip 或换内部 grant），
+    // worker 便判不出「平台认证过的只读访客」→ platformReadonly 恒 false → 只读终端页
+    // 上的「owner 登录后可操作 →」SSO 引导消失，冷打开卡片链接的人困在无登录入口的
+    // 只读页里。补一个仅展示用的提示头（授权判定完全不读它，见常量注释）；同样设在
+    // terminalForwardHeaders 之后，客户端自带的同名头已被整片丢弃、无法夹带。
+    if (actor?.terminalCapability === 'readonly') {
+      headers[TERMINAL_PLATFORM_READONLY_HINT_HEADER] = '1';
+    }
     return { ...parsed, port, revoked: false, actor, proxyGrant, readAuthSessionId, headers };
   };
 

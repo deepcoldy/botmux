@@ -334,6 +334,73 @@ describe('central terminal front proxy boundary', () => {
     await close(upstream);
   });
 
+  // ── #933 回归修复：平台只读访客的展示层提示头 ────────────────────────────────
+  // 剥掉平台注入的 Cookie/Role（P1-6 strip / 内部 grant 两条路都会剥）之后，worker
+  // 判不出「平台认证过的只读访客」，只读终端页上的「owner 登录后可操作 →」SSO 引导
+  // 从此消失。前门补一个仅展示用的提示头；它必须：只发给平台只读身份（teammate/
+  // guest），别的身份一概不发；客户端自带的同名头在这些路径上被整片丢弃。
+  it('#933 hint: platform readonly viewers get the display-only hint header, every other identity does not', async () => {
+    const observed: Array<{ url: string; hint?: string; cookie?: string; role?: string }> = [];
+    const upstream = createServer((req, res) => {
+      const hint = req.headers['x-botmux-platform-readonly'];
+      observed.push({
+        url: req.url ?? '',
+        ...(typeof hint === 'string' ? { hint } : {}),
+        ...(req.headers.cookie ? { cookie: req.headers.cookie } : {}),
+        ...(typeof req.headers['x-botmux-role'] === 'string' ? { role: req.headers['x-botmux-role'] as string } : {}),
+      });
+      res.end('ok');
+    });
+    const upstreamPort = await listen(upstream);
+
+    const identities: Array<{ name: string; actor: TerminalDashboardActor | null; expectHint: boolean }> = [
+      { name: 'platform-teammate', actor: { userId: 'p:teammate', authSessionId: 's:teammate', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'readonly' }, expectHint: true },
+      { name: 'platform-guest', actor: { userId: 'p:guest', authSessionId: 's:guest', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'readonly' }, expectHint: true },
+      { name: 'platform-owner', actor: { userId: 'p:owner', authSessionId: 's:owner', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'owner' }, expectHint: false },
+      { name: 'legacy', actor: { userId: 'legacy-owner', authSessionId: 'legacy-auth', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'controlled' }, expectHint: false },
+      { name: 'h5', actor: { userId: 'ou_h5', authSessionId: 'h5-auth', expiresAt: Date.now() + 30 * 60_000, terminalCapability: 'controlled' }, expectHint: false },
+    ];
+    for (const identity of identities) {
+      const control = new TerminalControlManager({ secret: SECRET, audit: { append() {} } });
+      const proxy = createTerminalFrontProxy({
+        resolvePort: () => upstreamPort,
+        resolveActor: () => identity.actor,
+        control,
+        isAuthSessionLive: () => true,
+      });
+      const front = createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (!proxy.handleHttp(req, res, url)) res.writeHead(404).end();
+      });
+      const frontPort = await listen(front);
+      try {
+        // 冷打开卡片链接（viewToken）与 SSO 回跳后的无 token 路径都要覆盖：两条路
+        // 都会剥凭证，缺哪条 worker 都会在对应场景丢掉登录引导。
+        for (const query of ['?viewToken=card-view-capability', '']) {
+          observed.length = 0;
+          await fetch(`http://127.0.0.1:${frontPort}/s/s1/${query}`, {
+            headers: {
+              cookie: 'botmux_dashboard_token=platform-injected-machine-cookie',
+              'x-botmux-role': 'teammate',
+              // 客户端自带的同名头必须被丢弃：断言值恒为前门自己设置的 '1'。
+              'x-botmux-platform-readonly': 'forged-by-client',
+            },
+          });
+          const cell = `${identity.name} × ${query || 'no-token'}`;
+          expect(observed, cell).toHaveLength(1);
+          // 提示头绝不与 ambient 凭证同行：cookie/role 在这些路径上照旧被剥。
+          expect(observed[0].cookie, cell).toBeUndefined();
+          expect(observed[0].role, cell).toBeUndefined();
+          if (identity.expectHint) expect(observed[0].hint, cell).toBe('1');
+          else expect(observed[0].hint, cell).toBeUndefined();
+        }
+      } finally {
+        await close(front);
+      }
+    }
+    await close(upstream);
+  });
+
   // ── P1-5: bound view capabilities are refused once their auth session died ─
 
   it('P1-5: a bound view capability of a revoked auth session is refused before the worker', async () => {

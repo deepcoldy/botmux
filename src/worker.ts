@@ -157,6 +157,7 @@ import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
+  TERMINAL_PLATFORM_READONLY_HINT_HEADER,
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
 import {
@@ -16104,6 +16105,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Forbidden');
         return;
       }
+      // #933 回归修复：平台注入的 Cookie/Role 会被中央前门剥掉（P1-6 / 内部 grant），
+      // 此时 platformReadonly 判不出来；前门改用这个展示层提示头把「平台认证过的只读
+      // 访客」这一事实带过来。只影响只读页渲染哪条横幅（SSO 登录引导 vs 纯只读提示），
+      // 不参与任何授权判定——hasRead/hasWrite 在它之前就已定死。
+      const platformReadonlyHint = !hasWrite
+        && req.headers[TERMINAL_PLATFORM_READONLY_HINT_HEADER] !== undefined;
       const loginHdr = req.headers['x-botmux-login-url'];
       // The central front proxy only injects X-Botmux-Login-Url on the SPA 401
       // path, never on `/s/` terminal requests — so a read-only web terminal
@@ -16144,7 +16151,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
+      res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
     wss = new WebSocketServer({
