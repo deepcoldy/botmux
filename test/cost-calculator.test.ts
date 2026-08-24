@@ -71,6 +71,7 @@ vi.mock('../src/services/codex-transcript.js', () => ({
 
 vi.mock('../src/services/traex-transcript.js', () => ({
   findTraexRolloutBySessionId: vi.fn(() => undefined),
+  findTraexSessionIdByBotmuxSessionId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/pi-transcript.js', () => ({
@@ -111,7 +112,7 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
 import { existsSync, readFileSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
-import { findTraexRolloutBySessionId } from '../src/services/traex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from '../src/services/traex-transcript.js';
 import { findPiTranscriptBySessionId } from '../src/services/pi-transcript.js';
 import {
   getSessionJsonlPath,
@@ -164,6 +165,8 @@ beforeEach(() => {
   vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
   vi.mocked(findTraexRolloutBySessionId).mockReset();
   vi.mocked(findTraexRolloutBySessionId).mockReturnValue(undefined);
+  vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReset();
+  vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
   vi.mocked(findPiTranscriptBySessionId).mockReset();
   vi.mocked(findPiTranscriptBySessionId).mockReturnValue(undefined);
   vi.mocked(findAidenLatestCheckpointBySessionId).mockReset();
@@ -798,6 +801,30 @@ describe('getSessionTokenUsage', () => {
       context: { usedTokens: 90, windowTokens: 1_000, percentUsed: 9 },
       tokens: { in: 120, out: 12 },
     });
+  });
+
+  it('maps Botmux session ids to TraeX native session ids for usage lookup', () => {
+    vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue('mapped-traex-sid');
+    vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-mapped-traex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 55, output_tokens: 6 },
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'traex',
+      sessionId: 'botmux-sid',
+    })).toMatchObject({
+      in: 55,
+      out: 6,
+    });
+    expect(findTraexSessionIdByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid');
+    expect(findTraexRolloutBySessionId).toHaveBeenCalledWith('mapped-traex-sid');
   });
 
   it('reports TraeX rollouts via the codex fold, capturing the turn_context model', () => {

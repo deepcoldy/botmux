@@ -9,7 +9,7 @@ import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
-import { findTraexRolloutBySessionId } from './traex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
 
@@ -323,7 +323,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'cursor' } : null;
     }
     case 'traex': {
-      const path = cachedTranscriptPathLookup(`traex:${sid}`, null, () => findTraexRolloutBySessionId(sid) ?? null, { retryMiss: q.fresh });
+      const path = cachedTranscriptPathLookup(`traex:${q.sessionId}:${q.cliSessionId ?? ''}`, null, () => {
+        const mappedSid = q.cliSessionId
+          ? undefined
+          : findTraexSessionIdByBotmuxSessionId(q.sessionId);
+        const traexSid = q.cliSessionId || mappedSid || q.sessionId;
+        return findTraexRolloutBySessionId(traexSid) ?? null;
+      }, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
     }
     case 'grok': {

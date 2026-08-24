@@ -36,6 +36,7 @@ import {
   statSync,
 } from 'node:fs';
 import { execSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -53,7 +54,7 @@ import {
 } from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
-import { traeSessionsRoot } from './traex-paths.js';
+import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -87,6 +88,45 @@ export interface TraexRuntimeSnapshot {
 
 const IS_LINUX = platform() === 'linux';
 const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+type DatabaseSyncLike = {
+  prepare(sql: string): StatementSyncLike;
+  close(): void;
+};
+type StatementSyncLike = {
+  all(...params: unknown[]): any[];
+};
+
+let sqliteModule: { DatabaseSync: new (path: string) => DatabaseSyncLike } | null = null;
+let sqliteLoadAttempted = false;
+
+function loadSqlite(): typeof sqliteModule {
+  if (sqliteLoadAttempted) return sqliteModule;
+  sqliteLoadAttempted = true;
+  try {
+    const req = createRequire(import.meta.url);
+    sqliteModule = req('node:sqlite') as typeof sqliteModule;
+  } catch {
+    sqliteModule = null;
+  }
+  return sqliteModule;
+}
+
+function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
+  const mod = loadSqlite();
+  if (!mod) return null;
+  const dbPath = traeStateDbPath();
+  if (!existsSync(dbPath)) return null;
+  let db: DatabaseSyncLike | undefined;
+  try {
+    db = new mod.DatabaseSync(dbPath);
+    return fn(db);
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
 
 type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';
 
@@ -837,4 +877,26 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
     }
   }
   return undefined;
+}
+
+
+/** Find the newest TRAE native session whose first prompt contains Botmux's
+ *  session id. This mirrors Codex's history.jsonl bridge, but TRAE keeps the
+ *  mapping in the `threads` SQLite table. It is intentionally best-effort:
+ *  callers fall back to treating `sessionId` as a native id when unavailable. */
+export function findTraexSessionIdByBotmuxSessionId(botmuxSessionId: string): string | undefined {
+  if (!botmuxSessionId) return undefined;
+  return withTraeDb((db) => {
+    const rows = db.prepare(
+      'SELECT id, first_user_message AS firstMessage FROM threads ORDER BY created_at DESC LIMIT 200',
+    ).all() as { id?: string; firstMessage?: string }[];
+    for (const r of rows) {
+      if (typeof r.id === 'string'
+        && typeof r.firstMessage === 'string'
+        && r.firstMessage.includes(botmuxSessionId)) {
+        return r.id;
+      }
+    }
+    return undefined;
+  }) ?? undefined;
 }
