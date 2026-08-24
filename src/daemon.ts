@@ -85,7 +85,7 @@ import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
-import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
+import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -202,7 +202,7 @@ import {
   mojoLivePatchForSession,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
@@ -21614,8 +21614,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
   setDisplayNameRefresher(refreshBotNameState);
-  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar. These
-  // handlers drive the open-platform console (browser web-session, NOT
+  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar / re-describe.
+  // These handlers drive the open-platform console (browser web-session, NOT
   // getBotClient — so the bot-level gate can't catch them); skip registering
   // them entirely so the dashboard profile actions are inert for a core-only bot.
   if (!cfg.apiOnly) {
@@ -21656,7 +21656,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
-  } // end !cfg.apiOnly (open-platform rename/avatar handlers)
+  // 机器人多语言名片描述读/写（dashboard 档案头「飞书名片描述」入口）：开放平台
+  // 自动化改飞书应用每个已配语言的描述并发布新版本（名片跟随已发布版本，同 rename）。
+  // 只读/回写描述，不改内存 botName/avatar/名册，故无需额外同步。
+  setBotDescriptionManager({
+    read: () => readBotDescriptionsOnOpenPlatform(cfg.larkAppId, cfg.brand),
+    update: descriptions => updateBotDescriptionsOnOpenPlatform(
+      cfg.larkAppId,
+      descriptions,
+      cfg.brand,
+    ),
+  });
+  } // end !cfg.apiOnly (open-platform profile handlers)
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.

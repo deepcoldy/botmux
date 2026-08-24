@@ -6347,6 +6347,46 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // GET/PUT /api/bots/:appId/description — proxy to that bot's daemon. GET
+    // returns the localized descriptions read straight off the Open Platform;
+    // PUT body `{ descriptions: Record<lang, string> }` republishes them. The
+    // daemon owns all validation/publish/language-set semantics; this proxy only
+    // forwards, bounding the PUT body so a malicious client can't buffer freely.
+    let mBotDescription: RegExpMatchArray | null;
+    if (
+      (req.method === 'GET' || req.method === 'PUT') &&
+      (mBotDescription = url.pathname.match(/^\/api\/bots\/([^/]+)\/description$/))
+    ) {
+      const appId = decodeURIComponent(mBotDescription[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(appId, `/api/bot-description`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      for await (const c of req) {
+        received += (c as Buffer).length;
+        // Descriptions are tiny (≤20 langs × ≤120 chars); cap before buffering more.
+        if (received > 64 * 1024) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'body_too_large' }));
+          return;
+        }
+        chunks.push(c as Buffer);
+      }
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-description`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/avatar — proxy to that bot's daemon. Body
     // `{ imageBase64: string }` (512×512 PNG, canvas-normalized by the web UI).
     // The daemon runs the Open Platform automation (upload icon + base_info +
