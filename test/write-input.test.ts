@@ -47,6 +47,7 @@ import {
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
@@ -665,6 +666,44 @@ describe('writeInput: edge cases', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, '');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('cursor: submits then activates the follow-up steer action in tmux', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, 'steer this turn');
+      await vi.runAllTimersAsync();
+      await write;
+
+      expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
+      expect(pty.sendSpecialKeys.mock.calls).toEqual([
+        ['Enter'],
+        ['Enter'],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: submits then activates follow-up steering in raw PTY mode', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeRawPty();
+      const write = adapter.writeInput(pty, 'steer raw turn');
+      await vi.runAllTimersAsync();
+      await write;
+
+      expect(pty.write.mock.calls.map(c => c[0])).toEqual([
+        'steer raw turn',
+        '\r',
+        '\r',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('kimi: settles only the first write for each backend instance', async () => {
