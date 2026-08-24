@@ -118,7 +118,7 @@ import {
   type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
-import { confirm } from './confirm-modal.js';
+import { confirm, promptText } from './confirm-modal.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
@@ -3742,7 +3742,7 @@ function SessionsPage(): React.JSX.Element {
   // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
   // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
   const openDebugTerminal = useCallback(async (): Promise<void> => {
-    const input = window.prompt(t('sessions.debugTerminalPrompt'), '');
+    const input = await promptText({ title: t('sessions.debugTerminal'), message: t('sessions.debugTerminalPrompt') });
     if (input === null) return; // 用户取消
     const workingDir = input.trim();
     const tab = window.open('about:blank', '_blank');
