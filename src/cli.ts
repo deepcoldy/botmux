@@ -7392,6 +7392,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
+  bots invite --chat <chatId> --team <id> --agent <appId>...
+                                       往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
+                                       详见 \`botmux bots invite --help\`
   history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文；
@@ -12673,6 +12676,22 @@ async function cmdUserPromptHook(): Promise<void> {
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
+  if (sub === '--help' || sub === '-h' || sub === 'help') {
+    console.log(`
+botmux bots — 机器人协作花名册 / 团队补人
+
+子命令:
+  bots list [--scope chat|team] [--team <id>] [--session-id ID]
+             列出机器人。默认 chat scope：当前飞书群内的 bot（含 open_id、能力标签、能否可靠 @到）；
+             --scope team：跨机列出同团队、已 opt-in 的 agent（按专长发现，供拉群 / 补人）。
+  bots invite --chat <chatId> --team <id> --agent <appId>...
+             往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进。
+
+补人（invite）的完整参数与 403 前置条件见 \`botmux bots invite --help\`。
+`);
+    return;
+  }
+
   // `bots invite`：往**已存在的团队群**补人（同 team、已 opt-in 的 agent + 各自 owner），
   // 打平台端点4（machine-auth）。独立子命令——与「建新群」的 create-group 语义分开，
   // 不再靠 create-group --chat 区分（那个入口易被误读成"建群"）。在会话/transport 闸门前分流。
@@ -12684,6 +12703,7 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   if (sub !== 'list' && sub !== 'ls' && sub !== '') {
     console.error('用法: botmux bots list [--scope chat|team] [--team <id>] [--session-id ID]');
     console.error('      botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
+    console.error('（完整说明见 botmux bots --help）');
     process.exit(1);
   }
 
@@ -12879,6 +12899,45 @@ async function tryAutoAddPlatformBot(
  * {ok, chatId, invalidBotIds, invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
  */
 async function cmdBotsInvite(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`
+botmux bots invite — 往「已存在的团队群」补人（同团队、已 opt-in 的 agent + 各自 owner）
+
+用法:
+  botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+                     [--json-status]
+
+参数:
+  --chat <chatId>  必填。目标群 chatId（oc_...）。须满足三个前置条件（否则平台按 403 拒绝，见下）。
+  --team <teamId>  团队 id。省略时：本机唯一团队自动用它，多个团队要求显式指定（不猜）。
+  --agent <appId>  至少一个、可多次、按 appId 去重。appId 从 \`botmux bots list --scope team\` 发现。
+  --json-status    可选；在 stdout 单行 chatId 后追加一行 {ok, chatId, invalidBotIds,
+                   invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
+
+行为:
+  - 全程 machine-auth，只认 appId、不需要 @（发起人在别人 bot 进群前根本 @不到它）。
+  - 补人恒把 agent + 各自 owner 一起拉进群；已在群内视作成功（幂等）。
+  - 授权 / opt-in 闸 / 大厅排除全在平台，CLI 零判断、只如实展示平台判定。
+  - 平台机器人（BotmuxPlatform）不在目标群时，会自动用群内本机 bot 当代理把它拉进群再重试；
+    自动添加失败（需群主审批 / 代理 bot 无成员管理 scope）时给出手动添加引导。
+
+目标群前置条件（不满足平台按 403 拒绝）:
+  - 平台机器人（BotmuxPlatform）已在群里     → 否则 platform_bot_not_in_chat（先把它拉进群）
+  - 你本人已在该群                          → 否则 requester_not_in_chat（只能往你自己在场的群补人）
+  - 非机器人大厅                            → 否则 chat_is_hall（大厅是 bot-only 身份登记群）
+  - 目标群属于本团队                        → 否则 chat_not_in_team
+
+与相邻命令的区别（别混）:
+  - create-group --team：把「同团队但不在任何共同群」的 agent + owner 新建成一个聚焦新群。
+  - bots invite --chat：群已经在了、且平台机器人也在，往里补同团队的人（含各自 owner）。
+  - /invite（飞书群内 slash）：把 bot 加进当前群，走飞书原生加成员，限同租户、只拉 bot 不带 owner。
+
+输出:
+  - 成功 stdout 输出单行 chatId（与 create-group 一致）；失败 / 部分失败 stderr 打提示并非零退出。
+`);
+    return;
+  }
+
   const { addTeamGroupMembers, fetchTeams, describeTeamAgentsFailure, rateLimitRetryHint, shouldTryAutoAddPlatformBot } =
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
