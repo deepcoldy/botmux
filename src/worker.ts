@@ -267,6 +267,7 @@ import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionId
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
+import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -13356,6 +13357,27 @@ async function spawnCli(
       // Preserve the existing fail-safe: the adapter probe / two-tier fallback
       // below still decides whether resume is possible.
       log(`WARN Claude resume transcript sync failed: ${(err as Error).message}`);
+    }
+  }
+  // Pre-exact-dir OMP versions stored transcripts in cwd-derived shared
+  // buckets. Only a cold, non-adopt resume may copy one uniquely attributable
+  // legacy JSONL into the exact effective-id directory. The adapter probe below
+  // intentionally stays synchronous and pure: it only decides whether this
+  // preflight published an exact resume target.
+  if (cfg.cliId === 'oh-my-pi' && effectiveResume && !willReattachPersistent && !cfg.adoptMode) {
+    const exactOmpSessionDir = ompSessionDir(effectiveAdapterSessionId);
+    const migrated = migrateLegacyOmpSession(
+      effectiveAdapterSessionId,
+      cfg.workingDir,
+      exactOmpSessionDir,
+    );
+    if (migrated.status === 'migrated') {
+      log(`OMP legacy resume transcript migrated: ${migrated.sourcePath} → ${migrated.targetPath}`);
+      if (migrated.artifactDirectoryPreserved) {
+        log(`OMP legacy artifact directory preserved outside sandbox: ${migrated.sourcePath.slice(0, -'.jsonl'.length)}`);
+      }
+    } else if (migrated.reason !== 'no-match' && migrated.reason !== 'exact-history-exists') {
+      log(`WARN OMP legacy resume migration skipped (${migrated.reason}${migrated.detail ? `: ${migrated.detail}` : ''})`);
     }
   }
   // Hermes stores sessions in a SQLite state.db (not cwd-scoped JSONL). Resolve

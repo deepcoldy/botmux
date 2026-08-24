@@ -113,10 +113,15 @@ describe('resolveFileBridgePath (oh-my-pi)', () => {
 
   it('resolves only the newest transcript inside the exact Botmux session directory', () => {
     const dir = join(ROOT, '.omp', 'agent', 'sessions', 'botmux', 'sid-omp');
+    const legacyDir = join(ROOT, '.omp', 'agent', 'sessions', '-legacy-project');
     mkdirSync(dir, { recursive: true });
+    mkdirSync(legacyDir, { recursive: true });
     const path = join(dir, 'session.jsonl');
+    const legacyPath = join(legacyDir, 'legacy.jsonl');
     writeFileSync(path, '');
+    writeFileSync(legacyPath, 'legacy history must not be attached');
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).toBe(path);
+    expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).not.toBe(legacyPath);
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sibling' })).toBeUndefined();
   });
 });

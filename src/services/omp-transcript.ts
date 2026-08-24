@@ -41,7 +41,8 @@ export interface OmpDrainOptions {
 
 type OmpTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
 
-function visibleText(content: unknown): string {
+/** Canonical text projection for OMP message content. */
+export function ompMessageText(content: unknown): string {
   if (typeof content === 'string') return content.trim();
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
@@ -220,7 +221,7 @@ export function drainOmpTranscript(
           state = {};
         }
       }
-      const text = visibleText(message.content);
+      const text = ompMessageText(message.content);
       if (text) {
         events.push({
           uuid: `${path}:${lineStart}`,
@@ -251,7 +252,7 @@ export function drainOmpTranscript(
       uuid: `${path}:${lineStart}`,
       timestampMs: timestampMs(entry, message),
       kind: 'assistant_final',
-      text: visibleText(message.content),
+      text: ompMessageText(message.content),
       ...terminalOutcome(stopReason as OmpTerminalStopReason),
     };
     state = {
