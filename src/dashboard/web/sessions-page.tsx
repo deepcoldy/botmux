@@ -119,6 +119,7 @@ import {
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
 import { confirm, promptText } from './confirm-modal.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
@@ -3330,7 +3331,7 @@ function SessionsPage(): React.JSX.Element {
     // do NOT imperatively mutate the button here — the board's locate button renders
     // its icon via dangerouslySetInnerHTML and a textContent write permanently wipes it.
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST', headers: controlCsrfHeaders() });
       const body = await r.json();
       if (body.ok) return true;
       toast(`Locate failed: ${body.error ?? r.status}`, { kind: 'error' });
