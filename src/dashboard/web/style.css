@@ -19421,7 +19421,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
   padding: 8px 0 2px;
   min-width: 0;
 }
-.settings-page .settings-group-prefix-editor .settings-field-row {
+.settings-page .settings-group-prefix-editor .settings-field-row,
+/* OAuth 回调基址是一条完整 URL，挤在 240px 的右列里读不全，跟群名前缀一样竖排。 */
+.settings-page .settings-oauth-redirect-base-editor .settings-field-row {
   grid-template-columns: 1fr;
   align-items: start;
   gap: 8px;
@@ -27594,6 +27596,56 @@ button.skills-issue-badge:hover {
 }
 
 .feed-group-auth-open:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+/* 会话群标签行的次级动作：修复开放平台回调白名单。刻意做成链接态而非按钮，
+   免得跟主操作「一键授权」抢视觉权重（它才是用户 99% 的时候要点的那个）。 */
+.bd-sg-repair-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.bd-sg-repair-link:hover:not(:disabled) { color: var(--accent-strong); text-decoration: underline; }
+.bd-sg-repair-link:disabled { color: var(--muted); cursor: default; }
+
+.bd-sg-repair-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+/* .bd-body .bd-row :where(label, .bd-field) 把行内所有 label 变成 grid，这个
+   复选框标签要留在流式行里，显式覆盖回 inline-flex（特异性需盖过那条规则）。 */
+.bot-defaults-page .bd-body .bd-row .bd-sg-repair-all { display: inline-flex; }
+.bd-sg-repair-all input[type=checkbox] { margin: 0; }
+
+/* 修复结果 / 诊断提示：多行竖排，行内可夹「修复配置」链接与安全设置深链。 */
+.bd-sg-repair-hint {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+/* per-bot 结果是一行一个 bot，竖排才读得清；诊断提示则是一句话 + 两个入口，
+   保持横排折行。 */
+.bd-sg-repair-hint[data-sg-tag-repair-feedback="done"] {
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+}
+.bd-sg-repair-hint [data-sg-tag-repair-item="not_owned"],
+.bd-sg-repair-hint [data-sg-tag-repair-item="failed"] { color: var(--warning); }
+.feed-group-auth-card .bd-sg-repair-hint { margin-top: 14px; }
 
 .cs-advanced-fields .cs-feed-group {
   min-width: 0;

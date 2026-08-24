@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-open-platform-automation.test.ts
  */
-import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -11,13 +11,16 @@ import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
   BOT_BASELINE_CALLBACKS,
+  BOTMUX_REDIRECT_URL,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
   buildSafeSettingPayload,
   buildScopeUpdatePayload,
+  collectBotmuxRedirectUrls,
   createFeishuOpenPlatformApp,
   createOpenPlatformApiClient,
   extractOpenPlatformCsrfToken,
+  extractOpenPlatformRedirectUrls,
   extractOpenPlatformSessionIdentity,
   extractOpenPlatformScopeEntries,
   getCookieHeader,
@@ -30,6 +33,7 @@ import {
   safeErrorMessage,
   type StoredCookie,
   vcListenerEventGateError,
+  writeRedirectWhitelist,
   writeStoredCookiesToSessionFile,
 } from '../src/setup/open-platform-automation.js';
 
@@ -212,6 +216,172 @@ describe('Open Platform payload helpers', () => {
       isDeveloperPanel: true,
     });
     expect(buildSafeSettingPayload('cli_x').redirectURL).toEqual(['http://127.0.0.1:9768/callback']);
+  });
+});
+
+describe('redirect 白名单读→合并→写', () => {
+  /** postJson 桩：读接口返回 `read`（或抛错），写接口按 `writeResults` 顺序成功/失败。 */
+  function stubPostJson(opts: {
+    read?: unknown;
+    readThrows?: boolean;
+    writeErrors?: Array<Error | null>;
+  }) {
+    const reads: string[] = [];
+    const writes: Array<{ path: string; body: any }> = [];
+    let writeIndex = 0;
+    const postJson = async (path: string, body?: unknown): Promise<unknown> => {
+      if (path.includes('/safe_setting/update/')) {
+        writes.push({ path, body });
+        const err = (opts.writeErrors ?? [])[writeIndex++];
+        if (err) throw err;
+        return { code: 0 };
+      }
+      reads.push(path);
+      if (opts.readThrows) throw new Error('safe_setting read endpoint missing');
+      return opts.read;
+    };
+    return { postJson, reads, writes };
+  }
+
+  const readPayload = (redirectURL: unknown) => ({
+    code: 0,
+    data: { Head: { RespFormat: 0 }, allowRefreshToken: true, ipWhiteList: [], redirectURL, safeServerDomain: [] },
+  });
+
+  it('parses the live safe_setting shape and tells "empty list" apart from "unreadable"', () => {
+    // 实测形态（feishu.cn 租户）：data.redirectURL 是字符串数组。
+    expect(extractOpenPlatformRedirectUrls(readPayload([
+      'http://127.0.0.1:9768/callback',
+      'http://10.1.2.3:7891/oauth/callback',
+    ]))).toEqual(['http://127.0.0.1:9768/callback', 'http://10.1.2.3:7891/oauth/callback']);
+    // 未包 data 的扁平返回也认。
+    expect(extractOpenPlatformRedirectUrls({ redirectURL: ['https://a.example.com/oauth/callback'] }))
+      .toEqual(['https://a.example.com/oauth/callback']);
+    // 去空白 + 去重 + 丢掉非字符串项。
+    expect(extractOpenPlatformRedirectUrls(readPayload([' https://a/cb ', 'https://a/cb', 42, null])))
+      .toEqual(['https://a/cb']);
+    // 读到了、但线上一条都没配 → 空数组（可以放心合并）。
+    expect(extractOpenPlatformRedirectUrls(readPayload([]))).toEqual([]);
+    // 读不出来 → null（只能退化成覆盖写）。畸形与端点不存在都归到这一类。
+    expect(extractOpenPlatformRedirectUrls(readPayload('not-an-array'))).toBeNull();
+    expect(extractOpenPlatformRedirectUrls({ code: 0 })).toBeNull();
+    expect(extractOpenPlatformRedirectUrls({ code: 0, data: {} })).toBeNull();
+    expect(extractOpenPlatformRedirectUrls(null)).toBeNull();
+    expect(extractOpenPlatformRedirectUrls('nonsense')).toBeNull();
+  });
+
+  it('merges with the live whitelist instead of overwriting the user\'s own entries', async () => {
+    const stub = stubPostJson({ read: readPayload(['https://console.example.com/my-own-callback']) });
+    const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [
+      BOTMUX_REDIRECT_URL,
+      'https://m-abc.example.com/oauth/callback',
+    ]);
+
+    expect(stub.reads).toEqual(['/developers/v1/safe_setting/cli_x']);
+    expect(result.status).toBe('updated');
+    expect(stub.writes).toHaveLength(1);
+    // 用户自己配的那条必须原样留着——历史实现的全量覆盖会把它静默清掉。
+    expect(stub.writes[0].body.redirectURL).toEqual([
+      BOTMUX_REDIRECT_URL,
+      'https://console.example.com/my-own-callback',
+      'https://m-abc.example.com/oauth/callback',
+    ]);
+    expect(stub.writes[0].body.clientId).toBe('cli_x');
+  });
+
+  it('short-circuits without any write when every wanted URL is already live', async () => {
+    const stub = stubPostJson({
+      read: readPayload([BOTMUX_REDIRECT_URL, 'https://m-abc.example.com/oauth/callback', 'https://other/cb']),
+    });
+    const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [
+      BOTMUX_REDIRECT_URL,
+      'https://m-abc.example.com/oauth/callback',
+    ]);
+
+    expect(result.status).toBe('unchanged');
+    expect(stub.writes).toEqual([]);
+  });
+
+  it('falls back to overwriting with the wanted list when the read endpoint is unusable', async () => {
+    const stub = stubPostJson({ readThrows: true });
+    const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [
+      BOTMUX_REDIRECT_URL,
+      'https://m-abc.example.com/oauth/callback',
+    ]);
+
+    // 读不到就只能退化成今天的行为：至少保证 botmux 自己的链路可用。
+    expect(result.existing).toBeNull();
+    expect(result.status).toBe('updated');
+    expect(stub.writes).toHaveLength(1);
+    expect(stub.writes[0].body.redirectURL).toEqual([
+      BOTMUX_REDIRECT_URL,
+      'https://m-abc.example.com/oauth/callback',
+    ]);
+  });
+
+  it('retries once with the minimal set when the merged write is rejected', async () => {
+    const stub = stubPostJson({
+      read: readPayload(['https://console.example.com/my-own-callback']),
+      writeErrors: [new Error('code=1 msg=invalid redirect url'), null],
+    });
+    const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [
+      BOTMUX_REDIRECT_URL,
+      'http://badly-formatted-host/oauth/callback',
+    ]);
+
+    expect(result.status).toBe('updated_fallback');
+    expect(stub.writes).toHaveLength(2);
+    // 兜底集 = 线上现值 ∪ 127.0.0.1：保住核心那条，同时仍不删用户的。
+    expect(stub.writes[1].body.redirectURL).toEqual([
+      BOTMUX_REDIRECT_URL,
+      'https://console.example.com/my-own-callback',
+    ]);
+  });
+
+  it('does not resend an identical payload when the minimal set equals the rejected one', async () => {
+    const stub = stubPostJson({
+      read: readPayload([]),
+      writeErrors: [new Error('code=1 msg=rejected')],
+    });
+
+    await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', [BOTMUX_REDIRECT_URL]))
+      .rejects.toThrow('rejected');
+    expect(stub.writes).toHaveLength(1);
+  });
+
+  it('collects every redirect base botmux knows about, loopback first', () => {
+    const prevHome = process.env.HOME;
+    const prevPublic = process.env.BOTMUX_PUBLIC_URL;
+    // 两个不同的 HOME：readGlobalConfig 按路径缓存 2s，同一路径改文件读不到新值。
+    const emptyHome = mkdtempSync(join(tmpdir(), 'botmux-redirect-home-a-'));
+    const configuredHome = mkdtempSync(join(tmpdir(), 'botmux-redirect-home-b-'));
+    mkdirSync(join(configuredHome, '.botmux'));
+    writeFileSync(
+      join(configuredHome, '.botmux', 'config.json'),
+      JSON.stringify({ oauthRedirectBase: 'http://10.1.2.3:7891/' }),
+    );
+    try {
+      // 空 HOME（没有 config.json / platform.json）+ 自建反代 → 只多出反代那条。
+      process.env.HOME = emptyHome;
+      process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com/';
+      expect(collectBotmuxRedirectUrls()).toEqual([
+        BOTMUX_REDIRECT_URL,
+        'https://botmux.example.com/oauth/callback',
+      ]);
+
+      // 手填的 oauthRedirectBase 也要进白名单（今天一条都没写进去，正是要手动粘贴的根因）。
+      process.env.HOME = configuredHome;
+      delete process.env.BOTMUX_PUBLIC_URL;
+      expect(collectBotmuxRedirectUrls()).toEqual([
+        BOTMUX_REDIRECT_URL,
+        'http://10.1.2.3:7891/oauth/callback',
+      ]);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevPublic === undefined) delete process.env.BOTMUX_PUBLIC_URL;
+      else process.env.BOTMUX_PUBLIC_URL = prevPublic;
+    }
   });
 });
 
@@ -1007,8 +1177,12 @@ describe('automateOpenPlatformSetup', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.sessionSource).toBe('botmux_cache');
+    // redirect 白名单紧跟 csrf 就位（/app/cli_x/auth 之后第一件事）：读一次现值再写，
+    // 不再排在发版前——后面任何一步提前 return 都不该把白名单一起拖死。
     expect(calls.filter(call => new URL(call.url).host === 'open.feishu.cn').map(call => new URL(call.url).pathname)).toEqual([
       '/app/cli_x/auth',
+      '/developers/v1/safe_setting/cli_x',
+      '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
       '/developers/v1/robot/switch/cli_x',
@@ -1021,12 +1195,12 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/callback/cli_x',
       '/developers/v1/callback/update/cli_x',
       '/developers/v1/callback/cli_x',
-      '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/visible/online/cli_x',
       '/developers/v1/app_version/list/cli_x',
       '/developers/v1/app_version/create/cli_x',
       '/developers/v1/publish/commit/cli_x/v1',
     ]);
+    if (result.ok) expect(result.redirectConfigured).toBe(true);
     const updateCall = calls.find(call => call.url.includes('/scope/update/'));
     expect(new Headers(updateCall?.init.headers).get('x-csrf-token')).toBe('csrf_auto');
     expect(new Headers(updateCall?.init.headers).get('cookie')).toBe('session=secret-cookie-value');
@@ -1084,6 +1258,8 @@ describe('automateOpenPlatformSetup', () => {
     expect(result.ok).toBe(true);
     expect(calls.filter(call => new URL(call.url).host === 'open.larkoffice.com').map(call => new URL(call.url).pathname)).toEqual([
       '/app/cli_x/auth',
+      '/developers/v1/safe_setting/cli_x',
+      '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
       '/developers/v1/robot/switch/cli_x',
@@ -1096,7 +1272,6 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/callback/cli_x',
       '/developers/v1/callback/update/cli_x',
       '/developers/v1/callback/cli_x',
-      '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/visible/online/cli_x',
       '/developers/v1/app_version/list/cli_x',
       '/developers/v1/app_version/create/cli_x',
@@ -1145,6 +1320,63 @@ describe('automateOpenPlatformSetup', () => {
     // 权限被租户拒绝不阻塞后续：redirect / 版本 / 发布仍然走完。
     expect(calls.some(u => u.includes('/safe_setting/update/'))).toBe(true);
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+  });
+
+  it('still writes the redirect whitelist when a later step aborts the whole run', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      calls.push(href);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      // scope/all 失败会让整个流程提前 return——白名单必须在这之前就已经落地。
+      if (href.includes('/scope/all/')) return new Response('forbidden', { status: 403 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({ appId: 'cli_x', sessionFilePath: sessionFile, fetchImpl });
+
+    expect(result.ok).toBe(false);
+    expect(calls.some(u => u.includes('/safe_setting/update/cli_x'))).toBe(true);
+    if (!result.ok) expect(result.redirectConfigured).toBe(true);
+  });
+
+  it('keeps going and reports a warning when the redirect whitelist cannot be written', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/safe_setting/update/')) return Response.json({ code: 1, msg: 'redirect rejected' });
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+
+    // 白名单写不进去不该拖垮建 bot：事件/版本照常走完，只是显式带回「还差这一步」。
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.redirectConfigured).toBe(false);
+      expect(result.redirectWarning).toContain('redirect');
+      expect(result.versionId).toBe('v1');
+    }
   });
 
   it('skips scope update when no manifest scope exists in this tenant catalog, still succeeding', async () => {

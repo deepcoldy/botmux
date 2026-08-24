@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
   parseOnlineVisibility,
   VisibilityParseError,
@@ -139,6 +140,14 @@ export type OpenPlatformAutomationResult =
       missingVcEvents: string[];
       /** 回读确认事件接收方式已是长连接(ok:true 时恒为 true,显式带回供门函数统一判定)。 */
       eventModeReady: boolean;
+      /**
+       * redirect 白名单是否写成功。白名单缺失 = authorize 直接 20029 硬失败
+       * (群聊模式 / 会话群标签 / `/login` 全部授权不了),但它不阻断建 bot,
+       * 所以必须显式带回,让调用方把「还差这一步」翻译成人话。
+       */
+      redirectConfigured: boolean;
+      /** redirect 白名单写入失败的原因(仅 redirectConfigured=false 时有)。 */
+      redirectWarning?: string;
       /** Managed onboarding only: exact same-session event mode readback. */
       eventMode?: number;
       /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
@@ -172,6 +181,10 @@ export type OpenPlatformAutomationResult =
       missingVcEvents?: string[];
       /** 事件接收方式是否回读确认为长连接(走到订阅阶段才有;早期失败为 undefined)。 */
       eventModeReady?: boolean;
+      /** redirect 白名单是否写成功(csrf 就位后立刻尝试,失败不阻断本流程)。 */
+      redirectConfigured?: boolean;
+      /** redirect 白名单写入失败的原因。 */
+      redirectWarning?: string;
       /** Managed onboarding exact event-mode ACK, preserved across later scope propagation failure. */
       eventMode?: number;
       /** Managed onboarding exact baseline count ACK, preserved across later scope propagation failure. */
@@ -412,8 +425,137 @@ export function buildSafeSettingPayload(appId: string, extraRedirectUrls: string
     clientId: appId,
     // 默认本机回贴地址 + 可选的 dashboard 自动回调地址（global-config
     // oauthRedirectBase 场景）。去重保持幂等。
+    // ⚠️ 这里是**全量覆盖**语义：给什么，白名单就是什么。调用方必须先用
+    // {@link writeRedirectWhitelist} 读回线上现值并合并，不要直接拿几条
+    // botmux 自己的地址来调它——那会把用户手配的其它回调地址静默清掉。
     redirectURL: [...new Set([BOTMUX_REDIRECT_URL, ...extraRedirectUrls])],
   };
+}
+
+/**
+ * botmux 自己知道的、应当出现在 redirect 白名单里的全部回调地址。
+ *
+ * 只有 `http://127.0.0.1:9768/callback` 是常量兜底（粘贴回调那条链路）；另外三条
+ * 都是「本机 dashboard 对外可达基址」的不同来源，存在才追加 `<base>/oauth/callback`：
+ *   • `oauthRedirectBase`（用户在 global-config 里手填的对外基址）
+ *   • `platformMachineBaseUrl()`（接了中心平台 → `https://m-<machineId>.<平台域名>`）
+ *   • `publicReverseProxyBaseUrl()`（自建反代 `BOTMUX_PUBLIC_URL`）
+ * 今天这三条一条都没写进去，正是「配了 oauthRedirectBase 也还是要手动粘贴回调」的根因。
+ *
+ * ⚠️ 故意**不**推导「本机 host:port」：飞书白名单对**非 loopback 的明文 http**
+ * 到底收不收、收了 authorize 时会不会仍报 20029，都还没实测过（见方案 T2）。
+ * 猜一条塞进去，失败时会连累整批写入（虽然有最小集兜底，但白白多一次往返），
+ * 而且 LAN 地址对话题里的其他人本来就不一定可达。等 T2 实测有结论再加。
+ */
+export function collectBotmuxRedirectUrls(): string[] {
+  const urls: string[] = [BOTMUX_REDIRECT_URL];
+  const pushBase = (base: string | null | undefined) => {
+    const trimmed = base?.trim().replace(/\/+$/, '');
+    if (trimmed && /^https?:\/\//.test(trimmed)) urls.push(`${trimmed}/oauth/callback`);
+  };
+  // 三个来源各自独立 try/catch：配置读不动 / 未绑定平台都不该拖垮其它两条。
+  try { pushBase(readGlobalConfig().oauthRedirectBase); } catch { /* config unavailable */ }
+  try { pushBase(platformMachineBaseUrl()); } catch { /* not bound to a platform */ }
+  try { pushBase(publicReverseProxyBaseUrl()); } catch { /* env unavailable */ }
+  return uniqueStrings(urls);
+}
+
+/**
+ * 从 `POST /developers/v1/safe_setting/<appId>` `{}` 的返回里解析现有 redirect 白名单。
+ *
+ * 返回 `null` 表示**没读出来**（端点不存在 / 结构变了 / 报错），与「读到了但是空数组」
+ * 严格区分：前者只能退化成覆盖写（保住 botmux 自己能用），后者可以放心合并。
+ * 实测返回形态（feishu.cn 租户，2026-08）：
+ * `{code:0, data:{allowRefreshToken, ipWhiteList:[], redirectURL:[...], safeServerDomain:[]}}`。
+ */
+export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | null {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const raw = data.redirectURL ?? data.redirectUrl ?? data.redirectURLs;
+  if (!Array.isArray(raw)) return null;
+  return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
+}
+
+/** `automateOpenPlatformSetup` 内联 postJson / `OpenPlatformApiClient.postJson` 的公共形状。 */
+export type OpenPlatformPostJson = (path: string, body?: unknown) => Promise<unknown>;
+
+export interface RedirectWhitelistWriteResult {
+  /** unchanged=幂等短路没发写请求；updated=写了全集；updated_fallback=全集被拒、退到最小集。 */
+  status: 'unchanged' | 'updated' | 'updated_fallback';
+  /** 线上现有白名单（读不出来时为 null）。 */
+  existing: string[] | null;
+  /** 本次实际落地（或确认已在线上）的白名单。 */
+  redirectUrls: string[];
+}
+
+/**
+ * 读 → 合并 → 写 redirect 白名单，**绝不删用户已有条目**。
+ *
+ * `buildSafeSettingPayload` 是全量覆盖语义，历史实现直接拿 botmux 自己那几条去调，
+ * 于是每次建 bot / 权限自愈都把用户在后台手配的其它回调地址静默清空。这里先读回
+ * 线上现值再取并集；读不出来才退化成覆盖写（保底让 botmux 自己的链路能用）。
+ *
+ * `postJson` 走参数注入而不是闭包捕获，是为了下一阶段的「批量修复存量 bot」能直接
+ * 复用同一段逻辑——那条路径必须走 {@link createOpenPlatformApiClient}（它的 referer
+ * 是通用的 `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup`
+ * 里那份 referer 绑死单个 appId 的内联 postJson。
+ *
+ * 写失败时兜底重试一次「线上现值 ∪ 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被
+ * console 拒掉时，整批写入会一起失败，最小集能保住最核心的粘贴回调链路。两次都失败
+ * 才抛出，由调用方记成 warning（不阻断建 bot）。
+ */
+export async function writeRedirectWhitelist(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  wanted: string[] = collectBotmuxRedirectUrls(),
+): Promise<RedirectWhitelistWriteResult> {
+  let existing: string[] | null = null;
+  try {
+    existing = extractOpenPlatformRedirectUrls(await postJson(`/developers/v1/safe_setting/${appId}`, {}));
+  } catch {
+    // 端点不存在 / 报错 → 当作读不出来，走覆盖写降级分支。
+    existing = null;
+  }
+
+  const wantedUrls = uniqueStrings(wanted);
+  if (existing !== null && wantedUrls.every(url => existing!.includes(url))) {
+    // 幂等短路：想要的全在线上了，一次写请求都不发。
+    return { status: 'unchanged', existing, redirectUrls: existing };
+  }
+
+  const merged = existing === null ? wantedUrls : uniqueStrings([...existing, ...wantedUrls]);
+  const mergedPayload = buildSafeSettingPayload(appId, merged);
+  try {
+    await postJson(`/developers/v1/safe_setting/update/${appId}`, mergedPayload);
+    return { status: 'updated', existing, redirectUrls: mergedPayload.redirectURL };
+  } catch (err: any) {
+    const minimalPayload = buildSafeSettingPayload(
+      appId,
+      existing === null ? [] : uniqueStrings([...existing, BOTMUX_REDIRECT_URL]),
+    );
+    // 最小集与刚被拒的全集一样 → 失败与「多余条目」无关，重发同一份没有意义。
+    if (sameRedirectSet(minimalPayload.redirectURL, mergedPayload.redirectURL)) throw err;
+    try {
+      await postJson(`/developers/v1/safe_setting/update/${appId}`, minimalPayload);
+    } catch (fallbackErr: any) {
+      // `cause` 挂首次失败的**原始错误对象**（而不是只把它拼进字符串）：批量修复
+      // 要靠 `OpenPlatformApiError` 的 status/code 把「这个 app 不属于当前登录账号」
+      // （403 / code=10003）与普通写失败分开，字符串里拿不到状态码。首次失败的文案
+      // 不重复拼进 message，交给 safeErrorMessage 顺 cause 链取——否则同一句会出现两遍。
+      throw new Error(
+        `全集与最小集兜底两次写入均失败（最小集: ${safeErrorMessage(fallbackErr)}）`,
+        { cause: err },
+      );
+    }
+    return { status: 'updated_fallback', existing, redirectUrls: minimalPayload.redirectURL };
+  }
+}
+
+function sameRedirectSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every(item => set.has(item));
 }
 
 /**
@@ -630,7 +772,12 @@ export async function automateOpenPlatformSetup(
 ): Promise<OpenPlatformAutomationResult> {
   const brand = options.brand ?? 'feishu';
   if (brand !== 'feishu') {
-    return { ok: false, reason: 'unsupported_brand', message: '开放平台自动配置当前只支持 feishu.cn 租户' };
+    return {
+      ok: false,
+      reason: 'unsupported_brand',
+      message: '开放平台自动配置当前只支持 feishu.cn 租户',
+      redirectConfigured: false,
+    };
   }
 
   const fetcher = options.fetchImpl ?? fetch;
@@ -653,6 +800,7 @@ export async function automateOpenPlatformSetup(
       reason: preparedSession.reason,
       message: `获取 Feishu Web session 失败: ${preparedSession.message}`,
       sessionFile: preparedSession.sessionFile,
+      redirectConfigured: false,
     };
   }
 
@@ -680,7 +828,13 @@ export async function automateOpenPlatformSetup(
       csrfToken = extractOpenPlatformCsrfToken(homePage.text);
     }
   } catch (err: any) {
-    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: 'network',
+      message: `读取开放平台页面失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      redirectConfigured: false,
+    };
   }
   if (!csrfToken) {
     return {
@@ -689,6 +843,7 @@ export async function automateOpenPlatformSetup(
       message:
         'Feishu session 可读取，但开放平台页面没有返回 window.csrfToken；可能需要在浏览器完成开放平台登录',
       sessionFile,
+      redirectConfigured: false,
     };
   }
 
@@ -720,6 +875,20 @@ export async function automateOpenPlatformSetup(
     return data;
   };
 
+  // redirect 白名单：csrf 一就位就立刻写,**不再留到流程末尾**。
+  // 后面的 scope 读取 / robot 与事件开关 / 核心事件回读 任意一步失败都会提前
+  // return,把白名单一起拖死;而白名单缺失是 authorize 的**硬失败**(20029,用户
+  // 连飞书授权页都进不去,群聊模式 p2pMode=group、会话群标签、`/login` 全部授权
+  // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
+  let redirectConfigured = false;
+  let redirectWarning: string | undefined;
+  try {
+    await writeRedirectWhitelist(postJson, options.appId);
+    redirectConfigured = true;
+  } catch (err: any) {
+    redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;
+  }
+
   let allScopesPayload: unknown;
   try {
     allScopesPayload = await postJson(`/developers/v1/scope/all/${options.appId}`);
@@ -729,6 +898,8 @@ export async function automateOpenPlatformSetup(
       reason: openPlatformOwnerAccessDenied(err) ? 'owner_session_mismatch' : 'api_error',
       message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`,
       sessionFile,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 
@@ -766,6 +937,8 @@ export async function automateOpenPlatformSetup(
       reason: 'api_error',
       message: `启用机器人或长连接事件能力失败: ${safeErrorMessage(err)}`,
       sessionFile,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 
@@ -905,18 +1078,12 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 
   try {
-    // 自动回调场景：global-config oauthRedirectBase 指向本机 dashboard 时，把
-    // `<base>/oauth/callback` 一并写入 redirect 白名单，authorize 才允许回跳。
-    let extraRedirects: string[] = [];
-    try {
-      const base = readGlobalConfig().oauthRedirectBase?.trim().replace(/\/+$/, '');
-      if (base && /^https?:\/\//.test(base)) extraRedirects = [`${base}/oauth/callback`];
-    } catch { /* config unavailable → default only */ }
-    await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId, extraRedirects));
     // 原样镜像**线上版本**的可见范围（白/黑名单都带）——绝不注入「当前 Web
     // session 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 /
     // 选择已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄
@@ -945,6 +1112,8 @@ export async function automateOpenPlatformSetup(
         eventWarning,
         missingVcEvents,
         eventModeReady,
+        redirectConfigured,
+        redirectWarning,
       };
     }
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
@@ -964,6 +1133,8 @@ export async function automateOpenPlatformSetup(
         eventWarning,
         missingVcEvents,
         eventModeReady,
+        redirectConfigured,
+        redirectWarning,
       };
     }
     if (versionId) {
@@ -981,6 +1152,8 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      redirectConfigured,
+      redirectWarning,
       ...(options.requireVerifiedEvents
         ? {
             eventMode: eventState?.eventMode,
@@ -999,6 +1172,8 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 }

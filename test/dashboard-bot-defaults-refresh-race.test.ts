@@ -216,7 +216,10 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
     const renderer = renderRow('app_old');
     await flush();
     const authButton = () => renderer.root.findByProps({ 'data-action': 'session-group-tag-auth' });
-    act(() => { authButton().props.onClick(); });
+    // startAuth now awaits the silent redirect-whitelist repair BEFORE minting the
+    // auth URL (the fetch stub above rejects that call, which is exactly the
+    // non-blocking path), so the auth POST only goes out after a microtask drain.
+    await flush(() => { authButton().props.onClick(); });
     expect(postUrls).toEqual(['/api/bots/app_old/session-group-tag-auth']);
 
     // Bot switch while the old bot's POST is in flight, THEN its response
@@ -229,7 +232,7 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
     expect(authButton().props.disabled).toBe(false);
 
     // Positive control: the new bot's own auth flow still opens ITS page.
-    act(() => { authButton().props.onClick(); });
+    await flush(() => { authButton().props.onClick(); });
     await flush(() => newAuth.resolve(jsonResponse({ ok: true, authUrl: 'https://auth.example/NEW-BOT' })));
     expect(open).toHaveBeenCalledTimes(1);
     expect(open).toHaveBeenCalledWith('https://auth.example/NEW-BOT', '_blank', 'noopener');
@@ -251,7 +254,9 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
 
     const renderer = renderRow('app_old');
     await flush();
-    act(() => { renderer.root.findByProps({ 'data-action': 'session-group-tag-auth' }).props.onClick(); });
+    // Drain past the silent repair call so the auth POST is genuinely in flight
+    // when the bot switch happens (that is the race this test is about).
+    await flush(() => { renderer.root.findByProps({ 'data-action': 'session-group-tag-auth' }).props.onClick(); });
 
     await flush(() => switchBot(renderer, 'app_new'));
     // The old bot's POST fails late — the error belongs to the previous

@@ -470,9 +470,14 @@ export async function applyScopesUnverified(
 
 /**
  * setup 后 "还要手动点的步骤" 结构化数据. 跟 cli.ts 的 printRemainingSteps + README
- * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 按需重定向 URL); PersonalAgent
+ * "5 分钟快速接入" 一致: 主线就两步 (权限申请 + 重定向 URL); PersonalAgent
  * 应用默认订阅事件 + bot 能力, 不在主线提示, 收不到消息时见 README 的 fallback
  * 自查清单.
+ *
+ * 重定向 URL 曾被写成 "按需, 可跳过" —— 那是误导. 群聊模式 (p2pMode=group)、
+ * 会话群标签 (feed-group) 和 /login 都要走 OAuth 拿用户 token, 白名单里没有回调
+ * 地址时 authorize 直接报 20029, 用户连飞书授权页都打不开. 只有纯话题模式且从不
+ * 用 /login 才真的用不上它.
  */
 export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): RemainingStep[] {
   return [
@@ -483,7 +488,8 @@ export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): Rem
     },
     {
       title:
-        '添加重定向 URL http://127.0.0.1:9768/callback (按需, 用于 botmux 内 /login 跨用户调 API)',
+        '添加重定向 URL http://127.0.0.1:9768/callback '
+        + '(群聊模式 p2pMode=group / 会话群标签 feed-group / /login 必需, 用于跨用户调 API; 缺了会报 20029)',
       url: `${buildAppHomeDeepLink(appId, brand)}/safe`,
     },
   ];

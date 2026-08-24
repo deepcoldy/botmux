@@ -845,6 +845,80 @@ describe('applySettingsWrite — scheduleTimeZone', () => {
   });
 });
 
+// oauthRedirectBase 是 OAuth 零粘贴授权的输入：授权链接回跳 `<base>/oauth/callback`，
+// 而 dashboard 的接收器是 pathname 精确匹配。所以只收 http(s) 的 origin，路径 / query /
+// fragment / 凭证一律拒——用户填错要在保存这一刻就知道，而不是等飞书跳回来才发现。
+describe('applySettingsWrite — oauthRedirectBase', () => {
+  it('persists a valid https origin', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: 'https://botmux.example.com' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'https://botmux.example.com' });
+  });
+
+  it('accepts plain http with an explicit port (LAN / 自建反代场景)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: 'http://10.1.2.3:7891' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'http://10.1.2.3:7891' });
+  });
+
+  it('strips trailing slashes and surrounding whitespace', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: '  https://botmux.example.com///  ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'https://botmux.example.com' });
+  });
+
+  it('normalizes scheme case and the default port away', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: 'HTTPS://Botmux.Example.COM:443' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: 'https://botmux.example.com' });
+  });
+
+  it("clears the setting on '' → mergeGlobalConfig({ oauthRedirectBase: null })", async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: '' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: null });
+  });
+
+  it('clears the setting on a whitespace-only string', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: '   ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: null });
+  });
+
+  it('clears the setting on null', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ oauthRedirectBase: null }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ oauthRedirectBase: null });
+  });
+
+  for (const [label, value] of [
+    ['a bare host without a scheme', 'botmux.example.com'],
+    ['a non-http(s) scheme', 'ftp://botmux.example.com'],
+    ['a path prefix (dashboard matches /oauth/callback exactly)', 'https://botmux.example.com/botmux'],
+    ['a query string', 'https://botmux.example.com?token=x'],
+    ['a fragment', 'https://botmux.example.com#x'],
+    ['embedded credentials', 'https://user:pw@botmux.example.com'],
+    ['a scheme with no host', 'http://'],
+    ['a non-string value', 42],
+  ] as Array<[string, unknown]>) {
+    it(`rejects ${label} → invalid_oauthRedirectBase (no write)`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ oauthRedirectBase: value }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('unreachable');
+      expect(r.error).toBe('invalid_oauthRedirectBase');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe('applySettingsWrite — IO surface', () => {
   it('does not touch maintenance merge when only dashboard fields are present', async () => {
     const deps = makeDeps();

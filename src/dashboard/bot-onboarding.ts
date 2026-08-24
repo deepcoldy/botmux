@@ -1525,6 +1525,9 @@ export class BotOnboardingManager {
       subscribedEventCount: MANAGED_VERIFIED_EVENT_COUNT,
       missingVcEvents: [],
       eventModeReady: true,
+      // 这份 ACK 是从权限台账重建的，本次并没有碰 redirect 白名单。宁可报「没配」
+      // 让人去核一眼，也不能凭空报「配好了」——那正是 20029 静默失败的来源。
+      redirectConfigured: false,
       eventMode: managedPermission.eventMode,
       verifiedEventCount: managedPermission.verifiedEventCount,
       versionId: managedPermission.versionId,

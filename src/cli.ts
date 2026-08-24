@@ -1105,10 +1105,11 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
   }
   console.log('');
 
-  console.log('  4. 添加重定向 URL (用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息)');
+  console.log('  4. 添加重定向 URL (群聊模式 p2pMode=group / 会话群标签 feed-group / `/login` 必需)');
   console.log(`     申请链接: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
   console.log('     填入: http://127.0.0.1:9768/callback');
-  console.log('     不需要 `/login` 拿卡片消息的话, 这一步可以跳过.\n');
+  console.log('     用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息; 白名单里没有它,');
+  console.log('     这三种用法点授权会直接报 20029, 连飞书授权页都进不去.\n');
 
   console.log('  5. 在「版本管理与发布」创建版本并提交发布');
   console.log(`     配置链接: ${home}/version`);
