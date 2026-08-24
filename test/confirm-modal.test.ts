@@ -29,16 +29,26 @@ function withStubbedWindow(): void {
 }
 
 afterEach(() => {
+  // 卸载本用例挂载的所有 root：ConfirmModalRoot 在挂载期把 listener 注册进模块级
+  // listeners Set，卸载才会移除。不清理则跨用例累积 stale root（当前 ref 恒 null
+  // 无害，但脆——一个 emit() 会驱动所有历史 root 重渲染）。
+  act(() => {
+    for (const r of mountedRoots) r.unmount();
+  });
+  mountedRoots.length = 0;
   vi.unstubAllGlobals();
 });
 
 // 渲染一个 ConfirmModalRoot 并返回其 renderer；队列是模块级单例，弹窗调用在
-// 渲染前后皆可，emit() 会驱动 root 重渲染到最新队首。
+// 渲染前后皆可，emit() 会驱动 root 重渲染到最新队首。挂载的 root 收进 mountedRoots，
+// 由 afterEach 统一 unmount（见上）。
+const mountedRoots: TestRenderer.ReactTestRenderer[] = [];
 function mountRoot(): TestRenderer.ReactTestRenderer {
   let renderer!: TestRenderer.ReactTestRenderer;
   act(() => {
     renderer = TestRenderer.create(createElement(ConfirmModalRoot));
   });
+  mountedRoots.push(renderer);
   return renderer;
 }
 
@@ -69,6 +79,10 @@ function click(renderer: TestRenderer.ReactTestRenderer, text: string): void {
 }
 function typeInto(renderer: TestRenderer.ReactTestRenderer, value: string): void {
   act(() => inputOf(renderer).props.onInput({ target: { value } }));
+}
+// 模拟输入框按键；isComposing 走 nativeEvent，对齐产品代码读的 event.nativeEvent.isComposing
+function keyDown(renderer: TestRenderer.ReactTestRenderer, key: string, opts: { isComposing?: boolean } = {}): void {
+  act(() => inputOf(renderer).props.onKeyDown({ key, nativeEvent: { isComposing: opts.isComposing ?? false } }));
 }
 
 describe('promptText — window.prompt 语义对齐', () => {
@@ -128,6 +142,31 @@ describe('promptText — window.prompt 语义对齐', () => {
     expect(inputOf(renderer).props.value).toBe('/home/x');
     click(renderer, '确认');
     expect(await p).toBe('/home/x');
+  });
+
+  it('Enter 键提交（非组词）→ resolve 当前输入', async () => {
+    withStubbedWindow();
+    const renderer = mountRoot();
+    const p = enqueue(() => promptText({ title: 'T', message: 'M' }));
+    typeInto(renderer, '/srv/app');
+    keyDown(renderer, 'Enter');
+    expect(await p).toBe('/srv/app');
+  });
+
+  it('IME 组词中的 Enter 不提交（isComposing=true 时放行给输入法）', async () => {
+    withStubbedWindow();
+    const renderer = mountRoot();
+    let settled = false;
+    const p = enqueue(() => promptText({ title: 'T', message: 'M' }).then(v => { settled = true; return v; }));
+    typeInto(renderer, '目录');
+    // 组词上屏的 Enter：不得提交
+    keyDown(renderer, 'Enter', { isComposing: true });
+    await Promise.resolve(); // 放行微任务，若误 settle 这里 settled 会翻真
+    expect(settled).toBe(false);
+    expect(maybeInput(renderer)).toBeDefined(); // 弹窗仍开，队首未结算
+    // 组词结束后的 Enter 才真正提交
+    keyDown(renderer, 'Enter', { isComposing: false });
+    expect(await p).toBe('目录');
   });
 });
 

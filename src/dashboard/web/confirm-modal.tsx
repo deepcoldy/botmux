@@ -158,7 +158,7 @@ export function ConfirmModalRoot() {
           <h3 id="confirm-modal-title" className="confirm-modal-title">
             {options.title}
           </h3>
-          <p className="confirm-modal-message">{options.message}</p>
+          <p id="confirm-modal-message" className="confirm-modal-message">{options.message}</p>
           {showInput ? (
             <div className="confirm-modal-input-row">
               <input
@@ -169,9 +169,12 @@ export function ConfirmModalRoot() {
                 placeholder={placeholder}
                 autoComplete="off"
                 spellCheck={false}
+                aria-labelledby="confirm-modal-message"
                 onInput={event => setTyped((event.target as HTMLInputElement).value)}
                 onKeyDown={event => {
-                  if (event.key === 'Enter' && canConfirm) settle(true, typed);
+                  // isComposing：IME 组词（中/日/韩）期间的 Enter 是「上屏候选词」，
+                  // 不是提交，放行给输入法处理，避免强确认文本或目录被截断误提交。
+                  if (event.key === 'Enter' && !event.nativeEvent.isComposing && canConfirm) settle(true, typed);
                 }}
               />
             </div>
