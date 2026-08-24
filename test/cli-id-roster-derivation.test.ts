@@ -85,6 +85,8 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none',
       // Added by upstream #858: a bundled Node JSON-RPC runner with no skills dir.
       dsh: 'none',
+      // PTY-driven TUI variant of dsh; no skills dir of its own.
+      'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces

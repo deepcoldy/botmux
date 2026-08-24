@@ -2,6 +2,9 @@ import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 /**
  * dsh-tui adapter — PTY-driven full-screen TUI for DeepSeek Harness.
@@ -39,6 +42,14 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildArgs({ resume, resumeSessionId }) {
+      // Pre-create the authPaths in the real HOME before the worker enters the
+      // sandbox: the sandbox's keepExisting filter drops authPaths that don't
+      // exist yet, and the TUI can't create them from inside. ~/.dsh-tui holds
+      // resume.txt — without this, sandbox:true would silently break cross-
+      // session resume (same pattern as the dsh adapter's mkdirSync).
+      const home = homedir();
+      mkdirSync(join(home, '.dsh'), { recursive: true });
+      mkdirSync(join(home, '.dsh-tui'), { recursive: true });
       const args: string[] = [];
       if (resume) {
         // Bare --resume makes the launcher read ~/.dsh-tui/resume.txt; an
