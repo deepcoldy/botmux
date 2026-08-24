@@ -1663,10 +1663,13 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
     return null;
   }, [bot.larkAppId, tr]);
 
+  useEffect(() => {
+    void loadDescriptions();
+  }, [loadDescriptions]);
+
   const openEditor = useCallback(() => {
     setOpen(true);
-    void loadDescriptions(Object.keys(drafts).length > 0 ? drafts : undefined);
-  }, [drafts, loadDescriptions]);
+  }, []);
 
   const save = useCallback(async () => {
     const normalized = normalizeBotDescriptions(drafts);

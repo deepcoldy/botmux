@@ -72,6 +72,16 @@ describe('dashboard bot description helpers', () => {
 });
 
 describe('dashboard bot description editor wiring', () => {
+  it('loads descriptions on mount and opens the editor without a duplicate read', () => {
+    expect(page).toContain(`useEffect(() => {
+    void loadDescriptions();
+  }, [loadDescriptions]);`);
+
+    const openEditor = page.match(/const openEditor = useCallback\(\(\) => \{[\s\S]*?\n  \}, \[[^\]]*\]\);/)?.[0] ?? '';
+    expect(openEditor).toContain('setOpen(true);');
+    expect(openEditor).not.toContain('loadDescriptions');
+  });
+
   it('wires the profile editor to the description API and draft helpers', () => {
     expect(page).toContain('function BotDescriptionControl');
     expect(page).toContain('data-action="edit-bot-description"');
