@@ -12908,7 +12908,7 @@ botmux bots invite — 往「已存在的团队群」补人（同团队、已 op
                      [--json-status]
 
 参数:
-  --chat <chatId>  必填。目标群 chatId（oc_...）。须满足三个前置条件（否则平台按 403 拒绝，见下）。
+  --chat <chatId>  必填。目标群 chatId（oc_...）。须满足下列前置条件（否则平台按 403 拒绝，见下）。
   --team <teamId>  团队 id。省略时：本机唯一团队自动用它，多个团队要求显式指定（不猜）。
   --agent <appId>  至少一个、可多次、按 appId 去重。appId 从 \`botmux bots list --scope team\` 发现。
   --json-status    可选；在 stdout 单行 chatId 后追加一行 {ok, chatId, invalidBotIds,
@@ -12921,16 +12921,19 @@ botmux bots invite — 往「已存在的团队群」补人（同团队、已 op
   - 平台机器人（BotmuxPlatform）不在目标群时，会自动用群内本机 bot 当代理把它拉进群再重试；
     自动添加失败（需群主审批 / 代理 bot 无成员管理 scope）时给出手动添加引导。
 
-目标群前置条件（不满足平台按 403 拒绝）:
+前置条件（不满足平台按 403 拒绝，平台按 error code 分型）:
   - 平台机器人（BotmuxPlatform）已在群里     → 否则 platform_bot_not_in_chat（先把它拉进群）
   - 你本人已在该群                          → 否则 requester_not_in_chat（只能往你自己在场的群补人）
   - 非机器人大厅                            → 否则 chat_is_hall（大厅是 bot-only 身份登记群）
-  - 目标群属于本团队                        → 否则 chat_not_in_team
+  - 每个 --agent 都已 opt-in 进该团队        → 否则 not_in_team_bots（其 owner 需在平台「管理机器人」把它加进团队；
+                                              提示会点出具体被拒的 agent，部分失败也会在 invalidBotIds 里列出）
 
 与相邻命令的区别（别混）:
-  - create-group --team：把「同团队但不在任何共同群」的 agent + owner 新建成一个聚焦新群。
+  - create-group --team：把同团队、已 opt-in 的别人机器上的 agent + 各自 owner 新建成一个聚焦新群。
   - bots invite --chat：群已经在了、且平台机器人也在，往里补同团队的人（含各自 owner）。
-  - /invite（飞书群内 slash）：把 bot 加进当前群，走飞书原生加成员，限同租户、只拉 bot 不带 owner。
+  - /invite（飞书群内 slash）：把 bot 加进当前群，走飞书原生加成员，限同租户；命令本身只拉 bot，
+    owner 由被拉 bot 的 daemon 在入群事件里补拉（默认开启，可 per-bot 关，且需其 daemon 在线）——
+    区别于本命令/create-group 由平台原子带上 owner（不依赖对方 daemon 在线）。
 
 输出:
   - 成功 stdout 输出单行 chatId（与 create-group 一致）；失败 / 部分失败 stderr 打提示并非零退出。
