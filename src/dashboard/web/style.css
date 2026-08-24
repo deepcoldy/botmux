@@ -10828,6 +10828,163 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .bd-name-editor button { font-size: 12px; }
 .bd-name-status { display: block; margin-top: 4px; font-size: 11.5px; }
 .bd-name-status:empty { display: none; }
+.bot-defaults-page .bd-description-control {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 2px;
+}
+.bot-defaults-page .bd-description-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-preview {
+  display: -webkit-box;
+  min-width: 0;
+  max-width: min(640px, 100%);
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.bot-defaults-page .bd-description-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+.bot-defaults-page .bd-description-edit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent-strong);
+}
+.bot-defaults-page .bd-description-edit:disabled { cursor: progress; opacity: 0.65; }
+.bot-defaults-page .bd-description-status {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.bot-defaults-page .bd-description-status .bd-feishu-login { margin-left: 6px; }
+.bot-defaults-page .bd-description-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  overflow: auto;
+  background: var(--modal-backdrop);
+  backdrop-filter: blur(3px);
+}
+.bot-defaults-page .bd-description-modal {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 14px;
+  width: min(680px, 94vw);
+  max-height: min(720px, calc(100vh - 32px));
+  margin: auto;
+  padding: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--modal-shadow);
+}
+.bot-defaults-page .bd-description-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-modal-head h3 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.25;
+}
+.bot-defaults-page .bd-description-modal-status {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.bot-defaults-page .bd-description-modal-status .bd-feishu-login { margin-left: 6px; }
+.bot-defaults-page .bd-description-list {
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+.bot-defaults-page .bd-description-row {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-row-head > span {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-row-head strong {
+  color: var(--fg);
+  font-size: 12px;
+}
+.bot-defaults-page .bd-description-row-head code {
+  color: var(--faint);
+  font-size: 10.5px;
+}
+.bot-defaults-page .bd-description-row-head em {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 700;
+}
+.bot-defaults-page .bd-description-row textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 82px;
+  resize: vertical;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.bot-defaults-page .bd-description-count {
+  justify-self: end;
+  color: var(--faint);
+  font-size: 11px;
+}
+.bot-defaults-page .bd-description-count.at-limit { color: var(--warning); }
+.bot-defaults-page .bd-description-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 /* 「扫码登录飞书」——改名因缺登录态降级时才亮出 */
 .bd-feishu-login {
   display: inline-block;
@@ -13040,6 +13197,14 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
     grid-column: 1 / -1;
     justify-content: flex-start;
     margin-left: 0;
+  }
+  .bot-defaults-page .bd-description-modal {
+    width: min(100%, 94vw);
+    padding: 14px;
+  }
+  .bot-defaults-page .bd-description-row-head {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

@@ -23,6 +23,16 @@ import {
   type CliOptionsState,
   type SubstituteTargetResolution,
 } from './bot-defaults.js';
+import {
+  descriptionPreview,
+  descriptionsFromSnapshot,
+  localeLabel,
+  mergeDescriptionDrafts,
+  orderedDescriptionDrafts,
+  truncateDescription,
+  type BotDescriptionDrafts,
+  type BotDescriptionSnapshot,
+} from './bot-description.js';
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -46,6 +56,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 
 /** 会话群标签名的输入上限，与服务端 `MAX_SESSION_TAG_NAME_CODEPOINTS`
@@ -959,6 +970,7 @@ function BotDefaultsCard(props: {
                 </>
               )}
             />
+            <BotDescriptionControl bot={bot} />
           </div>
         </header>
         <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
@@ -1562,6 +1574,245 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
             setLoginVisible(false);
             setLoginOpen(false);
             void submitRename();
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function isBotDescriptionSnapshot(value: unknown): value is BotDescriptionSnapshot {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.primaryLang === 'string'
+    && Array.isArray(record.languages)
+    && record.languages.every(row => {
+      if (!row || typeof row !== 'object') return false;
+      const item = row as Record<string, unknown>;
+      return typeof item.lang === 'string' && typeof item.description === 'string';
+    });
+}
+
+function botDescriptionErrorText(
+  tr: (key: string, params?: Record<string, string | number>) => string,
+  res: JsonResponse,
+): string {
+  const error = typeof res.body?.error === 'string' ? res.body.error : '';
+  const message = typeof res.body?.message === 'string' ? res.body.message : '';
+  if (error) {
+    const known = [
+      'no_session',
+      'session_expired',
+      'no_access',
+      'unsupported_brand',
+      'description_not_wired',
+      'body_too_large',
+      'api_error',
+    ];
+    return known.includes(error)
+      ? (message && error === 'api_error' ? message : tr(`botDefaults.descriptionWarn.${error}`))
+      : (message || error);
+  }
+  return responseErrorText(res);
+}
+
+function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const { bot } = props;
+  const [snapshot, setSnapshot] = useState<BotDescriptionSnapshot | null>(null);
+  const [drafts, setDrafts] = useState<BotDescriptionDrafts>({});
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [loginVisible, setLoginVisible] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+
+  const loadDescriptions = useCallback(async (previousDrafts?: BotDescriptionDrafts) => {
+    setBusy(true);
+    setStatus({ text: `⏳ ${tr('botDefaults.descriptionLoading')}`, ok: true });
+    try {
+      const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`);
+      if (res.ok && isBotDescriptionSnapshot(res.body)) {
+        const nextSnapshot = { primaryLang: res.body.primaryLang, languages: res.body.languages };
+        setSnapshot(nextSnapshot);
+        if (previousDrafts) {
+          const merged = mergeDescriptionDrafts(nextSnapshot, previousDrafts);
+          setDrafts(merged.descriptions);
+          setStatus(merged.ok
+            ? { text: `✓ ${tr('botDefaults.descriptionLoginReloaded')}`, ok: true }
+            : { text: `⚠ ${tr('botDefaults.descriptionLanguagesChanged')}` });
+        } else {
+          setDrafts(descriptionsFromSnapshot(nextSnapshot));
+          setStatus(null);
+        }
+        setLoginVisible(false);
+        return nextSnapshot;
+      }
+      const error = String(res.body?.error ?? '');
+      if (error === 'no_session' || error === 'session_expired') {
+        setStatus({ text: `✗ ${botDescriptionErrorText(tr, res)}` });
+        setLoginVisible(true);
+      } else {
+        setStatus({ text: `✗ ${tr('botDefaults.descriptionLoadFailed', { error: botDescriptionErrorText(tr, res) })}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${tr('botDefaults.descriptionLoadFailed', { error: caughtErrorText(e) })}` });
+    } finally {
+      setBusy(false);
+    }
+    return null;
+  }, [bot.larkAppId, tr]);
+
+  const openEditor = useCallback(() => {
+    setOpen(true);
+    void loadDescriptions(Object.keys(drafts).length > 0 ? drafts : undefined);
+  }, [drafts, loadDescriptions]);
+
+  const save = useCallback(async () => {
+    const normalized = normalizeBotDescriptions(drafts);
+    if (!normalized.ok) {
+      const key = normalized.reason === 'description_required'
+        ? 'botDefaults.descriptionRequired'
+        : normalized.reason === 'description_too_long'
+          ? 'botDefaults.descriptionTooLong'
+          : 'botDefaults.descriptionInvalid';
+      setStatus({ text: `✗ ${tr(key, { lang: normalized.lang ?? '' })}` });
+      return;
+    }
+    setBusy(true);
+    setStatus({ text: `⏳ ${tr('botDefaults.descriptionPublishing')}`, ok: true });
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/description`, {
+        descriptions: normalized.descriptions,
+      });
+      if (res.ok) {
+        const primaryLang = typeof res.body?.primaryLang === 'string'
+          ? res.body.primaryLang
+          : snapshot?.primaryLang ?? Object.keys(normalized.descriptions)[0] ?? '';
+        const nextSnapshot: BotDescriptionSnapshot = {
+          primaryLang,
+          languages: Object.entries(normalized.descriptions).map(([lang, description]) => ({ lang, description })),
+        };
+        setSnapshot(nextSnapshot);
+        setDrafts(descriptionsFromSnapshot(nextSnapshot));
+        setOpen(false);
+        setStatus({ text: `✓ ${tr('botDefaults.descriptionPublished')}`, ok: true });
+        return;
+      }
+      const error = String(res.body?.error ?? '');
+      if (error === 'languages_changed') {
+        await loadDescriptions();
+        setStatus({ text: `⚠ ${tr('botDefaults.descriptionLanguagesChanged')}` });
+      } else if (error === 'no_session' || error === 'session_expired') {
+        setStatus({ text: `✗ ${botDescriptionErrorText(tr, res)}` });
+        setLoginVisible(true);
+      } else {
+        setStatus({ text: `✗ ${tr('botDefaults.descriptionFailed', { error: botDescriptionErrorText(tr, res) })}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${tr('botDefaults.descriptionFailed', { error: caughtErrorText(e) })}` });
+    } finally {
+      setBusy(false);
+    }
+  }, [bot.larkAppId, drafts, loadDescriptions, snapshot?.primaryLang, tr]);
+
+  const rows = snapshot ? orderedDescriptionDrafts(snapshot) : [];
+  const preview = descriptionPreview(snapshot);
+
+  return (
+    <div className="bd-description-control">
+      <div className="bd-description-preview-row">
+        <span className="bd-description-preview" title={preview || tr('botDefaults.descriptionEmptyPreview')}>
+          {preview || tr('botDefaults.descriptionEmptyPreview')}
+        </span>
+        <button
+          type="button"
+          className="bd-description-edit"
+          data-action="edit-bot-description"
+          title={tr('botDefaults.descriptionEdit')}
+          aria-label={tr('botDefaults.descriptionEdit')}
+          disabled={busy}
+          onClick={openEditor}
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+          </svg>
+        </button>
+      </div>
+      {status ? (
+        <small className={statusClass(status, 'bd-description-status')} data-description-status>
+          {status.text}
+          {loginVisible ? (
+            <button type="button" className="bd-feishu-login" data-action="feishu-login-description" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+          ) : null}
+        </small>
+      ) : null}
+      {open && typeof document !== 'undefined' ? createPortal(
+        <div
+          className="bd-description-overlay"
+          onClick={event => {
+            if (event.currentTarget === event.target && !busy) setOpen(false);
+          }}
+        >
+          <div className="bd-description-modal" role="dialog" aria-modal="true" aria-labelledby="bd-description-title">
+            <div className="bd-description-modal-head">
+              <h3 id="bd-description-title">{tr('botDefaults.descriptionTitle')}</h3>
+              <button type="button" className="feishu-login-close" aria-label={tr('feishuLogin.close')} disabled={busy} onClick={() => setOpen(false)}>x</button>
+            </div>
+            {status ? (
+              <small className={statusClass(status, 'bd-description-modal-status')} data-description-modal-status>
+                {status.text}
+                {loginVisible ? (
+                  <button type="button" className="bd-feishu-login" data-action="feishu-login-description-modal" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+                ) : null}
+              </small>
+            ) : null}
+            <div className="bd-description-list">
+              {rows.length === 0 ? (
+                <p className="empty">{busy ? tr('botDefaults.descriptionLoading') : tr('botDefaults.descriptionLoadEmpty')}</p>
+              ) : rows.map(row => {
+                const value = drafts[row.lang] ?? row.description;
+                const count = Array.from(value).length;
+                return (
+                  <label className="bd-description-row" data-description-lang={row.lang} key={row.lang}>
+                    <span className="bd-description-row-head">
+                      <span>
+                        <strong>{localeLabel(row.lang)}</strong>
+                        <code>{row.lang}</code>
+                      </span>
+                      {row.lang === snapshot?.primaryLang ? <em>{tr('botDefaults.descriptionPrimary')}</em> : null}
+                    </span>
+                    <textarea
+                      rows={3}
+                      value={value}
+                      disabled={busy}
+                      onChange={event => setDrafts(current => ({
+                        ...current,
+                        [row.lang]: truncateDescription(event.currentTarget.value),
+                      }))}
+                    />
+                    <small className={count >= BOT_DESCRIPTION_MAX_CHARS ? 'bd-description-count at-limit' : 'bd-description-count'}>
+                      {count}/{BOT_DESCRIPTION_MAX_CHARS}
+                    </small>
+                  </label>
+                );
+              })}
+            </div>
+            <div className="bd-description-actions">
+              <button type="button" disabled={busy} onClick={() => setOpen(false)}>{tr('botDefaults.descriptionCancel')}</button>
+              <button type="button" className="primary" disabled={busy || rows.length === 0} onClick={() => void save()}>{tr('botDefaults.descriptionSave')}</button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+      {loginOpen ? (
+        <FeishuLoginModal
+          onClose={() => setLoginOpen(false)}
+          onSuccess={() => {
+            setLoginVisible(false);
+            setLoginOpen(false);
+            void loadDescriptions(drafts);
           }}
         />
       ) : null}

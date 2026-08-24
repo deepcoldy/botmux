@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   descriptionPreview,
   descriptionsFromSnapshot,
@@ -7,6 +8,10 @@ import {
   orderedDescriptionDrafts,
   truncateDescription,
 } from '../src/dashboard/web/bot-description.js';
+
+const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
+const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.url), 'utf8');
 
 const loaded = {
   primaryLang: 'zh_cn',
@@ -63,5 +68,48 @@ describe('dashboard bot description helpers', () => {
 
   it('returns an empty preview before descriptions are loaded', () => {
     expect(descriptionPreview(null)).toBe('');
+  });
+});
+
+describe('dashboard bot description editor wiring', () => {
+  it('wires the profile editor to the description API and draft helpers', () => {
+    expect(page).toContain('function BotDescriptionControl');
+    expect(page).toContain('data-action="edit-bot-description"');
+    expect(page).toContain('/description`');
+    expect(page).toContain('mergeDescriptionDrafts');
+    expect(page).toContain('data-description-lang={row.lang}');
+    expect(page).toContain('BOT_DESCRIPTION_MAX_CHARS');
+    expect(page).toContain('truncateDescription(event.currentTarget.value)');
+    expect(page).toContain('<BotDescriptionControl bot={bot} />');
+  });
+
+  it('adds bounded profile-preview and editor-modal styles', () => {
+    expect(css).toContain('.bot-defaults-page .bd-description-preview');
+    expect(css).toContain('.bot-defaults-page .bd-description-modal');
+    expect(css).toContain('.bot-defaults-page .bd-description-list');
+    expect(css).toContain('.bot-defaults-page .bd-description-row');
+  });
+
+  it('ships Chinese and English copy for the description editor', () => {
+    for (const key of [
+      'descriptionTitle',
+      'descriptionEdit',
+      'descriptionSave',
+      'descriptionPublishing',
+      'descriptionPublished',
+      'descriptionLanguagesChanged',
+      'descriptionLoginReloaded',
+    ]) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
+  });
+
+  it('keeps shared Feishu login copy generic across profile and callback flows', () => {
+    expect(i18n).toContain('用飞书 App 扫码并确认登录（登录态仅存本机');
+    expect(i18n).toContain('Scan with the Feishu app and confirm to log in');
+    expect(i18n).toContain('✓ Logged in — continuing…');
+    expect(i18n).not.toContain('profile changes');
+    expect(i18n).not.toContain('retrying the rename');
+    expect(i18n).not.toContain('授权改名');
   });
 });
