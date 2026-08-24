@@ -1786,10 +1786,13 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
                       rows={3}
                       value={value}
                       disabled={busy}
-                      onChange={event => setDrafts(current => ({
-                        ...current,
-                        [row.lang]: truncateDescription(event.currentTarget.value),
-                      }))}
+                      onChange={event => {
+                        const nextValue = truncateDescription(event.currentTarget.value);
+                        setDrafts(current => ({
+                          ...current,
+                          [row.lang]: nextValue,
+                        }));
+                      }}
                     />
                     <small className={count >= BOT_DESCRIPTION_MAX_CHARS ? 'bd-description-count at-limit' : 'bd-description-count'}>
                       {count}/{BOT_DESCRIPTION_MAX_CHARS}

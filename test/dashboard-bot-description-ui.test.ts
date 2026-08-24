@@ -83,6 +83,12 @@ describe('dashboard bot description editor wiring', () => {
     expect(page).toContain('<BotDescriptionControl bot={bot} />');
   });
 
+  it('captures textarea input before the React state updater runs', () => {
+    expect(page).not.toContain('[row.lang]: truncateDescription(event.currentTarget.value)');
+    expect(page).toContain('const nextValue = truncateDescription(event.currentTarget.value);');
+    expect(page).toContain('[row.lang]: nextValue');
+  });
+
   it('adds bounded profile-preview and editor-modal styles', () => {
     expect(css).toContain('.bot-defaults-page .bd-description-preview');
     expect(css).toContain('.bot-defaults-page .bd-description-modal');
