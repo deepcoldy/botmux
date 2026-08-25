@@ -142,10 +142,22 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // Verified on Cursor Agent 2026.08.11. This is the real mounted composer,
-    // unlike the browser-login and startup screens. Once it has appeared at
-    // least once the worker may safely type-ahead subsequent Lark messages.
-    readyPattern: /→\s+Plan, search, build anything/,
+    // The mounted composer's placeholder, matched to prove the real input box
+    // exists (unlike the browser-login and startup screens). Once it has
+    // appeared at least once the worker may safely type-ahead subsequent Lark
+    // messages.
+    //
+    // BOTH placeholder states must match. Cursor Agent 2026.08.11 picks the
+    // placeholder as `sessionEmpty ? "Plan, search, build anything" : "Add a
+    // follow-up"` and never switches back once the chat has any history. The
+    // worker resets the IdleDetector (clearing readySeen) before every write,
+    // and the IdleDetector suppresses quiescence-idle until readyPattern is seen
+    // again — so a first-turn-only pattern would match on turn 1 but never on
+    // turn 2+, leaving the CLI stuck reporting "working" forever (quiescence
+    // permanently suppressed, no idle edge). Matching the post-turn placeholder
+    // too keeps every turn's idle edge alive. Neither placeholder appears on the
+    // login/startup screens, so the boot-time guard is unchanged.
+    readyPattern: /→\s+(?:Plan, search, build anything|Add a follow-up)/,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
     skillsDir: '~/.cursor/skills',

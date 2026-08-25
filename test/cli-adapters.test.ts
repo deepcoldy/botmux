@@ -890,6 +890,20 @@ describe('cursor buildArgs', () => {
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
   });
+
+  it('readyPattern matches BOTH the empty-session and post-turn composer placeholders', () => {
+    // Cursor Agent 2026.08.11 renders `sessionEmpty ? "Plan, search, build
+    // anything" : "Add a follow-up"` and never reverts. The worker resets the
+    // IdleDetector (clearing readySeen) before every write, and quiescence-idle
+    // is suppressed until readyPattern is seen again — so if the pattern only
+    // matched the empty-session placeholder, turn 2+ would never re-seed ready
+    // and the CLI would be stuck reporting "working" forever. Both must match.
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.readyPattern?.test('  → Add a follow-up')).toBe(true);
+    // Guard against over-broad matching: the arrow-prefixed composer glyph is
+    // required, so unrelated screen text with the phrase must not false-match.
+    expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
 });
 
 describe('genius buildArgs', () => {
