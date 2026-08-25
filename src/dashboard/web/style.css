@@ -27647,6 +27647,36 @@ button.skills-issue-badge:hover {
 .bd-sg-repair-hint [data-sg-tag-repair-item="failed"] { color: var(--warning); }
 .feed-group-auth-card .bd-sg-repair-hint { margin-top: 14px; }
 
+/* 会话群标签名：模式下拉下面单起一行。输入框刻意不预填默认名——留空就是「用默认」，
+   默认名放在 placeholder 里自己说话，说明文字整行占满另起一行。 */
+.bd-sg-tag-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 8px;
+}
+/* .bd-body .bd-row :where(label, .bd-field) 把行内 label 变成 block，这个标签要
+   留在流式行里；输入框同理要盖掉 .bd-row input[type=text] 的 width:100%。 */
+.bot-defaults-page .bd-body .bd-row .bd-sg-tag-name > label {
+  display: inline-block;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.bot-defaults-page .bd-body .bd-row .bd-sg-tag-name input[type=text] {
+  width: auto;
+  min-width: 180px;
+  max-width: 280px;
+}
+.bd-sg-tag-name-hint {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .cs-advanced-fields .cs-feed-group {
   min-width: 0;
   margin: 0;

@@ -48,6 +48,11 @@ import {
 } from '../../services/grant-policy.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 
+/** 会话群标签名的输入上限，与服务端 `MAX_SESSION_TAG_NAME_CODEPOINTS`
+ *  （services/feed-group-tagger.ts）保持一致。这里不 import 那个常量：该模块会连带
+ *  拉进 bot-registry / node:fs，进不了浏览器 bundle。服务端仍会自己截断兜底。 */
+const MAX_SG_TAG_NAME_LENGTH = 60;
+
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
 type CardPrefPatch = Record<string, boolean | string>;
@@ -4286,10 +4291,17 @@ function repairStatusText(tr: ReturnType<typeof useT>, item: RedirectRepairItem)
  *  → 本行轮询到 authorized 后徽标变绿。 */
 export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
-  const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
+  const [status, setStatus] = useState<
+    { authorized: boolean; tagMode: string; tagName: string; defaultTagName: string } | null
+  >(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 标签名输入框：受控 state 与已保存值分离——用户敲字期间不能被状态轮询回填覆盖，
+  // 所以只在挂载/切 bot/保存成功这三个时机同步 nameInput。
+  const [nameInput, setNameInput] = useState('');
+  const [nameBusy, setNameBusy] = useState(false);
+  const [nameStatus, setNameStatus] = useState<StatusMessage>(null);
   // Remote-callback paste fallback (mirrors groups-page / sessions-page): when
   // set, the overlay is shown so a browser that can't reach the daemon's
   // 127.0.0.1:9768 loopback (远程 VM / 中心化平台 m-* 子域访问) can still finish
@@ -4310,11 +4322,19 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const [authTimedOut, setAuthTimedOut] = useState(false);
   const lifecycle = useRef({ generation: 0, mounted: true });
 
-  const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
+  const fetchStatus = async (generation = lifecycle.current.generation, syncNameInput = false): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
       if (lifecycle.current.mounted && generation === lifecycle.current.generation && res.ok && res.body.ok) {
-        setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'feed-group') });
+        const tagName = String(res.body.tagName ?? '');
+        setStatus({
+          authorized: !!res.body.authorized,
+          tagMode: String(res.body.tagMode ?? 'feed-group'),
+          tagName,
+          defaultTagName: String(res.body.defaultTagName ?? ''),
+        });
+        // 只有首屏/切 bot 才回填输入框——授权轮询期间用户可能正在里面打字。
+        if (syncNameInput) setNameInput(tagName);
         return !!res.body.authorized;
       }
     } catch { /* transient */ }
@@ -4339,7 +4359,10 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     setRepairAll(false);
     setLoginOpen(false);
     setAuthTimedOut(false);
-    void fetchStatus(generation);
+    setNameInput('');
+    setNameBusy(false);
+    setNameStatus(null);
+    void fetchStatus(generation, true);
     return () => {
       lifecycle.current.mounted = false;
       lifecycle.current.generation += 1;
@@ -4357,7 +4380,12 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
       if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
-        setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
+        setStatus(s => ({
+          authorized: s?.authorized ?? false,
+          tagMode: String(res.body.tagMode),
+          tagName: String(res.body.tagName ?? s?.tagName ?? ''),
+          defaultTagName: String(res.body.defaultTagName ?? s?.defaultTagName ?? ''),
+        }));
       } else {
         setErr(responseErrorText(res));
       }
@@ -4367,6 +4395,46 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       }
     } finally {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) setModeBusy(false);
+    }
+  }
+
+  /** 标签名保存（失焦 / 回车）。留空 = 清除配置回默认名，所以空串也要发请求。
+   *  与 saveMode 同一条 per-bot 写入通路（PUT session-group-tag-config），同样用
+   *  generation 挡掉切 bot 后才回来的慢响应。 */
+  async function saveName(): Promise<void> {
+    const generation = lifecycle.current.generation;
+    const next = nameInput.trim();
+    // 与已保存值一致就别打接口了——失焦事件比真正的改动频繁得多。
+    if (next === (status?.tagName ?? '')) {
+      setNameInput(next);
+      return;
+    }
+    setNameBusy(true);
+    setNameStatus(null);
+    setErr(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { name: next });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      if (res.ok && res.body.ok) {
+        const saved = String(res.body.tagName ?? '');
+        setStatus(s => ({
+          authorized: s?.authorized ?? false,
+          tagMode: String(res.body.tagMode ?? s?.tagMode ?? 'feed-group'),
+          tagName: saved,
+          defaultTagName: String(res.body.defaultTagName ?? s?.defaultTagName ?? ''),
+        }));
+        // 服务端可能做了 trim/截断——回填成真正存下来的那个值。
+        setNameInput(saved);
+        setNameStatus({ text: tr('botDefaults.sgTagNameSaved'), ok: true });
+      } else {
+        setNameStatus({ text: responseErrorText(res), ok: false });
+      }
+    } catch (e: any) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setNameStatus({ text: caughtErrorText(e), ok: false });
+      }
+    } finally {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setNameBusy(false);
     }
   }
 
@@ -4608,6 +4676,37 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           )}
           {err && <span className="status-error">✗ {err}</span>}
         </div>
+        {/* 标签名：off 模式下不打标签，输入框无意义。placeholder 显示留空时实际
+            生效的默认名（「<bot 名>会话」），让用户一眼看懂「不填等于什么」。 */}
+        {tagMode !== 'off' ? (
+          <div className="bd-sg-tag-name" data-sg-tag-name-row>
+            <label htmlFor="sg-tag-name-input">{tr('botDefaults.sgTagName')}</label>
+            <input
+              id="sg-tag-name-input"
+              type="text"
+              data-input="sessionGroupTagName"
+              aria-label={tr('botDefaults.sgTagName')}
+              placeholder={status?.defaultTagName ?? ''}
+              maxLength={MAX_SG_TAG_NAME_LENGTH}
+              value={nameInput}
+              disabled={nameBusy || !status}
+              onChange={event => {
+                setNameInput(event.currentTarget.value);
+                setNameStatus(null);
+              }}
+              onBlur={() => void saveName()}
+              onKeyDown={event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                event.currentTarget.blur();
+              }}
+            />
+            <StatusSpan status={nameStatus} attr={{ 'data-sg-tag-name-status': '' }} />
+            <small className="bd-sg-tag-name-hint">
+              {tr('botDefaults.sgTagNameHint', { name: status?.defaultTagName ?? '' })}
+            </small>
+          </div>
+        ) : null}
         {tagMode === 'feed-group' && repairFeedback ? (
           <div className="bd-sg-repair-hint" data-sg-tag-repair-feedback={repairFeedback.kind}>
             {repairFeedback.kind === 'login_required' ? (

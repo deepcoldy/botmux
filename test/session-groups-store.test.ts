@@ -41,7 +41,12 @@ import {
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
-import { resolveTagMode } from '../src/services/feed-group-tagger.js';
+import {
+  resolveTagMode,
+  resolveSessionTagName,
+  clampSessionTagName,
+  MAX_SESSION_TAG_NAME_CODEPOINTS,
+} from '../src/services/feed-group-tagger.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-groups-store-test-'));
@@ -283,5 +288,47 @@ describe('resolveTagMode', () => {
     expect(resolveTagMode({ mode: 'chat-tag' })).toBe('chat-tag');
     expect(resolveTagMode({ mode: 'feed-group' })).toBe('feed-group');
     expect(resolveTagMode({ mode: 'off' })).toBe('off');
+  });
+});
+
+describe('resolveSessionTagName（标签名回落链）', () => {
+  it('配置名优先，且原样保留（只 trim）', () => {
+    expect(resolveSessionTagName({ configuredName: '  我的工作台  ', botDisplayName: 'CodeXonAst' }))
+      .toBe('我的工作台');
+  });
+
+  it('没配名字 → 「<bot 显示名>会话」（多 bot 靠 bot 名区分，这是本次改动的重点）', () => {
+    expect(resolveSessionTagName({ botDisplayName: 'CodeXonAst' })).toBe('CodeXonAst会话');
+    expect(resolveSessionTagName({ configuredName: '   ', botDisplayName: 'CodeXonAst' }))
+      .toBe('CodeXonAst会话');
+  });
+
+  it('英文 locale 用 "<bot> chats"', () => {
+    expect(resolveSessionTagName({ botDisplayName: 'CodeXonAst', locale: 'en' }))
+      .toBe('CodeXonAst chats');
+  });
+
+  it('配置名与 bot 显示名都没有 → 旧默认名兜底', () => {
+    expect(resolveSessionTagName({})).toBe('Botmux群会话');
+    expect(resolveSessionTagName({ configuredName: '', botDisplayName: '   ' })).toBe('Botmux群会话');
+  });
+
+  it('bot 名过长按码点截到 12（侧边栏只显示前几个字）', () => {
+    // 20 个中文字 → 取前 12 个再拼「会话」。
+    expect(resolveSessionTagName({ botDisplayName: '机'.repeat(20) })).toBe(`${'机'.repeat(12)}会话`);
+    // emoji 是单个码点，不能被 slice 成半个代理对。
+    expect(resolveSessionTagName({ botDisplayName: '🤖'.repeat(20) })).toBe(`${'🤖'.repeat(12)}会话`);
+  });
+
+  it('自定义名超长按码点保守截断（飞书分组名有长度限制）', () => {
+    const long = 'a'.repeat(200);
+    const out = resolveSessionTagName({ configuredName: long });
+    expect(Array.from(out)).toHaveLength(MAX_SESSION_TAG_NAME_CODEPOINTS);
+    expect(clampSessionTagName(long)).toBe(out);
+  });
+
+  it('clampSessionTagName 对全空白返回空串（= 清除配置回默认）', () => {
+    expect(clampSessionTagName('   ')).toBe('');
+    expect(clampSessionTagName(' 工作 ')).toBe('工作');
   });
 });

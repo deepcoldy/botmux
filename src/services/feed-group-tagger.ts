@@ -21,7 +21,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { getBot, getBotClient } from '../bot-registry.js';
+import { getBot, getBotClient, effectiveBotDisplayName, type BotState } from '../bot-registry.js';
 import { config } from '../config.js';
 import { resolveUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -29,9 +29,96 @@ import { sendUserMessage } from '../im/lark/client.js';
 import { t, localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 
+/** 连 bot 显示名都拿不到时的最后兜底（多 bot 下毫无区分度，仅作保底）。 */
 const DEFAULT_TAG_NAME = 'Botmux群会话';
+/** 自定义标签名的保守长度上限（按码点算，中文/emoji 各算 1）。飞书未公开分组名
+ *  的精确上限，取 60 足够放下正常命名，又不至于被服务端以超长拒绝。 */
+export const MAX_SESSION_TAG_NAME_CODEPOINTS = 60;
+/** 默认名里 bot 名的最长码点数：侧边栏宽度只显示前几个字，超出部分看不见。 */
+const MAX_BOT_LABEL_CODEPOINTS = 12;
 /** Re-nudge the owner about missing scope/auth at most once per this window. */
 const NUDGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+function truncateCodepoints(value: string, limit: number): string {
+  return Array.from(value).slice(0, Math.max(0, limit)).join('');
+}
+
+/** 归一化一个用户自定义标签名：trim + 保守截断。全空白 → 空串（= 清除配置）。 */
+export function clampSessionTagName(raw: string): string {
+  return truncateCodepoints(raw.trim(), MAX_SESSION_TAG_NAME_CODEPOINTS);
+}
+
+/** 「<bot 名>会话」/「<bot name> chats」——默认名与建群冲突退避名共用这一套构词，
+ *  两条路径必须产出同一个字符串，否则默认名一变就会触发一次无意义的改名。 */
+function botScopedTagName(botLabel: string, locale: 'zh' | 'en'): string {
+  const label = truncateCodepoints(botLabel.trim(), MAX_BOT_LABEL_CODEPOINTS);
+  return locale === 'en' ? `${label} chats` : `${label}会话`;
+}
+
+/**
+ * 标签 / 分组名的回落链（feed-group 与 chat-tag 两种模式共用，保证默认名一致）：
+ *   1. 用户在 bots.json / Dashboard 配的 `sessionGroup.tag.name`（trim 后非空）
+ *   2. 「<bot 显示名>会话」——多 bot / 多设备下靠 bot 名区分
+ *   3. DEFAULT_TAG_NAME——bot 显示名也拿不到时的保底
+ */
+export function resolveSessionTagName(input: {
+  configuredName?: string;
+  botDisplayName?: string;
+  locale?: 'zh' | 'en';
+}): string {
+  const configured = clampSessionTagName(input.configuredName ?? '');
+  if (configured) return configured;
+  const label = input.botDisplayName?.trim();
+  if (!label) return DEFAULT_TAG_NAME;
+  return botScopedTagName(label, input.locale === 'en' ? 'en' : 'zh');
+}
+
+/**
+ * bot 的「真名」：自定义 displayName > 飞书探测名 botName（复用 bot-registry 的
+ * `effectiveBotDisplayName`，与 dashboard 展示同源）。两者都没有时返回 undefined
+ * ——该 helper 的最后一档兜底是 larkAppId，拿它拼「cli_xxx会话」毫无意义。
+ *
+ * 取舍：只读内存注册表，同步、零 IO。`botName` 由 daemon 启动时的
+ * `probeBotOpenId`（/bot/v3/info）异步回填，理论上极早期的一次建群可能还没探测到，
+ * 此时默认名先落到 DEFAULT_TAG_NAME；等下一次打标（探测早已完成）由下方
+ * configuredName 改名机制自动纠正成「<bot 名>会话」，不必在打标链路里等 IO。
+ */
+function botDisplayLabel(state: BotState): string | undefined {
+  const name = effectiveBotDisplayName(state).trim();
+  return name && name !== state.config.larkAppId ? name : undefined;
+}
+
+/**
+ * 建群名冲突退避专用的 bot 标签：比 `botDisplayLabel` 多兜几档（bots.json 的 name、
+ * cliId、appId 尾号），因为这条路径必须产出**某个**能区分本 app 的字符串，退无可退
+ * 时宁可难看也不能返回空。
+ */
+function fallbackBotLabel(larkAppId: string): string {
+  const state = getBot(larkAppId);
+  const cfg = state.config;
+  return (
+    botDisplayLabel(state)
+    || cfg.name?.trim()
+    || cfg.cliId?.trim()
+    || larkAppId.slice(-6)
+  );
+}
+
+/**
+ * 该 bot 在「没配自定义标签名」时会用的默认名。Dashboard 用它做输入框 placeholder，
+ * 让用户看到留空到底等于什么名字。bot 不在本进程注册表时退回旧默认名。
+ */
+export function defaultSessionTagName(larkAppId: string): string {
+  try {
+    const state = getBot(larkAppId);
+    return resolveSessionTagName({
+      botDisplayName: botDisplayLabel(state),
+      locale: localeForBot(larkAppId),
+    });
+  } catch {
+    return DEFAULT_TAG_NAME;
+  }
+}
 
 interface TagCache {
   /** Tenant chat-tag id (chat-tag mode). */
@@ -315,24 +402,25 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     let created = await createGroup(name);
     if (isNameTaken(created)) {
       // 分组名用户级全局唯一，但操作权限按创建应用隔离——本 app 的 list 看不到、
-      // 也建不了同名组（典型：多个 bot 应用都用默认名 / 换 app 重装）。自动退避
-      // 为「<bot 显示名>会话」：关键区分信息前置——侧边栏宽度只显示前几个字，
+      // 也建不了同名组（典型：多个 bot 应用都配了同一个名字 / 换 app 重装）。自动
+      // 退避为「<bot 显示名>会话」：关键区分信息前置——侧边栏宽度只显示前几个字，
       // 「配置名·bot名」的后缀式命名会把 bot 名截没（实测反馈）。
-      const bot = getBot(larkAppId);
-      const rawLabel = (bot.botName ?? cfg.displayName ?? cfg.cliId ?? larkAppId.slice(-6)).trim();
-      const botLabel = Array.from(rawLabel).slice(0, 12).join('');
-      const fallbackName = localeForBot(larkAppId) === 'en' ? `${botLabel} chats` : `${botLabel}会话`;
-      if (fallbackName !== name) {
+      const scoped = botScopedTagName(fallbackBotLabel(larkAppId), localeForBot(larkAppId));
+      // 第二档带 app 尾号消歧：默认名本来就是「<bot 名>会话」时第一档是同名空转，
+      // 只有「两个应用的 bot 显示名也撞了」才会走到这里——难看总好过建不出分组。
+      const candidates = [scoped, `${scoped}·${cfg.larkAppId.slice(-4)}`].filter(c => c !== name);
+      for (const candidate of candidates) {
         logger.warn(
-          `[session-tag] feed group name "${name}" is taken by another app's group (per-user unique, `
-          + `per-app operable); falling back to "${fallbackName}"`,
+          `[session-tag] feed group name "${actualName}" is taken by another app's group (per-user unique, `
+          + `per-app operable); falling back to "${candidate}"`,
         );
-        actualName = fallbackName;
+        actualName = candidate;
         // 退避名也可能已由本 app 早先建过（cache 丢失场景）——先查再建。
-        const existingFallback = await findFeedGroupByName(host, userToken, fallbackName);
+        const existingFallback = await findFeedGroupByName(host, userToken, candidate);
         created = existingFallback
           ? { ok: true, code: 0, data: { group_id: existingFallback } }
-          : await createGroup(fallbackName);
+          : await createGroup(candidate);
+        if (!isNameTaken(created)) break;
       }
     }
     if (!created.ok) {
@@ -348,16 +436,26 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
   } else if ((cache.configuredName ?? cache.name) !== name) {
     // 配置名变更才触发改名；对比 configuredName 而非实际名，避免退避名（name·bot）
     // 与配置名的固有差异导致每次建群都空转一次 rename。
-    const renamed = await callFeedGroupApi(host, userToken, 'PUT',
-      `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}`, {
-        feed_group_updater: { name, update_fields: [1] },
-      });
-    if (renamed.ok) {
-      cache.name = name;
+    if (cache.name === name) {
+      // 分组当前实际名已经就是目标名（典型：旧默认名下退避成「<bot 名>会话」，而新
+      // 默认名恰好等于它）。同名 rename 会被飞书判 230001 already exists → 失败分支
+      // 不写 configuredName → 每次打标都白跑一次。这里只把 configuredName 对齐。
       cache.configuredName = name;
       saveCache(larkAppId, cache);
+      logger.info(`[session-tag] feed group already named "${name}"; aligned configuredName without rename`);
     } else {
-      logger.warn(`[session-tag] feed group rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
+      const renamed = await callFeedGroupApi(host, userToken, 'PUT',
+        `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}`, {
+          feed_group_updater: { name, update_fields: [1] },
+        });
+      if (renamed.ok) {
+        cache.name = name;
+        cache.configuredName = name;
+        saveCache(larkAppId, cache);
+        logger.info(`[session-tag] feed group renamed → "${name}"`);
+      } else {
+        logger.warn(`[session-tag] feed group rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
+      }
     }
   }
   if (!cache.groupId) return;
@@ -399,11 +497,16 @@ export function resolveTagMode(
  */
 export async function tagSessionGroup(larkAppId: string, chatId: string, ownerOpenId: string): Promise<void> {
   try {
-    const cfg = getBot(larkAppId).config;
-    const tag = cfg.sessionGroup?.tag ?? {};
+    const state = getBot(larkAppId);
+    const tag = state.config.sessionGroup?.tag ?? {};
     const mode = resolveTagMode(tag);
     if (mode === 'off') return;
-    const name = tag.name?.trim() || DEFAULT_TAG_NAME;
+    // 两种模式共用同一条回落链：配置名 → 「<bot 显示名>会话」→ 旧默认名。
+    const name = resolveSessionTagName({
+      configuredName: tag.name,
+      botDisplayName: botDisplayLabel(state),
+      locale: localeForBot(larkAppId),
+    });
     if (mode === 'feed-group') {
       await tagViaFeedGroup(larkAppId, chatId, ownerOpenId, name);
       return;

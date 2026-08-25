@@ -1220,7 +1220,11 @@ export interface SessionGroupConfig {
    */
   tag?: {
     mode?: 'chat-tag' | 'feed-group' | 'off';
-    /** Tag / feed-group display name (default: Botmux群会话). */
+    /**
+     * Tag / feed-group display name. Empty/absent (default) = 「<bot 显示名>会话」
+     * （多 bot / 多设备靠 bot 名区分；bot 显示名也拿不到时才保底成 Botmux群会话）。
+     * 回落链见 services/feed-group-tagger.ts 的 resolveSessionTagName。
+     */
     name?: string;
   };
   /**
