@@ -12,7 +12,10 @@ import { join } from 'node:path';
 
 const DIR = join(homedir(), '.botmux', 'data');
 const legacyPath = join(DIR, 'user-token.json');
-const perAppPath = (appId: string) => join(DIR, `user-token-${appId}.json`);
+const perAppPath = (appId: string, ownerOpenId?: string) => join(
+  DIR,
+  ownerOpenId ? `user-token-${appId}-${encodeURIComponent(ownerOpenId)}.json` : `user-token-${appId}.json`,
+);
 
 // In-memory fake filesystem keyed by absolute path.
 const files = new Map<string, string>();
@@ -79,6 +82,29 @@ describe('resolveUserToken — per-app isolation', () => {
     process.env.FEISHU_USER_ACCESS_TOKEN = 'ENV_TOK';
     const { resolveUserToken } = await fresh();
     expect(await resolveUserToken('whatever', 'sec', 'lark')).toBe('ENV_TOK');
+  });
+
+  it('does not expose an app-wide env token to an owner-scoped request', async () => {
+    process.env.FEISHU_USER_ACCESS_TOKEN = 'ENV_TOK';
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken('app_a', 'sec', 'feishu', 'ou_A')).toBeNull();
+  });
+
+  it('isolates two owners of the same app', async () => {
+    files.set(perAppPath('app_a', 'ou_A'), validToken({ access_token: 'TOK_A', appId: 'app_a', brand: 'feishu', ownerOpenId: 'ou_A' }));
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken('app_a', 'sec', 'feishu', 'ou_A')).toBe('TOK_A');
+    expect(await resolveUserToken('app_a', 'sec', 'feishu', 'ou_B')).toBeNull();
+  });
+
+  it('does not let owner B appear feed-group authorized from owner A token', async () => {
+    files.set(perAppPath('app_a', 'ou_A'), validToken({
+      access_token: 'TOK_A', appId: 'app_a', brand: 'feishu', ownerOpenId: 'ou_A',
+      scope: 'im:feed_group_v1:write',
+    }));
+    const { getFeedGroupAuthStatus } = await fresh();
+    expect(getFeedGroupAuthStatus('app_a', 'feishu', 'ou_A').authorized).toBe(true);
+    expect(getFeedGroupAuthStatus('app_a', 'feishu', 'ou_B').authorized).toBe(false);
   });
 
   // Hardening (Codex review): validate the file's inner appId/brand, not just the

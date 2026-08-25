@@ -2509,6 +2509,7 @@ export async function handleCommand(
             botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand),
             FEED_GROUP_OAUTH_SCOPES,
+            message.senderId,
           );
           await sessionReply(rootId, [
             t('cmd.login.tags_title', undefined, loc),

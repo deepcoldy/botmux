@@ -77,4 +77,28 @@ describe('tryHandleCallbackUrl across module instances', () => {
     expect(result).not.toBeNull();
     expect(result!.matched).toBe(false);
   });
+
+  it('rejects a callback authenticated as a different owner', async () => {
+    const a = await import('../src/utils/user-token.js');
+    const { state } = a.generateAuthUrl(APP_ID, APP_SECRET, 'feishu', ['im:feed_group_v1:write'], 'ou_expected');
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/oauth/token')) {
+        return {
+          ok: true,
+          json: async () => ({
+            access_token: 'uat', refresh_token: 'urt', token_type: 'Bearer',
+            expires_in: 3600, refresh_token_expires_in: 7200,
+            scope: 'im:feed_group_v1:write',
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({ data: { open_id: 'ou_other' } }) };
+    }) as any);
+
+    const result = await a.tryHandleCallbackUrl(
+      `http://127.0.0.1:9768/callback?code=test_code&state=${encodeURIComponent(state)}`,
+    );
+    expect(result).toMatchObject({ matched: true, ok: false });
+    expect(result!.message).toContain('不一致');
+  });
 });
