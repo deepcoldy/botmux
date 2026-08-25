@@ -440,7 +440,17 @@ export function cloneBotConfig(
   for (const key of [
     'apiOnly',
     'name',
+    'displayName',
     'messageListeners',
+    'oncallChats',
+    'allowedChatGroups',
+    'chatGrants',
+    'globalGrants',
+    'quotaState',
+    'grantExpiryState',
+    'sessionGroup',
+    'chatReplyModes',
+    'noCardChats',
     'activationPending',
     'activationDeactivating',
     'activationStarting',
@@ -458,6 +468,19 @@ export function cloneBotConfig(
   }
 
   return cloned;
+}
+
+/** 只允许 daemon 已认证的 source open_id 进入共享的跨应用 owner 归一化。 */
+export function cloneOwnerEntries(
+  source: Record<string, any>,
+  sourceAppId?: string,
+  sourceOwnerOpenId?: string,
+): string[] {
+  const managedOwner = sourceAppId === source.larkAppId ? sourceOwnerOpenId : undefined;
+  if (!Array.isArray(source.allowedUsers)) return [];
+  return source.allowedUsers.filter((entry: unknown): entry is string => (
+    typeof entry === 'string' && (!entry.startsWith('ou_') || entry === managedOwner)
+  ));
 }
 
 export function removeBotConfig<T extends { larkAppId?: string; name?: unknown }>(

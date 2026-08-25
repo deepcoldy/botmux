@@ -158,6 +158,8 @@ import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../s
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
+import { cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
+import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -5260,6 +5262,55 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
     setupBotState({ globalGrants: ['ou_talk_only'], allowedUsers: ['ou_admin'] });
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_admin')).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_talk_only')).toBe(false);
+  });
+});
+
+describe('managed Agent clone owner boundary', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');
+  });
+
+  it('keeps the human owner operable without cloning source instance state', async () => {
+    const instanceKeys = [
+      'displayName',
+      'oncallChats',
+      'allowedChatGroups',
+      'chatGrants',
+      'globalGrants',
+      'quotaState',
+      'grantExpiryState',
+      'sessionGroup',
+      'chatReplyModes',
+      'noCardChats',
+    ] as const;
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      cliId: 'codex',
+      allowedUsers: ['ou_source_owner', 'ou_stale_coowner'],
+      ...Object.fromEntries(instanceKeys.map(key => [key, { source: key }])),
+    };
+    const owners = cloneOwnerEntries(source, 'cli_source', 'ou_source_owner');
+    expect(owners).toEqual(['ou_source_owner']);
+
+    const normalized = await normalizeManagedOwnerEntries(
+      owners.join(','),
+      { sourceAppId: 'cli_source', sourceOwnerOpenId: 'ou_source_owner', creatingApp: true },
+      async () => 'on_human_owner',
+    );
+    const target = cloneBotConfig(source, {
+      larkAppId: MY_APP_ID,
+      larkAppSecret: 'target-secret',
+      allowedUsers: normalized?.split(','),
+    });
+    expect(target.allowedUsers).toEqual(['on_human_owner']);
+    for (const key of instanceKeys) expect(target).not.toHaveProperty(key);
+
+    // 目标 app 启动时会把 union_id 解析成自己视角下的 open_id。
+    setupBotState({ configAllowedUsers: target.allowedUsers, allowedUsers: [USER_OPEN_ID] });
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_source_owner')).toBe(false);
   });
 });
 

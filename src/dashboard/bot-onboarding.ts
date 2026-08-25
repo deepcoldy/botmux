@@ -19,7 +19,7 @@ import {
   type CriticalScopeReadbackResult,
   type RemainingStep,
 } from '../setup/verify-permissions.js';
-import { resolveSetupAppName } from '../setup/app-name.js';
+import { resolveCloneAppName, resolveSetupAppName } from '../setup/app-name.js';
 import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
@@ -141,7 +141,7 @@ export interface BotOnboardingSnapshot {
 
 /** 调用方 (dashboard) 已校验过的表单输入: CLI / 工作目录 / model. */
 export interface BotOnboardingInput {
-  /** 飞书应用名称；留空时按待追加的 bots.json 行号生成 botmux-N。 */
+  /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
   cloneSourceAppId?: string;
   /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
@@ -1592,8 +1592,9 @@ export class BotOnboardingManager {
   }
 
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
     const cloneSource = input.cloneSourceAppId
-      ? readBotsJsonOrEmpty(this.opts.botsJsonPath).find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
+      ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
       : undefined;
     if (input.cloneSourceAppId && !cloneSource) {
       this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
@@ -1601,7 +1602,14 @@ export class BotOnboardingManager {
     }
     // Freeze the resolved name before any asynchronous work. Later bot list
     // changes must not make the name drift midway through onboarding.
-    const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
+    const appName = cloneSource
+      ? resolveCloneAppName(
+          input.appName,
+          [cloneSource.displayName, cloneSource.name, input.cloneSourceAppId]
+            .find(value => typeof value === 'string' && value.trim()),
+          this.now(),
+        )
+      : resolveSetupAppName(input.appName, configuredBots.length);
     this.patch(id, {
       registrationMode: input.registrationMode ?? 'web',
       ...(input.requireCriticalScopesBeforeActivation

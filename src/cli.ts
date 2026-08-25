@@ -6,7 +6,7 @@
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
- *   botmux clone <bot>    — create a new app, then copy an existing bot's configuration
+ *   botmux clone <bot> [--name <name>] — create a new app, then copy an existing bot's configuration
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
  *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services;
@@ -55,6 +55,7 @@ import {
   assertUniqueBotProcessNames,
   botProcessName,
   cloneBotConfig,
+  cloneOwnerEntries,
   normalizeBotConfig,
   parseBotConfigsJson,
   parseBotSelection,
@@ -67,7 +68,7 @@ import {
 } from './setup/bot-config-editor.js';
 import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
 import { checkCliAvailability, hasAgentLaunchConfigChanged } from './setup/cli-availability.js';
-import { resolveSetupAppName } from './setup/app-name.js';
+import { resolveCloneAppName, resolveSetupAppName } from './setup/app-name.js';
 import {
   blocksSetupBotStart,
   classifySetupOpenPlatformOutcome,
@@ -2495,9 +2496,12 @@ async function cmdSetupScripted(
 }
 
 async function cmdClone(argv: string[]): Promise<void> {
-  const [sourceSelector, ...extra] = argv;
-  if (!sourceSelector || extra.length > 0) {
-    console.error('用法: botmux clone <进程名|配置名|AppID>');
+  const [sourceSelector, nameFlag, requestedName] = argv;
+  if (
+    !sourceSelector
+    || (argv.length !== 1 && (argv.length !== 3 || nameFlag !== '--name' || !requestedName?.trim()))
+  ) {
+    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>]');
     process.exitCode = 1;
     return;
   }
@@ -2509,16 +2513,30 @@ async function cmdClone(argv: string[]): Promise<void> {
     return;
   }
   const source = bots[sourceIndex];
-  const owners = Array.isArray(source.allowedUsers)
-    ? source.allowedUsers.filter((entry: unknown) => typeof entry === 'string' && !entry.startsWith('ou_'))
-    : [];
+  const owners = cloneOwnerEntries(
+    source,
+    process.env.BOTMUX_LARK_APP_ID,
+    process.env.BOTMUX_OWNER_OPEN_ID ?? process.env.__OWNER_OPEN_ID,
+  );
   if (!hasOwnerEntry(owners)) {
-    console.error('源机器人没有可跨应用复用的 owner（邮箱、手机号或 on_ union_id）。');
+    console.error('源机器人没有可跨应用复用的 owner（邮箱、手机号、on_ union_id，或当前会话已认证的 owner）。');
     process.exitCode = 1;
     return;
   }
   const addArgs = ['add', '--create-app', '--allowed-users', owners.join(',')];
-  if (botBrand(source) === 'lark') addArgs.push('--brand', 'lark');
+  if (botBrand(source) === 'lark') {
+    if (requestedName) {
+      console.error('Lark SDK 创建路径暂不支持自定义应用名称。');
+      process.exitCode = 1;
+      return;
+    }
+    addArgs.push('--brand', 'lark');
+  } else {
+    const sourceName = typeof source.displayName === 'string' && source.displayName.trim()
+      ? source.displayName.trim()
+      : botProcessName(source, sourceIndex);
+    addArgs.push('--app-name', resolveCloneAppName(requestedName, sourceName));
+  }
   await cmdSetupScripted(addArgs, source);
 }
 
@@ -7316,8 +7334,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
-  clone <机器人名>
-              创建新应用并复制该机器人的配置；新应用凭证与 owner 保持为创建结果
+  clone <机器人名> [--name <新名称>]
+              创建新应用并复制该机器人的行为配置；留空名称自动使用 源名称-copy-时间戳
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
