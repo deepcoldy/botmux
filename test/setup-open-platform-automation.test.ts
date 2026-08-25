@@ -26,6 +26,7 @@ import {
   getCookieHeader,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
+  missingRedirectUrls,
   OpenPlatformApiError,
   parseSetupOpenPlatformAutoFlag,
   prepareFeishuWebSession,
@@ -37,6 +38,7 @@ import {
   writeRedirectWhitelist,
   writeStoredCookiesToSessionFile,
 } from '../src/setup/open-platform-automation.js';
+import { classifySetupOpenPlatformOutcome } from '../src/setup/open-platform-outcome.js';
 
 function cookie(overrides: Partial<StoredCookie> = {}): StoredCookie {
   return {
@@ -433,6 +435,63 @@ describe('redirect 白名单读→合并→写', () => {
 
     await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', [BOTMUX_REDIRECT_URL]))
       .rejects.toThrow('rejected');
+    expect(stub.writes).toHaveLength(1);
+  });
+
+  // ── redirect 完整性判据（automation 与批量修复共用同一个纯函数）─────────────
+  describe('missingRedirectUrls', () => {
+    it('按落盘结果逐条核对 wanted，不看 status', () => {
+      // 全落盘（顺序无关、线上多出的条目无所谓）→ 一条不缺。
+      expect(missingRedirectUrls(
+        [BOTMUX_REDIRECT_URL, 'https://a.example.com/oauth/callback'],
+        ['https://a.example.com/oauth/callback', 'https://user-own/cb', BOTMUX_REDIRECT_URL],
+      )).toEqual([]);
+      // 最小集兜底的典型形态：wanted 里超出「线上现值 ∪ 本机回调」的那条被丢了。
+      expect(missingRedirectUrls(
+        [BOTMUX_REDIRECT_URL, 'https://a.example.com/oauth/callback'],
+        [BOTMUX_REDIRECT_URL, 'https://user-own/cb'],
+      )).toEqual(['https://a.example.com/oauth/callback']);
+      // 一次写请求都没发（skipped_unreadable 的 redirectUrls）→ wanted 全缺。
+      expect(missingRedirectUrls([BOTMUX_REDIRECT_URL], [])).toEqual([BOTMUX_REDIRECT_URL]);
+      // 空白 / 重复条目不该被算成「缺了一条」。
+      expect(missingRedirectUrls([BOTMUX_REDIRECT_URL, BOTMUX_REDIRECT_URL, ''], [BOTMUX_REDIRECT_URL])).toEqual([]);
+    });
+  });
+
+  // ── 兜底重写的判据：主题词 AND 拒绝词双命中 ─────────────────────────────────
+  // 历史实现是一张 OR 关键词表，任一命中就再改一次线上安全设置；下面三条负例在旧
+  // 判据下都会误触发第二次写。
+  const rejectedByConsole = (err: unknown) => stubPostJson({
+    // 现值与 wanted 都非空，最小集 ≠ 全集：兜底一旦触发就一定看得到第二次写。
+    read: readPayload(['https://console.example.com/my-own-callback']),
+    writeErrors: [err],
+  });
+  const twoWanted = [BOTMUX_REDIRECT_URL, 'https://m-abc.example.com/oauth/callback'];
+
+  it('URL 格式类拒绝（中英）才触发一次最小集兜底', async () => {
+    for (const msg of ['code=1 msg=redirect url format invalid', 'code=1 msg=重定向 URL 非法']) {
+      const stub = rejectedByConsole(new Error(msg));
+      const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', twoWanted);
+      expect(result.status).toBe('updated_fallback');
+      expect(stub.writes).toHaveLength(2);
+    }
+  });
+
+  it.each([
+    // 实测误触发场景：只有拒绝词「invalid」，说的根本不是 URL。
+    ['400 invalid csrf token', new OpenPlatformApiError('invalid csrf token', { code: 1, msg: 'invalid csrf token' }, 400)],
+    // 主题词命中但属于限流：改小重发只会再吃一次限流。
+    ['429 redirect rate limited', new OpenPlatformApiError('HTTP 429: redirect rate limited', { code: 1 }, 429)],
+    // 限流 / 服务端故障优先于关键词：文案双命中也不能重写线上配置（否则限流时反而多打一次）。
+    ['429 且文案双命中', new OpenPlatformApiError('HTTP 429: redirect url format invalid', { code: 1 }, 429)],
+    ['503 且文案双命中', new OpenPlatformApiError('HTTP 503: redirect url format invalid', { code: 1 }, 503)],
+    ['409 且文案双命中', new OpenPlatformApiError('HTTP 409: redirect url format invalid', { code: 1 }, 409)],
+    // 只有拒绝词「not allowed」，与白名单写了什么无关。
+    ['operation not allowed', new Error('code=1 msg=operation not allowed')],
+  ])('不因 %s 触发二次写', async (_label, err) => {
+    const stub = rejectedByConsole(err);
+    await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', twoWanted)).rejects.toBe(err);
+    // 只发 1 次 update，也就不可能返回 updated_fallback（兜底那次才会产生它）。
     expect(stub.writes).toHaveLength(1);
   });
 
@@ -1530,6 +1589,72 @@ describe('automateOpenPlatformSetup', () => {
     expect(result.ok).toBe(true);
     expect(calls.some(u => u.includes('/safe_setting/update/'))).toBe(true);
     if (result.ok) expect(result.redirectConfigured).toBe(true);
+  });
+
+  it('全集被拒退到最小集时不报「已配置」：redirectConfigured=false + warning 列出缺失地址 + ready_with_warnings', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-fallback-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    // 空 HOME（无 config.json / platform.json）+ 反代基址 → wanted 恰好两条，
+    // 其中反代那条正是最小集兜底会丢掉的。
+    const emptyHome = mkdtempSync(join(tmpdir(), 'botmux-open-platform-fallback-home-'));
+    const prevHome = process.env.HOME;
+    const prevPublic = process.env.BOTMUX_PUBLIC_URL;
+    process.env.HOME = emptyHome;
+    process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com/';
+    const proxyRedirectUrl = 'https://botmux.example.com/oauth/callback';
+
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const redirectWrites: string[][] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/safe_setting/update/')) {
+        const body = JSON.parse(String(init?.body));
+        redirectWrites.push(body.redirectURL);
+        // 第一次（全集）被 console 判非法 → 触发最小集兜底；第二次放行。
+        return redirectWrites.length === 1
+          ? Response.json({ code: 1, msg: 'redirect url format invalid' })
+          : Response.json({ code: 0 });
+      }
+      if (href.includes('/safe_setting/')) {
+        return Response.json({ code: 0, data: { redirectURL: ['https://console.example.com/my-own-callback'] } });
+      }
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    try {
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      });
+
+      // 兜底集 = 线上现值 ∪ 本机回调：反代那条被丢了，按定义就没写全。
+      expect(redirectWrites).toHaveLength(2);
+      expect(redirectWrites[0]).toContain(proxyRedirectUrl);
+      expect(redirectWrites[1]).not.toContain(proxyRedirectUrl);
+      // 白名单没写全不阻断建 bot：版本照常发；但绝不能报成「已配置 redirect URL」。
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.redirectConfigured).toBe(false);
+        expect(result.redirectWarning).toContain(proxyRedirectUrl);
+        expect(result.versionId).toBe('v1');
+      }
+      // CLI 打印 / scripted JSON / onboarding 都挂在这条 outcome 上。
+      expect(classifySetupOpenPlatformOutcome(result).status).toBe('ready_with_warnings');
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevPublic === undefined) delete process.env.BOTMUX_PUBLIC_URL;
+      else process.env.BOTMUX_PUBLIC_URL = prevPublic;
+    }
   });
 
   it('skips scope update when no manifest scope exists in this tenant catalog, still succeeding', async () => {

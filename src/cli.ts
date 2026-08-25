@@ -1302,8 +1302,12 @@ async function pickExistingAppCredentials(
  * - secret 不进 argv / 日志 / 错误链 (registerApp 内部 safeMsg 已做; 手动模式下
  *   AppSecret 通过 rl.question 异步读取, 不会出现在 process.argv)
  * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
+ *
+ * export 是给单测用的取值缝：`appJustCreated` 只在这里按来源分支置位，下游
+ * (`promptBotConfig` → SETUP_APP_JUST_CREATED → finishOpenPlatformSetup) 只是原样透传，
+ * 所以「哪条来源算刚创建」必须在这一层锁住。生产代码没有别的调用方。
  */
-async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
+export async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
   | {
       ok: true;
       appId: string;
@@ -1447,6 +1451,13 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
           appSecret: result.appSecret,
           brand: result.brand,
           userOpenId: result.userOpenId,
+          // tryRegisterApp 只有「device flow 现场注册一个新应用」这一条语义（见
+          // setup/register-app.ts：SDK 打 `app/registration` 的 begin/poll），没有
+          // 「复用已有应用」的分支，所以这里恒为刚创建。漏了它，兼容模式建出的新应用
+          // 在 finishOpenPlatformSetup 里拿不到 allowBlindWrite —— 读不到白名单时会
+          // 按「保护存量用户条目」零写入，可新应用本来就没有任何条目可保护，结果就是
+          // redirect 白名单一条都没写，authorize 直接 20029。
+          appJustCreated: true,
         };
       }
       console.log(`\n⚠️  SDK 扫码失败 (${result.error}): ${result.message}`);

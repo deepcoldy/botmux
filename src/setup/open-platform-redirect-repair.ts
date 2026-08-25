@@ -31,6 +31,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import {
   collectBotmuxRedirectUrls,
   createOpenPlatformApiClient,
+  missingRedirectUrls,
   OpenPlatformApiError,
   prepareFeishuWebSession,
   safeErrorMessage,
@@ -296,10 +297,10 @@ async function repairOne(
     // 最小集兜底恰恰是「写成功了但想要的没写全」：丢掉的那条正是这次要用的回调地址
     // 时，authorize 照样 20029，报 fixed 等于把 partial 藏起来。
     //
-    // 按落盘结果判而不是直接认 `status === 'updated_fallback'`：今天这两者等价
-    //（最小集 = 线上现值 ∪ 本机回调，按定义就是把 wanted 里超出这个范围的条目丢了），
-    // 但兜底集的构成一旦调整，只有「拿 wanted 对一遍实际结果」这条判据不会跟着错。
-    const missing = wanted.filter(url => !written.redirectUrls.includes(url));
+    // 判据收口在 {@link missingRedirectUrls}：`automateOpenPlatformSetup` 的
+    // `redirectConfigured` 消费的是同一个纯函数，两处各写一份必然漂移（automation
+    // 曾经漏判 `updated_fallback`，这边却判对了）。
+    const missing = missingRedirectUrls(wanted, written.redirectUrls);
     if (missing.length > 0) {
       return {
         appId,

@@ -512,6 +512,29 @@ export interface RedirectWhitelistWriteResult {
   warning?: string;
 }
 
+/**
+ * 「这次想写的地址里，有哪几条最终没落在线上」——redirect 白名单**是否算配置成功**的
+ * 唯一判据。
+ *
+ * 纯函数（无 IO、无状态），由 {@link automateOpenPlatformSetup} 与
+ * `open-platform-redirect-repair.ts` 的批量修复**共用同一份结果**：两处各写一份完整性
+ * 判断必然漂移——automation 曾经只特判 `skipped_unreadable`、其余一律报「已配置」，于是
+ * `updated_fallback`（按定义至少漏掉一条 wanted）被假报成成功，用户拿到一个建好了、
+ * 一授权就 20029 的 bot。
+ *
+ * 按**实际落盘结果**逐条核对 `wanted`，而不是特判某个 status：今天只有
+ * `updated_fallback` 会漏条（最小集 = 线上现值 ∪ 本机回调，超出这个范围的 wanted 都被
+ * 丢了），但兜底集的构成一旦调整，只有「拿 wanted 对一遍实际结果」这条判据不会跟着错。
+ *
+ * ⚠️ `skipped_unreadable`（读不到线上现值 → 一次写请求都没发）**不走这条路**：它是
+ * 「没写」而不是「写漏了」，两者的下一步完全不同（前者要先修登录态/权限，后者去后台
+ * 补地址），由两个调用方各自单独特判并给出区分开的措辞。
+ */
+export function missingRedirectUrls(wanted: string[], written: string[]): string[] {
+  const live = new Set(written);
+  return uniqueStrings(wanted).filter(url => !live.has(url));
+}
+
 export interface WriteRedirectWhitelistOptions {
   /**
    * 允许「读不出线上现值时直接全量覆盖写」。
@@ -621,10 +644,21 @@ function sameRedirectSet(a: string[], b: string[]): boolean {
   return b.every(item => set.has(item));
 }
 
-/** 「这条 URL 格式不合法」类报错里出现的词。中英各覆盖一组，命中即认。 */
+/**
+ * 主题词：这句报错在说「某个 URL / 回调地址」。
+ * 单独出现不构成拒绝（`redirect rate limited` 也含 redirect）。
+ */
+const REDIRECT_URL_SUBJECT_KEYWORDS = [
+  'url', 'uri', 'redirect', 'callback', '回调', '重定向', '链接',
+];
+
+/**
+ * 拒绝词：这句报错在说「它不合法 / 格式不对 / 不被接受」。
+ * 同样单独出现不构成拒绝（`invalid csrf token` 也含 invalid）。
+ */
 const REDIRECT_URL_REJECTION_KEYWORDS = [
-  'url', 'uri', 'redirect', 'invalid', 'illegal', 'malformed', 'format', 'not allowed', 'unsupported',
-  '非法', '不合法', '格式', '重定向', '回调', '不支持', '不允许',
+  'invalid', 'illegal', 'malformed', 'format', 'not allowed', 'not supported', 'unsupported',
+  '非法', '不合法', '格式', '不支持', '不允许',
 ];
 
 /**
@@ -636,17 +670,29 @@ const REDIRECT_URL_REJECTION_KEYWORDS = [
  *   1. 传输层失败（fetch failed / ECONNRESET…）→ false。重发只会再失败一次。
  *   2. HTTP 401/403 或 console 的 owner 拒绝码 → false。这是鉴权问题，与写什么无关，
  *      重发还会被拒，而且会把 `not_owned` 的判定链拉长。
- *   3. 其余（含 `code!=0` 的业务拒绝）→ 文案里出现 URL/格式类关键词才算。
- * 判不出来就**不**兜底：少一次可能有用的重试，好过在网络/鉴权故障上多改一次线上配置。
+ *   3. HTTP 408/409/429 与所有 5xx → false。超时 / 冲突 / 限流 / 服务端故障都与
+ *      「写了什么」无关，立刻改小重发只会再吃一次限流或再撞一次冲突。
+ *   4. 其余（含 `code!=0` 的业务拒绝）→ **主题词 AND 拒绝词双命中**才算：文案里既要
+ *      出现 url/uri/redirect/callback/回调/重定向/链接 这类**说的是地址**的词，又要出现
+ *      invalid/illegal/malformed/format/not allowed/unsupported/非法/格式/不支持 这类
+ *      **说它被拒**的词。
+ *
+ * 曾经是一张 OR 关键词表，任一命中就兜底重写一次线上配置——`invalid csrf token`
+ *（实测会误触发）、`operation not allowed` 这类与白名单毫无关系的报错都会让 botmux
+ * 再写一次开放平台安全设置。判不出来就**不**兜底：少一次可能有用的重试，好过在
+ * 网络 / 鉴权 / 限流故障上多改一次线上配置。
  */
 function isRedirectUrlRejectedError(err: unknown): boolean {
   if (isLikelyTransientNetworkError(err)) return false;
   if (err instanceof OpenPlatformApiError) {
     if (err.status === 401 || err.status === 403) return false;
+    if (err.status === 408 || err.status === 409 || err.status === 429) return false;
+    if (err.status >= 500) return false;
     if (openPlatformOwnerAccessDenied(err)) return false;
   }
   const message = safeErrorMessage(err).toLowerCase();
-  return REDIRECT_URL_REJECTION_KEYWORDS.some(keyword => message.includes(keyword));
+  return REDIRECT_URL_SUBJECT_KEYWORDS.some(keyword => message.includes(keyword))
+    && REDIRECT_URL_REJECTION_KEYWORDS.some(keyword => message.includes(keyword));
 }
 
 /**
@@ -974,14 +1020,29 @@ export async function automateOpenPlatformSetup(
   let redirectConfigured = false;
   let redirectWarning: string | undefined;
   try {
-    const written = await writeRedirectWhitelist(postJson, options.appId, undefined, {
+    // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
+    // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
+    // 猜——那正是 `updated_fallback` 被假报成成功的原因。
+    const wantedRedirectUrls = collectBotmuxRedirectUrls();
+    const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
     });
     if (written.status === 'skipped_unreadable') {
+      // 「读不到线上现值 → 一次写请求都没发」。与下面的「写了但没写全」是两回事：
+      // 这里连线上有什么都不知道，谈不上缺哪几条，措辞也要分开。
       redirectWarning = written.warning;
     } else {
-      redirectConfigured = true;
+      const missing = missingRedirectUrls(wantedRedirectUrls, written.redirectUrls);
+      if (missing.length === 0) {
+        redirectConfigured = true;
+      } else {
+        // 写请求返回 200 ≠ 想要的地址都在线上。缺的那条正是本机这次要用的回调地址时，
+        // authorize 照样 20029，报「已配置」等于把问题藏到用户踩坑那一刻。
+        redirectWarning = written.status === 'updated_fallback'
+          ? `完整地址列表被开放平台拒绝，已退回「线上现值 + 本机回调」最小集写入；仍缺: ${missing.join('、')}`
+          : `写入已提交，但以下回调地址仍未生效: ${missing.join('、')}`;
+      }
     }
   } catch (err: any) {
     redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;

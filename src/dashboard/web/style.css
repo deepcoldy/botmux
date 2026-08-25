@@ -27643,6 +27643,10 @@ button.skills-issue-badge:hover {
   gap: 2px;
   justify-items: start;
 }
+/* partial 与 not_owned / failed 同属警示色：白名单写了但 wanted 没写全，缺的那条正是
+   本机回调时 authorize 照样 20029，视觉上不能跟 fixed / unchanged 混成一类。
+   （类名由 bot-defaults-page.tsx 的 data-sg-tag-repair-item={item.status} 直接输出。） */
+.bd-sg-repair-hint [data-sg-tag-repair-item="partial"],
 .bd-sg-repair-hint [data-sg-tag-repair-item="not_owned"],
 .bd-sg-repair-hint [data-sg-tag-repair-item="failed"] { color: var(--warning); }
 .feed-group-auth-card .bd-sg-repair-hint { margin-top: 14px; }
