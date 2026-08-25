@@ -17851,6 +17851,11 @@ function publishLocalProcessAttestation(cliPid?: number): void {
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
   });
+  // IPC preserves order: the daemon records this exact CLI pid/generation
+  // before it snapshots the current turn's pre-existing descendants. This is
+  // required for the opening turn, whose origin is first published before the
+  // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
+  if (currentBotmuxTurnId) publishSandboxRelayCapability();
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`

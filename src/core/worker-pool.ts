@@ -27,7 +27,7 @@ import {
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { resolveSessionLaunchModel } from './session-model.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
@@ -424,6 +424,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
+import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -9852,6 +9853,21 @@ function isMeetingDrivenTurn(
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
 }
 
+function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
+  // The daemon owns this per-turn sender map. The worker contributes only the
+  // turn id over private IPC; it can never choose which human that id denotes.
+  return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+}
+
+function currentTurnProcessIdentities(
+  ds: DaemonSession,
+  turnId: string | undefined,
+): string[] | undefined {
+  return turnId && ds.localProcessAttestation?.cliPid
+    ? snapshotProcessIdentities(ds.localProcessAttestation.cliPid)
+    : undefined;
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -12151,12 +12167,19 @@ function setupWorkerHandlers(
             break;
           }
         }
+        const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
+            : {}),
+          ...((msg.turnId && currentGatewayCallerOpenId(ds, msg.turnId))
+            ? { callerOpenId: currentGatewayCallerOpenId(ds, msg.turnId) }
+            : {}),
+          ...(preexistingProcessIdentities
+            ? { preexistingProcessIdentities }
             : {}),
         };
         break;

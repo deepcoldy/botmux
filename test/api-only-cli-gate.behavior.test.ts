@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
  * Requires the compiled artifact; skips if dist is absent.
  */
 const CLI = resolve('dist/cli.js');
-const LARK_FACING = ['send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant'];
+const LARK_FACING = ['send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'actor'];
 
 let DATA_DIR = '';
 const VIRTUAL_SID = 'sess_behavior_virtual';

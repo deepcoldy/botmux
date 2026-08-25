@@ -7732,6 +7732,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  actor current --json
+              返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   mojo-containment list|revoke
               查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
               blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
@@ -14559,7 +14561,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
   'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
-  'vc-agent', 'report',
+  'vc-agent', 'report', 'actor',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
   console.error(
@@ -14586,6 +14588,31 @@ switch (command) {
       break;
     }
     process.stdout.write(`${JSON.stringify(botmuxCapabilities())}\n`);
+    break;
+  }
+  case 'actor': {
+    const { parseCurrentActorArgs, resolveBotmuxAncestorContext, resolveCurrentActor } = await import('./cli/current-actor.js');
+    const parsed = parseCurrentActorArgs(process.argv.slice(3));
+    if (!parsed.ok) {
+      console.error(parsed.error);
+      process.exitCode = 2;
+      break;
+    }
+    try {
+      const { ipcPort, sessionId } = resolveBotmuxAncestorContext();
+      const actor = await resolveCurrentActor({
+        ipcPort,
+        sessionId,
+      });
+      process.stdout.write(`${JSON.stringify(actor)}\n`);
+    } catch {
+      process.stdout.write(`${JSON.stringify({
+        schema: 'botmux.current-actor.v2',
+        status: 'blocked',
+        error: 'current_actor_unverified',
+      })}\n`);
+      process.exitCode = 2;
+    }
     break;
   }
   case 'setup': {

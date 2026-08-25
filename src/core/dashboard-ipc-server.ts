@@ -45,6 +45,13 @@ import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+import {
+  CURRENT_ACTOR_ROUTE,
+} from '../cli/current-actor.js';
+import {
+  resolveDaemonCurrentActor,
+  resolveLoopbackPeerProcesses,
+} from './current-actor-attestation.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -722,6 +729,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
   if (method === 'POST' && pathname === MANAGED_ORIGIN_ATTEST_ROUTE) return true;
+  // The daemon authenticates this route from the live loopback peer process
+  // and its private worker IPC state. It intentionally accepts no file/env
+  // capability because those are writable by an unconfined same-UID Agent.
+  if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -951,6 +962,49 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
   } finally {
     managedOriginPreauthInFlight -= 1;
   }
+});
+
+ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
+  let body: { sessionId?: unknown };
+  try {
+    body = await readBoundedJsonBody(req, 1_024, 1_000);
+  } catch (err) {
+    if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(res, err instanceof IpcBodyTooLargeError ? 413 : 400, {
+      schema: 'botmux.current-actor.v2',
+      status: 'blocked',
+      error: 'current_actor_unverified',
+    });
+  }
+  const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
+    ? body.sessionId
+    : '';
+  const peer = resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress,
+    remotePort: req.socket.remotePort,
+    localPort: req.socket.localPort,
+  });
+  if (!sessionId || !peer.ok) {
+    return jsonRes(res, 403, {
+      schema: 'botmux.current-actor.v2',
+      status: 'blocked',
+      error: 'current_actor_unverified',
+    });
+  }
+  const result = await resolveDaemonCurrentActor({
+    sessionId,
+    peer: peer.peer,
+    findSession: findActiveBySessionId,
+  });
+  return result.ok
+    ? jsonRes(res, 200, result.document)
+    : jsonRes(res, 403, {
+        schema: 'botmux.current-actor.v2',
+        status: 'blocked',
+        error: result.error,
+      });
 });
 
 // ─── Session list / detail ─────────────────────────────────────────────────

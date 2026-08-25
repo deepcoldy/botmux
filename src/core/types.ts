@@ -493,6 +493,13 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Current human caller, carried over private worker IPC from the
+     * daemon-authenticated input envelope. Never sourced from CLI env/files. */
+    callerOpenId?: string;
+    /** Linux pid:starttime identities already present in the CLI subtree when
+     * this turn authority was published. Actor callers may not traverse one of
+     * these old descendants; the long-lived CLI root itself is the exception. */
+    preexistingProcessIdentities?: string[];
   };
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
