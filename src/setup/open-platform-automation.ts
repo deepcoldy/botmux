@@ -662,6 +662,36 @@ const REDIRECT_URL_REJECTION_KEYWORDS = [
 ];
 
 /**
+ * 把一张关键词表编译成匹配函数：**英文/ASCII 词按词边界（独立单词）匹配，中文词按子串**。
+ *
+ * 英文必须卡词边界，否则普通单词内部的片段会被当成命中，实测三例：
+ *   - `security token invalid`：`security` 里含 `uri`（主题词）+ `invalid`（拒绝词）
+ *   - `invalid operation during request`：`during` 里含 `uri`
+ *   - `callback information unavailable`：`information` 里含 `format`
+ * 三句都与「白名单里有条非法 URL」毫无关系，裸 `includes` 却会让 botmux 再改一次
+ * 线上安全设置。多词短语（`not allowed`）按整条短语卡首尾词边界；结尾允许一个复数
+ * `s`（`one of the urls is invalid` 仍算主题命中），词内片段依旧不算。
+ *
+ * 中文没有词边界概念（`回调地址非法` 本就连写，`\b` 在中文串里也失去意义），继续 includes。
+ * 大小写不敏感沿用旧行为：ASCII 正则带 `i`，中文无大小写之分。
+ */
+function compileKeywordMatcher(keywords: string[]): (message: string) => boolean {
+  // 纯 ASCII 可打印字符 = 英文单词/短语；含中文的走 includes。
+  const isAscii = (keyword: string) => /^[\x20-\x7e]+$/.test(keyword);
+  // 关键词表里目前没有正则元字符，仍转义一次，免得以后加词时静默变成正则。
+  const asciiWords = keywords.filter(isAscii).map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const cjkKeywords = keywords.filter(keyword => !isAscii(keyword));
+  const wordPattern = asciiWords.length > 0
+    ? new RegExp(`\\b(?:${asciiWords.join('|')})s?\\b`, 'i')
+    : null;
+  return (message: string) => (wordPattern?.test(message) ?? false)
+    || cjkKeywords.some(keyword => message.includes(keyword));
+}
+
+const matchesRedirectUrlSubject = compileKeywordMatcher(REDIRECT_URL_SUBJECT_KEYWORDS);
+const matchesRedirectUrlRejection = compileKeywordMatcher(REDIRECT_URL_REJECTION_KEYWORDS);
+
+/**
  * 判断一次 `safe_setting/update` 失败是不是「白名单里某条 URL 被 console 判非法」——
  * 只有这一类才值得用最小集再写一次。
  *
@@ -675,7 +705,10 @@ const REDIRECT_URL_REJECTION_KEYWORDS = [
  *   4. 其余（含 `code!=0` 的业务拒绝）→ **主题词 AND 拒绝词双命中**才算：文案里既要
  *      出现 url/uri/redirect/callback/回调/重定向/链接 这类**说的是地址**的词，又要出现
  *      invalid/illegal/malformed/format/not allowed/unsupported/非法/格式/不支持 这类
- *      **说它被拒**的词。
+ *      **说它被拒**的词。英文词必须是**独立单词**（词边界），不认词内片段——
+ *      `security token invalid`（security 含 uri）、`invalid operation during request`
+ *      （during 含 uri）、`callback information unavailable`（information 含 format）
+ *      这三句实测都会被裸 `includes` 判成双命中，见 {@link compileKeywordMatcher}。
  *
  * 曾经是一张 OR 关键词表，任一命中就兜底重写一次线上配置——`invalid csrf token`
  *（实测会误触发）、`operation not allowed` 这类与白名单毫无关系的报错都会让 botmux
@@ -690,9 +723,8 @@ function isRedirectUrlRejectedError(err: unknown): boolean {
     if (err.status >= 500) return false;
     if (openPlatformOwnerAccessDenied(err)) return false;
   }
-  const message = safeErrorMessage(err).toLowerCase();
-  return REDIRECT_URL_SUBJECT_KEYWORDS.some(keyword => message.includes(keyword))
-    && REDIRECT_URL_REJECTION_KEYWORDS.some(keyword => message.includes(keyword));
+  const message = safeErrorMessage(err);
+  return matchesRedirectUrlSubject(message) && matchesRedirectUrlRejection(message);
 }
 
 /**

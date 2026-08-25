@@ -469,7 +469,12 @@ describe('redirect 白名单读→合并→写', () => {
   const twoWanted = [BOTMUX_REDIRECT_URL, 'https://m-abc.example.com/oauth/callback'];
 
   it('URL 格式类拒绝（中英）才触发一次最小集兜底', async () => {
-    for (const msg of ['code=1 msg=redirect url format invalid', 'code=1 msg=重定向 URL 非法']) {
+    for (const msg of [
+      'code=1 msg=redirect url format invalid',
+      'code=1 msg=重定向 URL 非法',
+      // 复数形态仍算主题命中（词边界允许结尾一个 s），否则这类文案会白白丢掉兜底。
+      'code=1 msg=one of the urls is invalid',
+    ]) {
       const stub = rejectedByConsole(new Error(msg));
       const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', twoWanted);
       expect(result.status).toBe('updated_fallback');
@@ -480,6 +485,13 @@ describe('redirect 白名单读→合并→写', () => {
   it.each([
     // 实测误触发场景：只有拒绝词「invalid」，说的根本不是 URL。
     ['400 invalid csrf token', new OpenPlatformApiError('invalid csrf token', { code: 1, msg: 'invalid csrf token' }, 400)],
+    // ↓ 三条「词内片段」负例：英文关键词必须按独立单词匹配，裸 includes 全会误判成双命中。
+    // security 里含主题词 uri + 拒绝词 invalid，说的却是令牌。
+    ['security token invalid', new Error('code=1 msg=security token invalid')],
+    // during 里含主题词 uri，说的是操作本身非法。
+    ['invalid operation during request', new Error('code=1 msg=invalid operation during request')],
+    // information 里含拒绝词 format；主题词 callback 虽真命中，但没有任何「被拒」的表述。
+    ['callback information unavailable', new Error('code=1 msg=callback information unavailable')],
     // 主题词命中但属于限流：改小重发只会再吃一次限流。
     ['429 redirect rate limited', new OpenPlatformApiError('HTTP 429: redirect rate limited', { code: 1 }, 429)],
     // 限流 / 服务端故障优先于关键词：文案双命中也不能重写线上配置（否则限流时反而多打一次）。
