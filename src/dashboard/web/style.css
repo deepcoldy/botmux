@@ -10878,7 +10878,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   line-height: 1.45;
 }
 .bot-defaults-page .bd-description-status .bd-feishu-login { margin-left: 6px; }
-.bot-defaults-page .bd-description-overlay {
+.bot-defaults-page.bd-description-overlay {
   position: fixed;
   inset: 0;
   z-index: 100000;

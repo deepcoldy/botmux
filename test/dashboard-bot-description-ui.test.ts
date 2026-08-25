@@ -106,6 +106,12 @@ describe('dashboard bot description editor wiring', () => {
     expect(css).toContain('.bot-defaults-page .bd-description-row');
   });
 
+  it('keeps the body portal inside the description editor CSS scope', () => {
+    expect(page).toContain('className="bot-defaults-page bd-description-overlay"');
+    expect(css).toContain('.bot-defaults-page.bd-description-overlay');
+    expect(css).not.toContain('.bot-defaults-page .bd-description-overlay');
+  });
+
   it('ships Chinese and English copy for the description editor', () => {
     for (const key of [
       'descriptionTitle',

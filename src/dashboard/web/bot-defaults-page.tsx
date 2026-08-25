@@ -1752,7 +1752,7 @@ function BotDescriptionControl(props: { bot: BotDefaultsRow }) {
       ) : null}
       {open && typeof document !== 'undefined' ? createPortal(
         <div
-          className="bd-description-overlay"
+          className="bot-defaults-page bd-description-overlay"
           onClick={event => {
             if (event.currentTarget === event.target && !busy) setOpen(false);
           }}
