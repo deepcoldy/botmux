@@ -1,6 +1,7 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
+import { resolvePiModelFlag } from './pi-model.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
@@ -85,7 +86,8 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       const args = [
         '--session-id', sessionId,
       ];
-      if (model?.trim()) args.push('--model', model.trim());
+      const resolvedModel = resolvePiModelFlag(model);
+      if (resolvedModel) args.push('--model', resolvedModel);
       // Pi's interactive mode processes positional initial messages after TUI
       // startup, avoiding stdin races while keeping the native TUI visible.
       if (initialPrompt) args.push(initialPrompt);
