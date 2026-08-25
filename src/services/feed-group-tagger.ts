@@ -457,6 +457,15 @@ async function callFeedGroupApi(
   }
 }
 
+/** 从授权链接里取出本次真正使用的 `redirect_uri`；取不到就退回默认 loopback。 */
+function redirectUriOf(authUrl: string): string {
+  try {
+    return new URL(authUrl).searchParams.get('redirect_uri') || 'http://127.0.0.1:9768/callback';
+  } catch {
+    return 'http://127.0.0.1:9768/callback';
+  }
+}
+
 async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, reason: string): Promise<void> {
   if (nudgeThrottled(larkAppId)) return;
   try {
@@ -471,7 +480,10 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
     await sendUserMessage(
       larkAppId,
       ownerOpenId,
-      t('sg.tag_auth_nudge', { reason, url: authUrl }, loc),
+      // 回跳地址按本次授权链接实际使用的 redirect_uri 说，别写死 127.0.0.1：
+      // 配了 oauthRedirectBase / 平台绑定 / 反代时它是 `<base>/oauth/callback`，
+      // 那种情况下浏览器根本不会跳 loopback，照抄那句话只会把用户带偏。
+      t('sg.tag_auth_nudge', { reason, url: authUrl, redirect: redirectUriOf(authUrl) }, loc),
       'text',
     );
     logger.info(`[session-tag] sent auth nudge to owner ${ownerOpenId.substring(0, 12)} (${reason})`);

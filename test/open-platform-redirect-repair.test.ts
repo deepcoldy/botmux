@@ -3,8 +3,9 @@
  *
  * Run: pnpm vitest run test/open-platform-redirect-repair.test.ts
  *
- * 注入缝走 `prepareSession` / `clientFactory` / `loadBots` / `collectWanted`，
- * 不碰真实网络与 `~/.botmux`。
+ * 注入缝走 `prepareSession` / `clientFactory` / `loadBots` / `collectWanted`，不碰
+ * 真实网络与 `~/.botmux`。唯一的例外是「AbortSignal 接到底」那条用例：它必须跑默认
+ * 工厂那条真实链路，所以改用注入的 `fetchImpl` + 临时目录里的 session 文件，同样不出网。
  *
  * ⚠️ 409 那一跳（`reason:'in_flight'` → HTTP 409 `repair_in_flight`）**没有**路由层
  * 用例：`src/dashboard.ts` 是入口脚本而不是可导入模块（顶层 `await registry.start()`、
@@ -13,10 +14,14 @@
  * 本身放在 service 侧做成可测的 `in_flight` 返回值（见下方用例），路由只剩一行把它
  * 翻成 409 的纯映射。
  */
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { BotConfig } from '../src/bot-registry.js';
 import {
   OpenPlatformApiError,
+  writeStoredCookiesToSessionFile,
   type OpenPlatformApiClient,
   type StoredCookie,
 } from '../src/setup/open-platform-automation.js';
@@ -48,7 +53,7 @@ const okSession = async () => ({
 
 /**
  * console postJson 桩。`existing[appId]` = 线上现有白名单；`'unreadable'` 让读接口
- * 抛错（走覆盖写降级）。`writeErrors[appId]` 按写入次序消费，用于模拟被拒 / 403。
+ * 抛错（走「零写入」分支）。`writeErrors[appId]` 按写入次序消费，用于模拟被拒 / 403。
  */
 function makeClient(opts: {
   existing?: Record<string, string[] | 'unreadable'>;
@@ -203,12 +208,11 @@ describe('repairOpenPlatformRedirects', () => {
     expect(map.cli_own.status).toBe('fixed');
   });
 
-  it('403 藏在兜底重试的 cause 链里时也要认出 not_owned', async () => {
-    // wanted 不止一条 → 全集被拒后 writeRedirectWhitelist 会用最小集再试一次，
-    // 两次都失败时抛的是包装过的普通 Error，原始 403 只在 cause 上。而「配了
-    // oauthRedirectBase + 换了账号」恰恰走这条分支，只认最外层就会误报成 failed。
+  it('403 写失败只发一次写请求：鉴权问题不该触发最小集兜底，仍判 not_owned', async () => {
+    // wanted 不止一条 → 历史实现会在全集被拒后用最小集再写一次；403 属于鉴权失败，
+    // 改小再写只会再被拒一次，白白多打一次 console，还把 not_owned 的判定藏进 cause 链。
     const stub = makeClient({
-      existing: { cli_other: 'unreadable' },
+      existing: { cli_other: ['https://console.example.com/my-own-callback'] },
       writeErrors: { cli_other: [ownerDenied('cli_other'), ownerDenied('cli_other')] },
     });
     const out = await repairOpenPlatformRedirects({
@@ -220,8 +224,46 @@ describe('repairOpenPlatformRedirects', () => {
 
     expect(out.ok).toBe(true);
     if (!out.ok) return;
-    expect(stub.writes).toHaveLength(2);
+    expect(stub.writes).toHaveLength(1);
     expect(out.results[0]).toMatchObject({ appId: 'cli_other', status: 'not_owned' });
+  });
+
+  it('403 但 code 不是 10003 → 归 failed，不能报「换个账号扫码」', async () => {
+    // 限流 / CSRF 失效 / 租户策略拦截都可能是 403。把它们说成「你不是协作者」，
+    // 用户照着换账号扫一遍照样修不好，还看不到真实原因。
+    const throttled = new OpenPlatformApiError(
+      'HTTP 403 /developers/v1/safe_setting/update/cli_a: code=1254043 msg=rate limited',
+      { code: 1254043, msg: 'rate limited' },
+      403,
+    );
+    const stub = makeClient({ existing: { cli_a: [] }, writeErrors: { cli_a: [throttled] } });
+    const out = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => [LOOPBACK],
+    });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.results[0].status).toBe('failed');
+    expect(out.results[0].message).toContain('rate limited');
+  });
+
+  it('读不到线上白名单 → 零写入并记 failed（绝不盲写覆盖用户自己配的回调）', async () => {
+    const stub = makeClient({ existing: { cli_a: 'unreadable' } });
+    const out = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => WANTED,
+    });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(stub.writes).toEqual([]);
+    expect(out.results[0].status).toBe('failed');
+    expect(out.results[0].message).toContain('未写入');
   });
 
   it('普通写失败记 failed 并带上原因，不误判成 not_owned', async () => {
@@ -242,7 +284,7 @@ describe('repairOpenPlatformRedirects', () => {
     expect(out.results[0].message).toContain('invalid redirect url');
   });
 
-  it('全集被拒、最小集写成功 → 仍算 fixed，但要说清退到了最小集', async () => {
+  it('全集被拒、最小集写成功但 wanted 没写全 → partial，并列出缺了哪几条', async () => {
     const stub = makeClient({
       existing: { cli_a: ['https://console.example.com/my-own-callback'] },
       writeErrors: { cli_a: [new Error('code=1 msg=invalid redirect url'), null] },
@@ -256,10 +298,32 @@ describe('repairOpenPlatformRedirects', () => {
 
     expect(out.ok).toBe(true);
     if (!out.ok) return;
-    expect(out.results[0].status).toBe('fixed');
+    // 兜底集 = 线上现值 ∪ 本机回调，PLATFORM 那条根本没落地 —— 用户接下来要用的
+    // 恰恰可能是它，报 fixed 等于把「还是会 20029」藏起来。
+    expect(out.results[0].status).toBe('partial');
+    expect(out.results[0].missingRedirectUrls).toEqual([PLATFORM]);
+    expect(out.results[0].message).toContain(PLATFORM);
     expect(out.results[0].message).toContain('最小集');
-    // 兜底集 = 线上现值 ∪ 本机回调：仍然不删用户那条。
+    // 兜底集仍然不删用户那条。
     expect(stub.writes[1].redirectURL).toEqual([LOOPBACK, 'https://console.example.com/my-own-callback']);
+  });
+
+  it('wanted 全部落地才算 fixed：不带缺失列表、也不夹带兜底说明（partial 的反例）', async () => {
+    const stub = makeClient({ existing: { cli_a: ['https://console.example.com/my-own-callback'] } });
+    const out = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => WANTED,
+    });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.results[0].status).toBe('fixed');
+    expect(out.results[0].missingRedirectUrls).toBeUndefined();
+    expect(out.results[0].message).toBeUndefined();
+    // 落盘的白名单确实含 wanted 的每一条，用户那条也还在。
+    expect(out.results[0].redirectUrls).toEqual([LOOPBACK, 'https://console.example.com/my-own-callback', PLATFORM]);
   });
 
   it('目标集只含 !apiOnly 且 brand=feishu 的 bot（brand 缺省视为 feishu）', async () => {
@@ -388,6 +452,98 @@ describe('repairOpenPlatformRedirects', () => {
       collectWanted: () => [LOOPBACK],
     })).rejects.toThrow('boom');
 
+    expect(isRepairOpenPlatformRedirectsInFlight()).toBe(false);
+  });
+
+  it('下游永不 settle 时按截止时间返回 timeout，且下一批能正常开始（不再吃 409）', async () => {
+    const stub = makeClient({ existing: { cli_a: [] } });
+    const out = await repairOpenPlatformRedirects({
+      deadlineMs: 20,
+      // 挂死在 client 工厂上：没有服务端 deadline 时 inFlight 会永远留着，
+      // 之后每次点「修复配置」都只会拿到 409，只能重启 daemon 才能自愈。
+      clientFactory: () => new Promise(() => {}),
+      prepareSession: okSession,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => [LOOPBACK],
+    });
+
+    expect(out).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(isRepairOpenPlatformRedirectsInFlight()).toBe(false);
+
+    const next = await repairOpenPlatformRedirects({
+      prepareSession: okSession,
+      clientFactory: stub.clientFactory,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => [LOOPBACK],
+    });
+    expect(next.ok).toBe(true);
+    expect(stub.writes.map(w => w.appId)).toEqual(['cli_a']);
+  });
+
+  it('整批 deadline 的 AbortSignal 真的接进下游 fetch（登录态校验 / console 取页 / 每次 postJson）', async () => {
+    // 这条用例刻意**不注入** prepareSession / clientFactory，跑的正是默认工厂那条真实
+    // 链路——只有信号真接到底，超时才等于「下游当场断开」，而不是「上层不等了、下游
+    // 还在后台偷偷写」。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-redirect-repair-signal-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, cookies());
+
+    const seen: Array<{ url: string; hasSignal: boolean }> = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      seen.push({ url: href, hasSignal: init?.signal instanceof AbortSignal });
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') {
+        return new Response('<script>window.csrfToken="csrf_repair"</script>', { status: 200 });
+      }
+      if (href.includes('/safe_setting/update/')) return Response.json({ code: 0 });
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const out = await repairOpenPlatformRedirects({
+      fetchImpl,
+      sessionFilePath: sessionFile,
+      loadBots: () => [bot('cli_a')],
+      collectWanted: () => [LOOPBACK],
+    });
+
+    expect(out.ok).toBe(true);
+    // 登录态校验 + console 取页 + 白名单读 + 白名单写，一次都不能漏。
+    expect(seen.map(call => call.url)).toEqual([
+      'https://ask.feishu.cn/',
+      'https://open.feishu.cn/app',
+      'https://open.feishu.cn/developers/v1/safe_setting/cli_a',
+      'https://open.feishu.cn/developers/v1/safe_setting/update/cli_a',
+    ]);
+    expect(seen.every(call => call.hasSignal)).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('超时批次即使之后自己活过来，也一个写请求都提交不出去（代际 fence）', async () => {
+    const stub = makeClient({ existing: { cli_a: [], cli_b: [] } });
+    let releaseClient: (() => void) | undefined;
+    const gate = new Promise<void>(resolve => { releaseClient = resolve; });
+
+    const timedOut = await repairOpenPlatformRedirects({
+      deadlineMs: 20,
+      prepareSession: okSession,
+      // 注入的依赖收不到 AbortSignal —— 正是「只靠 Promise.race 清 inFlight」会翻车
+      // 的那类下游：超时后它还活着，稍后 resolve 就会继续往 console 写。
+      clientFactory: async () => { await gate; return stub.clientFactory(); },
+      loadBots: () => [bot('cli_a'), bot('cli_b')],
+      collectWanted: () => [LOOPBACK],
+    });
+    expect(timedOut).toMatchObject({ ok: false, reason: 'timeout' });
+
+    // 让旧批醒过来，并给它足够的事件循环轮次去尝试写。
+    releaseClient?.();
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+    await new Promise(r => setTimeout(r, 10));
+
+    // 代际 fence 的硬断言：超时批次在超时之后的 update 调用数为 0。
+    expect(stub.writes).toEqual([]);
     expect(isRepairOpenPlatformRedirectsInFlight()).toBe(false);
   });
 });

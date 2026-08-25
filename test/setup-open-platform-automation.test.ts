@@ -26,6 +26,7 @@ import {
   getCookieHeader,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
+  OpenPlatformApiError,
   parseSetupOpenPlatformAutoFlag,
   prepareFeishuWebSession,
   probeVcMeetingEventSubscription,
@@ -70,7 +71,13 @@ function openPlatformSubscriptionMock(appId: string, opts: {
   callbackSwitchNoop?: boolean;
   /** event/update 中包含这些事件时整批被拒(逐个重试时对应单个失败)。 */
   rejectEventNames?: string[];
-  initial?: { appEvents?: string[]; userEvents?: string[]; callbacks?: string[]; callbackMode?: number; eventMode?: number };
+  initial?: { appEvents?: string[]; userEvents?: string[]; callbacks?: string[]; callbackMode?: number; eventMode?: number; redirectUrls?: string[] };
+  /**
+   * safe_setting 读接口读不出白名单（返回体里没有 redirectURL）。默认可读——
+   * automateOpenPlatformSetup 现在「读不到就零写入」，默认不可读会让所有只关心
+   * 别的步骤的用例都莫名少一次白名单写入。
+   */
+  redirectUnreadable?: boolean;
   /** visible/online 响应体（不给时用「全员可见」的现行契约形态）。 */
   visibleOnline?: unknown;
 } = {}) {
@@ -80,9 +87,26 @@ function openPlatformSubscriptionMock(appId: string, opts: {
     userEvents: [...(opts.initial?.userEvents ?? [])],
     callbackMode: opts.initial?.callbackMode ?? 1,
     callbacks: [...(opts.initial?.callbacks ?? [])],
+    redirectUrls: [...(opts.initial?.redirectUrls ?? [])],
   };
   const updateBodies: Array<Record<string, unknown>> = [];
+  const redirectWrites: Array<Record<string, unknown>> = [];
   const handle = (href: string, init?: RequestInit): Response | null => {
+    // redirect 白名单同样是「读现值 → 合并 → 写」的有状态接口：读不回真实形态的话，
+    // 生产代码会判成「读不出来」并跳过写入，用例就再也看不到 safe_setting/update。
+    if (href.endsWith(`/developers/v1/safe_setting/update/${appId}`)) {
+      const body = JSON.parse(String(init?.body));
+      // 单独记账：`updateBodies` 被「事件/回调幂等」用例断言为空数组，白名单写入
+      // 不属于那件事，混进去会让那条用例误红。
+      redirectWrites.push(body);
+      state.redirectUrls = [...((body.redirectURL as string[] | undefined) ?? [])];
+      return Response.json({ code: 0 });
+    }
+    if (href.endsWith(`/developers/v1/safe_setting/${appId}`)) {
+      return opts.redirectUnreadable
+        ? Response.json({ code: 0 })
+        : Response.json({ code: 0, data: { redirectURL: [...state.redirectUrls] } });
+    }
     if (href.endsWith(`/developers/v1/event/update/${appId}`)) {
       const body = JSON.parse(String(init?.body));
       updateBodies.push(body);
@@ -132,7 +156,7 @@ function openPlatformSubscriptionMock(appId: string, opts: {
     }
     return null;
   };
-  return { state, updateBodies, handle };
+  return { state, updateBodies, redirectWrites, handle };
 }
 
 describe('parseSetupOpenPlatformAutoFlag', () => {
@@ -302,14 +326,42 @@ describe('redirect 白名单读→合并→写', () => {
     expect(stub.writes).toEqual([]);
   });
 
-  it('falls back to overwriting with the wanted list when the read endpoint is unusable', async () => {
+  it('读不到线上现值时零写入，并回一条明确的 warning', async () => {
     const stub = stubPostJson({ readThrows: true });
     const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [
       BOTMUX_REDIRECT_URL,
       'https://m-abc.example.com/oauth/callback',
     ]);
 
-    // 读不到就只能退化成今天的行为：至少保证 botmux 自己的链路可用。
+    // safe_setting 是全量覆盖语义：读失败还照写 = 拿 botmux 自己那几条把用户
+    // 手配的回调地址整批清掉。一次写请求都不许发。
+    expect(stub.writes).toEqual([]);
+    expect(result.status).toBe('skipped_unreadable');
+    expect(result.existing).toBeNull();
+    expect(result.redirectUrls).toEqual([]);
+    expect(result.warning).toContain('读不到');
+    expect(result.warning).toContain('未写入');
+  });
+
+  it('读接口返回体结构不认识（不是抛错）同样零写入', async () => {
+    // 端点还在、HTTP 200，但没有可识别的 redirectURL 数组——一样属于「不知道线上有什么」。
+    const stub = stubPostJson({ read: { code: 0, data: {} } });
+    const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [BOTMUX_REDIRECT_URL]);
+
+    expect(stub.writes).toEqual([]);
+    expect(result.status).toBe('skipped_unreadable');
+  });
+
+  it('只有显式 allowBlindWrite（调用方能证明 app 刚创建）才允许读失败后覆盖写', async () => {
+    const stub = stubPostJson({ readThrows: true });
+    const result = await writeRedirectWhitelist(
+      stub.postJson,
+      'cli_x',
+      [BOTMUX_REDIRECT_URL, 'https://m-abc.example.com/oauth/callback'],
+      { allowBlindWrite: true },
+    );
+
+    // 刚建出来的应用白名单必然为空，覆盖不掉任何用户条目，这时才值得保住 botmux 自己的链路。
     expect(result.existing).toBeNull();
     expect(result.status).toBe('updated');
     expect(stub.writes).toHaveLength(1);
@@ -317,6 +369,41 @@ describe('redirect 白名单读→合并→写', () => {
       BOTMUX_REDIRECT_URL,
       'https://m-abc.example.com/oauth/callback',
     ]);
+  });
+
+  it('网络类写失败不触发最小集兜底（重发只会再失败一次）', async () => {
+    const networkError = new TypeError('fetch failed');
+    (networkError as any).cause = Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET' });
+    const stub = stubPostJson({
+      read: readPayload(['https://console.example.com/my-own-callback']),
+      writeErrors: [networkError],
+    });
+
+    await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', [
+      BOTMUX_REDIRECT_URL,
+      'https://m-abc.example.com/oauth/callback',
+    ])).rejects.toThrow('fetch failed');
+    // 最小集与被拒全集并不相同，历史实现会在这里再写一次；网络故障时那一次毫无意义。
+    expect(stub.writes).toHaveLength(1);
+  });
+
+  it('403 写失败不触发最小集兜底，且原始 OpenPlatformApiError 原样抛出', async () => {
+    const denied = new OpenPlatformApiError(
+      'HTTP 403 /developers/v1/safe_setting/update/cli_x: code=10003',
+      { code: 10003, msg: 'no permission' },
+      403,
+    );
+    const stub = stubPostJson({
+      read: readPayload(['https://console.example.com/my-own-callback']),
+      writeErrors: [denied],
+    });
+
+    // 鉴权失败与「白名单里有条非法 URL」无关，改小再写一次同样会被拒。
+    await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', [
+      BOTMUX_REDIRECT_URL,
+      'https://m-abc.example.com/oauth/callback',
+    ])).rejects.toBe(denied);
+    expect(stub.writes).toHaveLength(1);
   });
 
   it('retries once with the minimal set when the merged write is rejected', async () => {
@@ -1377,6 +1464,72 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.redirectWarning).toContain('redirect');
       expect(result.versionId).toBe('v1');
     }
+  });
+
+  it('存量应用读不到白名单时零写入，只记 warning（绝不盲写覆盖用户条目）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x', { redirectUnreadable: true });
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      calls.push(href);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+
+    expect(result.ok).toBe(true);
+    // 读失败 → 一次 safe_setting/update 都没发；其余步骤照常走完。
+    expect(calls.some(u => u.includes('/safe_setting/update/'))).toBe(false);
+    if (result.ok) {
+      expect(result.redirectConfigured).toBe(false);
+      expect(result.redirectWarning).toContain('未写入');
+      expect(result.versionId).toBe('v1');
+    }
+  });
+
+  it('appJustCreated=true 时读不到白名单仍会覆盖写（新应用没有可被覆盖的用户条目）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x', { redirectUnreadable: true });
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      calls.push(href);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+      appJustCreated: true,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls.some(u => u.includes('/safe_setting/update/'))).toBe(true);
+    if (result.ok) expect(result.redirectConfigured).toBe(true);
   });
 
   it('skips scope update when no manifest scope exists in this tenant catalog, still succeeding', async () => {

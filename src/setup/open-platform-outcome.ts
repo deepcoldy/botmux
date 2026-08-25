@@ -24,12 +24,17 @@ export function classifySetupOpenPlatformOutcome(
       ? { status: 'manual', result }
       : { status: 'failed', result };
   }
+  // redirect 白名单没写成功也算 warning：它不阻断建 bot，但缺了它 authorize 直接
+  // 20029（群聊模式 p2pMode=group / 会话群标签 / `/login` 全都授权不了）。历史实现
+  // 把这种「建好了但一授权就失败」的 bot 报成纯 ready，用户只能等踩坑才发现。
   const hasWarnings = Boolean(
     result.scopeWarning
     || result.eventWarning
     || result.scopeCount === 0
     || result.skippedScopeCount > 0
     || !result.versionId
+    || !result.redirectConfigured
+    || result.redirectWarning
   );
   return { status: hasWarnings ? 'ready_with_warnings' : 'ready', result };
 }

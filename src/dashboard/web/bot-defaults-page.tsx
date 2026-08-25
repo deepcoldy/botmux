@@ -4218,9 +4218,11 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
  *  `src/setup/open-platform-redirect-repair.ts` 的 `RedirectRepairItem`）。 */
 type RedirectRepairItem = {
   appId: string;
-  status: 'fixed' | 'unchanged' | 'not_owned' | 'failed';
+  /** `partial` = 写成功了但 wanted 没写全（典型：最小集兜底），**不算成功**。 */
+  status: 'fixed' | 'unchanged' | 'partial' | 'not_owned' | 'failed';
   message?: string;
   redirectUrls?: string[];
+  missingRedirectUrls?: string[];
 };
 
 type RedirectRepairOutcome =
@@ -4263,22 +4265,28 @@ async function callRepairRedirects(appIds?: string[]): Promise<RedirectRepairOut
   }
 }
 
-/** 整批都落到 fixed/unchanged 才算「回调地址已就绪」，否则要给用户一条提示。 */
+/** 整批都落到 fixed/unchanged 才算「回调地址已就绪」，否则要给用户一条提示。
+ *  `partial` 刻意不在成功集合里：想要的回调地址没写全，authorize 照样可能 20029。 */
 function repairFullySucceeded(outcome: RedirectRepairOutcome): boolean {
   return outcome.kind === 'ok'
     && outcome.items.length > 0
     && outcome.items.every(item => item.status === 'fixed' || item.status === 'unchanged');
 }
 
-/** per-bot 结果文案。成功态用本地化标签（服务端消息是中文的，en 下别直接抛出去）；
- *  失败态才附服务端原因——那句话里有排障需要的细节。 */
+/** per-bot 结果文案。成功态（fixed/unchanged）用本地化标签即可——服务端消息是中文的，
+ *  en 下别直接抛出去；其余状态**必须**把服务端 message 带出来：partial 的「缺了哪几条」
+ *  和 failed 的真实原因都只在那句话里，吞掉它用户就只看到一个没有下一步的状态词。 */
 function repairStatusText(tr: ReturnType<typeof useT>, item: RedirectRepairItem): string {
   if (item.status === 'fixed') return tr('botDefaults.sgTagRepairStatusFixed');
   if (item.status === 'unchanged') return tr('botDefaults.sgTagRepairStatusUnchanged');
-  if (item.status === 'not_owned') return tr('botDefaults.sgTagRepairStatusNotOwned');
-  return item.message
-    ? tr('botDefaults.sgTagRepairFailed', { reason: item.message })
-    : tr('botDefaults.sgTagRepairStatusFailed');
+  const label = item.status === 'partial'
+    ? tr('botDefaults.sgTagRepairStatusPartial')
+    : item.status === 'not_owned'
+      ? tr('botDefaults.sgTagRepairStatusNotOwned')
+      : tr('botDefaults.sgTagRepairStatusFailed');
+  const detail = item.message
+    || (item.missingRedirectUrls?.length ? item.missingRedirectUrls.join('、') : '');
+  return detail ? tr('botDefaults.sgTagRepairStatusDetail', { status: label, detail }) : label;
 }
 
 /** 会话群标签行（p2pMode=group 时显示）：tag mode 选择器 + 按模式分支的

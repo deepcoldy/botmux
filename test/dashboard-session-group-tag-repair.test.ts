@@ -116,6 +116,40 @@ describe('SessionGroupTagRow — redirect 白名单修复', () => {
     act(() => renderer.unmount());
   });
 
+  it('一键授权：修复只补上一部分（partial）不算成功，必须把缺失地址显示出来', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    const open = vi.fn();
+    vi.stubGlobal('window', { open });
+    const repairBodies: any[] = [];
+    stubFetch({
+      repairBodies,
+      repair: () => jsonResponse({
+        ok: true,
+        results: [{
+          appId: 'cli_repairtest',
+          status: 'partial',
+          message: '完整地址列表被开放平台拒绝，已退回最小集写入；仍缺: https://m-abc.example.com/oauth/callback',
+          redirectUrls: ['http://127.0.0.1:9768/callback'],
+          missingRedirectUrls: ['https://m-abc.example.com/oauth/callback'],
+        }],
+        wanted: ['http://127.0.0.1:9768/callback', 'https://m-abc.example.com/oauth/callback'],
+      }),
+    });
+
+    const renderer = renderRow();
+    await flush();
+    await flush(() => { authButton(renderer).props.onClick(); });
+
+    // 授权流程本身照常不被阻塞（既定设计）。
+    expect(open).toHaveBeenCalledWith('https://auth.example/OK', '_blank', 'noopener');
+    // 但绝不能像 fixed 那样静默：缺的那条恰恰可能是这次要用的回调地址。
+    expect(feedback(renderer, 'done')).toHaveLength(1);
+    const item = renderer.root.findByProps({ 'data-sg-tag-repair-item': 'partial' });
+    const text = String(item.props.children);
+    expect(text).toContain('https://m-abc.example.com/oauth/callback');
+    act(() => renderer.unmount());
+  });
+
   it('一键授权：修复报 feishu_login_required 也照常开授权页，并给一条可点的扫码提示', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout'] });
     const open = vi.fn();

@@ -1075,7 +1075,24 @@ function printCopyHint(filePath: string): void {
   console.log('');
 }
 
-function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
+/**
+ * 手动提示里要让用户填的重定向 URL 列表。
+ *
+ * 写死 `http://127.0.0.1:9768/callback` 是错的：配了 `oauthRedirectBase` / 接了中心
+ * 平台 / 自建反代时，实际发起授权用的是 `<base>/oauth/callback`，只填 loopback 那条
+ * 照样 20029。这里按当前配置实时算（与自动写白名单用的是同一个函数）。
+ * `collectBotmuxRedirectUrls` 内部逐项 try/catch，理论上不抛；再兜一层是因为这段只是
+ * 「打印提示」，任何意外都不该把 setup 本身弄挂。
+ */
+function safeCollectBotmuxRedirectUrls(collect: () => string[]): string[] {
+  try {
+    const urls = collect();
+    if (urls.length > 0) return urls;
+  } catch { /* 配置读不动：退回最核心的那一条 */ }
+  return ['http://127.0.0.1:9768/callback'];
+}
+
+function printRemainingSteps(appId: string, brand: 'feishu' | 'lark', redirectUrls: string[]): void {
   // 同时覆盖 Web 企业自建应用与 SDK PersonalAgent fallback：后者的 bot / 事件
   // 步骤通常已完成，但重复核对无害；前者在自动化中途失败时必须补齐这些步骤。
   const home = `${larkHosts(brand).openApi}/app/${appId}`;
@@ -1107,7 +1124,9 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
 
   console.log('  4. 添加重定向 URL (群聊模式 p2pMode=group / 会话群标签 feed-group / `/login` 必需)');
   console.log(`     申请链接: ${home}/safe → 进入「安全设置」→「重定向 URL」`);
-  console.log('     填入: http://127.0.0.1:9768/callback');
+  // 多条时逐行列出：配了 oauthRedirectBase / 平台绑定 / 反代的机器少填一条就还是 20029。
+  console.log(redirectUrls.length === 1 ? `     填入: ${redirectUrls[0]}` : '     以下每一条都要填入:');
+  if (redirectUrls.length > 1) for (const url of redirectUrls) console.log(`       - ${url}`);
   console.log('     用于 botmux 内 `/login` 拿用户 UAT 获取卡片消息; 白名单里没有它,');
   console.log('     这三种用法点授权会直接报 20029, 连飞书授权页都进不去.\n');
 
@@ -1122,13 +1141,24 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
 async function finishOpenPlatformSetup(
   appId: string,
   brand: 'feishu' | 'lark',
-  options: { reuseOnly?: boolean; forceQrLogin?: boolean; quiet?: boolean } = {},
+  options: {
+    reuseOnly?: boolean;
+    forceQrLogin?: boolean;
+    quiet?: boolean;
+    /** 本次 setup 刚创建出这个应用 —— 只有它允许 redirect 白名单在读失败时盲写覆盖。 */
+    appJustCreated?: boolean;
+  } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
-  const { parseSetupOpenPlatformAutoFlag, automateOpenPlatformSetup } = await import('./setup/open-platform-automation.js');
+  const {
+    parseSetupOpenPlatformAutoFlag,
+    automateOpenPlatformSetup,
+    collectBotmuxRedirectUrls,
+  } = await import('./setup/open-platform-automation.js');
+  const redirectUrls = safeCollectBotmuxRedirectUrls(collectBotmuxRedirectUrls);
   if (!parseSetupOpenPlatformAutoFlag(process.argv.slice(3))) {
     say('\n已跳过开放平台自动配置 (--no-open-platform-auto)。');
-    if (!options.quiet) printRemainingSteps(appId, brand);
+    if (!options.quiet) printRemainingSteps(appId, brand, redirectUrls);
     return { status: 'skipped' };
   }
 
@@ -1146,6 +1176,7 @@ async function finishOpenPlatformSetup(
     forceQrLogin: options.forceQrLogin,
     disableQrLogin: options.reuseOnly,
     disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
+    appJustCreated: options.appJustCreated,
   });
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
@@ -1159,7 +1190,15 @@ async function finishOpenPlatformSetup(
     } else if (result.scopeCount === 0) {
       say('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
     }
-    say(`   已配置 redirect URL: http://127.0.0.1:9768/callback`);
+    // redirect 白名单是独立的一步，失败不阻断建 bot —— 但也绝不能无条件报「已配置」。
+    // 白名单缺了这条，群聊模式 / 会话群标签 / `/login` 点授权直接 20029。
+    if (result.redirectConfigured) {
+      say(`   已配置 redirect URL: ${redirectUrls.join('、')}`);
+    } else {
+      say(`   ⚠️ redirect URL 未配置成功：${result.redirectWarning ?? '未知原因'}`);
+      say(`      请到开放平台「安全设置」→「重定向 URL」手动添加: ${redirectUrls.join('、')}`);
+      say('      缺了它，群聊模式 p2pMode=group / 会话群标签 / `/login` 点授权会直接报 20029。');
+    }
     if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
     else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');
     say('');
@@ -1169,7 +1208,7 @@ async function finishOpenPlatformSetup(
   say(`${outcome.status === 'manual' ? 'ℹ️ ' : '⚠️ '} 开放平台自动配置${outcome.status === 'manual' ? '需要手动完成' : '失败'} (${result.reason}): ${result.message}`);
   if (result.sessionFile) say(`   botmux session 文件: ${result.sessionFile}`);
   say('   请按下面的手动步骤继续完成开放平台配置。');
-  if (!options.quiet) printRemainingSteps(appId, brand);
+  if (!options.quiet) printRemainingSteps(appId, brand, redirectUrls);
   return outcome;
 }
 
@@ -1265,7 +1304,16 @@ async function pickExistingAppCredentials(
  * - 任何失败都返回结构化对象, 不抛 (调用方根据 ok=false 回退)
  */
 async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
-  | { ok: true; appId: string; appSecret: string; brand: Brand; userOpenId?: string; webSessionReady?: boolean }
+  | {
+      ok: true;
+      appId: string;
+      appSecret: string;
+      brand: Brand;
+      userOpenId?: string;
+      webSessionReady?: boolean;
+      /** 这个应用是本次 setup 现场创建出来的（而不是「选择已有」/「手动输入」的存量应用）。 */
+      appJustCreated?: boolean;
+    }
   | { ok: false; reason: 'cancelled' }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
@@ -1353,6 +1401,7 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
           appSecret: webResult.appSecret,
           brand: 'feishu',
           webSessionReady: true,
+          appJustCreated: true,
         };
       }
 
@@ -1611,13 +1660,26 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   if (creds.webSessionReady) {
     Object.defineProperty(normalized, SETUP_WEB_SESSION_READY, { value: true, enumerable: false });
   }
+  if (creds.appJustCreated) {
+    Object.defineProperty(normalized, SETUP_APP_JUST_CREATED, { value: true, enumerable: false });
+  }
   return normalized;
 }
 
 const SETUP_WEB_SESSION_READY = Symbol('setup-web-session-ready');
+/**
+ * 「这个应用是本次 setup 刚创建的」。与 {@link SETUP_WEB_SESSION_READY} 分开两个
+ * 符号：后者只说明「本机有可复用的 Web 登录态」，把它当「刚建的应用」用会在
+ * 「选择已有应用」路径上误判——那条路径同样有登录态，但应用是存量的。
+ */
+const SETUP_APP_JUST_CREATED = Symbol('setup-app-just-created');
 
 function hasSetupWebSession(bot: Record<string, any>): boolean {
   return Boolean((bot as any)[SETUP_WEB_SESSION_READY]);
+}
+
+function wasAppJustCreatedBySetup(bot: Record<string, any>): boolean {
+  return Boolean((bot as any)[SETUP_APP_JUST_CREATED]);
 }
 
 function formatOptionalValue(v: unknown): string {
@@ -1856,7 +1918,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
 
   writeBotsJsonAtomic([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot) });
+  await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot), appJustCreated: wasAppJustCreatedBySetup(bot) });
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
   console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
@@ -2291,6 +2353,9 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
           brand: botBrand(bot),
         }),
         quiet: cmd.json,
+        // 只认「本次命令确实创建出了这个 appId」这一条硬证据：--app-id/--app-secret
+        // 直接传进来的存量应用绝不能拿到盲写授权。
+        appJustCreated: createdAppId !== undefined && createdAppId === bot.larkAppId,
       });
     }
 
@@ -2544,7 +2609,7 @@ async function cmdSetup(): Promise<void> {
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       writeBotsJsonAtomic([newBot]);
       console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
-      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
+      await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -2662,7 +2727,7 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([...bots, newBot]);
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
     await printAddBotLiveHint(newBot.larkAppId);
     return;
     }
@@ -2719,7 +2784,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
+    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
     await printAddBotLiveHint(newBot.larkAppId);
 
   } else {

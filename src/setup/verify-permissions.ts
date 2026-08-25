@@ -488,9 +488,48 @@ export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): Rem
     },
     {
       title:
-        '添加重定向 URL http://127.0.0.1:9768/callback '
+        `添加重定向 URL ${remainingStepRedirectUrls().join(' 和 ')} `
         + '(群聊模式 p2pMode=group / 会话群标签 feed-group / /login 必需, 用于跨用户调 API; 缺了会报 20029)',
       url: `${buildAppHomeDeepLink(appId, brand)}/safe`,
     },
   ];
+}
+
+/**
+ * 提示里要让用户填的重定向 URL 实际列表。
+ *
+ * 写死 `http://127.0.0.1:9768/callback` 会误导：配了 `oauthRedirectBase` / 接了中心
+ * 平台 / 自建反代的机器，真正发起授权用的是 `<base>/oauth/callback`，只填 loopback
+ * 那条照样 20029。
+ *
+ * ⚠️ 这里必须用**动态 import**，不能在文件头静态 import：
+ * `open-platform-automation.ts` 反过来 import 本模块的 `VC_MEETING_BOT_EVENTS`，
+ * 而且是在它自己的**模块顶层 const 初始化**里用。静态互引会让「先加载
+ * verify-permissions」的入口在对方模块体执行时撞上 TDZ（`Cannot access
+ * 'VC_MEETING_BOT_EVENTS' before initialization`）而整个进程起不来。
+ *
+ * `buildRemainingSteps` 是同步函数（onboarding 落终态时直接调），所以用同步可用的
+ * 已加载模块缓存：`automateOpenPlatformSetup` 这条链路一定先加载过对方模块，缓存
+ * 就有值；缓存没命中（例如 dashboard 在没跑过自动化的上下文里落 remainingSteps）
+ * 就回落到 loopback 单条 —— 保守但绝不炸。
+ */
+function remainingStepRedirectUrls(): string[] {
+  try {
+    const urls = loadedCollectBotmuxRedirectUrls?.();
+    if (urls && urls.length > 0) return urls;
+  } catch { /* 配置读不动：回落到最核心的那一条 */ }
+  return [DEFAULT_BOTMUX_REDIRECT_URL];
+}
+
+const DEFAULT_BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
+
+/** 由 {@link registerBotmuxRedirectUrlCollector} 注入，见上方注释解释为何不能静态 import。 */
+let loadedCollectBotmuxRedirectUrls: (() => string[]) | undefined;
+
+/**
+ * 让 `open-platform-automation.ts` 在自己加载完成后把 `collectBotmuxRedirectUrls`
+ * 注册进来。单向依赖（automation → verify-permissions）保持不变，不引入新的环。
+ */
+export function registerBotmuxRedirectUrlCollector(collect: () => string[]): void {
+  loadedCollectBotmuxRedirectUrls = collect;
 }

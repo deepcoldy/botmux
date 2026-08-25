@@ -12,7 +12,7 @@ import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
-import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
+import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
@@ -205,6 +205,16 @@ export interface OpenPlatformAutomationOptions {
   disableQrLogin?: boolean;
   /** Require all baseline events/callbacks and a published version to be proven before managed activation. */
   requireVerifiedEvents?: boolean;
+  /**
+   * 「这个 app 是本次流程刚刚创建出来的」。**只有** setup / onboarding 的建应用链路
+   * 能传 true。
+   *
+   * 唯一作用：允许 redirect 白名单在**读不到线上现值时**退化成覆盖写。刚建的应用
+   * 白名单必然为空，覆盖不掉任何用户条目；对存量应用盲写则会静默清掉用户手配的
+   * 回调地址（见 {@link WriteRedirectWhitelistOptions.allowBlindWrite}）。
+   * 权限自愈 / VC 事件补订阅 / 批量修复这些跑在存量应用上的链路一律不传。
+   */
+  appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   pollIntervalMs?: number;
@@ -460,6 +470,12 @@ export function collectBotmuxRedirectUrls(): string[] {
   return uniqueStrings(urls);
 }
 
+// verify-permissions 的 buildRemainingSteps 要按实际配置列重定向 URL，但它**不能**
+// 反向 import 本模块（本模块在顶层 const 里用它的 VC_MEETING_BOT_EVENTS，静态互引
+// 会 TDZ 崩）。所以由本模块单向把函数注册过去，依赖方向仍是 automation →
+// verify-permissions 一条边。
+registerBotmuxRedirectUrlCollector(collectBotmuxRedirectUrls);
+
 /**
  * 从 `POST /developers/v1/safe_setting/<appId>` `{}` 的返回里解析现有 redirect 白名单。
  *
@@ -481,12 +497,34 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
 export type OpenPlatformPostJson = (path: string, body?: unknown) => Promise<unknown>;
 
 export interface RedirectWhitelistWriteResult {
-  /** unchanged=幂等短路没发写请求；updated=写了全集；updated_fallback=全集被拒、退到最小集。 */
-  status: 'unchanged' | 'updated' | 'updated_fallback';
+  /**
+   * • `unchanged`          — 幂等短路没发写请求
+   * • `updated`            — 写了全集
+   * • `updated_fallback`   — 全集被拒、退到最小集
+   * • `skipped_unreadable` — 读不到线上现值且未获盲写授权 → **一次写请求都没发**
+   */
+  status: 'unchanged' | 'updated' | 'updated_fallback' | 'skipped_unreadable';
   /** 线上现有白名单（读不出来时为 null）。 */
   existing: string[] | null;
-  /** 本次实际落地（或确认已在线上）的白名单。 */
+  /** 本次实际落地（或确认已在线上）的白名单。`skipped_unreadable` 时为空数组。 */
   redirectUrls: string[];
+  /** `skipped_unreadable` 时的人话说明，由调用方记成 warning。 */
+  warning?: string;
+}
+
+export interface WriteRedirectWhitelistOptions {
+  /**
+   * 允许「读不出线上现值时直接全量覆盖写」。
+   *
+   * `buildSafeSettingPayload` 是全量覆盖语义，所以盲写 = 把线上白名单替换成
+   * `wanted`。对**存量应用**这会静默清掉用户自己配的回调地址，违反「绝不删用户
+   * 条目」契约；读接口只要抖一下（瞬时网络 / 结构变化 / 权限异常）就会踩到。
+   * 因此默认 false：读不出来就零写入、回 `skipped_unreadable`。
+   *
+   * 只有调用方能**证明这个 app 是本次自动化刚刚创建出来的**（白名单必然为空，
+   * 覆盖不掉任何东西）才允许传 true —— 见 `OpenPlatformAutomationOptions.appJustCreated`。
+   */
+  allowBlindWrite?: boolean;
 }
 
 /**
@@ -494,28 +532,50 @@ export interface RedirectWhitelistWriteResult {
  *
  * `buildSafeSettingPayload` 是全量覆盖语义，历史实现直接拿 botmux 自己那几条去调，
  * 于是每次建 bot / 权限自愈都把用户在后台手配的其它回调地址静默清空。这里先读回
- * 线上现值再取并集；读不出来才退化成覆盖写（保底让 botmux 自己的链路能用）。
+ * 线上现值再取并集。
  *
- * `postJson` 走参数注入而不是闭包捕获，是为了下一阶段的「批量修复存量 bot」能直接
- * 复用同一段逻辑——那条路径必须走 {@link createOpenPlatformApiClient}（它的 referer
- * 是通用的 `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup`
- * 里那份 referer 绑死单个 appId 的内联 postJson。
+ * ⚠️ **读不出来时默认零写入**（`skipped_unreadable`）。历史实现在这里退化成全量
+ * 覆盖写，等于把「读接口抖了一下」翻译成「清掉用户的自定义回调」——同一个契约违约，
+ * 只是触发条件更隐蔽。只有 {@link WriteRedirectWhitelistOptions.allowBlindWrite}
+ * （调用方能证明 app 是刚创建的）才恢复覆盖写。
  *
- * 写失败时兜底重试一次「线上现值 ∪ 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被
- * console 拒掉时，整批写入会一起失败，最小集能保住最核心的粘贴回调链路。两次都失败
- * 才抛出，由调用方记成 warning（不阻断建 bot）。
+ * `postJson` 走参数注入而不是闭包捕获，是为了「批量修复存量 bot」能直接复用同一段
+ * 逻辑——那条路径必须走 {@link createOpenPlatformApiClient}（它的 referer 是通用的
+ * `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup` 里那份
+ * referer 绑死单个 appId 的内联 postJson。
+ *
+ * 写失败时**只在「URL 被 console 判非法」这一类错误上**兜底重试一次「线上现值 ∪
+ * 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被拒时整批会一起失败，最小集能保住
+ * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不做第二次改写（见
+ * {@link isRedirectUrlRejectedError}）。两次都失败才抛出，由调用方记成 warning
+ * （不阻断建 bot）。
  */
 export async function writeRedirectWhitelist(
   postJson: OpenPlatformPostJson,
   appId: string,
   wanted: string[] = collectBotmuxRedirectUrls(),
+  options: WriteRedirectWhitelistOptions = {},
 ): Promise<RedirectWhitelistWriteResult> {
   let existing: string[] | null = null;
+  let readError: string | undefined;
   try {
-    existing = extractOpenPlatformRedirectUrls(await postJson(`/developers/v1/safe_setting/${appId}`, {}));
-  } catch {
-    // 端点不存在 / 报错 → 当作读不出来，走覆盖写降级分支。
+    const payload = await postJson(`/developers/v1/safe_setting/${appId}`, {});
+    existing = extractOpenPlatformRedirectUrls(payload);
+    if (existing === null) readError = '返回体里没有可识别的 redirectURL 数组';
+  } catch (err: any) {
+    // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
     existing = null;
+    readError = safeErrorMessage(err);
+  }
+
+  if (existing === null && !options.allowBlindWrite) {
+    // 零写入：盲写会把线上白名单整体替换掉，读失败恰恰意味着「不知道线上有什么」。
+    return {
+      status: 'skipped_unreadable',
+      existing: null,
+      redirectUrls: [],
+      warning: `读不到开放平台现有 redirect 白名单（${readError ?? '未知原因'}），为避免覆盖用户自定义回调地址，本次未写入`,
+    };
   }
 
   const wantedUrls = uniqueStrings(wanted);
@@ -530,6 +590,9 @@ export async function writeRedirectWhitelist(
     await postJson(`/developers/v1/safe_setting/update/${appId}`, mergedPayload);
     return { status: 'updated', existing, redirectUrls: mergedPayload.redirectURL };
   } catch (err: any) {
+    // 兜底只针对「某条 URL 被判非法」——网络异常重发同样会失败，403 重发只会再被拒，
+    // 两者都只是白白多打一次 console。
+    if (!isRedirectUrlRejectedError(err)) throw err;
     const minimalPayload = buildSafeSettingPayload(
       appId,
       existing === null ? [] : uniqueStrings([...existing, BOTMUX_REDIRECT_URL]),
@@ -556,6 +619,34 @@ function sameRedirectSet(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   const set = new Set(a);
   return b.every(item => set.has(item));
+}
+
+/** 「这条 URL 格式不合法」类报错里出现的词。中英各覆盖一组，命中即认。 */
+const REDIRECT_URL_REJECTION_KEYWORDS = [
+  'url', 'uri', 'redirect', 'invalid', 'illegal', 'malformed', 'format', 'not allowed', 'unsupported',
+  '非法', '不合法', '格式', '重定向', '回调', '不支持', '不允许',
+];
+
+/**
+ * 判断一次 `safe_setting/update` 失败是不是「白名单里某条 URL 被 console 判非法」——
+ * 只有这一类才值得用最小集再写一次。
+ *
+ * ⚠️ 开放平台没有公开这个端点的错误码表，仓库里也没有实测记录（截至本次改动），
+ * 所以做不到「按 code 精确判定」。这里按**保守**顺序判：
+ *   1. 传输层失败（fetch failed / ECONNRESET…）→ false。重发只会再失败一次。
+ *   2. HTTP 401/403 或 console 的 owner 拒绝码 → false。这是鉴权问题，与写什么无关，
+ *      重发还会被拒，而且会把 `not_owned` 的判定链拉长。
+ *   3. 其余（含 `code!=0` 的业务拒绝）→ 文案里出现 URL/格式类关键词才算。
+ * 判不出来就**不**兜底：少一次可能有用的重试，好过在网络/鉴权故障上多改一次线上配置。
+ */
+function isRedirectUrlRejectedError(err: unknown): boolean {
+  if (isLikelyTransientNetworkError(err)) return false;
+  if (err instanceof OpenPlatformApiError) {
+    if (err.status === 401 || err.status === 403) return false;
+    if (openPlatformOwnerAccessDenied(err)) return false;
+  }
+  const message = safeErrorMessage(err).toLowerCase();
+  return REDIRECT_URL_REJECTION_KEYWORDS.some(keyword => message.includes(keyword));
 }
 
 /**
@@ -883,8 +974,15 @@ export async function automateOpenPlatformSetup(
   let redirectConfigured = false;
   let redirectWarning: string | undefined;
   try {
-    await writeRedirectWhitelist(postJson, options.appId);
-    redirectConfigured = true;
+    const written = await writeRedirectWhitelist(postJson, options.appId, undefined, {
+      // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
+      allowBlindWrite: options.appJustCreated === true,
+    });
+    if (written.status === 'skipped_unreadable') {
+      redirectWarning = written.warning;
+    } else {
+      redirectConfigured = true;
+    }
   } catch (err: any) {
     redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;
   }
