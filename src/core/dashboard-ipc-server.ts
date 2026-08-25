@@ -5020,6 +5020,15 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   let body: { enabled?: unknown };
   try { body = await readJsonBody<{ enabled?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  // Legacy `readIsolation: true` implies the sandbox (bot-registry folds it in
+  // fail-closed), so clearing `sandbox` alone would leave the bot sandboxed while
+  // this toggle reports OFF. Refuse rather than lie. Clearing read isolation is a
+  // policy change in its own right and must go through PUT /api/bot-read-isolation,
+  // which carries the active-session / pane-teardown guards this next-session-only
+  // route deliberately lacks.
+  if (body.enabled !== true && sandboxStore.getBotReadIsolation(cachedLarkAppId)) {
+    return jsonRes(res, 409, { ok: false, error: 'sandbox_legacy_read_isolation_set' });
+  }
   // File-sandbox policy is frozen onto each Session at creation and reused on
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.

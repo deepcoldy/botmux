@@ -50,6 +50,27 @@ describe('migrateSandboxConfigOnDisk', () => {
     expect(e.sandboxPaths).toEqual({ deny: ['~/x'] });
   });
 
+  it('absorbs readIsolation on an entry that already carries sandboxPaths', async () => {
+    // Pre-fix this entry hit the "already on the new model" short-circuit and was
+    // NEVER migrated: it stayed sandboxed only through worker.ts's legacy
+    // readIsolation or-branch, so removing that branch would silently unsandbox it.
+    write([{
+      larkAppId: 'cli_c', larkAppSecret: 's',
+      readIsolation: true,
+      sandboxPaths: { readOnly: ['/some/path'] },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_c']);
+    const [e] = read();
+    expect(e.sandbox).toBe(true);
+    expect(e.readIsolation).toBe(true); // kept for downgrade
+    expect(e.sandboxPaths).toEqual({ readOnly: ['/some/path'] }); // paths untouched
+    // and converged: a second pass has nothing left to do
+    const after = readFileSync(botsPath, 'utf-8');
+    expect((await migrateSandboxConfigOnDisk(botsPath)).migrated).toEqual([]);
+    expect(readFileSync(botsPath, 'utf-8')).toBe(after);
+  });
+
   it('is idempotent: second run migrates nothing and leaves the file unchanged', async () => {
     write([{ larkAppId: 'cli_a', larkAppSecret: 's', sandbox: true, sandboxHidePaths: ['~/.aws'] }]);
     await migrateSandboxConfigOnDisk(botsPath);

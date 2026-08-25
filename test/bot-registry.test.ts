@@ -1967,4 +1967,22 @@ describe('normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS', () => {
     const { DASHBOARD_MAX_TURN_TIMEOUT_MS } = await import('../src/dashboard/web/bot-defaults-page.js');
     expect(DASHBOARD_MAX_TURN_TIMEOUT_MS).toBe(mod.MAX_TURN_TIMEOUT_MS);
   });
+
+  it('folds legacy readIsolation into sandbox (fail-closed, migration may never have run)', () => {
+    // Core-only skips the startup migration and a read-only bots.json only warns,
+    // so the loader itself must hold "readIsolation ⇒ sandboxed" — otherwise the
+    // frozen session.sandbox (forkWorker) disagrees with what the worker enforces.
+    const [legacyOnly, withPaths, plain, off] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'ri_a', larkAppSecret: 's', readIsolation: true },
+      { larkAppId: 'ri_b', larkAppSecret: 's', readIsolation: true, sandboxPaths: { readOnly: ['/p'] } },
+      { larkAppId: 'ri_c', larkAppSecret: 's', sandbox: true },
+      { larkAppId: 'ri_d', larkAppSecret: 's' },
+    ]));
+    expect(legacyOnly.sandbox).toBe(true);
+    expect(legacyOnly.readIsolation).toBe(true);
+    expect(withPaths.sandbox).toBe(true);
+    expect(withPaths.sandboxPaths).toEqual({ readOnly: ['/p'], readWrite: [], deny: [] });
+    expect(plain.sandbox).toBe(true);
+    expect(off.sandbox).toBe(false); // no opt-in anywhere → still off
+  });
 });

@@ -1258,7 +1258,19 @@ export interface MigratedSandboxFields {
  * reverse script (design doc §6.2). Returns null when nothing to migrate.
  */
 export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandboxPaths?: unknown }): MigratedSandboxFields | null {
-  if (entry.sandboxPaths !== undefined) return null; // already on the new model
+  // `readIsolation: true` ALWAYS implies the file sandbox, so it must converge to
+  // `sandbox: true` even on an entry that already carries the new `sandboxPaths`
+  // field — that combination (readIsolation + sandboxPaths, no `sandbox`) used to
+  // fall through the "already on the new model" short-circuit below and could
+  // NEVER be migrated. Its isolation then hung entirely on worker.ts's legacy
+  // `|| cfg.readIsolation === true` compatibility branch: the day that branch is
+  // dropped (the intended convergence), such a bot silently becomes unsandboxed.
+  // Path migration is skipped here (the new-model lists are authoritative); only
+  // the missing `sandbox` flag is filled in.
+  const readIsolationImpliesSandbox = entry.readIsolation === true && entry.sandbox !== true;
+  if (entry.sandboxPaths !== undefined) {
+    return readIsolationImpliesSandbox ? { sandbox: true } : null; // already on the new model
+  }
   const hasLegacy = entry.readIsolation === true
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0

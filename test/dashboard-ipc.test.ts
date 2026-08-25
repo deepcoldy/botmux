@@ -2223,6 +2223,66 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   });
 });
 
+describe('PUT /api/bot-sandbox', () => {
+  it('refuses to turn the sandbox off while legacy readIsolation still implies it', async () => {
+    const appId = 'test-sandbox-off-legacy-read-isolation';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    setLarkAppId(appId);
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotSandbox');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'sandbox_legacy_read_isolation_set' });
+      // nothing persisted: the bot stays sandboxed, as readIsolation still demands
+      expect(updateSpy).not.toHaveBeenCalled();
+    } finally {
+      updateSpy.mockRestore();
+    }
+  });
+
+  it('still allows turning the sandbox on with legacy readIsolation set', async () => {
+    const appId = 'test-sandbox-on-legacy-read-isolation';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    setLarkAppId(appId);
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotSandbox')
+      .mockResolvedValue({ ok: true, sandbox: true } as any);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, sandbox: true });
+      expect(updateSpy).toHaveBeenCalledWith(appId, true);
+    } finally {
+      updateSpy.mockRestore();
+    }
+  });
+});
+
 describe('PUT /api/bot-read-isolation', () => {
   for (const enabled of [false, true]) {
     it(`treats ${enabled}→${enabled} as a no-op even with active and persisted pending owners`, async () => {

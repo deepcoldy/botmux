@@ -1004,6 +1004,28 @@ describe('migrateLegacySandboxFields', () => {
     expect(migrateLegacySandboxFields({ sandbox: true })).toBeNull();
     expect(migrateLegacySandboxFields({})).toBeNull();
   });
+
+  it('still absorbs readIsolation on a sandboxPaths-carrying entry (fail-open gap)', () => {
+    // The entry shape that could never be migrated: new-model paths present, but
+    // the sandbox flag only implied by legacy readIsolation. Isolation must not
+    // depend on worker.ts's legacy or-branch surviving.
+    expect(migrateLegacySandboxFields({
+      readIsolation: true,
+      sandboxPaths: { readOnly: ['/some/path'] },
+    })).toEqual({ sandbox: true });
+    // Paths are NOT rewritten — the new-model lists stay authoritative.
+    expect(migrateLegacySandboxFields({
+      readIsolation: true,
+      sandboxReadonlyPaths: ['~/legacy'],
+      sandboxPaths: { readOnly: ['/new'] },
+    })).toEqual({ sandbox: true });
+    // Already converged (sandbox:true) → still a no-op, so migration stays idempotent.
+    expect(migrateLegacySandboxFields({
+      sandbox: true,
+      readIsolation: true,
+      sandboxPaths: { readOnly: ['/some/path'] },
+    })).toBeNull();
+  });
 });
 
 describe('compiler parity with accessForPath', () => {

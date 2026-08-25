@@ -2399,6 +2399,13 @@ export function botAcceptsSlashFromBots(larkAppId: string): boolean {
 }
 
 /**
+ * Bots whose legacy `readIsolation` has already been folded into `sandbox` in
+ * memory and warned about — the warn must fire once per process, not on every
+ * loadBotConfigs() call (event dispatch / dashboard paths re-parse the file).
+ */
+const legacyReadIsolationWarned = new Set<string>();
+
+/**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
@@ -2927,6 +2934,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
+    // Explicit fail-closed notice for the alias fold below: the entry asks for
+    // read isolation but carries no `sandbox: true`, i.e. the startup migration
+    // has not converged it (core-only skips migration, a read-only bots.json
+    // only warns, and a `sandboxPaths`-carrying entry was unreachable for it
+    // before this release). It IS treated as sandboxed — say so instead of
+    // leaving the discrepancy to the legacy compatibility branch in worker.ts.
+    if (entry.readIsolation === true && entry.sandbox !== true
+      && !legacyReadIsolationWarned.has(entry.larkAppId)) {
+      legacyReadIsolationWarned.add(entry.larkAppId);
+      logger.warn(`[bot-registry:${entry.larkAppId}] legacy readIsolation=true without sandbox=true — 按沙盒处理（fail-closed）。请在 bots.json 补 "sandbox": true，或让 daemon 启动时的 sandbox 迁移写回（BOTMUX_CORE_ONLY=1 或 bots.json 只读时不会发生）。`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -3010,7 +3029,19 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
-      sandbox: entry.sandbox === true,
+      // FAIL-CLOSED alias fold: legacy `readIsolation: true` ALWAYS means "this
+      // bot runs sandboxed", so the in-memory config says so even when the disk
+      // migration never ran (BOTMUX_CORE_ONLY=1 skips it; a read-only bots.json
+      // only warns). Without this, such a bot kept `sandbox: false` in memory
+      // and stayed isolated purely through worker.ts's legacy
+      // `|| cfg.readIsolation === true` branch, while every consumer that reads
+      // the flag alone disagreed — most consequentially forkWorker, which FREEZES
+      // `session.sandbox = botCfg.sandbox === true` onto the session and hands
+      // that frozen value to sandbox-keyed decisions downstream
+      // (evaluateVcMeetingConsumerIsolation, restore/refork sibling fields).
+      // Folding here makes "readIsolation ⇒ sandboxed" hold at every layer
+      // instead of at each remembered call site.
+      sandbox: entry.sandbox === true || entry.readIsolation === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
             readWrite: normalizeStringList(entry.sandboxPaths.readWrite),
