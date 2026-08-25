@@ -1033,7 +1033,29 @@ function buildCodexAppTurnInput(opts: {
   };
 }
 
-export function buildNewTopicPrompt(
+/** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
+ *  （#794 后续）所需的 turnId 与 sessionBackendType：turnId 是 opening 轮的权威
+ *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
+ *  sidecar 绑定；sessionBackendType 取会话冻结的后端类型（远端后端无本地 hook 进程）。 */
+type NewTopicOpts = {
+  larkAppId?: string;
+  chatId?: string;
+  whiteboardId?: string;
+  substituteTrigger?: SubstituteTrigger;
+  chatContext?: ChatContext;
+  turnId?: string;
+  sessionBackendType?: BackendType;
+};
+
+type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'sessionId' | 'role'
+  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
+  | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
+  | 'mentions' | 'availableBots';
+
+/** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
+ *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
+ *  sidecar/claim 机制。inline 模式（hookMode=false）输出与历史完全一致。 */
+function buildNewTopicBlocks(
   userMessage: string,
   sessionId: string,
   cliId: CliId,
@@ -1045,8 +1067,9 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
-): string {
+  opts?: NewTopicOpts,
+  hookMode = false,
+): Array<{ key: NewTopicBlockKey; text: string }> {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
   // (Claude Code builds its own via --append-system-prompt). Source hints
@@ -1108,8 +1131,11 @@ export function buildNewTopicPrompt(
   const mergedMessage = followUps && followUps.length > 0
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
-  const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
-  const parts: string[] = [];
+  // hook 模式（#794 后续）：PTY 文本只保留用户正文，不再包 <user_message> 外壳。
+  // 理由同 follow-up：会话发现主防线是 collectBotmuxSessionIdentities 按文件名排除，
+  // 标题提取有 ?? rawContent 兜底。inline 模式保持原样。
+  const userBlock = hookMode ? mergedMessage : `<user_message>\n${mergedMessage}\n</user_message>`;
+  const blocks: Array<{ key: NewTopicBlockKey; text: string }> = [];
 
   // Put stable, instruction-like context before the user's first turn. This
   // improves salience without moving per-turn attribution (sender/mentions)
@@ -1118,40 +1144,60 @@ export function buildNewTopicPrompt(
   // message — same position as in follow-ups — not after it, where it could be
   // misread as part of the user's text.
   if (!adapter.injectsSessionContext) {
-    if (routingBlock) parts.push(routingBlock);
-    if (skillBlock) parts.push(skillBlock);
-    if (identityBlock) parts.push(identityBlock);
-    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+    if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
+    if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
+    if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+    blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
-  if (roleBlock) parts.push(roleBlock);
-  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
-  if (whiteboardBlock) parts.push(whiteboardBlock);
-  if (chatContextPolicyBlock) parts.push(chatContextPolicyBlock);
-  if (chatContextBlock) parts.push(chatContextBlock);
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
+  if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
+  if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
 
-  parts.push(userBlock);
+  blocks.push({ key: 'userMessage', text: userBlock });
 
   const senderBlock = renderSenderTag(sender);
-  if (senderBlock) parts.push(senderBlock);
+  if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
-  if (substituteBlock) parts.push(substituteBlock);
+  if (substituteBlock) blocks.push({ key: 'substitute', text: substituteBlock });
 
   const senderNote = renderCursorSenderNote(cliId, !!senderBlock, locale);
-  if (senderNote) parts.push(senderNote);
+  if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = formatAttachmentsHint(attachments, locale);
-  if (attachHint) parts.push(attachHint);
+  if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
   // and session ID via system prompt, so skip those blocks here.
-  if (mentionBlock) parts.push(mentionBlock);
-  if (botBlock) parts.push(botBlock);
+  if (mentionBlock) blocks.push({ key: 'mentions', text: mentionBlock });
+  if (botBlock) blocks.push({ key: 'availableBots', text: botBlock });
   // The per-session skill catalog block is appended later in the worker-pool
   // fork path (prepareSessionSkillPrompt), which also writes the manifest and
   // resolves delivery — keeping a single injection site avoids double-rendering.
 
-  return parts.join('\n\n');
+  return blocks;
+}
+
+export function buildNewTopicPrompt(
+  userMessage: string,
+  sessionId: string,
+  cliId: CliId,
+  cliPathOverride?: string,
+  attachments?: LarkAttachment[],
+  mentions?: LarkMention[],
+  availableBots?: Array<{ name: string; displayName: string; openId: string }>,
+  followUps?: string[],
+  botIdentity?: { name?: string; openId?: string },
+  locale?: Locale,
+  sender?: ResolvedSender,
+  opts?: NewTopicOpts,
+): string {
+  return buildNewTopicBlocks(
+    userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
+    availableBots, followUps, botIdentity, locale, sender, opts,
+  ).map((b) => b.text).join('\n\n');
 }
 
 /** Build the legacy opening prompt plus a Codex App structured sidecar. The
@@ -1182,8 +1228,43 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    /** opening 轮的权威 turnId（= 发给 worker 的 turnId，最终成为
+     *  managedTurnOrigin.turnId）。hook 模式下用于 sidecar 绑定；缺失回退 inline。 */
+    turnId?: string;
+    /** 会话冻结的后端类型，用于 hook 模式判定（远端后端无本地 hook 进程）。 */
+    sessionBackendType?: BackendType;
   },
 ): CliTurnPayload {
+  // hook 注入模式（#794 后续）：opening 也走 sidecar——whiteboard/sender/mentions
+  // 写入 per-turn sidecar，PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。
+  // 与 follow-up 同一套 sidecar/claim 机制；turnId 是 claim 的权威键，缺失或条件
+  // 不满足时回退 inline（legacy 路径），行为与历史完全一致。
+  const hookTurnId = opts?.turnId;
+  if (resolveEnvelopeInjectionMode({
+    cliId,
+    cliPathOverride,
+    sessionBackendType: opts?.sessionBackendType,
+    larkAppId: opts?.larkAppId,
+  }) === 'hook' && hookTurnId) {
+    const blocks = buildNewTopicBlocks(
+      userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
+      availableBots, followUps, botIdentity, locale, sender, opts, true,
+    );
+    const ENVELOPE_KEYS = new Set<NewTopicBlockKey>(['whiteboard', 'sender', 'mentions']);
+    const ptyText = blocks
+      .filter((b) => !ENVELOPE_KEYS.has(b.key))
+      .map((b) => b.text)
+      .join('\n\n');
+    const hookEnvelope = blocks
+      .filter((b) => ENVELOPE_KEYS.has(b.key))
+      .map((b) => b.text)
+      .join('\n\n');
+    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
+      return { content: ptyText };
+    }
+    // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
+  }
   const content = buildNewTopicPrompt(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
     availableBots, followUps, botIdentity, locale, sender, opts,
@@ -1300,7 +1381,12 @@ function buildFollowUpBlocks(
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
+  // hook 模式（#794 后续）：PTY 文本只保留用户正文，不再包 <user_message> 外壳。
+  // 外壳的唯一作用是给 transcript 消费方（会话发现 / 标题提取）做结构标记，
+  // 但会话发现的主防线是 collectBotmuxSessionIdentities 的按文件名排除（不依赖
+  // transcript 内容），标题提取有 ?? rawContent 兜底，所以 hook 模式下可以去掉。
+  // inline 模式保持原样（其它 CLI 与旧会话发现正则仍依赖外壳）。
+  blocks.push({ key: 'userMessage', text: hookMode ? content : `<user_message>\n${content}\n</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
@@ -1345,9 +1431,19 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
  *     （read-isolation 下是 per-bot BOT_HOME 那份，不是全局）；
  *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
  * 任一不满足 → inline（现状字节不变）。
+ *
+ * opening（buildNewTopicCliInput）复用同一判定：cfg 字段是 FollowUpOpts /
+ * NewTopicOpts 的结构化子集，两边都满足。
  */
-function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
-  if (!opts?.cliId) return 'inline';
+type EnvelopeInjectionCfg = {
+  cliId?: CliId;
+  cliPathOverride?: string;
+  sessionBackendType?: BackendType;
+  larkAppId?: string;
+};
+
+function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
+  if (!cfg?.cliId) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
@@ -1356,19 +1452,19 @@ function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
   // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
   // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
   // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
-  if (!opts.sessionBackendType || !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
+  if (!cfg.sessionBackendType || !LOCAL_BACKENDS.has(cfg.sessionBackendType)) return 'inline';
   let adapter: CliAdapter;
   try {
-    adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
+    adapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
   } catch { return 'inline'; }
   if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
-  if (!opts.larkAppId) return 'inline';
+  if (!cfg.larkAppId) return 'inline';
   let botConfig: BotConfig;
   try {
-    botConfig = getBot(opts.larkAppId).config;
+    botConfig = getBot(cfg.larkAppId).config;
   } catch { return 'inline'; }
   if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId, opts.sessionBackendType);
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, cfg.larkAppId, cfg.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
@@ -1420,15 +1516,21 @@ export function buildFollowUpCliInput(
   // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
   // turnId 是 claim 的权威键：缺失时无法做 turn 绑定，回退 inline（避免 reminder 被
   // 剥离却无 sidecar 可领）。
+  //
+  // #794 后续：sender/mentions 也搬进 hook envelope，PTY 文本只剩用户正文（+ role/
+  // summaryMemory 等稳定上下文）。模型经 system-reminder 仍看得到发送者与提及，
+  // 输入框不再出现 <user_message>/<sender>/<mentions> 标签。代价：hook 注入内容不落
+  // transcript，insight 发送者归因对 hook 模式会话降级为「未知用户」（用户已确认接受）。
   const hookTurnId = opts?.turnId;
   if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
+    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['reminder', 'whiteboard', 'sender', 'mentions']);
     const ptyText = blocks
-      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
+      .filter((b) => !ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
       .join('\n\n');
     const hookEnvelope = blocks
-      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard')
+      .filter((b) => ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {

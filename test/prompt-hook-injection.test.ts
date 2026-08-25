@@ -91,7 +91,7 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 
 // ─── 被测模块 ──────────────────────────────────────────────────────────────
 
-import { buildFollowUpCliInput } from '../src/core/session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput } from '../src/core/session-manager.js';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const SESSION_ID = 'hook-session-789';
@@ -133,21 +133,24 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     else process.env.SESSION_DATA_DIR = prevDataDir;
   });
 
-  it('auto + claude-code + preflight 通过：reminder/whiteboard 进 sidecar，PTY 文本只留其余块', () => {
+  it('auto + claude-code + preflight 通过：reminder/whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_1' }));
 
-    // PTY 文本：有 user_message / sender / mentions，无 reminder / whiteboard
-    expect(result.content).toContain('<user_message>\n帮我修个 bug\n</user_message>');
-    expect(result.content).toContain('<sender ');
-    expect(result.content).toContain('<mentions>');
+    // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / reminder / whiteboard
+    expect(result.content).toBe('帮我修个 bug');
+    expect(result.content).not.toContain('<user_message>');
+    expect(result.content).not.toContain('<sender ');
+    expect(result.content).not.toContain('<mentions>');
     expect(result.content).not.toContain('<botmux_reminder>');
     expect(result.content).not.toContain('<whiteboard');
 
-    // sidecar：按 PTY 文本指纹读回，含 reminder + whiteboard
+    // sidecar：按 PTY 文本指纹读回，含 reminder + whiteboard + sender + mentions
     const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
     expect(envelope).toBeDefined();
     expect(envelope).toContain('<botmux_reminder>');
     expect(envelope).toContain('<whiteboard');
+    expect(envelope).toContain('<sender ');
+    expect(envelope).toContain('<mentions>');
     // hook 模式用描述式文案（命令式原文只出现在 inline 路径）
     expect(envelope).toContain('本会话通过 botmux 桥接飞书');
     expect(envelope).not.toContain('至少 botmux send 回应一次');
@@ -257,6 +260,101 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     });
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: undefined }));
     expect(result.content).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+});
+
+describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
+  let prevDataDir: string | undefined;
+  beforeEach(() => {
+    prevDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+    });
+    preflightMock.mockReturnValue(true);
+  });
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = prevDataDir;
+  });
+
+  const openingOpts = (overrides: Record<string, unknown> = {}) => ({
+    larkAppId: LARK_APP_ID,
+    whiteboardId: 'wb_1',
+    turnId: TURN_ID,
+    sessionBackendType: 'pty' as const,
+    ...overrides,
+  });
+
+  it('auto + claude-code + preflight 通过 + turnId：whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined,
+      [{ name: 'Bob', openId: 'ou_bob' }],
+      undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+
+    // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / whiteboard
+    expect(result.content).toBe('帮我修个 bug');
+    expect(result.content).not.toContain('<user_message>');
+    expect(result.content).not.toContain('<sender ');
+    expect(result.content).not.toContain('<mentions>');
+    expect(result.content).not.toContain('<whiteboard');
+
+    // sidecar：含 whiteboard + sender + mentions
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+    expect(envelope).toBeDefined();
+    expect(envelope).toContain('<whiteboard');
+    expect(envelope).toContain('<sender ');
+    expect(envelope).toContain('<mentions>');
+  });
+
+  it('缺 turnId：回退 inline（有 user_message 外壳，无 sidecar）', () => {
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts({ turnId: undefined }),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(result.content).toContain('<sender ');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('off：完全 inline（无 sidecar）', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' as const },
+    });
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('无 whiteboard/sender/mentions（envelope 为空）：回退 inline，保留外壳', () => {
+    // envelope 为空时不写 sidecar，回退 inline——外壳保留给会话发现/标题提取用。
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      undefined,
+      undefined,
+      undefined,
+      openingOpts({ whiteboardId: undefined }),
+    );
+    expect(result.content).toContain('<user_message>');
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 });
