@@ -8,14 +8,24 @@
  * message into the new group, sends a DM receipt linking the group, kicks off
  * the async AI title, and hands back a rewritten RoutingContext pointing at
  * the new chat (chat-scope). handleNewTopic then simply recurses with that
- * context — every later step (oncall working-dir resolution via the binding
- * written at creation, session spawn, streaming card) behaves exactly like a
- * normal solo-group chat-scope session.
+ * context — every later step (working-dir resolution, session spawn,
+ * streaming card) behaves exactly like a normal solo-group chat-scope session.
  *
- * The oncall binding written at creation carries ONLY the working dir: the
- * group's talk/quota identity comes from the authorization provenance recorded
- * in the registry (origin* fields), which the dispatcher replays for every
- * later message. See evaluateSessionGroupTalk in im/lark/event-dispatcher.
+ * Working dir: ONLY an explicit `sessionGroup.workingDir` is bound to the new
+ * chat as an oncall binding at creation. When it is unset, birth deliberately
+ * writes NO binding so the recursed handleNewTopic resolves the dir through
+ * the same layered lookup as any other group (resolvePinnedWorkingDir):
+ * defaultOncall auto-bind, the bot's own defaultWorkingDir — with
+ * `defaultWorkingDirAutoWorktree` honored, which an oncall-sourced dir would
+ * suppress — or the repo-selection card. The old fallback chain
+ * (defaultWorkingDir → workingDirs[0]) pinned those dirs as oncall bindings,
+ * which both disabled auto-worktree and silently skipped the repo picker for
+ * multi-repo bots.
+ *
+ * When a binding IS written it carries ONLY the working dir: the group's
+ * talk/quota identity comes from the authorization provenance recorded in the
+ * registry (origin* fields), which the dispatcher replays for every later
+ * message. See evaluateSessionGroupTalk in im/lark/event-dispatcher.
  *
  * Returns null to fall through to the legacy thread behavior:
  *   - the message is a slash command (never birth a group for /help, /login …)
@@ -107,7 +117,12 @@ export async function maybeBirthSessionGroup(
 
   const prefix = sg.namePrefix ?? '';
   const placeholder = buildPlaceholderName(text, prefix, locale);
-  const workingDir = sg.workingDir?.trim() || botCfg.defaultWorkingDir?.trim() || botCfg.workingDir?.trim() || undefined;
+  // Only the explicit session-group template dir becomes a binding. Falling
+  // back to defaultWorkingDir / workingDirs[0] here would re-source the bot's
+  // default as an ONCALL dir, which suppresses defaultWorkingDirAutoWorktree
+  // and skips the repo-selection card for multi-repo bots — the recursed
+  // handleNewTopic already resolves those correctly when no binding exists.
+  const workingDir = sg.workingDir?.trim() || undefined;
 
   // Provenance snapshot, taken in the DM context BEFORE the new chat exists:
   // WHICH authorization is paying for this group. The dispatcher replays it for

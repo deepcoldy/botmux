@@ -23,9 +23,12 @@
  *                  ONLY without tool calls (a `length`+toolCall is mid-turn: Pi
  *                  runs failToolCallsFromTruncatedMessage (terminate:false) and
  *                  keeps looping).
- *   - `error`    — API/provider error (e.g. "Cancelled by backend") → `failed`
- *                  (`pi_turn_error`). Hard terminal (turn_end→return) regardless
- *                  of content, so it always emits.
+ *   - `error`    — API/provider error (e.g. "Cancelled by backend") → `failed`.
+ *                  The record's `errorMessage` is classified via the shared
+ *                  Codex-family classifier (gateway/connection/auth/…) and a
+ *                  redacted summary is carried on the event; without an
+ *                  errorMessage the code stays `pi_turn_error`. Hard terminal
+ *                  (turn_end→return) regardless of content, so it always emits.
  *   - `aborted`  — user interrupt (Esc) → `ambiguous` (`pi_turn_aborted`). Hard
  *                  terminal. `ambiguous` (not `failed`) because Esc may land
  *                  after a tool side effect already ran — same audit semantic as
@@ -65,6 +68,7 @@ import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readl
 import { execSync } from 'node:child_process';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
+import { codexTaskFailureCode, safeFailureSummary } from './codex-transcript.js';
 
 const PI_SESSIONS_ROOT = join(homedir(), '.pi', 'agent', 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -82,6 +86,10 @@ export interface PiBridgeEvent {
    *  `aborted`. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
   terminalErrorCode?: string;
+  /** Safe, bounded user-facing detail extracted from the record's
+   *  `errorMessage` (redacted through safeFailureSummary). Raw provider errors
+   *  stay in the session JSONL / Web terminal. */
+  terminalErrorSummary?: string;
   sourceSessionId?: string;
 }
 
@@ -95,22 +103,37 @@ type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
  *  CodexBridgeQueue emit ordering / dedup.
  *  - `stop`/`length` → real answers → completed (undefined status keeps the
  *    historical default + lets the empty-final fallback fire).
- *  - `error` → `failed` (`pi_turn_error`): an explicit provider error.
+ *  - `error` → `failed`: an explicit provider error. When the record carries
+ *    an `errorMessage` (e.g. "upstream stream error: rpc error: code = 1 desc
+ *    = Cancelled by backend" from the model gateway), classify it through the
+ *    shared Codex-family classifier so the failure card names the real cause
+ *    (gateway/connection/auth/…) and carries a redacted summary instead of
+ *    the opaque "no error summary" fallback. Without an errorMessage the code
+ *    stays `pi_turn_error`.
  *  - `aborted` → `ambiguous` (`pi_turn_aborted`): a user Esc can land AFTER a
  *    tool's side effect already completed, so we don't assert it "did not
  *    happen" — same audit semantic as Codex/TraeX `turn_aborted`.
  *  All non-`stop`/`length` map to `!== 'completed'`, so the pending turn is
  *  dropped and the type-ahead queue head is released, never wedged. */
-function piTerminalOutcome(stopReason: PiTerminalStopReason): Pick<
-  PiBridgeEvent,
-  'terminalStatus' | 'terminalErrorCode'
-> {
+function piTerminalOutcome(
+  stopReason: PiTerminalStopReason,
+  errorMessage?: string,
+): Pick<PiBridgeEvent, 'terminalStatus' | 'terminalErrorCode' | 'terminalErrorSummary'> {
   switch (stopReason) {
     case 'stop':
     case 'length':
       return {};
-    case 'error':
-      return { terminalStatus: 'failed', terminalErrorCode: 'pi_turn_error' };
+    case 'error': {
+      if (!errorMessage) {
+        return { terminalStatus: 'failed', terminalErrorCode: 'pi_turn_error' };
+      }
+      const summary = safeFailureSummary(errorMessage);
+      return {
+        terminalStatus: 'failed',
+        terminalErrorCode: codexTaskFailureCode(errorMessage),
+        ...(summary ? { terminalErrorSummary: summary } : {}),
+      };
+    }
     case 'aborted':
       return { terminalStatus: 'ambiguous', terminalErrorCode: 'pi_turn_aborted' };
   }
@@ -309,13 +332,22 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
       && !hasToolCall(obj.message.content);
     if (!isHardTerminal && !isTextTerminal) continue;
 
+    // Provider error detail (verified on pi 0.84.2: lives on `message`, next to
+    // stopReason; accept a top-level fallback mirroring the stopReason read).
+    const errorMessage =
+      typeof obj.message.errorMessage === 'string'
+        ? obj.message.errorMessage
+        : typeof obj.errorMessage === 'string'
+          ? obj.errorMessage
+          : undefined;
+
     events.push({
       uuid: `${path}:${lineStart}`,
       timestampMs,
       kind: 'assistant_final',
       text: joinTextContent(obj.message.content),
       sourceSessionId: sessionId,
-      ...piTerminalOutcome(stopReason as PiTerminalStopReason),
+      ...piTerminalOutcome(stopReason as PiTerminalStopReason, errorMessage),
     });
   }
 

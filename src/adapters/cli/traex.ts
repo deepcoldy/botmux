@@ -1,13 +1,12 @@
 import { execFile } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { traeStateDbPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
+  findTraexSessionIdByBotmuxSessionId,
   traexHistoryMatchDelta,
   traexHistorySize,
   findTraexRolloutSetByPid,
@@ -30,78 +29,6 @@ import { delay } from '../../utils/timing.js';
  *     exact role=user record in that rollout's post-submit byte delta.
  *   - Skills are installed into ~/.trae/skills.
  */
-
-// -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------
-
-type DatabaseSyncLike = {
-  prepare(sql: string): StatementSyncLike;
-  close(): void;
-};
-type StatementSyncLike = {
-  get(...params: unknown[]): any;
-  all(...params: unknown[]): any[];
-};
-
-let sqliteModule: { DatabaseSync: new (path: string) => DatabaseSyncLike } | null = null;
-let sqliteLoadAttempted = false;
-
-function loadSqlite(): typeof sqliteModule {
-  if (sqliteLoadAttempted) return sqliteModule;
-  sqliteLoadAttempted = true;
-  // node:sqlite is the built-in experimental SQLite binding available in
-  // Node 22+. The runtime may still reject it (older Node without the
-  // feature); callers treat that as verification-unavailable and fail closed.
-  // 必须走 createRequire：本包是 ESM（"type":"module"），裸 require 是
-  // ReferenceError —— 之前就是被这里的 try/catch 吞掉，导致生产 dist 里
-  // SQLite 提交验证/会话反查整条链路静默失效。
-  try {
-    const req = createRequire(import.meta.url);
-    sqliteModule = req('node:sqlite') as typeof sqliteModule;
-  } catch {
-    sqliteModule = null;
-  }
-  return sqliteModule;
-}
-
-function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const mod = loadSqlite();
-  if (!mod) return null;
-  const dbPath = traeStateDbPath();
-  if (!existsSync(dbPath)) return null;
-  let db: DatabaseSyncLike | undefined;
-  try {
-    db = new mod.DatabaseSync(dbPath);
-    return fn(db);
-  } catch {
-    return null;
-  } finally {
-    try { db?.close(); } catch { /* ignore */ }
-  }
-}
-
-/** Adapter-side session-id ownership uses findTraexRolloutSetByPid +
- * traexHistorySidIsOwned directly in writeInput (kept as raw three-state so the
- * enumeration-unavailable case can fast-degrade). The authoritative persist /
- * bridge-attach decision additionally re-checks worker-side via
- * traexHistorySidOwnedByCurrentPid, whose pid resolution is richer than
- * pty.cliPid (and covers the sandbox bwrap-supervisor case). */
-
-
-/** Scan threads backwards for the most recent thread whose first_user_message
- *  references the botmux session id. Used by buildArgs(resume) and
- *  buildResumeCommand to recover a TRAE-native session UUID from a botmux
- *  session id. */
-function latestTraeSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
-  return withDb((db) => {
-    const rows = db.prepare(
-      'SELECT id, first_user_message AS firstMessage FROM threads ORDER BY created_at DESC LIMIT 200',
-    ).all() as { id: string; firstMessage?: string }[];
-    for (const r of rows) {
-      if (r.firstMessage && r.firstMessage.includes(botmuxSessionId)) return r.id;
-    }
-    return undefined;
-  }) ?? undefined;
-}
 
 // -------------------------------------------------------------------------
 
@@ -330,13 +257,13 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 
-      const traeSessionId = resumeSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
+      const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;
       return ['resume', ...baseArgs, traeSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
-      const sid = cliSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
+      const sid = cliSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!sid) return null;
       return `traex resume ${sid}`;
     },

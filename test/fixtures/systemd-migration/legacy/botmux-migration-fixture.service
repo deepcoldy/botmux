@@ -1,0 +1,9 @@
+[Unit]
+Description=botmux systemd migration legacy fixture
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KillMode=control-group
+ExecStart=/bin/sh -c 'sleep 300 & echo $! > %t/botmux-migration-god.pid; sleep 300 & echo $! > %t/botmux-migration-persistent.pid'
+ExecStop=/bin/true

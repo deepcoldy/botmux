@@ -28,6 +28,22 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
+/**
+ * 中央前门 → worker 的「平台只读访客」**展示层**提示头（#933 回归修复）。
+ *
+ * 背景：平台注入的 Cookie / `X-Botmux-Role` 在两条路上都会被 dashboard 前门剥掉
+ * （显式 query capability 走 P1-6 的 stripBrowserCredentials；无 capability 时换成
+ * 内部签名 grant）。剥掉之后 worker 的 `platformReadonly` 恒为 false，只读终端页
+ * 便不再显示「owner 登录后可操作 →」的 SSO 引导——冷打开飞书卡片链接的平台访客
+ * 被困在一个没有任何登录入口的只读页里。
+ *
+ * 该头只影响只读页渲染哪条横幅（登录引导 vs 纯只读提示），**不进入任何读/写授权
+ * 判定**：直连 worker 伪造它，最多让一个本来就只读的页面多显示一条登录引导链接。
+ * 前门在 terminalForwardHeaders 丢弃全部客户端 `x-botmux-*` 之后才设置它，浏览器
+ * 无法夹带。
+ */
+export const TERMINAL_PLATFORM_READONLY_HINT_HEADER = 'x-botmux-platform-readonly';
+
 export interface TerminalWriteInput {
   /** Value of the `X-Botmux-Role` request header (normalized to a single string, or undefined). */
   role: string | undefined;

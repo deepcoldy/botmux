@@ -244,8 +244,9 @@ function createGroupResult(overrides: Record<string, unknown> = {}): any {
     notifyError: null,
     shareLink: null,
     shareLinkError: null,
-    // 出生必须拿到 workingDir 绑定（bot 配了 workingDir → birth 会请求绑定）。
-    // 绑定没落地时的回退是「绑定没落地必须回退」那组用例的被测对象。
+    // 仅显式 sessionGroup.workingDir 会请求绑定（defaultWorkingDir/workingDirs 不再
+    // fallback 成绑定——那会抑制 auto-worktree、跳过选仓库卡）。默认配置下 birth 不看
+    // 这个字段；「绑定没落地必须回退」那组用例会先补上 sessionGroup.workingDir。
     oncallBindings: [{ larkAppId: APP, ok: true, created: true }],
     roleProfileBootstrapMessageId: null,
     roleProfileBootstrapError: null,
@@ -451,11 +452,19 @@ describe('会话群继承来源授权（堵 oncall 腿的额度与权限绕过�
 });
 
 /**
- * 出生时那条 oncall 绑定承载的是 workingDir。绑定没落地 = 会话群解不出工作目录，
- * 每一轮都会跑错地方；而 birth 过去**一眼都没看** result.oncallBindings。
+ * 显式 sessionGroup.workingDir 会以 oncall 绑定承载。绑定没落地 = 会话群解不出
+ * 这个模板目录，每一轮都会跑错地方；而 birth 过去**一眼都没看** result.oncallBindings。
  * 回退语义与「用户没能被邀请进群」一致：解散半残的群、回落原私聊线程。
+ * （绑定只在显式配置 sessionGroup.workingDir 时才会被请求，这里先补上。）
  */
 describe('会话群出生：workingDir 绑定没落地必须回退', () => {
+  beforeEach(() => {
+    getBot(APP).config.sessionGroup = {
+      ...(getBot(APP).config.sessionGroup ?? {}),
+      workingDir: join(mocks.dataDir, 'workdir'),
+    };
+  });
+
   it('绑定失败 → 不登记会话群，任务回落原私聊（已扣的费不白扣）', async () => {
     mocks.createGroupWithBots.mockResolvedValue(createGroupResult({
       oncallBindings: [{ larkAppId: APP, ok: false, error: 'bots.json write failed' }],

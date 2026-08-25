@@ -148,6 +148,12 @@ export interface DaemonSession {
    *  resolved launch model so that recovery does not relaunch on a stale one.
    *  Cleared when a worker generation reports ready. In-memory only. */
   crashDiagnosticParked?: boolean;
+  /** Daemon-side bounded auto-retry state for TRANSIENT worker startup
+   *  failures (e.g. "spawnSync tmux ETIMEDOUT" during a post-outage restart
+   *  storm — see worker-startup-retry.ts). `attempts` counts the current
+   *  failing streak; `timer` is the pending blank re-fork. Reset (timer
+   *  cleared) when a worker generation reaches `ready`. In-memory only. */
+  startupAutoRetry?: { attempts: number; timer?: NodeJS.Timeout };
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机

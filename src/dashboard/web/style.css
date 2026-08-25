@@ -18821,19 +18821,19 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .settings-nav-group-label {
-  margin: 0 0 2px;
+  margin: 0 0 4px;
   padding: 0 var(--sp-2);
   font-size: var(--fs-12);
-  font-weight: 600;
-  color: var(--muted);
+  font-weight: 700;
+  color: var(--fg);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
 }
 
 .settings-nav-link {
   display: block;
   width: 100%;
-  padding: 5px var(--sp-2);
+  padding: 5px var(--sp-2) 5px calc(var(--sp-2) + 8px);
   border: none;
   border-left: 2px solid transparent;
   background: none;
@@ -18846,7 +18846,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .settings-nav-link:hover {
-  color: var(--text);
+  color: var(--fg);
   background: var(--surface-muted);
 }
 

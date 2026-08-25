@@ -254,6 +254,47 @@ describe('TmuxPipeBackend.spawn', () => {
     }
   });
 
+  it('treats a deadline that raced a clean exit (ETIMEDOUT + numeric status) as retryable — 2026-08-23 regression', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      let newSessionAttempts = 0;
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (Array.isArray(args) && args.includes('new-session')) {
+          newSessionAttempts += 1;
+          if (newSessionAttempts === 1) {
+            // The exact 08-23 storm shape: the overloaded client finished and
+            // exited CLEANLY (numeric status, no signal, empty stderr) in the
+            // same window the exec deadline fired, so Node attached BOTH the
+            // clean exit and the ETIMEDOUT error. The server had actually
+            // created the session. The old classifier read "clean numeric exit
+            // ⇒ deterministic rejection" and killed the launch user-visibly.
+            throw Object.assign(new Error('spawnSync tmux ETIMEDOUT'), {
+              code: 'ETIMEDOUT',
+              errno: -110,
+              syscall: 'spawnSync tmux',
+              status: 0,
+              signal: null,
+              stderr: Buffer.from(''),
+            });
+          }
+          // Retry discovers the session DOES exist server-side → success.
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('duplicate session: bmx-owned'),
+          });
+        }
+        return '' as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
+      expect(() => be.spawn('echo', [], spawnOpts())).not.toThrow();
+      expect(newSessionAttempts).toBe(2);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
   it('does NOT retry new-session on a server-answered deterministic rejection', () => {
     let newSessionAttempts = 0;
     mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {

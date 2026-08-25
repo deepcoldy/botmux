@@ -31,7 +31,7 @@ import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
@@ -70,6 +70,13 @@ export function setStartupTmuxRetrySleepForTests(fn: ((ms: number) => void) | nu
  *  refused/no socket, command timeout, spawn-level EMFILE/EAGAIN) is plausibly
  *  transient under a stalled/overloaded shared server. */
 function isRetryableStartupTmuxFailure(err: any): boolean {
+  // Deadline first (2026-08-23 regression): a timed-out client can exit
+  // cleanly in the same window the kill fires, so the throw carries a numeric
+  // status + empty stderr alongside ETIMEDOUT. Reading that as "the server
+  // answered and rejected deterministically" turned a new-session that had
+  // actually SUCCEEDED server-side into a fatal, user-visible 会话启动失败
+  // during the post-outage restart storm. A timeout is never deterministic.
+  if (isExecTimeoutError(err)) return true;
   if (err && typeof err.status === 'number' && !err.signal) {
     return isTmuxServerLevelErrorText((err.stderr?.toString?.() ?? '').trim());
   }
@@ -676,6 +683,12 @@ export class TmuxPipeBackend implements SessionBackend {
       ).trim();
       return { state: paneId.length > 0 ? 'exists' : 'missing', reason: paneId.length > 0 ? undefined : 'empty pane id' };
     } catch (err: any) {
+      // Deadline first: a timed-out probe can carry a clean numeric exit when
+      // the client's completion races the kill (isExecTimeoutError). That is
+      // "no answer", never an authoritative 'missing'.
+      if (isExecTimeoutError(err)) {
+        return { state: 'unknown', reason: 'probe deadline (ETIMEDOUT)' };
+      }
       if (err && typeof err.status === 'number' && !err.signal) {
         const stderr = (err.stderr?.toString?.() ?? '').trim();
         if (isTmuxServerLevelErrorText(stderr)) {
@@ -810,6 +823,9 @@ export class TmuxPipeBackend implements SessionBackend {
       });
       return 'up';
     } catch (err: any) {
+      // Deadline first — same race as probePaneAddressability: a clean exit
+      // status attached to an ETIMEDOUT throw is still "no answer".
+      if (isExecTimeoutError(err)) return 'unreachable';
       if (err && typeof err.status === 'number' && !err.signal) {
         const stderr = (err.stderr?.toString?.() ?? '').trim();
         // Connection-level wording ("error connecting", "lost server") ⇒ the
@@ -909,11 +925,13 @@ export class TmuxPipeBackend implements SessionBackend {
       // capture-screenshot backend; verified geometry-neutral on the pipe
       // backend (toggling status on a detached session changes neither pane
       // size nor cursor), so it's safe to default ON.
-      execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+      // Bounded: these are cosmetic and best-effort, but without a timeout a
+      // wedged shared server would pin the worker's startup path indefinitely.
+      execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
     } catch { /* session may not be ready yet — benign */ }
   }
 

@@ -96,7 +96,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -459,6 +459,11 @@ import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import {
+  MAX_STARTUP_AUTO_RETRIES,
+  isTransientStartupFailure,
+  startupAutoRetryDelayMs,
+} from './worker-startup-retry.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -1654,6 +1659,21 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   } catch {
     return owner;
   }
+}
+
+/** 失败兜底卡片（turnFailed final_output）的兜底 @ 对象。仅当会话没有任何真人
+ *  footer 收件人时使用（典型：bot-to-bot 派发的 ownerless 会话遇到模型网关故障，
+ *  没人被 @，故障静默滑过）——回退到 bot 管理员（首个已授权真人 open_id，与
+ *  「缺权限警告私信对象」同口径）。返回 undefined = 没有可 @ 的真人，不加提及。 */
+function failureNoticeFallbackMentionOpenId(ds: DaemonSession): string | undefined {
+  const admin = getOwnerOpenId(ds.larkAppId);
+  if (!admin) return undefined;
+  try {
+    // 管理员名单里混入 bot open_id 时不 @：卡片里 @ 一个 bot 会触发它的新一轮，
+    // 失败通知不该产生二次派发。fail closed。
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(admin)) return undefined;
+  } catch { /* cross-ref 读取失败 → 仍然 @ 配置的管理员（admin 名单本就是真人为主） */ }
+  return admin;
 }
 
 export function clearUsageLimitState(ds: DaemonSession): void {
@@ -9424,6 +9444,8 @@ export function forkWorker(
     // dsh runner turn timeout: read live from bot config so tuning bots.json
     // takes effect on the next worker fork without recreating the session.
     turnTimeoutMs: botCfg.turnTimeoutMs,
+    // dsh runtime variant (official runner vs dsh-tui PTY TUI).
+    dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
@@ -10005,6 +10027,69 @@ function setupWorkerHandlers(
       logger.error(`[${t}] Failed to deliver worker startup failure to Lark: ${err?.message ?? err}`);
     }
   };
+  /**
+   * Daemon-side self-heal for TRANSIENT startup/relaunch failures (see
+   * worker-startup-retry.ts; 2026-08-23 tmux restart-storm incident). Returns
+   * true when a silent bounded retry was scheduled INSTEAD of a user-visible
+   * notify. Scope is deliberately narrow:
+   *   - only turn-less failures — a turn-carrying failure has a waiting sender
+   *     and (for durable VC/at-most-once turns) its own delivery state machine
+   *     that must keep owning retries;
+   *   - only reasons the classifier deems transient host/backend pressure;
+   *   - bounded by MAX_STARTUP_AUTO_RETRIES per failing streak (reset on a
+   *     worker generation reaching `ready`), so a persistent failure still
+   *     surfaces to the user with the standard card.
+   * The retry itself is a blank re-fork (`forkWorker(ds, '', true)`) — exactly
+   * what a daemon restart or the next inbound message would do: re-attach when
+   * the backing pane survived (the 08-23 case — pane and CLI were alive, only
+   * the worker had died), cold `--resume` otherwise.
+   */
+  const scheduleTransientStartupRetry = (
+    reason: string,
+    turnId?: string,
+    dispatchAttempt?: number,
+  ): boolean => {
+    if (turnId !== undefined || dispatchAttempt !== undefined) return false;
+    if (startupState.failureNotified) return false;
+    if (!isTransientStartupFailure(reason)) return false;
+    if (ds.session.status !== 'active') return false;
+    const attempts = (ds.startupAutoRetry?.attempts ?? 0) + 1;
+    if (attempts > MAX_STARTUP_AUTO_RETRIES) return false;
+    // Mark this generation handled so the pre-ready exit guard cannot post a
+    // duplicate start_exited_early card behind the scheduled retry.
+    startupState.failureNotified = true;
+    const delayMs = startupAutoRetryDelayMs(ds.session.sessionId, attempts);
+    logger.warn(
+      `[${t}] Transient worker startup failure (${reason}); `
+      + `auto-retry ${attempts}/${MAX_STARTUP_AUTO_RETRIES} in ${Math.round(delayMs / 1000)}s`,
+    );
+    const timer = setTimeout(() => {
+      if (ds.startupAutoRetry?.timer === timer) ds.startupAutoRetry.timer = undefined;
+      // Lifecycle guards: the session may have been closed, replaced in the
+      // registry, or revived by an inbound message while the timer slept.
+      if (ds.session.status !== 'active') return;
+      if (ds.worker && !ds.worker.killed) return;
+      if (activeSessionsRegistry && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds) return;
+      logger.info(
+        `[${t}] Auto-retrying worker start (${attempts}/${MAX_STARTUP_AUTO_RETRIES}) `
+        + 'after transient startup failure',
+      );
+      try {
+        forkWorker(ds, '', true);
+      } catch (err: any) {
+        logger.error(`[${t}] Startup auto-retry fork failed: ${err?.message ?? err}`);
+      }
+    }, delayMs);
+    timer.unref?.();
+    // An inbound message can revive the session between two failing
+    // generations; if the replacement fails too, the previous generation's
+    // still-pending timer must not survive as an orphan (its guards make a
+    // double blank re-fork merely wasteful, not harmful — but one streak owns
+    // exactly one pending retry).
+    if (ds.startupAutoRetry?.timer) clearTimeout(ds.startupAutoRetry.timer);
+    ds.startupAutoRetry = { attempts, timer };
+    return true;
+  };
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
@@ -10170,6 +10255,13 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // A generation reached ready: the transient-startup failing streak is
+        // over. Clear the budget and any still-pending retry timer (an inbound
+        // message may have revived the session while a retry slept).
+        if (ds.startupAutoRetry) {
+          if (ds.startupAutoRetry.timer) clearTimeout(ds.startupAutoRetry.timer);
+          ds.startupAutoRetry = undefined;
+        }
         // Restore the daemon-owned display mode BEFORE any card handling: a
         // fresh worker always boots with displayMode='hidden', and every early
         // break below (managed / replyAlreadySent / streamingCardDisabled /
@@ -11523,7 +11615,11 @@ function setupWorkerHandlers(
         logger.error(`[${t}] Worker error: ${msg.message}`);
         // `error` is a fatal launch-generation signal. It normally arrives
         // during init, but can also follow a previously-ready worker whose CLI
-        // recovery/restart fails; that later failure must remain user-visible.
+        // recovery/restart fails; that later failure must remain user-visible —
+        // UNLESS it is a turn-less transient (post-outage restart storm), where
+        // a bounded silent re-fork self-heals without waking anyone (08-23:
+        // idle sessions got "会话启动失败" cards while their panes were alive).
+        if (scheduleTransientStartupRetry(msg.message, msg.turnId, msg.dispatchAttempt)) break;
         await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
         break;
       }
@@ -12929,6 +13025,15 @@ function deliverFinalOutput(
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+      // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
+      // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
+      // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
+      const failureMentionOpenId = msg.turnFailed === true && !managedReceiver && !recipientOpenId
+        ? failureNoticeFallbackMentionOpenId(ds)
+        : undefined;
+      const deliveredAssistantText = failureMentionOpenId
+        ? `<at id=${failureMentionOpenId}></at> ${safeAssistantText}`
+        : safeAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
@@ -12957,7 +13062,7 @@ function deliverFinalOutput(
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
-            markdown: safeAssistantText,
+            markdown: deliveredAssistantText,
             ...(feedback ? { feedback } : {}),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -13425,6 +13530,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: agentCfg.model,
     turnTimeoutMs: botCfg.turnTimeoutMs,
+    dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Adopt is normally observe-only (prompt=''), driven later by 'message'

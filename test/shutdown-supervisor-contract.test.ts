@@ -125,6 +125,25 @@ describe('graceful shutdown supervisor contract', () => {
     expect(stop).toContain('PM2 registry mutation incomplete');
   });
 
+  it('lets systemd retire only the exact owned God after an attested fleet stop', () => {
+    const helperStart = cli.indexOf('function terminateSystemdOwnedPm2God()');
+    const helperEnd = cli.indexOf('async function cmdStop()', helperStart);
+    const helper = cli.slice(helperStart, helperEnd);
+    expect(helper).toContain('process.env[BOTMUX_SYSTEMD_SERVICE_ENV]');
+    expect(helper).toContain('currentLinuxSystemdCgroup()');
+    expect(helper).toContain("ownership.processes.length !== 1");
+    expect(helper).toContain('readSupervisorProcessStartIdentity(target.pid)');
+    expect(helper).toContain("process.kill(target.pid, 'SIGTERM')");
+    expect(helper).not.toContain('SIGKILL');
+
+    const stopStart = cli.indexOf('async function cmdStop()');
+    const stopEnd = cli.indexOf('async function cmdRestart()', stopStart);
+    const stop = cli.slice(stopStart, stopEnd);
+    expect(stop).toContain("process.argv.includes('--systemd-service')");
+    expect(stop.indexOf('terminateSystemdOwnedPm2God()', stop.indexOf('PM2 registry mutation incomplete')))
+      .toBeGreaterThan(stop.indexOf('PM2 registry mutation incomplete'));
+  });
+
   it('restart waits for the fleet decision before any PM2 delete', () => {
     const start = cli.indexOf('function deleteAllBotmuxProcesses(');
     const end = cli.indexOf('/**\n * One-time migration', start);
@@ -260,30 +279,31 @@ describe('graceful shutdown supervisor contract', () => {
     // Any pm2 client invocation with no live God daemonizes one from its own
     // env (pm2 Client.start → pingDaemon false → launchDaemon).
     //
-    // cmdStatus keeps a REAL atomic gate: the God scan and the pm2 call both
-    // run inside the fleet lock (runPm2 is synchronous), and God retirement
-    // needs that same lock, so no interleaving can retire the observed God
-    // before the client connects. On lock-wait timeout it exits non-zero.
-    const statusStart = cli.indexOf('async function cmdStatus(');
+    // cmdStatus uses #919's read-only RPC client (pingDaemon + launchRPC,
+    // never Client.start/connect), so it cannot birth a God and needs no
+    // fleet lock: a generation-bound observer is race-free by construction.
+    // It also fail-closes on an external God via inspectLinuxPm2ReadonlyTarget.
+    const statusStart = cli.indexOf('function cmdStatus(');
     const status = cli.slice(statusStart, cli.indexOf('function cmdUpgrade(', statusStart));
-    expect(status).toContain('withPm2FleetMutationLock(');
-    const statusGate = status.indexOf('listPm2GodDaemonPids().length === 0');
-    const statusRun = status.indexOf("runPm2(['status'])");
-    expect(statusGate).toBeGreaterThanOrEqual(0);
-    expect(statusRun).toBeGreaterThan(statusGate);
-    expect(status).toContain('process.exitCode = 1');
+    expect(status).toContain('linuxReadonlyPm2Available(');
+    expect(status).toContain('printReadonlyPm2Status(');
+    // The ownership-gated mutation path must not back a read-only command:
+    // mutationFromArgs rejects status/logs, and a lock would serialize a
+    // pure observer against fleet restarts for no safety gain.
+    expect(status).not.toContain('runPm2(');
+    expect(status).not.toContain('withPm2FleetMutationLock(');
 
-    // cmdLogs cannot get the same shape — its PM2 client would outlive any
-    // held lock, and "gate, release, then spawn" is a check/use race (the God
-    // can be retired between release and the client's connect). So logs runs
-    // NO pm2 client at all: it tails the log files pm2 writes. Structurally
-    // there is nothing left to race — pin the absence of every pm2 entry
-    // point across the TRANSITIVE call chain, not just the function body
-    // (warnIfLegacyBotmuxAlive once hid a legacy-home jlist client that a
-    // body-only scan missed).
+    // cmdLogs runs NO pm2 client at all: it tails the log files pm2 writes.
+    // Structurally there is nothing left to race — pin the absence of every
+    // pm2 entry point across the TRANSITIVE call chain, not just the function
+    // body (warnIfLegacyBotmuxAlive once hid a legacy-home jlist client that a
+    // body-only scan missed). It叠加 #919 的 external-God fail-closed：
+    // 只读 /proc 扫描，external → 抛 ExternalPm2GodOwnershipError（exit 2 +
+    // 迁移指引），absent/owned 落进 tail，保住「fleet 停了也能看历史」。
     const logsStart = cli.indexOf('async function cmdLogs(');
     const logs = cli.slice(logsStart, statusStart);
     expect(logs).toContain('LogFileFollower');
+    expect(logs).toContain('inspectLinuxPm2ReadonlyTarget(');
     const legacyWarnStart = cli.indexOf('function warnIfLegacyBotmuxAlive(');
     const legacyWarn = cli.slice(legacyWarnStart, cli.indexOf('\n}', legacyWarnStart));
     const logTail = readFileSync(new URL('../src/cli/log-tail.ts', import.meta.url), 'utf8');
@@ -463,8 +483,12 @@ describe('graceful shutdown supervisor contract', () => {
     const restartStart = cli.indexOf('async function cmdRestart()');
     const restartEnd = cli.indexOf('/**\n * Bring a SINGLE bot', restartStart);
     const restart = cli.slice(restartStart, restartEnd);
-    expect(restart).toContain("process.argv.includes('--bootstrap-shutdown-protocol')");
-    expect(restart).toContain("process.argv.includes('--yes')");
+    const flagsStart = cli.indexOf('function validateRestartLifecycleFlags(');
+    const flagsEnd = cli.indexOf('async function preflightRestartGenerationForSystemdRepair()', flagsStart);
+    const flags = cli.slice(flagsStart, flagsEnd);
+    expect(flags).toContain("argv.includes('--bootstrap-shutdown-protocol')");
+    expect(flags).toContain("argv.includes('--yes')");
+    expect(restart).toContain('validateRestartLifecycleFlags()');
     expect(restart).toContain("bootstrapDeleteAllBotmuxProcesses('restart')");
     expect(restart).toContain('deleteAllBotmuxProcesses()');
     expect(restart.lastIndexOf('deleteAllBotmuxProcesses()'))

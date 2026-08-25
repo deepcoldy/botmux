@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { LoadingState } from './dashboard-components.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { confirm } from './confirm-modal.js';
 
 // ─── Types (mirror src/dashboard/customization-api.ts payloads) ──────────────
 
@@ -363,7 +364,7 @@ function CustomizationPage() {
           <button className="cz-btn cz-btn-ghost" onClick={() => setShowHistory(h => !h)}>历史 / 回滚 ({data.history.length})</button>
           <a className="cz-btn cz-btn-ghost" href="/api/customization/export" download>导出 bundle</a>
           <button className="cz-btn cz-btn-ghost" onClick={() => setShowImport(true)}>导入 bundle</button>
-          <button className="cz-btn cz-btn-danger" onClick={async () => { if (confirm('把所有 prompt/skill 覆盖恢复出厂？（会先存快照，可回滚撤回）')) { await post('/api/customization/reset-all'); flash('已全部恢复出厂'); } }}>全部恢复出厂</button>
+          <button className="cz-btn cz-btn-danger" onClick={async () => { if (await confirm({ title: '全部恢复出厂', message: '把所有 prompt/skill 覆盖恢复出厂？会先存快照，可回滚撤回。', danger: true, confirmLabel: '恢复出厂' })) { await post('/api/customization/reset-all'); flash('已全部恢复出厂'); } }}>全部恢复出厂</button>
         </div>
 
         {showHistory ? (
@@ -375,7 +376,7 @@ function CustomizationPage() {
                   <span className="cz-hist-when">{rel(s.at)}</span>
                   <span className="cz-hist-label">{s.label}</span>
                   <span className="cz-hist-sum">prompt {s.summary.promptKeys} · skill {s.summary.skills} · {s.summary.enabled ? 'on' : 'off'}</span>
-                  <button className="cz-link" onClick={async () => { if (confirm('回滚到此快照？')) { await post('/api/customization/rollback', { id: s.id }); flash('已回滚'); } }}>回滚到此</button>
+                  <button className="cz-link" onClick={async () => { if (await confirm({ title: '回滚快照', message: '回滚到此快照？回滚本身也会存快照，非破坏式。', confirmLabel: '回滚' })) { await post('/api/customization/rollback', { id: s.id }); flash('已回滚'); } }}>回滚到此</button>
                 </div>
               ))}
             </div>

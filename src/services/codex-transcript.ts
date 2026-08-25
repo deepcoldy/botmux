@@ -229,6 +229,12 @@ export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
 export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
 export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';
 export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
+/** Model gateway / upstream service failure (5xx, gRPC stream cancel, …):
+ *  the request reached the model service but the SERVER side failed. Distinct
+ *  from `codex_connection_failed` (client could not reach the service at all)
+ *  so the user-facing card can say "server-side transient, just retry later"
+ *  instead of pointing at the local network. */
+export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
 
 const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
@@ -406,6 +412,15 @@ export function codexTaskFailureCode(error: unknown): string {
   }
   if (/invalid_request|invalid request|validation|empty_string|\b400\b|\b-4003\b/.test(normalized)) {
     return CODEX_INVALID_REQUEST_ERROR_CODE;
+  }
+  // Model gateway / upstream failures: the service answered but failed
+  // server-side (proxy 5xx, gRPC stream cancel, overloaded backend). Checked
+  // BEFORE the connection branch so e.g. "gateway timeout" classifies as
+  // upstream rather than a local connectivity problem. Observed live:
+  // "upstream stream error: rpc error: code = 1 desc = Cancelled by backend
+  // [biz error]" (model gateway cancelling the stream mid-turn).
+  if (/upstream|rpc error|cancell?ed by backend|gateway|\b50[0234]\b|service unavailable|internal server error|overloaded/.test(normalized)) {
+    return CODEX_UPSTREAM_ERROR_CODE;
   }
   if (/econn|connection|network|socket|timed?\s*out|timeout|dns|enotfound/.test(normalized)) {
     return CODEX_CONNECTION_ERROR_CODE;

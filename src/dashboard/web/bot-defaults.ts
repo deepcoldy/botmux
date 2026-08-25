@@ -63,6 +63,8 @@ export type BotDefaultsRow = {
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
   turnTimeoutMs?: number;
+  /** dsh runtime variant: 'official' (JSON-RPC runner) or 'tui' (dsh-tui PTY). */
+  dshRuntime?: 'official' | 'tui' | null;
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;

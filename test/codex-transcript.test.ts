@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_AUTH_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -269,6 +269,40 @@ describe('extractLastCodexTurn', () => {
       mk('user', 'u2'),
     ]);
     expect(out).toEqual({ userText: 'u1', assistantText: 'a1' });
+  });
+});
+
+describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => {
+  it('classifies model gateway / upstream failures as codex_upstream_error', () => {
+    // Live incident shape: the model gateway cancelled the stream mid-turn.
+    expect(codexTaskFailureCode(
+      'upstream stream error: rpc error: code = 1 desc = Cancelled by backend [biz error]',
+    )).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('502 Bad Gateway')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('503 Service Unavailable')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode({ error: { message: 'Internal server error' } }))
+      .toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('Overloaded: please retry')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it('checks upstream BEFORE connection so "gateway timeout" is server-side, not local network', () => {
+    expect(codexTaskFailureCode('504 Gateway Timeout')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it('keeps the more specific categories ahead of upstream', () => {
+    // A gateway 429 is still a rate limit; a gateway 401 is still auth.
+    expect(codexTaskFailureCode('upstream error: 429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    expect(codexTaskFailureCode('gateway rejected: 401 Unauthorized')).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(codexTaskFailureCode('invalid_request: empty_string')).toBe(CODEX_INVALID_REQUEST_ERROR_CODE);
+  });
+
+  it('keeps plain connectivity failures on codex_connection_failed', () => {
+    expect(codexTaskFailureCode('ECONNRESET: connection reset by peer')).toBe(CODEX_CONNECTION_ERROR_CODE);
+    expect(codexTaskFailureCode('getaddrinfo ENOTFOUND api.example.com')).toBe(CODEX_CONNECTION_ERROR_CODE);
+  });
+
+  it('falls back to codex_task_failed for unrecognized errors', () => {
+    expect(codexTaskFailureCode('something exploded')).toBe(CODEX_TASK_FAILED_ERROR_CODE);
   });
 });
 

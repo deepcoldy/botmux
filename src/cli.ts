@@ -44,8 +44,18 @@ import {
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
-import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
+import {
+  enableAutostart,
+  disableAutostart,
+  autostartStatus,
+  refreshAutostart,
+  handoffLinuxPm2Start,
+  prepareLinuxPm2ServiceRepair,
+  applyLinuxPm2ServiceRepair,
+  inspectLinuxSystemdService,
+} from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import {
@@ -141,6 +151,11 @@ import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredSche
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
+import {
+  captureReadonlyPm2Jlist,
+  printReadonlyPm2Status,
+} from './cli/pm2-readonly.js';
+import { runExistingPm2Command } from './cli/pm2-existing.js';
 import { pm2ManagedExitConfig } from './pm2-graceful-exit.js';
 import {
   parseCanonicalPm2Id,
@@ -164,6 +179,21 @@ import {
 } from './cli/pm2-god-retirement.js';
 import { pm2FleetMutationLockTarget, withPm2FleetMutationLock } from './cli/pm2-fleet-lock.js';
 import { LogFileFollower, type LogTailSource } from './cli/log-tail.js';
+import {
+  BOTMUX_SYSTEMD_SERVICE,
+  BOTMUX_SYSTEMD_SERVICE_ENV,
+  ExternalPm2GodOwnershipError,
+  currentLinuxSystemdCgroup,
+  describeExternalPm2Owner,
+  inspectLinuxPm2Command,
+  inspectLinuxPm2GodOwnership,
+  inspectLinuxPm2ReadonlyTarget,
+  revalidateLinuxPm2GodProcess,
+  scanLinuxPm2GodPids,
+  type LinuxPm2Command,
+  type LinuxPm2CommandInspection,
+  type LinuxPm2GodProcess,
+} from './core/pm2-lifecycle-owner.js';
 import {
   requestAttestedDaemonShutdown,
   requestAttestedDaemonShutdownBatch,
@@ -401,21 +431,7 @@ function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
   const marker = `God Daemon (${home})`;
   const pids: number[] = [];
   if (process.platform === 'linux') {
-    let entries: string[];
-    try { entries = readdirSync('/proc'); }
-    catch (err) {
-      throw new Error(`cannot inspect /proc for duplicate PM2 Gods: ${err instanceof Error ? err.message : err}`);
-    }
-    for (const ent of entries) {
-      if (!/^\d+$/.test(ent)) continue;
-      const pid = parseInt(ent, 10);
-      if (!pid) continue;
-      try {
-        const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\u0000/g, ' ').trim();
-        if (cmd.includes('PM2 v') && cmd.includes(marker)) pids.push(pid);
-      } catch { /* another user's or already-exited process */ }
-    }
-    return pids.sort((a, b) => a - b);
+    return scanLinuxPm2GodPids(home);
   }
   if (process.platform === 'win32') {
     const windowsScan = spawnSync('powershell.exe', [
@@ -463,6 +479,82 @@ function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
   return pids.sort((a, b) => a - b);
 }
 
+function linuxPm2CommandInspection(
+  command: LinuxPm2Command,
+  home: string = PM2_HOME,
+): LinuxPm2CommandInspection {
+  if (process.platform !== 'linux') {
+    return { ownership: { kind: 'absent' }, plan: { kind: 'direct' } };
+  }
+  return inspectLinuxPm2Command({ command, home });
+}
+
+function pm2LifecycleOwnershipError(inspection: LinuxPm2CommandInspection): Error {
+  const { plan, ownership } = inspection;
+  if (plan.kind === 'reject' && ownership.kind === 'external') {
+    return new ExternalPm2GodOwnershipError(ownership);
+  }
+  return new Error(
+    'PM2 God Daemon 尚未由 botmux.service 建立；请先运行 `botmux start` 完成 systemd handoff。',
+  );
+}
+
+async function runPm2LifecycleCliCommand(action: () => void | Promise<void>): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    if (!(error instanceof ExternalPm2GodOwnershipError)) throw error;
+    console.error(`❌ ${error.message}`);
+    process.exitCode = error.exitCode;
+  }
+}
+
+function assertDirectPm2Access(
+  command: LinuxPm2Command,
+  home: string = PM2_HOME,
+): LinuxPm2CommandInspection {
+  const inspection = linuxPm2CommandInspection(command, home);
+  if (inspection.plan.kind !== 'direct') throw pm2LifecycleOwnershipError(inspection);
+  return inspection;
+}
+
+function linuxReadonlyPm2Available(
+  home: string = PM2_HOME,
+): { available: boolean; expectedGod?: LinuxPm2GodProcess } {
+  if (process.platform !== 'linux' || home !== PM2_HOME) return { available: true };
+  const target = inspectLinuxPm2ReadonlyTarget(home);
+  if (!target) return { available: false };
+  return typeof target === 'object'
+    ? { available: true, expectedGod: target }
+    : { available: true };
+}
+
+function handoffLinuxPm2StartIfNeeded(): boolean {
+  const inspection = linuxPm2CommandInspection('start');
+  const { plan } = inspection;
+  if (plan.kind === 'direct') {
+    if (process.platform !== 'linux' || inspection.ownership.kind !== 'owned') return false;
+    const god = inspection.ownership.processes.length === 1
+      ? inspection.ownership.processes[0]
+      : undefined;
+    if (!god) throw pm2LifecycleOwnershipError(inspection);
+    const state = inspectLinuxSystemdService();
+    if (state.activeState === 'active'
+        && state.subState === 'running'
+        && state.mainPid === god.pid) return false;
+    handoffLinuxPm2Start({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR });
+    console.log(`✅ 已由 ${BOTMUX_SYSTEMD_SERVICE} 接管现有 PM2 God`);
+    return true;
+  }
+  if (plan.kind === 'reject') throw pm2LifecycleOwnershipError(inspection);
+  if (plan.kind !== 'handoff') throw pm2LifecycleOwnershipError(inspection);
+  handoffLinuxPm2Start({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR });
+  console.log(`✅ daemon 已由 ${plan.service} 启动`);
+  console.log('   日志: botmux logs');
+  console.log('   状态: botmux status');
+  return true;
+}
+
 function listSingletonPm2GodDaemonPidsForMutation(home: string = PM2_HOME): number[] {
   const pids = listPm2GodDaemonPids(home);
   if (pids.length <= 1) return pids;
@@ -480,19 +572,42 @@ function assertNoDuplicatePm2GodDaemons(home: string = PM2_HOME): void {
 }
 
 function runPm2(args: string[], inherit = true, home: string = PM2_HOME, timeoutMs?: number): void {
-  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
-  const r = spawnSync(pm2.command, pm2.args, {
-    stdio: inherit ? 'inherit' : 'pipe',
-    env: pm2Env(home),
-    shell: pm2.shell ?? false,
-    timeout: timeoutMs,
-  });
-  if (r.status !== 0) {
-    // r.error is set when the process couldn't be spawned/timed out (status null);
-    // prefer it so failures don't surface as a bare "status null".
-    const detail = r.error?.message ?? `status ${r.status}`;
-    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  const inspection = assertDirectPm2Access('plugin', home);
+  if (process.platform === 'linux' && inspection.ownership.kind === 'owned') {
+    if (inspection.ownership.processes.length !== 1) {
+      throw new Error(
+        `refusing PM2 mutation: expected one botmux.service-owned God for ${home}, got `
+        + `${inspection.ownership.processes.map(process => process.pid).join(', ') || 'none'}`,
+      );
+    }
+    runExistingPm2Command({
+      pkgRoot: PKG_ROOT,
+      home,
+      args,
+      inherit,
+      timeoutMs,
+      env: pm2Env(home),
+      expectedGod: inspection.ownership.processes[0]!,
+    });
+  } else {
+    // Only the botmux.service caller may reach this with an absent primary God.
+    // Legacy/non-Linux homes retain their platform-specific PM2 CLI behavior.
+    const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
+    const r = spawnSync(pm2.command, pm2.args, {
+      stdio: inherit ? 'inherit' : 'pipe',
+      env: pm2Env(home),
+      shell: pm2.shell ?? false,
+      timeout: timeoutMs,
+    });
+    if (r.status !== 0) {
+      // r.error is set when the process couldn't be spawned/timed out (status null);
+      // prefer it so failures don't surface as a bare "status null".
+      const detail = r.error?.message ?? `status ${r.status}`;
+      throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+    }
   }
+  const after = linuxPm2CommandInspection('plugin', home);
+  if (after.plan.kind === 'reject') throw pm2LifecycleOwnershipError(after);
 }
 
 /**
@@ -501,27 +616,17 @@ function runPm2(args: string[], inherit = true, home: string = PM2_HOME, timeout
  * a shell) as well as macOS/Linux. Throws on non-zero exit / spawn failure.
  */
 function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000): string {
-  const pm2 = buildPm2SpawnCommand(pm2Bin(), args);
-  const r = spawnSync(pm2.command, pm2.args, {
-    encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: pm2Env(home),
-    shell: pm2.shell ?? false,
-    timeout: timeoutMs,
-    // `pm2 jlist` serializes EVERY process's full env + metadata, so its stdout
-    // grows ~linearly with the bot count. Node's default spawnSync maxBuffer is
-    // 1 MiB — a box with ~30+ bots blows past it and spawnSync fails with
-    // ENOBUFS, which surfaced as `start-bot` (dashboard "bring one bot online")
-    // dying before it could launch anything. Lift the cap well above any real
-    // fleet size. (ps/git captures elsewhere already do the same.)
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  if (r.status !== 0) {
-    const detail = r.error?.message
-      ?? ((r.stderr ? String(r.stderr).trim() : '') || `status ${r.status}`);
-    throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
+  if (args.length !== 1 || args[0] !== 'jlist') {
+    throw new Error(`unsupported read-only PM2 command: ${args.join(' ')}`);
   }
-  return typeof r.stdout === 'string' ? r.stdout : '';
+  const readonly = linuxReadonlyPm2Available(home);
+  if (!readonly.available) return '[]';
+  return captureReadonlyPm2Jlist({
+    pkgRoot: PKG_ROOT,
+    home,
+    timeoutMs,
+    expectedGod: readonly.expectedGod,
+  });
 }
 
 async function cmdInternalPm2StartExact(args: string[]): Promise<void> {
@@ -2774,19 +2879,45 @@ function preflightNodeSanity(home: string = PM2_HOME): void {
 }
 
 async function cmdStart(): Promise<void> {
+  const systemdServiceStart = process.argv.includes('--systemd-service');
+  if (systemdServiceStart) {
+    if (process.platform !== 'linux'
+        || process.env[BOTMUX_SYSTEMD_SERVICE_ENV] !== BOTMUX_SYSTEMD_SERVICE
+        || !currentLinuxSystemdCgroup().split('/').includes(BOTMUX_SYSTEMD_SERVICE)) {
+      throw new Error('[start] --systemd-service requires the exact botmux.service cgroup');
+    }
+  }
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
     process.exit(1);
   }
   ensureConfigDir();
+  if (systemdServiceStart) {
+    const ownership = inspectLinuxPm2GodOwnership(PM2_HOME);
+    if (ownership.kind === 'external' || (ownership.kind === 'owned' && ownership.processes.length !== 1)) {
+      throw new Error(
+        `[start] systemd ExecStart requires unique botmux.service PM2 ownership: ${describeExternalPm2Owner(ownership) || ownership.kind}`,
+      );
+    }
+    const observedGod = ownership.kind === 'owned' ? ownership.processes[0] : undefined;
+    if (observedGod && !observedGod.startIdentity) {
+      throw new Error('[start] cannot bind the existing PM2 God process generation');
+    }
+  }
   await ensureSystemDependencies();
 
-  // 启动前快速校验每个 bot 的凭证. Codex review 边界 #5: 凭证无效是
-  // 唯一应该阻塞 start 的情况; scope/event 缺失在 daemon 起来后用 WARN
-  // + 私信处理 (event-dispatcher.checkRequiredScopes).
-  //
-  // 失败时打印明确的 appId 前缀和错误码, 不打印 secret, 不 spawn pm2 进程.
+  const botsForCheck = await preflightConfiguredBotCredentials();
+  if (!systemdServiceStart && handoffLinuxPm2StartIfNeeded()) return;
+  if (systemdServiceStart) {
+    await startConfiguredFleet(botsForCheck, { systemdServiceStart: true });
+  } else {
+    await startConfiguredFleet(botsForCheck);
+  }
+}
+
+/** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
+async function preflightConfiguredBotCredentials() {
   const botsForCheck = loadBotsJson();
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
@@ -2814,6 +2945,13 @@ async function cmdStart(): Promise<void> {
       process.exit(1);
     }
   }
+  return botsForCheck;
+}
+
+async function startConfiguredFleet(
+  botsForCheck: ReturnType<typeof loadBotsJson>,
+  options: { systemdServiceStart?: boolean } = {},
+): Promise<void> {
 
   await withPm2FleetMutationLock(async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
@@ -2824,7 +2962,7 @@ async function cmdStart(): Promise<void> {
       assertNoDuplicatePm2GodDaemons();
       preflightNodeSanity();
       cleanupLegacyPm2();
-      const currentProjection = readVerifiedBotmuxPm2Projection('start');
+      let currentProjection = readVerifiedBotmuxPm2Projection('start');
       assertNoUnregisteredLiveDaemonDescriptors('start', currentProjection);
       assertCanonicalUniquePm2Rows('start', currentProjection);
       const configuredNames = configuredCoreProcessNames(lockedBots);
@@ -2841,12 +2979,26 @@ async function cmdStart(): Promise<void> {
           );
           return;
         } catch (error) {
-          throw new Error(
-            `[start] refusing PM2 start while a partial/live core fleet exists `
-            + `(${liveEntries.map(entry => `${entry.name}:${entry.pid}`).join(', ')}): `
-            + `${error instanceof Error ? error.message : String(error)}; `
-            + 'use start-bot only for an exact one-missing-bot fleet, or restart',
-          );
+          if (!options.systemdServiceStart) {
+            throw new Error(
+              `[start] refusing PM2 start while a partial/live core fleet exists `
+              + `(${liveEntries.map(entry => `${entry.name}:${entry.pid}`).join(', ')}): `
+              + `${error instanceof Error ? error.message : String(error)}; `
+              + 'use start-bot only for an exact one-missing-bot fleet, or restart',
+            );
+          }
+        }
+      }
+      // A killed/failed ExecStart may leave partial core rows in an otherwise
+      // reusable service-owned God. Retry their normal attested shutdown and
+      // rebuild only the core fleet; plugin rows stay on the same God.
+      if (options.systemdServiceStart && currentProjection.length > 0) {
+        deleteAllBotmuxProcesses();
+        cleanupStaleDaemonDescriptors();
+        currentProjection = readVerifiedBotmuxPm2Projection('systemd-start-recovery');
+        assertNoUnregisteredLiveDaemonDescriptors('systemd-start-recovery', currentProjection);
+        if (currentProjection.length > 0) {
+          throw new Error('[systemd-start] core fleet recovery left PM2 rows behind');
         }
       }
       const unprovenDormant = currentProjection.filter(
@@ -2879,7 +3031,9 @@ async function cmdStart(): Promise<void> {
       );
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
-  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
+  await reconcilePluginServicesForCli(undefined, {
+    autoOnly: true,
+  });
   const bots = loadBotsJson();
   const count = bots.length || 1;
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -2887,8 +3041,13 @@ async function cmdStart(): Promise<void> {
   console.log(`   状态: botmux status`);
   // If the user previously enabled autostart, sync the unit file in case
   // node/cli.js paths changed since (nvm switch, npm upgrade, etc.).
-  if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-    console.log(`   autostart unit 已同步到当前 Node/cli.js 路径`);
+  // A Type=forking unit necessarily has a live start Job/activating state
+  // until this ExecStart child returns. The parent repair transaction already
+  // wrote and daemon-reloaded the unit; self-refresh here would reject that
+  // expected in-flight state and make every systemd start fail.
+  if (!options.systemdServiceStart
+      && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+    console.log(`   autostart 主 unit 已同步到当前 Node/cli.js 路径`);
   }
   await printDashboardHintWithRetry();
 }
@@ -3608,6 +3767,15 @@ function cleanupLegacyPm2(
   assertNoDuplicatePm2GodDaemons(legacyHome);
   preflightNodeSanity(legacyHome);
   assertNoDuplicatePm2GodDaemons(legacyHome);
+  // Read through the non-daemonizing client first. An unrelated legacy God is
+  // not a migration target and must remain untouched; a legacy God that does
+  // contain Botmux rows is ownership-gated before any shutdown signal/delete.
+  const legacyProjection = readVerifiedBotmuxPm2Projection(
+    'legacy-cleanup-discovery',
+    legacyHome,
+  );
+  if (legacyProjection.length === 0) return false;
+  assertDirectPm2Access('plugin', legacyHome);
   if (bootstrapOperation) bootstrapDeleteAllBotmuxProcesses(bootstrapOperation, legacyHome);
   else {
     const currentProjection = readVerifiedBotmuxPm2Projection('legacy-cleanup-authority');
@@ -3616,14 +3784,59 @@ function cleanupLegacyPm2(
   return true;
 }
 
+function terminateSystemdOwnedPm2God(): void {
+  if (process.platform !== 'linux') {
+    throw new Error('[systemd-stop] PM2 God retirement is only supported on Linux');
+  }
+  if (process.env[BOTMUX_SYSTEMD_SERVICE_ENV] !== BOTMUX_SYSTEMD_SERVICE) {
+    throw new Error('[systemd-stop] missing botmux.service environment attestation');
+  }
+  const callerCgroup = currentLinuxSystemdCgroup();
+  if (!callerCgroup.split('/').includes(BOTMUX_SYSTEMD_SERVICE)) {
+    throw new Error(`[systemd-stop] caller is outside ${BOTMUX_SYSTEMD_SERVICE}: ${callerCgroup}`);
+  }
+
+  const ownership = inspectLinuxPm2GodOwnership(PM2_HOME);
+  if (ownership.kind === 'absent') return;
+  if (ownership.kind !== 'owned' || ownership.processes.length !== 1) {
+    throw new Error(
+      `[systemd-stop] refusing ambiguous PM2 God retirement: ${describeExternalPm2Owner(ownership) || ownership.kind}`,
+    );
+  }
+  const target = ownership.processes[0]!;
+  const identity = target.startIdentity;
+  if (!identity || !revalidateLinuxPm2GodProcess(target, PM2_HOME)) {
+    throw new Error(`[systemd-stop] cannot bind PM2 God pid ${target.pid} to a process generation`);
+  }
+  try {
+    process.kill(target.pid, 'SIGTERM');
+  } catch (error) {
+    if (readSupervisorProcessStartIdentity(target.pid) !== identity) return;
+    throw new Error(
+      `[systemd-stop] failed to signal PM2 God ${target.pid}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const deadline = Date.now() + 30_000;
+  while (readSupervisorProcessStartIdentity(target.pid) === identity) {
+    if (Date.now() >= deadline) {
+      throw new Error(`[systemd-stop] PM2 God ${target.pid} did not exit after SIGTERM`);
+    }
+    sleepSyncMs(50);
+  }
+}
+
 async function cmdStop(): Promise<void> {
   const includePluginServices = process.argv.includes('--with-plugin');
+  const systemdServiceStop = process.argv.includes('--systemd-service');
   const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
   const bootstrapConfirmed = process.argv.includes('--yes');
   if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
     throw new Error(
       '[stop] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
     );
+  }
+  if (systemdServiceStop && includePluginServices) {
+    throw new Error('[stop] --systemd-service cannot be combined with --with-plugin');
   }
   ensureConfigDir();
   await withPm2FleetMutationLock(async () => {
@@ -3635,6 +3848,7 @@ async function cmdStop(): Promise<void> {
       if (includePluginServices) {
         await stopPluginServicesForCli(undefined, { autoOnly: true });
       }
+      if (systemdServiceStop) terminateSystemdOwnedPm2God();
       console.log('daemon 已通过一次性 shutdown-protocol bootstrap 安全边界停止。');
       return;
     }
@@ -3656,6 +3870,7 @@ async function cmdStop(): Promise<void> {
       if (includePluginServices) {
         await stopPluginServicesForCli(undefined, { autoOnly: true });
       }
+      if (systemdServiceStop) terminateSystemdOwnedPm2God();
       console.log('daemon 未在运行。');
       return;
     }
@@ -3707,7 +3922,140 @@ async function cmdStop(): Promise<void> {
     }
     cleanupStaleDaemonDescriptors();
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    if (systemdServiceStop) terminateSystemdOwnedPm2God();
   }, { maxWaitMs: 5_000 });
+}
+
+interface RestartLifecycleFlags {
+  includePm2: boolean;
+  includePluginServices: boolean;
+  bootstrapShutdownProtocol: boolean;
+  bootstrapConfirmed: boolean;
+}
+
+function validateRestartLifecycleFlags(argv: string[] = process.argv): RestartLifecycleFlags {
+  const flags = {
+    includePm2: argv.includes('--include-pm2'),
+    includePluginServices: argv.includes('--with-plugin'),
+    bootstrapShutdownProtocol: argv.includes('--bootstrap-shutdown-protocol'),
+    bootstrapConfirmed: argv.includes('--yes'),
+  };
+  if (flags.bootstrapShutdownProtocol && !flags.bootstrapConfirmed) {
+    throw new Error(
+      '[restart] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
+    );
+  }
+  if (flags.bootstrapShutdownProtocol && flags.includePm2) {
+    throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
+  }
+  return flags;
+}
+
+async function preflightRestartGenerationForSystemdRepair(): Promise<void> {
+  assertNoDuplicatePm2GodDaemons();
+  preflightNodeSanity();
+  await ensureSystemDependencies();
+  await preflightConfiguredBotCredentials();
+}
+
+async function restoreManualPluginServicesAfterSystemdRepair(pluginIds: string[]): Promise<void> {
+  if (pluginIds.length === 0) return;
+  const { startPluginServices } = await import('./core/plugins/service-manager.js');
+  const reports = await startPluginServices(pluginIds);
+  const incomplete = pluginIds.filter(id => !reports.some(report => (
+    report.pluginId === id
+    && (report.action === 'started' || report.action === 'already-running')
+    && report.status === 'online'
+    && Number.isSafeInteger(report.pid)
+    && report.pid! > 1
+  )));
+  if (incomplete.length > 0) {
+    throw new Error(
+      '[systemd-repair] manual plugin service restore incomplete: '
+      + incomplete.map(id => {
+        const report = reports.find(item => item.pluginId === id);
+        return `${id}:${report?.warning ?? report?.status ?? report?.action ?? 'missing-report'}`;
+      }).join(', '),
+    );
+  }
+  console.log(`✅ 已恢复迁移前运行的 manual plugin service: ${pluginIds.join(', ')}`);
+}
+
+async function bootstrapRetireCoreForSystemdRepair(): Promise<void> {
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    assertNoDuplicatePm2GodDaemons();
+    cleanupLegacyPm2('restart');
+    bootstrapDeleteAllBotmuxProcesses('restart');
+    cleanupStaleDaemonDescriptors();
+  }, { maxWaitMs: 5_000 });
+}
+
+async function migrateLinuxPm2ServiceIfRequired(
+  repairRequired: boolean,
+  flags: RestartLifecycleFlags,
+): Promise<boolean> {
+  if (!repairRequired) return false;
+  await preflightRestartGenerationForSystemdRepair();
+  const { snapshotRunningManualPluginServiceIds } = await import('./core/plugins/service-manager.js');
+  const manualPluginIds = await snapshotRunningManualPluginServiceIds();
+  if (flags.bootstrapShutdownProtocol) await bootstrapRetireCoreForSystemdRepair();
+  const restartIntentDir = resolveDataDir();
+  const restartAttemptId = randomBytes(16).toString('hex');
+  let restartIntentPrepared = false;
+  try {
+    const now = Date.now();
+    let stagedRestartIntent: RestartIntent | null = null;
+    try {
+      stagedRestartIntent = consumeRestartIntentTo(restartIntentDir, now);
+    } catch { /* intent reporting is best-effort */ }
+    try {
+      writeRestartAttemptIntentTo(
+        restartIntentDir,
+        stagedRestartIntent ?? { kind: 'manual', at: new Date(now).toISOString() },
+        now,
+        restartAttemptId,
+      );
+      restartIntentPrepared = true;
+    } catch { /* intent reporting is best-effort */ }
+
+    let failure: unknown;
+    try {
+      applyLinuxPm2ServiceRepair({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR });
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      await restoreManualPluginServicesAfterSystemdRepair(manualPluginIds);
+    } catch (restoreError) {
+      failure = failure
+        ? new AggregateError([failure, restoreError], '[systemd-repair] repair and plugin restore both failed')
+        : restoreError;
+    }
+    if (failure) throw failure;
+  } catch (error) {
+    if (restartIntentPrepared) {
+      try {
+        removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+      } catch { /* best-effort */ }
+    }
+    throw error;
+  }
+  if (restartIntentPrepared) {
+    let committed = false;
+    try {
+      committed = commitRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+    } catch { /* best-effort after verified repair */ }
+    if (!committed) {
+      try {
+        removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+      } catch { /* best-effort */ }
+      console.warn('⚠️  daemon 已恢复，但重启摘要凭据未能提交；本次不会发送重启摘要。');
+    }
+  }
+  console.log('✅ daemon 与 systemd 运行态已由 botmux.service 完成修复和重启');
+  console.log('   日志: botmux logs');
+  console.log('   状态: botmux status');
+  return true;
 }
 
 async function cmdRestart(): Promise<void> {
@@ -3729,19 +4077,32 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  // #877 恢复了 --include-pm2 对存活 God 的彻底重启（退役 + 重建），
+  // 旧的 assertIncludePm2RestartAdmission 会拒绝一切存活 God，与之冲突，已移除。
+  const lifecycleFlags = validateRestartLifecycleFlags();
+  const {
+    includePm2,
+    includePluginServices,
+    bootstrapShutdownProtocol,
+  } = lifecycleFlags;
+  const autostartOpts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+  const systemdRepair = prepareLinuxPm2ServiceRepair(autostartOpts);
+  if (await migrateLinuxPm2ServiceIfRequired(systemdRepair, lifecycleFlags)) return;
+  // --include-pm2 退役 God 后要在 botmux.service cgroup 里生继任者。非 service
+  // cgroup 的调用方（用户手动 ssh 跑）在进程内生 God 会落进调用方 cgroup（#774
+  // 的根因），runPm2 的 ownership gate 也会拒。把整个退役+重建周期交给 service：
+  // systemctl restart 的 ExecStop 退役 fleet+God、ExecStart 在 service cgroup
+  // 里全新生，与 --include-pm2 终态等价。必须在 fleet 锁外调（service 的 start
+  // 也要拿这把锁，锁内调会死锁）。
+  if (includePm2
+      && process.platform === 'linux'
+      && (process.env[BOTMUX_SYSTEMD_SERVICE_ENV] !== BOTMUX_SYSTEMD_SERVICE
+          || !currentLinuxSystemdCgroup().split('/').includes(BOTMUX_SYSTEMD_SERVICE))) {
+    handoffLinuxPm2Start(autostartOpts);
+    return;
+  }
+  // bootstrap 组合校验已在 validateRestartLifecycleFlags 内完成。
   await withPm2FleetMutationLock(async () => {
-    const includePm2 = process.argv.includes('--include-pm2');
-    const includePluginServices = process.argv.includes('--with-plugin');
-    const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
-    const bootstrapConfirmed = process.argv.includes('--yes');
-    if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
-      throw new Error(
-        '[restart] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
-      );
-    }
-    if (bootstrapShutdownProtocol && includePm2) {
-      throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
-    }
 
     const restartIntentDir = resolveDataDir();
     let stagedRestartIntent: RestartIntent | null = null;
@@ -3904,7 +4265,7 @@ async function cmdRestart(): Promise<void> {
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
     if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-      console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
+      console.log(`autostart 主 unit 已同步到当前 Node/cli.js 路径`);
     }
     await printDashboardHintWithRetry();
   }, { maxWaitMs: 5_000 });
@@ -4352,7 +4713,14 @@ function warnIfLegacyBotmuxAlive(): void {
   } catch { /* no pids dir */ }
 }
 
+// #877 的纯文件 tail：fleet 停止时也能看日志，且永不创建 God。
+// 叠加 #919 的 external-God fail-closed：只读 /proc 扫描，external → 抛
+// ExternalPm2GodOwnershipError（runPm2LifecycleCliCommand 收敛为 exit 2 + 迁移指引）；
+// absent/owned 不落进 tail，保住「fleet 停了也能看历史」。
 async function cmdLogs(): Promise<void> {
+  if (process.platform === 'linux') {
+    inspectLinuxPm2ReadonlyTarget(PM2_HOME);
+  }
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
@@ -4437,30 +4805,23 @@ function allBotmuxLogSources(bots: any[]): LogTailSource[] {
   return sources;
 }
 
-async function cmdStatus(): Promise<void> {
-  warnIfLegacyBotmuxAlive();
-  // A pm2 client with no live God lazily births one from this process's env.
-  // During an include-pm2 restart's kill→start window that replacement God
-  // would abort the restart with the whole fleet offline, and in a normally
-  // stopped state it would silently resurrect a God nobody asked for — so a
-  // read-only status must check for a God under the fleet lock and never
-  // create one.
-  let entered = false;
-  try {
-    await withPm2FleetMutationLock(async () => {
-      entered = true;
-      if (listPm2GodDaemonPids().length === 0) {
-        console.log('PM2 God 未运行：fleet 已停止（status 不会隐式启动它；需要时运行 botmux start）。');
-        return;
-      }
-      runPm2(['status']);
-    }, { maxWaitMs: 3_000 });
-  } catch (err) {
-    if (entered) throw err;
-    // Non-zero so automation doesn't mistake "couldn't observe" for success.
-    console.log('fleet 停启操作进行中（fleet mutation 锁被占用），请稍后重试 botmux status。');
-    process.exitCode = 1;
+// status 走只读 RPC client（#919）：永不 daemonize、无需 fleet 锁，且对
+// external God 同样 fail-closed（inspectLinuxPm2ReadonlyTarget 抛
+// ExternalPm2GodOwnershipError → runPm2LifecycleCliCommand 收敛为 exit 2）。
+// master 的 fleet-lock + pm2 CLI status 与 ownership-gated 变更路径不兼容
+// （mutationFromArgs 不接受 status），故保留 PR 版。
+function cmdStatus(): void {
+  const readonly = linuxReadonlyPm2Available();
+  if (!readonly.available) {
+    console.log('daemon 未在运行。');
+    return;
   }
+  warnIfLegacyBotmuxAlive();
+  printReadonlyPm2Status({
+    pkgRoot: PKG_ROOT,
+    home: PM2_HOME,
+    expectedGod: readonly.expectedGod,
+  });
 }
 
 function cmdUpgrade(): void {
@@ -7387,8 +7748,13 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。
     按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；
     纯记录/低优先级进度/简短确认→--no-mention；没信息量的"收到"不如不发。
+    Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成
+    正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
   bots list                            列出当前群聊中的机器人（含 open_id）
+  bots invite --chat <chatId> --team <id> --agent <appId>...
+                                       往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
+                                       详见 \`botmux bots invite --help\`
   history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文；
@@ -10858,8 +11224,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
                         派单前按双方 receiver 视角建立并回读 talk-only exact chatGrant，
                         发送后等待目标 session 接单确认；不支持 --repo 管理命令
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
-  --brief <text>        子项目简报 / 追加内容
+  --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
+  --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
@@ -10879,6 +11246,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const repo = argValue(rest, '--repo');
   const intoRoot = argValue(rest, '--into');
   const standby = rest.includes('--standby');
+  const steer = rest.includes('--steer');
   const botSpecs = argValues(rest, '--bot');
   const botAppSpecs = argValues(rest, '--bot-app');
 
@@ -10901,6 +11269,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--standby 与 --into 不能同用。');
     process.exit(1);
   }
+  if (standby && steer) {
+    console.error('--standby 与 --steer 不能同用（待命模式没有简报可调整当前 turn）。');
+    process.exit(1);
+  }
   if (botAppSpecs.length > 0 && repo) {
     console.error('--bot-app 仅自动建立 talk-only chatGrant，不能授权 /repo 管理命令；请使用驻守 Bot 的默认工作目录，或另走显式 operate 信任链路。');
     process.exit(1);
@@ -10909,6 +11281,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
     process.exit(1);
   }
+  if (steer) brief = withBotSteerDirective(brief);
   if (!intoRoot && !title.trim()) {
     console.error('新开话题需要 --title。往已有话题追加请用 --into <root_id>。');
     process.exit(1);
@@ -12663,6 +13036,22 @@ async function cmdUserPromptHook(): Promise<void> {
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
+  if (sub === '--help' || sub === '-h' || sub === 'help') {
+    console.log(`
+botmux bots — 机器人协作花名册 / 团队补人
+
+子命令:
+  bots list [--scope chat|team] [--team <id>] [--session-id ID]
+             列出机器人。默认 chat scope：当前飞书群内的 bot（含 open_id、能力标签、能否可靠 @到）；
+             --scope team：跨机列出同团队、已 opt-in 的 agent（按专长发现，供拉群 / 补人）。
+  bots invite --chat <chatId> --team <id> --agent <appId>...
+             往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进。
+
+补人（invite）的完整参数与 403 前置条件见 \`botmux bots invite --help\`。
+`);
+    return;
+  }
+
   // `bots invite`：往**已存在的团队群**补人（同 team、已 opt-in 的 agent + 各自 owner），
   // 打平台端点4（machine-auth）。独立子命令——与「建新群」的 create-group 语义分开，
   // 不再靠 create-group --chat 区分（那个入口易被误读成"建群"）。在会话/transport 闸门前分流。
@@ -12674,6 +13063,7 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   if (sub !== 'list' && sub !== 'ls' && sub !== '') {
     console.error('用法: botmux bots list [--scope chat|team] [--team <id>] [--session-id ID]');
     console.error('      botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
+    console.error('（完整说明见 botmux bots --help）');
     process.exit(1);
   }
 
@@ -12869,6 +13259,48 @@ async function tryAutoAddPlatformBot(
  * {ok, chatId, invalidBotIds, invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
  */
 async function cmdBotsInvite(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`
+botmux bots invite — 往「已存在的团队群」补人（同团队、已 opt-in 的 agent + 各自 owner）
+
+用法:
+  botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+                     [--json-status]
+
+参数:
+  --chat <chatId>  必填。目标群 chatId（oc_...）。须满足下列前置条件（否则平台按 403 拒绝，见下）。
+  --team <teamId>  团队 id。省略时：本机唯一团队自动用它，多个团队要求显式指定（不猜）。
+  --agent <appId>  至少一个、可多次、按 appId 去重。appId 从 \`botmux bots list --scope team\` 发现。
+  --json-status    可选；在 stdout 单行 chatId 后追加一行 {ok, chatId, invalidBotIds,
+                   invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
+
+行为:
+  - 全程 machine-auth，只认 appId、不需要 @（发起人在别人 bot 进群前根本 @不到它）。
+  - 补人恒把 agent + 各自 owner 一起拉进群；已在群内视作成功（幂等）。
+  - 授权 / opt-in 闸 / 大厅排除全在平台，CLI 零判断、只如实展示平台判定。
+  - 平台机器人（BotmuxPlatform）不在目标群时，会自动用群内本机 bot 当代理把它拉进群再重试；
+    自动添加失败（需群主审批 / 代理 bot 无成员管理 scope）时给出手动添加引导。
+
+前置条件（不满足平台按 403 拒绝，平台按 error code 分型）:
+  - 平台机器人（BotmuxPlatform）已在群里     → 否则 platform_bot_not_in_chat（先把它拉进群）
+  - 你本人已在该群                          → 否则 requester_not_in_chat（只能往你自己在场的群补人）
+  - 非机器人大厅                            → 否则 chat_is_hall（大厅是 bot-only 身份登记群）
+  - 每个 --agent 都已 opt-in 进该团队        → 否则 not_in_team_bots（其 owner 需在平台「管理机器人」把它加进团队；
+                                              提示会点出具体被拒的 agent，部分失败也会在 invalidBotIds 里列出）
+
+与相邻命令的区别（别混）:
+  - create-group --team：把同团队、已 opt-in 的别人机器上的 agent + 各自 owner 新建成一个聚焦新群。
+  - bots invite --chat：群已经在了、且平台机器人也在，往里补同团队的人（含各自 owner）。
+  - /invite（飞书群内 slash）：把 bot 加进当前群，走飞书原生加成员，限同租户；命令本身只拉 bot，
+    owner 由被拉 bot 的 daemon 在入群事件里补拉（默认开启，可 per-bot 关，且需其 daemon 在线）——
+    区别于本命令/create-group 由平台原子带上 owner（不依赖对方 daemon 在线）。
+
+输出:
+  - 成功 stdout 输出单行 chatId（与 create-group 一致）；失败 / 部分失败 stderr 打提示并非零退出。
+`);
+    return;
+  }
+
   const { addTeamGroupMembers, fetchTeams, describeTeamAgentsFailure, rateLimitRetryHint, shouldTryAutoAddPlatformBot } =
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
@@ -13495,7 +13927,7 @@ async function reconcilePluginServicesForCli(
   options: { autoOnly?: boolean } = {},
 ): Promise<void> {
   const { startPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await startPluginServices(pluginIds, options);
+  const reports = await startPluginServices(pluginIds, { autoOnly: options.autoOnly });
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -13507,7 +13939,7 @@ async function stopPluginServicesForCli(
   options: { autoOnly?: boolean } = {},
 ): Promise<import('./core/plugins/service-manager.js').PluginServiceReport[]> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await stopPluginServices(pluginIds, options);
+  const reports = await stopPluginServices(pluginIds, { autoOnly: options.autoOnly });
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -14073,14 +14505,14 @@ switch (command) {
     else await cmdSetup();
     break;
   }
-  case 'start':   await cmdStart(); break;
+  case 'start':   await runPm2LifecycleCliCommand(() => cmdStart()); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
-  case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
-  case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
-  case 'stop':    await cmdStop(); break;
-  case 'restart': await cmdRestart(); break;
-  case 'logs':    await cmdLogs(); break;
-  case 'status':  await cmdStatus(); break;
+  case 'start-bot': await runPm2LifecycleCliCommand(() => cmdStartBot(process.argv.slice(3))); break;
+  case 'stop-bot': await runPm2LifecycleCliCommand(() => cmdStopBot(process.argv.slice(3))); break;
+  case 'stop':    await runPm2LifecycleCliCommand(() => cmdStop()); break;
+  case 'restart': await runPm2LifecycleCliCommand(() => cmdRestart()); break;
+  case 'logs':    await runPm2LifecycleCliCommand(() => cmdLogs()); break;
+  case 'status':  await runPm2LifecycleCliCommand(() => cmdStatus()); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
@@ -14309,7 +14741,7 @@ switch (command) {
     break;
   }
   case 'plugin':
-  case 'plugins':  await cmdPlugin(process.argv.slice(3)); break;
+  case 'plugins':  await runPm2LifecycleCliCommand(() => cmdPlugin(process.argv.slice(3))); break;
   case 'whiteboard':
   case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {
@@ -14325,13 +14757,15 @@ switch (command) {
     break;
   }
   case 'autostart': {
-    ensureConfigDir();
-    const sub = process.argv[3] ?? 'status';
-    const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
-    if (sub === 'enable' || sub === 'install') enableAutostart(opts);
-    else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
-    else if (sub === 'status') autostartStatus(opts);
-    else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    await runPm2LifecycleCliCommand(() => {
+      ensureConfigDir();
+      const sub = process.argv[3] ?? 'status';
+      const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+      if (sub === 'enable' || sub === 'install') enableAutostart(opts);
+      else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
+      else if (sub === 'status') autostartStatus(opts);
+      else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    });
     break;
   }
   default:

@@ -1,0 +1,15 @@
+---
+source: openai/codex codex-rs/tui/src/startup_hooks_review.rs
+snapshot: codex_tui__startup_hooks_review__tests__startup_hooks_review_prompt.snap
+ref: rust-v0.147.0
+---
+
+  Hooks need review
+  2 hooks are new or changed.
+  Hooks can run outside the sandbox after you trust them.
+
+› 1. Review hooks
+  2. Trust all and continue
+  3. Continue without trusting (hooks won't run)
+
+  Press enter to confirm or esc to go back

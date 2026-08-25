@@ -78,6 +78,19 @@ describe('TmuxBackend.probeSession', () => {
     expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
   });
 
+  it('returns "unknown" when the deadline raced a clean exit (ETIMEDOUT + numeric status) — 2026-08-23 regression', () => {
+    // Under heavy load the probe client can finish and exit cleanly in the
+    // same window the exec deadline fires; Node attaches BOTH the numeric
+    // status and the ETIMEDOUT error. A deadline is never an authoritative
+    // server answer — reading this shape as 'missing' fed destructive
+    // liveness/kill-verify counters during the 08-23 restart storm.
+    bothThrow(
+      { code: 'ETIMEDOUT', status: 1, signal: null, stderr: Buffer.from('') },
+      { code: 'ETIMEDOUT', status: 1, signal: null, stderr: Buffer.from('') },
+    );
+    expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
+  });
+
   it('returns "unknown" on a clean CONNECTION-level failure (server stall ⇒ instant ECONNREFUSED), NOT "missing"', () => {
     // Linux fails unix-socket connect() with an instant clean ECONNREFUSED when
     // the shared server's accept backlog overflows — the client never reached

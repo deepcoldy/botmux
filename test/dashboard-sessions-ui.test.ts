@@ -334,6 +334,17 @@ describe('dashboard sessions filters', () => {
     expect(page).not.toContain('botTriggeredTopics: event.currentTarget.checked');
   });
 
+  it('sends the control CSRF ticket on the session /locate POST', () => {
+    // 服务端只对 locate 这一个会话动作强制校验 P1-11 CSRF 票据（dashboard.ts 的
+    // enforceControlCsrf），旧会话页这条 fetch 曾漏带头，导致点「定位话题」稳定
+    // 403 control_csrf_invalid。回归守卫：locate 必须走 controlCsrfHeaders()。
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    expect(page).toContain("import { controlCsrfHeaders } from './control-csrf.js';");
+    const locateCall = page.match(/fetch\(`\/api\/sessions\/\$\{encodeURIComponent\(row\.sessionId\)\}\/locate`[^;]*/);
+    expect(locateCall, 'locate fetch call not found').not.toBeNull();
+    expect(locateCall![0]).toContain('headers: controlCsrfHeaders()');
+  });
+
   it('groups thread sessions by chat and root message without claiming ancestry', () => {
     const rows = [
       {

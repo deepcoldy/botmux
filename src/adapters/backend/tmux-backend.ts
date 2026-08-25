@@ -59,6 +59,29 @@ export function isTmuxServerLevelErrorText(stderrText: string): boolean {
 }
 
 /**
+ * True when a thrown exec*Sync error represents the caller's own `timeout`
+ * deadline firing — regardless of the exit-status shape Node attached.
+ *
+ * Node reports a spawnSync timeout as `error.code === 'ETIMEDOUT'` while ALSO
+ * reporting whatever the child managed to do around the kill. Normally the
+ * child dies from the kill signal (`status: null, signal: 'SIGTERM'`), but
+ * under heavy load the client can complete and exit cleanly in the same window
+ * the deadline fires — the throw then carries `status: 0/1, signal: null` PLUS
+ * the ETIMEDOUT error. 2026-08-23: exactly that shape escaped every
+ * "clean numeric exit ⇒ the server answered deterministically" classifier
+ * during a post-outage mass cold-restart (261 sessions rebuilt in ~40s after
+ * the shared server died): `new-session` had actually succeeded server-side,
+ * but the launch was classified as a deterministic rejection, not retried, and
+ * the worker died user-visibly ("会话启动失败: spawnSync tmux ETIMEDOUT").
+ *
+ * A deadline is NEVER an authoritative server answer. Every tmux classifier
+ * must check this BEFORE any status-shape branch.
+ */
+export function isExecTimeoutError(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null | undefined)?.code === 'ETIMEDOUT';
+}
+
+/**
  * TmuxBackend — session backend using tmux for process persistence.
  *
  * Architecture: pty-under-tmux.
@@ -160,6 +183,10 @@ export class TmuxBackend implements SessionBackend {
       });
       return 'exists';
     } catch (e: any) {
+      // Deadline first: a timed-out client can surface a clean numeric exit
+      // when its completion races the kill (see isExecTimeoutError) — that is
+      // still "no answer", never an authoritative 'missing'.
+      if (isExecTimeoutError(e)) return 'unknown';
       if (e && typeof e.status === 'number' && !e.signal) {
         const stderrText = (e.stderr?.toString?.() ?? '').trim();
         if (isTmuxServerLevelErrorText(stderrText)) return 'unknown';

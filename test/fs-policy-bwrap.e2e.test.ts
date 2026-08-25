@@ -238,14 +238,21 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       const sessionsRoot = join(agentRoot, 'sessions');
       const own = ompSessionDir('self');
       const sibling = join(sessionsRoot, 'botmux/sibling');
+      const legacy = join(sessionsRoot, '-legacy-project');
       const terminalSessions = join(agentRoot, 'terminal-sessions');
       const siblingTranscript = join(sibling, 'secret.jsonl');
+      const legacyTranscript = join(legacy, 'legacy.jsonl');
+      const migratedTranscript = join(own, 'migrated.jsonl');
       const breadcrumb = join(terminalSessions, 'pane');
       expect(own).toBe(join(sessionsRoot, 'botmux/self'));
-      const adapterArgs = createOhMyPiAdapter('/usr/bin/omp').buildArgs({ sessionId: 'self', resume: false });
-      expect(adapterArgs[adapterArgs.indexOf('--session-dir') + 1]).toBe(own);
-
       mkdirSync(own, { recursive: true });
+      mkdirSync(legacy, { recursive: true });
+      writeFileSync(legacyTranscript, 'LEGACY_SECRET');
+      writeFileSync(migratedTranscript, 'MIGRATED_EXACT');
+      const adapterArgs = createOhMyPiAdapter('/usr/bin/omp').buildArgs({ sessionId: 'self', resume: true });
+      expect(adapterArgs[adapterArgs.indexOf('--session-dir') + 1]).toBe(own);
+      expect(adapterArgs[adapterArgs.indexOf('--resume') + 1]).toBe(migratedTranscript);
+
       mkdirSync(sibling, { recursive: true });
       mkdirSync(terminalSessions, { recursive: true });
       writeFileSync(join(agentRoot, 'agent.db'), 'state');
@@ -262,6 +269,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
 
       expect(run(args, `printf updated >> ${JSON.stringify(join(agentRoot, 'agent.db'))}`).status).toBe(0);
       expect(readFileSync(join(agentRoot, 'agent.db'), 'utf8')).toContain('updated');
+      expect(run(args, `cat ${JSON.stringify(migratedTranscript)}`).out).toContain('MIGRATED_EXACT');
       expect(run(args, `printf own > ${JSON.stringify(join(own, 'new.jsonl'))}`).status).toBe(0);
       expect(readFileSync(join(own, 'new.jsonl'), 'utf8')).toBe('own');
 
@@ -271,6 +279,9 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       const siblingRead = run(args, `cat ${JSON.stringify(siblingTranscript)}`);
       expect(siblingRead.status).not.toBe(0);
       expect(siblingRead.out).not.toContain('SIBLING_SECRET');
+      const legacyRead = run(args, `cat ${JSON.stringify(legacyTranscript)}`);
+      expect(legacyRead.status).not.toBe(0);
+      expect(legacyRead.out).not.toContain('LEGACY_SECRET');
 
       const other = join(sessionsRoot, 'botmux/other');
       expect(run(args, `mkdir ${JSON.stringify(other)}`).status).not.toBe(0);

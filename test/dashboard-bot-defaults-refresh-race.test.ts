@@ -1,6 +1,20 @@
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
+
+// The session-group-tag auth overlay renders through `createPortal(…, document.body)`
+// (bot-defaults-page.tsx) so it escapes the animated `.page` containing block in the
+// real dashboard. react-test-renderer has no DOM host, so a real portal's children are
+// NOT placed in the renderer tree and `renderer.root.findByProps` can't see the paste
+// input / cancel / complete controls. Render portal children inline here so the overlay
+// stays discoverable; production keeps its real createPortal behavior untouched. Only
+// createPortal is overridden — everything else in react-dom (which react-test-renderer
+// depends on) passes through.
+vi.mock('react-dom', async (importActual) => {
+  const actual = await importActual<typeof import('react-dom')>();
+  return { ...actual, createPortal: (children: React.ReactNode) => children };
+});
+
 import { createRefreshGate } from '../src/dashboard/web/bot-defaults.js';
 import { SessionGroupTagRow } from '../src/dashboard/web/bot-defaults-page.js';
 
@@ -111,6 +125,21 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  // The auth overlay renders only when `authUrl && typeof document !== 'undefined'`
+  // and, once open, a modal effect attaches document-level listeners (scroll/keydown).
+  // react-test-renderer has no DOM, so without a document stub the overlay's
+  // `typeof document` guard short-circuits to null (paste input never appears) and,
+  // once past it, `document.addEventListener` throws. Provide the minimum surface the
+  // portaled overlay touches; createPortal itself is rendered inline via the top-level
+  // react-dom mock. unstubAllGlobals in afterEach clears this between tests.
+  beforeEach(() => {
+    vi.stubGlobal('document', {
+      body: {},
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
   });
 
   it('drops a slow saveMode response from the previous bot instead of overwriting the new row', async () => {

@@ -56,6 +56,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(),
   getBotBrand: vi.fn(() => undefined),
   resolveBrandLabel: vi.fn(() => undefined),
+  // Bot admin (first resolved human allowedUser) — the failure-notice fallback
+  // @ target. Tests that exercise turnFailed override this per case.
+  getOwnerOpenId: vi.fn(() => undefined),
   // Reply-card footer usage only renders in 'footer' mode; tests override this
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
@@ -123,7 +126,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getOwnerOpenId, resolveUsageDisplay } from '../src/bot-registry.js';
 import {
   clearMessageListenerRunPreviewStore,
   createMessageListenerRunPreview,
@@ -300,6 +303,46 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {
+    // Bot-to-bot dispatched sessions are ownerless: a model-gateway failure
+    // card would otherwise ping nobody and scroll by silently.
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_failed_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); // no session.ownerOpenId → no footer recipient
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_admin_human></at>');
+  });
+
+  it('turnFailed final_output with a human footer recipient does NOT add the admin fallback mention', async () => {
+    // The owner is already addressed by the card footer's <at>; a second
+    // body mention would double-ping.
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_failed_owner_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_session_owner';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    const sent = String(sessionReply.mock.calls[0][1]);
+    expect(sent).not.toContain('ou_admin_human');
+    expect(sent).toContain('<at id=ou_session_owner></at>');
+  });
+
+  it('ordinary (non-failed) final_output never adds the admin fallback mention', async () => {
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_ok_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_admin_human');
   });
 
   it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {

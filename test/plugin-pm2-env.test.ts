@@ -5,10 +5,24 @@ import { join } from 'node:path';
 
 const childProcess = vi.hoisted(() => ({
   spawnSync: vi.fn(),
+  ownershipProcesses: [
+    { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'fixture-birth' },
+  ] as Array<{ pid: number; cgroup: string; startIdentity: string }>,
 }));
 
 vi.mock('node:child_process', () => ({
   spawnSync: childProcess.spawnSync,
+}));
+
+vi.mock('../src/core/pm2-lifecycle-owner.js', () => ({
+  describeExternalPm2Owner: () => '',
+  inspectLinuxPm2Command: () => ({
+    ownership: {
+      kind: 'owned',
+      processes: childProcess.ownershipProcesses,
+    },
+    plan: { kind: 'direct' },
+  }),
 }));
 
 describe('plugin PM2 environment', () => {
@@ -18,8 +32,17 @@ describe('plugin PM2 environment', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-pm2-env-'));
     vi.stubEnv('HOME', home);
     vi.stubEnv('kill_timeout', '3500');
+    // The test runner itself may run under a PM2-managed daemon, which sets
+    // PM2_USAGE/PM2_SILENT in its env. pm2Env spreads process.env, so these
+    // would ride into the spawned helper and fail the absence assertions —
+    // clear them so the test is environment-independent.
+    delete process.env.PM2_USAGE;
+    delete process.env.PM2_SILENT;
     vi.resetModules();
     childProcess.spawnSync.mockReset();
+    childProcess.ownershipProcesses = [
+      { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'fixture-birth' },
+    ];
     childProcess.spawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
   });
 
@@ -41,6 +64,8 @@ describe('plugin PM2 environment', () => {
     expect(options.env.kill_timeout).toBeUndefined();
     expect(options.env.PLUGIN_VALUE).toBe('preserved');
     expect(options.env.PM2_HOME).toBe(join(home, '.botmux', 'pm2'));
+    expect(options.env.PM2_SILENT).toBeUndefined();
+    expect(options.env.PM2_USAGE).toBeUndefined();
   });
 
   it('does not leak the daemon PM2 graceful-exit sentinel into plugin PM2 apps', async () => {
@@ -60,6 +85,18 @@ describe('plugin PM2 environment', () => {
     expect(options.env[PM2_GRACEFUL_EXIT_CODE_ENV]).toBeUndefined();
   });
 
+  it('refuses a mutation when multiple service-owned Gods share the plugin home', async () => {
+    childProcess.ownershipProcesses = [
+      { pid: 123, cgroup: '/user.slice/botmux.service', startIdentity: 'birth-a' },
+      { pid: 456, cgroup: '/user.slice/botmux.service', startIdentity: 'birth-b' },
+    ];
+    vi.resetModules();
+    const { runPluginPm2 } = await import('../src/core/plugins/pm2.js');
+
+    expect(() => runPluginPm2(['start', 'fixture'], { inherit: false }))
+      .toThrow(/exactly one.*123, 456/);
+    expect(childProcess.spawnSync).not.toHaveBeenCalled();
+  });
   it('does not leak the Dashboard Feishu H5 login family into plugin PM2 apps', async () => {
     // Plugin services are started/stopped in-process by the DASHBOARD, the one
     // machine-wide holder of BOTMUX_DASHBOARD_FEISHU_H5_* (APP_SECRET can mint

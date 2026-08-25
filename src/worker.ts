@@ -157,6 +157,7 @@ import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
+  TERMINAL_PLATFORM_READONLY_HINT_HEADER,
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
 import {
@@ -189,7 +190,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -266,6 +267,7 @@ import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionId
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
+import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -334,7 +336,11 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxVersion } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
-import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
+import {
+  StuckDetector,
+  matchHookReviewScreen,
+  shouldHoldInputForHookReview,
+} from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
@@ -2091,7 +2097,7 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', mojo: 'Mojo' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
@@ -2206,6 +2212,37 @@ let readyPatternSeenDuringHold = false;
 let awaitingPostSessionStartPromptEvidence = false;
 /** Scoped marker set only by IdleDetector's screen-driven callback. */
 let postSessionStartPromptEvidenceInFlight = false;
+/** A visible Codex Hook-review screen owns Enter/arrow keys. Keep queued IM
+ * input out of that menu so an automated submit cannot accidentally select
+ * “Trust all” or get consumed as menu navigation. */
+let hookReviewInputHold = false;
+let hookReviewInputHoldNotified = false;
+
+function refreshHookReviewInputHold(snapshot: string): void {
+  if (!snapshot.trim()) return;
+  const blocked = shouldHoldInputForHookReview(snapshot);
+  if (blocked === hookReviewInputHold) return;
+  hookReviewInputHold = blocked;
+  if (blocked) {
+    log('Hook review menu visible — holding queued input until the menu is resolved');
+    return;
+  }
+  hookReviewInputHoldNotified = false;
+  log('Hook review menu cleared — releasing queued input');
+  if (hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
+}
+
+function notifyHookReviewInputHold(): void {
+  if (hookReviewInputHoldNotified) return;
+  hookReviewInputHoldNotified = true;
+  send({
+    type: 'user_notify',
+    turnId: currentBotmuxTurnId,
+    message:
+      '⚠️ Codex 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，'
+      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。',
+  });
+}
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
  *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
@@ -2461,6 +2498,16 @@ let pendingSessionRename: string | null = null;
 let nativeSessionTitleSyncInFlight: string | undefined;
 let nativeSessionTitleAppliedThreadId: string | undefined;
 let nativeSessionTitleRevision = 0;
+
+/** Every user-controlled input class that flushPending can deliver. Keep this
+ * shared with review-menu release handling so a queued raw command, adopt
+ * message, or native rename is not stranded after the menu disappears. */
+function hasPendingInputForFlush(): boolean {
+  return pendingMessages.length > 0
+    || pendingAdoptMessages.length > 0
+    || pendingRawInputs.length > 0
+    || pendingSessionRename !== null;
+}
 let nativeSessionTitleResumeUpdatedAt: number | undefined;
 let nativeSessionTitleCurrentGenerationResume = false;
 const nativeSessionTitleSyncAbortControllers = new Set<AbortController>();
@@ -4242,7 +4289,9 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
       ? 'worker.empty_final_failed_auth'
       : errorCode === CODEX_CONNECTION_ERROR_CODE
         ? 'worker.empty_final_failed_connection'
-        : 'worker.empty_final_failed';
+        : errorCode === CODEX_UPSTREAM_ERROR_CODE
+          ? 'worker.empty_final_failed_upstream'
+          : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
   const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
   return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
@@ -7210,6 +7259,10 @@ function emitReadyCodexTurns(): void {
       lastUuid: turn.turnId,
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      // Failure-fallback notice (not a model answer): lets the daemon add a
+      // human @mention so e.g. a model-gateway outage doesn't scroll by
+      // silently in bot-to-bot sessions.
+      ...(fallbackKind === 'failed' ? { turnFailed: true } : {}),
     });
   }
   for (const turn of ready) {
@@ -9661,6 +9714,7 @@ function onPtyData(data: string): void {
     }
   }
   renderer?.write(data);
+  refreshHookReviewInputHold(`${renderer?.rawSnapshot() ?? ''}\n${data}`);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
   // no relay needed. In non-tmux mode AND in pipe mode (adopt-bridge),
@@ -9771,6 +9825,7 @@ async function onBackendScreenResync(snapshot: string): Promise<void> {
   // current viewport: a prior local attach may have changed the real geometry.
   const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
   lastAnalyzerSnapshot = visibleSnapshot;
+  refreshHookReviewInputHold(visibleSnapshot);
 
   // ZMX history does not carry the authoritative current PTY dimensions. A
   // local `zmx attach` can resize the session below our default 120x24 and that
@@ -10675,7 +10730,7 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
-  if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
+  if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   // 注入进行中不得并发写 PTY（用户消息留在 pendingMessages，注入完成后的下一次
@@ -10688,6 +10743,14 @@ async function flushPending(): Promise<void> {
   // flushPendingInjections 消费完 barrier 后由其 finally 的 re-kick 排空。
   if (shouldDeferUserFlush(pendingInjections)) return;
   if (bareShellLaunchBlocked) return;  // launch is held at a bare shell — don't type prompts into it
+  // A Hook-review page has an active selection and consumes Enter/arrow keys.
+  // Re-check the rendered viewport right before a literal write; PTY chunks
+  // can arrive between idle detection and this queue drain.
+  refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+  if (hookReviewInputHold) {
+    notifyHookReviewInputHold();
+    return;
+  }
   // Screen-idle is not a durable receipt. A permission/AskUser prompt can look
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
@@ -12294,7 +12357,16 @@ async function spawnCli(
     return;
   }
 
-  cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
+  // dsh runtime variant: when the bot selected dsh-tui (dshRuntime='tui'),
+  // resolve the PTY-driven dsh-tui adapter instead of the headless JSON-RPC
+  // runner. The bot's cliId stays 'dsh' (the toggle is a per-bot config field),
+  // so every other dsh-specific branch (OSC decode, turn timeout, etc.) is
+  // unaffected — dsh-tui simply doesn't emit OSC frames, making the decoder a
+  // no-op for it.
+  const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
+    ? 'dsh-tui'
+    : cfg.cliId as CliId;
+  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
   // worker re-probes the requested persistent backend here. A requested
@@ -13247,6 +13319,8 @@ async function spawnCli(
   bareShellLaunchBlocked = false;
   bareShellChecked = false;
   bareShellCheckInProgress = false;
+  hookReviewInputHold = false;
+  hookReviewInputHoldNotified = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 0 (adapter capability): adapters whose buildArgs can only resume a
@@ -13289,6 +13363,27 @@ async function spawnCli(
       // Preserve the existing fail-safe: the adapter probe / two-tier fallback
       // below still decides whether resume is possible.
       log(`WARN Claude resume transcript sync failed: ${(err as Error).message}`);
+    }
+  }
+  // Pre-exact-dir OMP versions stored transcripts in cwd-derived shared
+  // buckets. Only a cold, non-adopt resume may copy one uniquely attributable
+  // legacy JSONL into the exact effective-id directory. The adapter probe below
+  // intentionally stays synchronous and pure: it only decides whether this
+  // preflight published an exact resume target.
+  if (cfg.cliId === 'oh-my-pi' && effectiveResume && !willReattachPersistent && !cfg.adoptMode) {
+    const exactOmpSessionDir = ompSessionDir(effectiveAdapterSessionId);
+    const migrated = migrateLegacyOmpSession(
+      effectiveAdapterSessionId,
+      cfg.workingDir,
+      exactOmpSessionDir,
+    );
+    if (migrated.status === 'migrated') {
+      log(`OMP legacy resume transcript migrated: ${migrated.sourcePath} → ${migrated.targetPath}`);
+      if (migrated.artifactDirectoryPreserved) {
+        log(`OMP legacy artifact directory preserved outside sandbox: ${migrated.sourcePath.slice(0, -'.jsonl'.length)}`);
+      }
+    } else if (migrated.reason !== 'no-match' && migrated.reason !== 'exact-history-exists') {
+      log(`WARN OMP legacy resume migration skipped (${migrated.reason}${migrated.detail ? `: ${migrated.detail}` : ''})`);
     }
   }
   // Hermes stores sessions in a SQLite state.db (not cwd-scoped JSONL). Resolve
@@ -16038,6 +16133,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         res.end('Forbidden');
         return;
       }
+      // #933 回归修复：平台注入的 Cookie/Role 会被中央前门剥掉（P1-6 / 内部 grant），
+      // 此时 platformReadonly 判不出来；前门改用这个展示层提示头把「平台认证过的只读
+      // 访客」这一事实带过来。只影响只读页渲染哪条横幅（SSO 登录引导 vs 纯只读提示），
+      // 不参与任何授权判定——hasRead/hasWrite 在它之前就已定死。
+      const platformReadonlyHint = !hasWrite
+        && req.headers[TERMINAL_PLATFORM_READONLY_HINT_HEADER] !== undefined;
       const loginHdr = req.headers['x-botmux-login-url'];
       // The central front proxy only injects X-Botmux-Login-Url on the SPA 401
       // path, never on `/s/` terminal requests — so a read-only web terminal
@@ -16078,7 +16179,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
+      res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
     wss = new WebSocketServer({
@@ -18239,12 +18340,22 @@ process.on('message', async (raw: unknown) => {
       // shell。bareShellCheckInProgress 覆盖“检查进行中”、bareShellLaunchBlocked
       // 覆盖“仍停在裸 shell 的安全 hold”两种状态，一并入队；若该进程随后出现
       // 真实 PTY prompt 且 leaf 已变为非 shell，markPromptReady 会恢复排空。
+      // Hook-review menus are another direct-write hazard: raw_input normally
+      // preserves busy delivery, but its Enter/arrow sequence must never drive
+      // the menu's current selection.
+      refreshHookReviewInputHold(lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
-        || bareShellCheckInProgress || bareShellLaunchBlocked) {
+        || bareShellCheckInProgress || bareShellLaunchBlocked
+        || hookReviewInputHold) {
         freshnessInputQueue.enqueueRaw(msg);
-        log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
+        if (hookReviewInputHold) {
+          notifyHookReviewInputHold();
+          log(`Deferred passthrough slash command while Hook review is visible: ${msg.content}`);
+        } else {
+          log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
+        }
       } else {
         await deliverRawInput(msg);
       }

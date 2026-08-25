@@ -3,9 +3,11 @@
  *
  * TRAE is a Codex-family CLI, but its terminal event is NOT byte-identical to
  * upstream Codex:
- *   - genuine user input is confirmed by event_msg `user_message`; TRAE also
- *     writes internal runtime injections as response_item role=user messages,
- *     so those records alone are not user-attribution evidence;
+ *   - genuine user input is confirmed by event_msg `user_message` or, in
+ *     TraeX 0.201.4 rollout dialect, event_msg `item_completed` with a
+ *     `UserMessage` item; TRAE also writes internal runtime injections as
+ *     response_item role=user messages, so those records alone are not
+ *     user-attribution evidence;
  *   - assistant response_item messages have no `phase` and are emitted many
  *     times during tool use, so none of them is a safe turn boundary;
  *   - event_msg `task_complete` is the durable end-of-turn marker and carries
@@ -34,6 +36,7 @@ import {
   statSync,
 } from 'node:fs';
 import { execSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -51,7 +54,7 @@ import {
 } from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
-import { traeSessionsRoot } from './traex-paths.js';
+import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -85,6 +88,45 @@ export interface TraexRuntimeSnapshot {
 
 const IS_LINUX = platform() === 'linux';
 const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+type DatabaseSyncLike = {
+  prepare(sql: string): StatementSyncLike;
+  close(): void;
+};
+type StatementSyncLike = {
+  all(...params: unknown[]): any[];
+};
+
+let sqliteModule: { DatabaseSync: new (path: string) => DatabaseSyncLike } | null = null;
+let sqliteLoadAttempted = false;
+
+function loadSqlite(): typeof sqliteModule {
+  if (sqliteLoadAttempted) return sqliteModule;
+  sqliteLoadAttempted = true;
+  try {
+    const req = createRequire(import.meta.url);
+    sqliteModule = req('node:sqlite') as typeof sqliteModule;
+  } catch {
+    sqliteModule = null;
+  }
+  return sqliteModule;
+}
+
+function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
+  const mod = loadSqlite();
+  if (!mod) return null;
+  const dbPath = traeStateDbPath();
+  if (!existsSync(dbPath)) return null;
+  let db: DatabaseSyncLike | undefined;
+  try {
+    db = new mod.DatabaseSync(dbPath);
+    return fn(db);
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
 
 type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';
 
@@ -120,6 +162,48 @@ interface TraexPendingAgentMessages {
 
 const traexPendingAgentCache = new Map<string, TraexPendingAgentMessages>();
 const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
+
+/** New and legacy user event dialects can mirror one another in the same
+ * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
+ * identical prompts in distinct turns must remain distinct local turns. */
+const traexSeenUserTurns = new Map<string, Set<string>>();
+const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
+const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
+
+function claimTraexUserTurn(path: string, turnId: unknown): boolean {
+  if (typeof turnId !== 'string' || turnId.length === 0) return true;
+  let seen = traexSeenUserTurns.get(path);
+  if (!seen) {
+    seen = new Set<string>();
+    traexSeenUserTurns.set(path, seen);
+    if (traexSeenUserTurns.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+      const oldestPath = traexSeenUserTurns.keys().next().value;
+      if (oldestPath) traexSeenUserTurns.delete(oldestPath);
+    }
+  }
+  if (seen.has(turnId)) return false;
+  seen.add(turnId);
+  if (seen.size > TRAEX_SEEN_USER_TURNS_PER_PATH_MAX) {
+    const oldestTurnId = seen.keys().next().value;
+    if (oldestTurnId) seen.delete(oldestTurnId);
+  }
+  return true;
+}
+
+function itemCompletedUserText(item: unknown): string {
+  if (!item || typeof item !== 'object') return '';
+  const record = item as { type?: unknown; content?: unknown };
+  if (record.type !== 'UserMessage' || !Array.isArray(record.content)) return '';
+  const parts: string[] = [];
+  for (const block of record.content) {
+    if (!block || typeof block !== 'object') continue;
+    const textBlock = block as { type?: unknown; text?: unknown };
+    if (textBlock.type === 'text' && typeof textBlock.text === 'string') {
+      parts.push(textBlock.text);
+    }
+  }
+  return parts.join('');
+}
 
 function traexPendingAgentState(path: string): TraexPendingAgentMessages {
   let state = traexPendingAgentCache.get(path);
@@ -228,6 +312,16 @@ export function drainTraexRollout(
   const sourceSessionId = codexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  const seenUserTurns = new Set<string>();
+  const legacyUserIndexesWithoutTurnId = new Map<string, number>();
+  const claimUserTurn = (turnId: unknown): boolean => {
+    if (typeof turnId !== 'string' || turnId.length === 0) return true;
+    if (seenUserTurns.has(turnId)) return false;
+    seenUserTurns.add(turnId);
+    // Probes must not consume the persistent de-duplication claim that the
+    // production drainer needs when it observes this same record later.
+    return probe || claimTraexUserTurn(path, turnId);
+  };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
   let cursor = start;
@@ -254,7 +348,33 @@ export function drainTraexRollout(
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
       const userText = payload.message;
-      if (userText) {
+      if (userText && claimUserTurn(payload.turn_id)) {
+        events.push({ ...base, kind: 'user', text: userText });
+        if (typeof payload.turn_id !== 'string' || payload.turn_id.length === 0) {
+          legacyUserIndexesWithoutTurnId.set(userText, events.length - 1);
+        }
+        // New turn: drop any agent_message state an unterminated predecessor
+        // left behind so it can't be attributed to this turn.
+        if (!probe) traexPendingAgentCache.delete(path);
+      }
+      continue;
+    }
+    if (obj.type === 'event_msg'
+      && payload.type === 'item_completed') {
+      const userText = itemCompletedUserText(payload.item);
+      if (userText && claimUserTurn(payload.turn_id)) {
+        // Legacy user_message records did not always carry a turn id. When
+        // the same drain also contains their 0.201.4 UserMessage mirror,
+        // replace the uncorrelatable legacy event with the turn-addressable
+        // item_completed event instead of starting two local turns.
+        const legacyIndex = legacyUserIndexesWithoutTurnId.get(userText);
+        if (legacyIndex !== undefined) {
+          events.splice(legacyIndex, 1);
+          legacyUserIndexesWithoutTurnId.delete(userText);
+          for (const [text, index] of legacyUserIndexesWithoutTurnId) {
+            if (index > legacyIndex) legacyUserIndexesWithoutTurnId.set(text, index - 1);
+          }
+        }
         events.push({ ...base, kind: 'user', text: userText });
         // New turn: drop any agent_message state an unterminated predecessor
         // left behind so it can't be attributed to this turn.
@@ -306,6 +426,7 @@ export function drainTraexRollout(
             : '';
       }
       if (!probe) traexPendingAgentCache.delete(path);
+      legacyUserIndexesWithoutTurnId.clear();
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -331,6 +452,7 @@ export function drainTraexRollout(
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
       if (!probe) traexPendingAgentCache.delete(path);
+      legacyUserIndexesWithoutTurnId.clear();
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -431,8 +553,8 @@ function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** Submit-confirmation probe: only a complete event_msg/user_message record
- * appended after `fromOffset` can match. Read-only — drains with `probe` so
+/** Submit-confirmation probe: only a complete user event record appended after
+ * `fromOffset` can match. Read-only — drains with `probe` so
  * it never mutates the per-turn agent_message cache the production drainer
  * relies on (a re-drain of the same live rollout at a different offset must
  * not clear pending turn state). Not currently wired into the production
@@ -755,4 +877,26 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
     }
   }
   return undefined;
+}
+
+
+/** Find the newest TRAE native session whose first prompt contains Botmux's
+ *  session id. This mirrors Codex's history.jsonl bridge, but TRAE keeps the
+ *  mapping in the `threads` SQLite table. It is intentionally best-effort:
+ *  callers fall back to treating `sessionId` as a native id when unavailable. */
+export function findTraexSessionIdByBotmuxSessionId(botmuxSessionId: string): string | undefined {
+  if (!botmuxSessionId) return undefined;
+  return withTraeDb((db) => {
+    const rows = db.prepare(
+      'SELECT id, first_user_message AS firstMessage FROM threads ORDER BY created_at DESC LIMIT 200',
+    ).all() as { id?: string; firstMessage?: string }[];
+    for (const r of rows) {
+      if (typeof r.id === 'string'
+        && typeof r.firstMessage === 'string'
+        && r.firstMessage.includes(botmuxSessionId)) {
+        return r.id;
+      }
+    }
+    return undefined;
+  }) ?? undefined;
 }
