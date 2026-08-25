@@ -276,6 +276,8 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
     'BOTMUX_PUBLIC_URL',
+    // Host-scoped Go build fanout policy inherited by bot-owned commands.
+    'GOFLAGS',
     // Dashboard control-audit destination + terminal takeover lease TTL.
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
     'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',

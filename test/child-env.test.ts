@@ -52,6 +52,7 @@ describe('redactChildEnv()', () => {
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
+      GOFLAGS: '-p=4',
     });
     // The bug this guards: `{ ...env, LARK_APP_ID: undefined }` leaves the key
     // PRESENT (`'LARK_APP_ID' in obj === true`), and node-pty then stringifies
@@ -63,6 +64,8 @@ describe('redactChildEnv()', () => {
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');
     expect(out.PATH).toBe('/usr/bin');
+    // Host-scoped build policy reaches the CLI through the ordinary child env.
+    expect(out.GOFLAGS).toBe('-p=4');
   });
 
   it('does not mutate the input env', () => {

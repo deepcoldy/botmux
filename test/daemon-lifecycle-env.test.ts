@@ -28,6 +28,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DAEMON_IPC_BASE_PORT: '9998',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://stale.proxy.example.com',
+      GOFLAGS: '-p=99',
       BOTMUX_DASHBOARD_FEISHU_H5_ENABLED: 'true',
       BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'stale-secret',
     })).toEqual(expected());
@@ -50,6 +51,9 @@ describe('resolveDaemonEnv()', () => {
       // so a self-upgrade restart from inside a session has NO inherited value —
       // only the .env snapshot can keep web-terminal links on the proxy domain.
       'BOTMUX_PUBLIC_URL=http://botmux.example.com',
+      // The same file-authority rule must apply to host build policy. A restart
+      // launched inside a session may carry the old daemon's baked GOFLAGS.
+      'GOFLAGS=-p=4',
     ].join('\n'))).toEqual(expected({
       WEB_EXTERNAL_HOST: 'relay.example.com',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
@@ -58,6 +62,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://botmux.example.com',
+      GOFLAGS: '-p=4',
     }));
   });
 
@@ -69,6 +74,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DAEMON_IPC_BASE_PORT: '7993',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://shell.proxy.example.com',
+      GOFLAGS: '-p=8',
     }, [
       'WEB_EXTERNAL_HOST=file.example.com',
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
@@ -77,6 +83,7 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_DAEMON_IPC_BASE_PORT=7992',
       'BOTMUX_DASHBOARD_PUBLIC_READONLY=true',
       'BOTMUX_PUBLIC_URL=http://file.proxy.example.com',
+      'GOFLAGS=-p=4',
     ].join('\n'))).toEqual(expected({
       WEB_EXTERNAL_HOST: 'shell.example.com',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
@@ -85,6 +92,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DAEMON_IPC_BASE_PORT: '7993',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://shell.proxy.example.com',
+      GOFLAGS: '-p=8',
     }));
   });
 
@@ -97,6 +105,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DAEMON_IPC_BASE_PORT: '',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: '',
       BOTMUX_PUBLIC_URL: '',
+      GOFLAGS: '',
     }, [
       'WEB_EXTERNAL_HOST=file.example.com',
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
@@ -105,11 +114,12 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_DAEMON_IPC_BASE_PORT=7992',
       'BOTMUX_DASHBOARD_PUBLIC_READONLY=false',
       'BOTMUX_PUBLIC_URL=http://file.proxy.example.com',
+      'GOFLAGS=-p=4',
     ].join('\n'))).toEqual(expected());
   });
 });
 
-describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () => {
+describe('DAEMON_ENV_KEYS carries non-secret managed-process settings only', () => {
   // `botmux-dashboard` is its own PM2 app. Non-secret dashboard settings reach
   // it via the env block baked from this list; the Feishu H5 login family
   // (APP_SECRET included) deliberately does NOT — the dashboard entry point
@@ -163,6 +173,10 @@ describe('DAEMON_ENV_KEYS carries the non-secret dashboard settings only', () =>
   it('includes the audit-path and terminal-lease settings from .env.example', () => {
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH');
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS');
+  });
+
+  it('includes the host-scoped Go build fanout policy', () => {
+    expect(DAEMON_ENV_KEYS as readonly string[]).toContain('GOFLAGS');
   });
 
   it('resolves the non-secret dashboard settings from the .env snapshot end to end', () => {

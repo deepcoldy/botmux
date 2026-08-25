@@ -32,6 +32,10 @@ export const DAEMON_ENV_KEYS = [
   // from a bot session (whose pane wrapper unsets BOTMUX_*) silently demoted
   // all web-terminal links back to raw ip:port.
   'BOTMUX_PUBLIC_URL',
+  // Host-scoped Go build fanout policy. This is intentionally an ordinary,
+  // non-secret environment value: the daemon inherits it, worker/session
+  // children retain it, and individual Go commands may still override -p.
+  'GOFLAGS',
   // Dashboard-only, non-secret settings: the control-audit destination
   // (dashboard/control-audit.ts defaultControlAuditPath) and the terminal
   // takeover lease TTL (dashboard/terminal-control.ts terminalControlTtlFromEnv).

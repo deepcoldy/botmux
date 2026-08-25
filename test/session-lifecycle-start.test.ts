@@ -2025,6 +2025,17 @@ describe('session.start lifecycle integration', () => {
     vi.unstubAllEnvs();
   });
 
+  it('preserves the host-scoped Go build policy in the daemon→worker fork env', () => {
+    vi.stubEnv('GOFLAGS', '-p=4');
+
+    forkWorker(makeDs(), 'hello', false);
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.GOFLAGS).toBe('-p=4');
+
+    vi.unstubAllEnvs();
+  });
+
   it('removes leaked workflow identity from the daemon→worker fork env', () => {
     vi.stubEnv('BOTMUX_WORKFLOW', '1');
     vi.stubEnv('BOTMUX_WORKFLOW_RUN_ID', 'run-leaked');
