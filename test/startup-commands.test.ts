@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import {
   normalizeStartupCommand,
   normalizeStartupCommandList,
+  planStartupCommandsForCli,
   parseStartupCommandsInput,
   shouldRunStartupCommandsOnSpawn,
   shouldDeferInitialPromptForStartup,
@@ -13,6 +14,8 @@ describe('normalizeStartupCommand', () => {
     expect(normalizeStartupCommand('  effort ultracode ')).toBe('/effort ultracode');
     expect(normalizeStartupCommand('/effort ultracode')).toBe('/effort ultracode');
     expect(normalizeStartupCommand('/model opus')).toBe('/model opus');
+    expect(normalizeStartupCommand('  -c model_reasoning_effort="medium" ')).toBe('-c model_reasoning_effort="medium"');
+    expect(normalizeStartupCommand('--config model_reasoning_effort="high"')).toBe('--config model_reasoning_effort="high"');
   });
 
   it('collapses embedded newlines so a command submits as one line', () => {
@@ -38,6 +41,8 @@ describe('parseStartupCommandsInput', () => {
   it('adds missing leading slashes and dedupes in order', () => {
     expect(parseStartupCommandsInput('effort ultracode, /effort ultracode, mcp'))
       .toEqual(['/effort ultracode', '/mcp']);
+    expect(parseStartupCommandsInput('-c model_reasoning_effort="medium", -c model_reasoning_effort="medium"'))
+      .toEqual(['-c model_reasoning_effort="medium"']);
   });
 
   it('drops empty tokens and tolerates trailing separators', () => {
@@ -49,13 +54,33 @@ describe('parseStartupCommandsInput', () => {
 
 describe('normalizeStartupCommandList', () => {
   it('normalizes a bots.json array, dropping junk and deduping', () => {
-    expect(normalizeStartupCommandList(['/effort ultracode', 'model opus', '', 42, '/effort ultracode']))
-      .toEqual(['/effort ultracode', '/model opus']);
+    expect(normalizeStartupCommandList(['/effort ultracode', 'model opus', '-c model_reasoning_effort="medium"', '', 42, '/effort ultracode']))
+      .toEqual(['/effort ultracode', '/model opus', '-c model_reasoning_effort="medium"']);
   });
 
   it('returns [] for non-arrays', () => {
     expect(normalizeStartupCommandList(undefined)).toEqual([]);
     expect(normalizeStartupCommandList('/effort ultracode' as any)).toEqual([]);
+  });
+});
+
+describe('planStartupCommandsForCli', () => {
+  it('converts TraeX model_reasoning_effort config commands into launch args', () => {
+    expect(planStartupCommandsForCli('traex', [
+      '-c model_reasoning_effort="medium"',
+      '--config model_reasoning_effort="high"',
+      '/model GPT-5.5',
+    ])).toEqual({
+      launchConfigArgs: ['-c', 'model_reasoning_effort="medium"', '-c', 'model_reasoning_effort="high"'],
+      tuiCommands: ['/model GPT-5.5'],
+    });
+  });
+
+  it('keeps non-TraeX startup commands on the TUI path', () => {
+    expect(planStartupCommandsForCli('codex', ['-c model_reasoning_effort="medium"'])).toEqual({
+      launchConfigArgs: [],
+      tuiCommands: ['-c model_reasoning_effort="medium"'],
+    });
   });
 });
 
@@ -116,5 +141,13 @@ describe('worker.ts startup-commands wiring', () => {
     expect(src).toContain('logicalContent: lastSpawnQueuedInitialPromptLogicalContent');
     expect(src).toContain('args.unshift(...piInitialPromptAdditionalArgs);');
     expect(src).toContain('Object.assign(childEnv, piInitialPromptEnv);');
+  });
+
+  it('passes startup-derived launch args into adapter buildArgs and leaves only TUI commands for replay', () => {
+    expect(src).toContain('const startupCommandPlan = planStartupCommandsForCli(cfg.cliId, cfg.startupCommands);');
+    expect(src).toContain('lastSpawnStartupTuiCommands = startupCommandPlan.tuiCommands;');
+    expect(src).toContain('lastSpawnStartupLaunchArgs = startupCommandPlan.launchConfigArgs;');
+    expect(src).toContain('startupLaunchArgs: lastSpawnStartupLaunchArgs,');
+    expect(src).toContain('const cmds = lastSpawnStartupTuiCommands;');
   });
 });

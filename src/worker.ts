@@ -106,7 +106,7 @@ import {
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
-import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { planStartupCommandsForCli, shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
@@ -1797,6 +1797,8 @@ let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
 let lastSpawnQueuedInitialPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
+let lastSpawnStartupTuiCommands: string[] = [];
+let lastSpawnStartupLaunchArgs: string[] = [];
 // True when this session runs under an outer bwrap supervisor (file sandbox OR
 // Linux credential-only bwrap) — both make getChildPid() the supervisor, not the
 // CLI leaf. credentialOnlyBwrap needs host probes so it can't be recomputed from
@@ -2388,7 +2390,7 @@ function awaitPtyQuiescence(quietMs: number, capMs: number): Promise<void> {
  *  the user's existing session). Invoked once per spawn from flushPending under
  *  the isFlushing mutex, so no user message can interleave. */
 async function runStartupCommands(): Promise<void> {
-  const cmds = lastInitConfig?.startupCommands;
+  const cmds = lastSpawnStartupTuiCommands;
   if (!cmds || cmds.length === 0) return;
   if (lastInitConfig?.adoptMode) return;
   if (!backend) return;
@@ -13591,6 +13593,9 @@ async function spawnCli(
   const buildArgsWorkingDir = sandboxRequested
     ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
     : cfg.workingDir;
+  const startupCommandPlan = planStartupCommandsForCli(cfg.cliId, cfg.startupCommands);
+  lastSpawnStartupTuiCommands = startupCommandPlan.tuiCommands;
+  lastSpawnStartupLaunchArgs = startupCommandPlan.launchConfigArgs;
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -13611,6 +13616,7 @@ async function spawnCli(
     // dsh runner only; other adapters ignore the field.
     turnTimeoutMs: cfg.turnTimeoutMs,
     reasoningEffort: cfg.reasoningEffort,
+    startupLaunchArgs: lastSpawnStartupLaunchArgs,
     disableCliBypass: cfg.disableCliBypass === true,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless
     // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.

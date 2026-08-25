@@ -1,7 +1,10 @@
 /**
  * Startup commands — per-bot slash commands the worker types into a freshly
  * spawned CLI right after it's ready, BEFORE the user's first prompt (e.g.
- * `/effort ultracode`, `/model opus`). Extracted into a leaf module so both
+ * `/effort ultracode`, `/model opus`). A narrow TraeX exception lets users
+ * write `-c model_reasoning_effort="medium"` in the same field; that line is
+ * consumed as a launch-time config override instead of being typed into the
+ * TUI. Extracted into a leaf module so both
  * bots.json parsing ({@link ../bot-registry.js}) and the `/botconfig` config
  * store ({@link ../services/bot-config-store.js}) share one normalization
  * without a circular import.
@@ -20,13 +23,18 @@ const MAX_STARTUP_COMMAND_LEN = 200;
 /**
  * Normalize a single startup command: collapse embedded newlines (each command
  * must submit as one line), trim, and ensure a leading `/` (so users can type
- * `effort ultracode` or `/effort ultracode`). Returns null for empty / too-long
- * input. Internal spaces (arguments) are preserved.
+ * `effort ultracode` or `/effort ultracode`). TraeX launch config lines may
+ * start with `-c` / `--config` and are preserved without a slash. Returns null
+ * for empty / too-long input. Internal spaces (arguments) are preserved.
  */
 export function normalizeStartupCommand(cmd: unknown): string | null {
   if (typeof cmd !== 'string') return null;
   const oneLine = cmd.replace(/[\r\n]+/g, ' ').trim();
   if (!oneLine) return null;
+  if (/^(?:-c|--config)\s+/.test(oneLine)) {
+    if (oneLine.length > MAX_STARTUP_COMMAND_LEN) return null;
+    return oneLine;
+  }
   const withSlash = oneLine.startsWith('/') ? oneLine : `/${oneLine}`;
   if (withSlash.length > MAX_STARTUP_COMMAND_LEN) return null;
   return withSlash;
@@ -85,4 +93,33 @@ export function shouldDeferInitialPromptForStartup(opts: {
   passesInitialPromptViaArgs: boolean;
 }): boolean {
   return opts.hasStartupCommands && !opts.adoptMode && opts.passesInitialPromptViaArgs;
+}
+
+export interface StartupCommandPlan {
+  tuiCommands: string[];
+  launchConfigArgs: string[];
+}
+
+function parseTraexLaunchConfigCommand(command: string): string[] | null {
+  const match = command.trim().match(/^(?:-c|--config)\s+(.+)$/);
+  if (!match) return null;
+  const config = match[1]?.trim();
+  if (!config || !config.startsWith('model_reasoning_effort=')) return null;
+  return ['-c', config];
+}
+
+export function planStartupCommandsForCli(cliId: string | undefined, commands: readonly string[] | undefined): StartupCommandPlan {
+  const tuiCommands: string[] = [];
+  const launchConfigArgs: string[] = [];
+  for (const command of commands ?? []) {
+    if (cliId === 'traex') {
+      const args = parseTraexLaunchConfigCommand(command);
+      if (args) {
+        launchConfigArgs.push(...args);
+        continue;
+      }
+    }
+    tuiCommands.push(command);
+  }
+  return { tuiCommands, launchConfigArgs };
 }

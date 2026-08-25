@@ -1866,6 +1866,22 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('passes startup-derived launch config args to TraeX', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-effort',
+      resume: false,
+      startupLaunchArgs: ['-c', 'model_reasoning_effort="medium"'],
+    });
+    const i = args.indexOf('model_reasoning_effort="medium"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it('omits startup launch config args when none are configured', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-effort', resume: false });
+    expect(args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
   it('bypasses both permission and hook-review gates for automation when the hook-trust toggle is on', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false, bypassHookTrust: true });
     expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');

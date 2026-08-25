@@ -147,6 +147,8 @@ export interface CliAdapter {
      *  grok `--reasoning-effort`). Only adapters with an explicit reasoning
      *  control honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Extra launch-time config args derived from bot startupCommands. */
+    startupLaunchArgs?: string[];
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`

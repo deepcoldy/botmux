@@ -25,7 +25,6 @@ describe('Codex model-aware reasoning efforts', () => {
     expect(codexModelSupportsReasoningEffort('', 'max')).toBe(false);
   });
 });
-
 describe('Grok model-aware reasoning efforts', () => {
   it('treats grok as a configurable reasoning CLI', () => {
     expect(isConfigurableReasoningCliId('grok')).toBe(true);
