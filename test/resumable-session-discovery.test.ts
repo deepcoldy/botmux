@@ -430,6 +430,105 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     ]);
     expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([]);
   });
+
+  // Codex >=0.147 no longer writes event_msg/user_message; user turns live in
+  // response_item message role:user entries. The first is a synthetic preamble
+  // (here AGENTS.md instructions + environment_context in ONE message's two
+  // input_text blocks — the real rollout shape), the second is the real prompt.
+  it('falls back to the first real response_item user message when event_msg/user_message is absent (Codex >=0.147)', async () => {
+    writeRollout('2026/08/19', 'rollout-2026-08-19-newformat.jsonl', [
+      { timestamp: '2026-08-19T22:41:43Z', type: 'session_meta', payload: { id: '01a01a78-8d40-7a80-a7c0-8b467bb31779', cwd: '/root/iserver/botmux' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [
+        { type: 'input_text', text: '# AGENTS.md instructions for /root/iserver/botmux\n\n<INSTRUCTIONS>\nrepo guide\n</INSTRUCTIONS>\n\n' },
+        { type: 'input_text', text: '<environment_context>\n  <cwd>/root/iserver/botmux</cwd>\n  <shell>zsh</shell>\n</environment_context>' },
+      ] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'refactor the rollout parser for the new format' }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      cliSessionId: '01a01a78-8d40-7a80-a7c0-8b467bb31779',
+      cwd: '/root/iserver/botmux',
+      title: 'refactor the rollout parser for the new format',
+    });
+  });
+
+  // Every observed synthetic preamble shape must be skipped before the real
+  // prompt is taken as the title (verified against ~80 live ~/.codex rollouts).
+  it('skips each synthetic preamble shape before taking the response_item title', async () => {
+    writeRollout('2026/08/13', 'rollout-envctx.jsonl', [
+      { type: 'session_meta', payload: { id: 'envctx-sid', cwd: '/root/p' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/root/p</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-08-13</current_date>\n</environment_context>' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the real prompt after env context' }] } },
+    ]);
+    writeRollout('2026/08/02', 'rollout-plugins.jsonl', [
+      { type: 'session_meta', payload: { id: 'plugins-sid', cwd: '/root/q' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n</recommended_plugins>' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the real prompt after plugins' }] } },
+    ]);
+    writeRollout('2026/08/01', 'rollout-perms.jsonl', [
+      { type: 'session_meta', payload: { id: 'perms-sid', cwd: '/root/r' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<permissions>\nread-only sandbox\n</permissions>' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the real prompt after permissions' }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId).sort()).toEqual(['envctx-sid', 'perms-sid', 'plugins-sid']);
+    expect(out.find((s) => s.cliSessionId === 'envctx-sid')?.title).toBe('the real prompt after env context');
+    expect(out.find((s) => s.cliSessionId === 'plugins-sid')?.title).toBe('the real prompt after plugins');
+    expect(out.find((s) => s.cliSessionId === 'perms-sid')?.title).toBe('the real prompt after permissions');
+  });
+
+  // 散文中提及 preamble 标签不是合成 preamble——锚定行首避免误杀真实 prompt。
+  it('does not skip a real prompt that mentions preamble tags in prose', async () => {
+    writeRollout('2026/08/14', 'rollout-prose-tags.jsonl', [
+      { type: 'session_meta', payload: { id: 'prose-sid', cwd: '/root/s' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'what does <environment_context> mean in codex rollouts? also <permissions> docs' }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cliSessionId: 'prose-sid', title: 'what does <environment_context> mean in codex rollouts? also <permissions> docs' });
+  });
+
+  // A new-format rollout whose first real user turn carries botmux's injected
+  // wrapper is botmux-origin and must be dropped — skipping the message and
+  // taking a later turn would leak botmux sessions into the /adopt picker.
+  it('drops botmux-origin rollouts whose response_item user turn carries the injected wrapper (new format)', async () => {
+    writeRollout('2026/08/20', 'rollout-bmx-newfmt.jsonl', [
+      { type: 'session_meta', payload: { id: 'bmx-newfmt', cwd: '/root/x' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/root/x</cwd>\n</environment_context>' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<user_message>\n@Codex do the thing\n</user_message>\n<sender type="user" open_id="ou_abcdefghijklmnop" />' }] } },
+    ]);
+    writeRollout('2026/08/21', 'rollout-ext-newfmt.jsonl', [
+      { type: 'session_meta', payload: { id: 'ext-newfmt', cwd: '/root/y' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/root/y</cwd>\n</environment_context>' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'a prompt typed straight into codex' }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['ext-newfmt']);
+  });
+
+  // Detection is structural: an external new-format session whose prompt merely
+  // discusses botmux's XML in prose must NOT be mis-flagged (mirrors the
+  // event_msg/user_message regression coverage above).
+  it('keeps external new-format sessions that only mention botmux tags in prose', async () => {
+    writeRollout('2026/08/22', 'rollout-ext-discuss.jsonl', [
+      { type: 'session_meta', payload: { id: 'ext-discuss', cwd: '/root/z' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/root/z</cwd>\n</environment_context>' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'I am debugging botmux and the <user_message> tag behavior, and why does <sender type= show up?' }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['ext-discuss']);
+  });
+
+  // A rollout whose only user turns are synthetic preambles (no real prompt)
+  // has no meaningful title and is dropped, not adopted with the preamble.
+  it('drops new-format rollouts with only a synthetic preamble and no real prompt', async () => {
+    writeRollout('2026/08/23', 'rollout-preamble-only.jsonl', [
+      { type: 'session_meta', payload: { id: 'preamble-only', cwd: '/root/p' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/root/p</cwd>\n</environment_context>' }] } },
+    ]);
+    expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([]);
+  });
 });
 
 describe('discoverAntigravitySessions', () => {

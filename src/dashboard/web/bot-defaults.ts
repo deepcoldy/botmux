@@ -87,6 +87,9 @@ export type BotDefaultsRow = {
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  /** Bot-level master switch for the native CoT (thinking process) message.
+   *  Default ON — only an explicit false means disabled. */
+  thinkingCard?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };

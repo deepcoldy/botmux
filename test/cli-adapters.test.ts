@@ -831,11 +831,17 @@ describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
   it('fresh session passes trust/force/model flags without resume flags', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      initialPrompt: 'first Lark turn',
+      model: 'gpt-5',
+    });
     expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
+    expect(args.at(-1)).toBe('first Lark turn');
     expect(args).not.toContain('--resume');
     expect(args).not.toContain('--continue');
   });
@@ -846,11 +852,13 @@ describe('cursor buildArgs', () => {
       sessionId: 'sess-cursor',
       resume: true,
       resumeSessionId: chatId,
+      initialPrompt: 'resume turn',
     });
     expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
+    expect(args.at(-1)).toBe('resume turn');
     expect(args).not.toContain('--continue');
   });
 
@@ -874,6 +882,27 @@ describe('cursor buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
     expect(args).toContain('--trust');
     expect(args).not.toContain('--force');
+  });
+
+  it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
+  it('readyPattern matches BOTH the empty-session and post-turn composer placeholders', () => {
+    // Cursor Agent 2026.08.11 renders `sessionEmpty ? "Plan, search, build
+    // anything" : "Add a follow-up"` and never reverts. The worker resets the
+    // IdleDetector (clearing readySeen) before every write, and quiescence-idle
+    // is suppressed until readyPattern is seen again — so if the pattern only
+    // matched the empty-session placeholder, turn 2+ would never re-seed ready
+    // and the CLI would be stuck reporting "working" forever. Both must match.
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.readyPattern?.test('  → Add a follow-up')).toBe(true);
+    // Guard against over-broad matching: the arrow-prefixed composer glyph is
+    // required, so unrelated screen text with the phrase must not false-match.
+    expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
   });
 });
 

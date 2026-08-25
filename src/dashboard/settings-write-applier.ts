@@ -103,6 +103,8 @@ export interface ResolvedDashboardSettingsView {
   remoteAccess?: boolean;
   /** Machine-wide v3 Workflow feature switch. Default ON. */
   workflow: { enabled: boolean };
+  /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
+  oauthRedirectBase?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -241,6 +243,7 @@ export type ApplySettingsWriteError =
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
   | 'invalid_scheduleTimeZone'
+  | 'invalid_oauthRedirectBase'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -257,6 +260,38 @@ function isValidHerdrPluginSource(value: string): boolean {
 
 function isValidHerdrPluginRef(value: string): boolean {
   return !value.startsWith('-') && !/[\s\0]/.test(value);
+}
+
+/**
+ * 归一化 OAuth 回跳基址：只接受 http(s) 的 **origin**（协议 + 主机 + 可选端口），
+ * 返回去掉尾斜杠的规范形式；不合法返回 null。
+ *
+ * 为什么只收 origin 而不放行路径：`resolveOAuthRedirectUri` 是拿 `<base>/oauth/callback`
+ * 直接拼的，而 dashboard 侧的回调接收器是 `url.pathname === '/oauth/callback'` 精确匹配
+ * （dashboard.ts）。带路径的 base 只有在反代恰好剥掉前缀时才成立，用户填错却要等到
+ * 授权跳回来才看得出错——那个时机排障成本最高。前缀反代这种高级场景仍可用
+ * `BOTMUX_PUBLIC_URL`（publicReverseProxyBaseUrl）表达。
+ *
+ * 同样拒掉 query / fragment / 用户名密码：它们拼上 `/oauth/callback` 后必然是坏地址。
+ * 走 `new URL(...).origin` 顺带把 `HTTP://Host:80` 这类写法归一（大小写、默认端口）。
+ */
+function normalizeOAuthRedirectBase(raw: string): string | null {
+  const value = raw.trim();
+  if (!/^https?:\/\//i.test(value)) return null;
+  let url: URL;
+  try {
+    // 先削尾斜杠：用户从地址栏复制多半带一条，`https://host/` 与 `https://host`
+    // 应当等价（多条也一并吃掉）。削完仍解析不出 URL 的（如裸 `http://`）落到 null。
+    url = new URL(value.replace(/\/+$/, ''));
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (!url.hostname) return null;
+  if (url.username || url.password || url.search || url.hash) return null;
+  if (url.pathname !== '' && url.pathname !== '/') return null;
+  // origin 天然不含尾斜杠；'null' 只会出现在 opaque origin（非 http(s)）上，这里已排除。
+  return url.origin;
 }
 
 /** 与 daemon 实际私聊收件人选择保持一致：只要求存在首个可用 open_id。 */
@@ -599,6 +634,22 @@ export async function applySettingsWrite(
       touched = true;
     } else {
       return { ok: false, error: 'invalid_scheduleTimeZone' };
+    }
+  }
+
+  if ('oauthRedirectBase' in obj) {
+    const v = obj.oauthRedirectBase;
+    if (v === null || (typeof v === 'string' && v.trim() === '')) {
+      // 清除 → resolveOAuthRedirectUri 退回 http://127.0.0.1:9768/callback 粘贴流程。
+      deps.mergeGlobalConfig({ oauthRedirectBase: null });
+      touched = true;
+    } else if (typeof v === 'string') {
+      const normalized = normalizeOAuthRedirectBase(v);
+      if (!normalized) return { ok: false, error: 'invalid_oauthRedirectBase' };
+      deps.mergeGlobalConfig({ oauthRedirectBase: normalized });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_oauthRedirectBase' };
     }
   }
 

@@ -81,6 +81,7 @@ import {
 } from '../im/lark/md-card.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -10769,6 +10770,20 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'thinking_update': {
+        // Cosmetic CoT channel — never touches settlement. Same stale-worker
+        // guard as screen_update; sessionId echo is validated when present.
+        // Renders as a native CoT message (message_cot AG-UI stream); any API
+        // failure disables it for the turn (self-catching, logged as [cot]).
+        if (!ownsLifecycleMutation()) break;
+        if (msg.sessionId && msg.sessionId !== ds.session.sessionId) break;
+        // Cache even when the CoT switches are off — `/cot show` uses this to
+        // summon the bubble mid-turn with everything accumulated so far.
+        ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+        handleCotThinkingUpdate(ds, msg);
+        break;
+      }
+
       case 'screen_update': {
         if (!ownsLifecycleMutation()) break;
         // Wait for worker init, independently of Web Terminal availability.
@@ -11829,6 +11844,14 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = undefined;
         }
+        // Settle this turn's native CoT message, if one is live. Cosmetic and
+        // self-catching — must never delay or fail the terminal path
+        // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
+        // one-shot `/cot show` force and drops the mid-turn thinking cache (a
+        // post-terminal summon would create a bubble nobody ever finishes).
+        finalizeCotMessage(ds, msg.turnId, msg.status);
+        ds.cotForced = undefined;
+        ds.lastThinkingUpdate = undefined;
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
@@ -12528,6 +12551,11 @@ function setupWorkerHandlers(
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
       invalidateTuiPrompt(ds, 'worker_exit');
+      // A crashed/killed worker never sends turn_terminal (the only finalize
+      // path) — settle any live CoT thinking bubble as interrupted so it
+      // doesn't spin until the next daemon restart. Cosmetic, self-catching.
+      abortCotMessage(ds);
+      ds.lastThinkingUpdate = undefined;
       // Fence this lifetime before a polling dispatcher can observe its last
       // ACK. Keeping the old receipt is useful audit evidence, but the
       // persisted current generation advances immediately so it cannot count

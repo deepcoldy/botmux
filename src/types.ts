@@ -1152,6 +1152,15 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
     : Message
   : never;
 
+/** One node of the native CoT (thinking process) message, in transcript
+ *  order. `thinking` renders as a reasoning paragraph; `tool_call` /
+ *  `tool_result` render as the tool timeline (icon + args + result). The
+ *  worker truncates args/results before shipping. */
+export type CotEntry =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | { kind: 'tool_result'; id: string; result: string };
+
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | {
@@ -1235,6 +1244,15 @@ export type WorkerToDaemon =
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
+  /** Incremental model thinking (CoT) attributed to an active Lark turn.
+   * `entries` is the FULL cumulative list so far (not a delta) — each entry
+   * renders as its own node in the native CoT message: thinking paragraphs,
+   * tool calls, and tool results, in transcript order. Append-only: earlier
+   * entries never change. Worker-side throttled; currently emitted by the
+   * Claude (transcript attribution) and Codex (bridge-queue cot observer)
+   * bridges. Cosmetic channel: it must never influence turn
+   * settlement, final_output attribution, or durable receipts. */
+  | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }

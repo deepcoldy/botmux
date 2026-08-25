@@ -304,6 +304,7 @@ import {
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
@@ -923,6 +924,10 @@ interface ResolvedDashboardSettings {
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
+  /** OAuth 授权回跳基址（`<base>/oauth/callback`），null = 未配置 ⇒ 退回
+   *  `http://127.0.0.1:9768/callback` 的手工粘贴流程。见 global-config 的
+   *  `oauthRedirectBase`。 */
+  oauthRedirectBase: string | null;
   /** Configured schedule-task timezone override (IANA), or null when unset
    *  ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone: string | null;
@@ -1482,6 +1487,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
+    oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
     effectiveScheduleTimeZone: scheduleTimeZone(),
@@ -5534,6 +5540,42 @@ const server = createServer(async (req, res) => {
       const out = await preflightVcMeetingBot(appId);
       if (out.ok) return jsonRes(res, 200, { ok: true });
       return jsonRes(res, 400, { ok: false, error: out.error, feishuLoginQr: out.feishuLoginQr });
+    }
+
+    // 「一键修复开放平台 redirect 白名单」批量入口：一次扫码，把全部（或 body 里
+    // 点名的）存量 bot 的回调白名单补齐。白名单缺失是 authorize 的硬失败（20029），
+    // 而存量 bot 今天没有任何自愈路径会去补它 —— 所以做成显式动作。
+    // 私有 API，同样不在 PUBLIC_READ_PATHS，未认证已被 decideDashboardAuth 401。
+    if (url.pathname === '/api/open-platform/repair-redirects') {
+      if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const rawAppIds = (parsed as { appIds?: unknown } | null)?.appIds;
+      let appIds: string[] | undefined;
+      if (rawAppIds !== undefined && rawAppIds !== null) {
+        if (!Array.isArray(rawAppIds) || rawAppIds.some(id => typeof id !== 'string')) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_appIds' });
+        }
+        appIds = rawAppIds as string[];
+      }
+      const out = await repairOpenPlatformRedirects({ appIds });
+      if (out.ok) return jsonRes(res, 200, { ok: true, results: out.results, wanted: out.wanted });
+      // 已有一批在跑 → 409（single-flight 在 service 侧，见 open-platform-redirect-repair.ts）：
+      // 用户点两下不该排队等上一批跑完，也不该让两批抢同一份 session/csrf。
+      if (out.reason === 'in_flight') {
+        return jsonRes(res, 409, { ok: false, errorCode: 'repair_in_flight', message: out.message });
+      }
+      // 缺登录态不是错误，是「还差一步」：回 200 让前端走已有的扫码流程
+      //（POST /api/feishu-login/start + GET /api/feishu-login/status）后重试，
+      // 与 VC preflight 遇到同类失败时弹二维码是同一套登录态。
+      if (out.reason === 'login_required') {
+        return jsonRes(res, 200, { ok: false, errorCode: 'feishu_login_required', message: out.message });
+      }
+      return jsonRes(res, 502, { ok: false, errorCode: out.reason, message: out.message });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/role-profiles') {

@@ -3,6 +3,7 @@ import type {
   CodexAppTurnInput,
   CliTurnPayload,
   ChatContext,
+  CotEntry,
   Session,
   DaemonToWorker,
   LarkAttachment,
@@ -323,6 +324,19 @@ export interface DaemonSession {
    *  command so a user can manually summon a live card in an otherwise-quiet
    *  session. In-memory only (resets on daemon restart). */
   streamingCardForced?: boolean;
+  /** One-shot override for the native CoT (thinking process) message: when
+   *  true, the bubble renders for the current/next turn even if the chat is
+   *  in `noCotChats` or the bot-level `thinkingCard` switch is off. Flipped on
+   *  by `/cot show`; auto-cleared when that turn settles (turn_terminal), so
+   *  it is a single peek, not a toggle. In-memory only. */
+  cotForced?: boolean;
+  /** Latest `thinking_update` of the RUNNING turn, cached regardless of the
+   *  CoT switches so `/cot show` can summon the bubble mid-turn with all
+   *  thinking accumulated so far (the worker only emits on NEW entries — a
+   *  bare force flag could otherwise miss a turn whose thinking already
+   *  ended). Cleared on turn_terminal: a bubble created after its turn
+   *  settled would never receive RUN_FINISHED and spin forever. */
+  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-

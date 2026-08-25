@@ -1023,10 +1023,25 @@ export function buildStreamingCard(
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
   // link right in the card so anyone here can open a writable terminal without
   // the get-write-link → DM round-trip. The link is intentionally group-visible.
+  // Rendered as a URL button (same shape as the read-only terminal button),
+  // not a markdown link: the token URL is long and wrapped into an ugly raw
+  // URL blob in the card. The group-visible warning stays as a note below.
   if (writableTerminalUrl) {
     elements.push({
-      tag: 'markdown',
-      content: t('card.writable_terminal_link', { url: writableTerminalUrl }, locale),
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.open_writable_terminal', undefined, locale) },
+        type: 'primary',
+        multi_url: terminalMultiUrl(writableTerminalUrl),
+      }],
+    });
+    elements.push({
+      tag: 'note',
+      elements: [{
+        tag: 'lark_md',
+        content: t('card.writable_terminal_warning', undefined, locale),
+      }],
     });
   }
 

@@ -48,6 +48,11 @@ import {
 } from '../../services/grant-policy.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 
+/** 会话群标签名的输入上限，与服务端 `MAX_SESSION_TAG_NAME_CODEPOINTS`
+ *  （services/feed-group-tagger.ts）保持一致。这里不 import 那个常量：该模块会连带
+ *  拉进 bot-registry / node:fs，进不了浏览器 bundle。服务端仍会自己截断兜底。 */
+const MAX_SG_TAG_NAME_LENGTH = 60;
+
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
 type CardPrefPatch = Record<string, boolean | string>;
@@ -681,6 +686,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    thinkingCard: body.thinkingCard,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -3201,6 +3207,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
+  const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -3210,7 +3217,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-  }, [bot.disableStreamingCard, bot.privateCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setThinkingCard(bot.thinkingCard !== false);
+  }, [bot.disableStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -3274,6 +3282,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             />
             <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
           </div>
+          <ToggleRow
+            checked={thinkingCard}
+            disabled={busy !== null}
+            dataAction="toggle-thinking-card"
+            title={tr('botDefaults.thinkingCard')}
+            description={tr('botDefaults.thinkingCardDescription')}
+            help={tr('botDefaults.thinkingCardHelp')}
+            onChange={checked => {
+              const previous = thinkingCard;
+              setThinkingCard(checked);
+              void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
+            }}
+          />
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
@@ -4209,6 +4230,81 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
   return value === 'thread' ? 'thread' : value === 'group' ? 'group' : 'chat';
 }
 
+/** `POST /api/open-platform/repair-redirects` 的单个 bot 结果（服务端契约见
+ *  `src/setup/open-platform-redirect-repair.ts` 的 `RedirectRepairItem`）。 */
+type RedirectRepairItem = {
+  appId: string;
+  /** `partial` = 写成功了但 wanted 没写全（典型：最小集兜底），**不算成功**。 */
+  status: 'fixed' | 'unchanged' | 'partial' | 'not_owned' | 'failed';
+  message?: string;
+  redirectUrls?: string[];
+  missingRedirectUrls?: string[];
+};
+
+type RedirectRepairOutcome =
+  | { kind: 'ok'; items: RedirectRepairItem[] }
+  /** 缺登录态（HTTP 200 + errorCode=feishu_login_required）——扫码后重试即可。 */
+  | { kind: 'login_required' }
+  /** 已有一批在跑（409）/ console 报错（502）/ 网络失败 / 超时。 */
+  | { kind: 'error'; message: string };
+
+/** 静默修复的等待上限。授权按钮点下去后用户在等，不能被一次挂住的 console 请求
+ *  拖到没有反馈——超时就当「没修成」，照常打开授权页（见 startAuth 的注释）。 */
+const REDIRECT_REPAIR_TIMEOUT_MS = 15_000;
+
+/** 老浏览器 / 非浏览器宿主（react-test-renderer 跑在 node 里）没有
+ *  `AbortSignal.timeout` 时退化成「不设超时」，而不是抛异常挡住调用方。 */
+function redirectRepairSignal(): AbortSignal | undefined {
+  return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+    ? AbortSignal.timeout(REDIRECT_REPAIR_TIMEOUT_MS)
+    : undefined;
+}
+
+/** 调一次批量修复。`appIds` 省略 = 全量（补齐其它 bot）。
+ *  这里刻意不复用 `sendJson`：它没有超时，而这条链路要打开放平台 console。 */
+async function callRepairRedirects(appIds?: string[]): Promise<RedirectRepairOutcome> {
+  try {
+    const r = await fetch('/api/open-platform/repair-redirects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(appIds ? { appIds } : {}),
+      signal: redirectRepairSignal(),
+    });
+    const body = await r.json().catch(() => ({} as any));
+    if (r.ok && body?.ok === true) {
+      return { kind: 'ok', items: Array.isArray(body.results) ? body.results as RedirectRepairItem[] : [] };
+    }
+    if (body?.errorCode === 'feishu_login_required') return { kind: 'login_required' };
+    return { kind: 'error', message: String(body?.message || body?.error || `HTTP ${r.status}`) };
+  } catch (e: any) {
+    return { kind: 'error', message: caughtErrorText(e) };
+  }
+}
+
+/** 整批都落到 fixed/unchanged 才算「回调地址已就绪」，否则要给用户一条提示。
+ *  `partial` 刻意不在成功集合里：想要的回调地址没写全，authorize 照样可能 20029。 */
+function repairFullySucceeded(outcome: RedirectRepairOutcome): boolean {
+  return outcome.kind === 'ok'
+    && outcome.items.length > 0
+    && outcome.items.every(item => item.status === 'fixed' || item.status === 'unchanged');
+}
+
+/** per-bot 结果文案。成功态（fixed/unchanged）用本地化标签即可——服务端消息是中文的，
+ *  en 下别直接抛出去；其余状态**必须**把服务端 message 带出来：partial 的「缺了哪几条」
+ *  和 failed 的真实原因都只在那句话里，吞掉它用户就只看到一个没有下一步的状态词。 */
+function repairStatusText(tr: ReturnType<typeof useT>, item: RedirectRepairItem): string {
+  if (item.status === 'fixed') return tr('botDefaults.sgTagRepairStatusFixed');
+  if (item.status === 'unchanged') return tr('botDefaults.sgTagRepairStatusUnchanged');
+  const label = item.status === 'partial'
+    ? tr('botDefaults.sgTagRepairStatusPartial')
+    : item.status === 'not_owned'
+      ? tr('botDefaults.sgTagRepairStatusNotOwned')
+      : tr('botDefaults.sgTagRepairStatusFailed');
+  const detail = item.message
+    || (item.missingRedirectUrls?.length ? item.missingRedirectUrls.join('、') : '');
+  return detail ? tr('botDefaults.sgTagRepairStatusDetail', { status: label, detail }) : label;
+}
+
 /** 会话群标签行（p2pMode=group 时显示）：tag mode 选择器 + 按模式分支的
  *  授权 UI（PR review：授权行必须与实际 tagMode 一致）。
  *  - feed-group（默认）：个人侧边栏分组，需一次 OAuth → 显示状态徽标 + 一键授权
@@ -4219,10 +4315,17 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
  *  → 本行轮询到 authorized 后徽标变绿。 */
 export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
-  const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
+  const [status, setStatus] = useState<
+    { authorized: boolean; tagMode: string; tagName: string; defaultTagName: string } | null
+  >(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 标签名输入框：受控 state 与已保存值分离——用户敲字期间不能被状态轮询回填覆盖，
+  // 所以只在挂载/切 bot/保存成功这三个时机同步 nameInput。
+  const [nameInput, setNameInput] = useState('');
+  const [nameBusy, setNameBusy] = useState(false);
+  const [nameStatus, setNameStatus] = useState<StatusMessage>(null);
   // Remote-callback paste fallback (mirrors groups-page / sessions-page): when
   // set, the overlay is shown so a browser that can't reach the daemon's
   // 127.0.0.1:9768 loopback (远程 VM / 中心化平台 m-* 子域访问) can still finish
@@ -4230,13 +4333,32 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const [authUrl, setAuthUrl] = useState('');
   const [callbackUrl, setCallbackUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // 回调白名单（redirect URL）修复：与授权状态是两件事，所以自成一组 state。
+  // feedback=null 表示「没什么要说的」；login_required 渲染成一条可点提示。
+  const [repairFeedback, setRepairFeedback] = useState<
+    { kind: 'login_required' } | { kind: 'error'; message: string } | { kind: 'done'; items: RedirectRepairItem[] } | null
+  >(null);
+  const [repairBusy, setRepairBusy] = useState(false);
+  /** 勾上 = 修复请求不带 appIds，服务端按「全部可修复的 bot」处理。 */
+  const [repairAll, setRepairAll] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+  /** 授权轮询 3s×60 跑完仍未授权 —— 大概率是白名单缺条目导致飞书直接报 20029。 */
+  const [authTimedOut, setAuthTimedOut] = useState(false);
   const lifecycle = useRef({ generation: 0, mounted: true });
 
-  const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
+  const fetchStatus = async (generation = lifecycle.current.generation, syncNameInput = false): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
       if (lifecycle.current.mounted && generation === lifecycle.current.generation && res.ok && res.body.ok) {
-        setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'feed-group') });
+        const tagName = String(res.body.tagName ?? '');
+        setStatus({
+          authorized: !!res.body.authorized,
+          tagMode: String(res.body.tagMode ?? 'feed-group'),
+          tagName,
+          defaultTagName: String(res.body.defaultTagName ?? ''),
+        });
+        // 只有首屏/切 bot 才回填输入框——授权轮询期间用户可能正在里面打字。
+        if (syncNameInput) setNameInput(tagName);
         return !!res.body.authorized;
       }
     } catch { /* transient */ }
@@ -4255,7 +4377,16 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     setAuthUrl('');
     setCallbackUrl('');
     setSubmitting(false);
-    void fetchStatus(generation);
+    // 修复结果是 per-bot 的，换 bot 后留在屏幕上会指鹿为马。
+    setRepairFeedback(null);
+    setRepairBusy(false);
+    setRepairAll(false);
+    setLoginOpen(false);
+    setAuthTimedOut(false);
+    setNameInput('');
+    setNameBusy(false);
+    setNameStatus(null);
+    void fetchStatus(generation, true);
     return () => {
       lifecycle.current.mounted = false;
       lifecycle.current.generation += 1;
@@ -4273,7 +4404,12 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
       if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
-        setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
+        setStatus(s => ({
+          authorized: s?.authorized ?? false,
+          tagMode: String(res.body.tagMode),
+          tagName: String(res.body.tagName ?? s?.tagName ?? ''),
+          defaultTagName: String(res.body.defaultTagName ?? s?.defaultTagName ?? ''),
+        }));
       } else {
         setErr(responseErrorText(res));
       }
@@ -4286,12 +4422,91 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     }
   }
 
+  /** 标签名保存（失焦 / 回车）。留空 = 清除配置回默认名，所以空串也要发请求。
+   *  与 saveMode 同一条 per-bot 写入通路（PUT session-group-tag-config），同样用
+   *  generation 挡掉切 bot 后才回来的慢响应。 */
+  async function saveName(): Promise<void> {
+    const generation = lifecycle.current.generation;
+    const next = nameInput.trim();
+    // 与已保存值一致就别打接口了——失焦事件比真正的改动频繁得多。
+    if (next === (status?.tagName ?? '')) {
+      setNameInput(next);
+      return;
+    }
+    setNameBusy(true);
+    setNameStatus(null);
+    setErr(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { name: next });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      if (res.ok && res.body.ok) {
+        const saved = String(res.body.tagName ?? '');
+        setStatus(s => ({
+          authorized: s?.authorized ?? false,
+          tagMode: String(res.body.tagMode ?? s?.tagMode ?? 'feed-group'),
+          tagName: saved,
+          defaultTagName: String(res.body.defaultTagName ?? s?.defaultTagName ?? ''),
+        }));
+        // 服务端可能做了 trim/截断——回填成真正存下来的那个值。
+        setNameInput(saved);
+        setNameStatus({ text: tr('botDefaults.sgTagNameSaved'), ok: true });
+      } else {
+        setNameStatus({ text: responseErrorText(res), ok: false });
+      }
+    } catch (e: any) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setNameStatus({ text: caughtErrorText(e), ok: false });
+      }
+    } finally {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setNameBusy(false);
+    }
+  }
+
+  /** 手动「修复配置」：勾了「顺便补齐其它 bot」就发全量请求。缺登录态时不报错，
+   *  直接弹现成的 FeishuLoginModal 扫码，扫完由 onSuccess 再跑一遍本函数。 */
+  async function repairRedirects(): Promise<void> {
+    if (repairBusy) return;
+    const generation = lifecycle.current.generation;
+    setRepairBusy(true);
+    setRepairFeedback(null);
+    const outcome = await callRepairRedirects(repairAll ? undefined : [props.bot.larkAppId]);
+    if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+    setRepairBusy(false);
+    if (outcome.kind === 'login_required') {
+      setLoginOpen(true);
+      return;
+    }
+    setRepairFeedback(outcome.kind === 'ok'
+      ? { kind: 'done', items: outcome.items }
+      : { kind: 'error', message: outcome.message });
+  }
+
   async function startAuth(): Promise<void> {
     const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
     setCallbackUrl('');
+    setAuthTimedOut(false);
+    setRepairFeedback(null);
+    // 静默修复期间「修复配置」也置灰：两条链路打的是同一个 single-flight 接口，
+    // 同时点只会让后一个吃 409。这也顺手接管了可能还挂着的手动修复的 busy 态
+    //（它的提交守卫已被上面那次 ++generation 判失效）。
+    setRepairBusy(true);
     try {
+      // 先静默补一次 redirect 白名单：白名单里没有本次要用的回调地址时，飞书授权页
+      // 会直接报 20029（「重定向 URL 有误」），用户连登录都进不去。但这一步只是
+      // 「提高成功率」，绝不能挡住授权本身 —— 缺登录态 / 已有一批在跑 / 网络失败 /
+      // 15s 超时，一律照常往下开授权页，只在区块里留一条提示。
+      const repaired = await callRepairRedirects([props.bot.larkAppId]);
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      setRepairBusy(false);
+      if (!repairFullySucceeded(repaired)) {
+        setRepairFeedback(repaired.kind === 'login_required'
+          ? { kind: 'login_required' }
+          : repaired.kind === 'error'
+            ? { kind: 'error', message: repaired.message }
+            : { kind: 'done', items: repaired.items });
+      }
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
       // A bot switch while the POST was in flight must neither surface the old
       // bot's error nor open the old bot's authorization page in a new tab.
@@ -4329,12 +4544,21 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           return;
         }
       }
+      // 轮询跑满仍未授权。最常见的哑失败是白名单缺回调地址 —— 飞书页面直接报
+      // 「重定向 URL 有误 / 20029」，用户根本没机会点同意，这里是唯一能把它翻译成
+      // 人话（并给出「修复配置」+ 安全设置深链）的地方。不当错误报：远程粘贴场景
+      // 本来就轮询不到，弹窗仍留着等用户粘贴。
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthTimedOut(true);
     } catch (e: any) {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
         setErr(caughtErrorText(e));
       }
     } finally {
-      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setAuthBusy(false);
+        // 走到 catch 分支（sendJson 抛了）时上面那次 setRepairBusy(false) 可能没执行到。
+        setRepairBusy(false);
+      }
     }
   }
 
@@ -4396,6 +4620,37 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     { value: 'chat-tag', label: tr('botDefaults.sgTagModeChatTag') },
     { value: 'off', label: tr('botDefaults.sgTagModeOff') },
   ];
+  // 开放平台「安全设置」深链：白名单就配在这一页。larkConsoleUrl 对非 cli_ 前缀的
+  // 合成 appId 返回 null（core-only bot / 首屏占位），拼不出来就不给这个入口。
+  const consoleUrl = larkConsoleUrl(props.bot.larkAppId, props.bot.brand);
+  const safeSettingsUrl = consoleUrl ? `${consoleUrl}/safe` : null;
+
+  const repairButton = (
+    <button
+      type="button"
+      className="bd-sg-repair-link"
+      data-action="session-group-tag-repair"
+      disabled={repairBusy}
+      onClick={() => void repairRedirects()}
+    >
+      {repairBusy ? tr('botDefaults.sgTagRepairBusy') : tr('botDefaults.sgTagRepairEntry')}
+    </button>
+  );
+
+  // 授权轮询超时后的诊断：弹窗开着时挂在弹窗里（用户正盯着它），弹窗被取消后落回
+  // 行内，两处共用同一份节点，文案只维护一遍。
+  const authTimeoutDiagnostic = (
+    <p className="bd-sg-repair-hint" data-sg-tag-auth-timeout>
+      <span>{tr('botDefaults.sgTagAuthTimeoutHint')}</span>
+      {repairButton}
+      {safeSettingsUrl ? (
+        <a className="bd-console-link" href={safeSettingsUrl} target="_blank" rel="noopener noreferrer">
+          {tr('botDefaults.sgTagAuthTimeoutOpenSafe')}
+        </a>
+      ) : null}
+    </p>
+  );
+
   return (
     <div className="bd-row" data-session-group-tag-row>
       <div className="bd-field">
@@ -4428,11 +4683,92 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
                   {authBusy ? tr('botDefaults.sgTagAuthWaiting') : tr('botDefaults.sgTagAuthStart')}
                 </button>
               )}
+              {/* 次级入口：只补开放平台的回调白名单，不动授权本身。授权前点它可以
+                  规避 20029，授权后点它（勾上下面的复选框）可以顺手补齐其它 bot。 */}
+              {repairButton}
+              <label className="bd-sg-repair-all">
+                <input
+                  type="checkbox"
+                  data-input="sessionGroupTagRepairAll"
+                  checked={repairAll}
+                  disabled={repairBusy}
+                  onChange={event => setRepairAll(event.currentTarget.checked)}
+                />
+                {tr('botDefaults.sgTagRepairAllLabel')}
+              </label>
             </>
           )}
           {err && <span className="status-error">✗ {err}</span>}
         </div>
+        {/* 标签名：off 模式下不打标签，输入框无意义。placeholder 显示留空时实际
+            生效的默认名（「<bot 名>会话」），让用户一眼看懂「不填等于什么」。 */}
+        {tagMode !== 'off' ? (
+          <div className="bd-sg-tag-name" data-sg-tag-name-row>
+            <label htmlFor="sg-tag-name-input">{tr('botDefaults.sgTagName')}</label>
+            <input
+              id="sg-tag-name-input"
+              type="text"
+              data-input="sessionGroupTagName"
+              aria-label={tr('botDefaults.sgTagName')}
+              placeholder={status?.defaultTagName ?? ''}
+              maxLength={MAX_SG_TAG_NAME_LENGTH}
+              value={nameInput}
+              disabled={nameBusy || !status}
+              onChange={event => {
+                setNameInput(event.currentTarget.value);
+                setNameStatus(null);
+              }}
+              onBlur={() => void saveName()}
+              onKeyDown={event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                event.currentTarget.blur();
+              }}
+            />
+            <StatusSpan status={nameStatus} attr={{ 'data-sg-tag-name-status': '' }} />
+            <small className="bd-sg-tag-name-hint">
+              {tr('botDefaults.sgTagNameHint', { name: status?.defaultTagName ?? '' })}
+            </small>
+          </div>
+        ) : null}
+        {tagMode === 'feed-group' && repairFeedback ? (
+          <div className="bd-sg-repair-hint" data-sg-tag-repair-feedback={repairFeedback.kind}>
+            {repairFeedback.kind === 'login_required' ? (
+              // 「不阻塞」的落点：授权照常开，这里只提示还差一次扫码。点它 → 弹现成
+              // 的 FeishuLoginModal，扫完自动重跑修复。
+              <button
+                type="button"
+                className="bd-sg-repair-link"
+                data-action="session-group-tag-repair-login"
+                onClick={() => setLoginOpen(true)}
+              >
+                {tr('botDefaults.sgTagRepairNeedLogin')}
+              </button>
+            ) : repairFeedback.kind === 'error' ? (
+              <span>{tr('botDefaults.sgTagRepairFailed', { reason: repairFeedback.message })}</span>
+            ) : (
+              repairFeedback.items.map(item => (
+                <span key={item.appId} data-sg-tag-repair-item={item.status}>
+                  {`${item.appId}: ${repairStatusText(tr, item)}`}
+                </span>
+              ))
+            )}
+          </div>
+        ) : null}
+        {authTimedOut && !authUrl ? authTimeoutDiagnostic : null}
       </div>
+      {loginOpen ? (
+        <FeishuLoginModal
+          onClose={() => setLoginOpen(false)}
+          onSuccess={() => {
+            // 扫码拿到的登录态与批量修复读的是同一份 ~/.botmux/feishu-session.json
+            // （FeishuLoginManager 与 prepareFeishuWebSession 共用该文件），所以扫完
+            // 直接重试即可，不需要再让用户点一次。
+            setLoginOpen(false);
+            void repairRedirects();
+          }}
+        />
+      ) : null}
       {authUrl && typeof document !== 'undefined' ? (
         // Portal 到 body:此弹层内联渲染在 .page 页面容器的 DOM 里,而 .page 有
         // `animation: dashboard-page-enter … both`——fill-mode:both 使动画结束后
@@ -4459,6 +4795,7 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
                   onChange={event => setCallbackUrl(event.currentTarget.value)}
                 />
               </label>
+              {authTimedOut ? authTimeoutDiagnostic : null}
               <div className="actions">
                 <button
                   type="button"

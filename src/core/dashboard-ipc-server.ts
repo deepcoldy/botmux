@@ -205,6 +205,7 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
@@ -3963,6 +3964,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    thinkingCard: cardPrefs.thinkingCard,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
@@ -4009,7 +4011,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     usageDisplay?: unknown;
-    disableStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    disableStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
@@ -4020,7 +4022,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     usageDisplay?: UsageDisplayMode;
-    disableStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    disableStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
@@ -4034,6 +4036,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
@@ -4603,46 +4606,75 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
   }
 });
 
-// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）。
+// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）+ 标签名。
+// tagName = 用户配置的自定义名（没配就是空串）；defaultTagName = 留空时实际生效的
+// 默认名「<bot 显示名>会话」，Dashboard 拿它做输入框 placeholder。
 ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
     const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
-    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group' });
+    jsonRes(res, 200, {
+      ok: true,
+      ...status,
+      tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group',
+      tagName: cfg.sessionGroup?.tag?.name ?? '',
+      defaultTagName: defaultSessionTagName(cachedLarkAppId),
+    });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
 });
 
-// PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
-// selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
-// 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
-// 'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）|
-// 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更内存注册表，与
-// /botconfig 同一持久化通道。
+// PUT /api/session-group-tag-config — 会话群标签模式 + 标签名（Dashboard 的
+// 「会话群标签」区块，PR review：授权行必须与实际 tagMode 一致）。
+// Body `{ mode?, name? }`，两者都可单独提交（Dashboard 下拉只发 mode、输入框只发
+// name），但至少要带一个：
+//   mode: 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
+//         'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）| 'off'
+//   name: 自定义标签名；trim 后为空 = 删掉该字段回默认名「<bot 显示名>会话」。
+//         超长按码点保守截断（clampSessionTagName），存进去的就是实际生效的。
+// 写 bots.json 的 sessionGroup.tag 并热更内存注册表，与 /botconfig 同一持久化通道。
 ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { mode?: unknown };
-  try { body = await readJsonBody<{ mode?: unknown }>(req); }
+  let body: { mode?: unknown; name?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown; name?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const hasMode = body.mode !== undefined && body.mode !== null;
+  const hasName = body.name !== undefined && body.name !== null;
   const mode = body.mode === 'chat-tag' || body.mode === 'feed-group' || body.mode === 'off'
     ? body.mode : undefined;
-  if (!mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  if (hasMode && !mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  if (hasName && typeof body.name !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_name' });
+  // 一个字段都没带 → 沿用原来的 invalid_mode（老 dashboard 只发 mode，语义不变）。
+  if (!hasMode && !hasName) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  const name = hasName ? clampSessionTagName(body.name as string) : undefined;
   try {
     const bot = getBot(cachedLarkAppId);
     const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
       if (!entry.sessionGroup || typeof entry.sessionGroup !== 'object') entry.sessionGroup = {};
       if (!entry.sessionGroup.tag || typeof entry.sessionGroup.tag !== 'object') entry.sessionGroup.tag = {};
-      entry.sessionGroup.tag.mode = mode;
+      if (mode) entry.sessionGroup.tag.mode = mode;
+      if (hasName) {
+        if (name) entry.sessionGroup.tag.name = name;
+        else delete entry.sessionGroup.tag.name; // 留空 = 清配置回默认，bots.json 保持干净
+      }
       return { write: true, result: mode };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-    bot.config.sessionGroup = {
-      ...(bot.config.sessionGroup ?? {}),
-      tag: { ...(bot.config.sessionGroup?.tag ?? {}), mode },
-    };
-    jsonRes(res, 200, { ok: true, tagMode: mode });
+    const tag = { ...(bot.config.sessionGroup?.tag ?? {}) };
+    if (mode) tag.mode = mode;
+    if (hasName) {
+      if (name) tag.name = name;
+      else delete tag.name;
+    }
+    bot.config.sessionGroup = { ...(bot.config.sessionGroup ?? {}), tag };
+    jsonRes(res, 200, {
+      ok: true,
+      tagMode: tag.mode ?? 'feed-group',
+      tagName: tag.name ?? '',
+      defaultTagName: defaultSessionTagName(cachedLarkAppId),
+    });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }

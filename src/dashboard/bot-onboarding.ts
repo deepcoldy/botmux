@@ -69,6 +69,14 @@ export interface BotOnboardingPermission {
   eventMode?: number;
   /** Exact baseline event + callback count ACK for MOSA-managed activation. */
   verifiedEventCount?: number;
+  /**
+   * redirect 白名单是否写成功。**独立于 ok**：权限/发版全绿但白名单没写上时，这个
+   * bot 一点授权就 20029（群聊模式 / 会话群标签 / `/login` 全都用不了），前端必须
+   * 能把这一步单独讲出来，不能被一句「权限配置完成」盖过去。
+   */
+  redirectConfigured?: boolean;
+  /** redirect 白名单未配置成功的原因。 */
+  redirectWarning?: string;
   /** 失败原因 / 信息 (失败时给出手动步骤) */
   reason?: string;
   message?: string;
@@ -1525,6 +1533,9 @@ export class BotOnboardingManager {
       subscribedEventCount: MANAGED_VERIFIED_EVENT_COUNT,
       missingVcEvents: [],
       eventModeReady: true,
+      // 这份 ACK 是从权限台账重建的，本次并没有碰 redirect 白名单。宁可报「没配」
+      // 让人去核一眼，也不能凭空报「配好了」——那正是 20029 静默失败的来源。
+      redirectConfigured: false,
       eventMode: managedPermission.eventMode,
       verifiedEventCount: managedPermission.verifiedEventCount,
       versionId: managedPermission.versionId,
@@ -1888,6 +1899,8 @@ export class BotOnboardingManager {
           callbacks,
           sessionFilePath,
           meta.requireVerifiedEvents,
+          // compat 路径同样是「刚注册出来的新应用」（registerWithSdk），白名单必然为空。
+          true,
         );
       }
       const first = await this.automateOpenPlatform({
@@ -1899,6 +1912,10 @@ export class BotOnboardingManager {
         disableQrLogin: meta.registrationMode === 'web',
         disableBytedcliFallback: meta.registrationMode === 'web',
         requireVerifiedEvents: meta.requireVerifiedEvents,
+        // 这条链路只在 run() 的建应用流程里被调到（应用几分钟前刚由本任务创建），
+        // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
+        // runPermissionRecovery，那边不传。
+        appJustCreated: true,
         ...callbacks,
       });
       return first;
@@ -1996,6 +2013,7 @@ export class BotOnboardingManager {
     callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onQrScanConfirmed' | 'onStatus'>,
     sessionFilePath: string,
     requireVerifiedEvents: boolean,
+    appJustCreated = false,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2006,6 +2024,7 @@ export class BotOnboardingManager {
         disableQrLogin: false,
         disableBytedcliFallback: true,
         requireVerifiedEvents,
+        appJustCreated,
         ...callbacks,
       });
     } finally {
@@ -2035,6 +2054,9 @@ export class BotOnboardingManager {
           scopeWarning: auto.scopeWarning,
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
+          // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
         }
       : {
           ok: false,
@@ -2043,6 +2065,8 @@ export class BotOnboardingManager {
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
           versionId: auto.versionId,
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
         };
     this.patch(id, {
       status,

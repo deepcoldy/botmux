@@ -48,6 +48,9 @@ export interface ConfigFieldSpec {
   effect: ConfigEffect;
   /** 是否支持 `/config unset <field>`（清回默认）。boolean 字段用 `set off` 即可，无需 unset。 */
   clearable: boolean;
+  /** kind==='boolean' 且默认值为 ON 的字段：持久化取反（只写显式 false，true
+   *  删 key），展示时缺省渲染为 on。缺省（undefined）保持默认 OFF 语义。 */
+  defaultOn?: boolean;
   /** kind==='enum' 时的合法取值（已小写）。 */
   enumValues?: readonly string[];
   /** kind==='string' 的最大长度（trim 后计），超出 coerce 报 too_long。缺省不限。 */
@@ -80,6 +83,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
+  { key: 'thinkingCard', configKey: 'thinkingCard', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；当前支持 claude-code / codex）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -125,7 +129,7 @@ export function parseBooleanValue(raw: string): boolean | undefined {
 
 /** 展示某字段当前值的人类可读文本。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
-  if (spec.kind === 'boolean') return value === true ? 'on' : 'off';
+  if (spec.kind === 'boolean') return (spec.defaultOn ? value !== false : value === true) ? 'on' : 'off';
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
@@ -228,8 +232,12 @@ export async function applyConfigField(
     if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
-      // 与 parseBotConfigsFromText 一致：true 才写，false → 删 key（bots.json 保持干净）。
-      if (effective === true) entry[spec.configKey] = true;
+      // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
+      // false 删 key；默认 ON（defaultOn）的字段 false 才写、true 删 key。
+      if (spec.defaultOn) {
+        if (effective === false) entry[spec.configKey] = false;
+        else delete entry[spec.configKey];
+      } else if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
     } else if (spec.kind === 'json') {
       entry[spec.configKey] = effective as any;
@@ -244,7 +252,9 @@ export async function applyConfigField(
   if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
-    (bot.config as any)[spec.configKey] = effective || undefined;
+    (bot.config as any)[spec.configKey] = spec.defaultOn
+      ? (effective === false ? false : undefined)
+      : (effective || undefined);
   } else if (spec.kind === 'json') {
     (bot.config as any)[spec.configKey] = effective;
   } else {

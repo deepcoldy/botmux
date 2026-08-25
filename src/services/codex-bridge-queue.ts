@@ -40,7 +40,7 @@
  *     reached either terminal edge.
  */
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
-import type { CodexBridgeEvent } from './codex-transcript.js';
+import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
 
 const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
 const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
@@ -110,6 +110,10 @@ export class CodexBridgeQueue {
   private seen = new Set<string>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
+  /** Cosmetic observer for 'cot' events attributed to the collecting turn —
+   *  feeds the native CoT (thinking process) message. Never affects
+   *  attribution or lifecycle; exceptions are swallowed at the call site. */
+  private cotObserver?: (entries: readonly CodexCotEntry[], turn: CodexPendingTurn) => void;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
@@ -374,6 +378,11 @@ export class CodexBridgeQueue {
     });
     return activeRemaining.length > 0 ? Math.max(...activeRemaining) : undefined;
   }
+  /** Register the CoT observer (see field doc). */
+  setCotObserver(fn: (entries: readonly CodexCotEntry[], turn: CodexPendingTurn) => void): void {
+    this.cotObserver = fn;
+  }
+
   /** Process newly-appended events. Idempotent on uuid: events with seen
    *  uuids are skipped, so callers can replay safely. */
   ingest(events: CodexBridgeEvent[]): void {
@@ -420,6 +429,16 @@ export class CodexBridgeQueue {
   }
 
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    if (ev.kind === 'cot') {
+      // Cosmetic thinking-timeline record. Only meaningful while a turn is
+      // collecting; history replay / unmatched events are dropped (never
+      // buffered — a late replay into the wrong turn is worse than a gap).
+      if (this.collecting && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+        try { this.cotObserver(ev.cotEntries, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+      }
+      return;
+    }
     if (ev.kind === 'user') {
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),

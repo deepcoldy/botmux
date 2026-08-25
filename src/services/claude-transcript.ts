@@ -317,6 +317,83 @@ export function extractAssistantText(event: TranscriptEvent): string {
   return parts.join('\n\n');
 }
 
+/**
+ * Extract the model's thinking (CoT) text from one assistant event. Walks all
+ * `type:'thinking'` blocks in `message.content` and joins them with blank
+ * lines. Returns '' when the event carries no thinking blocks. Sidechain /
+ * error filtering is the caller's job (bridge-turn-queue already applies it
+ * before attribution).
+ */
+export function extractAssistantThinking(event: TranscriptEvent): string {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block && (block as any).type === 'thinking' && typeof (block as any).thinking === 'string' && (block as any).thinking.length > 0) {
+      parts.push((block as any).thinking);
+    }
+  }
+  return parts.join('\n\n');
+}
+
+/** Per-entry truncation caps for the CoT tool timeline. Tool args (Write
+ *  contents, long prompts) and results (file reads, command output) can be
+ *  hundreds of KB — the bubble only needs a recognisable preview. */
+const COT_TOOL_ARGS_MAX_CHARS = 600;
+const COT_TOOL_RESULT_MAX_CHARS = 800;
+
+function truncateForCot(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** One node of the native CoT message. Mirrors `CotEntry` in types.ts —
+ *  redeclared structurally here to keep this module dependency-free. */
+export type TranscriptCotEntry =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | { kind: 'tool_result'; id: string; result: string };
+
+/** Flatten a tool_result block's content (string, or array of text blocks)
+ *  to a display string. Non-text blocks (images) are skipped. */
+function stringifyToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b: any) => b.text)
+    .join('\n');
+}
+
+/**
+ * Extract the CoT (thinking process) entries from one transcript event, in
+ * content-block order:
+ *   - assistant events → `thinking` blocks and `tool_use` blocks
+ *     (id + name + JSON-stringified input, truncated);
+ *   - user events → `tool_result` blocks (tool_use_id + flattened text,
+ *     truncated).
+ * Returns [] for events carrying neither. Sidechain / error filtering is the
+ * caller's job (bridge-turn-queue applies it before attribution).
+ */
+export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return [];
+  const entries: TranscriptCotEntry[] = [];
+  for (const block of content as any[]) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
+      entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+      let args = '';
+      try { args = block.input === undefined ? '' : JSON.stringify(block.input); } catch { /* unserialisable input — show none */ }
+      entries.push({ kind: 'tool_call', id: block.id, name: block.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) });
+    } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+      const result = stringifyToolResultContent(block.content);
+      entries.push({ kind: 'tool_result', id: block.tool_use_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) });
+    }
+  }
+  return entries;
+}
+
 /** Convenience: filter+extract a list of events into a single concatenated string. */
 export function joinAssistantText(events: TranscriptEvent[]): string {
   return pickAssistantTextEvents(events)

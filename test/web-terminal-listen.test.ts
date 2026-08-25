@@ -111,10 +111,53 @@ describe('listenWebTerminalWithFallback', () => {
     expect(logs.some((line) => line.includes('retrying with random port'))).toBe(true);
   });
 
-  it('rejects (does not fall back) for non-EADDRINUSE errors', async () => {
+  it('falls back to a random port when the preferred port is winnat-reserved (EACCES)', async () => {
+    // Windows-specific regression: a persisted webPort that lands in a
+    // winnat/Hyper-V reserved TCP range binds with EACCES (not EADDRINUSE) after
+    // a reboot re-randomizes the reservations. The previous condition only
+    // recovered from EADDRINUSE, so EACCES fell through to reject → the worker
+    // exited code 1 with "listen EACCES: permission denied 0.0.0.0:<port>" and
+    // the bot could receive messages but never start a session. Simulate the
+    // reserved-port EACCES on the first bind, then let the fallback bind.
     const { httpServer, wss } = makePair();
-    // No preferredPort → an invalid host triggers a non-EADDRINUSE error which
-    // must reject rather than silently retry.
+    const originalListen = httpServer.listen;
+    let listenCalls = 0;
+
+    httpServer.listen = ((...args: Parameters<Server['listen']>) => {
+      listenCalls++;
+      if (listenCalls === 1) {
+        const err = Object.assign(new Error('listen EACCES: permission denied 0.0.0.0:58634'), {
+          code: 'EACCES',
+          errno: -4092,
+          syscall: 'listen',
+          address: '0.0.0.0',
+          port: 58634,
+        }) as NodeJS.ErrnoException;
+        process.nextTick(() => httpServer.emit('error', err));
+        return httpServer;
+      }
+      return Reflect.apply(originalListen, httpServer, args) as Server;
+    }) as Server['listen'];
+
+    const logs: string[] = [];
+    const boundPort = await listenWebTerminalWithFallback({
+      httpServer,
+      wss,
+      host: '127.0.0.1',
+      preferredPort: 58634,
+      log: (msg) => logs.push(msg),
+    });
+
+    expect(listenCalls).toBe(2);
+    expect(boundPort).toBeGreaterThan(0);
+    expect(boundPort).not.toBe(58634);
+    expect(logs.some((line) => line.includes('unavailable (EACCES)'))).toBe(true);
+  });
+
+  it('rejects (does not fall back) for errors that are neither EADDRINUSE nor EACCES', async () => {
+    const { httpServer, wss } = makePair();
+    // No preferredPort → an invalid host triggers a non-recoverable error
+    // (e.g. EADDRNOTAVAIL) which must reject rather than silently retry.
     await expect(
       listenWebTerminalWithFallback({ httpServer, wss, host: '203.0.113.1', preferredPort: undefined }),
     ).rejects.toBeTruthy();

@@ -110,6 +110,20 @@ function agentMessage(text: string, phase: 'commentary' | 'final_answer' = 'comm
   };
 }
 
+// Dialect that dropped the `phase` field (cf. codex >= 0.146): the record
+// carries no phase at all, so commentary and final are byte-identical.
+function agentMessageNoPhase(text: string) {
+  return {
+    timestamp: '2000-01-01T00:00:02.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'agent_message',
+      message: text,
+      memory_citation: null,
+    },
+  };
+}
+
 function taskCompleteWithError(error: unknown, lastAgentMessage?: string) {
   return {
     timestamp: '2000-01-01T00:00:03.000Z',
@@ -669,6 +683,214 @@ describe('drainTraexRollout', () => {
       kind: 'assistant_final',
       text: '这是最终答案',
     }));
+  });
+
+  it('reconstructs the final from the last item_completed AgentMessage item (0.201.4+ assistant dialect)', () => {
+    // Symmetric to the UserMessage user dialect: TraeX 0.201.4+ can emit the
+    // assistant message as an item_completed AgentMessage item. The LAST one
+    // is the final candidate; mid-turn items are overwritten.
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent-mid',
+        content: [{ type: 'Text', text: 'mid-turn progress' }],
+      }, undefined, '2000-01-01T00:00:02.000Z')),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent-final',
+        content: [{ type: 'Text', text: '这是最终答案' }],
+      }, undefined, '2000-01-01T00:00:02.500Z')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
+  it('accepts the output_text block shape in an AgentMessage item (upstream Responses API dialect)', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'output_text', text: '这是最终答案' }],
+      })),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
+  it('reconstructs an AgentMessage item final in adopt mode (real transcript text, not synthesis)', () => {
+    // Like the final_answer-phase reconstruction, an AgentMessage item is the
+    // model's real transcript answer — safe in BOTH modes. adopt is in fact
+    // the mode where it matters most: drain is the only channel to Lark.
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'Text', text: '这是最终答案' }],
+      })),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
+  it('does not treat an item_completed AgentMessage item as a user turn start', () => {
+    // Regression guard for the #997 boundary: only UserMessage items start a
+    // turn; AgentMessage items are assistant-side and must not emit a user
+    // event even when they carry text.
+    writeFileSync(path, [
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'Text', text: 'assistant text' }],
+      })),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toHaveLength(0);
+  });
+
+  it('reconstructs the final from the last phase-less agent_message (phase-dropped dialect, cf. codex >= 0.146)', () => {
+    // A dialect that dropped the `phase` field makes commentary and final
+    // byte-identical; the last phase-less agent_message is the best final
+    // candidate.
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessageNoPhase('中间 commentary')),
+      line(agentMessageNoPhase('这是最终答案')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
+  it('prefers a final_answer-phase agent_message over a phase-less fallback candidate', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessageNoPhase('别的候选')),
+      line(agentMessage('真正的最终答案', 'final_answer')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '真正的最终答案',
+    }));
+  });
+
+  it('prefers an AgentMessage item over a phase-less agent_message candidate', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessageNoPhase('phase-less 候选')),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'Text', text: 'item 候选' }],
+      })),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'item 候选',
+    }));
+  });
+
+  it('recognises deliberate silence in a phase-less agent_message (sentinel, not a false final)', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessageNoPhase('已通过 botmux send 回报。BOTMUX_NO_REPLY')),
+      line(taskComplete()),
+    ].join(''));
+
+    // Non-adopt: synthesise the bare sentinel the fallback gate treats as
+    // genuine silence instead of posting the narration as the final.
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'BOTMUX_NO_REPLY',
+    }));
+    // Adopt: no synthesis (verbatim contract) — the empty final stays empty.
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '',
+    }));
+  });
+
+  it('recognises deliberate silence in an item_completed AgentMessage item (sentinel, not a false final)', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'Text', text: '已通过 botmux send 回报。BOTMUX_NO_REPLY' }],
+      })),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'BOTMUX_NO_REPLY',
+    }));
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '',
+    }));
+  });
+
+  it('retains the phase-less agent_message candidate across drain calls (drained before task_complete)', () => {
+    // Turns run for minutes while the poller drains on the second scale: the
+    // phase-less candidate and the task_complete almost never share a drain.
+    const firstBatch = line(user('long-running turn'))
+      + line(agentMessageNoPhase('这是最终答案'));
+    writeFileSync(path, firstBatch);
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    appendFileSync(path, line(taskComplete()));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: '这是最终答案' }),
+    ]);
+  });
+
+  it('a probe re-drain does not consume the AgentMessage item final candidate', () => {
+    // The submit-confirmation probe re-drains the same live rollout; its
+    // item_completed processing must not record (or clear) the assistant
+    // candidate the production drainer is holding for the still-open turn.
+    const firstBatch = line(user('long turn'))
+      + line(itemCompleted({
+        type: 'AgentMessage',
+        id: 'msg-agent',
+        content: [{ type: 'Text', text: '这是最终答案' }],
+      }));
+    writeFileSync(path, firstBatch);
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    // Submit-confirmation probe re-drains the same rollout.
+    expect(traexRolloutHasUserInputSince(path, 0, 'long turn')).toBe(true);
+
+    // Turn completes; the production drain must still see the cached item.
+    appendFileSync(path, line(taskComplete()));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: '这是最终答案' }),
+    ]);
   });
 
   it('a probe re-drain mid-turn does not clear the production pending state', () => {

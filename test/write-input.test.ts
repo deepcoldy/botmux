@@ -47,6 +47,7 @@ import {
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
@@ -92,6 +93,10 @@ const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
 const COCO_HISTORY_PATH = platform() === 'darwin'
   ? join(homedir(), 'Library', 'Caches', 'coco', 'history.jsonl')
   : join(homedir(), '.cache', 'coco', 'history.jsonl');
+// traecli 0.201.5+ submit log (Codex-shaped {session_id, ts, text}), shared
+// with the traex adapter. coco's writeInput polls this IN ADDITION to the
+// legacy ~/.cache/coco/history.jsonl ({content, mode:"user"}) path.
+const TRAE_HISTORY_PATH = join(homedir(), '.trae', 'cli', 'history.jsonl');
 const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
 
 function appendCodexHistory(content: string, sessionId?: string): void {
@@ -114,6 +119,16 @@ function appendCocoHistory(content: string): void {
 function resetCocoHistory(): void {
   mkdirSync(dirname(COCO_HISTORY_PATH), { recursive: true });
   writeFileSync(COCO_HISTORY_PATH, '');
+}
+
+function appendTraeHistory(content: string, sessionId = 'coco-test-session'): void {
+  mkdirSync(dirname(TRAE_HISTORY_PATH), { recursive: true });
+  appendFileSync(TRAE_HISTORY_PATH, JSON.stringify({ session_id: sessionId, ts: Date.now(), text: content }) + '\n');
+}
+
+function resetTraeHistory(): void {
+  mkdirSync(dirname(TRAE_HISTORY_PATH), { recursive: true });
+  writeFileSync(TRAE_HISTORY_PATH, '');
 }
 
 function writeClaudeKeybindings(bindings: Record<string, string>): void {
@@ -665,6 +680,44 @@ describe('writeInput: edge cases', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, '');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('cursor: submits then activates the follow-up steer action in tmux', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, 'steer this turn');
+      await vi.runAllTimersAsync();
+      await write;
+
+      expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
+      expect(pty.sendSpecialKeys.mock.calls).toEqual([
+        ['Enter'],
+        ['Enter'],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: submits then activates follow-up steering in raw PTY mode', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeRawPty();
+      const write = adapter.writeInput(pty, 'steer raw turn');
+      await vi.runAllTimersAsync();
+      await write;
+
+      expect(pty.write.mock.calls.map(c => c[0])).toEqual([
+        'steer raw turn',
+        '\r',
+        '\r',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('kimi: settles only the first write for each backend instance', async () => {
@@ -1515,8 +1568,12 @@ describe('coco writeInput submission confirmation', () => {
   // The mock records the last-pasted text and, on the first Enter (when
   // configured to confirm), writes a coco-shaped history line with that
   // content so the adapter's prefix-match path can succeed.
-  function makeCocoPasteTmuxPty(opts?: { confirmCocoSubmit?: boolean }) {
+  function makeCocoPasteTmuxPty(opts?: { confirmCocoSubmit?: boolean; historyTarget?: 'legacy' | 'trae' }) {
     const confirmCocoSubmit = opts?.confirmCocoSubmit ?? true;
+    // 'legacy' → ~/.cache/coco/history.jsonl ({content,mode:"user"}); 'trae' →
+    // ~/.trae/cli/history.jsonl ({session_id,ts,text}) — the two formats coco's
+    // dual-path confirmation must accept.
+    const historyTarget = opts?.historyTarget ?? 'legacy';
     let lastPasted = '';
     let submittedOnce = false;
     return {
@@ -1526,7 +1583,8 @@ describe('coco writeInput submission confirmation', () => {
         if (key !== 'Enter') return;
         if (!confirmCocoSubmit || submittedOnce) return;
         submittedOnce = true;
-        appendCocoHistory(lastPasted);
+        if (historyTarget === 'trae') appendTraeHistory(lastPasted);
+        else appendCocoHistory(lastPasted);
       }),
       pasteText: vi.fn((text: string) => { lastPasted = text; }),
     } satisfies PtyHandle;
@@ -1702,5 +1760,120 @@ describe('coco writeInput submission confirmation', () => {
     expect(result).toEqual({ submitted: true });
     const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
     expect(enterCalls).toBe(1);
+  });
+
+  // ── Dual-path submit confirmation (traecli 0.201.5 migration) ────────────
+  // traecli 0.201.5 moved the submit log from ~/.cache/coco/history.jsonl
+  // ({content,mode:"user"}) to $TRAE_HOME/cli/history.jsonl
+  // ({session_id,ts,text}) — the same file the traex adapter polls. Coco runs
+  // the same binary, so writeInput must poll BOTH and confirm on either.
+
+  it('confirms a submit when only the new ~/.trae/cli/history.jsonl path records it', async () => {
+    // Legacy path exists but holds no marker; the traecli 0.201.5+ path gets
+    // the {session_id,ts,text} line. Before the dual-path fix this submit
+    // false-warned submit_unconfirmed forever.
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so legacy file exists');
+    resetTraeHistory();
+    const adapter = createCocoAdapter('/bin/coco');
+    const pty = makeCocoPasteTmuxPty({ historyTarget: 'trae' });
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true });
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    const enterCalls = pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter').length;
+    expect(enterCalls).toBe(1);
+  });
+
+  it('honors TRAE_HOME for the new history path (resolved per submit, not at module load)', async () => {
+    // traeHistoryPath() must be evaluated at submit time: TRAE_HOME may be set
+    // after the adapter module loaded. Point it at a custom home and confirm
+    // the marker is found there (and not under the default ~/.trae).
+    const prevTraeHome = process.env.TRAE_HOME;
+    const customHome = join(homedir(), '.trae-coco-dual-path-test-home');
+    process.env.TRAE_HOME = customHome;
+    try {
+      resetCocoHistory();
+      appendCocoHistory('seed prior submit so legacy file exists');
+      const customHistory = join(customHome, 'cli', 'history.jsonl');
+      mkdirSync(dirname(customHistory), { recursive: true });
+      writeFileSync(customHistory, '');
+      let lastPasted = '';
+      const pty: PtyHandle = {
+        write: vi.fn(),
+        sendText: vi.fn(),
+        sendSpecialKeys: vi.fn((key: string) => {
+          if (key !== 'Enter') return;
+          appendFileSync(customHistory, JSON.stringify({ session_id: 'custom-home-session', ts: Date.now(), text: lastPasted }) + '\n');
+        }),
+        pasteText: vi.fn((text: string) => { lastPasted = text; }),
+      };
+
+      const adapter = createCocoAdapter('/bin/coco');
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(result).toEqual({ submitted: true });
+    } finally {
+      if (prevTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = prevTraeHome;
+      try { rmSync(customHome, { recursive: true, force: true }); } catch { /* memfs / absent */ }
+    }
+  });
+
+  it('fresh install: confirms via the new path when only ~/.trae/cli/history.jsonl appears', async () => {
+    // Both logs absent at submit time; CoCo creates ONLY the new-path file
+    // with our marker during the fresh-install short wait.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    try { rmSync(TRAE_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    const pty = makeCocoPasteTmuxPty({ historyTarget: 'trae' });
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('new path uses EXACT text match — a same-prefix decoy line does not confirm', async () => {
+    // The legacy path matches a 40-char PREFIX; the new path matches the full
+    // text exactly (traexHistoryMatchDelta, shared with traex). A line sharing
+    // only the prefix must NOT confirm on the new path.
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so legacy file exists');
+    resetTraeHistory();
+    const content = 'shared-prefix '.repeat(4) + 'actual submitted tail';
+    const decoy = content.slice(0, 40) + ' different tail from another pane';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendTraeHistory(decoy, 'decoy-session');
+      }),
+      pasteText: vi.fn(),
+    };
+
+    const adapter = createCocoAdapter('/bin/coco');
+    const result = await adapter.writeInput(pty, content);
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
+    expect((result as any).recheck()).toBe(false);
+  });
+
+  it('recheck closure scans both paths — a late append to the NEW path flips it to true', async () => {
+    // In-band budget exhausted with neither log holding the marker; the
+    // worker's deferred recheck must still spot a slow append on EITHER path.
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so legacy file exists');
+    resetTraeHistory();
+    const adapter = createCocoAdapter('/bin/coco');
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    const recheck = (result as any)?.recheck as () => boolean;
+    expect(typeof recheck).toBe('function');
+    expect(recheck()).toBe(false);
+    appendTraeHistory(MULTILINE, 'late-trae-session');
+    expect(recheck()).toBe(true);
   });
 });

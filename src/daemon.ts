@@ -39,6 +39,7 @@ import {
   type OverloadCardBrowser,
 } from './core/host-overload-alert.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
+import { sweepOrphanCotMessages } from './im/lark/cot-message.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -228,7 +229,7 @@ import {
 } from './core/dispatch-report-binding.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
@@ -17894,6 +17895,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
+    // /cot likewise only toggles per-chat config — never needs a session.
+    if (cmd === '/cot') {
+      await handleCotCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
+      return;
+    }
     // /term needs a live session's terminal; in a brand-new topic there's none.
     // Route here (own owner-gate inside) so the generic block below doesn't
     // pre-create a worker=null phantom session just to reply "no session".
@@ -22361,6 +22367,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore complete → /api/asks may now safely 403 unknown sessions again; a
   // reconnecting ask hook that raced the restore got retryable 503s until here.
   sessionsRestored = true;
+
+  // Close CoT thinking bubbles orphaned by the previous daemon generation
+  // (created mid-turn, never settled — their in-memory state died with the
+  // old process, so without this they spin on「执行中」forever). Scoped to
+  // THIS bot's markers: the orphan dir is shared across per-bot PM2 daemons.
+  if (selfDaemonLarkAppId) {
+    void sweepOrphanCotMessages(selfDaemonLarkAppId).catch(() => { /* cosmetic */ });
+  }
 
   // Freeze the control plane of restored mojo sessions NOW, not at their next
   // worker fork. Restore completes before the dispatcher can deliver a message,

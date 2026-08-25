@@ -43,6 +43,8 @@ const autoOk = (): OpenPlatformAutomationResult => ({
   eventModeReady: true,
   eventMode: 4,
   verifiedEventCount: 7,
+  // ok:true 的必填字段：白名单没写上时 bot 一点授权就 20029，默认桩按「写上了」。
+  redirectConfigured: true,
   versionId: 'v1',
 });
 
@@ -725,6 +727,35 @@ describe('BotOnboardingManager', () => {
     });
     // 终态清掉第二个二维码, 不残留在页面.
     expect(status?.platformQrDataUrl).toBeUndefined();
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('把 redirect 白名单状态透传到 permission，并给刚建的 app 放行盲写', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-redirect-'));
+    const calls: Array<{ appJustCreated?: boolean }> = [];
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({ ok: true, appId: 'cli_redirect', appSecret: 's', brand: 'feishu' }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async (opts) => {
+        calls.push({ appJustCreated: opts.appJustCreated });
+        // 权限/事件/发版全绿，唯独白名单没写上——这正是「建好了却一授权就 20029」。
+        return { ...autoOk(), redirectConfigured: false, redirectWarning: '写入 redirect 白名单失败: code=1 msg=rejected' };
+      },
+    });
+
+    const job = manager.start({ cliId: 'claude-code', workingDir: '~' });
+    await job.done;
+
+    // 建应用流程刚创建出这个 app，才允许白名单在读失败时覆盖写。
+    expect(calls).toEqual([{ appJustCreated: true }]);
+    // ok:true 不能把「白名单没配上」盖过去：前端要能单独把这一步讲给用户听。
+    expect(manager.get(job.id)?.permission).toMatchObject({
+      ok: true,
+      redirectConfigured: false,
+      redirectWarning: '写入 redirect 白名单失败: code=1 msg=rejected',
+    });
 
     rmSync(dir, { recursive: true, force: true });
   });
