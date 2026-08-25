@@ -2512,6 +2512,39 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-browser-tool-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart?.params.dynamicTools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'botmux_browser',
+          inputSchema: expect.objectContaining({
+            additionalProperties: false,
+            required: ['operation'],
+          }),
+        }),
+      ]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
     // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
     // routes to thread/resume, and even though the adapter still forwards

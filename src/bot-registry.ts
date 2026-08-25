@@ -27,6 +27,10 @@ import {
   normalizeExistingAppServerConfig,
   type ExistingAppServerConfig,
 } from './core/existing-app-server.js';
+import {
+  normalizeCodexBrowserConfig,
+  type CodexBrowserConfig,
+} from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
@@ -1347,6 +1351,11 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /**
+   * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
+   * backed by the locally installed Codex Chrome/Edge extension plugin.
+   */
+  codexBrowser?: CodexBrowserConfig;
   /**
    * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
    * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
@@ -2724,6 +2733,21 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    const codexBrowser = normalizeCodexBrowserConfig(
+      entry.codexBrowser,
+      `Bot config [${i}].codexBrowser`,
+    );
+    if (codexBrowser) {
+      if (entryCliId !== 'codex-app') {
+        throw new Error(`Bot config [${i}]: codexBrowser is supported only for cliId "codex-app"`);
+      }
+      if (existingAppServer) {
+        throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with existingAppServer`);
+      }
+      if (entry.sandbox === true || entry.readIsolation === true) {
+        throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with sandbox or readIsolation`);
+      }
+    }
     if (existingAppServer) {
       if (entryCliId !== 'codex' && entryCliId !== 'codex-app') {
         throw new Error(`Bot config [${i}]: existingAppServer is supported only for cliId "codex" or "codex-app"`);
@@ -3008,6 +3032,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
       sandbox: entry.sandbox === true,

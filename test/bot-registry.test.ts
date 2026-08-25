@@ -366,6 +366,30 @@ describe('parseBotConfigsFromText — brand', () => {
     }]))).toThrow(/only for cliId "codex" or "codex-app"/);
   });
 
+  it('keeps the Codex browser bridge opt-in and restricted to owned Codex App sessions', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-browser',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexBrowser: true,
+    }]));
+    expect(cfg.codexBrowser).toEqual({ enabled: true, family: 'chrome' });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-browser-cli',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      codexBrowser: true,
+    }]))).toThrow(/only for cliId "codex-app"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'isolated-browser',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexBrowser: true,
+      sandbox: true,
+    }]))).toThrow(/sandbox or readIsolation/);
+  });
+
   it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([
       {

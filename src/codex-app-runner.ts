@@ -34,6 +34,12 @@ import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
 } from './services/codex-app-token-usage.js';
+import {
+  CODEX_BROWSER_DYNAMIC_TOOL,
+  CodexBrowserBroker,
+  type DynamicToolCallParams,
+} from './services/codex-browser-broker.js';
+import type { CodexBrowserFamily } from './core/codex-browser-config.js';
 
 type JsonObject = Record<string, any>;
 
@@ -51,6 +57,8 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  browserFamily?: CodexBrowserFamily;
+  browserPluginRoot?: string;
 }
 
 interface PendingRequest {
@@ -255,6 +263,8 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
+    else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   if (!controlBootstrapPath) throw new Error(`${CODEX_APP_CONTROL_BOOTSTRAP_ENV} is required`);
@@ -288,6 +298,9 @@ function appDeveloperInstructions(args: Args): string {
       '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
       '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
+      args.browserFamily
+        ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
+        : '',
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
   }
@@ -297,6 +310,9 @@ function appDeveloperInstructions(args: Args): string {
     'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
     'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
+    args.browserFamily
+      ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
+      : '',
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }
@@ -722,6 +738,13 @@ connectControlSocket();
 
 let client!: AppServerClient;
 let threadId = args.threadId;
+const browserBroker = args.browserFamily
+  ? new CodexBrowserBroker({
+      sessionId: args.sessionId,
+      family: args.browserFamily,
+      ...(args.browserPluginRoot ? { pluginRoot: args.browserPluginRoot } : {}),
+    })
+  : undefined;
 let threadReady = false;
 let activeTurn: ActiveTurn | null = null;
 let activeTurnEpoch = 0;
@@ -901,7 +924,20 @@ function handleServerRequest(msg: JsonObject): boolean {
     return true;
   }
   if (method === 'item/tool/call') {
-    client.respond(msg.id, { contentItems: [], success: false });
+    if (!browserBroker) {
+      client.respond(msg.id, { contentItems: [], success: false });
+      return true;
+    }
+    void browserBroker.handleToolCall(msg.params as DynamicToolCallParams).then(
+      result => client.respond(msg.id, result),
+      error => client.respond(msg.id, {
+        contentItems: [{
+          type: 'inputText',
+          text: `Browser operation failed: ${error instanceof Error ? error.message : String(error)}`,
+        }],
+        success: false,
+      }),
+    );
     return true;
   }
   if (method === 'execCommandApproval' || method === 'applyPatchApproval') {
@@ -1498,6 +1534,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     // Keep Codex App's rich history in sync with turns created by this
     // external runner so the desktop UI can render follow-up messages.
     persistExtendedHistory: true,
+    ...(browserBroker ? { dynamicTools: [CODEX_BROWSER_DYNAMIC_TOOL] } : {}),
   }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/start') });
   const startedThreadId = String(started.thread.id);
   threadId = startedThreadId;
@@ -2421,6 +2458,7 @@ process.on('SIGTERM', () => {
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
+  browserBroker?.close();
   client?.close();
   process.exit(0);
 });
@@ -2429,6 +2467,7 @@ process.on('SIGINT', () => {
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
+  browserBroker?.close();
   client?.close();
   process.exit(130);
 });
