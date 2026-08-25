@@ -18,6 +18,11 @@
  *
  * Everything is best-effort and fire-and-forget: failures degrade to
  * "group created, not tagged" with a log line — never block a birth.
+ *
+ * 自愈：分组/标签是用户能在飞书里直接删掉的东西，一旦删了，缓存里的 id 就成了野
+ * 指针（feed-group 实测回 230004 group_id Not Exists），本模块会**明确**判出这类
+ * 「已不存在」错误 → 丢缓存 → 按目标名反查复用/重建 → 重试一次。见下方
+ * `isFeedGroupGone` / `isChatTagGone` 与 `HealBudget`。
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -167,6 +172,95 @@ function nudgeThrottled(appId: string): boolean {
   return false;
 }
 
+// ─── 自愈：分组 / 标签「已不存在」的判定与缓存丢弃（两种模式共用） ──────────────
+//
+// 线上真实故障：用户在飞书侧边栏手动删掉了「Botmux群会话」分组，缓存里的 ofg_xxx
+// 变成野指针，之后每次打标都被飞书判 230004（group_id Not Exists）——而这里既不清
+// 缓存也不重建，于是永久失败。下面这套判定 + forgetXxx 就是给两种模式加自愈用的。
+
+/** feed group 被删后飞书对旧 groupId 的专用错误码（msg: "group_id Not Exists"）。 */
+const FEED_GROUP_NOT_EXISTS_CODE = 230004;
+
+/** 飞书的通用「参数错误」码：细节只在 error.message 里，必须配文案才能判。 */
+const PARAM_INVALID_CODE = 230001;
+
+/**
+ * 授权 / 权限类错误码：**永远**不能被判成「目标不存在」。一次 token 过期或 scope
+ * 掉了就清缓存，会把好端端的分组/标签变成没人认领的孤儿（用户侧能看到，程序侧
+ * 再也不会往里加会话）。与 callFeedGroupApi 的 authProblem 判定同源。
+ */
+const AUTH_ERROR_CODES = [99991672, 99991679, 20027, 20005];
+
+/**
+ * 「目标实体已不存在」的错误文案特征。飞书把可操作的细节放在 msg / error.message
+ * 里（feed-group 实测就是「group_id Not Exists」），所以错误码之外再按文案兜一层。
+ * `not` / `no such` / `不存在` 这类**否定前缀是关键**：建群撞名的
+ * 「name already exists」绝不能命中，否则退避逻辑会被自愈抢走。
+ */
+const MISSING_ENTITY_MSG = /\bnot\s*exist(?:s|ed)?\b|\bnot\s*found\b|\bno\s+such\b|不存在|已删除|已解散/i;
+
+/**
+ * feed-group：这次失败是不是「分组已经不在了」。判定刻意收紧到**明确**的信号：
+ *   - code 230004——飞书对 feed group 的 group_id Not Exists 专用码；
+ *   - 或 code 230001（通用参数错误）且 message 明确说了「不存在」。
+ * 网络异常（连 code 都没有）、限流、鉴权失败一律 false，绝不清缓存。
+ */
+function isFeedGroupGone(r: LarkApiResult): boolean {
+  if (r.ok || r.authProblem) return false;
+  if (r.code === FEED_GROUP_NOT_EXISTS_CODE) return true;
+  return r.code === PARAM_INVALID_CODE && MISSING_ENTITY_MSG.test(String(r.msg ?? ''));
+}
+
+/**
+ * chat-tag：这次失败是不是「标签已经不在了」（管理员或别的应用把标签删了）。
+ *
+ * 飞书没有公开 im/v2/tags 的错误码表，也拿不到稳定的「标签不存在」专用码样本，
+ * 所以判定是「错误码明确 **或** 文案明确」二选一：
+ *   - code 230004——与 feed-group 同属 IM 的 23xxxx 段，飞书对「实体 id 不存在」
+ *     复用同一个码的可能性很高，命中就直接认；
+ *   - 否则要求文案**同时**点名 tag/标签 与 不存在/not found，避免把「参数非法」
+ *     这类含糊失败当成分组被删。
+ * 两条都要求「明确点名」——宁可漏判（退化成今天的失败路径，行为不变）也不能误判。
+ * 网络异常（没有 code）、缺 scope（missingScope）、鉴权码一律不算。
+ */
+function isChatTagGone(r: TenantApiResult): boolean {
+  if (r.ok || r.missingScope) return false;
+  if (typeof r.code !== 'number' || AUTH_ERROR_CODES.includes(r.code)) return false;
+  if (r.code === FEED_GROUP_NOT_EXISTS_CODE) return true;
+  const msg = String(r.msg ?? '');
+  return MISSING_ENTITY_MSG.test(msg) && /tag|标签/i.test(msg);
+}
+
+/**
+ * 一次 tagSessionGroup 调用内的自愈额度。改名撞删与打标撞删**共用**同一份额度，
+ * 保证「丢缓存 → 反查/重建 → 重试」在一次调用里最多跑一遍：自愈完仍报不存在
+ * （理论不可能）就走原失败路径记日志，不无限循环。
+ */
+interface HealBudget { left: number }
+
+function spendHeal(budget: HealBudget): boolean {
+  if (budget.left <= 0) return false;
+  budget.left -= 1;
+  return true;
+}
+
+/** 丢弃缓存里的 feed-group 身份；保留 lastAuthNudgeAt（节流状态与分组无关）。 */
+function forgetFeedGroup(appId: string): void {
+  const cache = loadCache(appId);
+  delete cache.groupId;
+  delete cache.name;
+  delete cache.configuredName;
+  saveCache(appId, cache);
+}
+
+/** 丢弃缓存里的 chat-tag 身份；同样保留 lastAuthNudgeAt。 */
+function forgetChatTag(appId: string): void {
+  const cache = loadCache(appId);
+  delete cache.chatTagId;
+  delete cache.chatTagName;
+  saveCache(appId, cache);
+}
+
 // ─── chat-tag mode (tenant token via the bot's SDK client) ───────────────────
 
 interface TenantApiResult {
@@ -228,8 +322,19 @@ async function maybeNudgeScope(larkAppId: string, ownerOpenId: string, scope: st
   }
 }
 
-/** Ensure the tenant chat tag exists (create / rename), returning its id. */
-async function ensureChatTag(larkAppId: string, name: string, ownerOpenId: string): Promise<string | null> {
+/**
+ * Ensure the tenant chat tag exists (create / rename), returning its id.
+ *
+ * 自愈点：改名（PATCH）撞上「标签已被删」时不再卡死在改名这一步——丢掉野指针后
+ * 重走新建路径（新建撞名会由飞书回 create_tag_fail_reason.duplicate_id，等价于
+ * feed-group 那侧的「按名反查复用」），本次打标继续。
+ */
+async function ensureChatTag(
+  larkAppId: string,
+  name: string,
+  ownerOpenId: string,
+  budget: HealBudget,
+): Promise<string | null> {
   const cache = loadCache(larkAppId);
   if (cache.chatTagId && cache.chatTagName === name) return cache.chatTagId;
 
@@ -243,6 +348,17 @@ async function ensureChatTag(larkAppId: string, name: string, ownerOpenId: strin
       saveCache(larkAppId, cache);
       return cache.chatTagId!;
     }
+    if (isChatTagGone(patched) && spendHeal(budget)) {
+      logger.info(
+        `[session-tag] chat tag "${cache.chatTagName}" (${cache.chatTagId}) no longer exists `
+        + `(code=${patched.code}); dropped cache, recreating as "${name}"`,
+      );
+      forgetChatTag(larkAppId);
+      // 缓存已空 → 这次递归只会走下面的新建/复用分支，不会再回到改名。
+      const rebuilt = await ensureChatTag(larkAppId, name, ownerOpenId, budget);
+      if (rebuilt) logger.info(`[session-tag] chat tag rebuilt/reused "${name}" (${rebuilt})`);
+      return rebuilt;
+    }
     logger.warn(`[session-tag] tag rename failed (keeping old name): code=${patched.code} ${patched.msg}`);
     return cache.chatTagId; // stale name still tags correctly
   }
@@ -250,6 +366,7 @@ async function ensureChatTag(larkAppId: string, name: string, ownerOpenId: strin
   const created = await tenantApi(larkAppId, 'POST', '/open-apis/im/v2/tags', {
     create_tag: { tag_type: 'tenant', name },
   });
+  // duplicate_id = 同名标签已存在 → 直接复用它（chat-tag 侧的「反查复用」由飞书代劳）。
   const id = created.data?.id ?? created.data?.create_tag_fail_reason?.duplicate_id;
   if (id) {
     cache.chatTagId = id;
@@ -263,14 +380,34 @@ async function ensureChatTag(larkAppId: string, name: string, ownerOpenId: strin
   return null;
 }
 
-async function tagViaChatTag(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
-  const tagId = await ensureChatTag(larkAppId, name, ownerOpenId);
-  if (!tagId) return;
-  const bound = await tenantApi(larkAppId, 'POST', '/open-apis/im/v2/biz_entity_tag_relation', {
+/** 把一个会话群挂到 chat tag 上。 */
+function bindChatTag(larkAppId: string, chatId: string, tagId: string): Promise<TenantApiResult> {
+  return tenantApi(larkAppId, 'POST', '/open-apis/im/v2/biz_entity_tag_relation', {
     tag_biz_type: 'chat',
     biz_entity_id: chatId,
     tag_ids: [tagId],
   });
+}
+
+async function tagViaChatTag(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
+  const budget: HealBudget = { left: 1 };
+  let tagId = await ensureChatTag(larkAppId, name, ownerOpenId, budget);
+  if (!tagId) return;
+
+  let bound = await bindChatTag(larkAppId, chatId, tagId);
+  if (isChatTagGone(bound) && spendHeal(budget)) {
+    // 标签被删 → 缓存里的 tagId 成了野指针：丢缓存 → 重建/复用同名标签 → 只重试一次。
+    logger.info(
+      `[session-tag] chat tag "${name}" (${tagId}) no longer exists (code=${bound.code}); `
+      + 'dropped cache and rebuilding by name',
+    );
+    forgetChatTag(larkAppId);
+    const rebuilt = await ensureChatTag(larkAppId, name, ownerOpenId, budget);
+    if (!rebuilt) return;
+    tagId = rebuilt;
+    logger.info(`[session-tag] chat tag rebuilt/reused "${name}" (${tagId}); retrying bind`);
+    bound = await bindChatTag(larkAppId, chatId, tagId);
+  }
   if (!bound.ok) {
     logger.warn(`[session-tag] bind ${chatId.substring(0, 12)} failed: code=${bound.code} ${bound.msg}`);
     if (bound.missingScope) void maybeNudgeScope(larkAppId, ownerOpenId, bound.missingScope);
@@ -308,7 +445,7 @@ async function callFeedGroupApi(
     const json: any = await res.json().catch(() => ({}));
     const code = typeof json.code === 'number' ? json.code : (res.ok ? 0 : res.status);
     if (code === 0) return { ok: true, code, data: json.data };
-    const authProblem = [99991672, 99991679, 20027, 20005].includes(code) || res.status === 401 || res.status === 403;
+    const authProblem = AUTH_ERROR_CODES.includes(code) || res.status === 401 || res.status === 403;
     // Feishu puts the actionable detail in error.message (e.g. 230001 is just
     // "param is invalid" while error.message says "name already exists") —
     // merge both so callers can branch on the real reason.
@@ -368,72 +505,123 @@ async function findFeedGroupByName(brandHost: string, userToken: string, name: s
   return null;
 }
 
-async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
-  const cfg = getBot(larkAppId).config;
-  const brand = normalizeBrand(cfg.brand);
-  const host = larkHosts(brand).openApi;
+/** 一次 feed-group 打标链路里到处要传的东西，打包成一个 ctx 免得参数列表爆炸。 */
+interface FeedGroupCtx {
+  larkAppId: string;
+  ownerOpenId: string;
+  /** 品牌对应的 open-apis host。 */
+  host: string;
+  userToken: string;
+  /** 本次打标的目标名（配置名 → 「<bot 显示名>会话」→ 旧默认名 的结果）。 */
+  name: string;
+  budget: HealBudget;
+}
 
-  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
-  if (!userToken) {
-    logger.info(`[session-tag] no user token for ${larkAppId}; skip feed-group tagging ${chatId.substring(0, 12)}`);
-    void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
-    return;
+/** 落地的分组：id + 它**实际**叫什么名字（可能是冲突退避名）。 */
+interface ResolvedFeedGroup { groupId: string; actualName: string }
+
+/**
+ * 建一个新的 feed group，并处理两种「名字被占」的情况：
+ *   1. 前面反查没找到、创建却报 230001 already exists（分页没翻到 / 刚建完还没进
+ *      列表 / 两个进程并发建群）→ **再反查一次按名复用**，别急着退避出一个重名组；
+ *   2. 确实被别的应用占着 → 退避到「<bot 名>会话」/ 带 app 尾号的候选名。
+ */
+async function createOrReuseFeedGroup(ctx: FeedGroupCtx): Promise<ResolvedFeedGroup | null> {
+  const { larkAppId, ownerOpenId, host, userToken, name } = ctx;
+  const cfg = getBot(larkAppId).config;
+
+  const createGroup = (groupName: string) => callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
+    feed_group_creator: { type: 'normal', name: groupName },
+  });
+  const isNameTaken = (r: LarkApiResult) =>
+    !r.ok && r.code === PARAM_INVALID_CODE && /already exists/i.test(String(r.msg ?? ''));
+
+  let actualName = name;
+  let created = await createGroup(name);
+
+  if (isNameTaken(created)) {
+    // 退避前先按名再反查一次：能复用就复用（分页/时序导致的假「查不到」）。
+    const raced = await findFeedGroupByName(host, userToken, name);
+    if (raced) {
+      logger.info(`[session-tag] feed group "${name}" reported as already existing; reused ${raced} instead of falling back`);
+      return { groupId: raced, actualName: name };
+    }
   }
 
+  if (isNameTaken(created)) {
+    // 分组名用户级全局唯一，但操作权限按创建应用隔离——本 app 的 list 看不到、
+    // 也建不了同名组（典型：多个 bot 应用都配了同一个名字 / 换 app 重装）。自动
+    // 退避为「<bot 显示名>会话」：关键区分信息前置——侧边栏宽度只显示前几个字，
+    // 「配置名·bot名」的后缀式命名会把 bot 名截没（实测反馈）。
+    const scoped = botScopedTagName(fallbackBotLabel(larkAppId), localeForBot(larkAppId));
+    // 第二档带 app 尾号消歧：默认名本来就是「<bot 名>会话」时第一档是同名空转，
+    // 只有「两个应用的 bot 显示名也撞了」才会走到这里——难看总好过建不出分组。
+    const candidates = [scoped, `${scoped}·${cfg.larkAppId.slice(-4)}`].filter(c => c !== name);
+    for (const candidate of candidates) {
+      logger.warn(
+        `[session-tag] feed group name "${actualName}" is taken by another app's group (per-user unique, `
+        + `per-app operable); falling back to "${candidate}"`,
+      );
+      actualName = candidate;
+      // 退避名也可能已由本 app 早先建过（cache 丢失场景）——先查再建。
+      const existingFallback = await findFeedGroupByName(host, userToken, candidate);
+      created = existingFallback
+        ? { ok: true, code: 0, data: { group_id: existingFallback } }
+        : await createGroup(candidate);
+      if (!isNameTaken(created)) break;
+    }
+  }
+
+  if (!created.ok) {
+    logger.warn(`[session-tag] feed group create "${actualName}" failed: code=${created.code} ${created.msg}`);
+    if (created.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${created.code}`);
+    return null;
+  }
+  const groupId = created.data?.group_id;
+  if (typeof groupId !== 'string' || !groupId) {
+    logger.warn(`[session-tag] feed group create "${actualName}" returned no group_id`);
+    return null;
+  }
+  return { groupId, actualName };
+}
+
+/**
+ * 确保本 app 手上有一个**可用**的 feed group，返回它的 id + 实际名。
+ * 顺序：缓存命中 → 按名反查复用 → 新建（撞名先反查、再退避候选）→ 配置名变了才改名。
+ *
+ * 自愈点：改名撞上「分组已被用户删掉」时不卡死在改名这一步——丢掉野指针后重走
+ * 反查/新建，本次打标继续。丢缓存后缓存里已经没有 groupId，递归只会走新建分支，
+ * 不可能再绕回改名，加上 budget 兜底，最多自愈一次。
+ */
+async function ensureFeedGroup(ctx: FeedGroupCtx): Promise<ResolvedFeedGroup | null> {
+  const { larkAppId, host, userToken, name } = ctx;
   const cache = loadCache(larkAppId);
+
   if (!cache.groupId) {
     // Reuse an existing same-name group first (multi-bot / reinstall dedup).
     const existing = await findFeedGroupByName(host, userToken, name);
     if (existing) {
       cache.groupId = existing;
       cache.name = name;
+      // 复用到的分组实际名就等于目标名，configuredName 一起写上——否则自愈重建后
+      // 缓存里少了 configuredName，下次打标会莫名其妙多发一次 rename。
+      cache.configuredName = name;
       saveCache(larkAppId, cache);
       logger.info(`[session-tag] reusing existing feed group "${name}" → ${existing}`);
+      return { groupId: existing, actualName: name };
     }
-  }
-  if (!cache.groupId) {
-    const createGroup = (groupName: string) => callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
-      feed_group_creator: { type: 'normal', name: groupName },
-    });
-    const isNameTaken = (r: LarkApiResult) =>
-      !r.ok && r.code === 230001 && /already exists/i.test(String(r.msg ?? ''));
 
-    let actualName = name;
-    let created = await createGroup(name);
-    if (isNameTaken(created)) {
-      // 分组名用户级全局唯一，但操作权限按创建应用隔离——本 app 的 list 看不到、
-      // 也建不了同名组（典型：多个 bot 应用都配了同一个名字 / 换 app 重装）。自动
-      // 退避为「<bot 显示名>会话」：关键区分信息前置——侧边栏宽度只显示前几个字，
-      // 「配置名·bot名」的后缀式命名会把 bot 名截没（实测反馈）。
-      const scoped = botScopedTagName(fallbackBotLabel(larkAppId), localeForBot(larkAppId));
-      // 第二档带 app 尾号消歧：默认名本来就是「<bot 名>会话」时第一档是同名空转，
-      // 只有「两个应用的 bot 显示名也撞了」才会走到这里——难看总好过建不出分组。
-      const candidates = [scoped, `${scoped}·${cfg.larkAppId.slice(-4)}`].filter(c => c !== name);
-      for (const candidate of candidates) {
-        logger.warn(
-          `[session-tag] feed group name "${actualName}" is taken by another app's group (per-user unique, `
-          + `per-app operable); falling back to "${candidate}"`,
-        );
-        actualName = candidate;
-        // 退避名也可能已由本 app 早先建过（cache 丢失场景）——先查再建。
-        const existingFallback = await findFeedGroupByName(host, userToken, candidate);
-        created = existingFallback
-          ? { ok: true, code: 0, data: { group_id: existingFallback } }
-          : await createGroup(candidate);
-        if (!isNameTaken(created)) break;
-      }
-    }
-    if (!created.ok) {
-      logger.warn(`[session-tag] feed group create "${actualName}" failed: code=${created.code} ${created.msg}`);
-      if (created.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${created.code}`);
-      return;
-    }
-    cache.groupId = created.data?.group_id;
-    cache.name = actualName;
+    const made = await createOrReuseFeedGroup(ctx);
+    if (!made) return null;
+    cache.groupId = made.groupId;
+    cache.name = made.actualName;
     cache.configuredName = name;
     saveCache(larkAppId, cache);
-    logger.info(`[session-tag] feed group "${actualName}" → ${cache.groupId}`);
-  } else if ((cache.configuredName ?? cache.name) !== name) {
+    logger.info(`[session-tag] feed group "${made.actualName}" → ${made.groupId}`);
+    return made;
+  }
+
+  if ((cache.configuredName ?? cache.name) !== name) {
     // 配置名变更才触发改名；对比 configuredName 而非实际名，避免退避名（name·bot）
     // 与配置名的固有差异导致每次建群都空转一次 rename。
     if (cache.name === name) {
@@ -453,17 +641,61 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
         cache.configuredName = name;
         saveCache(larkAppId, cache);
         logger.info(`[session-tag] feed group renamed → "${name}"`);
+      } else if (isFeedGroupGone(renamed) && spendHeal(ctx.budget)) {
+        logger.info(
+          `[session-tag] feed group "${cache.name}" (${cache.groupId}) no longer exists (code=${renamed.code}) `
+          + `on rename; dropped cache, rebuilding as "${name}"`,
+        );
+        forgetFeedGroup(larkAppId);
+        const rebuilt = await ensureFeedGroup(ctx);
+        if (rebuilt) {
+          logger.info(`[session-tag] feed group rebuilt/reused "${rebuilt.actualName}" (${rebuilt.groupId})`);
+        }
+        return rebuilt;
       } else {
         logger.warn(`[session-tag] feed group rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
       }
     }
   }
-  if (!cache.groupId) return;
+  return { groupId: cache.groupId, actualName: cache.name ?? name };
+}
 
-  const added = await callFeedGroupApi(host, userToken, 'POST',
-    `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}/batch_add_item`, {
+async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
+  const cfg = getBot(larkAppId).config;
+  const brand = normalizeBrand(cfg.brand);
+  const host = larkHosts(brand).openApi;
+
+  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
+  if (!userToken) {
+    logger.info(`[session-tag] no user token for ${larkAppId}; skip feed-group tagging ${chatId.substring(0, 12)}`);
+    void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
+    return;
+  }
+
+  const ctx: FeedGroupCtx = { larkAppId, ownerOpenId, host, userToken, name, budget: { left: 1 } };
+  let group = await ensureFeedGroup(ctx);
+  if (!group) return;
+
+  const addItem = (groupId: string) => callFeedGroupApi(host, userToken, 'POST',
+    `/open-apis/im/v1/groups/${encodeURIComponent(groupId)}/batch_add_item`, {
       items: [{ feed_id: chatId, feed_type: 'chat' }],
     });
+
+  let added = await addItem(group.groupId);
+  if (isFeedGroupGone(added) && spendHeal(ctx.budget)) {
+    // 用户在侧边栏手动删了分组 → 缓存里的 groupId 成了野指针，飞书回 230004。
+    // 丢缓存 → 按名反查复用 / 新建 → **只重试一次**；再失败走下面的原失败路径。
+    logger.info(
+      `[session-tag] feed group "${group.actualName}" (${group.groupId}) no longer exists (code=${added.code}); `
+      + 'dropped cache and rebuilding by name',
+    );
+    forgetFeedGroup(larkAppId);
+    const rebuilt = await ensureFeedGroup(ctx);
+    if (!rebuilt) return;
+    group = rebuilt;
+    logger.info(`[session-tag] feed group rebuilt/reused "${group.actualName}" (${group.groupId}); retrying tag`);
+    added = await addItem(group.groupId);
+  }
   if (!added.ok) {
     logger.warn(`[session-tag] feed group add ${chatId.substring(0, 12)} failed: code=${added.code} ${added.msg}`);
     if (added.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${added.code}`);
@@ -474,7 +706,7 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     logger.warn(`[session-tag] feed group add ${chatId.substring(0, 12)} partially failed: ${JSON.stringify(failed)}`);
     return;
   }
-  logger.info(`[session-tag] tagged ${chatId.substring(0, 12)} into feed group "${cache.name}" (${cache.groupId})`);
+  logger.info(`[session-tag] tagged ${chatId.substring(0, 12)} into feed group "${group.actualName}" (${group.groupId})`);
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────
