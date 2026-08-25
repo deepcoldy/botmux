@@ -20504,6 +20504,11 @@ async function handleThreadReplyAdmitted(
           codexAppText: reforkCodexApp.text,
           codexAppApplicationContext,
           codexAppMessageContext: reforkCodexApp.messageContext,
+          // #794 后续：worker-null refork 的 empty-start 首轮 opening 也走 hook 注入。
+          // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
+          // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
+          turnId: queuedHasDurableTail ? undefined : parsed.messageId,
+          sessionBackendType: ds.session.backendType,
         },
       );
     } else {

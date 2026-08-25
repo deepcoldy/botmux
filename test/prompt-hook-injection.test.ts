@@ -357,4 +357,39 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     expect(result.content).toContain('<user_message>');
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
+
+  it('skill catalog 追加到 prompt 尾部后：全量指纹 miss，prefix 兜底仍能 claim', () => {
+    // opening 是 CLI generation 的首轮，prepareSessionSkillPrompt 会把 skill catalog
+    // 追加到 prompt 尾部（${opts.prompt}\n\n${catalog}），这才是 claude-code 真正
+    // typed 进 PTY 的文本。sidecar 按「catalog 追加前」的 ptyText 写指纹，所以 hook
+    // fire 时全量指纹 exact match 会 miss，只能靠 prefix 兜底（前 30 归一字符，catalog
+    // 在尾 → 前 30 不变 → turnId 定域 0/1 条 → 救回）。本测试锁住这条 fallback 路径。
+    // 注意：消息需长于 PREFIX_FALLBACK_LEN（30 字符），否则前 30 字符本身就被追加改变。
+    const longMessage = '帮我修个 bug，这个问题出现在用户登录模块，需要排查一下认证流程的 token 刷新逻辑';
+    const result = buildNewTopicCliInput(
+      longMessage, SESSION_ID, 'claude-code', undefined,
+      undefined,
+      [{ name: 'Bob', openId: 'ou_bob' }],
+      undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toBe(longMessage);
+
+    // 模拟 prepareSessionSkillPrompt 把 catalog 追加到尾部
+    const catalog = '<botmux_skills>\n- skill-a\n- skill-b\n</botmux_skills>';
+    const typedText = `${result.content}\n\n${catalog}`;
+
+    // 全量指纹 miss（typed 文本 ≠ sidecar 的 ptyText），且 exact miss 不消费 sidecar
+    const exactMiss = claimPromptContext(SESSION_ID, TURN_ID, fingerprintPromptText(typedText));
+    expect(exactMiss).toBeUndefined();
+
+    // 但 sidecar 还在，用 prefix 兜底能 claim 回 envelope
+    const rescued = claimPromptContext(SESSION_ID, TURN_ID, fingerprintPromptText(typedText), prefixOf(typedText));
+    expect(rescued).toBeDefined();
+    expect(rescued).toContain('<sender ');
+    expect(rescued).toContain('<mentions>');
+  });
 });

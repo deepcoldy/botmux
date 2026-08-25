@@ -560,7 +560,8 @@ describe('executeScheduledTask — live-session injection', () => {
       const content = typeof injected === 'string' ? injected : injected.content;
       // 本地后端 + auto → hook 模式：reminder 进 sidecar，PTY 文本里没有
       expect(content).not.toContain('<botmux_reminder>');
-      expect(content).toContain('<user_message>');
+      // #794 后续：hook 模式连 <user_message> 外壳也剥掉，PTY 文本只剩正文
+      expect(content).not.toContain('<user_message>');
     } finally {
       (BOT.config as Record<string, unknown>).envelopeInjection = prev;
     }
