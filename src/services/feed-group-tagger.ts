@@ -49,21 +49,22 @@ interface TagCache {
   lastAuthNudgeAt?: number;
 }
 
-function cachePath(appId: string): string {
-  return join(config.session.dataDir, `feed-group-cache-${appId}.json`);
+function cachePath(appId: string, ownerOpenId?: string): string {
+  const suffix = ownerOpenId ? `-${ownerOpenId.replace(/[^a-zA-Z0-9_-]/g, '_')}` : '';
+  return join(config.session.dataDir, `feed-group-cache-${appId}${suffix}.json`);
 }
 
-function loadCache(appId: string): TagCache {
+function loadCache(appId: string, ownerOpenId?: string): TagCache {
   try {
-    const fp = cachePath(appId);
+    const fp = cachePath(appId, ownerOpenId);
     if (existsSync(fp)) return JSON.parse(readFileSync(fp, 'utf-8')) as TagCache;
   } catch { /* corrupted cache → start fresh */ }
   return {};
 }
 
-function saveCache(appId: string, cache: TagCache): void {
+function saveCache(appId: string, cache: TagCache, ownerOpenId?: string): void {
   try {
-    const fp = cachePath(appId);
+    const fp = cachePath(appId, ownerOpenId);
     mkdirSync(dirname(fp), { recursive: true });
     writeFileSync(fp, JSON.stringify(cache, null, 2), 'utf-8');
   } catch (err) {
@@ -71,12 +72,12 @@ function saveCache(appId: string, cache: TagCache): void {
   }
 }
 
-function nudgeThrottled(appId: string): boolean {
-  const cache = loadCache(appId);
+function nudgeThrottled(appId: string, ownerOpenId?: string): boolean {
+  const cache = loadCache(appId, ownerOpenId);
   const now = Date.now();
   if (cache.lastAuthNudgeAt && now - cache.lastAuthNudgeAt < NUDGE_INTERVAL_MS) return true;
   cache.lastAuthNudgeAt = now;
-  saveCache(appId, cache);
+  saveCache(appId, cache, ownerOpenId);
   return false;
 }
 
@@ -124,7 +125,7 @@ function scopeEnableLink(host: string, appId: string, scope: string): string {
 }
 
 async function maybeNudgeScope(larkAppId: string, ownerOpenId: string, scope: string): Promise<void> {
-  if (nudgeThrottled(larkAppId)) return;
+  if (nudgeThrottled(larkAppId, ownerOpenId)) return;
   try {
     const cfg = getBot(larkAppId).config;
     const host = larkHosts(normalizeBrand(cfg.brand)).openApi;
@@ -234,7 +235,7 @@ async function callFeedGroupApi(
 }
 
 async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, reason: string): Promise<void> {
-  if (nudgeThrottled(larkAppId)) return;
+  if (nudgeThrottled(larkAppId, ownerOpenId)) return;
   try {
     const cfg = getBot(larkAppId).config;
     const { authUrl } = generateAuthUrl(
@@ -242,6 +243,7 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      ownerOpenId,
     );
     const loc = localeForBot(larkAppId);
     await sendUserMessage(
@@ -286,21 +288,21 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
   const brand = normalizeBrand(cfg.brand);
   const host = larkHosts(brand).openApi;
 
-  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
+  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand, ownerOpenId);
   if (!userToken) {
     logger.info(`[session-tag] no user token for ${larkAppId}; skip feed-group tagging ${chatId.substring(0, 12)}`);
     void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
     return;
   }
 
-  const cache = loadCache(larkAppId);
+  const cache = loadCache(larkAppId, ownerOpenId);
   if (!cache.groupId) {
     // Reuse an existing same-name group first (multi-bot / reinstall dedup).
     const existing = await findFeedGroupByName(host, userToken, name);
     if (existing) {
       cache.groupId = existing;
       cache.name = name;
-      saveCache(larkAppId, cache);
+      saveCache(larkAppId, cache, ownerOpenId);
       logger.info(`[session-tag] reusing existing feed group "${name}" → ${existing}`);
     }
   }
@@ -343,7 +345,7 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     cache.groupId = created.data?.group_id;
     cache.name = actualName;
     cache.configuredName = name;
-    saveCache(larkAppId, cache);
+    saveCache(larkAppId, cache, ownerOpenId);
     logger.info(`[session-tag] feed group "${actualName}" → ${cache.groupId}`);
   } else if ((cache.configuredName ?? cache.name) !== name) {
     // 配置名变更才触发改名；对比 configuredName 而非实际名，避免退避名（name·bot）
@@ -355,7 +357,7 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     if (renamed.ok) {
       cache.name = name;
       cache.configuredName = name;
-      saveCache(larkAppId, cache);
+      saveCache(larkAppId, cache, ownerOpenId);
     } else {
       logger.warn(`[session-tag] feed group rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
     }

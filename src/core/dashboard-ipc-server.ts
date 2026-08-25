@@ -4596,6 +4596,7 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      cfg.ownerOpenId,
     );
     jsonRes(res, 200, { ok: true, authUrl });
   } catch (e: any) {
@@ -4608,7 +4609,7 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
-    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand), cfg.ownerOpenId);
     jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group' });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });

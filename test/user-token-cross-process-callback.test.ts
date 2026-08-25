@@ -77,4 +77,23 @@ describe('tryHandleCallbackUrl across module instances', () => {
     expect(result).not.toBeNull();
     expect(result!.matched).toBe(false);
   });
+
+  it('rejects a callback authorized by a different user than the expected owner', async () => {
+    const a = await import('../src/utils/user-token.js');
+    const { state } = a.generateAuthUrl(APP_ID, APP_SECRET, 'feishu', ['im:feed_group_v1:write'], 'ou_expected');
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        access_token: 'token_b', refresh_token: 'refresh_b', token_type: 'Bearer',
+        expires_in: 3600, refresh_token_expires_in: 7200,
+        scope: 'im:feed_group_v1:write', open_id: 'ou_other',
+      }),
+    })) as any);
+
+    const message = await a.handleCallbackUrl(
+      `http://127.0.0.1:9768/callback?code=test_code&state=${encodeURIComponent(state)}`,
+    );
+    expect(message).toContain('授权账号与发起授权的用户不一致');
+    expect(await a.resolveUserToken(APP_ID, APP_SECRET, 'feishu', 'ou_expected')).toBeNull();
+  });
 });

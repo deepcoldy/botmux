@@ -27,13 +27,13 @@ type ApiEnvelope = {
 };
 
 async function userApi(
-  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand'>,
+  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand' | 'ownerOpenId'>,
   path: string,
   init: RequestInit,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Record<string, unknown>> {
   const brand = normalizeBrand(bot.brand);
-  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, brand);
+  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, brand, bot.ownerOpenId);
   if (!token) throw new FeedGroupApiError('尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。', 'user_login_required', 401);
   const response = await fetchImpl(`${larkHosts(brand).openApi}${path}`, {
     ...init,
@@ -53,7 +53,7 @@ async function userApi(
 
 /** List all live native Feishu/Lark conversation labels for the authorized user. */
 export async function listFeedGroups(
-  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand'>,
+  bot: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand' | 'ownerOpenId'>,
   fetchImpl: typeof fetch = fetch,
 ): Promise<FeedGroup[]> {
   const groups: FeedGroup[] = [];

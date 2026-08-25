@@ -9,10 +9,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 const DIR = join(homedir(), '.botmux', 'data');
 const legacyPath = join(DIR, 'user-token.json');
 const perAppPath = (appId: string) => join(DIR, `user-token-${appId}.json`);
+const perOwnerPath = (appId: string, owner: string) => join(
+  DIR,
+  `user-token-${appId}-${createHash('sha256').update(owner).digest('hex').slice(0, 20)}.json`,
+);
 
 // In-memory fake filesystem keyed by absolute path.
 const files = new Map<string, string>();
@@ -79,6 +84,25 @@ describe('resolveUserToken — per-app isolation', () => {
     process.env.FEISHU_USER_ACCESS_TOKEN = 'ENV_TOK';
     const { resolveUserToken } = await fresh();
     expect(await resolveUserToken('whatever', 'sec', 'lark')).toBe('ENV_TOK');
+  });
+
+  it('isolates owner-scoped tokens and never falls back to the global env token', async () => {
+    files.set(perOwnerPath('app_a', 'ou_a'), validToken({
+      access_token: 'TOK_A', appId: 'app_a', brand: 'feishu', ownerOpenId: 'ou_a',
+    }));
+    process.env.FEISHU_USER_ACCESS_TOKEN = 'GLOBAL_TOK';
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken('app_a', 'sec', 'feishu', 'ou_a')).toBe('TOK_A');
+    expect(await resolveUserToken('app_a', 'sec', 'feishu', 'ou_b')).toBeNull();
+  });
+
+  it('reports feed-group auth independently for each owner', async () => {
+    files.set(perOwnerPath('app_a', 'ou_a'), validToken({
+      appId: 'app_a', brand: 'feishu', ownerOpenId: 'ou_a', scope: 'im:feed_group_v1:write',
+    }));
+    const { getFeedGroupAuthStatus } = await fresh();
+    expect(getFeedGroupAuthStatus('app_a', 'feishu', 'ou_a').authorized).toBe(true);
+    expect(getFeedGroupAuthStatus('app_a', 'feishu', 'ou_b').authorized).toBe(false);
   });
 
   // Hardening (Codex review): validate the file's inner appId/brand, not just the

@@ -12,7 +12,7 @@ import { readFileSync, mkdirSync, existsSync, unlinkSync, readdirSync } from 'no
 import { atomicWriteFileSync } from './atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { logger } from './logger.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -33,6 +33,11 @@ function tokenPathForApp(appId: string): string {
   return join(TOKEN_DIR, `user-token-${appId}.json`);
 }
 
+function tokenPathForOwner(appId: string, ownerOpenId: string): string {
+  const ownerKey = createHash('sha256').update(ownerOpenId).digest('hex').slice(0, 20);
+  return join(TOKEN_DIR, `user-token-${appId}-${ownerKey}.json`);
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface TokenStore {
@@ -48,6 +53,8 @@ export interface TokenStore {
    */
   appId?: string;
   brand?: Brand;
+  /** OAuth token subject. Required for owner-scoped personal-data operations. */
+  ownerOpenId?: string;
 }
 
 interface TokenResponse {
@@ -59,6 +66,7 @@ interface TokenResponse {
   scope: string;
   error?: string;
   error_description?: string;
+  open_id?: string;
 }
 
 // ─── Pending login state ──────────────────────────────────────────────────────
@@ -70,6 +78,8 @@ interface PendingLogin {
   appSecret: string;
   /** 租户品牌——决定回调换 token 时打哪个域名。缺省 feishu。 */
   brand: Brand;
+  /** Expected OAuth subject for owner-scoped flows. */
+  ownerOpenId?: string;
   createdAt: number;
 }
 
@@ -127,8 +137,8 @@ function loadTokenFromPath(path: string): TokenStore | null {
   }
 }
 
-function saveTokenForApp(token: TokenStore, appId: string): void {
-  const path = tokenPathForApp(appId);
+function saveTokenForApp(token: TokenStore, appId: string, ownerOpenId?: string): void {
+  const path = ownerOpenId ? tokenPathForOwner(appId, ownerOpenId) : tokenPathForApp(appId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   // 0600：OAuth token 是密钥，且原子写每次重建文件，不传 mode 会把用户
@@ -159,7 +169,14 @@ function tokenMatches(t: TokenStore, appId: string, brand: Brand): boolean {
  * 取指定 app 的 token。优先 per-app 文件，其次回退旧的单文件；两者都过
  * {@link tokenMatches} 校验（文件名 + 内容双重把关），不匹配一律视为无 token。
  */
-function loadTokenForApp(appId: string, brand: Brand): { token: TokenStore; source: string } | null {
+function loadTokenForApp(appId: string, brand: Brand, ownerOpenId?: string): { token: TokenStore; source: string } | null {
+  if (ownerOpenId) {
+    const token = loadTokenFromPath(tokenPathForOwner(appId, ownerOpenId));
+    if (token && tokenMatches(token, appId, brand) && token.ownerOpenId === ownerOpenId) {
+      return { token, source: 'botmux(owner)' };
+    }
+    return null;
+  }
   const perApp = loadTokenFromPath(tokenPathForApp(appId));
   if (perApp && tokenMatches(perApp, appId, brand)) return { token: perApp, source: 'botmux' };
   const legacy = loadTokenFromPath(LEGACY_TOKEN_PATH);
@@ -169,7 +186,7 @@ function loadTokenForApp(appId: string, brand: Brand): { token: TokenStore; sour
 
 // ─── Token refresh ────────────────────────────────────────────────────────────
 
-async function refreshToken(token: TokenStore, appId: string, appSecret: string, brand: Brand = 'feishu'): Promise<TokenStore | null> {
+async function refreshToken(token: TokenStore, appId: string, appSecret: string, brand: Brand = 'feishu', ownerOpenId?: string): Promise<TokenStore | null> {
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
@@ -197,10 +214,11 @@ async function refreshToken(token: TokenStore, appId: string, appSecret: string,
       scope: data.scope || token.scope,
       appId,
       brand,
+      ...(ownerOpenId ? { ownerOpenId } : {}),
     };
 
     // Write to this app's own token file (per-app, brand-stamped)
-    try { saveTokenForApp(updated, appId); } catch { /* best-effort */ }
+    try { saveTokenForApp(updated, appId, ownerOpenId); } catch { /* best-effort */ }
     logger.info('[user-token] Refreshed User Access Token');
     return updated;
   } catch (err: any) {
@@ -215,13 +233,13 @@ async function refreshToken(token: TokenStore, appId: string, appSecret: string,
  * Resolve a valid User Access Token.
  * Returns access_token string, or null if unavailable.
  */
-export async function resolveUserToken(appId: string, appSecret: string, brand: Brand = 'feishu'): Promise<string | null> {
+export async function resolveUserToken(appId: string, appSecret: string, brand: Brand = 'feishu', ownerOpenId?: string): Promise<string | null> {
   // 1. Environment variable (explicit global override)
   const envToken = process.env.FEISHU_USER_ACCESS_TOKEN;
-  if (envToken) return envToken;
+  if (envToken && !ownerOpenId) return envToken;
 
   // 2. Per-app token file (mismatched / 别的 bot 的 token → null，调用方提示 /login)
-  const loaded = loadTokenForApp(appId, brand);
+  const loaded = loadTokenForApp(appId, brand, ownerOpenId);
   if (!loaded) return null;
 
   const { token } = loaded;
@@ -232,7 +250,7 @@ export async function resolveUserToken(appId: string, appSecret: string, brand: 
 
   // access_token expired — try refresh
   if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand);
+    const refreshed = await refreshToken(token, appId, appSecret, brand, ownerOpenId);
     if (refreshed) return refreshed.access_token;
   }
 
@@ -296,7 +314,7 @@ export function resolveOAuthRedirectUri(): string {
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
  */
-export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu', extraScopes: string[] = []): { authUrl: string; state: string } {
+export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu', extraScopes: string[] = [], ownerOpenId?: string): { authUrl: string; state: string } {
   const state = randomBytes(32).toString('hex');
   const redirectUri = resolveOAuthRedirectUri();
 
@@ -320,6 +338,7 @@ export function generateAuthUrl(appId: string, appSecret: string, brand: Brand =
     appId,
     appSecret,
     brand,
+    ...(ownerOpenId ? { ownerOpenId } : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -370,9 +389,10 @@ export async function tryHandleCallbackUrl(url: string): Promise<CallbackHandleR
  * authorized = a stored token for this app carries the feed-group write scope
  * and is still usable (valid or refreshable).
  */
-export function getFeedGroupAuthStatus(appId: string, brand: Brand = 'feishu'): { authorized: boolean; expiresAt?: string } {
+export function getFeedGroupAuthStatus(appId: string, brand: Brand = 'feishu', ownerOpenId?: string): { authorized: boolean; expiresAt?: string } {
   try {
-    const loaded = loadTokenForApp(appId, brand);
+    if (!ownerOpenId) return { authorized: false };
+    const loaded = loadTokenForApp(appId, brand, ownerOpenId);
     if (!loaded) return { authorized: false };
     const token = loaded.token;
     const scopes = (token.scope ?? '').split(/\s+/);
@@ -429,6 +449,10 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     if (data.error || !data.access_token) {
       return `❌ 授权失败：${data.error_description || data.error || 'unknown error'}`;
     }
+    if (pending.ownerOpenId && data.open_id !== pending.ownerOpenId) {
+      logger.warn(`[user-token] OAuth subject mismatch for ${pending.appId}`);
+      return '❌ 授权失败：授权账号与发起授权的用户不一致，请使用正确账号重试';
+    }
 
     const now = new Date();
     const token: TokenStore = {
@@ -442,9 +466,10 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       scope: data.scope,
       appId: pending.appId,
       brand: pending.brand,
+      ...(pending.ownerOpenId ? { ownerOpenId: pending.ownerOpenId } : {}),
     };
 
-    saveTokenForApp(token, pending.appId);
+    saveTokenForApp(token, pending.appId, pending.ownerOpenId);
     logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId}`);
 
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
