@@ -8,7 +8,7 @@ export const messages: Record<string, string> = {
   'card.btn.open_local_codex': 'Open Codex',
   'card.btn.open_local_trae': 'Open TRAE',
   'card.btn.get_write_link': '🔑 Get Write Link',
-  'card.writable_terminal_link': '🔑 Writable terminal (visible to everyone here — anyone can drive it): [{url}]({url})',
+  'card.writable_terminal_warning': '🔑 Writable terminal (visible to everyone here — anyone can drive it)',
   'card.btn.restart_cli': '🔄 Restart {cliName}',
   'card.btn.disconnect': '⏏ Disconnect',
   'card.btn.close_session': '❌ Close Session',

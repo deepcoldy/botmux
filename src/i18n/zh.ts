@@ -11,7 +11,7 @@ export const messages: Record<string, string> = {
   'card.btn.open_local_codex': '打开 Codex',
   'card.btn.open_local_trae': '打开 TRAE',
   'card.btn.get_write_link': '🔑 获取操作链接',
-  'card.writable_terminal_link': '🔑 可操作终端（群内可见，任何人可直接操控）：[{url}]({url})',
+  'card.writable_terminal_warning': '🔑 可操作终端（群内可见，任何人可直接操控）',
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',
