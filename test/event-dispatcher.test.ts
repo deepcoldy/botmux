@@ -1606,7 +1606,7 @@ describe('message listener polling backfill', () => {
     await flushEventWork();
 
     expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat_listener', expect.objectContaining({
-      pageSize: expect.any(Number),
+      pageSize: 50,
       stopAfter: expect.any(Function),
     }));
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(
@@ -1625,6 +1625,30 @@ describe('message listener polling backfill', () => {
     );
   });
 
+  it('passes an abort signal to polled chat-history requests', async () => {
+    const card = makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-polled-abort-signal',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: '需要可取消的轮询' }]] }),
+      createTime: String(Date.now()),
+    });
+    let signal: AbortSignal | undefined;
+    mockListChatMessagesUntil.mockImplementationOnce(async (_appId, _chatId, options) => {
+      signal = options?.signal;
+      return [card];
+    });
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(signal).toBeDefined();
+    expect(typeof signal?.addEventListener).toBe('function');
+    expect(signal?.aborted).toBe(false);
+  });
+
   it('does not replay a polled listener message after the message_id is claimed', async () => {
     const card = makeHistoryMessage({
       senderAppId: OTHER_BOT_APP_ID,
@@ -1638,6 +1662,35 @@ describe('message listener polling backfill', () => {
     mockListChatMessagesUntil.mockResolvedValue([card]);
 
     await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+  });
+
+  it('normalizes REST body.content before dispatching a polled listener match', async () => {
+    const cardContent = JSON.stringify({
+      title: 'Argos平台报警',
+      elements: [[{ tag: 'text', text: 'body-only 告警详情' }]],
+    });
+    const card = {
+      message_id: 'msg-polled-body-only',
+      chat_id: 'chat_listener',
+      chat_type: 'group',
+      msg_type: 'interactive',
+      body: { content: cardContent },
+      create_time: String(Date.now()),
+      sender: {
+        id: OTHER_BOT_APP_ID,
+        id_type: 'app_id',
+        sender_type: 'app',
+      },
+    };
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+    handlers.handleNewTopic.mockImplementationOnce(async (data) => {
+      expect((data as any).message.content).toBe(cardContent);
+    });
+
     await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
     await flushEventWork();
 

@@ -142,6 +142,11 @@ let cachedBotName = '';
 export function setBotName(name: string): void { cachedBotName = name; }
 export function getBotName(): string { return cachedBotName; }
 
+export interface ComposeSessionRowOptions {
+  fresh?: boolean;
+  lightweight?: boolean;
+}
+
 function parseSessionTime(iso: string | undefined): number | undefined {
   if (!iso) return undefined;
   const ms = Date.parse(iso);
@@ -212,10 +217,13 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
-export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean }): SessionRow {
+export function composeRowFromActive(
+  ds: DaemonSession,
+  opts: ComposeSessionRowOptions = {},
+): SessionRow {
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
-  return {
+  const row: SessionRow = {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
@@ -273,18 +281,21 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     agentAttention: ds.agentAttention
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
-    tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
-    openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
-    ...buildSessionMessagePreview(ds.session),
   };
+  if (!opts.lightweight) {
+    row.tokenUsage = sessionTokenUsage(ds.session, ds.workingDir);
+    row.openTodos = sessionOpenTodos(ds.session, ds.workingDir, opts.fresh);
+    Object.assign(row, buildSessionMessagePreview(ds.session));
+  }
+  return row;
 }
 
-export function composeRowFromClosed(s: Session): SessionRow {
+export function composeRowFromClosed(s: Session, opts: ComposeSessionRowOptions = {}): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
-  return {
+  const row: SessionRow = {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
@@ -315,9 +326,12 @@ export function composeRowFromClosed(s: Session): SessionRow {
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: feishuChatLink(s.chatId, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
-    tokenUsage: sessionTokenUsage(s),
-    ...buildSessionMessagePreview(s),
   };
+  if (!opts.lightweight) {
+    row.tokenUsage = sessionTokenUsage(s);
+    Object.assign(row, buildSessionMessagePreview(s));
+  }
+  return row;
 }
 
 /**
@@ -328,10 +342,10 @@ export function composeRowFromClosed(s: Session): SessionRow {
  * dashboard presents it as dormant, with no terminal port, so operators can
  * see and explicitly retry closing it without an unsafe resume affordance.
  */
-export function composeRowFromPersistedActive(s: Session): SessionRow {
+export function composeRowFromPersistedActive(s: Session, opts: ComposeSessionRowOptions = {}): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
-  return {
+  const row: SessionRow = {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
@@ -363,7 +377,10 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
-    tokenUsage: sessionTokenUsage(s),
-    ...buildSessionMessagePreview(s),
   };
+  if (!opts.lightweight) {
+    row.tokenUsage = sessionTokenUsage(s);
+    Object.assign(row, buildSessionMessagePreview(s));
+  }
+  return row;
 }

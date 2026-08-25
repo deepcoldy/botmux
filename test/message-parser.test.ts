@@ -59,6 +59,32 @@ describe('parseApiMessage metadata', () => {
   });
 });
 
+describe('parseEventMessage compatibility', () => {
+  it('parses REST history messages that carry content in body.content', () => {
+    const result = parseEventMessage({
+      sender: {
+        sender_type: 'app',
+        sender_id: { app_id: 'cli_argos' },
+      },
+      message: {
+        message_id: 'om_body_only',
+        chat_id: 'oc_alerts',
+        chat_type: 'group',
+        message_type: 'interactive',
+        create_time: '1000',
+        body: {
+          content: JSON.stringify({
+            title: 'Argos平台报警',
+            elements: [[{ tag: 'text', text: 'body-only 告警详情' }]],
+          }),
+        },
+      },
+    } as any);
+
+    expect(result.parsed.content).toContain('body-only 告警详情');
+  });
+});
+
 // ─── Interactive card: Format A (Lark API simplified) ─────────────────────
 
 describe('Interactive card parsing: Format A (API simplified)', () => {

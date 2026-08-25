@@ -1611,6 +1611,10 @@ export async function listChatMessages(
 export interface ChatMessageScanOptions {
   /** Lark page size per request. Clamped to the API max of 50. */
   pageSize?: number;
+  /** Optional HTTP timeout for each page request. Falls back to the client default. */
+  timeoutMs?: number;
+  /** Optional cancellation signal for the underlying page requests. */
+  signal?: AbortSignal;
   /**
    * Called while scanning newest -> oldest. Returning true stops after the
    * current message has been included in the returned chronological list.
@@ -1639,7 +1643,7 @@ export async function listChatMessagesUntil(
       sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
-    });
+    }, { timeoutMs: options.timeoutMs, signal: options.signal });
 
     if (res.code !== 0) {
       throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
