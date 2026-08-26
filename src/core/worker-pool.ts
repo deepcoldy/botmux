@@ -1441,6 +1441,11 @@ function sessionAgentConfig(
   };
 }
 
+/** @internal test-only: exercise sessionAgentConfig's launch-config resolution
+ * (incl. the /cli cliLaunchSnapshot branch's live model resolution) directly,
+ * without spawning a real worker. */
+export const __testOnly_sessionAgentConfig = sessionAgentConfig;
+
 
 export { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 
