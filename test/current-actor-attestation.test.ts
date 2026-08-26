@@ -98,13 +98,17 @@ describe('daemon current actor attestation', () => {
     writeProc(procRoot, 90, 1, '900');
     writeProc(procRoot, 100, 1, '1000');
     writeProc(procRoot, 200, 1, '3000');
+    const resolveIdentity = vi.fn(async () => ({
+      openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com',
+    }));
     await expect(resolveDaemonCurrentActor({
       sessionId: 's1',
       peer: { pid: 200, procStart: '3000' },
       findSession: () => activeSession(),
-      resolveIdentity: vi.fn(),
+      resolveIdentity,
       procRoot,
     })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
   });
 
   it('rejects a new descendant reached through an old-turn child', async () => {
@@ -115,13 +119,17 @@ describe('daemon current actor attestation', () => {
     writeProc(procRoot, 102, 101, '1200');
     const ds = activeSession();
     ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '101:1100'];
+    const resolveIdentity = vi.fn(async () => ({
+      openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com',
+    }));
     await expect(resolveDaemonCurrentActor({
       sessionId: 's1',
       peer: { pid: 102, procStart: '1200' },
       findSession: () => ds,
-      resolveIdentity: vi.fn(),
+      resolveIdentity,
       procRoot,
     })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
   });
 
   it('rejects a stale worker generation before identity lookup', async () => {
@@ -145,6 +153,21 @@ describe('daemon current actor attestation', () => {
     const ds = activeSession();
     const resolveIdentity = vi.fn(async () => {
       ds.managedTurnOrigin = { capability: 'db'.repeat(32), turnId: 'om_next', callerOpenId: 'ou_other' };
+      return { openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com' };
+    });
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1', peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds, resolveIdentity, procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+  });
+
+  it('rejects a sender change during the live Contact lookup', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeSession();
+    const resolveIdentity = vi.fn(async () => {
+      ds.managedTurnOrigin.callerOpenId = 'ou_other';
       return { openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com' };
     });
     await expect(resolveDaemonCurrentActor({
