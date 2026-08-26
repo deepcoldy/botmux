@@ -944,8 +944,14 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
   if (obj?.type !== 'event_msg' || obj.payload?.type !== 'thread_settings_applied') return undefined;
   const raw = obj.payload.thread_settings;
-  const serviceTier = raw?.service_tier;
-  if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  // Codex omits service_tier when /fast is disabled; that is an applied
+  // default-tier snapshot, not a malformed settings record.
+  const rawServiceTier = raw.service_tier;
+  const serviceTier = rawServiceTier === undefined || rawServiceTier === ''
+    ? 'default'
+    : rawServiceTier;
+  if (typeof serviceTier !== 'string') return undefined;
   const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
   // Effort follows in-session changes made through Codex's own model controls.
   // Codex records it both at the top level and under collaboration_mode.settings;

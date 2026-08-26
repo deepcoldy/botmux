@@ -75,3 +75,38 @@ describe('resolveSessionLaunchModel', () => {
     expect(resolveSessionLaunchModel(ds({ cliId: 'codex' }))).toBeUndefined();
   });
 });
+
+/**
+ * A `/cli <cliId>`-selected session (cliLaunchSnapshot) resolves its model
+ * through THIS function too — sessionAgentConfig's snapshot branch calls it
+ * AFTER stamping ds.session.cliId = selected.cliId, so the CLI-match test runs
+ * against the selected CLI, and the model stays consistent with the in-place
+ * respawn paths (/restart, cli-crash, crash-diagnostic repark) which never pass
+ * through the snapshot branch but resolve the model the same way.
+ */
+describe('resolveSessionLaunchModel — /cli session selection', () => {
+  it('leaks no bot model across a cross-CLI selection (/cli codex on a claude bot)', () => {
+    // The whole point of /cli: a fresh session carries no model of its own, the
+    // selected CLI differs from the bot's, so the claude model is NOT handed to codex.
+    expect(resolveSessionLaunchModel(
+      ds({ cliId: 'codex', model: undefined }),
+      { cliId: 'claude-code', model: 'opus' },
+    )).toBeUndefined();
+  });
+
+  it('keeps the bot model for a same-CLI selection (/cli codex on a codex bot)', () => {
+    // Same CLI → the bot model applies, identical to what /restart would resolve,
+    // so first spawn and later in-place respawns agree.
+    expect(resolveSessionLaunchModel(
+      ds({ cliId: 'codex', model: undefined }),
+      { cliId: 'codex', model: 'gpt-5.6' },
+    )).toBe('gpt-5.6');
+  });
+
+  it('honors a per-trigger override on a /cli session regardless of CLI match', () => {
+    expect(resolveSessionLaunchModel(
+      ds({ cliId: 'codex', model: undefined }, 'gpt-5.6-terra'),
+      { cliId: 'claude-code', model: 'opus' },
+    )).toBe('gpt-5.6-terra');
+  });
+});

@@ -187,8 +187,8 @@ async function resumeRestoredPendingRepoSetup(
     const input = buildNewTopicCliInput(
       setup.prompt,
       ds.session.sessionId,
-      ds.session.cliId ?? bot.config.cliId,
-      ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+      ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
       ds.pendingAttachments,
       ds.pendingMentions,
       availableBots,
@@ -279,6 +279,7 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  if (ds.session.cliLaunchSnapshot?.state === 'resolved') return null;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
   let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
@@ -1708,7 +1709,7 @@ export function rememberLastCliInput(
   const normalized = typeof cliInput === 'string' ? { content: cliInput } : cliInput;
   ds.lastCliInput = normalized.content;
   const botCfg = getBot(ds.larkAppId).config;
-  const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
+  const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
   const keepCodexAppInput = opts?.codexAppInputAccepted ?? (
     effectiveCliId === 'codex-app' &&
     botCfg.codexAppCleanInput === true &&
@@ -1794,7 +1795,7 @@ export async function restoreActiveSessions(
 ): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
-    if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
+    if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;
     if (session.queued) return 1;
     return 0; // disposable daemon-command scratch
   };
@@ -2280,9 +2281,11 @@ export async function restoreActiveSessions(
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
-      hasHistory: session.queuedActivationPending
-        ? (session.queuedActivationResume ?? false)
-        : true,  // restored ordinary sessions have prior CLI history
+      hasHistory: session.cliLaunchSnapshot?.state === 'pending'
+        ? false
+        : session.queuedActivationPending
+          ? (session.queuedActivationResume ?? false)
+          : true,  // restored ordinary sessions have prior CLI history
       initialStartPending: session.queuedActivationPending === true
         || (session.queuedActivationTail?.length ?? 0) > 0,
       workingDir: session.workingDir,
@@ -3358,8 +3361,8 @@ export async function executeScheduledTask(
         }
         const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
           isAdoptMode: false,
-          cliId: existing.session.cliId ?? bot.config.cliId,
-          cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+          cliId: existing.session.cliLaunchSnapshot?.cliId ?? existing.session.cliId ?? bot.config.cliId,
+          cliPathOverride: existing.session.cliLaunchSnapshot?.cliPathOverride ?? existing.session.cliPathOverride ?? bot.config.cliPathOverride,
           locale: localeForBot(larkAppId),
           larkAppId,
           chatId: task.chatId,
@@ -3454,7 +3457,7 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -3552,7 +3555,7 @@ async function forkOrShowRepoCard(
   }
 
   const buildPrompt = () => buildNewTopicCliInput(
-    userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
+    userContent, ds.session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
     ds.pendingAttachments, ds.pendingMentions, undefined, ds.pendingFollowUps,
     { name: bot.botName, openId: bot.botOpenId }, locale, ds.pendingSender,
     {

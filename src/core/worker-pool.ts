@@ -27,11 +27,12 @@ import {
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { resolveSessionLaunchModel } from './session-model.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -424,6 +425,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
+import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -737,6 +739,7 @@ export function getActiveSessionsRegistry(): Map<string, DaemonSession> | undefi
  */
 export function isRelayableRealSession(ds: DaemonSession): boolean {
   if (ds.worker) return true;
+  if (ds.session.cliLaunchSnapshot) return true;
   if (ds.session.cliId) return true;
   if (ds.session.lastCliInput) return true;
   return false;
@@ -1143,7 +1146,7 @@ function tag(ds: DaemonSession): string {
 }
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
-  return ds.session.cliId ?? botCfg.cliId;
+  return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
 }
 
 function ordinaryTurnRecoveryEligible(
@@ -1309,8 +1312,42 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+  const selected = ds.session.cliLaunchSnapshot;
+  if (selected) {
+    if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
+    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
+    if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('CLI selection rejected: Riff is configured');
+    if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(selected.cliId)) {
+      throw new Error(`CLI selection rejected: ${selected.cliId} cannot use codexRpcInput`);
+    }
+    const runtime = selected.cliRuntime ?? undefined;
+    const legacyPath = selected.cliPathOverride ?? undefined;
+    const wrapperCli = selected.wrapperCli ?? undefined;
+    const reasoningEffort = selected.reasoningEffort ?? undefined;
+    const launchShell = selected.launchShell ?? undefined;
+    const startupCommands = [...selected.startupCommands];
+    if (selected.state === 'pending') {
+      selected.state = 'resolved';
+      ds.session.cliId = selected.cliId;
+      ds.session.cliRuntime = runtime;
+      ds.session.cliPathOverride = legacyPath;
+      ds.session.wrapperCli = wrapperCli;
+      ds.session.reasoningEffort = reasoningEffort;
+      ds.session.agentFrozen = true;
+      sessionStore.updateSession(ds.session);
+    }
+    // Model is NOT frozen from the snapshot (which carries none): resolve it live
+    // like every other spawn (#773) AFTER cliId is stamped, so resolveSessionLaunchModel
+    // compares against the selected CLI. Cross-CLI (the /cli use case) → cliMatchesBot
+    // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
+    // and stays consistent with in-place restarts (latestModelForRespawn), which never
+    // pass through this snapshot branch. spawnModelOverride is honored automatically.
+    const model = resolveSessionLaunchModel(ds, botCfg);
+    recordLaunchModel(ds, model);
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, reasoningEffort, launchShell, startupCommands };
+  }
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -1400,8 +1437,15 @@ function sessionAgentConfig(
     wrapperCli: ds.session.wrapperCli,
     model,
     reasoningEffort: ds.session.reasoningEffort,
+    launchShell: botCfg.launchShell,
+    startupCommands: botCfg.startupCommands,
   };
 }
+
+/** @internal test-only: exercise sessionAgentConfig's launch-config resolution
+ * (incl. the /cli cliLaunchSnapshot branch's live model resolution) directly,
+ * without spawning a real worker. */
+export const __testOnly_sessionAgentConfig = sessionAgentConfig;
 
 
 export { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -1683,6 +1727,9 @@ export function clearUsageLimitState(ds: DaemonSession): void {
     ds.usageLimitRetryTimer = undefined;
   }
   ds.usageLimit = undefined;
+  // Re-arm the proactive rate-limit notification latch: the next limit episode
+  // (even one with the same usageLimitStateKey) must notify the owner again.
+  ds.rateLimitNotifiedKey = undefined;
   persistStreamCardState(ds);
 }
 
@@ -7302,6 +7349,15 @@ export async function forkSession(
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.reasoningEffort = ds.session.reasoningEffort;
   childSession.model = ds.session.model;
+  childSession.cliLaunchSnapshot = ds.session.cliLaunchSnapshot
+    ? {
+        ...ds.session.cliLaunchSnapshot,
+        cliRuntime: ds.session.cliLaunchSnapshot.cliRuntime
+          ? { ...ds.session.cliLaunchSnapshot.cliRuntime, update: { ...ds.session.cliLaunchSnapshot.cliRuntime.update } }
+          : null,
+        startupCommands: [...ds.session.cliLaunchSnapshot.startupCommands],
+      }
+    : undefined;
   childSession.cliRuntime = ds.session.cliRuntime
     ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
     : undefined;
@@ -9439,7 +9495,7 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     wrapperCli: agentCfg.wrapperCli,
-    launchShell: botCfg.launchShell,
+    launchShell: agentCfg.launchShell,
     model: agentCfg.model,
     reasoningEffort: agentCfg.reasoningEffort,
     // dsh runner turn timeout: read live from bot config so tuning bots.json
@@ -9448,21 +9504,22 @@ export function forkWorker(
     // dsh runtime variant (official runner vs dsh-tui PTY TUI).
     dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
+    codexBrowser: botCfg.codexBrowser,
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
     // through its terminal and must never trigger BotMux's self-owned RPC engine.
     codexRpcInput: existingAppServerEndpoint
       ? false
-      : botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+      : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
-    startupCommands: botCfg.startupCommands,
+    startupCommands: agentCfg.startupCommands,
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: botCfg.env,
+    env: ds.session.cliLaunchSnapshot ? undefined : botCfg.env,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
@@ -9846,6 +9903,21 @@ function isMeetingDrivenTurn(
   if (!ds.session.vcMeetingReceiver) return false;
   if (dispatchAttempt !== undefined) return true;
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
+}
+
+function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
+  // The daemon owns this per-turn sender map. The worker contributes only the
+  // turn id over private IPC; it can never choose which human that id denotes.
+  return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+}
+
+function currentTurnProcessIdentities(
+  ds: DaemonSession,
+  turnId: string | undefined,
+): string[] | undefined {
+  return turnId && ds.localProcessAttestation?.cliPid
+    ? snapshotProcessIdentities(ds.localProcessAttestation.cliPid)
+    : undefined;
 }
 
 function setupWorkerHandlers(
@@ -10846,14 +10918,18 @@ function setupWorkerHandlers(
           });
           // Usage ledger: any settle-to-idle/limited edge records the delta.
           // Turn reactions are stricter — only flip ✋→✅ after a real busy
-          // period (working/analyzing). Cold-start starting→idle (or the first
-          // prompt-ready before the turn has gone working) must NOT DONE a
-          // message that is still about to be / just being processed. Grok
-          // card-off sessions hit this when the ready-gate settle fired idle
-          // ~seconds after GoGoGo while the CLI was still running the prompt.
+          // period (working/analyzing) that settles to IDLE. A limited settle
+          // is a blocked turn, not completion: DONE-ing ✋ on working→limited
+          // made users think the task finished while the CLI was stuck (the
+          // rate-limit notification below owns that attention instead).
+          // Cold-start starting→idle (or the first prompt-ready before the turn
+          // has gone working) must NOT DONE a message that is still about to be
+          // / just being processed. Grok card-off sessions hit this when the
+          // ready-gate settle fired idle ~seconds after GoGoGo while the CLI
+          // was still running the prompt.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            if (prevStatus === 'working' || prevStatus === 'analyzing') {
+            if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
             }
           }
@@ -10875,6 +10951,46 @@ function setupWorkerHandlers(
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
+
+        // Proactive rate/usage-limit notification. The streaming-card PATCH
+        // (card-on) carries no unread/mention signal, and card-off sessions
+        // skip card output entirely — so without a fresh message here the owner
+        // never learns the CLI is blocked (the turn just stalls). Fire on the
+        // working/other→limited edge, AFTER the managed/silent fence above but
+        // BEFORE the card-off early-break below (card-off sessions must still
+        // get this ping), once per limit episode: the latch is keyed on
+        // usageLimitStateKey and reset by clearUsageLimitState (self-heal /
+        // turn end), so the same episode's repeated limited ticks stay quiet
+        // while the next episode notifies again.
+        //
+        // Recovery-window exclusion: usageLimit is in-memory. When the CLI got
+        // limited WHILE the daemon was down (common for tmux/adopt restores),
+        // restore has no usageLimit to seed lastScreenStatus='limited' from,
+        // so the first post-restart limited tick is a false (empty→limited)
+        // edge. The in-memory latch also died with the old process, so without
+        // this guard the restart-silence contract would be broken by one @owner
+        // ping. The owner already got the private recovery DM summary; hold the
+        // ping until a real user turn clears suppressRecoveryCard.
+        if (
+          ds.lastScreenStatus === 'limited'
+          && prevStatus !== 'limited'
+          && ds.usageLimit
+          && !ds.suppressRecoveryCard
+          && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
+        ) {
+          ds.rateLimitNotifiedKey = usageLimitStateKey(ds.usageLimit);
+          const limit = ds.usageLimit;
+          const notifyBody = tr(
+            limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+            { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+            loc,
+          );
+          const ownerOpenId = ds.session.ownerOpenId;
+          const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+          scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
+            logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+          });
+        }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
@@ -12103,12 +12219,19 @@ function setupWorkerHandlers(
             break;
           }
         }
+        const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
+            : {}),
+          ...((msg.turnId && currentGatewayCallerOpenId(ds, msg.turnId))
+            ? { callerOpenId: currentGatewayCallerOpenId(ds, msg.turnId) }
+            : {}),
+          ...(preexistingProcessIdentities
+            ? { preexistingProcessIdentities }
             : {}),
         };
         break;

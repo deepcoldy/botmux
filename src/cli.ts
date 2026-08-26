@@ -7732,6 +7732,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  actor current --json
+              返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   mojo-containment list|revoke
               查看 / 显式撤销无法自证静止的 mojo containment handle（设备隔离
               blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
@@ -7932,6 +7934,7 @@ interface CurrentSession {
   larkAppId?: string;
   chatType?: 'group' | 'p2p';
   scope?: 'thread' | 'chat';
+  ownerOpenId?: string;
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -7949,6 +7952,7 @@ function detectCurrentSession(): CurrentSession | null {
     larkAppId: s.larkAppId,
     chatType: s.chatType,
     scope: s.scope,
+    ownerOpenId: s.ownerOpenId,
   };
 }
 
@@ -8363,13 +8367,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
+    // Default to group top-level: a schedule created inside a topic session
+    // (including an adopted one) must not pin its results to that topic.
+    // --topic opts in explicitly; p2p sessions keep the legacy inference.
     const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
       ? 'new-topic'
       : wantsTopLevel
         ? 'top-level'
         : wantsTopic
           ? 'topic'
-          : cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level';
+          : cur?.chatType === 'p2p'
+            ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
+            : 'top-level';
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
       console.error('话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
@@ -8401,11 +8410,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         prompt: promptArg,
         workingDir,
         chatId,
-        rootMessageId,
+        // Only topic execution keeps the captured root; at top-level the root
+        // is dropped so toggles can never pull execution back into the
+        // originating (e.g. adopted) topic.
+        rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
         larkAppId,
         creatorChatId: cur?.chatId,
         creatorRootMessageId: cur?.rootMessageId,
         creatorLarkAppId: cur?.larkAppId,
+        // Stamp the creator (sandboxed session owner) so the task's scheduled
+        // turns can authenticate workflow commands as them. The daemon
+        // re-checks the owner is still allowed at every run mutation.
+        ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,
@@ -14545,7 +14561,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
   'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
-  'vc-agent', 'report',
+  'vc-agent', 'report', 'actor',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
   console.error(
@@ -14572,6 +14588,31 @@ switch (command) {
       break;
     }
     process.stdout.write(`${JSON.stringify(botmuxCapabilities())}\n`);
+    break;
+  }
+  case 'actor': {
+    const { parseCurrentActorArgs, resolveBotmuxAncestorContext, resolveCurrentActor } = await import('./cli/current-actor.js');
+    const parsed = parseCurrentActorArgs(process.argv.slice(3));
+    if (!parsed.ok) {
+      console.error(parsed.error);
+      process.exitCode = 2;
+      break;
+    }
+    try {
+      const { ipcPort, sessionId } = resolveBotmuxAncestorContext();
+      const actor = await resolveCurrentActor({
+        ipcPort,
+        sessionId,
+      });
+      process.stdout.write(`${JSON.stringify(actor)}\n`);
+    } catch {
+      process.stdout.write(`${JSON.stringify({
+        schema: 'botmux.current-actor.v2',
+        status: 'blocked',
+        error: 'current_actor_unverified',
+      })}\n`);
+      process.exitCode = 2;
+    }
     break;
   }
   case 'setup': {

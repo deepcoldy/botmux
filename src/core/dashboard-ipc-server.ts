@@ -45,6 +45,13 @@ import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+import {
+  CURRENT_ACTOR_ROUTE,
+} from '../cli/current-actor.js';
+import {
+  resolveDaemonCurrentActor,
+  resolveLoopbackPeerProcesses,
+} from './current-actor-attestation.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -72,6 +79,11 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
+import { normalizeBotDescriptions } from '../services/bot-description-schema.js';
+import type {
+  OpenPlatformDescriptionReadResult,
+  OpenPlatformDescriptionUpdateResult,
+} from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
@@ -184,6 +196,17 @@ let botAvatarChanger: ((image: Buffer) => Promise<BotAvatarOutcome>) | null = nu
 export function setBotAvatarChanger(fn: ((image: Buffer) => Promise<BotAvatarOutcome>) | null): void {
   botAvatarChanger = fn;
 }
+// 机器人多语言名片描述读/写，注册方式同 renamer / avatar（开放平台自动化在
+// daemon 闭包里做）。描述没有 botmux 侧的本地等价物，失败不降级，把结构化原因
+// 原样返回给前端。API-only bot 不注册该 manager（无飞书应用可改）。
+export type BotDescriptionManager = {
+  read: () => Promise<OpenPlatformDescriptionReadResult>;
+  update: (descriptions: Record<string, string>) => Promise<OpenPlatformDescriptionUpdateResult>;
+};
+let botDescriptionManager: BotDescriptionManager | null = null;
+export function setBotDescriptionManager(manager: BotDescriptionManager | null): void {
+  botDescriptionManager = manager;
+}
 
 type SupervisorShutdownRegistration = SupervisorShutdownIdentity & {
   shutdown: () => Promise<void>;
@@ -203,7 +226,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -706,6 +729,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
   if (method === 'POST' && pathname === MANAGED_ORIGIN_ATTEST_ROUTE) return true;
+  // The daemon authenticates this route from the live loopback peer process
+  // and its private worker IPC state. It intentionally accepts no file/env
+  // capability because those are writable by an unconfined same-UID Agent.
+  if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -935,6 +962,49 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
   } finally {
     managedOriginPreauthInFlight -= 1;
   }
+});
+
+ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
+  let body: { sessionId?: unknown };
+  try {
+    body = await readBoundedJsonBody(req, 1_024, 1_000);
+  } catch (err) {
+    if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(res, err instanceof IpcBodyTooLargeError ? 413 : 400, {
+      schema: 'botmux.current-actor.v2',
+      status: 'blocked',
+      error: 'current_actor_unverified',
+    });
+  }
+  const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
+    ? body.sessionId
+    : '';
+  const peer = resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress,
+    remotePort: req.socket.remotePort,
+    localPort: req.socket.localPort,
+  });
+  if (!sessionId || !peer.ok) {
+    return jsonRes(res, 403, {
+      schema: 'botmux.current-actor.v2',
+      status: 'blocked',
+      error: 'current_actor_unverified',
+    });
+  }
+  const result = await resolveDaemonCurrentActor({
+    sessionId,
+    peer: peer.peer,
+    findSession: findActiveBySessionId,
+  });
+  return result.ok
+    ? jsonRes(res, 200, result.document)
+    : jsonRes(res, 403, {
+        schema: 'botmux.current-actor.v2',
+        status: 'blocked',
+        error: result.error,
+      });
 });
 
 // ─── Session list / detail ─────────────────────────────────────────────────
@@ -2925,12 +2995,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
-      rootMessageId: rootMessageId || undefined,
+      // Only topic execution retains a root anchor; at top-level/new-topic the
+      // root is dropped so it can never pull execution back into the topic the
+      // schedule was created from (e.g. an adopted one).
+      rootMessageId: executionPosition === 'topic' ? (rootMessageId || undefined) : undefined,
       scope: executionPosition === 'topic' ? 'thread' : 'chat',
       executionPosition,
       topicTitle: topicTitle || undefined,
       chatType: 'group',
       larkAppId: cachedLarkAppId,
+      // Stamp the bot owner as creator: dashboard is local + token-protected,
+      // and the daemon re-checks the owner is still allowed at every run
+      // mutation (scheduled-turn-provenance).
+      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
       deliver,
       silent,
     });
@@ -4276,6 +4353,66 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
   // invalid_image 是调用方参数问题（4xx），其余是飞书侧/环境失败（502）。
   const status = changed.reason === 'invalid_image' ? 400 : 502;
   jsonRes(res, status, { ok: false, error: changed.reason, message: changed.message });
+});
+
+// 机器人多语言名片描述读/写（dashboard 档案头「飞书名片描述」入口）。
+//   GET  /api/bot-description → { ok, primaryLang, languages:[{lang,description}] }
+//   PUT  /api/bot-description  Body `{ descriptions: { zh_cn, en_us, ... } }`
+// 走开放平台自动化真改飞书应用描述（全量回写 base_info + 建版发布，名片生效）。
+// 描述没有本地降级等价物：失败把结构化原因返回（no_session / session_expired 时
+// 前端引导扫码重登；languages_changed 时前端刷新重填）。manager 未注册（API-only
+// bot / 测试环境）→ 501。
+function descriptionFailureStatus(reason: string): number {
+  switch (reason) {
+    case 'languages_changed':
+      return 409;
+    case 'invalid_descriptions':
+    case 'description_required':
+    case 'description_too_long':
+      return 400;
+    default:
+      // no_session / session_expired / no_access / unsupported_brand / api_error
+      return 502;
+  }
+}
+
+ipcRoute('GET', '/api/bot-description', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!botDescriptionManager) return jsonRes(res, 501, { ok: false, error: 'description_not_wired' });
+  const result = await botDescriptionManager.read();
+  if (result.ok) {
+    return jsonRes(res, 200, { ok: true, primaryLang: result.primaryLang, languages: result.languages });
+  }
+  jsonRes(res, descriptionFailureStatus(result.reason), { ok: false, error: result.reason, message: result.message });
+});
+
+ipcRoute('PUT', '/api/bot-description', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!botDescriptionManager) return jsonRes(res, 501, { ok: false, error: 'description_not_wired' });
+  let body: unknown;
+  try { body = await readJsonBody<unknown>(req, 64 * 1024); }
+  catch (err) {
+    if (err instanceof JsonBodyTooLargeError) return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
+  }
+  // 顶层只允许 { descriptions }，防原型污染与多余键。
+  if (!hasExactSafeJsonKeys(body, ['descriptions'])) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+  const normalized = normalizeBotDescriptions((body as Record<string, unknown>).descriptions);
+  if (!normalized.ok) {
+    return jsonRes(res, 400, { ok: false, error: normalized.reason, lang: normalized.lang });
+  }
+  const result = await botDescriptionManager.update(normalized.descriptions);
+  if (result.ok) {
+    return jsonRes(res, 200, {
+      ok: true,
+      primaryLang: result.primaryLang,
+      descriptions: result.descriptions,
+      versionId: result.versionId,
+    });
+  }
+  jsonRes(res, descriptionFailureStatus(result.reason), { ok: false, error: result.reason, message: result.message, lang: result.lang });
 });
 
 // Per-bot agent launch settings. Body `{ cliId, model, cliRuntime? }` where `cliId` is the

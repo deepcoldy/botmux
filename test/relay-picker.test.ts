@@ -40,7 +40,7 @@ function makeDs(over: {
   chatId: string;
   lastMessageAt: number;
   title?: string;
-  ownerOpenId?: string;
+  ownerOpenId?: string | null;
   adoptedFrom?: any;
   cliId?: string | undefined;
   worker?: any;
@@ -60,7 +60,7 @@ function makeDs(over: {
       scope,
       chatType: 'group',
       larkAppId: APP,
-      ownerOpenId: over.ownerOpenId ?? OWNER,
+      ownerOpenId: 'ownerOpenId' in over ? (over.ownerOpenId ?? undefined) : OWNER,
       workingDir: '/tmp',
       cliId: 'cliId' in over ? over.cliId : ('claude-code' as any),
       adoptedFrom: over.adoptedFrom,
@@ -138,5 +138,26 @@ describe('collectRelayPickerEntries', () => {
 
     // topicB (same chat, different anchor) survives; topicA (the target) is gone.
     expect(entries.map(e => e.sessionId)).toEqual(['topic-b']);
+  });
+
+  it('includes ownerless sessions (ownerOpenId unset) in every operator\'s picker', async () => {
+    // Alert-listener / daemon-spawned sessions have no ownerOpenId. The picker
+    // must surface them to any operator — same rule as relay_confirm and
+    // /relay --create, which only gate when an owner IS set.
+    const ownerless = makeDs({ sessionId: 'ownerless', chatId: 'oc_a', lastMessageAt: 100, ownerOpenId: null });
+    const reg = registryOf(ownerless);
+
+    const entries = await collectRelayPickerEntries(reg, APP, CURRENT_CHAT, 'ou_any_operator');
+
+    expect(entries.map(e => e.sessionId)).toEqual(['ownerless']);
+  });
+
+  it('still hides another operator\'s owned sessions (owner gate unchanged)', async () => {
+    const owned = makeDs({ sessionId: 'owned', chatId: 'oc_a', lastMessageAt: 100, ownerOpenId: 'ou_real_owner' });
+    const reg = registryOf(owned);
+
+    const entries = await collectRelayPickerEntries(reg, APP, CURRENT_CHAT, 'ou_intruder');
+
+    expect(entries.map(e => e.sessionId)).toEqual([]);
   });
 });

@@ -100,7 +100,7 @@ const DURATION_UNIT_MS: Record<string, number> = {
   d: 86_400_000,
 };
 
-function checkSchedule(
+export function checkSchedule(
   input: string,
   tr: ReturnType<typeof useT>,
   timeZone?: string,
@@ -139,12 +139,28 @@ function checkSchedule(
     }
   }
 
-  // 中文自然语言（对齐服务端 parseChineseSchedule 的前缀族，含工作日变体）
-  if (/^(每日|每周[一二三四五六日天]?|每月|每\d*小时|每\d+分钟|每小时|每分钟|\d+\s*分钟后|\d+\s*小时后|明天|每个?工作日|工作日每[天日])/.test(s)) {
+  // 中文自然语言（对齐服务端 parseChineseSchedule 的前缀族，含工作日变体）。
+  // `每天` 是早期版本和 /schedule 一直支持的存量写法，不能只接受 `每日`。
+  if (/^(每[天日]|每周[一二三四五六日天]|每月\d{1,2}[号日]|每\d+小时|每小时|每\d+分钟|\d+\s*分钟后|\d+\s*小时后|明天|每个?工作日|工作日每[天日])/.test(s)) {
     return { ok: true };
   }
 
   return { ok: false, error: tr('schedules.form.errFormat') };
+}
+
+export function canSubmitSchedule(
+  input: string,
+  original: string | undefined,
+  tr: ReturnType<typeof useT>,
+  timeZone?: string,
+): boolean {
+  const normalized = input.trim();
+  if (!normalized) return false;
+  // Existing tasks may contain syntax authored by an older release. The
+  // server only re-parses schedule when it changes, so an unchanged legacy
+  // value must not prevent edits to the task's other fields.
+  if (original !== undefined && normalized === original.trim()) return true;
+  return checkSchedule(normalized, tr, timeZone).ok;
 }
 
 function ScheduleRowCard(props: {
@@ -680,17 +696,13 @@ function ScheduleFormModal(props: {
   function handleSubmit(e: React.FormEvent): void {
     e.preventDefault();
     setTouched(true);
+    setScheduleTouched(true);
     // 必填内联校验：不静默 return，每个缺字段都有可见红提示
     if (!editing && !larkAppId) return;
     if (!name.trim() || !prompt.trim()) return;
     if (!localDelivery && !chatId.trim()) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
-    if (schedule.trim()) {
-      const sc = checkSchedule(schedule, tr, scheduleTimeZone);
-      if (!sc.ok) return;
-    } else {
-      return;
-    }
+    if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
     props.onSubmit({
       name: name.trim(),
       schedule: schedule.trim(),

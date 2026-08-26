@@ -468,7 +468,7 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     expect(delivery.value.target_position).toBe('top-level');
   });
 
-  it('fresh topic → shows the custom title and cycles to its retained topic', () => {
+  it('fresh topic → shows the custom title and parks at top level instead of re-entering the retained topic', () => {
     const detail = detailFor({
       id: 'sch_fresh_topic',
       executionPosition: 'new-topic',
@@ -483,8 +483,9 @@ describe('buildSchedulesDetailCard (slice 2a)', () => {
     const delivery = (actionRow.actions as any[]).find(
       (a: any) => a.value?.action === SCHEDULES_ACTION_DELIVERY,
     );
-    expect(delivery.text.content).toBe('改为话题下执行');
-    expect(delivery.value.target_position).toBe('topic');
+    // The retained root must not pull the toggle back into a topic.
+    expect(delivery.text.content).toBe('改为群消息顶层');
+    expect(delivery.value.target_position).toBe('top-level');
   });
 
   it('delivery=local → shows local mode without a delivery switch', () => {
@@ -1323,7 +1324,9 @@ describe('handleSchedulesCardAction', () => {
       expect(r.toast).toBeUndefined();
       const cardJson = JSON.stringify(r.card?.data);
       expect(cardJson).toContain('执行位置：每次新话题');
-      expect(cardJson).toContain('改为话题下执行');
+      // Leaving a fresh topic parks at top level — never re-enters a retained
+      // (potentially adopted) topic root.
+      expect(cardJson).toContain('改为群消息顶层');
     });
 
     it('fresh topic → retained topic round-trips and rebuilds the selected position', async () => {

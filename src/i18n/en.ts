@@ -59,6 +59,8 @@ export const messages: Record<string, string> = {
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
+  'worker.rate_limit_notify.rate': '⚠️ {cliName} hit a rate limit — this turn is paused. Resend the last task after {retryLabel}, or send a new message to continue.',
+  'worker.rate_limit_notify.usage': '⚠️ {cliName} hit its usage limit — this turn is paused. Once the quota resets ({retryLabel}), resend the last task or send a new message to continue.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
   'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
 

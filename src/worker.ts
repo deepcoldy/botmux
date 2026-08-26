@@ -13740,6 +13740,7 @@ async function spawnCli(
     turnTimeoutMs: cfg.turnTimeoutMs,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
+    codexBrowser: cfg.codexBrowser,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless
     // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.
     // The adapter further ANDs this with !disableCliBypass. Read live per spawn.
@@ -17850,6 +17851,11 @@ function publishLocalProcessAttestation(cliPid?: number): void {
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
   });
+  // IPC preserves order: the daemon records this exact CLI pid/generation
+  // before it snapshots the current turn's pre-existing descendants. This is
+  // required for the opening turn, whose origin is first published before the
+  // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
+  if (currentBotmuxTurnId) publishSandboxRelayCapability();
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`

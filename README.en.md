@@ -66,6 +66,16 @@ Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (proce
 
 The current full set of `cliId`s is authoritative in [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts); per-CLI config and wrapper / gateway setups are in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 
+### Session-level CLI selection
+
+Before a session starts, select a registered CLI for that session with `/cli <cliId>`, for example:
+
+```text
+/cli codex
+```
+
+This switches only the bare CLI adapter. It does not inherit the bot's `wrapperCli`, `model`, or `startupCommands`. CLIs that require a `ttadk`, `aiden`, or other wrapper / gateway setup should therefore remain configured as the bot's default wrapper combination. Once the session starts, the CLI selection is frozen and is reused for later messages and restores.
+
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
 botmux doesn't reimplement memory, context management, tool calls, or permission systems — **most native CLI capabilities don't need reimplementing, and CLI upgrades usually benefit botmux directly** (when interfaces / params / output formats / resume semantics change, an adapter may still need to catch up). You keep talking in plain language; the daemon wraps context into structured prompts behind the scenes before feeding the CLI. An Agent-SDK-based approach is the inverse: capabilities depend on what the SDK exposes and on your own integration.

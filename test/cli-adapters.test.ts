@@ -553,6 +553,25 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
   });
+
+  it('passes the opt-in browser bridge only to the Codex App runner', () => {
+    const disabled = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(disabled).not.toContain('--browser-family');
+
+    const enabled = adapter.buildArgs({
+      sessionId: 'sess-app',
+      resume: false,
+      codexBrowser: {
+        enabled: true,
+        family: 'edge',
+        pluginRoot: '/opt/codex/chrome-plugin',
+      },
+    });
+    expect(enabled).toEqual(expect.arrayContaining([
+      '--browser-family', 'edge',
+      '--browser-plugin-root', '/opt/codex/chrome-plugin',
+    ]));
+  });
 });
 
 describe('mira buildArgs', () => {
@@ -643,6 +662,36 @@ describe('dsh buildArgs (runner model)', () => {
 
   it('advertises the deepseek model choices', () => {
     expect(adapter.modelChoices).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
+  });
+
+  it('canonicalizes a symlinked bin so --dsh-bin matches the sandbox-authorized path', () => {
+    // Regression: a symlink-installed dsh-jsonrpc-agent (e.g. ~/.local/bin →
+    // SDK package dir) plus a symlinked HOME made the runner spawn the raw
+    // symlink path, which the file sandbox never exposes (it authorizes only
+    // dirname(realpath(bin))) → `spawn ... ENOENT` crash-loop under sandbox=true.
+    // Both --dsh-bin and sandboxExtraExecPaths() must resolve to the real target.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-symlink-'));
+    try {
+      const realDir = join(root, 'opt', 'runtime');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'dsh-jsonrpc-agent-pkg-linux-x64');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'dsh-jsonrpc-agent');
+      symlinkSync(realBin, linkBin);
+
+      const symlinkAdapter = createDshAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const binIdx = args.indexOf('--dsh-bin');
+      expect(binIdx).toBeGreaterThanOrEqual(0);
+      expect(args[binIdx + 1]).toBe(canonicalReal);
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('writeInput frames content with the dsh marker', async () => {

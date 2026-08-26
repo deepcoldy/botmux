@@ -696,15 +696,102 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 33 = current master command set (32) + /forklist.
+    // 35 = current master command set (34, incl. /forklist and /cot) + /cli.
     // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(34);
+    expect(DAEMON_COMMANDS.size).toBe(35);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
     expect(DAEMON_COMMANDS.has('/list-slash-command')).toBe(true);
     expect(DAEMON_COMMANDS.has('/slash')).toBe(true);
+  });
+});
+
+describe('/cli session selection', () => {
+  it('persists a pending CLI selection and allows pre-freeze reselection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined, cliLaunchSnapshot: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toEqual(expect.objectContaining({
+      state: 'pending', entryId: 'codex', cliId: 'codex', cliRuntime: expect.objectContaining({ id: 'codex' }), wrapperCli: null,
+      cliPathOverride: null, launchShell: null, startupCommands: [],
+    }));
+    expect(ds.session.agentFrozen).toBeUndefined();
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot?.entryId).toBe('hermes');
+  });
+
+  it('rejects selection after history and does not mutate the snapshot', async () => {
+    const snapshot = { version: 1 as const, state: 'pending' as const, entryId: 'codex', cliId: 'codex' as const, cliRuntime: null, cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [] };
+    const ds = makeDaemonSession({ hasHistory: true, session: makeSession({ cliId: 'codex', cliLaunchSnapshot: snapshot }) });
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), makeDeps(ds), LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toEqual(snapshot);
+  });
+
+  it('rejects bare /cli and unknown cli ids', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli'), deps, LARK_APP_ID);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli does-not-exist'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, 'Usage: /cli <cliId>\nUnknown or invalid CLI.', undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('rejects riff because it requires bot-level backend configuration', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli riff'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(
+      ROOT_ID,
+      'CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session',
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
+  });
+
+  it('canonicalizes accepted CLI ids before persisting the selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli CODEX'), makeDeps(ds), LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot?.cliId).toBe('codex');
+    expect(ds.session.cliLaunchSnapshot?.entryId).toBe('codex');
+  });
+
+  it('rejects mixed-case Riff before persisting the selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli RIFF'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(
+      ROOT_ID,
+      'CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session',
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
   });
 });
 
@@ -3949,6 +4036,33 @@ describe('handleCommand', () => {
       expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
+    it('uses the selected CLI snapshot when pendingRepo is submitted with /repo', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '帮我看看这个 bug',
+        session: makeSession({
+          cliId: undefined,
+          cliLaunchSnapshot: {
+            version: 1,
+            state: 'pending',
+            entryId: 'codex',
+            cliId: 'codex',
+            cliRuntime: null,
+            cliPathOverride: null,
+            wrapperCli: null,
+            model: null,
+            reasoningEffort: null,
+            launchShell: null,
+            startupCommands: [],
+          },
+        }),
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), makeDeps(ds), LARK_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[2]).toBe('codex');
+    });
+
     it('submits chat context when bare /repo follows an empty group-join prompt', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
@@ -4500,6 +4614,37 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('新话题');
       expect(replyContent).toContain('静默模式');
+    });
+
+    it('defaults to group top-level when created from a topic/adopt session (no position modifier)', async () => {
+      // A schedule born inside a topic (including an adopted one) must not pin
+      // its results to that topic. Without an explicit modifier the default is
+      // top-level and the root bookmark is dropped.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      // Default extractScheduleModifiers mock returns no executionPosition.
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-topic-default' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      // Simulate a topic-scope (adopt) session: scope is 'thread'.
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.executionPosition).toBe('top-level');
+      expect(callArgs.scope).toBe('chat');
+      // The adopt topic root must not be retained as a bookmark.
+      expect(callArgs.rootMessageId).toBeUndefined();
     });
   });
 

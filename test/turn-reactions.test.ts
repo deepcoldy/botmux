@@ -340,13 +340,14 @@ describe('two-phase turn reactions', () => {
 
 /**
  * Source-level pin: the screen_update handler must only flip ✋→✅ after a real
- * busy period (working/analyzing → idle|limited). Cold-start starting→idle
+ * busy period (working/analyzing → idle). Cold-start starting→idle
  * (ready-gate settle before the turn has gone working) must leave GoGoGo alone
  * — otherwise card-off Grok sessions DONE a message while the CLI is still
- * chewing the first prompt.
+ * chewing the first prompt. A limited settle is also excluded (rate limit is a
+ * blocked turn, not completion — see test/rate-limit-notify.test.ts).
  */
 describe('turn reaction idle edge gate (source)', () => {
-  it('finishTurnReactions is gated on prevStatus working|analyzing', () => {
+  it('finishTurnReactions is gated on prevStatus working|analyzing and idle settle', () => {
     const source = readFileSync(
       join(process.cwd(), 'src/core/worker-pool.ts'),
       'utf8',
@@ -357,7 +358,9 @@ describe('turn reaction idle edge gate (source)', () => {
       ? source.indexOf('// Usage ledger + turn reactions')
       : source.indexOf('// Usage ledger: any settle-to-idle');
     expect(blockStart).toBeGreaterThan(-1);
-    const block = source.slice(blockStart, blockStart + 900);
+    // Window is wider than the original 900 chars: the gate now also excludes
+    // limited settles, so the condition line carries the extra idle check.
+    const block = source.slice(blockStart, blockStart + 1400);
     expect(block).toContain("prevStatus === 'working' || prevStatus === 'analyzing'");
     expect(block).toContain('void finishTurnReactions(ds)');
     // Must NOT call finishTurnReactions on every idle/limited edge unconditionally.
@@ -444,9 +447,11 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(ds.pendingAckReactions).toEqual([]);
   });
 
-  it('working→limited flips DONE (rate-limit banner on settle; synthetic working must not be rewritten)', async () => {
-    // Review third round: if both seeds classify to limited, gate never sees
-    // working. Forced synthetic working + limited settle must still DONE.
+  it('working→limited does NOT DONE (rate limit is a blocked turn, not completion)', async () => {
+    // A limited settle means the CLI is stuck on a rate/usage limit. DONE-ing
+    // the ✋ here made users think the task finished while it actually stalled;
+    // the proactive rate-limit notification (test/rate-limit-notify.test.ts)
+    // owns that attention instead. The ✋ must stay until a real idle settle.
     const worker = makeFakeWorker();
     const ds = makeDs({
       worker,
@@ -476,9 +481,9 @@ describe('turn reaction screen_update behavioral gate', () => {
     });
     await flush();
 
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
   });
 
   it('limited→limited alone does not DONE (no working edge)', async () => {

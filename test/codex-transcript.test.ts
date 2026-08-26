@@ -811,7 +811,7 @@ describe('drainCodexRollout', () => {
   });
 });
 
-function threadSettingsApplied(serviceTier: string, ts = '2026-04-29T07:00:00.000Z', model = 'gpt-5.6-sol') {
+function threadSettingsApplied(serviceTier?: string, ts = '2026-04-29T07:00:00.000Z', model = 'gpt-5.6-sol') {
   return {
     timestamp: ts,
     type: 'event_msg',
@@ -820,7 +820,7 @@ function threadSettingsApplied(serviceTier: string, ts = '2026-04-29T07:00:00.00
       thread_settings: {
         model,
         model_provider_id: 'byteseed',
-        service_tier: serviceTier,
+        ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
       },
     },
   };
@@ -869,13 +869,12 @@ describe('Codex thread settings observation', () => {
     expect(scanCodexThreadSettings(path)?.serviceTier).toBe('priority');
   });
 
-  it('does not confuse a settings event that carries no service_tier', () => {
-    writeFileSync(path, ev({
-      timestamp: '2026-04-29T07:00:00.000Z',
-      type: 'event_msg',
-      payload: { type: 'thread_settings_applied', thread_settings: { model: 'x' } },
-    }));
-    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  it('treats a valid settings event that carries no service_tier as default', () => {
+    writeFileSync(path, ev(threadSettingsApplied()));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
   });
 
   it('reads the top-level reasoning_effort (follows an in-session /effort switch)', () => {
@@ -932,6 +931,29 @@ describe('Codex thread settings observation', () => {
 
     expect(second.events).toEqual([]);
     expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('clears a live priority snapshot when Codex omits service_tier', () => {
+    writeFileSync(path, ev(threadSettingsApplied('priority')));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestThreadSettings?.serviceTier).toBe('priority');
+
+    appendFileSync(path, ev(threadSettingsApplied(undefined, '2026-04-29T07:01:00.000Z')));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('backward scan returns the newest omitted service_tier as default', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('priority'))
+      + ev(threadSettingsApplied(undefined, '2026-04-29T07:01:00.000Z')));
+    expect(scanCodexThreadSettings(path)).toEqual({
       model: 'gpt-5.6-sol',
       serviceTier: 'default',
     });
@@ -1095,4 +1117,3 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
     expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
   });
 });
-

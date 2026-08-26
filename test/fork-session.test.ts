@@ -86,6 +86,7 @@ import {
   forkWorker,
   setActiveSessionsRegistry,
   turnStartingCardStatus,
+  __testOnly_sessionAgentConfig as sessionAgentConfig,
 } from '../src/core/worker-pool.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -497,5 +498,68 @@ describe('forkSession — refusals', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('worker_busy');
     expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * sessionAgentConfig — /cli cliLaunchSnapshot model resolution WIRING.
+ *
+ * The unit-level model contract lives in session-launch-model.test.ts (it tests
+ * resolveSessionLaunchModel directly). These tests guard the CALL SITE: that the
+ * snapshot branch actually routes model through that live resolution AFTER it
+ * stamps ds.session.cliId = selected.cliId, rather than freezing the (null)
+ * snapshot model. Reverting the fix to `model = selected.model ?? undefined`
+ * reddens the "same-CLI keeps bot model" and "override wins" cases here — which
+ * the function-level tests cannot catch.
+ */
+describe('sessionAgentConfig — /cli snapshot model wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+      botName: 'TestBot',
+    } as any);
+  });
+
+  const pendingSnapshot = (cliId: any) => ({
+    version: 1 as const,
+    state: 'pending' as const,
+    entryId: cliId,
+    cliId,
+    cliRuntime: null,
+    cliPathOverride: null,
+    wrapperCli: null,
+    model: null,
+    reasoningEffort: null,
+    launchShell: null,
+    startupCommands: [] as string[],
+  });
+
+  // A fresh /cli-selected session: no history, no model of its own, pending snapshot.
+  const selectedDs = (cliId: any, dsOverrides: Partial<DaemonSession> = {}) =>
+    makeSourceDs(
+      { cliId: undefined, cliSessionId: undefined, agentFrozen: false, model: undefined, cliLaunchSnapshot: pendingSnapshot(cliId) as any },
+      dsOverrides,
+    );
+
+  it('leaks no bot model across a cross-CLI selection (/cli codex on a claude bot)', () => {
+    const ds = selectedDs('codex');
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.model).toBeUndefined();          // opus must NOT reach codex
+    expect(ds.session.cliId).toBe('codex');     // snapshot resolved onto the session
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('keeps the bot model for a same-CLI selection (/cli codex on a codex bot)', () => {
+    const ds = selectedDs('codex');
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex', model: 'gpt-5.6' });
+    expect(cfg.model).toBe('gpt-5.6');          // same CLI → live bot model applies (== /restart)
+  });
+
+  it('honors a per-trigger spawnModelOverride on a /cli session', () => {
+    const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
+    expect(cfg.model).toBe('gpt-5.6-terra');    // override wins even on cross-CLI
   });
 });

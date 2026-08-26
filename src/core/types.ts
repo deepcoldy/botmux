@@ -404,6 +404,12 @@ export interface DaemonSession {
   };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Latch for the proactive rate/usage-limit owner notification: the
+   *  usageLimitStateKey of the limit episode we already posted about. Exactly
+   *  one owner notification per episode; reset to undefined by
+   *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
+   *  notify again. In-memory only. */
+  rateLimitNotifiedKey?: string;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
@@ -487,6 +493,13 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Current human caller, carried over private worker IPC from the
+     * daemon-authenticated input envelope. Never sourced from CLI env/files. */
+    callerOpenId?: string;
+    /** Linux pid:starttime identities already present in the CLI subtree when
+     * this turn authority was published. Actor callers may not traverse one of
+     * these old descendants; the long-lived CLI root itself is the exception. */
+    preexistingProcessIdentities?: string[];
   };
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */

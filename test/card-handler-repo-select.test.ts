@@ -473,6 +473,35 @@ describe('repo select card — plain switch', () => {
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
+  it('uses the selected CLI snapshot when pendingRepo is submitted from the card', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      worker: null,
+      session: {
+        ...makeDs().session,
+        cliLaunchSnapshot: {
+          version: 1,
+          state: 'pending',
+          entryId: 'codex',
+          cliId: 'codex',
+          cliRuntime: null,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: null,
+          reasoningEffort: null,
+          launchShell: null,
+          startupCommands: [],
+        },
+      },
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[2]).toBe('codex');
+  });
+
   // ─── empty start (no buffered user input at all) ─────────────────────────
   //
   // Reached when the session was created by a bare `/repo` (the message IS the

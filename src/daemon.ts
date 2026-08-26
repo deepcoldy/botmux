@@ -65,6 +65,7 @@ import {
   getBot,
   getAllBots,
   getOwnerOpenId,
+  getDashboardAdminOpenIds,
   findOncallChat,
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
@@ -85,7 +86,7 @@ import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
-import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
+import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -202,7 +203,7 @@ import {
   mojoLivePatchForSession,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
@@ -6037,6 +6038,21 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           : undefined,
         selfLarkAppId: selfV3LarkAppId,
         baseDir: v3DefaultBaseDir(),
+        sessionDataDir: config.session.dataDir,
+        // Live owner gate for scheduled turns: the task creator must still be
+        // in the bot's resolvedAllowedUsers, so removing a creator revokes
+        // their scheduled tasks' workflow authority immediately.
+        // 镜像 canOperate 语义：未配白名单的开放 bot 恒放行（否则开放 bot 的
+        // 定时 workflow 会被一律拒绝且报误导性「不在授权名单」错误）。
+        isScheduleOwnerAllowed: (larkAppId, ownerOpenId) => {
+          const bot = getBot(larkAppId);
+          const hasAllowlist = (bot.config.allowedUsers?.length ?? 0) > 0
+            || (bot.config.allowedChatGroups?.length ?? 0) > 0
+            || (bot.config.globalGrants?.length ?? 0) > 0
+            || bot.config.p2pOpen === true;
+          if (!hasAllowlist) return true;
+          return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
+        },
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {
@@ -16733,8 +16749,8 @@ function buildReservedInitialInput(
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
-    ds.session.cliId ?? botCfg.cliId,
-    ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     ds.pendingAttachments,
     ds.pendingMentions,
     availableBots,
@@ -16868,7 +16884,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
   const buffered = [...(ds.pendingFollowUps ?? [])];
   if (buffered.length > 0) {
     const bot = getBot(ds.larkAppId);
-    const cliId = ds.session.cliId ?? bot.config.cliId;
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
     const rawCodexText = (ds.pendingCodexAppFollowUps ?? []).join('\n\n');
     const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
     const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
@@ -16879,7 +16895,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
       ds.session.sessionId,
       {
         cliId,
-        cliPathOverride: ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
         locale: localeForBot(ds.larkAppId),
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
@@ -17515,10 +17531,14 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
   const noticeKey = ctx.ingressAdmission?.admitted
     ? 'daemon.ordinary_ingress_admitted_reply_failed'
     : 'daemon.ordinary_ingress_failed';
+  const cliSelectionRejected = err instanceof Error && err.message.startsWith('CLI selection rejected:');
+  const notice = cliSelectionRejected
+    ? `⚠️ ${err.message}\n\n可直接发给当前 agent：\n请帮我修复 botmux 的 CLI 选择配置：检查当前 bot 的 env、Riff 和 codexRpcInput 设置，移除与会话级 /cli <cliId> 选择冲突的配置；不要修改代码，完成后告诉我具体改了什么。`
+    : tr(noticeKey, undefined, localeForBot(ctx.larkAppId));
   try {
     await sessionReply(
       replyAnchor,
-      tr(noticeKey, undefined, localeForBot(ctx.larkAppId)),
+      notice,
       'text',
       ctx.larkAppId,
     );
@@ -19376,7 +19396,9 @@ async function handleThreadReplyAdmitted(
     // config. Route passthrough capability from that frozen runtime so changing
     // `/botconfig cli` cannot make an old Codex App session receive raw_input
     // (or make an old interactive TUI lose its native slash commands).
-    const passthroughCliId = existingDs?.session.cliId ?? getBot(larkAppId).config.cliId;
+    const passthroughCliId = existingDs?.session.cliLaunchSnapshot?.cliId
+      ?? existingDs?.session.cliId
+      ?? getBot(larkAppId).config.cliId;
     if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
@@ -19787,8 +19809,8 @@ async function handleThreadReplyAdmitted(
         attachments,
         mentions: parsed.mentions,
         isAdoptMode: false,
-        cliId: ds.session.cliId ?? botCfg.cliId,
-        cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
         sender: await getThreadSender(),
         larkAppId,
         chatId: ds.session.chatId,
@@ -19927,7 +19949,7 @@ async function handleThreadReplyAdmitted(
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliId ?? botCfg.cliId,
+          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
           cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
           sender: followUpSender,
           larkAppId,
@@ -20280,7 +20302,7 @@ async function handleThreadReplyAdmitted(
     const isBridge = !!ds.adoptedFrom;
     const selfBot = getBot(ds.larkAppId);
     if (!isBridge) ensureSessionWhiteboard(ds);
-    const effectiveCliId = ds.session.cliId ?? dsBotCfgForMsg.cliId;
+    const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForMsg.cliId;
     // Empty-started session (repo select/skip/switch booted the CLI with no
     // turn): a LIVE worker is not proof the CLI ever saw botmux's opening
     // context — only `buildNewTopicCliInput` emits <botmux_routing> /
@@ -20303,7 +20325,7 @@ async function handleThreadReplyAdmitted(
           promptContent,
           ds.session.sessionId,
           effectiveCliId,
-          ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
+          ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
           attachments,
           parsed.mentions,
           openingBots,
@@ -20326,7 +20348,7 @@ async function handleThreadReplyAdmitted(
           mentions: parsed.mentions,
           isAdoptMode: false,
           cliId: effectiveCliId,
-          cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
+          cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
           sender: turnSender,
           larkAppId,
           chatId: ds.session.chatId,
@@ -20420,8 +20442,8 @@ async function handleThreadReplyAdmitted(
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
-          cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+          cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
           sender: await getThreadSender(),
           larkAppId,
           chatId: ds.session.chatId,
@@ -20562,8 +20584,8 @@ async function handleThreadReplyAdmitted(
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
-        ds.session.cliId ?? dsBotCfgForFork.cliId,
-        ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         attachments,
         parsed.mentions,
         openingBots,
@@ -20585,8 +20607,8 @@ async function handleThreadReplyAdmitted(
       const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
         attachments: queuedHasDurableTail ? undefined : attachments,
         mentions: queuedHasDurableTail ? undefined : parsed.mentions,
-        cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
-        cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         sender: queuedHasDurableTail ? undefined : reforkSender,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
@@ -21696,8 +21718,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
   setDisplayNameRefresher(refreshBotNameState);
-  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar. These
-  // handlers drive the open-platform console (browser web-session, NOT
+  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar / re-describe.
+  // These handlers drive the open-platform console (browser web-session, NOT
   // getBotClient — so the bot-level gate can't catch them); skip registering
   // them entirely so the dashboard profile actions are inert for a core-only bot.
   if (!cfg.apiOnly) {
@@ -21738,7 +21760,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
-  } // end !cfg.apiOnly (open-platform rename/avatar handlers)
+  // 机器人多语言名片描述读/写（dashboard 档案头「飞书名片描述」入口）：开放平台
+  // 自动化改飞书应用每个已配语言的描述并发布新版本（名片跟随已发布版本，同 rename）。
+  // 只读/回写描述，不改内存 botName/avatar/名册，故无需额外同步。
+  setBotDescriptionManager({
+    read: () => readBotDescriptionsOnOpenPlatform(cfg.larkAppId, cfg.brand),
+    update: descriptions => updateBotDescriptionsOnOpenPlatform(
+      cfg.larkAppId,
+      descriptions,
+      cfg.brand,
+    ),
+  });
+  } // end !cfg.apiOnly (open-platform profile handlers)
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.
