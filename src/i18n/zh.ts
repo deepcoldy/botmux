@@ -420,6 +420,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.success': '📡 已接入 {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ 已恢复 {cliName} 历史会话 · {project} —「{title}」',
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用。',
+  'cmd.adopt.managed_other_topic': '⚠️ 该 ID 是另一个话题的 Botmux 会话，不能用 /adopt 搬到当前话题。请到原话题点击「恢复会话」，或在本机运行 `botmux resume {id}`。',
   'cmd.detach.success': '⏏ 已断开，原 CLI 会话不受影响',
   'cmd.detach.existing_app_server_success': '⏏ 已断开飞书侧的 Codex 远程客户端；开发机 App Server 和 Codex App 会话仍在运行。',
   'cmd.detach.failed': '⚠️ 未能安全断开 BotMux 共享入口；原 Codex App 会话未受影响，请稍后重试。',

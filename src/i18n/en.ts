@@ -419,6 +419,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.success': '📡 Adopted {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ Resumed {cliName} session · {project} — “{title}”',
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use.',
+  'cmd.adopt.managed_other_topic': '⚠️ That ID belongs to a Botmux session in another topic and cannot be moved here with /adopt. Resume it from the original topic, or run `botmux resume {id}` locally.',
   'cmd.detach.success': '⏏ Disconnected. The original CLI session is untouched.',
   'cmd.detach.existing_app_server_success': '⏏ Disconnected BotMux’s remote Codex client. The development-machine App Server and Codex App conversation are still running.',
   'cmd.detach.failed': '⚠️ BotMux could not safely disconnect this shared entry. The original Codex App conversation is unaffected; please retry shortly.',
