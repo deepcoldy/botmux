@@ -39,6 +39,7 @@ import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import { normalizeMessageListenerCleanupConfig } from './services/message-listener-session-cleanup.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -236,6 +237,12 @@ export interface MessageListenerConfig {
     mode?: 'thread';
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
+  };
+  cleanup?: {
+    /** Default true. */
+    enabled?: boolean;
+    /** Default 168 hours. */
+    retentionHours?: number;
   };
 }
 
@@ -1060,6 +1067,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const includeMsgTypes = normalizeMessageListenerStringList(messageRaw.includeMsgTypes);
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
   messagePolicy.scope = 'top_level';
+  const cleanup = normalizeMessageListenerCleanupConfig(entry.cleanup);
 
   const contentRaw = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
     ? entry.contentPolicy as Record<string, unknown>
@@ -1089,6 +1097,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
     ...(contentPolicy ? { contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    cleanup,
   };
 }
 

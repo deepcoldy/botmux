@@ -47,6 +47,7 @@ import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   MAX_ROLE_BYTES,
   MESSAGE_LISTENER_WARN_BYTES,
+  DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS,
   DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT,
   MAX_MESSAGE_LISTENER_PREVIEW_LIMIT,
   roleKey,
@@ -116,6 +117,10 @@ const DEFAULT_LISTENER: MessageListenerData = {
     includeMsgTypes: [...LISTENER_MESSAGE_TYPES],
     scope: 'top_level',
   },
+  cleanup: {
+    enabled: true,
+    retentionHours: DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS,
+  },
 };
 
 function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
@@ -152,7 +157,22 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
         ...(listener.contentPolicy.matchMode ? { matchMode: listener.contentPolicy.matchMode } : {}),
       },
     } : {}),
+    cleanup: {
+      enabled: listener?.cleanup?.enabled !== false,
+      retentionHours: normalizeCleanupRetentionHours(listener?.cleanup?.retentionHours),
+    },
   };
+}
+
+function normalizeCleanupRetentionHours(raw: unknown): number {
+  const value = typeof raw === 'string' && raw.trim()
+    ? Number(raw.trim())
+    : raw;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS;
 }
 
 function listenerHasConfig(listener: MessageListenerData | null): boolean {
@@ -599,6 +619,17 @@ function RolesPage(props: { tab: RolesTab }) {
     }));
   }
 
+  function updateListenerCleanup(patch: Partial<NonNullable<MessageListenerData['cleanup']>>): void {
+    setEditingListener(prev => ({
+      ...prev,
+      cleanup: {
+        enabled: prev.cleanup?.enabled !== false,
+        retentionHours: normalizeCleanupRetentionHours(prev.cleanup?.retentionHours),
+        ...patch,
+      },
+    }));
+  }
+
   function toggleListenerSenderType(type: SenderTypeOption, checked: boolean): void {
     setEditingListener(prev => {
       const current = new Set(prev.senderPolicy?.includeSenderTypes ?? []);
@@ -720,6 +751,10 @@ function RolesPage(props: { tab: RolesTab }) {
         ...(raw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
       };
     })();
+    const cleanup = {
+      enabled: editingListener.cleanup?.enabled !== false,
+      retentionHours: normalizeCleanupRetentionHours(editingListener.cleanup?.retentionHours),
+    };
     return {
       enabled: editingListener.enabled,
       ...(editingListener.name?.trim() ? { name: editingListener.name.trim() } : {}),
@@ -741,6 +776,7 @@ function RolesPage(props: { tab: RolesTab }) {
         scope: 'top_level',
       },
       ...(contentPolicy ? { contentPolicy } : {}),
+      cleanup,
     };
   }
 
@@ -1203,6 +1239,7 @@ function RolesPage(props: { tab: RolesTab }) {
                   onSenderPolicyPatch={updateListenerSenderPolicy}
                   onMessagePolicyPatch={updateListenerMessagePolicy}
                   onContentPolicyPatch={updateListenerContentPolicy}
+                  onCleanupPatch={updateListenerCleanup}
                   onToggleSenderType={toggleListenerSenderType}
                   onToggleMsgType={toggleListenerMsgType}
                   onSetTargetPolicy={setListenerTargetPolicy}
@@ -1545,6 +1582,7 @@ function MessageListenerEditor(props: {
   onSenderPolicyPatch(patch: NonNullable<MessageListenerData['senderPolicy']>): void;
   onMessagePolicyPatch(patch: NonNullable<MessageListenerData['messagePolicy']>): void;
   onContentPolicyPatch(patch: NonNullable<MessageListenerData['contentPolicy']>): void;
+  onCleanupPatch(patch: Partial<NonNullable<MessageListenerData['cleanup']>>): void;
   onToggleSenderType(type: SenderTypeOption, checked: boolean): void;
   onToggleMsgType(msgType: string, checked: boolean): void;
   onSetTargetPolicy(openId: string, listening: boolean): void;
@@ -1753,6 +1791,27 @@ function MessageListenerEditor(props: {
               : tr('roles.listenerSenderModeIncludeHelp')}
           </small>
         </div>
+      </div>
+      <div className="roles-listener-policy-row">
+        <label className="filter-toggle roles-listener-enabled">
+          <input
+            type="checkbox"
+            checked={listener.cleanup?.enabled !== false}
+            onChange={ev => props.onCleanupPatch({ enabled: ev.currentTarget.checked })}
+          />
+          <span className="filter-toggle-switch" aria-hidden="true"></span>
+          <span className="filter-toggle-label">{tr('roles.listenerCleanupEnabled')}</span>
+        </label>
+        <label className="roles-listener-field">
+          <span className="roles-field-label">{tr('roles.listenerCleanupRetentionHours')}</span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={normalizeCleanupRetentionHours(listener.cleanup?.retentionHours)}
+            onChange={ev => props.onCleanupPatch({ retentionHours: normalizeCleanupRetentionHours(ev.currentTarget.value) })}
+          />
+        </label>
       </div>
       <div className="roles-listener-content-policy">
         <div className="roles-field-label">{tr('roles.listenerContentPolicy')}</div>

@@ -459,6 +459,7 @@ describe('parseBotConfigsFromText — brand', () => {
         scope: 'top_level',
       },
       replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+      cleanup: { enabled: true, retentionHours: 168 },
     });
     expect(cfg.messageListeners?.oc_disabled.enabled).toBe(false);
     expect(cfg.messageListeners?.oc_bad).toBeUndefined();

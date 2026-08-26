@@ -3521,6 +3521,7 @@ async function collectMessageListenerPreviewMatches(
     prompt: listener.prompt,
     ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
     ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    ...(listener.cleanup ? { cleanup: listener.cleanup } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
   const previewBot = {

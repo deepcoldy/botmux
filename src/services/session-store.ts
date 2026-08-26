@@ -1035,6 +1035,39 @@ export function reactivateClosedSession(
   return { ok: true, session };
 }
 
+export function closeSessionsMatching(
+  predicate: (session: Session) => boolean,
+  opts: { cleanupBridgeMarkers?: boolean; closedAt?: string } = {},
+): number {
+  load();
+  const closedAt = opts.closedAt ?? new Date().toISOString();
+  const closedSessionIds: string[] = [];
+  for (const [sessionId, session] of sessions) {
+    if (session.status !== 'active') continue;
+    if (!predicate(session)) continue;
+    if (session.larkAppId && session.dashboardAttachments?.length) {
+      try {
+        cleanupMaterializedDashboardImages(session.larkAppId, session.dashboardAttachments);
+        session.dashboardAttachments = undefined;
+        session.queuedAttachments = undefined;
+      } catch (error: any) {
+        logger.warn(`Failed to clean Dashboard images for session ${sessionId}: ${error?.message ?? error}`);
+      }
+    }
+    session.status = 'closed';
+    session.closedAt = closedAt;
+    closedSessionIds.push(sessionId);
+  }
+  if (closedSessionIds.length === 0) return 0;
+  save();
+  if (opts.cleanupBridgeMarkers !== false) {
+    for (const sessionId of closedSessionIds) cleanupSessionBridgeSendMarkers(sessionId);
+  }
+  for (const sessionId of closedSessionIds) deleteFrozenCards(sessionId);
+  logger.info(`Closed ${closedSessionIds.length} sessions in batch`);
+  return closedSessionIds.length;
+}
+
 export function updateSessionPid(sessionId: string, pid: number | null): void {
   loadForWrite();
   const session = sessions.get(sessionId);
