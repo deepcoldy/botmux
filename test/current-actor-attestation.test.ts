@@ -77,7 +77,7 @@ describe('daemon current actor attestation', () => {
     writeProc(procRoot, 101, 100, '2000');
     const ds = activeSession();
     const resolveIdentity = vi.fn(async () => ({
-      openId: 'ou_current', type: 'user' as const, email: 'Current.User@BYTEDANCE.COM',
+      openId: 'ou_current', type: 'user' as const, email: 'Current.User@Example.COM',
     }));
 
     await expect(resolveDaemonCurrentActor({
@@ -88,7 +88,7 @@ describe('daemon current actor attestation', () => {
       procRoot,
     })).resolves.toMatchObject({
       ok: true,
-      document: { actor: { username: 'current.user', enterpriseDomainVerified: true } },
+      document: { actor: { email: 'current.user@example.com' } },
     });
     expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current');
   });
@@ -99,7 +99,7 @@ describe('daemon current actor attestation', () => {
     writeProc(procRoot, 100, 1, '1000');
     writeProc(procRoot, 200, 1, '3000');
     const resolveIdentity = vi.fn(async () => ({
-      openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com',
+      openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
     }));
     await expect(resolveDaemonCurrentActor({
       sessionId: 's1',
@@ -120,7 +120,7 @@ describe('daemon current actor attestation', () => {
     const ds = activeSession();
     ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '101:1100'];
     const resolveIdentity = vi.fn(async () => ({
-      openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com',
+      openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
     }));
     await expect(resolveDaemonCurrentActor({
       sessionId: 's1',
@@ -153,7 +153,7 @@ describe('daemon current actor attestation', () => {
     const ds = activeSession();
     const resolveIdentity = vi.fn(async () => {
       ds.managedTurnOrigin = { capability: 'db'.repeat(32), turnId: 'om_next', callerOpenId: 'ou_other' };
-      return { openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com' };
+      return { openId: 'ou_current', type: 'user' as const, email: 'current@example.com' };
     });
     await expect(resolveDaemonCurrentActor({
       sessionId: 's1', peer: { pid: 100, procStart: '1000' },
@@ -168,7 +168,7 @@ describe('daemon current actor attestation', () => {
     const ds = activeSession();
     const resolveIdentity = vi.fn(async () => {
       ds.managedTurnOrigin.callerOpenId = 'ou_other';
-      return { openId: 'ou_current', type: 'user' as const, email: 'current@bytedance.com' };
+      return { openId: 'ou_current', type: 'user' as const, email: 'current@example.com' };
     });
     await expect(resolveDaemonCurrentActor({
       sessionId: 's1', peer: { pid: 100, procStart: '1000' },

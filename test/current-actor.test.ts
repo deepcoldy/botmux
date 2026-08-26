@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CURRENT_ACTOR_SCHEMA,
   CurrentActorError,
-  normalizeEnterpriseEmail,
+  normalizeActorEmail,
   parseCurrentActorArgs,
   resolveBotmuxAncestorContext,
   resolveCurrentActor,
@@ -65,13 +65,13 @@ describe('current actor client contract', () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
       schema: CURRENT_ACTOR_SCHEMA,
       status: 'verified',
-      actor: { enterpriseDomainVerified: true, username: 'current.user' },
+      actor: { email: 'current.user@example.com' },
     }), { status: 200 }));
     await expect(resolveCurrentActor({
       ipcPort: 7951,
       sessionId: 'sess-1',
       fetchImpl: fetchImpl as typeof fetch,
-    })).resolves.toMatchObject({ status: 'verified', actor: { username: 'current.user' } });
+    })).resolves.toMatchObject({ status: 'verified', actor: { email: 'current.user@example.com' } });
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://127.0.0.1:7951/api/current-actor',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ sessionId: 'sess-1' }) }),
@@ -79,9 +79,10 @@ describe('current actor client contract', () => {
   });
 
   it.each([
-    [{ schema: 'botmux.current-actor.v1', status: 'verified', actor: { username: 'x', enterpriseDomainVerified: true } }],
-    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { username: 'X', enterpriseDomainVerified: true } }],
-    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { username: 'x', enterpriseDomainVerified: false } }],
+    [{ schema: 'botmux.current-actor.v1', status: 'verified', actor: { email: 'x@example.com' } }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'X@example.com' } }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'not-an-email' } }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com', username: 'x' } }],
   ])('rejects an invalid daemon document: %j', async (payload) => {
     await expect(resolveCurrentActor({
       ipcPort: 7951,
@@ -98,8 +99,12 @@ describe('current actor client contract', () => {
     })).rejects.toThrow(CurrentActorError);
   });
 
-  it.each([undefined, '', 'not-an-email', '@bytedance.com', 'a@b@c', 'a@example.com'])(
-    'normalizer rejects an invalid enterprise email: %s',
-    (email) => expect(() => normalizeEnterpriseEmail(email)).toThrow(CurrentActorError),
+  it.each([undefined, '', 'not-an-email', '@example.com', 'a@b@c'])(
+    'normalizer rejects an invalid email: %s',
+    (email) => expect(() => normalizeActorEmail(email)).toThrow(CurrentActorError),
   );
+
+  it('normalizes an actor email without enforcing a tenant domain', () => {
+    expect(normalizeActorEmail(' Current.User@Example.COM ')).toBe('current.user@example.com');
+  });
 });

@@ -8,8 +8,7 @@ export interface CurrentActorDocument {
   schema: typeof CURRENT_ACTOR_SCHEMA;
   status: 'verified';
   actor: {
-    enterpriseDomainVerified: true;
-    username: string;
+    email: string;
   };
 }
 export interface ResolveCurrentActorOptions {
@@ -37,19 +36,16 @@ export function parseCurrentActorArgs(args: string[]): { ok: true } | { ok: fals
     : { ok: false, error: '用法: botmux actor current --json' };
 }
 
-export function normalizeEnterpriseEmail(value: unknown): { email: string; username: string } {
+export function normalizeActorEmail(value: unknown): string {
   if (typeof value !== 'string') {
-    throw new CurrentActorError('current Lark actor has no verified enterprise email');
+    throw new CurrentActorError('current Lark actor has no verified email');
   }
   const email = value.trim().toLowerCase();
   const separator = email.indexOf('@');
   if (separator <= 0 || separator === email.length - 1 || email.indexOf('@', separator + 1) !== -1) {
-    throw new CurrentActorError('current Lark actor enterprise email is invalid');
+    throw new CurrentActorError('current Lark actor email is invalid');
   }
-  if (email.slice(separator + 1) !== 'bytedance.com') {
-    throw new CurrentActorError('current Lark actor is outside the supported enterprise domain');
-  }
-  return { email, username: email.slice(0, separator) };
+  return email;
 }
 
 function parentPid(pid: number, procRoot: string): number | undefined {
@@ -131,11 +127,11 @@ function isCurrentActorDocument(value: unknown): value is CurrentActorDocument {
   const actor = document.actor;
   if (!actor || typeof actor !== 'object' || Array.isArray(actor)) return false;
   const fields = actor as Record<string, unknown>;
-  return fields.enterpriseDomainVerified === true
-    && typeof fields.username === 'string'
-    && fields.username.length > 0
-    && fields.username === fields.username.trim()
-    && fields.username === fields.username.toLowerCase();
+  if (Object.keys(fields).length !== 1 || typeof fields.email !== 'string'
+    || fields.email !== fields.email.trim()
+    || fields.email !== fields.email.toLowerCase()) return false;
+  try { return normalizeActorEmail(fields.email) === fields.email; }
+  catch { return false; }
 }
 
 /**

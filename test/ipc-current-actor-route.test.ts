@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/im/lark/identity-cache.js', () => ({
   resolveVerifiedUserIdentity: vi.fn(async (_app: string, openId: string) => ({
-    openId, type: 'user', email: 'current.user@bytedance.com',
+    openId, type: 'user', email: 'current.user@example.com',
   })),
 }));
 
@@ -55,7 +55,7 @@ describe('POST /api/current-actor', () => {
     expect(await response.json()).toEqual({
       schema: 'botmux.current-actor.v2',
       status: 'verified',
-      actor: { username: 'current.user', enterpriseDomainVerified: true },
+      actor: { email: 'current.user@example.com' },
     });
   });
 

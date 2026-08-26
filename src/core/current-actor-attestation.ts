@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { CURRENT_ACTOR_SCHEMA, normalizeEnterpriseEmail, type CurrentActorDocument } from '../cli/current-actor.js';
+import { CURRENT_ACTOR_SCHEMA, normalizeActorEmail, type CurrentActorDocument } from '../cli/current-actor.js';
 import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { collectSessionLineagePids } from './preview-port-owner.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
@@ -205,8 +205,8 @@ export async function resolveDaemonCurrentActor(input: {
   if (!identity || identity.type !== 'user' || identity.openId !== senderOpenId) {
     return { ok: false, error: 'current_actor_unverified' };
   }
-  let username: string;
-  try { ({ username } = normalizeEnterpriseEmail(identity.email)); }
+  let email: string;
+  try { email = normalizeActorEmail(identity.email); }
   catch { return { ok: false, error: 'current_actor_unverified' }; }
 
   const current = input.findSession(input.sessionId);
@@ -238,7 +238,7 @@ export async function resolveDaemonCurrentActor(input: {
     document: {
       schema: CURRENT_ACTOR_SCHEMA,
       status: 'verified',
-      actor: { username, enterpriseDomainVerified: true },
+      actor: { email },
     },
   };
 }
