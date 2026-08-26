@@ -3309,6 +3309,60 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists TraeX reasoning effort and validates it against TraeX levels', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-traex-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-traex-agent-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'DeepSeek-V4-Pro',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const ok = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'medium' }),
+      });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toMatchObject({
+        ok: true,
+        cliId: 'traex',
+        model: 'DeepSeek-V4-Pro',
+        reasoningEffort: 'medium',
+        selectionKey: 'traex',
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        cliId: 'traex',
+        model: 'DeepSeek-V4-Pro',
+        reasoningEffort: 'medium',
+      });
+
+      const unsupported = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'max' }),
+      });
+      expect(unsupported.status).toBe(400);
+      expect(await unsupported.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        model: 'DeepSeek-V4-Pro',
+        reasoningEffort: 'medium',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('persists, validates and clears the dsh turn timeout through bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tt-ipc-'));
     const configPath = join(dir, 'bots.json');

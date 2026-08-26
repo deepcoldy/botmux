@@ -618,8 +618,8 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
-  /** Optional codex reasoning effort frozen at creation (per-turn API override).
-   *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
+  /** Optional reasoning effort frozen at creation (per-turn API override).
+   *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * True once `cliId`/`cliPathOverride`/`wrapperCli` have been frozen for

@@ -240,6 +240,54 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows TraeX reasoning effort with conservative common options', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: body.reasoningEffort, selectionKey: 'traex' }),
+      } as any;
+    });
+    try {
+      const traexCliState = {
+        options: [
+          { id: 'traex', label: 'TraeX' },
+          { id: 'codex', label: 'Codex' },
+        ],
+        ttadkModelDefault: '',
+        ttadkModelSuggestions: [],
+      };
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: { larkAppId: 'cli_traex', cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'medium' },
+          sessionFallback: 'traex',
+          cliState: traexCliState,
+          patchBot: () => undefined,
+        }));
+      });
+      const picker = renderer.root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('medium');
+      const options = picker.props.options as Array<{ value: string; label: string }>;
+      expect(options.map(option => option.value)).toEqual(['', 'low', 'medium', 'high']);
+      expect(options[0]?.label).toBe('跟随 TraeX 默认值');
+      act(() => picker.props.onChange('high'));
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'high' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   const dshCliState = {
     options: [
       { id: 'codex', label: 'Codex' },

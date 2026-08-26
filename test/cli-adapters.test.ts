@@ -1866,18 +1866,18 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
-  it('passes startup-derived launch config args to TraeX', () => {
+  it('injects structured reasoning effort as a TraeX launch config', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({
       sessionId: 'traex-effort',
       resume: false,
-      startupLaunchArgs: ['-c', 'model_reasoning_effort="medium"'],
+      reasoningEffort: 'medium',
     });
     const i = args.indexOf('model_reasoning_effort="medium"');
     expect(i).toBeGreaterThan(0);
     expect(args[i - 1]).toBe('-c');
   });
 
-  it('omits startup launch config args when none are configured', () => {
+  it('omits the reasoning effort launch config when none is configured', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-effort', resume: false });
     expect(args.join(' ')).not.toContain('model_reasoning_effort');
   });

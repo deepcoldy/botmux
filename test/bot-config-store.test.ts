@@ -540,6 +540,25 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.cliId).toBe('codex');
   });
 
+  it('reasoningEffort is a next-session enum field', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex', model: 'DeepSeek-V4-Pro' });
+    const spec = store.findConfigField('reasoningEffort')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(store.coerceConfigValue(spec, 'MEDIUM')).toEqual({ ok: true, value: 'medium' });
+    expect(store.coerceConfigValue(spec, 'extreme')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const r1 = await store.applyConfigField('app_default', spec, 'medium');
+    expect(r1.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('medium');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('customPassthroughCommands')!;

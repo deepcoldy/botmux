@@ -1335,7 +1335,7 @@ export interface BotConfig {
    * toggle; the worker resolves the effective adapter at spawn time.
    */
   dshRuntime?: 'official' | 'tui';
-  /** Default Codex reasoning effort for newly created sessions. */
+  /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags

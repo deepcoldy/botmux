@@ -29,6 +29,7 @@ describe('Grok model-aware reasoning efforts', () => {
   it('treats grok as a configurable reasoning CLI', () => {
     expect(isConfigurableReasoningCliId('grok')).toBe(true);
     expect(isConfigurableReasoningCliId('codex')).toBe(true);
+    expect(isConfigurableReasoningCliId('traex')).toBe(true);
     expect(isConfigurableReasoningCliId('claude-code')).toBe(false);
   });
 
@@ -42,5 +43,15 @@ describe('Grok model-aware reasoning efforts', () => {
     expect(reasoningEffortsForCliModel('grok', 'custom-model')).toEqual(GROK_COMMON_REASONING_EFFORTS);
     expect(cliModelSupportsReasoningEffort('grok', 'grok-4.5', 'xhigh')).toBe(false);
     expect(cliModelSupportsReasoningEffort('grok', 'grok-4.6', 'high')).toBe(true);
+  });
+});
+
+describe('TraeX model-aware reasoning efforts', () => {
+  it('uses the TraeX catalog levels for known models and a conservative fallback', () => {
+    expect(reasoningEffortsForCliModel('traex', 'GPT-5.5')).toEqual(['low', 'medium', 'high', 'xhigh']);
+    expect(cliModelSupportsReasoningEffort('traex', 'GPT-5.5', 'xhigh')).toBe(true);
+    expect(cliModelSupportsReasoningEffort('traex', 'GPT-5.5', 'max')).toBe(false);
+    expect(cliModelSupportsReasoningEffort('traex', 'DeepSeek-V4-Pro', 'xhigh')).toBe(false);
+    expect(cliModelSupportsReasoningEffort('traex', undefined, 'medium')).toBe(true);
   });
 });

@@ -1,11 +1,6 @@
 /**
- * codex-effort-wiring.test.ts
- *
- * Guards the per-turn model/reasoningEffort CONSUMPTION chain — the wiring that
- * the first PR-A pass shipped untested (adapter → args / thread config), which
- * is where codex review caught real gaps (RPC effort never reached the engine;
- * xhigh silently downgraded). These assert the args/params a real codex actually
- * receives, using existing fixtures — no live process needed.
+ * Guards the per-turn model/reasoningEffort consumption chain (adapter args /
+ * thread config) with source-level checks where worker.ts has no public seam.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -91,7 +86,7 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     expect(body).toContain('reasoningEffort: cfg.reasoningEffort');
   });
 
-  it('freezes the per-Bot default onto a newly created session', () => {
+  it('freezes the per-Bot default onto a newly created session for supported CLIs', () => {
     const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
     expect(source).toContain('ds.session.reasoningEffort = isConfigurableReasoningCliId(ds.session.cliId)');
     expect(source).toContain('? ds.session.reasoningEffort ?? botCfg.reasoningEffort');

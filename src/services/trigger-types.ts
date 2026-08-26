@@ -71,7 +71,7 @@ export interface TriggerRequest {
      *  freshly-spawned session; ignored when folding into an existing worker.
      *  Empty/omitted → the bot's configured default. */
     model?: string;
-    /** Per-turn reasoning effort (codex `model_reasoning_effort`). Same
+    /** Per-turn reasoning effort. Same
      *  fresh-spawn-only semantics as `model`. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   };

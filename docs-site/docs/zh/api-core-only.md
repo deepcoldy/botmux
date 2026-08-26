@@ -149,7 +149,7 @@ function coreOnlyAuthHeaders(secret, method, path, port) {
 - **必须用 HTTP 应答模式**：apiOnly bot 的 trigger 请求必须带 `options.waitForFinalOutput`（同步）或 `options.asyncReturnSessionId`（异步），否则 `400 bad_request`（apiOnly 没有飞书群可回复，必须走 HTTP 拿结果）。
 - 异步触发返回一个合成 `http_async_*` chatId + 真实 `sessionId`；用该 `sessionId` 轮询 `trigger-result`。
 - 用户指令放在**顶层 `instruction`** 字段（渲染成 trusted `<botmux_task>`）——不是 `prompt`。
-- `options.model` / `options.reasoningEffort` 对 codex 家族和 grok 的 fresh trigger 生效。
+- `options.model` / `options.reasoningEffort` 对 codex 家族、traex 和 grok 的 fresh trigger 生效。
 - **轮询 `trigger-result` 用完整 sessionId**（UUID），不要用日志里的 `[worker:xxxxxxxx]` 短 tag——短 tag ≠ sessionId，会 `session_not_found`。
 
 ```bash

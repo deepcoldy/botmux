@@ -1855,7 +1855,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'grok' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: (cliKey === 'grok' || cliKey === 'traex' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -2039,11 +2039,11 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
-  const isReasoningSelection = isCodexSelection || cliKey === 'grok';
+  const isReasoningSelection = isCodexSelection || cliKey === 'grok' || cliKey === 'traex';
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(
-    () => reasoningEffortsForCliModel(cliKey === 'grok' ? 'grok' : isCodexSelection ? 'codex' : undefined, model),
+    () => reasoningEffortsForCliModel(cliKey === 'grok' || cliKey === 'traex' ? cliKey : isCodexSelection ? 'codex' : undefined, model),
     [cliKey, isCodexSelection, model],
   );
 
@@ -2314,6 +2314,8 @@ export function BotAgentSection(props: {
                   label: tr(
                     cliKey === 'grok'
                       ? 'botDefaults.agentReasoningEffortDefaultGrok'
+                      : cliKey === 'traex'
+                        ? 'botDefaults.agentReasoningEffortDefaultTraex'
                       : isCodexSelection
                         ? 'botDefaults.agentReasoningEffortDefaultCodex'
                         : 'botDefaults.agentReasoningEffortDefault',
