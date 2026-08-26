@@ -13,6 +13,7 @@ import {
   revalidateLinuxPm2GodProcess,
   type LinuxPm2GodProcess,
 } from '../core/pm2-lifecycle-owner.js';
+import { writeAndFlush } from './stdout-flush.js';
 
 const require = createRequire(import.meta.url);
 const pm2 = require('pm2') as any;
@@ -81,8 +82,15 @@ pm2.Client.pingDaemon((alive: boolean) => {
     if (mode === 'jlist') {
       pm2.list((error: Error | null | undefined, list: unknown[]) => {
         if (error) fail(`PM2 read-only jlist failed: ${error.message}`);
-        process.stdout.write(JSON.stringify(Array.isArray(list) ? list : []));
-        pm2.disconnect(() => process.exit(0));
+        // A PM2 registry can exceed the pipe's high-water mark. Calling
+        // process.exit() immediately after write() truncates its tail, making
+        // the parent reject a valid registry as malformed. Wait for stdout's
+        // completion callback before disconnecting and exiting.
+        void writeAndFlush(process.stdout, JSON.stringify(Array.isArray(list) ? list : []))
+          .then(
+            () => pm2.disconnect(() => process.exit(0)),
+            writeError => fail(`PM2 read-only jlist stdout write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}`),
+          );
       });
       return;
     }
