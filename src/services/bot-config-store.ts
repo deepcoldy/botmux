@@ -28,6 +28,11 @@ import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import {
+  cliModelSupportsReasoningEffort,
+  isCodexReasoningEffort,
+  isConfigurableReasoningCliId,
+} from './codex-reasoning-effort.js';
 
 /**
  * 生效时机：
@@ -229,7 +234,39 @@ export async function applyConfigField(
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
 
-  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+  const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
+    const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
+      ? entry.cliId.trim()
+      : bot.config.cliId;
+    const nextCliId = spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
+      ? effective.trim()
+      : currentCliId;
+    const currentModel = typeof entry.model === 'string' && entry.model.trim()
+      ? entry.model.trim()
+      : undefined;
+    const nextModel = spec.configKey === 'model'
+      ? typeof effective === 'string' && effective.trim()
+        ? effective.trim()
+        : undefined
+      : currentModel;
+    const currentReasoningEffort = isCodexReasoningEffort(entry.reasoningEffort)
+      ? entry.reasoningEffort
+      : undefined;
+    const nextReasoningEffort = spec.configKey === 'reasoningEffort'
+      ? effective === null
+        ? undefined
+        : isCodexReasoningEffort(effective)
+          ? effective
+          : undefined
+      : currentReasoningEffort;
+    if (spec.configKey === 'reasoningEffort' && effective !== null
+        && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
+      return { write: false, result: 'reasoning_effort_not_supported' };
+    }
+    if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
+        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+      return { write: false, result: 'reasoning_effort_not_supported_by_model' };
+    }
     if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
@@ -245,9 +282,13 @@ export async function applyConfigField(
     } else {
       entry[spec.configKey] = effective;
     }
+    if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(nextCliId)) {
+      delete entry.reasoningEffort;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
+  if (r.result) return { ok: false, reason: r.result };
 
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
   if (effective === null) {
@@ -260,6 +301,9 @@ export async function applyConfigField(
     (bot.config as any)[spec.configKey] = effective;
   } else {
     (bot.config as any)[spec.configKey] = effective;
+  }
+  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(String(effective ?? bot.config.cliId))) {
+    bot.config.reasoningEffort = undefined;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
   if (spec.configKey === 'feedback') {

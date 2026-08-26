@@ -978,6 +978,54 @@ describe('/botconfig canTalkDaemonCommands uses the field parser (not the passth
   });
 });
 
+describe('/botconfig reasoningEffort compatibility validation', () => {
+  it('rejects unsupported TraeX reasoning effort before writing bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-reasoning-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'traex',
+      model: 'DeepSeek-V4-Pro',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'TraeX',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'traex' as const,
+        model: 'DeepSeek-V4-Pro',
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const deps = makeDeps();
+
+    try {
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        makeLarkMessage('/botconfig set reasoningEffort xhigh', { senderId: 'ou_sender' }),
+        deps,
+        'app-1',
+      );
+
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].reasoningEffort).toBeUndefined();
+      expect((bot.config as any).reasoningEffort).toBeUndefined();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('reasoning_effort_not_supported_by_model');
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('/botconfig set p2pOpen (私聊对话全开) via the real text command', () => {
   it('turns DMs on and off through `/botconfig set`, keeping bots.json tidy', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-p2popen-'));

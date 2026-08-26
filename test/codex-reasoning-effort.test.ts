@@ -47,11 +47,21 @@ describe('Grok model-aware reasoning efforts', () => {
 });
 
 describe('TraeX model-aware reasoning efforts', () => {
-  it('uses the TraeX catalog levels for known models and a conservative fallback', () => {
+  it('uses the TraeX catalog levels for known models and fails closed otherwise', () => {
     expect(reasoningEffortsForCliModel('traex', 'GPT-5.5')).toEqual(['low', 'medium', 'high', 'xhigh']);
     expect(cliModelSupportsReasoningEffort('traex', 'GPT-5.5', 'xhigh')).toBe(true);
     expect(cliModelSupportsReasoningEffort('traex', 'GPT-5.5', 'max')).toBe(false);
+    for (const model of ['gpt-5.4-mini', 'gpt-5.3-codex', 'codex-auto-review']) {
+      expect(reasoningEffortsForCliModel('traex', model)).toEqual(['low', 'medium', 'high', 'xhigh']);
+      expect(cliModelSupportsReasoningEffort('traex', model, 'xhigh')).toBe(true);
+    }
     expect(cliModelSupportsReasoningEffort('traex', 'DeepSeek-V4-Pro', 'xhigh')).toBe(false);
-    expect(cliModelSupportsReasoningEffort('traex', undefined, 'medium')).toBe(true);
+    for (const model of ['Seed-Evolving', 'Seed-2.1-Pro', 'Seed-2.1-Turbo', 'Seed-Code']) {
+      expect(reasoningEffortsForCliModel('traex', model)).toEqual([]);
+      expect(cliModelSupportsReasoningEffort('traex', model, 'medium')).toBe(false);
+    }
+    expect(cliModelSupportsReasoningEffort('traex', undefined, 'medium')).toBe(false);
+    expect(reasoningEffortsForCliModel('traex', 'custom-model')).toEqual([]);
+    expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'medium')).toBe(false);
   });
 });

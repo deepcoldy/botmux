@@ -587,6 +587,35 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
   });
 
+  it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
+    const unsupportedCli = await loaded({ cliId: 'claude-code' });
+    const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
+    const r1 = await unsupportedCli.store.applyConfigField('app_default', spec, 'medium');
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.reason).toBe('reasoning_effort_not_supported');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(unsupportedCli.registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+
+    const unsupportedPair = await loaded({ cliId: 'traex', model: 'DeepSeek-V4-Pro' });
+    const r2 = await unsupportedPair.store.applyConfigField('app_default', spec, 'xhigh');
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toBe('reasoning_effort_not_supported_by_model');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(unsupportedPair.registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('rejects model writes that would make the stored reasoningEffort invalid', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'xhigh' });
+    const spec = store.findConfigField('model')!;
+    const r = await store.applyConfigField('app_default', spec, 'DeepSeek-V4-Pro');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reasoning_effort_not_supported_by_model');
+    expect(readConfig().model).toBe('GPT-5.5');
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.model).toBe('GPT-5.5');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+  });
+
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('customPassthroughCommands')!;

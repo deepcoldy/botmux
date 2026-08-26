@@ -17,7 +17,10 @@ const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoning
   ['gpt-5.6-luna', CODEX_COMMON_REASONING_EFFORTS],
   ['gpt-5.5', CODEX_COMMON_REASONING_EFFORTS],
   ['gpt-5.4', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.4-mini', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.3-codex', CODEX_COMMON_REASONING_EFFORTS],
   ['gpt-5.2', CODEX_COMMON_REASONING_EFFORTS],
+  ['codex-auto-review', CODEX_COMMON_REASONING_EFFORTS],
   ['deepseek-v4-pro', TRAEX_COMMON_REASONING_EFFORTS],
   ['deepseek-v4-flash', TRAEX_COMMON_REASONING_EFFORTS],
   ['seed-dogfooding-2.0', TRAEX_COMMON_REASONING_EFFORTS],
@@ -60,7 +63,8 @@ export function grokReasoningEffortsForModel(model: string | undefined): readonl
 
 export function traexReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
   const normalized = model?.trim().toLowerCase() ?? '';
-  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(normalized) ?? TRAEX_COMMON_REASONING_EFFORTS;
+  if (!normalized) return [];
+  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(normalized) ?? [];
 }
 
 /** Reasoning choices exposed by a CLI's Botmux control plane. */
