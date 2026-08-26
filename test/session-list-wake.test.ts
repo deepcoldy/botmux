@@ -9,7 +9,7 @@ const target = { backendType: 'tmux' as const, sessionName: 'bmx-deadbeef' };
 afterEach(() => vi.useRealTimers());
 
 describe('botmux list dormant backend wake', () => {
-  it('offers recovery only for a missing Botmux-managed attachable backend', () => {
+  it('offers recovery for missing backends and an inconclusive tmux control plane', () => {
     expect(canWakeDormantBackendForAttach({
       isAdopt: false,
       probe: 'missing',
@@ -23,6 +23,13 @@ describe('botmux list dormant backend wake', () => {
       realManagedSession: true,
       attachBackend: 'tmux',
       target,
+    })).toBe(true);
+    expect(canWakeDormantBackendForAttach({
+      isAdopt: false,
+      probe: 'unknown',
+      realManagedSession: true,
+      attachBackend: 'zmx',
+      target: { backendType: 'zmx', sessionName: 'bmx-deadbeef' },
     })).toBe(false);
     expect(canWakeDormantBackendForAttach({
       isAdopt: true,
