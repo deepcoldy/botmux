@@ -24,6 +24,9 @@ type OnboardingPermission = {
   skippedScopeCount?: number;
   versionId?: string;
   scopeWarning?: string;
+  /** 与 ok 独立：权限/发版全绿也可能没写上 redirect 白名单（见服务端同名字段注释）。 */
+  redirectConfigured?: boolean;
+  redirectWarning?: string;
   reason?: string;
   message?: string;
 };
@@ -249,6 +252,26 @@ export async function openBotOnboarding(): Promise<void> {
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
 }
 
+/**
+ * redirect 白名单没写上时的一条独立告警。
+ *
+ * 成功时**不加噪音**（回调地址配好本就是默认预期）；失败/未知时必须可见：这一步
+ * 不阻断建 bot，但缺了它，群聊模式 / 会话群标签 / `/login` 一点授权就 20029。
+ * `redirectConfigured === undefined` 走**旧快照兼容**：老 job 没有这个字段，不该
+ * 凭空报警，所以只对显式 false 出提示。
+ */
+function RedirectWarning(props: { permission: OnboardingPermission }): React.JSX.Element | null {
+  const { permission } = props;
+  if (permission.redirectConfigured !== false) return null;
+  return (
+    <p className="hint-warn" data-onboarding-redirect-warn="">
+      {permission.redirectWarning
+        ? t('botOnboarding.permissionRedirectWarn', { reason: permission.redirectWarning })
+        : t('botOnboarding.permissionRedirectWarnNoReason')}
+    </p>
+  );
+}
+
 function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
@@ -263,6 +286,7 @@ function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | n
       <>
         <p className="hint-ok">{parts.join(' ')}</p>
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
+        <RedirectWarning permission={permission} />
       </>
     );
   }
@@ -273,6 +297,7 @@ function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | n
         {t('botOnboarding.permissionManual')}
         {permission.message ? `（${permission.message}）` : ''}
       </p>
+      <RedirectWarning permission={permission} />
       {steps.length ? (
         <ol className="onboarding-steps">
           {steps.map(step => (

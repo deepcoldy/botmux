@@ -553,6 +553,25 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
   });
+
+  it('passes the opt-in browser bridge only to the Codex App runner', () => {
+    const disabled = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(disabled).not.toContain('--browser-family');
+
+    const enabled = adapter.buildArgs({
+      sessionId: 'sess-app',
+      resume: false,
+      codexBrowser: {
+        enabled: true,
+        family: 'edge',
+        pluginRoot: '/opt/codex/chrome-plugin',
+      },
+    });
+    expect(enabled).toEqual(expect.arrayContaining([
+      '--browser-family', 'edge',
+      '--browser-plugin-root', '/opt/codex/chrome-plugin',
+    ]));
+  });
 });
 
 describe('mira buildArgs', () => {
@@ -643,6 +662,36 @@ describe('dsh buildArgs (runner model)', () => {
 
   it('advertises the deepseek model choices', () => {
     expect(adapter.modelChoices).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
+  });
+
+  it('canonicalizes a symlinked bin so --dsh-bin matches the sandbox-authorized path', () => {
+    // Regression: a symlink-installed dsh-jsonrpc-agent (e.g. ~/.local/bin →
+    // SDK package dir) plus a symlinked HOME made the runner spawn the raw
+    // symlink path, which the file sandbox never exposes (it authorizes only
+    // dirname(realpath(bin))) → `spawn ... ENOENT` crash-loop under sandbox=true.
+    // Both --dsh-bin and sandboxExtraExecPaths() must resolve to the real target.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-symlink-'));
+    try {
+      const realDir = join(root, 'opt', 'runtime');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'dsh-jsonrpc-agent-pkg-linux-x64');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'dsh-jsonrpc-agent');
+      symlinkSync(realBin, linkBin);
+
+      const symlinkAdapter = createDshAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const binIdx = args.indexOf('--dsh-bin');
+      expect(binIdx).toBeGreaterThanOrEqual(0);
+      expect(args[binIdx + 1]).toBe(canonicalReal);
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('writeInput frames content with the dsh marker', async () => {
@@ -831,11 +880,17 @@ describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
   it('fresh session passes trust/force/model flags without resume flags', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      initialPrompt: 'first Lark turn',
+      model: 'gpt-5',
+    });
     expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
+    expect(args.at(-1)).toBe('first Lark turn');
     expect(args).not.toContain('--resume');
     expect(args).not.toContain('--continue');
   });
@@ -846,11 +901,13 @@ describe('cursor buildArgs', () => {
       sessionId: 'sess-cursor',
       resume: true,
       resumeSessionId: chatId,
+      initialPrompt: 'resume turn',
     });
     expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
+    expect(args.at(-1)).toBe('resume turn');
     expect(args).not.toContain('--continue');
   });
 
@@ -874,6 +931,27 @@ describe('cursor buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
     expect(args).toContain('--trust');
     expect(args).not.toContain('--force');
+  });
+
+  it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
+  it('readyPattern matches BOTH the empty-session and post-turn composer placeholders', () => {
+    // Cursor Agent 2026.08.11 renders `sessionEmpty ? "Plan, search, build
+    // anything" : "Add a follow-up"` and never reverts. The worker resets the
+    // IdleDetector (clearing readySeen) before every write, and quiescence-idle
+    // is suppressed until readyPattern is seen again — so if the pattern only
+    // matched the empty-session placeholder, turn 2+ would never re-seed ready
+    // and the CLI would be stuck reporting "working" forever. Both must match.
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.readyPattern?.test('  → Add a follow-up')).toBe(true);
+    // Guard against over-broad matching: the arrow-prefixed composer glyph is
+    // required, so unrelated screen text with the phrase must not false-match.
+    expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
   });
 });
 

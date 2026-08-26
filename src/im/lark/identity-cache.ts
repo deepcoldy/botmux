@@ -348,6 +348,45 @@ export interface ResolvedSender {
 }
 
 /**
+ * Resolve a human user from the authoritative contact API for a
+ * security-sensitive current-turn identity check. Unlike resolveSender(), this
+ * deliberately bypasses the persisted display cache: an old cached email must
+ * not authorize a new credential operation.
+ */
+export async function resolveVerifiedUserIdentity(
+  larkAppId: string,
+  openId: string,
+): Promise<{ openId: string; type: 'user'; name?: string; email?: string } | undefined> {
+  if (!openId) return undefined;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    const user = res?.code === 0 ? res?.data?.user : undefined;
+    if (!user) return undefined;
+    const rawName: unknown = user.name;
+    const rawEmail: unknown = user.enterprise_email ?? user.email;
+    const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+    const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+    recordIdentity(larkAppId, {
+      openId,
+      name,
+      email,
+      contactResolvedAt: Date.now(),
+      type: 'user',
+      source: 'contact_api',
+    });
+    return { openId, type: 'user', name, email };
+  } catch (err: any) {
+    logger.debug(
+      `[identity] strict contact lookup for ${openId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+    return undefined;
+  }
+}
+
+/**
  * Resolve sender identity for prompt injection.
  *
  * Inputs are taken directly from the Lark event (`sender_id.open_id`,

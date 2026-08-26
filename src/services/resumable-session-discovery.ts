@@ -339,11 +339,49 @@ export async function discoverClaudeFamilySessions(
 
 // ─── Codex / TRAE rollout (codex, traex) ─────────────────────────────────────
 
-/** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd;
- *  the first `event_msg`/`user_message` carries the user's first prompt (the
- *  `response_item` role:user entries include the synthetic
- *  <environment_context>/<permissions> preamble, so we prefer user_message).
- *  Streamed line by line, stopping once id + cwd + title are found. */
+/** Codex >=0.147 rollouts no longer emit `event_msg`/`user_message`; user turns
+ *  then live in `response_item` message role:user entries. The FIRST of those is
+ *  a synthetic startup preamble, never a real prompt. Observed shapes (verified
+ *  against ~80 live ~/.codex rollouts): the `<environment_context>` block, the
+ *  `<recommended_plugins>` list, the legacy `<permissions>` block, and codex's
+ *  `# AGENTS.md instructions for …` injection (which may share the message with
+ *  `<environment_context>` via multiple input_text blocks). */
+const SYNTHETIC_PREAMBLE_PATTERNS: readonly RegExp[] = [
+  // 锚定行首：合成 preamble 总是独立条目或以 tag 开头；不锚定会误杀散文中
+  // 提及这些标签的真实 prompt（如「<environment_context> 是什么意思」）。
+  /^<environment_context\b/,
+  /^<recommended_plugins\b/,
+  /^<permissions\b/,
+];
+
+function isSyntheticPreamble(text: string): boolean {
+  if (SYNTHETIC_PREAMBLE_PATTERNS.some((re) => re.test(text))) return true;
+  return /^# AGENTS\.md instructions\b/.test(text);
+}
+
+/** Join all `input_text` blocks of a rollout `response_item` message payload —
+ *  content is an array of `{type, text}` and a single user turn may span several
+ *  blocks (e.g. AGENTS.md instructions + environment_context). Mirrors
+ *  joinTextBlocks in codex-transcript; kept local so this discovery service has
+ *  no cross-service dependency. Trimmed so the ^-anchored botmux/synthetic
+ *  checks below see the real start of the prompt. */
+function rolloutResponseItemText(payload: Record<string, unknown>): string {
+  const content = payload.content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    const b = asRecord(block);
+    if (b?.type === 'input_text' && typeof b.text === 'string') parts.push(b.text);
+  }
+  return parts.join('').trim();
+}
+
+/** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd.
+ *  Title preference: the first `event_msg`/`user_message` (legacy format); when
+ *  absent (Codex >=0.147), the first non-synthetic `response_item` role:user
+ *  message — skipping the startup preamble and botmux-injected turns (which mark
+ *  the whole session botmux-origin, same as the user_message path). Streamed
+ *  line by line, stopping once id + cwd + title are found. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
@@ -352,7 +390,9 @@ async function parseRolloutTranscript(
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
-  const acc: { id: string | null; cwd: string | null; title: string; botmux: boolean } = { id: null, cwd: null, title: '', botmux: false };
+  const acc: { id: string | null; cwd: string | null; title: string; fallbackTitle: string; botmux: boolean } = {
+    id: null, cwd: null, title: '', fallbackTitle: '', botmux: false,
+  };
   let excluded = false;
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
@@ -367,11 +407,28 @@ async function parseRolloutTranscript(
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
       if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
+    } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+      // New-format (>=0.147) fallback title source. The first meaningful user
+      // turn determines origin, mirroring parseClaudeTranscript: a synthetic
+      // preamble is skipped, a botmux-wrapped turn drops the session, and the
+      // first raw turn becomes the fallback title (a later event_msg/user_message
+      // still wins when the rollout carries both).
+      const text = rolloutResponseItemText(payload);
+      if (!text) return; // empty / non-text content — not a title candidate
+      if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
+      if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+      // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
+      // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
+      // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合
+      // 格式文件中 legacy 条目按时间序在前，acc.title 会先命中早退，不受影响。
+      if (acc.id && acc.cwd && acc.fallbackTitle) return true;
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  if (excluded || acc.botmux || !acc.id || !acc.cwd || !acc.title) return null;
-  return { cliSessionId: acc.id, cwd: acc.cwd, title: acc.title, lastActivityAt: mtimeMs };
+  const title = acc.title || acc.fallbackTitle;
+  if (excluded || acc.botmux || !acc.id || !acc.cwd || !title) return null;
+  return { cliSessionId: acc.id, cwd: acc.cwd, title, lastActivityAt: mtimeMs };
 }
 
 export async function discoverRolloutSessions(

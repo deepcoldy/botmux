@@ -27,6 +27,10 @@ import {
   normalizeExistingAppServerConfig,
   type ExistingAppServerConfig,
 } from './core/existing-app-server.js';
+import {
+  normalizeCodexBrowserConfig,
+  type CodexBrowserConfig,
+} from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
@@ -204,6 +208,28 @@ export interface MessageListenerConfig {
     includeMsgTypes?: string[];
     /** V1 only supports top-level group messages. */
     scope?: 'top_level';
+  };
+  /**
+   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
+   * message (legacy behavior). When configured, a message matches the listener
+   * ONLY when its text satisfies the policy, so non-matching messages never
+   * wake the Agent. Keywords are case-insensitive substrings (linear-time
+   * `String.includes`, safe against attacker-controlled message text).
+   * `matchMode` 'any' (default) matches when at least one keyword hits; 'all'
+   * requires every keyword to hit.
+   *
+   * V1 intentionally does NOT support regexes: the policy is evaluated on the
+   * daemon main event loop for every inbound/backfilled message, and a user-
+   * authored JS regex with catastrophic backtracking (e.g. `(a+)+$`, 6 chars)
+   * freezes the whole multi-bot daemon for tens of seconds on a ~30-char
+   * message. A regex mode can return later behind a linear-time engine (RE2).
+   *
+   * bots.json example:
+   * `{"messageListeners":{"oc_xxx":{"enabled":true,"prompt":"...","contentPolicy":{"includeKeywords":["报错","500"],"matchMode":"any"}}}}`
+   */
+  contentPolicy?: {
+    includeKeywords?: string[];
+    matchMode?: 'any' | 'all';
   };
   replyPolicy?: {
     /** V1 always replies under the triggering message. */
@@ -1035,6 +1061,24 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
   messagePolicy.scope = 'top_level';
 
+  const contentRaw = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
+    ? entry.contentPolicy as Record<string, unknown>
+    : undefined;
+  let contentPolicy: MessageListenerConfig['contentPolicy'];
+  if (contentRaw) {
+    const includeKeywords = normalizeMessageListenerStringList(contentRaw.includeKeywords);
+    // V1 is keyword-substring only (see the contentPolicy type doc for why no
+    // regexes on the daemon main loop). Only persist non-default flags; an
+    // all-empty policy is dropped entirely (matchesContentPolicy treats
+    // absent/empty as match-all).
+    if (includeKeywords) {
+      contentPolicy = {
+        includeKeywords,
+        ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+      };
+    }
+  }
+
   return {
     enabled,
     ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
@@ -1043,6 +1087,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     prompt: prompt ?? '',
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
+    ...(contentPolicy ? { contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
 }
@@ -1220,7 +1265,11 @@ export interface SessionGroupConfig {
    */
   tag?: {
     mode?: 'chat-tag' | 'feed-group' | 'off';
-    /** Tag / feed-group display name (default: Botmux群会话). */
+    /**
+     * Tag / feed-group display name. Empty/absent (default) = 「<bot 显示名>会话」
+     * （多 bot / 多设备靠 bot 名区分；bot 显示名也拿不到时才保底成 Botmux群会话）。
+     * 回落链见 services/feed-group-tagger.ts 的 resolveSessionTagName。
+     */
     name?: string;
   };
   /**
@@ -1347,6 +1396,11 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /**
+   * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
+   * backed by the locally installed Codex Chrome/Edge extension plugin.
+   */
+  codexBrowser?: CodexBrowserConfig;
   /**
    * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
    * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
@@ -1668,6 +1722,19 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /**
+   * Stream the model's thinking process (CoT) into a native Feishu CoT
+   * message per turn: a fixed-height scrolling bubble showing thinking
+   * paragraphs and tool calls as nodes, auto-collapsing when the turn settles.
+   * Default ON (absent/undefined = on); only an explicit false disables.
+   * Requires a transcript-backed CLI (claude-code and codex today); other
+   * CLIs simply never emit the thinking channel. Per-chat opt-out via
+   * {@link noCotChats} (`/cot off`).
+   */
+  thinkingCard?: boolean;
+  /** chat_id list: chats where the CoT (thinking process) message is suppressed
+   *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
+  noCotChats?: string[];
   /**
    * When true, suppress the lightweight GoGoGo → DONE message reactions used as
    * progress markers in card-off sessions. Missing/false preserves the current
@@ -2724,6 +2791,21 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    const codexBrowser = normalizeCodexBrowserConfig(
+      entry.codexBrowser,
+      `Bot config [${i}].codexBrowser`,
+    );
+    if (codexBrowser) {
+      if (entryCliId !== 'codex-app') {
+        throw new Error(`Bot config [${i}]: codexBrowser is supported only for cliId "codex-app"`);
+      }
+      if (existingAppServer) {
+        throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with existingAppServer`);
+      }
+      if (entry.sandbox === true || entry.readIsolation === true) {
+        throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with sandbox or readIsolation`);
+      }
+    }
     if (existingAppServer) {
       if (entryCliId !== 'codex' && entryCliId !== 'codex-app') {
         throw new Error(`Bot config [${i}]: existingAppServer is supported only for cliId "codex" or "codex-app"`);
@@ -3008,6 +3090,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
       sandbox: entry.sandbox === true,
@@ -3088,6 +3171,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      thinkingCard: entry.thinkingCard === false ? false : undefined,
+      noCotChats: Array.isArray(entry.noCotChats)
+        ? entry.noCotChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
+        : undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()
         ? entry.receivedReactionEmoji.trim() : undefined,

@@ -249,7 +249,9 @@ export function computeDeliveryButtonAvailability(
 export function nextScheduleExecutionPosition(task: ScheduleCardTaskInput): 'top-level' | 'topic' | 'new-topic' {
   const placement = resolveScheduleExecutionPlacement(task);
   if (placement === 'thread') return 'top-level';
-  if (placement === 'new-topic') return task.rootMessageId ? 'topic' : 'top-level';
+  // Leaving a fresh topic parks at top level — never cycle back into a
+  // retained root, which may belong to the adopted topic the task was born in.
+  if (placement === 'new-topic') return 'top-level';
   return 'new-topic';
 }
 

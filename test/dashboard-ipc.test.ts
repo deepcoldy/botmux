@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, sym
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -4433,6 +4433,158 @@ describe('PUT /api/bot-avatar', () => {
       });
       expect(unwired.status).toBe(501);
       expect(await unwired.json()).toMatchObject({ ok: false, error: 'avatar_not_wired' });
+    });
+  });
+});
+
+describe('GET/PUT /api/bot-description', () => {
+  async function withDescriptionServer(fn: (base: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-description-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-description-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await fn(`http://127.0.0.1:${handle.port}`);
+    } finally {
+      setBotDescriptionManager(null);
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('reads and updates descriptions through the registered manager', async () => {
+    await withDescriptionServer(async base => {
+      const updates: Array<Record<string, string>> = [];
+      setBotDescriptionManager({
+        read: async () => ({
+          ok: true, primaryLang: 'zh_cn',
+          languages: [{ lang: 'zh_cn', description: '中文' }, { lang: 'en_us', description: 'English' }],
+        }),
+        update: async descriptions => {
+          updates.push(descriptions);
+          return { ok: true, primaryLang: 'zh_cn', descriptions, versionId: 'v-1' };
+        },
+      });
+      expect(await (await fetch(`${base}/api/bot-description`)).json()).toMatchObject({
+        ok: true, primaryLang: 'zh_cn',
+      });
+      const saved = await fetch(`${base}/api/bot-description`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ descriptions: { zh_cn: ' 新中文 ', en_us: ' New English ' } }),
+      });
+      expect(saved.status).toBe(200);
+      expect(updates).toEqual([{ zh_cn: '新中文', en_us: 'New English' }]);
+    });
+  });
+
+  it.each([
+    ['languages_changed', 409],
+    ['description_required', 400],
+    ['description_too_long', 400],
+    ['invalid_descriptions', 400],
+    ['no_session', 502],
+    ['session_expired', 502],
+    ['no_access', 502],
+    ['unsupported_brand', 502],
+    ['api_error', 502],
+  ] as const)('maps manager failure %s to HTTP %i', async (reason, status) => {
+    await withDescriptionServer(async base => {
+      setBotDescriptionManager({
+        read: async () => ({ ok: false, reason: 'api_error', message: 'read failed' }),
+        update: async () => ({ ok: false, reason, message: 'update failed' }),
+      });
+      const response = await fetch(`${base}/api/bot-description`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ descriptions: { zh_cn: '中文' } }),
+      });
+      expect(response.status).toBe(status);
+      expect(await response.json()).toMatchObject({ ok: false, error: reason });
+    });
+  });
+
+  it.each([
+    ['null', 'invalid_body'],
+    ['[]', 'invalid_body'],
+    [JSON.stringify({ descriptions: { zh_cn: '' } }), 'description_required'],
+    [JSON.stringify({ descriptions: { bad: 'x' } }), 'invalid_descriptions'],
+    [JSON.stringify({ descriptions: { zh_cn: 'x' }, extra: true }), 'invalid_body'],
+  ] as const)('rejects malformed input without calling the manager', async (body, error) => {
+    await withDescriptionServer(async base => {
+      let updates = 0;
+      setBotDescriptionManager({
+        read: async () => ({ ok: false, reason: 'api_error', message: 'unused' }),
+        update: async descriptions => { updates += 1; return { ok: true, primaryLang: 'zh_cn', descriptions }; },
+      });
+      const response = await fetch(`${base}/api/bot-description`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body,
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ ok: false, error });
+      expect(updates).toBe(0);
+    });
+  });
+
+  it('bounds PUT bodies and rejects malformed JSON', async () => {
+    await withDescriptionServer(async base => {
+      setBotDescriptionManager({
+        read: async () => ({ ok: false, reason: 'api_error', message: 'unused' }),
+        update: async descriptions => ({ ok: true, primaryLang: 'zh_cn', descriptions }),
+      });
+      const oversized = await fetch(`${base}/api/bot-description`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ descriptions: { zh_cn: 'x'.repeat(64 * 1024) } }),
+      });
+      expect(oversized.status).toBe(413);
+      expect(await oversized.json()).toMatchObject({ ok: false, error: 'body_too_large' });
+      const malformed = await fetch(`${base}/api/bot-description`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: '{',
+      });
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toMatchObject({ ok: false, error: 'invalid_json' });
+    });
+  });
+
+  it('returns 501 when no description manager is registered', async () => {
+    await withDescriptionServer(async base => {
+      setBotDescriptionManager(null);
+      for (const method of ['GET', 'PUT'] as const) {
+        const response = await fetch(`${base}/api/bot-description`, {
+          method,
+          headers: method === 'PUT' ? { 'content-type': 'application/json' } : undefined,
+          body: method === 'PUT' ? JSON.stringify({ descriptions: { zh_cn: '中文' } }) : undefined,
+        });
+        expect(response.status).toBe(501);
+      }
+    });
+  });
+
+  it('passes through successful and failed reads', async () => {
+    await withDescriptionServer(async base => {
+      setBotDescriptionManager({
+        read: async () => ({
+          ok: true, primaryLang: 'zh_cn',
+          languages: [{ lang: 'zh_cn', description: '中文' }],
+        }),
+        update: async descriptions => ({ ok: true, primaryLang: 'zh_cn', descriptions }),
+      });
+      expect(await (await fetch(`${base}/api/bot-description`)).json()).toMatchObject({ ok: true });
+      setBotDescriptionManager({
+        read: async () => ({ ok: false, reason: 'no_access', message: 'denied' }),
+        update: async descriptions => ({ ok: true, primaryLang: 'zh_cn', descriptions }),
+      });
+      const failed = await fetch(`${base}/api/bot-description`);
+      expect(failed.status).toBe(502);
+      expect(await failed.json()).toMatchObject({ ok: false, error: 'no_access' });
     });
   });
 });

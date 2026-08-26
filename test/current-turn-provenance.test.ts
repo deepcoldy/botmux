@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   CurrentTurnProvenanceError,
@@ -9,16 +9,25 @@ import {
 } from '../src/core/current-turn-provenance.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 
+const SCHED_TASK_ID = 'abcdef12';
+const SCHED_TURN_ID = `schedule:${SCHED_TASK_ID}:12345678-1234-1234-1234-123456789abc`;
+
 describe('resolveCurrentTurnProvenance', () => {
+  let root: string;
   let dataDir: string;
 
   beforeEach(() => {
-    dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-provenance-'));
+    root = mkdtempSync(join(tmpdir(), 'botmux-turn-provenance-'));
+    // Mirror the real layout: sessions under `<root>/sessions`, so the per-bot
+    // schedules.json resolves to `<root>/bots/<appId>/schedules.json` (cleaned
+    // with root — never the shared /tmp/bots).
+    dataDir = join(root, 'sessions');
+    mkdirSync(dataDir, { recursive: true });
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
   });
 
   afterEach(() => {
-    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   });
 
   function writeMarker(sessionId: string, turnId: string): void {
@@ -48,6 +57,22 @@ describe('resolveCurrentTurnProvenance', () => {
       join(dataDir, 'sessions-cli_real.json'),
       JSON.stringify({ [session.sessionId]: session }),
     );
+  }
+
+  function writeScheduledTask(overrides: Record<string, unknown> = {}): void {
+    const dir = join(dirname(dataDir), 'bots', 'cli_real');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'schedules.json'), JSON.stringify({
+      [SCHED_TASK_ID]: {
+        id: SCHED_TASK_ID,
+        name: 'nightly',
+        chatId: 'oc_real',
+        larkAppId: 'cli_real',
+        ownerOpenId: 'ou_task_owner',
+        enabled: true,
+        ...overrides,
+      },
+    }));
   }
 
   it('authenticates the current caller, not the static session owner', () => {
@@ -144,5 +169,103 @@ describe('resolveCurrentTurnProvenance', () => {
 
   it('returns null only for a genuine standalone invocation', () => {
     expect(resolveCurrentTurnProvenance({ dataDir, startPid: process.pid })).toBeNull();
+  });
+
+  describe('scheduled turns (schedule: prefix)', () => {
+    it('authenticates a scheduled turn as the task owner without human inbound fields', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      // A fresh scheduled session has NO quoteTargetId/lastCallerOpenId.
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask();
+
+      expect(resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toEqual({
+        sessionId: 'sess-1',
+        turnId: SCHED_TURN_ID,
+        callerOpenId: 'ou_task_owner',
+        larkAppId: 'cli_real',
+        chatId: 'oc_real',
+        chatType: 'p2p',
+        rootMessageId: 'om_real_root',
+      });
+    });
+
+    it('uses the chat-scope reply target root for a scheduled turn', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({
+        scope: 'chat',
+        quoteTargetId: undefined,
+        lastCallerOpenId: undefined,
+        currentReplyTarget: { rootMessageId: 'om_shared_topic', turnId: 'some-other-turn' },
+      });
+      writeScheduledTask();
+
+      expect(resolveCurrentTurnProvenance({ dataDir, startPid: process.pid })).toMatchObject({
+        rootMessageId: 'om_shared_topic',
+        callerOpenId: 'ou_task_owner',
+      });
+    });
+
+    it('rejects a scheduled turn whose task is missing', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(/不存在或已被删除/);
+    });
+
+    it('rejects a scheduled turn whose task has no ownerOpenId (legacy task)', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({ ownerOpenId: undefined });
+
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(/缺少创建者身份/);
+    });
+
+    it('rejects a scheduled turn whose task is disabled', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({ enabled: false });
+
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(/已被禁用/);
+    });
+
+    it('rejects a scheduled turn bound to a different chat', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({ chatId: 'oc_other' });
+
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(CurrentTurnProvenanceError);
+    });
+
+    it('still requires the human generation join for non-scheduled turns', () => {
+      // Regression guard: the exemption must not widen ordinary turns.
+      writeMarker('sess-1', 'turn-stale');
+      writeSession();
+
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(/turn-stale.*turn-current/);
+    });
   });
 });

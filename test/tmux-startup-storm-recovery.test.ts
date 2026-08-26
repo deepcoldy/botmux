@@ -47,11 +47,20 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
   let savedPath: string | undefined;
   let savedTmuxTmpdir: string | undefined;
 
-  const realTmuxEnv = () => ({
-    ...process.env,
-    PATH: savedPath,
-    TMUX_TMPDIR: workDir,
-  } as NodeJS.ProcessEnv);
+  const realTmuxEnv = () => {
+    const env = {
+      ...process.env,
+      PATH: savedPath,
+      TMUX_TMPDIR: workDir,
+    } as NodeJS.ProcessEnv;
+    // If the suite itself runs inside a tmux pane, the inherited $TMUX makes
+    // every tmux client ignore TMUX_TMPDIR and target the USER'S shared server
+    // — kill-server would nuke their sessions. Strip it so the private-socket
+    // isolation actually holds.
+    delete env.TMUX;
+    delete env.TMUX_PANE;
+    return env;
+  };
 
   beforeAll(() => {
     workDir = mkdtempSync(join(tmpdir(), 'bmx-storm-'));
@@ -98,10 +107,15 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     process.env.PATH = savedPath;
     if (savedTmuxTmpdir === undefined) delete process.env.TMUX_TMPDIR;
     else process.env.TMUX_TMPDIR = savedTmuxTmpdir;
+    const killEnv = { ...process.env, TMUX_TMPDIR: workDir };
+    // Same $TMUX hazard as realTmuxEnv (which is unusable here: workDir state
+    // is being torn down and PATH is already restored) — strip before killing.
+    delete killEnv.TMUX;
+    delete killEnv.TMUX_PANE;
     try {
       execFileSync(REAL_TMUX!, ['kill-server'], {
         stdio: 'ignore',
-        env: { ...process.env, TMUX_TMPDIR: workDir },
+        env: killEnv,
         timeout: 5000,
       });
     } catch { /* server already gone */ }

@@ -484,7 +484,7 @@ describe('API-only bot mode — apiOnly survives config reconstruction (source l
     expect(envInjections.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('skips open-platform rename/avatar handler registration for apiOnly bots', () => {
+  it('skips open-platform rename/avatar/description handler registration for apiOnly bots', () => {
     // These drive the console via a browser web-session (NOT getBotClient), so
     // the bot-level gate can't catch them — skip registration entirely.
     const daemonSrc = readFileSync(resolve('src/daemon.ts'), 'utf8');
@@ -492,6 +492,7 @@ describe('API-only bot mode — apiOnly survives config reconstruction (source l
     expect(block).toContain('if (!cfg.apiOnly) {');
     expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotRenamer('));
     expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotAvatarChanger('));
+    expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotDescriptionManager('));
   });
 });
 
@@ -542,11 +543,11 @@ describe('API-only bot mode — riff env re-freeze + VC listener exclusion (sour
     expect(writeBlock).not.toMatch(/next\.(?!larkCliProfile\b)[A-Za-z]+\s*=/u);
   });
 
-  it('skips open-platform rename/avatar handler registration for apiOnly (fails closed to local rename)', () => {
+  it('skips open-platform rename/avatar/description handler registration for apiOnly (fails closed to local rename)', () => {
     // Daemon owns the config: with the handler unregistered, the IPC route
     // returns renamer_not_wired (local displayName only, no console/Feishu call).
     const daemonSrc = readFileSync(resolve('src/daemon.ts'), 'utf8');
-    expect(daemonSrc).toContain('} // end !cfg.apiOnly (open-platform rename/avatar handlers)');
+    expect(daemonSrc).toContain('} // end !cfg.apiOnly (open-platform profile handlers)');
   });
 });
 

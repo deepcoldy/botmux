@@ -7410,6 +7410,15 @@ dialog.onboarding-dialog::backdrop {
   gap: 10px;
   align-items: center;
 }
+.roles-listener-content-policy {
+  display: grid;
+  gap: 8px;
+}
+.roles-listener-content-policy textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
 .roles-listener-policy {
   display: inline-flex;
   align-items: center;
@@ -10828,6 +10837,163 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .bd-name-editor button { font-size: 12px; }
 .bd-name-status { display: block; margin-top: 4px; font-size: 11.5px; }
 .bd-name-status:empty { display: none; }
+.bot-defaults-page .bd-description-control {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 2px;
+}
+.bot-defaults-page .bd-description-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-preview {
+  display: -webkit-box;
+  min-width: 0;
+  max-width: min(640px, 100%);
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.bot-defaults-page .bd-description-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+.bot-defaults-page .bd-description-edit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent-strong);
+}
+.bot-defaults-page .bd-description-edit:disabled { cursor: progress; opacity: 0.65; }
+.bot-defaults-page .bd-description-status {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.bot-defaults-page .bd-description-status .bd-feishu-login { margin-left: 6px; }
+.bot-defaults-page.bd-description-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  overflow: auto;
+  background: var(--modal-backdrop);
+  backdrop-filter: blur(3px);
+}
+.bot-defaults-page .bd-description-modal {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 14px;
+  width: min(680px, 94vw);
+  max-height: min(720px, calc(100vh - 32px));
+  margin: auto;
+  padding: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--modal-shadow);
+}
+.bot-defaults-page .bd-description-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-modal-head h3 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.25;
+}
+.bot-defaults-page .bd-description-modal-status {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.bot-defaults-page .bd-description-modal-status .bd-feishu-login { margin-left: 6px; }
+.bot-defaults-page .bd-description-list {
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+.bot-defaults-page .bd-description-row {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-row-head > span {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.bot-defaults-page .bd-description-row-head strong {
+  color: var(--fg);
+  font-size: 12px;
+}
+.bot-defaults-page .bd-description-row-head code {
+  color: var(--faint);
+  font-size: 10.5px;
+}
+.bot-defaults-page .bd-description-row-head em {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 700;
+}
+.bot-defaults-page .bd-description-row textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 82px;
+  resize: vertical;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.bot-defaults-page .bd-description-count {
+  justify-self: end;
+  color: var(--faint);
+  font-size: 11px;
+}
+.bot-defaults-page .bd-description-count.at-limit { color: var(--warning); }
+.bot-defaults-page .bd-description-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 /* 「扫码登录飞书」——改名因缺登录态降级时才亮出 */
 .bd-feishu-login {
   display: inline-block;
@@ -13040,6 +13206,14 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
     grid-column: 1 / -1;
     justify-content: flex-start;
     margin-left: 0;
+  }
+  .bot-defaults-page .bd-description-modal {
+    width: min(100%, 94vw);
+    padding: 14px;
+  }
+  .bot-defaults-page .bd-description-row-head {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 
@@ -19421,7 +19595,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
   padding: 8px 0 2px;
   min-width: 0;
 }
-.settings-page .settings-group-prefix-editor .settings-field-row {
+.settings-page .settings-group-prefix-editor .settings-field-row,
+/* OAuth 回调基址是一条完整 URL，挤在 240px 的右列里读不全，跟群名前缀一样竖排。 */
+.settings-page .settings-oauth-redirect-base-editor .settings-field-row {
   grid-template-columns: 1fr;
   align-items: start;
   gap: 8px;
@@ -27594,6 +27770,90 @@ button.skills-issue-badge:hover {
 }
 
 .feed-group-auth-open:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+/* 会话群标签行的次级动作：修复开放平台回调白名单。刻意做成链接态而非按钮，
+   免得跟主操作「一键授权」抢视觉权重（它才是用户 99% 的时候要点的那个）。 */
+.bd-sg-repair-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.bd-sg-repair-link:hover:not(:disabled) { color: var(--accent-strong); text-decoration: underline; }
+.bd-sg-repair-link:disabled { color: var(--muted); cursor: default; }
+
+.bd-sg-repair-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+/* .bd-body .bd-row :where(label, .bd-field) 把行内所有 label 变成 grid，这个
+   复选框标签要留在流式行里，显式覆盖回 inline-flex（特异性需盖过那条规则）。 */
+.bot-defaults-page .bd-body .bd-row .bd-sg-repair-all { display: inline-flex; }
+.bd-sg-repair-all input[type=checkbox] { margin: 0; }
+
+/* 修复结果 / 诊断提示：多行竖排，行内可夹「修复配置」链接与安全设置深链。 */
+.bd-sg-repair-hint {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+/* per-bot 结果是一行一个 bot，竖排才读得清；诊断提示则是一句话 + 两个入口，
+   保持横排折行。 */
+.bd-sg-repair-hint[data-sg-tag-repair-feedback="done"] {
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+}
+/* partial 与 not_owned / failed 同属警示色：白名单写了但 wanted 没写全，缺的那条正是
+   本机回调时 authorize 照样 20029，视觉上不能跟 fixed / unchanged 混成一类。
+   （类名由 bot-defaults-page.tsx 的 data-sg-tag-repair-item={item.status} 直接输出。） */
+.bd-sg-repair-hint [data-sg-tag-repair-item="partial"],
+.bd-sg-repair-hint [data-sg-tag-repair-item="not_owned"],
+.bd-sg-repair-hint [data-sg-tag-repair-item="failed"] { color: var(--warning); }
+.feed-group-auth-card .bd-sg-repair-hint { margin-top: 14px; }
+
+/* 会话群标签名：模式下拉下面单起一行。输入框刻意不预填默认名——留空就是「用默认」，
+   默认名放在 placeholder 里自己说话，说明文字整行占满另起一行。 */
+.bd-sg-tag-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 8px;
+}
+/* .bd-body .bd-row :where(label, .bd-field) 把行内 label 变成 block，这个标签要
+   留在流式行里；输入框同理要盖掉 .bd-row input[type=text] 的 width:100%。 */
+.bot-defaults-page .bd-body .bd-row .bd-sg-tag-name > label {
+  display: inline-block;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.bot-defaults-page .bd-body .bd-row .bd-sg-tag-name input[type=text] {
+  width: auto;
+  min-width: 180px;
+  max-width: 280px;
+}
+.bd-sg-tag-name-hint {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
 
 .cs-advanced-fields .cs-feed-group {
   min-width: 0;

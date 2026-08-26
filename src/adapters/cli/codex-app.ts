@@ -54,7 +54,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort, codexBrowser }) {
       const args = [
         runnerPath(),
         '--session-id', sessionId,
@@ -69,6 +69,8 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       // app-server thread/start (model + config.model_reasoning_effort).
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
       pushOpt(args, '--reasoning-effort', reasoningEffort);
+      pushOpt(args, '--browser-family', codexBrowser?.family);
+      pushOpt(args, '--browser-plugin-root', codexBrowser?.pluginRoot);
       return args;
     },
 

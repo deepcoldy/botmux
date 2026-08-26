@@ -7,7 +7,10 @@
  * Selection rules:
  *   • same bot (this larkAppId — only this daemon's sessions are visible)
  *   • NOT in the current chat (can't relay into the chat it already lives in)
- *   • operator is the session owner (owner-only access)
+ *   • operator is the session owner (owner-only access) — ownerless
+ *     sessions (ownerOpenId unset, e.g. alert-listener spawned) are
+ *     visible to every operator, matching the relay_confirm / /relay
+ *     --create owner gates
  *   • not an adopt session (those wrap a user-attached tmux pane, refused
  *     by transferSession anyway)
  *
@@ -36,7 +39,7 @@ export async function collectRelayPickerEntries(
   for (const c of activeSessions.values()) {
     if (c.larkAppId !== myAppId) continue;
     if (sessionAnchorId(c) === currentAnchor) continue;
-    if (c.session.ownerOpenId !== operatorOpenId) continue;
+    if (c.session.ownerOpenId && c.session.ownerOpenId !== operatorOpenId) continue;
     if (c.session.adoptedFrom) continue;
     // Daemon-command scratches (worker:null + no persisted CLI markers)
     // are placeholder records for /help / unfinished /relay etc. — they

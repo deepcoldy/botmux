@@ -78,6 +78,8 @@ interface DashboardSettings {
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
   remoteAccess: boolean;
+  /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
+  oauthRedirectBase: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -222,6 +224,7 @@ function parseSettings(s: any): DashboardSettings {
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
+    oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -778,6 +781,15 @@ function SettingsBody(props: {
               onChange={value => saveBoolean('remoteAccess', value)}
             />
           ) : null}
+          <OAuthRedirectBaseRow
+            value={settings.oauthRedirectBase}
+            disabled={dis || savingKey === 'oauthRedirectBase'}
+            onSave={value => props.onSave(
+              'oauthRedirectBase',
+              { oauthRedirectBase: value },
+              s => ({ ...s, oauthRedirectBase: value }),
+            )}
+          />
         </SettingsBlock>
         <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
           <ToggleRow
@@ -1533,6 +1545,105 @@ export function GroupNamePrefixRow(props: {
           onClick={submit}
         >
           {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 从 `location.href` 取当前访问 origin。浏览器最清楚自己是从哪个地址打开的
+ *  Dashboard —— 中心化平台的隧道会重写 Host 且不带 X-Forwarded-Host，服务端反而
+ *  推不准（见 platform/binding.ts 的注释），所以「一键填入」这颗按钮的价值就在于
+ *  用浏览器视角覆盖服务端视角。非浏览器宿主 / URL 解析失败时返回 ''。 */
+export function currentBrowserOrigin(): string {
+  try {
+    if (typeof location === 'undefined' || !location?.href) return '';
+    const origin = new URL(location.href).origin;
+    // 只认 http(s) origin：opaque origin 会给出 'null'，本地打开的 file:// 页在
+    // Chrome 下给出 'file://'——两者填进去都是废值，不如把按钮直接置灰。
+    return isValidOAuthRedirectBase(origin) ? origin : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
+ *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+export function isValidOAuthRedirectBase(raw: string): boolean {
+  const value = raw.trim();
+  if (!/^https?:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value.replace(/\/+$/, ''));
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (!url.hostname) return false;
+    if (url.username || url.password || url.search || url.hash) return false;
+    return url.pathname === '' || url.pathname === '/';
+  } catch {
+    return false;
+  }
+}
+
+/** OAuth 回跳基址：配了之后授权链接回跳 `<base>/oauth/callback`，Dashboard 自动收下，
+ *  用户不用再复制粘贴回调 URL。留空 = 退回 127.0.0.1 粘贴流程。 */
+export function OAuthRedirectBaseRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  // 与服务端同款归一：削尾斜杠。这样「保存的」和「看到的」是同一个串，也不会因为
+  // 多一条斜杠让保存按钮永远亮着（服务端存的是削过的）。
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串是合法输入（=清除配置），只有「填了但不是 http(s) origin」才拦。
+  const valid = trimmed === '' || isValidOAuthRedirectBase(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-oauth-redirect-base-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.oauthRedirectBaseHelp')}>{tr('settings.oauthRedirectBase')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="oauthRedirectBase"
+          value={draft}
+          placeholder={tr('settings.oauthRedirectBasePlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-oauth-redirect-base-preview>
+        {trimmed === ''
+          ? tr('settings.oauthRedirectBaseUnset')
+          : valid
+            ? tr('settings.oauthRedirectBasePreview', { url: `${trimmed}/oauth/callback` })
+            : tr('settings.oauthRedirectBaseInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          data-action="oauth-redirect-base-use-current"
+          disabled={props.disabled || !currentBrowserOrigin()}
+          onClick={() => setDraft(currentBrowserOrigin())}
+        >
+          {tr('settings.oauthRedirectBaseUseCurrent')}
+        </button>
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="oauth-redirect-base-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.oauthRedirectBaseSave')}
         </button>
       </div>
     </div>

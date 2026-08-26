@@ -57,8 +57,8 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, type TranscriptEvent } from './services/claude-transcript.js';
+import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
@@ -228,6 +228,7 @@ import type {
   CodexAppDispatchLedgerEntry,
   CodexAppGenerationCommit,
   CodexAppTurnInput,
+  CotEntry,
   DaemonToWorker,
   WorkerToDaemon,
   DisplayMode,
@@ -4156,6 +4157,107 @@ let bridgeBaselineDone = false;
  *  re-send the preamble. Reset only when the bridge teardown happens. */
 let bridgePreambleSent = false;
 
+// ─── Thinking (CoT) side-channel ─────────────────────────────────────────
+//
+// Cosmetic-only mirror of the Claude bridge's attribution: whenever an
+// assistant transcript event with `thinking` blocks is attributed to a Lark
+// turn, its entries are accumulated here and shipped to the daemon as a
+// throttled `thinking_update` IPC (full cumulative entry list — the daemon's
+// cot-message pump pushes only unseen entries). This channel must never
+// influence turn settlement: it bypasses emitReadyTurns entirely and is
+// dropped on any error.
+const THINKING_EMIT_INTERVAL_MS = 1_500;
+/** Hard cap on the accumulated CoT shipped per turn. Bounds the IPC payload
+ *  (every emit ships the full cumulative list) and the native CoT message
+ *  size; past the cap the timeline just ends with a「…」node. */
+const THINKING_ACCUMULATED_CAP = 60_000;
+let thinkingTurnKey: string | undefined;
+let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
+/** Thinking paragraphs + tool calls/results in transcript order — each
+ *  becomes its own node in the native CoT message. Append-only within a
+ *  turn. */
+let thinkingEntries: CotEntry[] = [];
+let thinkingTotalChars = 0;
+let thinkingCapNoted = false;
+
+function cotEntryChars(e: CotEntry): number {
+  switch (e.kind) {
+    case 'thinking': return e.text.length;
+    case 'tool_call': return e.name.length + e.args.length;
+    case 'tool_result': return e.result.length;
+  }
+}
+let thinkingEmitTimer: NodeJS.Timeout | null = null;
+let thinkingLastEmitMs = 0;
+
+/** CLI-agnostic accumulation core: append `entries` to the current turn's
+ *  timeline (resetting when the turn changes) and schedule a throttled emit.
+ *  Claude feeds this via transcript attribution, Codex via the structured
+ *  bridge queue's cot observer. */
+function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string; dispatchAttempt?: number }): void {
+  if (entries.length === 0) return;
+  const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
+  if (key !== thinkingTurnKey) {
+    thinkingTurnKey = key;
+    thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
+    thinkingEntries = [];
+    thinkingTotalChars = 0;
+    thinkingCapNoted = false;
+  }
+  if (thinkingTotalChars >= THINKING_ACCUMULATED_CAP) {
+    if (!thinkingCapNoted) {
+      thinkingCapNoted = true;
+      thinkingEntries.push({ kind: 'thinking', text: '…' });
+      scheduleThinkingEmit();
+    }
+    return;
+  }
+  for (const entry of entries) {
+    thinkingEntries.push(entry);
+    thinkingTotalChars += cotEntryChars(entry);
+  }
+  scheduleThinkingEmit();
+}
+
+function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn): void {
+  // Local-terminal turns have no Lark thread card to stream into; API-error
+  // records are execution metadata, not model thinking.
+  if (turn.isLocal) return;
+  if ((ev as any).isApiErrorMessage === true) return;
+  observeCotEntries(extractCotEntries(ev), turn);
+}
+
+/** Trailing-edge throttle: at most one thinking_update per interval, always
+ *  eventually flushing the latest accumulated text. */
+function scheduleThinkingEmit(): void {
+  if (thinkingEmitTimer) return;
+  const wait = Math.max(0, THINKING_EMIT_INTERVAL_MS - (Date.now() - thinkingLastEmitMs));
+  thinkingEmitTimer = setTimeout(() => {
+    thinkingEmitTimer = null;
+    if (!thinkingTurn || thinkingEntries.length === 0) return;
+    thinkingLastEmitMs = Date.now();
+    send({
+      type: 'thinking_update',
+      ...(sessionId ? { sessionId } : {}),
+      entries: thinkingEntries.slice(),
+      turnId: thinkingTurn.turnId,
+      ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
+    });
+  }, wait);
+}
+
+function resetThinkingChannel(): void {
+  if (thinkingEmitTimer) {
+    clearTimeout(thinkingEmitTimer);
+    thinkingEmitTimer = null;
+  }
+  thinkingTurnKey = undefined;
+  thinkingTurn = undefined;
+  thinkingEntries = [];
+  thinkingTotalChars = 0;
+  thinkingCapNoted = false;
+}
+
 // ─── Codex bridge state ──────────────────────────────────────────────────
 //
 // Parallel to the Claude bridge above. Codex's transcript layout is
@@ -4170,6 +4272,15 @@ let codexBridgeBaselineDone = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
+// Codex CoT: rollout reasoning/tool events attributed to the collecting turn
+// feed the same thinking channel as Claude's transcript attribution. Other
+// structured bridges (traex/cursor/pi/…) never emit 'cot' events, so this
+// observer is inert for them. Local (adopt) turns are skipped for the same
+// reason as Claude's: no Lark turn to anchor the bubble to.
+codexBridgeQueue.setCotObserver((entries, turn) => {
+  if (turn.isLocal) return;
+  observeCotEntries(entries, turn);
+});
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let ompBridgeState: OmpTranscriptState = {};
@@ -5299,7 +5410,7 @@ function bridgeIngest(): void {
   bridgeOffset = result.newOffset;
   bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
-  bridgeQueue.ingest(result.events, bridgeJsonlPath);
+  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
@@ -5472,6 +5583,7 @@ function stopBridgeWatcher(): void {
   // the interrupted turn, and restoring on top would double-deliver.
   bridgeRestoreGate.markGenerationRetired();
   bridgePreambleSent = false;
+  resetThinkingChannel();
 }
 
 /**
@@ -7310,6 +7422,7 @@ function stopCodexBridge(): void {
   mtrBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
+  resetThinkingChannel();
   codexBridgePendingSessionId = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
@@ -8806,11 +8919,26 @@ function handleVisibleStartupInteraction(data: string): boolean {
 
   trustHandled = true;
   log('Trust dialog detected, auto-accepting...');
-  if (backend && 'sendSpecialKeys' in backend) {
-    (backend as any).sendSpecialKeys('Enter');
-  } else {
-    backend?.write('\r');
-  }
+  // Codex 0.149 的按键处理器在信任框渲染的瞬间尚未就绪，同步发出的 Enter 会
+  // 落进死输入队列被静默丢弃（上游 openai/codex#39487）：确认从未提交，直到
+  // ~20s 后 submit_unconfirmed 兜底。延迟一个短 tick 再发，让按键处理器就绪；
+  // trustHandled 已同步置位，后续 chunk 重复命中同一文案不会重入。
+  // 围栏：400ms 内若发生 respawn（崩溃/配置切换/restart），旧 timer 不得把
+  // Enter 发进新会话的 backend（与本文件其它延迟回调的围栏约定一致）。
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  setTimeout(() => {
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    try {
+      if (backend && 'sendSpecialKeys' in backend) {
+        (backend as any).sendSpecialKeys('Enter');
+      } else {
+        backend?.write('\r');
+      }
+    } catch {
+      // tmux session 已退出等场景：空 Enter 无意义，静默丢弃
+    }
+  }, 400);
   return true;
 }
 
@@ -13612,6 +13740,7 @@ async function spawnCli(
     turnTimeoutMs: cfg.turnTimeoutMs,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
+    codexBrowser: cfg.codexBrowser,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless
     // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.
     // The adapter further ANDs this with !disableCliBypass. Read live per spawn.
@@ -17722,6 +17851,11 @@ function publishLocalProcessAttestation(cliPid?: number): void {
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
   });
+  // IPC preserves order: the daemon records this exact CLI pid/generation
+  // before it snapshots the current turn's pre-existing descendants. This is
+  // required for the opening turn, whose origin is first published before the
+  // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
+  if (currentBotmuxTurnId) publishSandboxRelayCapability();
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`

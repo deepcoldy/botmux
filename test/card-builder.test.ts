@@ -1300,6 +1300,55 @@ describe('buildStreamingCard', () => {
     });
   });
 
+  // ── Writable terminal link (writableTerminalLinkInCard opt-in) ──────────
+
+  describe('writable terminal link', () => {
+    const WURL = 'https://example.com/writable?token=secret';
+
+    const buildWithWritable = (locale: 'zh' | 'en' = 'zh') => parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+      undefined, undefined, false, false, locale, undefined, WURL,
+    ));
+
+    const allActionButtons = (card: any): any[] =>
+      card.elements.filter((e: any) => e.tag === 'action').flatMap((row: any) => row.actions);
+
+    it('renders the writable URL as a primary URL button instead of a raw markdown link', () => {
+      const card = buildWithWritable();
+      // No markdown element carries the token URL (the previous shape rendered
+      // the long URL as a raw markdown link blob).
+      const mdLinks = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(mdLinks.every((m: any) => !m.content.includes('?token='))).toBe(true);
+
+      const writableBtn = allActionButtons(card).find((a: any) => a.multi_url?.url.includes('?token='));
+      expect(writableBtn).toBeDefined();
+      expect(writableBtn.type).toBe('primary');
+      expect(writableBtn.text.content).toContain('可操作');
+      expectDirectUrl(writableBtn.multi_url.url, WURL);
+      expectDirectUrl(writableBtn.multi_url.pc_url, WURL);
+      expect(writableBtn.multi_url.android_url).toBe(WURL);
+      expect(writableBtn.multi_url.ios_url).toBe(WURL);
+    });
+
+    it('keeps the group-visible warning as a note under the button (zh + en)', () => {
+      const zh = buildWithWritable('zh');
+      const zhNote = zh.elements.find((e: any) => e.tag === 'note');
+      expect(zhNote).toBeDefined();
+      expect(JSON.stringify(zhNote)).toContain('群内可见');
+
+      const en = buildWithWritable('en');
+      const enNote = en.elements.find((e: any) => e.tag === 'note');
+      expect(enNote).toBeDefined();
+      expect(JSON.stringify(enNote)).toContain('visible to everyone');
+    });
+
+    it('omits the writable button and warning when no writable URL is set', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
+      expect(allActionButtons(card).some((a: any) => a.multi_url?.url.includes('?token='))).toBe(false);
+      expect(card.elements.some((e: any) => e.tag === 'note')).toBe(false);
+    });
+  });
+
   // ── CLI display name ───────────────────────────────────────────────────
 
   it('should default cliId to claude-code', () => {

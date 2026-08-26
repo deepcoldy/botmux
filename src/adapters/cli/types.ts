@@ -149,6 +149,8 @@ export interface CliAdapter {
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex App only: restricted local browser extension bridge. */
+    codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
      *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
      *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not

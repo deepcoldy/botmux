@@ -489,10 +489,20 @@ vi.mock('../src/services/card-mode-store.js', () => ({
   setCardMode: vi.fn(async () => ({ ok: true })),
 }));
 
+vi.mock('../src/services/cot-mode-store.js', () => ({
+  setCotMode: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../src/im/lark/cot-message.js', () => ({
+  handleCotThinkingUpdate: vi.fn(() => true),
+}));
+
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
+import { setCotMode } from '../src/services/cot-mode-store.js';
+import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import {
@@ -683,7 +693,7 @@ describe('DAEMON_COMMANDS set', () => {
     // 33 = current master command set (32) + /forklist.
     // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(33);
+    expect(DAEMON_COMMANDS.size).toBe(34);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -4215,6 +4225,37 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('新话题');
       expect(replyContent).toContain('静默模式');
     });
+
+    it('defaults to group top-level when created from a topic/adopt session (no position modifier)', async () => {
+      // A schedule born inside a topic (including an adopted one) must not pin
+      // its results to that topic. Without an explicit modifier the default is
+      // top-level and the root bookmark is dropped.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      // Default extractScheduleModifiers mock returns no executionPosition.
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-topic-default' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      // Simulate a topic-scope (adopt) session: scope is 'thread'.
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报'), deps, LARK_APP_ID);
+
+      expect(scheduler.addTask).toHaveBeenCalledTimes(1);
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.executionPosition).toBe('top-level');
+      expect(callArgs.scope).toBe('chat');
+      // The adopt topic root must not be retained as a bookmark.
+      expect(callArgs.rootMessageId).toBeUndefined();
+    });
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────
@@ -6397,6 +6438,119 @@ describe('/card — operator / canOperate gate', () => {
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('终端尚未就绪');
     expect(reply).not.toContain('会议接收会话');
+  });
+});
+
+describe('/cot — thinking-process message switch (operator / canOperate)', () => {
+  const CHAT_ID = 'oc_chat_1';
+  const botWith = (config: Record<string, unknown>) =>
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, ...config },
+    })) as any);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    vi.mocked(setCotMode).mockResolvedValue({ ok: true, changed: true } as any);
+    botWith({ thinkingCard: true });
+  });
+
+  it('rejects a non-operator: operator_only notice, no mode change', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_random', '/cot off', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('仅授权用户');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot off mutes the chat via setCotMode(off=true)', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot off', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已关闭');
+  });
+
+  it('/cot on restores the chat and confirms when the master switch is on', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+    expect(reply).not.toContain('thinkingCard on');
+  });
+
+  it('/cot on hints at the master switch when thinkingCard is explicitly off', async () => {
+    botWith({ thinkingCard: false });
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('thinkingCard on');
+  });
+
+  it('/cot on with an untouched config (default ON) confirms without the master-switch hint', async () => {
+    botWith({});
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('已恢复');
+    expect(reply).not.toContain('thinkingCard on');
+  });
+
+  it('/cot status reports on / chat-muted / master-off states', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('开启中');
+
+    botWith({ thinkingCard: true, noCotChats: [CHAT_ID] });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1]).toContain('本群已关闭');
+
+    botWith({ thinkingCard: false });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[2][1]).toContain('总开关未开');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('unknown subcommand shows usage', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot bogus', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('用法');
+    expect(setCotMode).not.toHaveBeenCalled();
+  });
+
+  it('/cot show without a live session replies no_active_session', async () => {
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('没有活跃');
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+  });
+
+  it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
+    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    const ds = makeDaemonSession();
+    ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({
+      type: 'thinking_update',
+      turnId: 'om_turn9',
+      entries: [{ kind: 'thinking', text: 'so far' }],
+    }));
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('已召唤');
+  });
+
+  it('/cot show while idle: arms the one-shot force for the next turn', async () => {
+    const ds = makeDaemonSession();
+    const deps = makeDeps(ds);
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+    expect(ds.cotForced).toBe(true);
+    expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
   });
 });
 

@@ -204,11 +204,16 @@ export interface CodexBridgeEvent {
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
    *   - 'assistant_final' closes the currently-collecting turn with output
-   *   - 'turn_aborted' closes it without producing fallback output */
-  kind: 'user' | 'assistant_final' | 'turn_aborted';
+   *   - 'turn_aborted' closes it without producing fallback output
+   *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
+   *     output) attributed to the collecting turn for the CoT message; it
+   *     never starts or closes a turn */
+  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
-   *  user, output_text for assistant). */
+   *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
+  /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
+  cotEntries?: CodexCotEntry[];
   /** Optional durable-delivery terminal outcome carried by bridges with an
    *  explicit completion record (for example Grok `turn_completed`). Codex
    *  final-answer records omit it and retain the historical completed
@@ -223,6 +228,99 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+}
+
+/** One node of the native CoT message. Mirrors `CotEntry` in types.ts /
+ *  `TranscriptCotEntry` in claude-transcript.ts — redeclared structurally to
+ *  keep this module dependency-free. */
+export type CodexCotEntry =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | { kind: 'tool_result'; id: string; result: string };
+
+/** Per-entry truncation caps for the CoT tool timeline (same rationale and
+ *  values as claude-transcript's): args/outputs can be hundreds of KB, the
+ *  bubble only needs a recognisable preview. */
+const COT_TOOL_ARGS_MAX_CHARS = 600;
+const COT_TOOL_RESULT_MAX_CHARS = 800;
+
+function truncateForCot(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** Codex shell outputs are usually a JSON string `{"output":"…","metadata":…}`;
+ *  unwrap to the inner output when that shape parses, otherwise show the raw
+ *  string (custom tools / newer formats). */
+function stringifyCodexToolOutput(output: unknown): string {
+  if (typeof output !== 'string') {
+    try { return output === undefined ? '' : JSON.stringify(output); } catch { return ''; }
+  }
+  if (output.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed && typeof parsed === 'object' && typeof parsed.output === 'string') return parsed.output;
+    } catch { /* not the wrapped shape — fall through to raw */ }
+  }
+  return output;
+}
+
+/**
+ * Extract CoT (thinking process) entries from one Codex rollout
+ * `response_item` payload. Returns [] for payload types that don't belong in
+ * the thinking timeline (user/assistant messages, ghost snapshots, …).
+ *
+ *   - `reasoning` → thinking text. Codex records the display summary in
+ *     `summary[]` (`summary_text` blocks — what the TUI shows) and, for some
+ *     providers, raw CoT in `content[]` (`reasoning_text`); prefer the
+ *     summary, fall back to raw.
+ *   - `function_call` / `custom_tool_call` / `local_shell_call` /
+ *     `web_search_call` → tool_call (name + truncated args).
+ *   - `function_call_output` / `custom_tool_call_output` → tool_result
+ *     (unwrapped + truncated output).
+ */
+export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
+  if (!p || typeof p !== 'object') return [];
+  if (p.type === 'reasoning') {
+    const texts: string[] = [];
+    for (const b of Array.isArray(p.summary) ? p.summary : []) {
+      if (b?.type === 'summary_text' && typeof b.text === 'string' && b.text.length > 0) texts.push(b.text);
+    }
+    if (texts.length === 0) {
+      for (const b of Array.isArray(p.content) ? p.content : []) {
+        if ((b?.type === 'reasoning_text' || b?.type === 'text') && typeof b.text === 'string' && b.text.length > 0) texts.push(b.text);
+      }
+    }
+    return texts.length > 0 ? [{ kind: 'thinking', text: texts.join('\n\n') }] : [];
+  }
+  if (p.type === 'function_call' && typeof p.name === 'string') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    const args = typeof p.arguments === 'string' ? p.arguments : '';
+    return [{ kind: 'tool_call', id, name: p.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+  }
+  if (p.type === 'custom_tool_call' && typeof p.name === 'string' && typeof p.call_id === 'string' && p.call_id) {
+    const args = typeof p.input === 'string' ? p.input : '';
+    return [{ kind: 'tool_call', id: p.call_id, name: p.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+  }
+  if (p.type === 'local_shell_call') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    let args = '';
+    try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
+    return [{ kind: 'tool_call', id, name: 'shell', args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+  }
+  if (p.type === 'web_search_call') {
+    const id = typeof p.call_id === 'string' && p.call_id ? p.call_id : (typeof p.id === 'string' ? p.id : '');
+    if (!id) return [];
+    let args = '';
+    try { args = p.action === undefined ? '' : JSON.stringify(p.action); } catch { /* unserialisable — show none */ }
+    return [{ kind: 'tool_call', id, name: 'web_search', args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) }];
+  }
+  if ((p.type === 'function_call_output' || p.type === 'custom_tool_call_output') && typeof p.call_id === 'string' && p.call_id) {
+    const result = stringifyCodexToolOutput(p.output);
+    return result.length > 0 ? [{ kind: 'tool_result', id: p.call_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) }] : [];
+  }
+  return [];
 }
 
 export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
@@ -445,7 +543,7 @@ export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
+  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted' | 'cot'; text: string }[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -779,6 +877,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
     }
+    // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
+    // become cosmetic 'cot' events. The queue attributes them to the
+    // collecting turn for the native CoT message; they never start or close
+    // a turn (the boundaries above/below stay authoritative).
+    if (obj.type === 'response_item') {
+      const cotEntries = codexCotEntriesFromResponseItem(p);
+      if (cotEntries.length > 0) {
+        events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+        continue;
+      }
+    }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
     // This is the SOLE assistant_final source. Codex assistant `response_item`
@@ -824,9 +933,10 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       });
       continue;
     }
-    // Everything else is skipped: role=developer/system instructions,
-    // reasoning, function_call*, and every assistant `response_item` message
-    // (mid-turn OR final) — the turn boundary comes only from task_complete.
+    // Everything else is skipped: role=developer/system instructions and
+    // every assistant `response_item` message (mid-turn OR final) — the turn
+    // boundary comes only from task_complete. Reasoning / tool calls surface
+    // as cosmetic 'cot' events above, never as boundaries.
   }
   return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
 }
@@ -834,8 +944,14 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
   if (obj?.type !== 'event_msg' || obj.payload?.type !== 'thread_settings_applied') return undefined;
   const raw = obj.payload.thread_settings;
-  const serviceTier = raw?.service_tier;
-  if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  // Codex omits service_tier when /fast is disabled; that is an applied
+  // default-tier snapshot, not a malformed settings record.
+  const rawServiceTier = raw.service_tier;
+  const serviceTier = rawServiceTier === undefined || rawServiceTier === ''
+    ? 'default'
+    : rawServiceTier;
+  if (typeof serviceTier !== 'string') return undefined;
   const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
   // Effort follows in-session changes made through Codex's own model controls.
   // Codex records it both at the top level and under collaboration_mode.settings;

@@ -105,6 +105,16 @@ describe('bot defaults focused layout', () => {
     }
   });
 
+  it('places the Feishu description editor inside the profile header main column', () => {
+    const profileStart = page.indexOf('<BotProfileIdentity');
+    const tabsStart = page.indexOf('<BotDefaultsTabs', profileStart);
+    const profileHead = page.slice(profileStart, tabsStart);
+
+    expect(profileHead).toContain('<BotDescriptionControl bot={bot} />');
+    expect(css).toMatch(/\.bot-defaults-page \.bd-description-preview\s*\{[\s\S]*?-webkit-line-clamp:\s*2;/);
+    expect(css).toMatch(/\.bot-defaults-page \.bd-description-modal\s*\{[\s\S]*?max-height:\s*min\(720px,\s*calc\(100vh - 32px\)\);/);
+  });
+
   it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');

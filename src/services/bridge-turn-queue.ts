@@ -32,6 +32,7 @@ import {
   normaliseForFingerprint,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
+  isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
@@ -259,7 +260,18 @@ export class BridgeTurnQueue {
    *  were originally observed in. Without this, a sessionId rotation
    *  between ingest and emit would silently drop the reply, since the
    *  global current jsonl path would no longer contain those uuids. */
-  ingest(events: TranscriptEvent[], sourceJsonlPath?: string): void {
+  ingest(
+    events: TranscriptEvent[],
+    sourceJsonlPath?: string,
+    /** Cosmetic side-channel observer: called at the moment an event is
+     *  attributed to a turn (the then-collecting turn) for
+     *    - every non-sidechain, non-error assistant event, and
+     *    - every non-sidechain pure-tool_result user event (intra-turn tool
+     *      output — skipped by turn-start handling but part of the turn).
+     *  Used by the worker to extract thinking/tool entries for the native
+     *  CoT message. Must never mutate the queue or influence attribution. */
+    onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+  ): void {
     for (const ev of events) {
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
@@ -276,7 +288,17 @@ export class BridgeTurnQueue {
         // assistant text after them, and (b) let a synthetic line that
         // accidentally contains the fingerprint substring start the
         // wrong turn.
-        if (!isMeaningfulUserEvent(ev)) continue;
+        if (!isMeaningfulUserEvent(ev)) {
+          // Pure tool_result events are intra-turn tool output — never a
+          // turn boundary, but the CoT observer wants them for the tool
+          // timeline of the currently-collecting turn.
+          if (this.collecting && onAssistantAttributed
+            && (ev as any).isSidechain !== true
+            && isPureToolResultUserEvent(ev.message?.content)) {
+            try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+          }
+          continue;
+        }
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
         // Type-ahead path: Claude writes `attachment(queued_command)` the
@@ -341,6 +363,9 @@ export class BridgeTurnQueue {
           this.collecting = headless;
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
+        if (this.collecting && onAssistantAttributed) {
+          try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+        }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
           if (terminalOutcome?.status !== 'rate_limited') {

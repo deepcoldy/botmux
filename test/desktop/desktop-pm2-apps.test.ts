@@ -30,7 +30,32 @@ function childProcessStub() {
   return child;
 }
 
+const runningPm2 = { pm2QueryAvailable: () => true };
+
 describe('desktop PM2 app listing', () => {
+  it('passes the inspected God generation to the read-only helper', async () => {
+    const child = childProcessStub();
+    const spawn = vi.fn(() => child);
+    const expectedGod = {
+      pid: 7310,
+      cgroup: '/user.slice/botmux.service',
+      startIdentity: 'desktop-generation',
+    };
+    const promise = listPm2Apps(paths, runtime, {
+      pm2QueryAvailable: () => expectedGod,
+      existsSync: () => true,
+      spawn: spawn as any,
+      execPath: '/Electron',
+      env: {},
+    });
+    child.stdout.emit('data', '[]');
+    child.emit('close', 0);
+
+    await expect(promise).resolves.toEqual([]);
+    const env = (spawn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env;
+    expect(JSON.parse(env.BOTMUX_PM2_EXPECTED_GOD!)).toEqual(expectedGod);
+  });
+
   it('runs PM2 through the bundled Node absolute path', async () => {
     const child = childProcessStub();
     const spawn = vi.fn(() => child);
@@ -43,6 +68,7 @@ describe('desktop PM2 app listing', () => {
       runtimeSource: 'bundled',
     };
     const promise = listPm2Apps(paths, bundled, {
+      ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       env: { PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1' },
@@ -53,7 +79,7 @@ describe('desktop PM2 app listing', () => {
     await expect(promise).resolves.toEqual([]);
     expect(spawn).toHaveBeenCalledWith(
       bundled.nodePath,
-      [`${bundled.root}/node_modules/pm2/bin/pm2`, 'jlist'],
+      [`${bundled.root}/dist/cli/pm2-readonly-client.js`, 'jlist'],
       expect.objectContaining({ env: expect.not.objectContaining({ ELECTRON_RUN_AS_NODE: expect.anything() }) }),
     );
   });
@@ -70,6 +96,7 @@ describe('desktop PM2 app listing', () => {
       runtimeSource: 'bundled',
     };
     const promise = listPm2Apps(paths, bundled, {
+      ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       env: { PATH: '/usr/bin:/bin' },
@@ -106,6 +133,7 @@ describe('desktop PM2 app listing', () => {
     const child = childProcessStub();
     const spawn = vi.fn(() => child);
     const promise = listPm2Apps(paths, runtime, {
+      ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
@@ -118,11 +146,28 @@ describe('desktop PM2 app listing', () => {
     await expect(promise).rejects.toThrow('PM2 jlist failed');
   });
 
+  it('treats the read-only helper absence code as an empty process list', async () => {
+    const child = childProcessStub();
+    const spawn = vi.fn(() => child);
+    const promise = listPm2Apps(paths, runtime, {
+      ...runningPm2,
+      existsSync: () => true,
+      spawn: spawn as any,
+      execPath: '/Electron',
+      env: {},
+    });
+
+    child.emit('close', 3);
+
+    await expect(promise).resolves.toEqual([]);
+  });
+
   it('rejects and kills PM2 discovery when it times out', async () => {
     vi.useFakeTimers();
     const child = childProcessStub();
     const spawn = vi.fn(() => child);
     const promise = expect(listPm2Apps(paths, runtime, {
+      ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
@@ -142,6 +187,7 @@ describe('desktop PM2 app listing', () => {
     const child = childProcessStub();
     const spawn = vi.fn(() => child);
     const promise = expect(listPm2Apps(paths, runtime, {
+      ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
@@ -166,6 +212,7 @@ describe('desktop PM2 app listing', () => {
       binPath: '/home/.botmux/bin/botmux',
       pathEnv: shellPath,
     }, {
+      ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       env: { PATH: '/usr/bin:/bin' },
@@ -179,5 +226,15 @@ describe('desktop PM2 app listing', () => {
     const pathEntries = (spawn.mock.calls[0]![2] as any).env.PATH.split(':');
     expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeGreaterThan(-1);
     expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeLessThan(pathEntries.indexOf('/usr/bin'));
+  });
+
+  it('does not spawn PM2 while listing an absent daemon', async () => {
+    const spawn = vi.fn();
+    await expect(listPm2Apps(paths, runtime, {
+      existsSync: () => true,
+      spawn: spawn as any,
+      pm2QueryAvailable: () => false,
+    })).resolves.toEqual([]);
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

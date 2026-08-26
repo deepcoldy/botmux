@@ -216,7 +216,10 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
     const renderer = renderRow('app_old');
     await flush();
     const authButton = () => renderer.root.findByProps({ 'data-action': 'session-group-tag-auth' });
-    act(() => { authButton().props.onClick(); });
+    // startAuth now awaits the silent redirect-whitelist repair BEFORE minting the
+    // auth URL (the fetch stub above rejects that call, which is exactly the
+    // non-blocking path), so the auth POST only goes out after a microtask drain.
+    await flush(() => { authButton().props.onClick(); });
     expect(postUrls).toEqual(['/api/bots/app_old/session-group-tag-auth']);
 
     // Bot switch while the old bot's POST is in flight, THEN its response
@@ -229,7 +232,7 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
     expect(authButton().props.disabled).toBe(false);
 
     // Positive control: the new bot's own auth flow still opens ITS page.
-    act(() => { authButton().props.onClick(); });
+    await flush(() => { authButton().props.onClick(); });
     await flush(() => newAuth.resolve(jsonResponse({ ok: true, authUrl: 'https://auth.example/NEW-BOT' })));
     expect(open).toHaveBeenCalledTimes(1);
     expect(open).toHaveBeenCalledWith('https://auth.example/NEW-BOT', '_blank', 'noopener');
@@ -251,7 +254,9 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
 
     const renderer = renderRow('app_old');
     await flush();
-    act(() => { renderer.root.findByProps({ 'data-action': 'session-group-tag-auth' }).props.onClick(); });
+    // Drain past the silent repair call so the auth POST is genuinely in flight
+    // when the bot switch happens (that is the race this test is about).
+    await flush(() => { renderer.root.findByProps({ 'data-action': 'session-group-tag-auth' }).props.onClick(); });
 
     await flush(() => switchBot(renderer, 'app_new'));
     // The old bot's POST fails late — the error belongs to the previous
@@ -468,6 +473,190 @@ describe('SessionGroupTagRow (bot-switch stale responses)', () => {
       for (let i = 0; i < 12; i++) await Promise.resolve();
     });
     expect(statusGets).toBe(before);
+    act(() => renderer.unmount());
+  });
+});
+
+// 「会话群标签」区块的标签名输入框（用户实测反馈：只有模式下拉，找不到在哪配名字）。
+// 关注点是保存语义，不是 race：失焦/回车触发保存、留空=清配置回默认、无改动不打接口、
+// placeholder 展示的是服务端算出来的默认名「<bot 名>会话」。
+describe('SessionGroupTagRow (标签名输入框)', () => {
+  function renderRow(appId: string): TestRenderer.ReactTestRenderer {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(SessionGroupTagRow, { bot: { larkAppId: appId } as any }));
+    });
+    return renderer;
+  }
+
+  async function flush(action?: () => void): Promise<void> {
+    await act(async () => {
+      action?.();
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+  }
+
+  /** 记录每次 PUT 的 body；GET 返回当前已保存的标签名。 */
+  function stubServer(initial: { tagMode?: string; tagName?: string; defaultTagName?: string } = {}) {
+    const state = {
+      tagMode: initial.tagMode ?? 'feed-group',
+      tagName: initial.tagName ?? '',
+      defaultTagName: initial.defaultTagName ?? 'CodeXonAst会话',
+    };
+    const puts: any[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: any) => {
+      const method = init?.method ?? 'GET';
+      if (method === 'GET' && url.includes('/session-group-tag-status')) {
+        return jsonResponse({ ok: true, authorized: true, ...state });
+      }
+      if (method === 'PUT' && url.includes('/session-group-tag-config')) {
+        const body = JSON.parse(init.body);
+        puts.push(body);
+        // 服务端语义：trim 后为空 = 清配置；这里连同 trim 一起模拟。
+        if (typeof body.name === 'string') state.tagName = body.name.trim();
+        if (body.mode) state.tagMode = body.mode;
+        return jsonResponse({ ok: true, ...state });
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    }));
+    return { puts, state };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('首屏回填已保存的名字，placeholder 用服务端算出的默认名', async () => {
+    stubServer({ tagName: '我的工作台' });
+    const renderer = renderRow('app_name');
+    await flush();
+
+    const input = renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+    expect(input.props.value).toBe('我的工作台');
+    expect(input.props.placeholder).toBe('CodeXonAst会话');
+    act(() => renderer.unmount());
+  });
+
+  it('失焦保存：写入 trim 后的名字并回填服务端存下来的值', async () => {
+    const { puts } = stubServer();
+    const renderer = renderRow('app_name');
+    await flush();
+    const input = () => renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+
+    await flush(() => { input().props.onChange({ currentTarget: { value: '  我的工作台 ' } }); });
+    await flush(() => { input().props.onBlur(); });
+
+    expect(puts).toEqual([{ name: '我的工作台' }]);
+    expect(input().props.value).toBe('我的工作台');
+    // 成功提示与页面其它控件同款（StatusSpan）。
+    expect(renderer.root.findByProps({ 'data-sg-tag-name-status': '' }).props.children).toBeTruthy();
+    act(() => renderer.unmount());
+  });
+
+  it('回车触发失焦（真正的保存挂在 onBlur 上）', async () => {
+    const { puts } = stubServer();
+    const renderer = renderRow('app_name');
+    await flush();
+    const input = () => renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+
+    await flush(() => { input().props.onChange({ currentTarget: { value: '按回车保存' } }); });
+    const blur = vi.fn();
+    const preventDefault = vi.fn();
+    act(() => { input().props.onKeyDown({ key: 'Enter', preventDefault, currentTarget: { blur } }); });
+    expect(preventDefault).toHaveBeenCalled();
+    expect(blur).toHaveBeenCalled();
+    // 没敲回车的按键不做任何事。
+    act(() => { input().props.onKeyDown({ key: 'a', preventDefault: vi.fn(), currentTarget: { blur: vi.fn() } }); });
+
+    await flush(() => { input().props.onBlur(); });
+    expect(puts).toEqual([{ name: '按回车保存' }]);
+    act(() => renderer.unmount());
+  });
+
+  it('清空 = 发空串清配置，回到默认名', async () => {
+    const { puts } = stubServer({ tagName: '我的工作台' });
+    const renderer = renderRow('app_name');
+    await flush();
+    const input = () => renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+
+    await flush(() => { input().props.onChange({ currentTarget: { value: '   ' } }); });
+    await flush(() => { input().props.onBlur(); });
+
+    expect(puts).toEqual([{ name: '' }]);
+    expect(input().props.value).toBe('');
+    expect(input().props.placeholder).toBe('CodeXonAst会话');
+    act(() => renderer.unmount());
+  });
+
+  it('没改动的失焦不打接口', async () => {
+    const { puts } = stubServer({ tagName: '我的工作台' });
+    const renderer = renderRow('app_name');
+    await flush();
+    const input = () => renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+
+    await flush(() => { input().props.onBlur(); });
+    expect(puts).toEqual([]);
+    act(() => renderer.unmount());
+  });
+
+  it('off 模式不渲染输入框（不打标签，名字没有意义）', async () => {
+    stubServer({ tagMode: 'off' });
+    const renderer = renderRow('app_name');
+    await flush();
+
+    expect(renderer.root.findAllByProps({ 'data-input': 'sessionGroupTagName' })).toHaveLength(0);
+    act(() => renderer.unmount());
+  });
+
+  it('chat-tag 模式同样有输入框（两种模式共用一个标签名）', async () => {
+    stubServer({ tagMode: 'chat-tag' });
+    const renderer = renderRow('app_name');
+    await flush();
+
+    expect(renderer.root.findAllByProps({ 'data-input': 'sessionGroupTagName' })).toHaveLength(1);
+    act(() => renderer.unmount());
+  });
+
+  it('保存失败时把错误显示在标签名这一行，不污染模式行', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: any) => {
+      const method = init?.method ?? 'GET';
+      if (method === 'GET') {
+        return jsonResponse({ ok: true, authorized: true, tagMode: 'feed-group', tagName: '', defaultTagName: 'CodeXonAst会话' });
+      }
+      return jsonResponse({ ok: false, error: 'bot_not_in_config' }, false, 400);
+    }));
+    const renderer = renderRow('app_name');
+    await flush();
+    const input = () => renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+
+    await flush(() => { input().props.onChange({ currentTarget: { value: '新名字' } }); });
+    await flush(() => { input().props.onBlur(); });
+
+    expect(renderer.root.findByProps({ 'data-sg-tag-name-status': '' }).props.children).toContain('bot_not_in_config');
+    expect(renderer.root.findAllByProps({ className: 'status-error' })).toHaveLength(0);
+    act(() => renderer.unmount());
+  });
+
+  it('切 bot 后输入框换成新 bot 的名字与默认名', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: any) => {
+      const method = init?.method ?? 'GET';
+      if (method === 'GET' && url.includes('app_old')) {
+        return jsonResponse({ ok: true, authorized: true, tagMode: 'feed-group', tagName: '旧 bot 的名字', defaultTagName: 'OldBot会话' });
+      }
+      if (method === 'GET') {
+        return jsonResponse({ ok: true, authorized: true, tagMode: 'feed-group', tagName: '', defaultTagName: 'NewBot会话' });
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    }));
+    const renderer = renderRow('app_old');
+    await flush();
+    const input = () => renderer.root.findByProps({ 'data-input': 'sessionGroupTagName' });
+    expect(input().props.value).toBe('旧 bot 的名字');
+
+    await flush(() => renderer.update(React.createElement(SessionGroupTagRow, { bot: { larkAppId: 'app_new' } as any })));
+    expect(input().props.value).toBe('');
+    expect(input().props.placeholder).toBe('NewBot会话');
     act(() => renderer.unmount());
   });
 });

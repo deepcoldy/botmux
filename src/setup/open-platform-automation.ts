@@ -12,8 +12,9 @@ import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
-import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
+import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
   parseOnlineVisibility,
   VisibilityParseError,
@@ -139,6 +140,14 @@ export type OpenPlatformAutomationResult =
       missingVcEvents: string[];
       /** 回读确认事件接收方式已是长连接(ok:true 时恒为 true,显式带回供门函数统一判定)。 */
       eventModeReady: boolean;
+      /**
+       * redirect 白名单是否写成功。白名单缺失 = authorize 直接 20029 硬失败
+       * (群聊模式 / 会话群标签 / `/login` 全部授权不了),但它不阻断建 bot,
+       * 所以必须显式带回,让调用方把「还差这一步」翻译成人话。
+       */
+      redirectConfigured: boolean;
+      /** redirect 白名单写入失败的原因(仅 redirectConfigured=false 时有)。 */
+      redirectWarning?: string;
       /** Managed onboarding only: exact same-session event mode readback. */
       eventMode?: number;
       /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
@@ -172,6 +181,10 @@ export type OpenPlatformAutomationResult =
       missingVcEvents?: string[];
       /** 事件接收方式是否回读确认为长连接(走到订阅阶段才有;早期失败为 undefined)。 */
       eventModeReady?: boolean;
+      /** redirect 白名单是否写成功(csrf 就位后立刻尝试,失败不阻断本流程)。 */
+      redirectConfigured?: boolean;
+      /** redirect 白名单写入失败的原因。 */
+      redirectWarning?: string;
       /** Managed onboarding exact event-mode ACK, preserved across later scope propagation failure. */
       eventMode?: number;
       /** Managed onboarding exact baseline count ACK, preserved across later scope propagation failure. */
@@ -192,6 +205,16 @@ export interface OpenPlatformAutomationOptions {
   disableQrLogin?: boolean;
   /** Require all baseline events/callbacks and a published version to be proven before managed activation. */
   requireVerifiedEvents?: boolean;
+  /**
+   * 「这个 app 是本次流程刚刚创建出来的」。**只有** setup / onboarding 的建应用链路
+   * 能传 true。
+   *
+   * 唯一作用：允许 redirect 白名单在**读不到线上现值时**退化成覆盖写。刚建的应用
+   * 白名单必然为空，覆盖不掉任何用户条目；对存量应用盲写则会静默清掉用户手配的
+   * 回调地址（见 {@link WriteRedirectWhitelistOptions.allowBlindWrite}）。
+   * 权限自愈 / VC 事件补订阅 / 批量修复这些跑在存量应用上的链路一律不传。
+   */
+  appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   pollIntervalMs?: number;
@@ -412,8 +435,296 @@ export function buildSafeSettingPayload(appId: string, extraRedirectUrls: string
     clientId: appId,
     // 默认本机回贴地址 + 可选的 dashboard 自动回调地址（global-config
     // oauthRedirectBase 场景）。去重保持幂等。
+    // ⚠️ 这里是**全量覆盖**语义：给什么，白名单就是什么。调用方必须先用
+    // {@link writeRedirectWhitelist} 读回线上现值并合并，不要直接拿几条
+    // botmux 自己的地址来调它——那会把用户手配的其它回调地址静默清掉。
     redirectURL: [...new Set([BOTMUX_REDIRECT_URL, ...extraRedirectUrls])],
   };
+}
+
+/**
+ * botmux 自己知道的、应当出现在 redirect 白名单里的全部回调地址。
+ *
+ * 只有 `http://127.0.0.1:9768/callback` 是常量兜底（粘贴回调那条链路）；另外三条
+ * 都是「本机 dashboard 对外可达基址」的不同来源，存在才追加 `<base>/oauth/callback`：
+ *   • `oauthRedirectBase`（用户在 global-config 里手填的对外基址）
+ *   • `platformMachineBaseUrl()`（接了中心平台 → `https://m-<machineId>.<平台域名>`）
+ *   • `publicReverseProxyBaseUrl()`（自建反代 `BOTMUX_PUBLIC_URL`）
+ * 今天这三条一条都没写进去，正是「配了 oauthRedirectBase 也还是要手动粘贴回调」的根因。
+ *
+ * ⚠️ 故意**不**推导「本机 host:port」：飞书白名单对**非 loopback 的明文 http**
+ * 到底收不收、收了 authorize 时会不会仍报 20029，都还没实测过（见方案 T2）。
+ * 猜一条塞进去，失败时会连累整批写入（虽然有最小集兜底，但白白多一次往返），
+ * 而且 LAN 地址对话题里的其他人本来就不一定可达。等 T2 实测有结论再加。
+ */
+export function collectBotmuxRedirectUrls(): string[] {
+  const urls: string[] = [BOTMUX_REDIRECT_URL];
+  const pushBase = (base: string | null | undefined) => {
+    const trimmed = base?.trim().replace(/\/+$/, '');
+    if (trimmed && /^https?:\/\//.test(trimmed)) urls.push(`${trimmed}/oauth/callback`);
+  };
+  // 三个来源各自独立 try/catch：配置读不动 / 未绑定平台都不该拖垮其它两条。
+  try { pushBase(readGlobalConfig().oauthRedirectBase); } catch { /* config unavailable */ }
+  try { pushBase(platformMachineBaseUrl()); } catch { /* not bound to a platform */ }
+  try { pushBase(publicReverseProxyBaseUrl()); } catch { /* env unavailable */ }
+  return uniqueStrings(urls);
+}
+
+// verify-permissions 的 buildRemainingSteps 要按实际配置列重定向 URL，但它**不能**
+// 反向 import 本模块（本模块在顶层 const 里用它的 VC_MEETING_BOT_EVENTS，静态互引
+// 会 TDZ 崩）。所以由本模块单向把函数注册过去，依赖方向仍是 automation →
+// verify-permissions 一条边。
+registerBotmuxRedirectUrlCollector(collectBotmuxRedirectUrls);
+
+/**
+ * 从 `POST /developers/v1/safe_setting/<appId>` `{}` 的返回里解析现有 redirect 白名单。
+ *
+ * 返回 `null` 表示**没读出来**（端点不存在 / 结构变了 / 报错），与「读到了但是空数组」
+ * 严格区分：前者只能退化成覆盖写（保住 botmux 自己能用），后者可以放心合并。
+ * 实测返回形态（feishu.cn 租户，2026-08）：
+ * `{code:0, data:{allowRefreshToken, ipWhiteList:[], redirectURL:[...], safeServerDomain:[]}}`。
+ */
+export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | null {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const raw = data.redirectURL ?? data.redirectUrl ?? data.redirectURLs;
+  if (!Array.isArray(raw)) return null;
+  return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
+}
+
+/** `automateOpenPlatformSetup` 内联 postJson / `OpenPlatformApiClient.postJson` 的公共形状。 */
+export type OpenPlatformPostJson = (path: string, body?: unknown) => Promise<unknown>;
+
+export interface RedirectWhitelistWriteResult {
+  /**
+   * • `unchanged`          — 幂等短路没发写请求
+   * • `updated`            — 写了全集
+   * • `updated_fallback`   — 全集被拒、退到最小集
+   * • `skipped_unreadable` — 读不到线上现值且未获盲写授权 → **一次写请求都没发**
+   */
+  status: 'unchanged' | 'updated' | 'updated_fallback' | 'skipped_unreadable';
+  /** 线上现有白名单（读不出来时为 null）。 */
+  existing: string[] | null;
+  /** 本次实际落地（或确认已在线上）的白名单。`skipped_unreadable` 时为空数组。 */
+  redirectUrls: string[];
+  /** `skipped_unreadable` 时的人话说明，由调用方记成 warning。 */
+  warning?: string;
+}
+
+/**
+ * 「这次想写的地址里，有哪几条最终没落在线上」——redirect 白名单**是否算配置成功**的
+ * 唯一判据。
+ *
+ * 纯函数（无 IO、无状态），由 {@link automateOpenPlatformSetup} 与
+ * `open-platform-redirect-repair.ts` 的批量修复**共用同一份结果**：两处各写一份完整性
+ * 判断必然漂移——automation 曾经只特判 `skipped_unreadable`、其余一律报「已配置」，于是
+ * `updated_fallback`（按定义至少漏掉一条 wanted）被假报成成功，用户拿到一个建好了、
+ * 一授权就 20029 的 bot。
+ *
+ * 按**实际落盘结果**逐条核对 `wanted`，而不是特判某个 status：今天只有
+ * `updated_fallback` 会漏条（最小集 = 线上现值 ∪ 本机回调，超出这个范围的 wanted 都被
+ * 丢了），但兜底集的构成一旦调整，只有「拿 wanted 对一遍实际结果」这条判据不会跟着错。
+ *
+ * ⚠️ `skipped_unreadable`（读不到线上现值 → 一次写请求都没发）**不走这条路**：它是
+ * 「没写」而不是「写漏了」，两者的下一步完全不同（前者要先修登录态/权限，后者去后台
+ * 补地址），由两个调用方各自单独特判并给出区分开的措辞。
+ */
+export function missingRedirectUrls(wanted: string[], written: string[]): string[] {
+  const live = new Set(written);
+  return uniqueStrings(wanted).filter(url => !live.has(url));
+}
+
+export interface WriteRedirectWhitelistOptions {
+  /**
+   * 允许「读不出线上现值时直接全量覆盖写」。
+   *
+   * `buildSafeSettingPayload` 是全量覆盖语义，所以盲写 = 把线上白名单替换成
+   * `wanted`。对**存量应用**这会静默清掉用户自己配的回调地址，违反「绝不删用户
+   * 条目」契约；读接口只要抖一下（瞬时网络 / 结构变化 / 权限异常）就会踩到。
+   * 因此默认 false：读不出来就零写入、回 `skipped_unreadable`。
+   *
+   * 只有调用方能**证明这个 app 是本次自动化刚刚创建出来的**（白名单必然为空，
+   * 覆盖不掉任何东西）才允许传 true —— 见 `OpenPlatformAutomationOptions.appJustCreated`。
+   */
+  allowBlindWrite?: boolean;
+}
+
+/**
+ * 读 → 合并 → 写 redirect 白名单，**绝不删用户已有条目**。
+ *
+ * `buildSafeSettingPayload` 是全量覆盖语义，历史实现直接拿 botmux 自己那几条去调，
+ * 于是每次建 bot / 权限自愈都把用户在后台手配的其它回调地址静默清空。这里先读回
+ * 线上现值再取并集。
+ *
+ * ⚠️ **读不出来时默认零写入**（`skipped_unreadable`）。历史实现在这里退化成全量
+ * 覆盖写，等于把「读接口抖了一下」翻译成「清掉用户的自定义回调」——同一个契约违约，
+ * 只是触发条件更隐蔽。只有 {@link WriteRedirectWhitelistOptions.allowBlindWrite}
+ * （调用方能证明 app 是刚创建的）才恢复覆盖写。
+ *
+ * `postJson` 走参数注入而不是闭包捕获，是为了「批量修复存量 bot」能直接复用同一段
+ * 逻辑——那条路径必须走 {@link createOpenPlatformApiClient}（它的 referer 是通用的
+ * `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup` 里那份
+ * referer 绑死单个 appId 的内联 postJson。
+ *
+ * 写失败时**只在「URL 被 console 判非法」这一类错误上**兜底重试一次「线上现值 ∪
+ * 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被拒时整批会一起失败，最小集能保住
+ * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不做第二次改写（见
+ * {@link isRedirectUrlRejectedError}）。两次都失败才抛出，由调用方记成 warning
+ * （不阻断建 bot）。
+ */
+export async function writeRedirectWhitelist(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  wanted: string[] = collectBotmuxRedirectUrls(),
+  options: WriteRedirectWhitelistOptions = {},
+): Promise<RedirectWhitelistWriteResult> {
+  let existing: string[] | null = null;
+  let readError: string | undefined;
+  try {
+    const payload = await postJson(`/developers/v1/safe_setting/${appId}`, {});
+    existing = extractOpenPlatformRedirectUrls(payload);
+    if (existing === null) readError = '返回体里没有可识别的 redirectURL 数组';
+  } catch (err: any) {
+    // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
+    existing = null;
+    readError = safeErrorMessage(err);
+  }
+
+  if (existing === null && !options.allowBlindWrite) {
+    // 零写入：盲写会把线上白名单整体替换掉，读失败恰恰意味着「不知道线上有什么」。
+    return {
+      status: 'skipped_unreadable',
+      existing: null,
+      redirectUrls: [],
+      warning: `读不到开放平台现有 redirect 白名单（${readError ?? '未知原因'}），为避免覆盖用户自定义回调地址，本次未写入`,
+    };
+  }
+
+  const wantedUrls = uniqueStrings(wanted);
+  if (existing !== null && wantedUrls.every(url => existing!.includes(url))) {
+    // 幂等短路：想要的全在线上了，一次写请求都不发。
+    return { status: 'unchanged', existing, redirectUrls: existing };
+  }
+
+  const merged = existing === null ? wantedUrls : uniqueStrings([...existing, ...wantedUrls]);
+  const mergedPayload = buildSafeSettingPayload(appId, merged);
+  try {
+    await postJson(`/developers/v1/safe_setting/update/${appId}`, mergedPayload);
+    return { status: 'updated', existing, redirectUrls: mergedPayload.redirectURL };
+  } catch (err: any) {
+    // 兜底只针对「某条 URL 被判非法」——网络异常重发同样会失败，403 重发只会再被拒，
+    // 两者都只是白白多打一次 console。
+    if (!isRedirectUrlRejectedError(err)) throw err;
+    const minimalPayload = buildSafeSettingPayload(
+      appId,
+      existing === null ? [] : uniqueStrings([...existing, BOTMUX_REDIRECT_URL]),
+    );
+    // 最小集与刚被拒的全集一样 → 失败与「多余条目」无关，重发同一份没有意义。
+    if (sameRedirectSet(minimalPayload.redirectURL, mergedPayload.redirectURL)) throw err;
+    try {
+      await postJson(`/developers/v1/safe_setting/update/${appId}`, minimalPayload);
+    } catch (fallbackErr: any) {
+      // `cause` 挂首次失败的**原始错误对象**（而不是只把它拼进字符串）：批量修复
+      // 要靠 `OpenPlatformApiError` 的 status/code 把「这个 app 不属于当前登录账号」
+      // （403 / code=10003）与普通写失败分开，字符串里拿不到状态码。首次失败的文案
+      // 不重复拼进 message，交给 safeErrorMessage 顺 cause 链取——否则同一句会出现两遍。
+      throw new Error(
+        `全集与最小集兜底两次写入均失败（最小集: ${safeErrorMessage(fallbackErr)}）`,
+        { cause: err },
+      );
+    }
+    return { status: 'updated_fallback', existing, redirectUrls: minimalPayload.redirectURL };
+  }
+}
+
+function sameRedirectSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every(item => set.has(item));
+}
+
+/**
+ * 主题词：这句报错在说「某个 URL / 回调地址」。
+ * 单独出现不构成拒绝（`redirect rate limited` 也含 redirect）。
+ */
+const REDIRECT_URL_SUBJECT_KEYWORDS = [
+  'url', 'uri', 'redirect', 'callback', '回调', '重定向', '链接',
+];
+
+/**
+ * 拒绝词：这句报错在说「它不合法 / 格式不对 / 不被接受」。
+ * 同样单独出现不构成拒绝（`invalid csrf token` 也含 invalid）。
+ */
+const REDIRECT_URL_REJECTION_KEYWORDS = [
+  'invalid', 'illegal', 'malformed', 'format', 'not allowed', 'not supported', 'unsupported',
+  '非法', '不合法', '格式', '不支持', '不允许',
+];
+
+/**
+ * 把一张关键词表编译成匹配函数：**英文/ASCII 词按词边界（独立单词）匹配，中文词按子串**。
+ *
+ * 英文必须卡词边界，否则普通单词内部的片段会被当成命中，实测三例：
+ *   - `security token invalid`：`security` 里含 `uri`（主题词）+ `invalid`（拒绝词）
+ *   - `invalid operation during request`：`during` 里含 `uri`
+ *   - `callback information unavailable`：`information` 里含 `format`
+ * 三句都与「白名单里有条非法 URL」毫无关系，裸 `includes` 却会让 botmux 再改一次
+ * 线上安全设置。多词短语（`not allowed`）按整条短语卡首尾词边界；结尾允许一个复数
+ * `s`（`one of the urls is invalid` 仍算主题命中），词内片段依旧不算。
+ *
+ * 中文没有词边界概念（`回调地址非法` 本就连写，`\b` 在中文串里也失去意义），继续 includes。
+ * 大小写不敏感沿用旧行为：ASCII 正则带 `i`，中文无大小写之分。
+ */
+function compileKeywordMatcher(keywords: string[]): (message: string) => boolean {
+  // 纯 ASCII 可打印字符 = 英文单词/短语；含中文的走 includes。
+  const isAscii = (keyword: string) => /^[\x20-\x7e]+$/.test(keyword);
+  // 关键词表里目前没有正则元字符，仍转义一次，免得以后加词时静默变成正则。
+  const asciiWords = keywords.filter(isAscii).map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const cjkKeywords = keywords.filter(keyword => !isAscii(keyword));
+  const wordPattern = asciiWords.length > 0
+    ? new RegExp(`\\b(?:${asciiWords.join('|')})s?\\b`, 'i')
+    : null;
+  return (message: string) => (wordPattern?.test(message) ?? false)
+    || cjkKeywords.some(keyword => message.includes(keyword));
+}
+
+const matchesRedirectUrlSubject = compileKeywordMatcher(REDIRECT_URL_SUBJECT_KEYWORDS);
+const matchesRedirectUrlRejection = compileKeywordMatcher(REDIRECT_URL_REJECTION_KEYWORDS);
+
+/**
+ * 判断一次 `safe_setting/update` 失败是不是「白名单里某条 URL 被 console 判非法」——
+ * 只有这一类才值得用最小集再写一次。
+ *
+ * ⚠️ 开放平台没有公开这个端点的错误码表，仓库里也没有实测记录（截至本次改动），
+ * 所以做不到「按 code 精确判定」。这里按**保守**顺序判：
+ *   1. 传输层失败（fetch failed / ECONNRESET…）→ false。重发只会再失败一次。
+ *   2. HTTP 401/403 或 console 的 owner 拒绝码 → false。这是鉴权问题，与写什么无关，
+ *      重发还会被拒，而且会把 `not_owned` 的判定链拉长。
+ *   3. HTTP 408/409/429 与所有 5xx → false。超时 / 冲突 / 限流 / 服务端故障都与
+ *      「写了什么」无关，立刻改小重发只会再吃一次限流或再撞一次冲突。
+ *   4. 其余（含 `code!=0` 的业务拒绝）→ **主题词 AND 拒绝词双命中**才算：文案里既要
+ *      出现 url/uri/redirect/callback/回调/重定向/链接 这类**说的是地址**的词，又要出现
+ *      invalid/illegal/malformed/format/not allowed/unsupported/非法/格式/不支持 这类
+ *      **说它被拒**的词。英文词必须是**独立单词**（词边界），不认词内片段——
+ *      `security token invalid`（security 含 uri）、`invalid operation during request`
+ *      （during 含 uri）、`callback information unavailable`（information 含 format）
+ *      这三句实测都会被裸 `includes` 判成双命中，见 {@link compileKeywordMatcher}。
+ *
+ * 曾经是一张 OR 关键词表，任一命中就兜底重写一次线上配置——`invalid csrf token`
+ *（实测会误触发）、`operation not allowed` 这类与白名单毫无关系的报错都会让 botmux
+ * 再写一次开放平台安全设置。判不出来就**不**兜底：少一次可能有用的重试，好过在
+ * 网络 / 鉴权 / 限流故障上多改一次线上配置。
+ */
+function isRedirectUrlRejectedError(err: unknown): boolean {
+  if (isLikelyTransientNetworkError(err)) return false;
+  if (err instanceof OpenPlatformApiError) {
+    if (err.status === 401 || err.status === 403) return false;
+    if (err.status === 408 || err.status === 409 || err.status === 429) return false;
+    if (err.status >= 500) return false;
+    if (openPlatformOwnerAccessDenied(err)) return false;
+  }
+  const message = safeErrorMessage(err);
+  return matchesRedirectUrlSubject(message) && matchesRedirectUrlRejection(message);
 }
 
 /**
@@ -630,7 +941,12 @@ export async function automateOpenPlatformSetup(
 ): Promise<OpenPlatformAutomationResult> {
   const brand = options.brand ?? 'feishu';
   if (brand !== 'feishu') {
-    return { ok: false, reason: 'unsupported_brand', message: '开放平台自动配置当前只支持 feishu.cn 租户' };
+    return {
+      ok: false,
+      reason: 'unsupported_brand',
+      message: '开放平台自动配置当前只支持 feishu.cn 租户',
+      redirectConfigured: false,
+    };
   }
 
   const fetcher = options.fetchImpl ?? fetch;
@@ -653,6 +969,7 @@ export async function automateOpenPlatformSetup(
       reason: preparedSession.reason,
       message: `获取 Feishu Web session 失败: ${preparedSession.message}`,
       sessionFile: preparedSession.sessionFile,
+      redirectConfigured: false,
     };
   }
 
@@ -680,7 +997,13 @@ export async function automateOpenPlatformSetup(
       csrfToken = extractOpenPlatformCsrfToken(homePage.text);
     }
   } catch (err: any) {
-    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: 'network',
+      message: `读取开放平台页面失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      redirectConfigured: false,
+    };
   }
   if (!csrfToken) {
     return {
@@ -689,6 +1012,7 @@ export async function automateOpenPlatformSetup(
       message:
         'Feishu session 可读取，但开放平台页面没有返回 window.csrfToken；可能需要在浏览器完成开放平台登录',
       sessionFile,
+      redirectConfigured: false,
     };
   }
 
@@ -720,6 +1044,42 @@ export async function automateOpenPlatformSetup(
     return data;
   };
 
+  // redirect 白名单：csrf 一就位就立刻写,**不再留到流程末尾**。
+  // 后面的 scope 读取 / robot 与事件开关 / 核心事件回读 任意一步失败都会提前
+  // return,把白名单一起拖死;而白名单缺失是 authorize 的**硬失败**(20029,用户
+  // 连飞书授权页都进不去,群聊模式 p2pMode=group、会话群标签、`/login` 全部授权
+  // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
+  let redirectConfigured = false;
+  let redirectWarning: string | undefined;
+  try {
+    // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
+    // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
+    // 猜——那正是 `updated_fallback` 被假报成成功的原因。
+    const wantedRedirectUrls = collectBotmuxRedirectUrls();
+    const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
+      // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
+      allowBlindWrite: options.appJustCreated === true,
+    });
+    if (written.status === 'skipped_unreadable') {
+      // 「读不到线上现值 → 一次写请求都没发」。与下面的「写了但没写全」是两回事：
+      // 这里连线上有什么都不知道，谈不上缺哪几条，措辞也要分开。
+      redirectWarning = written.warning;
+    } else {
+      const missing = missingRedirectUrls(wantedRedirectUrls, written.redirectUrls);
+      if (missing.length === 0) {
+        redirectConfigured = true;
+      } else {
+        // 写请求返回 200 ≠ 想要的地址都在线上。缺的那条正是本机这次要用的回调地址时，
+        // authorize 照样 20029，报「已配置」等于把问题藏到用户踩坑那一刻。
+        redirectWarning = written.status === 'updated_fallback'
+          ? `完整地址列表被开放平台拒绝，已退回「线上现值 + 本机回调」最小集写入；仍缺: ${missing.join('、')}`
+          : `写入已提交，但以下回调地址仍未生效: ${missing.join('、')}`;
+      }
+    }
+  } catch (err: any) {
+    redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;
+  }
+
   let allScopesPayload: unknown;
   try {
     allScopesPayload = await postJson(`/developers/v1/scope/all/${options.appId}`);
@@ -729,6 +1089,8 @@ export async function automateOpenPlatformSetup(
       reason: openPlatformOwnerAccessDenied(err) ? 'owner_session_mismatch' : 'api_error',
       message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`,
       sessionFile,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 
@@ -766,6 +1128,8 @@ export async function automateOpenPlatformSetup(
       reason: 'api_error',
       message: `启用机器人或长连接事件能力失败: ${safeErrorMessage(err)}`,
       sessionFile,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 
@@ -905,18 +1269,12 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 
   try {
-    // 自动回调场景：global-config oauthRedirectBase 指向本机 dashboard 时，把
-    // `<base>/oauth/callback` 一并写入 redirect 白名单，authorize 才允许回跳。
-    let extraRedirects: string[] = [];
-    try {
-      const base = readGlobalConfig().oauthRedirectBase?.trim().replace(/\/+$/, '');
-      if (base && /^https?:\/\//.test(base)) extraRedirects = [`${base}/oauth/callback`];
-    } catch { /* config unavailable → default only */ }
-    await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId, extraRedirects));
     // 原样镜像**线上版本**的可见范围（白/黑名单都带）——绝不注入「当前 Web
     // session 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 /
     // 选择已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄
@@ -945,6 +1303,8 @@ export async function automateOpenPlatformSetup(
         eventWarning,
         missingVcEvents,
         eventModeReady,
+        redirectConfigured,
+        redirectWarning,
       };
     }
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
@@ -964,6 +1324,8 @@ export async function automateOpenPlatformSetup(
         eventWarning,
         missingVcEvents,
         eventModeReady,
+        redirectConfigured,
+        redirectWarning,
       };
     }
     if (versionId) {
@@ -981,6 +1343,8 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      redirectConfigured,
+      redirectWarning,
       ...(options.requireVerifiedEvents
         ? {
             eventMode: eventState?.eventMode,
@@ -999,6 +1363,8 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      redirectConfigured,
+      redirectWarning,
     };
   }
 }

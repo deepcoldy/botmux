@@ -425,6 +425,34 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('defaultOn boolean (thinkingCard): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('thinkingCard')!;
+    expect(spec.defaultOn).toBe(true);
+
+    // off → explicit false on disk and in memory. oldText 'on' proves the
+    // untouched (absent) value renders as on — the default-ON display path.
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().thinkingCard).toBe(false);
+    expect(registry.getBot('app_default').config.thinkingCard).toBe(false);
+
+    // on → key deleted (back to default), in-memory undefined (= on).
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().thinkingCard).toBeUndefined();
+    expect(registry.getBot('app_default').config.thinkingCard).toBeUndefined();
+
+    // unset (null) from an explicit-false state also restores the default.
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().thinkingCard).toBeUndefined();
+  });
+
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('usageDisplay')!;

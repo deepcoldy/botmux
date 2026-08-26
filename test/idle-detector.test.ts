@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
@@ -826,6 +827,39 @@ describe('IdleDetector: quiescence detection', () => {
     detector.feed('READY>');
     vi.advanceTimersByTime(2000);
     expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  // Regression (PR #996 P0): cursor-agent renders `sessionEmpty ? "Plan,
+  // search, build anything" : "Add a follow-up"` and never reverts. The worker
+  // reset()s the detector before every write (clearing readySeen), and
+  // quiescence stays suppressed until readyPattern is seen again. A
+  // first-turn-only readyPattern therefore matched on turn 1 but never on turn
+  // 2+, so idle never fired again and the CLI was stuck reporting "working".
+  // With the real cursor adapter's two-state readyPattern, every turn's idle
+  // edge survives the reset.
+  it('cursor: idle still fires on turn 2+ after the composer placeholder switches', () => {
+    const detector = new IdleDetector(createCursorAdapter('/bin/cursor-agent'));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Turn 1: empty-session composer.
+    detector.feed('  → Plan, search, build anything');
+    vi.advanceTimersByTime(2000);
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // Worker resets before writing the next turn's input (clears readySeen).
+    detector.reset();
+
+    // Turn 2: cursor now shows the post-turn placeholder. The bug: this never
+    // matched a first-turn-only pattern, so readySeen stayed false and idle
+    // never fired. The fix: the two-state pattern matches, idle fires again.
+    detector.feed('working on it...');
+    vi.advanceTimersByTime(2000);
+    expect(cb, 'quiescence must stay suppressed until the post-turn composer is seen').toHaveBeenCalledTimes(1);
+    detector.feed('  → Add a follow-up');
+    vi.advanceTimersByTime(2000);
+    expect(cb, 'turn-2 idle must fire on the post-turn "Add a follow-up" placeholder').toHaveBeenCalledTimes(2);
     detector.dispose();
   });
 });
