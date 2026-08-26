@@ -34,6 +34,9 @@ export interface FrozenCard {
    *  recalled Codex card keeps its per-turn tier instead of being re-decorated
    *  with the session's current tier. Absent = no badge. */
   codexServiceTierBadge?: string;
+  /** Whether this historical turn deliberately completed with no reply. The
+   *  value belongs to this frozen card, not to the session's latest turn. */
+  silentIdle?: boolean;
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -350,19 +353,34 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
-  /** turnId → the triggering Lark message explicitly @-mentioned this bot.
-   *  Bounded FIFO (see recordTurnExplicitMention). Read at turn_terminal to
-   *  decide whether a deliberately-silent turn owes an auto receipt. In-memory
-   *  only: a daemon restart mid-turn just skips that turn's receipt. */
-  turnExplicitMentions?: Map<string, boolean>;
+  /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
+   *  Only positives are stored (absent === not mentioned), so the bounded FIFO
+   *  (see recordTurnExplicitMention) is spent entirely on turns that can still
+   *  owe a receipt — a long queue of un-@'d turns cannot evict a live one.
+   *  Read at turn_terminal to decide whether a deliberately-silent turn owes an
+   *  auto receipt. In-memory only: a daemon restart mid-turn skips the receipt. */
+  turnExplicitMentions?: Set<string>;
   /** Set when the LAST completed turn ended as deliberate silence (worker
    *  terminal outputDisposition 'nothing_to_send'). Drives the idle-card label
    *  「已处理 · 判定无需回复」 instead of 「等待输入」 so users can tell "chose
-   *  silence" from "stuck". Cleared by beginNewTurn. In-memory only. */
+   *  silence" from "stuck". Cleared by every new-turn entry point
+   *  (beginNewTurn and both worker-exited re-fork branches). In-memory only. */
   silentIdleTurnId?: string;
-  /** Dedupe guard: silent-turn auto receipt already posted for this turnId
-   *  (dispatchAttempt replays must not double-post). */
-  silentReceiptTurnId?: string;
+  /** turnId of the most recently STARTED turn (beginNewTurn and both
+   *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
+   *  turn_terminal that lands after a NEWER turn already opened — the normal
+   *  type-ahead ordering, since the follow-up is admitted while the previous
+   *  turn is still running — belongs to the PREVIOUS turn and must not relabel
+   *  the live card. Left undefined for sessions driven only by HTTP/async
+   *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
+  currentTurnId?: string;
+  /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
+   *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
+   *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
+   *  one-slot guard would let A₂ re-post. An entry is claimed BEFORE the reply
+   *  is sent and released if that send fails, so a later replay can compensate
+   *  instead of losing the closure permanently. */
+  silentReceiptTurnIds?: Set<string>;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */

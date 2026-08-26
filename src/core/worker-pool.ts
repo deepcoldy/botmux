@@ -931,29 +931,56 @@ export function silentIdleCardFlag(ds: DaemonSession): boolean {
   return !!ds.silentIdleTurnId;
 }
 
-const TURN_EXPLICIT_MENTION_MAX = 8;
+const TURN_EXPLICIT_MENTION_MAX = 64;
+/** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
+ *  larger than any plausible replay window within one session's lifetime. */
+const SILENT_RECEIPT_DEDUPE_MAX = 64;
+
+/** Provider-level idempotency key for the receipt. A transport timeout can be
+ *  commit-unknown: retrying with the same uuid lets Lark collapse the duplicate
+ *  even after the in-memory claim is deliberately released for compensation. */
+function silentTurnReceiptUuid(sessionId: string, turnId: string): string {
+  return `sr_${createHash('sha256')
+    .update(`${sessionId}\0${turnId}`, 'utf8')
+    .digest('hex')
+    .slice(0, 47)}`;
+}
+
+/** Evict oldest-first until `set` fits `max` (insertion order === FIFO). */
+function trimOldest(set: Set<string>, max: number): void {
+  while (set.size > max) {
+    const oldest = set.values().next().value;
+    if (oldest === undefined) break;
+    set.delete(oldest);
+  }
+}
 
 /** Record, at dispatch time, whether the Lark message that opened `turnId`
  *  explicitly @-mentioned this bot. Read back at turn_terminal to decide if a
  *  deliberately-silent turn owes an auto receipt (an explicit @ is a dispatched
- *  task — its final status must be reported, silence included). Bounded FIFO so
- *  unconsumed entries (crashed turns, non-Lark turns) cannot grow unbounded. */
+ *  task — its final status must be reported, silence included).
+ *
+ *  Only positives are stored: at read time "absent" already means "not
+ *  mentioned", so keeping `false` rows would spend the bound on turns that can
+ *  never owe a receipt — with type-ahead/queued turns a burst of un-@'d
+ *  messages would then evict an older @'d turn that is still in flight and
+ *  silently drop its receipt. The bound stays (crashed turns leave entries
+ *  unconsumed) but now covers 64 genuinely-pending @'d turns. */
 export function recordTurnExplicitMention(ds: DaemonSession, turnId: string, explicitMention: boolean): void {
   if (!turnId) return;
-  const map = ds.turnExplicitMentions ?? (ds.turnExplicitMentions = new Map());
-  map.delete(turnId);
-  map.set(turnId, explicitMention);
-  while (map.size > TURN_EXPLICIT_MENTION_MAX) {
-    const oldest = map.keys().next().value;
-    if (oldest === undefined) break;
-    map.delete(oldest);
+  if (!explicitMention) {
+    // Re-dispatch of the same turn without an @ must not inherit a stale yes.
+    ds.turnExplicitMentions?.delete(turnId);
+    return;
   }
+  const set = ds.turnExplicitMentions ?? (ds.turnExplicitMentions = new Set());
+  set.delete(turnId);
+  set.add(turnId);
+  trimOldest(set, TURN_EXPLICIT_MENTION_MAX);
 }
 
 function takeTurnExplicitMention(ds: DaemonSession, turnId: string): boolean {
-  const value = ds.turnExplicitMentions?.get(turnId) ?? false;
-  ds.turnExplicitMentions?.delete(turnId);
-  return value;
+  return ds.turnExplicitMentions?.delete(turnId) ?? false;
 }
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
@@ -1903,6 +1930,7 @@ export function parkStreamCard(ds: DaemonSession): void {
     title: ds.currentTurnTitle ?? '',
     displayMode: ds.displayMode ?? 'hidden',
     imageKey: ds.currentImageKey,
+    ...(silentIdleCardFlag(ds) ? { silentIdle: true } : {}),
     ...(() => {
       const badge = codexServiceTierBadge(
         sessionCliId(ds, getBot(ds.larkAppId).config),
@@ -5322,6 +5350,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    silentIdleCardFlag(ds),
   );
 }
 
@@ -12077,16 +12106,42 @@ function setupWorkerHandlers(
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
           && !ds.session.vcMeetingReceiver) {
-          const explicitMention = takeTurnExplicitMention(ds, msg.turnId);
-          ds.silentIdleTurnId = msg.turnId;
-          if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
-          if (explicitMention && ds.silentReceiptTurnId !== msg.turnId) {
-            ds.silentReceiptTurnId = msg.turnId;
+          // Consume the origin record ONLY when this attempt could actually post:
+          // a suppressed attempt that ate the record would leave a later,
+          // un-suppressed attempt (dispatchAttempt above the durable watermark)
+          // with no way to know the turn was @'d — the same silent drop the
+          // send-failure compensation above exists to prevent.
+          const receiptSuppressed = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
+          const explicitMention = receiptSuppressed ? false : takeTurnExplicitMention(ds, msg.turnId);
+          // Lineage gate on the LABEL only: with type-ahead, a follow-up turn is
+          // admitted while the previous one still runs, so this terminal can land
+          // after a newer turn already opened. Relabelling the live card then
+          // would advertise 「已处理 · 判定无需回复」 over a turn that is still
+          // working — and beginNewTurn has already passed, so nothing clears it.
+          // Unknown lineage (HTTP/async-only sessions) stays trusted.
+          if (!ds.currentTurnId || ds.currentTurnId === msg.turnId) {
+            ds.silentIdleTurnId = msg.turnId;
+            if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+          }
+          // The RECEIPT is owed regardless of lineage — a dispatched task must
+          // report its final status even if a newer turn has since opened.
+          const posted = ds.silentReceiptTurnIds ?? (ds.silentReceiptTurnIds = new Set());
+          if (explicitMention && !posted.has(msg.turnId)) {
+            // Claim BEFORE sending so a replay racing this await cannot double-post;
+            // release on failure so a later replay can still close the loop.
+            posted.add(msg.turnId);
+            trimOldest(posted, SILENT_RECEIPT_DEDUPE_MAX);
             void scopedReply(
               tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
               'text',
               msg.turnId,
+              { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId) },
             ).catch(err => {
+              // Nothing reached the thread: drop the claim AND restore the
+              // (already consumed) origin record, so a dispatchAttempt replay
+              // retries instead of losing the closure for good.
+              posted.delete(msg.turnId);
+              recordTurnExplicitMention(ds, msg.turnId, true);
               logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
             });
           }

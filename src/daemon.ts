@@ -4643,6 +4643,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
     const prevTitle = ds.currentTurnTitle || ds.session.title || runtimeDisplayName || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
     const previousCodexTierBadge = codexServiceTierBadge(effectiveCliId, ds.codexServiceTier);
+    const previousSilentIdle = silentIdleCardFlag(ds);
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
       ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
@@ -4670,6 +4671,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
         displayMode: prevMode,
         imageKey: ds.currentImageKey,
         ...(previousCodexTierBadge ? { codexServiceTierBadge: previousCodexTierBadge } : {}),
+        ...(previousSilentIdle ? { silentIdle: true } : {}),
       });
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
@@ -4681,6 +4683,10 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // New turn — the previous turn's deliberate-silence marker (if any) has been
   // baked into the frozen card above; live cards return to normal labels.
   ds.silentIdleTurnId = undefined;
+  // Lineage anchor for the deliberate-silence label: a turn_terminal that lands
+  // AFTER this point belongs to an older turn (type-ahead admits the follow-up
+  // while the previous turn is still running) and must not relabel this card.
+  ds.currentTurnId = turnId;
   ds.usageLimit = undefined;
   ds.streamCardPending = true;
   ds.streamCardPendingTurnId = turnId;
@@ -4728,7 +4734,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     );
   }
 
-  beginNewTurn(ds, title, turnId);
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
@@ -4755,6 +4760,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     if (!sendWorkerInput(ds, cliInput, turnId)) {
       throw new Error('doc-watch warmup worker input was not accepted');
     }
+    beginNewTurn(ds, title, turnId);
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
@@ -4770,7 +4776,10 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, ds.hasHistory);
+    if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
+      throw new Error('doc-watch warmup worker fork was not accepted');
+    }
+    beginNewTurn(ds, title, turnId);
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
@@ -17191,8 +17200,7 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    beginNewTurn(ds, commandContent, turn.messageId);
-    sendWorkerSessionInput(ds, {
+    const accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       // Same reason as the worker-pool raw_input send: a passthrough is a real
@@ -17200,6 +17208,11 @@ function deliverPassthroughToExistingSession(
       ...(mojoLivePatchForSession(ds) ?? {}),
       turnId: turn.messageId,
     });
+    if (!accepted) {
+      logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
+      return;
+    }
+    beginNewTurn(ds, commandContent, turn.messageId);
     turn.onDelivered?.();
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
@@ -20280,7 +20293,6 @@ async function handleThreadReplyAdmitted(
         sessionBackendType: ds.session.backendType,
         turnId: parsed.messageId,
         });
-    beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
@@ -20300,6 +20312,7 @@ async function handleThreadReplyAdmitted(
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
+        beginNewTurn(ds, parsed.content, parsed.messageId);
         rememberLastCliInput(ds, promptContent, cliInput);
       }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
@@ -20338,6 +20351,11 @@ async function handleThreadReplyAdmitted(
     ds.streamCardPending = true;
     ds.streamCardPendingTurnId = parsed.messageId;
     ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+    // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it):
+    // without clearing, a previous turn's deliberate-silence marker survives the
+    // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
+    ds.silentIdleTurnId = undefined;
+    ds.currentTurnId = parsed.messageId;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -20946,7 +20964,6 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           mode: 'live',
           turnId,
         });
-        beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
@@ -20959,6 +20976,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         if (!sendWorkerInput(ds, cliInput, turnId)) {
           throw new Error('worker became unavailable during comment:live-send');
         }
+        beginNewTurn(ds, text, turnId);
         logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
         return;
       }
@@ -20974,6 +20992,10 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       ds.streamCardPending = true;
       ds.streamCardPendingTurnId = turnId;
       ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+      // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
+      // see the Lark-message re-fork branch above.
+      ds.silentIdleTurnId = undefined;
+      ds.currentTurnId = turnId;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors

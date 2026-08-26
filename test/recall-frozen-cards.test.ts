@@ -896,6 +896,7 @@ describe('parkStreamCard', () => {
     ds.codexServiceTier = {
       model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
     };
+    ds.silentIdleTurnId = 'om_live_turn';
 
     parkStreamCard(ds);
 
@@ -907,6 +908,7 @@ describe('parkStreamCard', () => {
     expect(entry?.displayMode).toBe('screenshot');
     expect(entry?.imageKey).toBe('img_key_xyz');
     expect(entry?.codexServiceTierBadge).toBe('⚡ priority');
+    expect(entry?.silentIdle).toBe(true);
     expect(ds.parkedStreamCardNonce).toBe('nonce_live');
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
