@@ -138,4 +138,16 @@ describe('drainEbsdTranscript', () => {
       terminalErrorCode: 'ebsd_bridge_protocol_error',
     }]);
   });
+
+  it('uses a new event generation after in-place transcript truncation', () => {
+    writeFileSync(path, message('u1', null, 'user', text(`first-${'x'.repeat(256)}`)));
+    const first = drainEbsdTranscript(path, 0);
+
+    writeFileSync(path, message('u2', null, 'user', text('second')));
+    const second = drainEbsdTranscript(path, first.newOffset, first.state);
+
+    expect(second.events.map(event => event.text)).toEqual(['second']);
+    expect(second.events[0]?.uuid).not.toBe(first.events[0]?.uuid);
+    expect(second.state.generation).toBe(1);
+  });
 });

@@ -50,8 +50,7 @@ function chunkEbsdInput(text: string): string[] {
 function sendLiteral(pty: PtyHandle, text: string): boolean {
   try {
     if (pty.sendText) return pty.sendText(text) !== false;
-    pty.write(text);
-    return true;
+    return pty.write(text) !== false;
   } catch {
     return false;
   }
@@ -65,20 +64,19 @@ async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<b
   return true;
 }
 
-function submitEnter(pty: PtyHandle, attempts = 3): boolean {
-  for (let index = 0; index < attempts; index += 1) {
-    try {
-      if (pty.sendSpecialKeys) {
-        if (pty.sendSpecialKeys('Enter') !== false) return true;
-      } else {
-        pty.write('\r');
-        return true;
-      }
-    } catch {
-      // Retry a bounded number of times below.
+type EnterSubmitResult = 'submitted' | 'ambiguous' | 'rejected';
+
+function submitEnter(pty: PtyHandle): EnterSubmitResult {
+  try {
+    if (pty.sendSpecialKeys) {
+      return pty.sendSpecialKeys('Enter') === false ? 'ambiguous' : 'submitted';
     }
+    return pty.write('\r') === false ? 'rejected' : 'submitted';
+  } catch {
+    // A transport exception does not prove the key was not delivered. Retrying
+    // Enter or injecting Ctrl+C could duplicate or interrupt an accepted turn.
+    return 'ambiguous';
   }
-  return false;
 }
 
 export type EbsdInputWriter = (
@@ -103,8 +101,7 @@ export function createEbsdInputWriter(): EbsdInputWriter {
     lastClearAttemptAt = Date.now();
     try {
       if (pty.sendSpecialKeys) return pty.sendSpecialKeys('C-c') !== false;
-      pty.write('\x03');
-      return true;
+      return pty.write('\x03') !== false;
     } catch {
       return false;
     }
@@ -131,8 +128,11 @@ export function createEbsdInputWriter(): EbsdInputWriter {
       composerDirty = !(await clearComposer(pty));
       return { submitted: false };
     }
-    if (!submitEnter(pty)) {
-      composerDirty = !(await clearComposer(pty));
+    const enterResult = submitEnter(pty);
+    if (enterResult !== 'submitted') {
+      // Keep the draft marked dirty for the next confirmed write, but do not
+      // immediately retry/cancel: an ambiguous Enter may already be running.
+      composerDirty = true;
       return { submitted: false };
     }
     composerDirty = false;

@@ -675,6 +675,16 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).not.toMatch(/isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
   });
 
+  it('WIRING GUARD: service credential files use mandatory read-only policy rules', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toMatch(/mandatoryReadOnlyPaths\.push\(\.\.\.keepSecretReadonlyFiles\([\s\S]*?cliAdapter\.sandboxSecretReadonlyPaths/);
+    const readonlyStart = src.indexOf('readonlyRoots: keepExisting([');
+    const readonlyEnd = src.indexOf('botmuxInstallRoot,', readonlyStart);
+    expect(readonlyStart).toBeGreaterThan(-1);
+    expect(readonlyEnd).toBeGreaterThan(readonlyStart);
+    expect(src.slice(readonlyStart, readonlyEnd)).not.toContain('sandboxSecretReadonlyPaths');
+  });
+
   it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
     expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");

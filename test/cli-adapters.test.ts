@@ -1576,6 +1576,31 @@ describe('ebsd buildArgs', () => {
       'Invalid BotMux session id for ebsd',
     );
   });
+
+  it('does not retry or cancel an unconfirmed Enter', async () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const sendSpecialKeys = vi.fn(() => false);
+    const pty: PtyHandle = {
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => true),
+      sendSpecialKeys,
+    };
+
+    const result = await adapter.writeInput?.(pty, 'diagnose');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(sendSpecialKeys.mock.calls).toEqual([['Enter']]);
+  });
+
+  it('does not promote a rejected direct PTY write to success', async () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const write = vi.fn(() => false);
+
+    const result = await adapter.writeInput?.({ write }, 'diagnose');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(write).not.toHaveReturnedWith(true);
+  });
 });
 
 describe('mtr buildArgs', () => {

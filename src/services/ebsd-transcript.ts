@@ -17,7 +17,10 @@ import type { CodexBridgeEvent } from './codex-transcript.js';
 
 const EBSD_TERMINAL_CUSTOM_TYPE = 'ebsd.botmux.turn_completed.v1';
 
-export type EbsdTranscriptState = Record<string, never>;
+export interface EbsdTranscriptState {
+  generation?: number;
+  fileId?: string;
+}
 
 export interface EbsdDrainResult {
   events: CodexBridgeEvent[];
@@ -51,9 +54,14 @@ function timestampMs(entry: Record<string, unknown>, message?: Record<string, un
   return Date.now();
 }
 
+function eventUuid(path: string, generation: number, lineStart: number): string {
+  return `${path}:${generation}:${lineStart}`;
+}
+
 function terminalEvent(
   entry: Record<string, unknown>,
   path: string,
+  generation: number,
   lineStart: number,
 ): CodexBridgeEvent | null {
   if (entry.type !== 'custom' || entry.customType !== EBSD_TERMINAL_CUSTOM_TYPE) return null;
@@ -71,7 +79,7 @@ function terminalEvent(
     && (data.run_id === undefined || typeof data.run_id === 'string');
   if (!valid) {
     return {
-      uuid: `${path}:${lineStart}`,
+      uuid: eventUuid(path, generation, lineStart),
       timestampMs: timestampMs(entry),
       kind: 'assistant_final',
       text: '',
@@ -80,7 +88,7 @@ function terminalEvent(
     };
   }
   return {
-    uuid: `${path}:${lineStart}`,
+    uuid: eventUuid(path, generation, lineStart),
     timestampMs: timestampMs(entry),
     kind: 'assistant_final',
     text: answer.trim(),
@@ -95,20 +103,27 @@ function terminalEvent(
 export function drainEbsdTranscript(
   path: string,
   fromOffset: number,
-  _previousState: EbsdTranscriptState = {},
+  previousState: EbsdTranscriptState = {},
 ): EbsdDrainResult {
   if (!existsSync(path)) {
-    return { events: [], newOffset: 0, pendingTail: '', state: {} };
+    return { events: [], newOffset: fromOffset, pendingTail: '', state: previousState };
   }
 
   let size: number;
+  let fileId: string;
   try {
-    size = statSync(path).size;
+    const stats = statSync(path);
+    size = stats.size;
+    fileId = `${stats.dev}:${stats.ino}`;
   } catch {
-    return { events: [], newOffset: fromOffset, pendingTail: '', state: {} };
+    return { events: [], newOffset: fromOffset, pendingTail: '', state: previousState };
   }
 
-  const start = size < fromOffset ? 0 : fromOffset;
+  const reset = size < fromOffset
+    || (previousState.fileId !== undefined && previousState.fileId !== fileId);
+  const generation = (previousState.generation ?? 0) + (reset ? 1 : 0);
+  const state: EbsdTranscriptState = { generation, fileId };
+  const start = reset ? 0 : fromOffset;
   const events: CodexBridgeEvent[] = [];
   let completeText = '';
   let pendingTail = '';
@@ -147,7 +162,7 @@ export function drainEbsdTranscript(
       continue;
     }
 
-    const terminal = terminalEvent(entry, path, lineStart);
+    const terminal = terminalEvent(entry, path, generation, lineStart);
     if (terminal) {
       events.push(terminal);
       continue;
@@ -160,12 +175,12 @@ export function drainEbsdTranscript(
     const text = messageText(message.content);
     if (!text) continue;
     events.push({
-      uuid: `${path}:${lineStart}`,
+      uuid: eventUuid(path, generation, lineStart),
       timestampMs: timestampMs(entry, message),
       kind: 'user',
       text,
     });
   }
 
-  return { events, newOffset, pendingTail, state: {} };
+  return { events, newOffset, pendingTail, state };
 }

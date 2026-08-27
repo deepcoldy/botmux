@@ -14283,6 +14283,15 @@ async function spawnCli(
     const mandatoryDenyPaths: string[] = [];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
+    // Fixed service-adapter credentials are an invariant, not an owner-tunable
+    // convenience. Keep them in the mandatory tier so an equal-path user
+    // readWrite rule cannot turn a host-managed token/key file writable.
+    mandatoryReadOnlyPaths.push(...keepSecretReadonlyFiles(
+      cliAdapter.sandboxSecretReadonlyPaths?.({
+        ...childEnv,
+        ...perBotInjectEnv,
+      }) ?? [],
+    ));
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
     // cleanup manifest + the mode-000 empty ro-bind SOURCES. If SESSION_DATA_DIR
     // is configured INSIDE the working dir (a custom data dir under a RW-bound
@@ -14530,13 +14539,6 @@ async function spawnCli(
           ...childEnv,
           ...perBotInjectEnv,
         }) ?? [])].map(expandTildeLexical),
-        // Explicit credential-file channel for fixed service adapters. These
-        // are still read-only exact paths; the adapter contract additionally
-        // requires a model-facing surface with no general file/shell tool.
-        ...keepSecretReadonlyFiles(cliAdapter.sandboxSecretReadonlyPaths?.({
-          ...childEnv,
-          ...perBotInjectEnv,
-        }) ?? []),
       ]),
       botmuxInstallRoot,
       outbox,
