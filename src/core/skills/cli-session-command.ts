@@ -1,4 +1,4 @@
-import { readSessionSkillManifest } from './manifest-store.js';
+import { readSessionSkillManifest, SkillManifestReadError, SkillManifestParseError } from './manifest-store.js';
 import { listSkillResources, readSkillEntrypoint, readSkillResource } from './resource-reader.js';
 import { builtinSkillContent, builtinSkillEntries } from '../../skills/injection-mode.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
@@ -37,7 +37,21 @@ export function runSkillSessionCommand(
   }
   const sessionId = sessionIdFromEnv(env);
   if (!sessionId) return { code: 2, stdout: '', stderr: 'missing BOTMUX_SESSION_ID\n' };
-  const manifest = readSessionSkillManifest(sessionId);
+  let manifest;
+  try {
+    manifest = readSessionSkillManifest(sessionId);
+  } catch (err) {
+    // Present-but-unreadable (sandbox/policy) or corrupt manifest — a real
+    // fault, NOT "not found". Distinct message + exit 1 so the sandbox misconfig
+    // is diagnosable instead of masquerading as an absent manifest (exit 2).
+    if (err instanceof SkillManifestReadError) {
+      return { code: 1, stdout: '', stderr: `skill manifest exists but is unreadable for session ${sessionId} (${(err.cause as any)?.code ?? 'read error'}) — check the file sandbox read-only policy: ${err.path}\n` };
+    }
+    if (err instanceof SkillManifestParseError) {
+      return { code: 1, stdout: '', stderr: `skill manifest is corrupt for session ${sessionId}: ${err.path}\n` };
+    }
+    throw err;
+  }
   if (!manifest) {
     // No user-skill manifest — still surface built-ins for discovery.
     if (sub === 'list') {
