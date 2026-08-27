@@ -283,14 +283,32 @@ async function tryAutoFixScopes(
     });
 
     if (result.ok) {
+      // ⚠️ `scopeCount === 0` 有三种**互相矛盾**的成因，不能共用一句话。自从申请集合
+      // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
+      // 多少」变成「**缺失的那几项里成功了多少**」，于是 0 不再等于「本来就齐」，
+      // 反而最可能是「一项都没补上」——照旧说「所有必需权限已在应用清单中」就成了
+      // 恰在全部失败时谎报齐全。三种成因按可诊断性分开：
+      //   ① scopeWarning 有值 → scope/update 被租户整批拒了（开放平台明确报错）
+      //   ② skippedScopeCount > 0 → 这些名字不在该租户的开放平台目录里，不可授予
+      //      （automation 自己 warn 过「not present in the Open Platform catalog」）
+      //   ③ 都没有 → 申请集合本就是空的（缺失项已在清单中），才是真的「已齐全」
+      // 这句同时进 daemon 日志**和**下面的管理员 DM，DM 开头写着「✅ 已自动修复了
+      // 缺失的权限」，一旦这里说反就自相矛盾，管理员会以为不用管。
       const scopeDetail = result.scopeCount > 0
         ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
-        : '所有必需权限已在应用清单中';
-      logger.info(
-        `[${larkAppId}] auto-fix succeeded: ${scopeDetail}, ` +
+        : result.scopeWarning
+          ? `0 项权限已导入——开放平台拒绝了本次权限申请（${result.scopeWarning}），需到「权限管理」手动开通`
+          : result.skippedScopeCount > 0
+            ? `0 项权限已导入——这 ${result.skippedScopeCount} 项不在当前租户的开放平台权限目录中，无法自动申请，需到「权限管理」手动开通`
+            : '所有必需权限已在应用清单中';
+      // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
+      const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
+      const summary =
+        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}, ` +
         `version ${result.versionId ?? 'n/a'} published, ` +
-        `${result.subscribedEventCount} events subscribed`,
-      );
+        `${result.subscribedEventCount} events subscribed`;
+      if (autoFixEffective) logger.info(summary);
+      else logger.warn(summary);
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
       // never enabled the feature must not be pinged just because a non-critical
       // scope was topped up in the background). The log line above is the record.
@@ -301,13 +319,18 @@ async function tryAutoFixScopes(
       if (adminOpenId) {
         const fixedList = [...missingCritical, ...missingOptional];
         const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
+        // 标题跟着实际结果走：一项都没落地时说「已自动修复」是谎报，管理员会以为
+        // 不用管，而这条路径的下游（缺 critical scope）恰恰是最需要人工介入的。
         await dmAdmin(
           larkAppId,
           adminOpenId,
-          `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
+          (autoFixEffective
+            ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
+            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能申请成功，需要你手动开通：\n\n`) +
+          `${missingList}\n\n` +
           `${scopeDetail}，新版本已发布。\n` +
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
-          `auto-fixed ${fixedList.length} scopes`,
+          autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
         );
       }
       return true;

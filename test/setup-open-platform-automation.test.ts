@@ -27,6 +27,7 @@ import {
   getCookieHeader,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
+  readDefaultScopeManifest,
   missingRedirectUrls,
   OpenPlatformApiError,
   parseSetupOpenPlatformAutoFlag,
@@ -301,6 +302,82 @@ describe('filterScopeManifest — 只申请缺失项，避免全量 manifest 过
 
   it('空缺失列表 → 空申请集合', () => {
     expect(filterScopeManifest(manifest, [])).toEqual({ scopes: { tenant: [], user: [] } });
+  });
+
+  /**
+   * 裁剪之后 `scopeCount` 的语义变了：从「整份清单导入了多少」变成「**缺失的那几项
+   * 里成功了多少**」。所以 `0` 不再等于「本来就齐」，反而最常见的成因是「一项都没
+   * 补上」——调用方（event-dispatcher.tryAutoFixScopes）据此措辞，说反了就会在全部
+   * 失败时谎报「所有必需权限已在应用清单中」，而这句话同时进管理员 DM。
+   *
+   * 这里跑真实的 automation 拿到真实的 `scopeCount / skippedScopeCount /
+   * scopeWarning` 三元组，验证三种成因**确实可区分**——否则调用方无论怎么写文案都
+   * 只能靠猜。
+   */
+  it('三种 scopeCount===0 成因在结果里可区分（调用方措辞的依据）', async () => {
+    const FEED = ['im:feed_group_v1:read', 'im:feed_group_v1:write'];
+    const narrowed = filterScopeManifest(readDefaultScopeManifest(), FEED);
+
+    const run = async (label: string, opts: {
+      catalog: { appScopeList: any[]; userScopeList: any[] };
+      rejectScopeUpdate?: boolean;
+      manifest?: any;
+    }) => {
+      const dir = mkdtempSync(join(tmpdir(), `scope0-${label}-`));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = openPlatformSubscriptionMock('cli_s');
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/app/cli_s/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+        if (href.includes('/scope/all/')) return Response.json({ code: 0, data: opts.catalog });
+        if (href.includes('/scope/update/')) {
+          return opts.rejectScopeUpdate
+            ? Response.json({ code: 1, msg: 'scope not grantable for tenant' })
+            : Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/list/')) return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0' }] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+      const r = await automateOpenPlatformSetup({
+        appId: 'cli_s', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+        scopeManifest: opts.manifest ?? narrowed,
+      });
+      expect(r.ok, `${label}: ok=false reason=${(r as any).reason}`).toBe(true);
+      if (!r.ok) throw new Error('unreachable');
+      return { scopeCount: r.scopeCount, skipped: r.skippedScopeCount, warned: Boolean(r.scopeWarning) };
+    };
+
+    const catalogWithFeed = {
+      appScopeList: [{ id: 't1', name: 'im:message' }],
+      userScopeList: [{ id: 'u1', name: 'im:feed_group_v1:read' }, { id: 'u2', name: 'im:feed_group_v1:write' }],
+    };
+    const catalogWithoutFeed = {
+      appScopeList: [{ id: 't1', name: 'im:message' }, { id: 't2', name: 'im:resource' }],
+      userScopeList: [{ id: 'u1', name: 'im:message' }],
+    };
+
+    // ① 成功落地：scopeCount>0 —— 调用方说「N 项权限已导入」
+    expect(await run('applied', { catalog: catalogWithFeed }))
+      .toEqual({ scopeCount: 2, skipped: 0, warned: false });
+
+    // ② 租户目录里根本没有这两项 → 一个 id 都映射不出来，scope/update 都不会发。
+    //    scopeCount=0 但 skipped>0 —— 必须说「不在租户目录、需手动开通」。
+    expect(await run('not-in-catalog', { catalog: catalogWithoutFeed }))
+      .toEqual({ scopeCount: 0, skipped: 2, warned: false });
+
+    // ③ 目录里有、但开放平台整批拒了 → scopeCount 被归零且带 scopeWarning。
+    //    必须说「开放平台拒绝了申请」，不能说「已齐全」。
+    expect(await run('rejected', { catalog: catalogWithFeed, rejectScopeUpdate: true }))
+      .toEqual({ scopeCount: 0, skipped: 0, warned: true });
+
+    // ④ 真的无事可做（申请集合为空）才是「所有必需权限已在应用清单中」：
+    //    三个信号全为零/假，与 ②③ 明确可区分。
+    expect(await run('nothing-missing', {
+      catalog: catalogWithFeed, manifest: { scopes: { tenant: [], user: [] } },
+    })).toEqual({ scopeCount: 0, skipped: 0, warned: false });
   });
 });
 

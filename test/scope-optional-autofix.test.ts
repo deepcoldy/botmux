@@ -96,6 +96,65 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
     expect(silentIdx).toBeGreaterThanOrEqual(0);
     expect(adminIdx).toBeGreaterThan(silentIdx);
   });
+
+  it('does not claim success when zero scopes actually landed', () => {
+    // Regression: `scopeCount` now means "how many of the MISSING ones landed",
+    // so 0 most likely means "none applied" — not "nothing was missing". The old
+    // single-ternary said 「所有必需权限已在应用清单中」in both cases, i.e. it
+    // reported "all present" exactly when the top-up had fully failed.
+    expect(region).toContain('const autoFixEffective =');
+    // The three causes must be told apart: platform rejection (scopeWarning),
+    // not-in-catalog (skippedScopeCount), genuinely nothing missing.
+    expect(region).toContain('result.scopeWarning');
+    expect(region).toContain('result.skippedScopeCount > 0');
+    // ...and the honest branch must not reuse the "already present" wording.
+    const ineffectiveIdx = region.indexOf('0 项权限已导入');
+    expect(ineffectiveIdx, 'no explicit "0 项权限已导入" wording for the failed case').toBeGreaterThanOrEqual(0);
+  });
+
+  it('downgrades the log level and the DM headline when nothing landed', () => {
+    // A failed top-up must not log `succeeded` at info, nor open the admin DM
+    // with 「✅ 已自动修复了缺失的权限」— that headline is what makes an admin
+    // stop looking, and this path (missing CRITICAL scopes) is the one that most
+    // needs a human.
+    expect(region).toContain('logger.warn(summary)');
+    expect(region).toMatch(/autoFixEffective\s*$|autoFixEffective\s*\?/m);
+    expect(region).toContain('没能申请成功');
+  });
+});
+
+/**
+ * The 99991672 chicken-and-egg branch: the app lacks `self_manage`, so botmux
+ * cannot even read its own scope list. It must still ask for every
+ * botmux-required scope in one shot (so the NEXT restart's self-check passes),
+ * but must not fall back to the full 300+ manifest.
+ *
+ * Source-region pinned for the same reason as above (checkRequiredScopes is a
+ * network-driven function); the automation-side filtering itself is covered
+ * behaviorally in test/setup-open-platform-automation.test.ts.
+ */
+describe('checkRequiredScopes — 99991672 chicken-and-egg scope request set', () => {
+  const region = (() => {
+    const anchor = 'if (infoData.code === 99991672) {';
+    const start = src.indexOf(anchor);
+    expect(start, '99991672 branch not found').toBeGreaterThanOrEqual(0);
+    return src.slice(start, start + 1200);
+  })();
+
+  it('asks for every botmux-required scope, not just self_manage', () => {
+    // Passing only self_manage used to be cosmetic: the param never reached the
+    // request set (automation fell back to the full manifest), it only fed the
+    // log/DM text. Now that the manifest IS derived from these names, the list
+    // has to be the real one or the next restart still finds scopes missing.
+    expect(region).toMatch(/const requiredNow = BOTMUX_REQUIRED_SCOPES\.map\(s => \(\{ name: s\.name, desc: s\.desc \}\)\)/);
+    expect(region).toContain('tryAutoFixScopes(larkAppId, bot, brand, requiredNow, [])');
+  });
+
+  it('still only runs on feishu and falls through to the manual deep-link DM', () => {
+    expect(region).toContain("if (brand === 'feishu') {");
+    expect(region).toContain('if (fixed) return;');
+    expect(region).toContain('buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand)');
+  });
 });
 
 describe('ensureVcMeetingEventsSubscribed — startup VC-event check-then-configure', () => {
