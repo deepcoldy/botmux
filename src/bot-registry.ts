@@ -1559,6 +1559,10 @@ export interface BotConfig {
    */
   ownerOpenId?: string;
   allowedChatGroups?: string[];
+  /** 可触发当前群自动开放聊天的可信拉群 operator。 */
+  autoOncallOperatorOpenIds?: string[];
+  /** 由可信拉群事件产生的群级 talk 授权。 */
+  autoOncallChats?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
@@ -2871,12 +2875,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         }));
     }
 
-    let allowedChatGroups: string[] | undefined;
-    if (Array.isArray(entry.allowedChatGroups)) {
-      allowedChatGroups = entry.allowedChatGroups
-        .filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0)
-        .map((x: string) => x.trim());
-    }
+    const parseStringArray = (value: unknown): string[] | undefined => Array.isArray(value)
+      ? [...new Set(value
+        .filter((x: unknown): x is string => typeof x === 'string' && x.trim().length > 0)
+        .map(x => x.trim()))]
+      : undefined;
+    const allowedChatGroups = parseStringArray(entry.allowedChatGroups);
+    const autoOncallOperatorOpenIds = parseStringArray(entry.autoOncallOperatorOpenIds);
+    const autoOncallChats = parseStringArray(entry.autoOncallChats);
 
     // defaultOncall: per-bot default for auto-binding new group chats.
     // Tolerate missing fields: an entry with `enabled:true` but no workingDir
@@ -3164,6 +3170,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.ownerOpenId
         : undefined,
       allowedChatGroups,
+      autoOncallOperatorOpenIds,
+      autoOncallChats,
       oncallChats,
       defaultOncall,
       defaultOncallAutoboundChats,

@@ -398,27 +398,39 @@ export async function addAllowedChatGroup(
   return { ok: true, created: r.result.created };
 }
 
-/** 撤销整群 talk 授权：把 chatId 从 allowedChatGroups 移除。 */
+/**
+ * 显式撤销整群 talk 授权：同一 RMW 内清掉手动与自动两种来源。
+ * bot 退群时只撤销自动来源，仍由 auto-oncall-store 单独处理。
+ */
 export async function removeAllowedChatGroup(
   larkAppId: string, chatId: string,
 ): Promise<{ ok: true; removed: boolean } | Fail> {
   let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-  const r = await rmwBotEntry<{ removed: boolean }>(larkAppId, (entry) => {
-    const cur: string[] = Array.isArray(entry.allowedChatGroups) ? entry.allowedChatGroups : [];
-    const removed = cur.includes(chatId);
-    const next = cur.filter((c: string) => c !== chatId);
-    if (next.length > 0) entry.allowedChatGroups = next;
+  type Removed = { manual: boolean; automatic: boolean };
+  const r = await rmwBotEntry<Removed>(larkAppId, (entry) => {
+    const manual: string[] = Array.isArray(entry.allowedChatGroups) ? entry.allowedChatGroups : [];
+    const automatic: string[] = Array.isArray(entry.autoOncallChats) ? entry.autoOncallChats : [];
+    const removed = { manual: manual.includes(chatId), automatic: automatic.includes(chatId) };
+    const nextManual = manual.filter((c: string) => c !== chatId);
+    const nextAutomatic = automatic.filter((c: string) => c !== chatId);
+    if (nextManual.length > 0) entry.allowedChatGroups = nextManual;
     else delete entry.allowedChatGroups;
-    return { write: removed, result: { removed } };
+    if (nextAutomatic.length > 0) entry.autoOncallChats = nextAutomatic;
+    else delete entry.autoOncallChats;
+    return { write: removed.manual || removed.automatic, result: removed };
   });
   if (!r.ok) return r;
-  if (r.result.removed) {
-    const next = (bot.config.allowedChatGroups ?? []).filter(c => c !== chatId);
-    if (next.length > 0) bot.config.allowedChatGroups = next;
+  const removed = r.result.manual || r.result.automatic;
+  if (removed) {
+    const nextManual = (bot.config.allowedChatGroups ?? []).filter(c => c !== chatId);
+    const nextAutomatic = (bot.config.autoOncallChats ?? []).filter(c => c !== chatId);
+    if (nextManual.length > 0) bot.config.allowedChatGroups = nextManual;
     else delete bot.config.allowedChatGroups;
-    logger.info(`[grant:${larkAppId}] -chatGroup ${chatId}`);
+    if (nextAutomatic.length > 0) bot.config.autoOncallChats = nextAutomatic;
+    else delete bot.config.autoOncallChats;
+    logger.info(`[grant:${larkAppId}] -chatGroup ${chatId} sources=${JSON.stringify(r.result)}`);
   }
-  return { ok: true, removed: r.result.removed };
+  return { ok: true, removed };
 }
 
 /**

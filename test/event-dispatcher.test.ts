@@ -117,6 +117,15 @@ vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
   setSubstituteEnabledForChat: vi.fn(),
 }));
 
+const mockIsAutoOncallOperator = vi.fn(() => false);
+const mockAddAutoOncallChat = vi.fn(async () => ({ ok: true as const, created: false }));
+const mockRemoveAutoOncallChat = vi.fn(async () => ({ ok: true as const, removed: false }));
+vi.mock('../src/services/auto-oncall-store.js', () => ({
+  isAutoOncallOperator: (...args: any[]) => mockIsAutoOncallOperator(...args),
+  addAutoOncallChat: (...args: any[]) => mockAddAutoOncallChat(...args),
+  removeAutoOncallChat: (...args: any[]) => mockRemoveAutoOncallChat(...args),
+}));
+
 // Capture the registered event handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
 let capturedWsClientOptions: Record<string, any> | undefined;
@@ -7741,6 +7750,135 @@ describe('rawMessageIngressAnchor', () => {
       thread_id: 'omt_second',
     });
     expect(second).toBe(first);
+  });
+});
+
+describe('trusted bot-added event — automatic chat talk authorization', () => {
+  const OTHER_APP_ID = 'app-bot-b';
+  const TRUSTED_OPERATOR = 'ou_byte_oncall';
+  let handlers: ReturnType<typeof makeHandlers>;
+  let botStates: Map<string, any>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetEventClaimsForTest();
+    mockIsAutoOncallOperator.mockReset();
+    mockAddAutoOncallChat.mockReset();
+    mockRemoveAutoOncallChat.mockReset();
+    botStates = new Map([
+      [MY_APP_ID, {
+        config: {
+          larkAppId: MY_APP_ID,
+          larkAppSecret: 'secret',
+          cliId: 'claude-code',
+          allowedUsers: ['ou_admin'],
+          autoOncallOperatorOpenIds: [TRUSTED_OPERATOR],
+        },
+        botOpenId: MY_OPEN_ID,
+        resolvedAllowedUsers: ['ou_admin'],
+      }],
+      [OTHER_APP_ID, {
+        config: {
+          larkAppId: OTHER_APP_ID,
+          larkAppSecret: 'secret-b',
+          cliId: 'claude-code',
+          allowedUsers: ['ou_other_admin'],
+          autoOncallOperatorOpenIds: [TRUSTED_OPERATOR],
+        },
+        botOpenId: OTHER_BOT_OPEN_ID,
+        resolvedAllowedUsers: ['ou_other_admin'],
+      }],
+    ]);
+    mockGetBot.mockImplementation((appId: string) => botStates.get(appId));
+    mockIsAutoOncallOperator.mockImplementation((appId: string, operatorOpenId: string | undefined) =>
+      botStates.get(appId)?.config.autoOncallOperatorOpenIds?.includes(operatorOpenId) === true);
+    mockAddAutoOncallChat.mockImplementation(async (appId: string, chatId: string) => {
+      const config = botStates.get(appId).config;
+      const chats: string[] = config.autoOncallChats ?? [];
+      const created = !chats.includes(chatId);
+      if (created) config.autoOncallChats = [...chats, chatId];
+      return { ok: true as const, created };
+    });
+    mockRemoveAutoOncallChat.mockImplementation(async (appId: string, chatId: string) => {
+      const config = botStates.get(appId).config;
+      const chats: string[] = config.autoOncallChats ?? [];
+      const removed = chats.includes(chatId);
+      const next = chats.filter(id => id !== chatId);
+      if (next.length > 0) config.autoOncallChats = next;
+      else delete config.autoOncallChats;
+      return { ok: true as const, removed };
+    });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  function botAddedEvent(overrides: Record<string, unknown> = {}) {
+    return {
+      event_id: 'evt-auto-oncall-added',
+      chat_id: 'oc_auto_oncall',
+      operator_id: { open_id: TRUSTED_OPERATOR },
+      ...overrides,
+    };
+  }
+
+  it('opens talk only for the current bot × current chat, never operate', async () => {
+    capturedHandlers['im.chat.member.bot.added_v1'](botAddedEvent());
+    await flushEventWork();
+
+    expect(canTalk(MY_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(true);
+    expect(canOperate(MY_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(false);
+    expect(canTalk(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(false);
+    expect(canTalk(OTHER_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('does not turn an open bot into allowlist mode after opening a chat automatically', async () => {
+    const bot = botStates.get(MY_APP_ID);
+    delete bot.config.allowedUsers;
+    bot.resolvedAllowedUsers = [];
+
+    capturedHandlers['im.chat.member.bot.added_v1'](botAddedEvent());
+    await flushEventWork();
+
+    expect(canTalk(MY_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(true);
+    expect(canTalk(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(true);
+    expect(canOperate(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(true);
+  });
+
+  it('does not open a group added by a non-trusted user, regardless of group name', async () => {
+    capturedHandlers['im.chat.member.bot.added_v1'](botAddedEvent({
+      event_id: 'evt-untrusted-added',
+      operator_id: { open_id: 'ou_not_trusted' },
+      name: 'Production OnCall 紧急响应群',
+    }));
+    await flushEventWork();
+
+    expect(mockAddAutoOncallChat).not.toHaveBeenCalled();
+    expect(canTalk(MY_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('dedupes repeated delivery of the same bot-added event', async () => {
+    const event = botAddedEvent();
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+
+    expect(mockAddAutoOncallChat).toHaveBeenCalledTimes(1);
+    expect(botStates.get(MY_APP_ID).config.autoOncallChats).toEqual(['oc_auto_oncall']);
+  });
+
+  it('cleans the automatic authorization when this bot leaves the chat', async () => {
+    capturedHandlers['im.chat.member.bot.added_v1'](botAddedEvent());
+    await flushEventWork();
+    expect(canTalk(MY_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(true);
+
+    capturedHandlers['im.chat.member.bot.deleted_v1']({
+      event_id: 'evt-auto-oncall-deleted',
+      chat_id: 'oc_auto_oncall',
+    });
+    await flushEventWork();
+
+    expect(mockRemoveAutoOncallChat).toHaveBeenCalledWith(MY_APP_ID, 'oc_auto_oncall');
+    expect(canTalk(MY_APP_ID, 'oc_auto_oncall', USER_OPEN_ID)).toBe(false);
   });
 });
 
