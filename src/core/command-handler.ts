@@ -93,7 +93,7 @@ import {
 } from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1 } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
@@ -109,6 +109,7 @@ import {
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
+import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -3101,9 +3102,7 @@ export async function handleCommand(
           const managedTarget = sessionStore.getOwnedSession(directTarget)
             ?? sessionStore.listSessions().find(s => s.cliSessionId === directTarget);
           if (managedTarget) {
-            const managedAnchor = managedTarget.scope === 'chat'
-              ? managedTarget.chatId
-              : managedTarget.rootMessageId;
+            const managedAnchor = storedSessionAnchorId(managedTarget);
             if (!ds || !adoptAnchor || managedAnchor !== adoptAnchor) {
               await sessionReply(rootId, t('cmd.adopt.managed_other_topic', {
                 id: managedTarget.sessionId,
@@ -3113,9 +3112,11 @@ export async function handleCommand(
 
             const result = await resumeSession(managedTarget.sessionId, activeSessions);
             if (result.ok) {
-              await sessionReply(rootId, t('card.action.resume_success', {
-                cliName: sessionCliDisplayName(result.ds),
-              }, localeForBot(result.ds.larkAppId)));
+              const cliName = sessionCliDisplayName(result.ds);
+              const resumeMsg = resumeStartsFresh(result.ds.session)
+                ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+                : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+              await sessionReply(rootId, resumeMsg);
             } else if (result.error === 'not_closed') {
               await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
             } else if (result.error === 'anchor_occupied') {

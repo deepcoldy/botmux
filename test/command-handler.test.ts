@@ -4812,6 +4812,77 @@ describe('handleCommand', () => {
       expect(reply).not.toContain('tmux pane');
     });
 
+    it('does not resume a materialized scheduled run from the containing chat anchor', async () => {
+      const scratch = makeDaemonSession({
+        scope: 'chat',
+        chatId: CHAT_ID,
+        hasHistory: false,
+        session: makeSession({
+          sessionId: 'scratch-session',
+          scope: 'chat',
+          chatId: CHAT_ID,
+          cliId: undefined,
+        }),
+      });
+      const closed = makeSession({
+        sessionId: 'materialized-schedule-run',
+        status: 'closed',
+        scope: 'chat',
+        chatId: CHAT_ID,
+        rootMessageId: 'om_materialized_root',
+        deferredScheduleRun: {
+          taskId: 'task-1',
+          turnId: 'schedule:task-1:run-1',
+          routingAnchor: 'schedule-run:task-1:run-1',
+          createdAt: '2026-08-27T00:00:00.000Z',
+        },
+      });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt materialized-schedule-run'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('另一个话题');
+    });
+
+    it('says when an exact managed session will resume as a fresh CLI session', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'cursor-without-native-id',
+        status: 'closed',
+        cliId: 'cursor',
+        cliSessionId: undefined,
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt cursor-without-native-id'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).toHaveBeenCalledWith(closed.sessionId, deps.activeSessions);
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('新起干净会话');
+      expect(reply).toContain('旧上下文不会带回');
+    });
+
     it('passes the bot current custom Codex executable into live adopt discovery', async () => {
       vi.mocked(getBot).mockImplementation((() => ({
         botName: 'Vendor Codex',
