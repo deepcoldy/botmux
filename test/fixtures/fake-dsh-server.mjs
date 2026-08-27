@@ -36,6 +36,26 @@ import { appendFileSync } from 'node:fs';
 const scenario = process.env.FAKE_DSH_SCENARIO ?? 'happy';
 const finalText = process.env.FAKE_DSH_FINAL_TEXT ?? '你好，我是 dsh。';
 const logPath = process.env.FAKE_DSH_LOG;
+const expectedEnv = process.env.FAKE_DSH_EXPECT_ENV_JSON
+  ? JSON.parse(process.env.FAKE_DSH_EXPECT_ENV_JSON)
+  : {};
+const expectedAbsentEnv = (process.env.FAKE_DSH_EXPECT_ABSENT_ENV ?? '')
+  .split(',')
+  .map(name => name.trim())
+  .filter(Boolean);
+
+for (const [name, expected] of Object.entries(expectedEnv)) {
+  if (process.env[name] !== expected) {
+    process.stderr.write(`expected env ${name} to match test value\n`);
+    process.exit(2);
+  }
+}
+for (const name of expectedAbsentEnv) {
+  if (process.env[name] !== undefined) {
+    process.stderr.write(`expected env ${name} to be absent\n`);
+    process.exit(2);
+  }
+}
 
 let inputBuffer = '';
 let promptCount = 0;

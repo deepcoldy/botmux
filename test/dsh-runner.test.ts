@@ -382,14 +382,52 @@ describe('dsh-runner', () => {
     await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
   });
 
-  it('boots with credentials from ~/.dsh/.credentials.yaml and no ambient DEEPSEEK_API_KEY', async () => {
+  it('passes versioned credential refs to the dsh child without exposing records', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
-    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, 'SUPER_RELAY_API_KEY: cred-from-file\nDEEPSEEK_API_KEY: ds-from-file\n');
-    h = spawnRunner('happy', [], { DEEPSEEK_API_KEY: '' }, home);
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, `
+version: 1
+refs:
+  SUPER_RELAY_API_KEY: cred-from-versioned-file
+records:
+  llm-pi-ai/super-relay:
+    kind: grant
+    payload:
+      access: must-not-be-an-env-value
+`);
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: undefined,
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-versioned-file' }),
+      FAKE_DSH_EXPECT_ABSENT_ENV: 'records',
+    }, home);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    // The runner booted successfully reading credentials from the native file.
     expect(existsSync(join(home, '.dsh', 'botmux', 'cordis.yml'))).toBe(true);
+  });
+
+  it('retains support for pre-release flat credential files', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, 'SUPER_RELAY_API_KEY: cred-from-flat-file\n');
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: undefined,
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-flat-file' }),
+    }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+  });
+
+  it('lets ambient credentials override the versioned credential file', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS, `
+version: 1
+refs:
+  SUPER_RELAY_API_KEY: cred-from-file
+  EMPTY_CREDENTIAL: ''
+`);
+    h = spawnRunner('happy', [], {
+      SUPER_RELAY_API_KEY: 'cred-from-environment',
+      FAKE_DSH_EXPECT_ENV_JSON: JSON.stringify({ SUPER_RELAY_API_KEY: 'cred-from-environment' }),
+      FAKE_DSH_EXPECT_ABSENT_ENV: 'EMPTY_CREDENTIAL',
+    }, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
   });
 
   it('lets --model argv override the settings.yaml model', async () => {
