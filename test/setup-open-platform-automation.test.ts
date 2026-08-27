@@ -23,6 +23,7 @@ import {
   extractOpenPlatformRedirectUrls,
   extractOpenPlatformSessionIdentity,
   extractOpenPlatformScopeEntries,
+  filterScopeManifest,
   getCookieHeader,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
@@ -244,6 +245,65 @@ describe('Open Platform payload helpers', () => {
     expect(buildSafeSettingPayload('cli_x').redirectURL).toEqual(['http://127.0.0.1:9768/callback']);
   });
 });
+
+describe('filterScopeManifest — 只申请缺失项，避免全量 manifest 过度申请', () => {
+  const manifest = {
+    scopes: {
+      tenant: [
+        'im:message',
+        'im:resource',
+        'calendar:calendar:read',
+        'application:application:self_manage',
+      ],
+      user: [
+        'im:message',
+        'im:feed_group_v1:read',
+        'im:feed_group_v1:write',
+        'docs:document:readonly',
+      ],
+    },
+  };
+
+  it('保留点名的权限并沿用 manifest 的 tenant/user 分桶归属', () => {
+    // im:feed_group_v1:* 只在 user 桶；im:resource 只在 tenant 桶——分桶必须来自
+    // manifest，不能自己猜。
+    const filtered = filterScopeManifest(manifest, [
+      'im:feed_group_v1:read',
+      'im:feed_group_v1:write',
+      'im:resource',
+    ]);
+    expect(filtered).toEqual({
+      scopes: {
+        tenant: ['im:resource'],
+        user: ['im:feed_group_v1:read', 'im:feed_group_v1:write'],
+      },
+    });
+  });
+
+  it('同名权限同时落两桶时两桶都保留', () => {
+    const filtered = filterScopeManifest(manifest, ['im:message']);
+    expect(filtered).toEqual({ scopes: { tenant: ['im:message'], user: ['im:message'] } });
+  });
+
+  it('不点名的权限一律不申请（日历/文档等不再被连带带上）', () => {
+    const filtered = filterScopeManifest(manifest, ['application:application:self_manage']);
+    expect(filtered.scopes?.tenant).toEqual(['application:application:self_manage']);
+    expect(filtered.scopes?.user).toEqual([]);
+    // 关键回归点：manifest 里的 calendar/docs 权限不会被带进申请集合。
+    expect(filtered.scopes?.tenant).not.toContain('calendar:calendar:read');
+    expect(filtered.scopes?.user).not.toContain('docs:document:readonly');
+  });
+
+  it('manifest 里不存在的名字直接落空（交给 catalog 映射记 skipped）', () => {
+    const filtered = filterScopeManifest(manifest, ['im:nonexistent:scope']);
+    expect(filtered).toEqual({ scopes: { tenant: [], user: [] } });
+  });
+
+  it('空缺失列表 → 空申请集合', () => {
+    expect(filterScopeManifest(manifest, [])).toEqual({ scopes: { tenant: [], user: [] } });
+  });
+});
+
 
 describe('redirect 白名单读→合并→写', () => {
   /** postJson 桩：读接口返回 `read`（或抛错），写接口按 `writeResults` 顺序成功/失败。 */

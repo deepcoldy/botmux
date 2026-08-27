@@ -419,6 +419,32 @@ export function mapManifestScopesToOpenPlatformIds(
   };
 }
 
+/**
+ * 把整份 scope 清单裁到「只保留 `wantedNames` 里点名的权限」，tenant / user 分桶
+ * **原样沿用 manifest 的归属**。
+ *
+ * 权限自愈只缺某几项时，历史实现把整份 {@link readDefaultScopeManifest}（300+ 项）
+ * 全量 `operation:'add'` 追加进去——「用缺失项当触发器，却拿完整清单当申请集合」，
+ * 于是补一个 `im:feed_group_v1:read` 会连带申请日历/文档/表格等一大批 botmux 自己
+ * 都不校验的权限。调用方先用本函数把 manifest 裁成缺失项，再传给
+ * {@link automateOpenPlatformSetup} 的 `scopeManifest`，申请集合就与缺失集合一致。
+ *
+ * ⚠️ 故意**不**自己猜 bucket：`im:feed_group_v1:*` 只在 user 桶、`im:resource` 只在
+ * tenant 桶，同名权限也可能同时落两个桶（manifest 里有 121 项 tenant∩user 重叠）。
+ * 以 manifest 的分桶为准，能落哪个桶就保留哪个桶，避免把 user 权限误当 tenant 申请。
+ * 不在 manifest 里的名字直接落空（automation 侧的 catalog 映射也会把它算进
+ * skippedScopeCount），不硬塞。
+ */
+export function filterScopeManifest(manifest: ScopeManifest, wantedNames: string[]): ScopeManifest {
+  const wanted = new Set(uniqueStrings(wantedNames));
+  return {
+    scopes: {
+      tenant: uniqueStrings(manifest.scopes?.tenant ?? []).filter(name => wanted.has(name)),
+      user: uniqueStrings(manifest.scopes?.user ?? []).filter(name => wanted.has(name)),
+    },
+  };
+}
+
 export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>) {
   return {
     clientId: appId,
@@ -2027,7 +2053,7 @@ async function pollFeishuQrLogin(
   };
 }
 
-function readDefaultScopeManifest(): ScopeManifest {
+export function readDefaultScopeManifest(): ScopeManifest {
   const here = dirname(fileURLToPath(import.meta.url));
   const candidates = [
     join(here, 'lark-scopes.json'),

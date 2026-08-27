@@ -35,7 +35,7 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, probeVcMeetingEventSubscription } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
@@ -260,11 +260,18 @@ async function tryAutoFixScopes(
   try {
     const totalMissing = missingCritical.length + missingOptional.length;
     logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
+    // 只申请「实际缺失」的那几项：把默认清单裁成缺失集合再传进去，避免
+    // 「用缺失项当触发器、却拿完整 manifest（300+ 项）当申请集合」——那会让补一个
+    // im:feed_group_v1:read 连带申请日历/文档/表格等一大批 botmux 不校验的权限。
+    // 分桶归属仍以默认 manifest 为准（见 filterScopeManifest）。
+    const wantedScopeNames = [...missingCritical, ...missingOptional].map(s => s.name);
+    const scopeManifest = filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames);
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
+      scopeManifest,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -360,11 +367,13 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // self_manage 后下次重启就能自检了。
     if (infoData.code === 99991672) {
       // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
-      // are missing. Try the Open Platform web-session auto-fix to add ALL
-      // required scopes (including self_manage) in one shot.
+      // are missing. Try the Open Platform web-session auto-fix to add every
+      // botmux-required scope (including self_manage) in one shot — passing the
+      // full BOTMUX_REQUIRED_SCOPES so the next restart's self-check finds them
+      // all present, without over-applying the whole 300+ scope manifest.
       if (brand === 'feishu') {
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand,
-          [{ name: SELF_MANAGE_SCOPE, desc: '应用自查 (免审批)' }], []);
+        const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
+        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
         if (fixed) return;
       }
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);

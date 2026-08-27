@@ -76,6 +76,15 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
     expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean }');
   });
 
+  it('only requests the actually-missing scopes (filtered manifest, not the full 300+)', () => {
+    // Regression: the automation was called with no scopeManifest, so it applied
+    // the entire default manifest. It must now derive the manifest from the
+    // missing critical+optional names and pass it through.
+    expect(region).toContain('filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames)');
+    expect(region).toMatch(/const wantedScopeNames = \[\.\.\.missingCritical, \.\.\.missingOptional\]\.map\(s => s\.name\)/);
+    expect(region).toContain('scopeManifest,');
+  });
+
   it('threads disableQrLogin into the Open Platform automation', () => {
     expect(region).toContain('disableQrLogin: opts?.disableQrLogin,');
   });
