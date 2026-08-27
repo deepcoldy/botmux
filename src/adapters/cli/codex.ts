@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { resolveCommand } from './registry.js';
+import { resolveCommandReal } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -142,8 +142,9 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | u
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
-  // modelChoices and must not shell out (see resolveCommand); the binary path
-  // is a spawn-time concern.
+  // modelChoices and must not shell out (see resolveCommandReal); the binary
+  // path is a spawn-time concern. Canonicalize before spawning because Codex
+  // locates bundled helper executables relative to its own executable path.
   const rawBin = pathOverride ?? 'codex';
   let cachedBin: string | undefined;
   return {
@@ -175,7 +176,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // reads/writes its DBs under CODEX_HOME=BOT_HOME/codex instead, and exposing
     // the host ~/.codex would only leak history/sessions it never touches.
     authPaths: ['~/.codex'],
-    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    get resolvedBin(): string { return (cachedBin ??= resolveCommandReal(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
