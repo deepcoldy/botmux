@@ -143,6 +143,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  detachWorkerForTransfer,
   forkAdoptWorker,
   forkWorker,
   initWorkerPool,
@@ -232,7 +233,7 @@ beforeEach(() => {
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
-  it('clears the watchdog when the exact live worker generation receives the turn', async () => {
+  it('settles tracking when the exact live worker generation commits the turn', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -244,9 +245,17 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const ds = makeDs();
     forkWorker(ds, 'hello', false);
     const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
     await vi.advanceTimersByTimeAsync(5_000);
 
     const businessSends = vi.mocked(worker.send).mock.calls
@@ -254,6 +263,42 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(1);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('bounds tracking when a received turn never commits', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_delayed');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(1_500);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
+
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
   });
 
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
@@ -280,7 +325,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('Worker 未能接收'),
+      expect.stringContaining('无法确认这条消息是否已进入 Worker 的执行队列'),
       'text',
       'app_test',
       'om_business',
@@ -289,6 +334,42 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(2);
+  });
+
+  it('does not retry or report failure after parent IPC confirms the enqueue', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_delayed');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('消息已进入 Worker 的 IPC 队列'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('请重发本条消息');
   });
 
   it('retries immediately when the parent IPC callback rejects the enqueue', async () => {
@@ -316,11 +397,267 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(businessSends).toHaveLength(2);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('Worker 未能接收'),
+      expect.stringContaining('无法确认这条消息是否已进入 Worker 的执行队列'),
       'text',
       'app_test',
       'om_business',
     );
+  });
+
+  it('settles on a delayed state when an IPC retry is later confirmed', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_delayed');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    let deliveryAttempt = 0;
+    vi.mocked(worker.send).mockImplementation((message: any, callback?: (err?: Error | null) => void) => {
+      if (message?.type !== 'message') return true;
+      deliveryAttempt += 1;
+      callback?.(deliveryAttempt === 1 ? new Error('channel backpressure') : null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.runAllTicks();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('消息已进入 Worker 的 IPC 队列');
+  });
+
+  it('settles a transport retry when the first attempt ACK arrives late', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation(() => true);
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('lets a receipt from the first attempt suppress a late callback error', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    let callback: ((err?: Error | null) => void) | undefined;
+    vi.mocked(worker.send).mockImplementation((_message: any, next?: (err?: Error | null) => void) => {
+      callback = next;
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    callback?.(new Error('late callback error'));
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('reports an ambiguous delivery when the live worker exits before receipt', async () => {
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('不要直接重发');
+  });
+
+  it('uses only the startup failure notice when a cold worker exits before ready', async () => {
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const worker = makeFakeWorker();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    forkMock.mockImplementationOnce(() => worker);
+
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('会话启动失败');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认这条消息');
+  });
+
+  it('reports a concurrent follow-up separately when a cold worker exits before ready', async () => {
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const worker = makeFakeWorker();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    forkMock.mockImplementationOnce(() => worker);
+
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    expect(sendWorkerInput(ds, 'follow-up', 'om_followup')).toBe(true);
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls.map(call => call[1])).toEqual(expect.arrayContaining([
+      expect.stringContaining('会话启动失败'),
+      expect.stringContaining('无法确认这条消息是否已进入 Worker 的执行队列'),
+    ]));
+    expect(sessionReply.mock.calls.filter(call => call[4] === 'om_kickoff')).toHaveLength(1);
+    expect(sessionReply.mock.calls.filter(call => call[4] === 'om_followup')).toHaveLength(1);
+  });
+
+  it('suppresses ordinary delivery failure during an intentional routing transfer', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.connected = true;
+    worker.exitCode = null;
+    worker.signalCode = null;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      if (message?.type === 'detach_for_transfer') {
+        queueMicrotask(() => {
+          worker.emit('message', { type: 'transfer_detached', requestId: message.requestId });
+          worker.exitCode = 0;
+          worker.emit('exit', 0, null);
+        });
+      }
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await expect(detachWorkerForTransfer(ds, { timeoutMs: 100 })).resolves.toBe(true);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('renders transport, commit, and failure notices in the bot English locale', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ lang: 'en' }));
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'transport delayed', 'om_transport_delayed')).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sendWorkerInput(ds, 'commit delayed', 'om_commit_delayed')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_commit_delayed' });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    vi.mocked(worker.send).mockImplementation(() => true);
+    expect(sendWorkerInput(ds, 'delivery failed', 'om_delivery_failed')).toBe(true);
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(sessionReply.mock.calls.map(call => call[1])).toEqual(expect.arrayContaining([
+      expect.stringContaining('entered the Worker IPC queue'),
+      expect.stringContaining('Worker received this message'),
+      expect.stringContaining('could not confirm whether this message entered the Worker execution queue'),
+    ]));
+    expect(sessionReply.mock.calls.every(call => String(call[1]).includes('do not resend'))).toBe(true);
   });
 
   it('retries a turn that the worker received but could not enqueue', async () => {
@@ -358,7 +695,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('Worker 未能接收'),
+      expect.stringContaining('无法确认这条消息是否已进入 Worker 的执行队列'),
       'text',
       'app_test',
       'om_business',
@@ -390,16 +727,16 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('Worker 未能接收'),
+      expect.stringContaining('无法确认这条消息是否已进入 Worker 的执行队列'),
       'text',
       'app_test',
       'om_business',
     );
   });
 
-  it('tracks a cold-start init turn and retries when the worker never receives it', async () => {
+  it('keeps a transport-confirmed cold-start init queued when the worker is slow', async () => {
     vi.useFakeTimers();
-    const sessionReply = vi.fn(async () => 'om_failure');
+    const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
       getSessionWorkingDir: () => '/repo',
@@ -407,26 +744,31 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    const worker = makeFakeWorker();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    forkMock.mockImplementationOnce(() => worker);
 
     forkWorker(ds, 'cold start', 'om_kickoff');
-    const worker = forkMock.mock.results.at(-1)!.value;
-    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(2_000);
     await Promise.resolve();
 
     const initSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
-    expect(initSends).toHaveLength(2);
+    expect(initSends).toHaveLength(1);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('Worker 未能接收'),
+      expect.stringContaining('消息已进入 Worker 的 IPC 队列'),
       'text',
       'app_test',
       'om_kickoff',
     );
   });
 
-  it('does not mistake slow startup for delivery failure after init is received', async () => {
+  it('reports a slow startup as delayed rather than failed after init is received', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
@@ -446,7 +788,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .map(call => call[0])
       .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
     expect(initSends).toHaveLength(1);
-    expect(sessionReply).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认');
   });
 });
 
@@ -465,6 +810,7 @@ describe('ordinary Claude semantic recovery', () => {
     forkWorker(ds, 'original task', 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
 
     worker.emit('message', {
       type: 'turn_terminal',
@@ -484,6 +830,7 @@ describe('ordinary Claude semantic recovery', () => {
     }));
     expect(firstRecovery.content).not.toContain('original task');
     worker.emit('message', { type: 'turn_input_received', turnId: firstRecovery.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: firstRecovery.turnId });
     worker.emit('message', {
       type: 'turn_terminal',
       sessionId: ds.session.sessionId,
@@ -501,6 +848,7 @@ describe('ordinary Claude semantic recovery', () => {
     expect(recoveries).toHaveLength(2);
     expect(recoveries[1].turnId).not.toBe(recoveries[0].turnId);
     worker.emit('message', { type: 'turn_input_received', turnId: recoveries[1].turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: recoveries[1].turnId });
     worker.emit('message', {
       type: 'turn_terminal',
       sessionId: ds.session.sessionId,
@@ -626,6 +974,7 @@ describe('ordinary Claude semantic recovery', () => {
     forkWorker(ds, 'turn N', 'om_turn_n');
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_turn_n' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_turn_n' });
 
     expect(sendWorkerInput(ds, 'turn N+1', 'om_turn_n_plus_1')).toBe(true);
     expect(ds.session.ordinaryTurnRecovery).toMatchObject({
@@ -925,6 +1274,7 @@ describe('ordinary Claude semantic recovery', () => {
     forkWorker(ds, 'original task', 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
     worker.emit('message', {
       type: 'turn_terminal',
       sessionId: ds.session.sessionId,

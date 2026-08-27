@@ -6292,7 +6292,11 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
-const ORDINARY_IM_RECEIPT_TIMEOUT_MS = 2_000;
+// IPC transport and worker acknowledgement are separate stages. A transport
+// timeout may retry because the parent never confirmed enqueue; an ACK timeout
+// is only a delayed/ambiguous state because the child may still execute later.
+const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
+const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -6303,6 +6307,8 @@ type OrdinaryImDelivery = {
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>;
   turnId: string;
   attempt: number;
+  received: boolean;
+  transportConfirmed: boolean;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -6365,6 +6371,35 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
   ));
 }
 
+function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  clearOrdinaryImDelivery(record);
+  logger.warn(
+    `[${tag(record.ds)}] Ordinary IM input is still waiting for the worker after IPC enqueue `
+    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
+    + `attempt=${record.attempt}`,
+  );
+  if (
+    record.turnId.startsWith('bmx-recovery-')
+    || isMeetingDrivenTurn(record.ds, record.turnId)
+    || isSilentScheduledTurn(record.ds, record.turnId)
+  ) return;
+  const loc = botLocale(getBot(record.ds.larkAppId).config);
+  const messageKey = record.received
+    ? 'worker.input_commit_delayed'
+    : 'worker.input_delivery_delayed';
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(record.ds),
+    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
+    'text',
+    record.ds.larkAppId,
+    record.turnId,
+  ).catch(err => logger.error(
+    `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
 function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   if (
@@ -6399,18 +6434,31 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
 
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
+  record.received = false;
+  record.transportConfirmed = false;
   const attempt = ++record.attempt;
+  record.timer = setTimeout(() => {
+    retryOrFailOrdinaryImDelivery(record, 'ipc_callback_timeout');
+  }, ORDINARY_IM_TRANSPORT_TIMEOUT_MS);
+  record.timer.unref?.();
   try {
     record.worker.send(record.message, (err) => {
       if (pendingOrdinaryImDeliveries.get(record.key) !== record || record.attempt !== attempt) return;
+      if (record.received) return;
       if (err) {
         retryOrFailOrdinaryImDelivery(record, `ipc_callback:${err.message}`);
         return;
       }
+      record.transportConfirmed = true;
+      clearOrdinaryImDeliveryTimer(record);
       logger.info(
         `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
         + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
       );
+      record.timer = setTimeout(() => {
+        delayOrdinaryImDelivery(record);
+      }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+      record.timer.unref?.();
     });
   } catch (err) {
     queueMicrotask(() => retryOrFailOrdinaryImDelivery(
@@ -6418,16 +6466,6 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
       `ipc_throw:${err instanceof Error ? err.message : String(err)}`,
     ));
     return true;
-  }
-
-  // The worker ACKs synchronously when its IPC handler claims the exact turn.
-  // Slow CLI startup/processing therefore does not extend this transport-only
-  // timeout; the later committed ACK retains input-queue semantics.
-  if (pendingOrdinaryImDeliveries.get(record.key) === record) {
-    record.timer = setTimeout(() => {
-      retryOrFailOrdinaryImDelivery(record, 'receipt_timeout');
-    }, ORDINARY_IM_RECEIPT_TIMEOUT_MS);
-    record.timer.unref?.();
   }
   return true;
 }
@@ -6452,6 +6490,8 @@ function sendOrdinaryImDeliveryTracked(
     message,
     turnId,
     attempt: 0,
+    received: false,
+    transportConfirmed: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   return sendOrdinaryImDeliveryAttempt(record);
@@ -6485,7 +6525,14 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
   const record = pendingOrdinaryImDeliveries.get(key);
   if (!record) return;
-  clearOrdinaryImDeliveryTimer(record);
+  if (!record.received) {
+    record.received = true;
+    clearOrdinaryImDeliveryTimer(record);
+    record.timer = setTimeout(() => {
+      delayOrdinaryImDelivery(record);
+    }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+    record.timer.unref?.();
+  }
   logger.info(
     `[${tag(ds)}] Ordinary IM input received by worker `
     + `turn=${turnId.substring(0, 16)} generation=${workerGeneration} attempt=${record.attempt}`,
@@ -6514,9 +6561,22 @@ function rejectOrdinaryImDelivery(
   retryOrFailOrdinaryImDelivery(record, `worker_rejected:${reason}`);
 }
 
-function abandonOrdinaryImDeliveriesForWorker(worker: ChildProcess): void {
+function settleOrdinaryImDeliveriesForWorker(
+  worker: ChildProcess,
+  options: { suppressAllFailures: boolean; startupOwnedTurnId?: string },
+): void {
   for (const record of pendingOrdinaryImDeliveries.values()) {
-    if (record.worker === worker) clearOrdinaryImDelivery(record);
+    if (record.worker !== worker) continue;
+    if (options.suppressAllFailures || record.turnId === options.startupOwnedTurnId) {
+      clearOrdinaryImDelivery(record);
+      continue;
+    }
+    const reason = record.received
+      ? 'worker_exited_after_receipt'
+      : record.transportConfirmed
+        ? 'worker_exited_after_ipc_enqueue'
+        : 'worker_exited_before_ipc_enqueue';
+    failOrdinaryImDelivery(record, reason);
   }
 }
 
@@ -12748,8 +12808,22 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
-    abandonOrdinaryImDeliveriesForWorker(worker);
     const transferRetirement = transferRetiringWorkers.has(worker);
+    const lifecycleRetirement = lifecycleRetiringWorkers.get(ds)?.has(worker) === true;
+    const preReadyExit = !startupState.ready;
+    const suppressDeliveryFailure = transferRetirement
+      || lifecycleRetirement
+      || worker.killed
+      || ds.session.status === 'closed';
+    settleOrdinaryImDeliveriesForWorker(worker, {
+      suppressAllFailures: suppressDeliveryFailure,
+      // The startup failure path owns only the initial cold-start turn. Any
+      // concurrent follow-up has its own user-visible delivery contract and
+      // must not disappear behind the init turn's single failure notice.
+      startupOwnedTurnId: !suppressDeliveryFailure && preReadyExit
+        ? startupState.initTurnId
+        : undefined,
+    });
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);
     logger.info(`[${t}] Worker process exited (code: ${code})`);
@@ -12757,7 +12831,14 @@ function setupWorkerHandlers(
     // happen before the worker sends either ready or a structured error.  Do
     // not leave the originating Lark message unanswered. Intentional close /
     // replacement kills are excluded to avoid noisy false alarms.
-    if (!transferRetirement && !startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
+    if (
+      !transferRetirement
+      && !lifecycleRetirement
+      && preReadyExit
+      && !startupState.failureNotified
+      && !worker.killed
+      && ds.session.status !== 'closed'
+    ) {
       const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
