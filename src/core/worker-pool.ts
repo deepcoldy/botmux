@@ -10750,7 +10750,21 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
           break;
         }
-        restartCoordinator.resolve(ds.session.sessionId, msg.attemptId, msg.status);
+        const restartSettled = restartCoordinator.resolve(
+          ds.session.sessionId,
+          msg.attemptId,
+          msg.status,
+        );
+        // requestSessionRestart() fences the live generation by clearing
+        // workerReady before asking the worker to respawn its CLI in place. An
+        // in-worker respawn does not emit the process-level `ready` message
+        // again, so the matching successful receipt is the authoritative edge
+        // that must release that fence. Without this assignment the terminal
+        // can be prompt-ready/idle while relay and fork remain permanently
+        // blocked as `worker_busy`.
+        if (restartSettled && msg.status === 'succeeded') {
+          ds.workerReady = true;
+        }
         break;
       }
 
