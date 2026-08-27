@@ -1286,7 +1286,7 @@ function DashboardShell(): React.JSX.Element {
               <ThemeMenuSlot />
               <a
                 className="topbar-docs-link"
-                href="https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/"
+                href="https://deepcoldy.github.io/botmux/"
                 target="_blank"
                 rel="noopener noreferrer"
                 title={t('nav.docs')}
