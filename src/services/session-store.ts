@@ -120,7 +120,9 @@ export function assertSqliteSupported(): void {
 function openDbForOwnStore(path: string): SqliteDatabaseLike {
   requireSqliteEngine(`会话存储 ${basename(path)} `);
   const db = openDatabaseSyncOrThrow(path);
-  // Both engines validate the file at first use, not in the constructor.
+  // Neither engine validates the file in the constructor. `busy_timeout` is
+  // connection-level and touches no page either; the first statement that can
+  // reject a corrupt file is `journal_mode` below — still inside this helper.
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
@@ -140,7 +142,10 @@ function openDbForRead(path: string): SqliteDatabaseLike {
   } catch {
     db = openDatabaseSyncOrThrow(path, { readOnly: true });
   }
-  // First use: file validation (corrupt → throw here, skippable by scan).
+  // NOT a validation point: `busy_timeout` is connection-level and touches no
+  // page, so a corrupt file survives it — this helper RETURNS A HANDLE for one.
+  // The read path's validation happens at the caller's first page-touching
+  // statement (the SELECT), which the scan loops treat as a skippable store.
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   return db;
 }

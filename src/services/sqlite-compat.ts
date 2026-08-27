@@ -150,13 +150,16 @@ export function openDatabaseSyncNow(path: string, opts: OpenOptions = {}): Datab
 
 /**
  * Synchronous open that distinguishes "no engine" from "engine loaded, file
- * unusable". Module-load errors throw from `require`. Both runtimes defer
- * file validation to first use — a corrupt / locked file does **not** throw
- * from the constructor; it surfaces at the first `exec` / query
- * (`file is not a database`). Fail-closed stores (session-store) call this
- * then immediately `PRAGMA busy_timeout`, so SQLITE_NOTADB still throws
- * inside the open helper's caller and is not collapsed into "runtime has
- * no SQLite".
+ * unusable". Module-load errors throw from `require`. Neither runtime validates
+ * the file in the constructor, and `PRAGMA busy_timeout` does not either (it is
+ * connection-level and touches no page). A corrupt / locked file is rejected by
+ * the first PAGE-TOUCHING statement, which differs per path:
+ *   • write path (`openDbForOwnStore`): `PRAGMA journal_mode` — inside the helper.
+ *   • read path (`openDbForRead`): the helper RETURNS A HANDLE; the caller's
+ *     first SELECT throws (`file is not a database`).
+ * Either way the throw lands inside a scan loop's try, which rethrows only
+ * `SessionStoreSqliteUnavailableError` and skips everything else — so
+ * SQLITE_NOTADB stays "skippable store", never "runtime has no SQLite".
  */
 export function openDatabaseSyncOrThrow(path: string, opts: OpenOptions = {}): DatabaseSyncLike {
   return openWithLoadedEngine(path, opts);
