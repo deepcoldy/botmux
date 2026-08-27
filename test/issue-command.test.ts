@@ -5,8 +5,10 @@ import {
   handleIssueDone,
   handleIssueRelease,
   handleIssueStatus,
+  reposFor,
   type IssueCommandDeps,
 } from '../src/im/lark/issue-command.js';
+import { scanMultipleProjects } from '../src/services/project-scanner.js';
 import {
   ISSUE_ACTION_CLAIM_CANCEL,
   ISSUE_ACTION_CLAIM_CONFIRM,
@@ -15,6 +17,10 @@ import {
   ISSUE_ACTION_PAGE,
   ISSUE_ACTION_TEAM,
 } from '../src/im/lark/issue-card.js';
+
+vi.mock('../src/services/project-scanner.js', () => ({
+  scanMultipleProjects: vi.fn(() => []),
+}));
 
 const APP = 'cli_worker';
 const ME = 'ou_admin';
@@ -157,6 +163,37 @@ describe('看板导航', () => {
 });
 
 describe('领取', () => {
+  it('只把依赖提供的仓库目录传给候选扫描器', () => {
+    vi.clearAllMocks();
+    vi.mocked(scanMultipleProjects).mockReturnValueOnce([{
+      name: 'card-mode-repo',
+      path: '/w/card-mode-repo',
+      type: 'repo',
+      branch: 'main',
+    }]);
+
+    const choices = reposFor(APP, deps({ workingDirs: () => ['/w/card-mode'] }).d);
+
+    expect(scanMultipleProjects).toHaveBeenCalledWith(
+      ['/w/card-mode'],
+      3,
+      { includeWorktrees: true },
+    );
+    expect(choices).toEqual([{
+      name: 'card-mode-repo',
+      path: '/w/card-mode-repo',
+      branch: 'main',
+    }]);
+  });
+
+  it('依赖没有提供仓库目录时不调用扫描器', () => {
+    vi.clearAllMocks();
+    const choices = reposFor(APP, deps({ workingDirs: () => [] }).d);
+
+    expect(choices).toEqual([]);
+    expect(scanMultipleProjects).not.toHaveBeenCalled();
+  });
+
   it('打开确认卡时按标签自动匹配仓库', async () => {
     const { d } = deps({ workingDirs: () => [] });
     const r = await handleIssueCardAction(
