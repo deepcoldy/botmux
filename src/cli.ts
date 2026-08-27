@@ -25,6 +25,7 @@ import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { writeAndFlush } from './cli/stdout-flush.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -7111,8 +7112,19 @@ async function relaySend(
         try { unlinkSync(cfile); } catch { /* */ }
         if (preparedContentOutfile) { try { unlinkSync(preparedContentOutfile); } catch { /* */ } }
         if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
-        if (res.stdout) process.stdout.write(res.stdout);
-        if (res.stderr) process.stderr.write(res.stderr);
+        // The host child normally returns a short success JSON, but either
+        // stream can contain an upstream error body.  This relay exits
+        // explicitly, so wait for both writes or a large response is silently
+        // truncated at the sandbox boundary.
+        try {
+          await Promise.all([
+            res.stdout ? writeAndFlush(process.stdout, res.stdout) : Promise.resolve(),
+            res.stderr ? writeAndFlush(process.stderr, res.stderr) : Promise.resolve(),
+          ]);
+        } catch (writeError) {
+          console.error(`relay: 无法完整输出 host 响应：${writeError instanceof Error ? writeError.message : String(writeError)}`);
+          process.exit(1);
+        }
         process.exit(res.code ?? 0);
       } catch { /* partial write — retry next tick */ }
     }
@@ -10737,6 +10749,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // result.kind==='answered' 时用 toLegacySelected 取回旧的 string（单问单选）
   const selected = toLegacySelected(result);
 
+  let stdoutPayload: string | undefined;
   if (useJson) {
     const out: AskJsonOutput = {
       // `selected` 是「单问单选」的向后兼容值（= toLegacySelected 的形状判据：
@@ -10749,7 +10762,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       comment: result.kind === 'answered' ? result.comment : null,
       timedOut: result.kind === 'timedOut',
     };
-    process.stdout.write(JSON.stringify(out) + '\n');
+    stdoutPayload = JSON.stringify(out) + '\n';
   } else if (result.kind === 'answered') {
     // 非 JSON 模式：单选输出 key，多选输出逗号分隔的 keys。
     //
@@ -10766,7 +10779,19 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     // N 项→逗号分隔，全程 exit 0。文字作答时 answers[0] 为空数组同样落空行（上面已在
     // stderr 提示改读 --json 的 comment）。
     const value = multiSelect ? (result.answers[0]?.join(',') ?? '') : (selected ?? '');
-    process.stdout.write(value + '\n');
+    stdoutPayload = value + '\n';
+  }
+
+  // `ask --json` includes the user's free-form comment, whose size is not
+  // bounded by this CLI.  stdout is asynchronous for pipes; an immediate
+  // process.exit() can otherwise lose everything after the pipe buffer.
+  if (stdoutPayload !== undefined) {
+    try {
+      await writeAndFlush(process.stdout, stdoutPayload);
+    } catch (writeError) {
+      console.error(`botmux ask: stdout 输出失败：${writeError instanceof Error ? writeError.message : String(writeError)}`);
+      process.exit(1);
+    }
   }
 
   switch (result.kind) {
