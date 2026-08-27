@@ -16744,6 +16744,15 @@ function buildReservedInitialInput(
       // master: thread the joined-chat context into the opening prompt (group-join
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
+      // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
+      // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
+      // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
+      // raw 命令冷启动（pendingRawInput）的 buffered follow-up 走 raw_input IPC
+      // 延迟发送，turnId 权威流不同，暂不启用 hook，保持 inline。
+      turnId: ds.pendingRawInput
+        ? undefined
+        : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
+      sessionBackendType: ds.session.backendType,
     },
   );
   // R5-B1-1: COPY the frozen new-topic steer authorization onto the opening
@@ -20279,6 +20288,10 @@ async function handleThreadReplyAdmitted(
             codexAppText: parsed.content,
             codexAppApplicationContext,
             codexAppMessageContext,
+            // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
+            // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
+            turnId: parsed.messageId,
+            sessionBackendType: ds.session.backendType,
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -20539,6 +20552,11 @@ async function handleThreadReplyAdmitted(
           codexAppText: reforkCodexApp.text,
           codexAppApplicationContext,
           codexAppMessageContext: reforkCodexApp.messageContext,
+          // #794 后续：worker-null refork 的 empty-start 首轮 opening 也走 hook 注入。
+          // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
+          // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
+          turnId: queuedHasDurableTail ? undefined : parsed.messageId,
+          sessionBackendType: ds.session.backendType,
         },
       );
     } else {

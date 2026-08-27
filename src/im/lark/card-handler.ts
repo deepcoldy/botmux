@@ -561,6 +561,13 @@ export async function commitRepoSelection(
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
               chatContext: ds.pendingChatContext,
+              // #794 后续：opening 走 hook 注入（sender/mentions 进 envelope，PTY 文本
+              // 只剩正文）。turnId 与下方 forkWorker 的权威 turnId 一致；raw 命令冷启动
+              // 的 buffered follow-up 走 raw_input IPC 延迟发送，turnId 权威流不同，不启用。
+              turnId: pendingRawInput
+                ? undefined
+                : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
+              sessionBackendType: ds.session.backendType,
             },
           )
         : undefined;

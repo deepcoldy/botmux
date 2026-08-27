@@ -26,6 +26,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const mocks = vi.hoisted(() => {
   process.env.SESSION_DATA_DIR = `${process.env.TMPDIR ?? '/tmp'}/botmux-initial-turn-${process.pid}`;
@@ -499,11 +500,14 @@ describe('empty-started session — first real business turn must use the new-to
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
-  it('worker-null refork + auto hook: opening 轮不写 speculative sidecar（review 三审 HIGH-3）', async () => {
+  it('worker-null refork + auto hook: opening 轮写合法 sidecar（非 speculative follow-up reminder）', async () => {
     // 三审发现：opening 分支曾无条件先跑 buildReforkCliInput（有写 sidecar 的副作用），
     // 结果被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
     // opening 的 hook 会领到这份没发出去的 speculative reminder → 双注入。
-    // 修复后 opening 分支直接用 buildNewTopicCliInput（不写 sidecar）。
+    // 修复后 opening 分支直接用 buildNewTopicCliInput。#794 后续后 opening 也走 hook
+    // 注入：写的是**合法** opening sidecar（whiteboard/sender/mentions，无 follow-up
+    // reminder），opening 内容只剩正文。本测试锁住：sidecar 是 opening envelope（claim
+    // 回的内容不含 <botmux_reminder>），不是 speculative follow-up reminder。
     const anchor = 'om_hook_opening_root';
     const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'claude-code' });
     ds.session.backendType = 'pty';
@@ -526,13 +530,17 @@ describe('empty-started session — first real business turn must use the new-to
       makeCtx(anchor, 'om_hook_first'),
     );
 
-    // opening 用 new-topic 构造，不应有 sidecar 写入
-    const sidecarDir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', ds.session.sessionId);
-    expect(existsSync(sidecarDir)).toBe(false);
-    // opening 内容应包含 user_message（new-topic 开场）；claude 系列不内联 routing 块
+    // opening 走 hook 模式：PTY 文本只剩正文，无 <user_message> 外壳 / reminder
     const opening = forkInputs()[0]!.content;
-    expect(opening).toContain('<user_message>');
+    expect(opening).toBe('第一条消息');
+    expect(opening).not.toContain('<user_message>');
     expect(opening).not.toContain('<botmux_reminder>');
+    // sidecar 是合法 opening envelope：claim 回的内容含 sender，不含 follow-up reminder
+    // （若写的是 speculative buildReforkCliInput sidecar，envelope 会含 <botmux_reminder>）
+    const envelope = claimPromptContext(ds.session.sessionId, 'om_hook_first', fingerprintPromptText(opening), prefixOf(opening));
+    expect(envelope).toBeDefined();
+    expect(envelope).toContain('<sender ');
+    expect(envelope).not.toContain('<botmux_reminder>');
   });
 
   it('worker-null refork keeps --resume when a non-IM path already fed the CLI', async () => {
