@@ -159,6 +159,27 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('CJADK_INTERACTIVE='))).toBe(false);
   });
 
+  it('forwards only ebsd service metadata and credential file paths to the pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      EBSD_BOTMUX_DIAG_ENDPOINT: 'https://gateway.example',
+      EBSD_BOTMUX_DIAG_TOKEN_FILE: '/run/secrets/diag-token',
+      EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE: '/run/secrets/ak',
+      EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE: '/run/secrets/sk',
+      EBSD_BOTMUX_SUBJECT: 'botmux-ebsd@prod',
+      EBSD_BOTMUX_REPOSITORY_ROOT: '/srv/repos',
+      EBSD_NO_UPDATE_CHECK: '1',
+    });
+    expect(out).toEqual(expect.arrayContaining([
+      'EBSD_BOTMUX_DIAG_ENDPOINT=https://gateway.example',
+      'EBSD_BOTMUX_DIAG_TOKEN_FILE=/run/secrets/diag-token',
+      'EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE=/run/secrets/ak',
+      'EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE=/run/secrets/sk',
+      'EBSD_BOTMUX_SUBJECT=botmux-ebsd@prod',
+      'EBSD_BOTMUX_REPOSITORY_ROOT=/srv/repos',
+      'EBSD_NO_UPDATE_CHECK=1',
+    ]));
+  });
+
   it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',

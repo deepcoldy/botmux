@@ -82,7 +82,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       pi: 'global', 'oh-my-pi': 'global', grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
       // no skill mechanism at all
-      aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none',
+      aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none', ebsd: 'none',
       // Added by upstream #858: a bundled Node JSON-RPC runner with no skills dir.
       dsh: 'none',
       // PTY-driven TUI variant of dsh; no skills dir of its own.

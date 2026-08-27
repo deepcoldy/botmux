@@ -45,6 +45,7 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
+import { createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
@@ -112,7 +113,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -1510,6 +1511,70 @@ describe('oh-my-pi buildArgs', () => {
 
   it('has no modelChoices (setup skips model prompt)', () => {
     expect(adapter.modelChoices).toBeUndefined();
+  });
+});
+
+describe('ebsd buildArgs', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-ebsd-adapter-'));
+    vi.stubEnv('HOME', home);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('launches the hidden service-mode TUI without OMP yolo or model flags', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const args = adapter.buildArgs({
+      sessionId: 'sid-ebsd',
+      resume: false,
+      model: 'must-not-forward',
+      disableCliBypass: false,
+    });
+    expect(args).toEqual([
+      'botmux', '--session-id', 'sid-ebsd', '--auth-mode', 'service',
+    ]);
+    expect(adapter.inputEnvelope).toBe('service-user');
+    expect(adapter.allowExtraArgs).toBe(false);
+    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.reliableTurnTerminal).toBe(true);
+    expect(adapter.skillsDir).toBeUndefined();
+    expect(adapter.spawnEnv).toMatchObject({ EBSD_NO_UPDATE_CHECK: '1' });
+    expect(adapter.authPaths).toEqual(['~/.ebsd']);
+    const serviceEnv = {
+      EBSD_BOTMUX_DIAG_TOKEN_FILE: '/run/secrets/diag',
+      EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE: '/run/secrets/ak',
+      EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE: '/run/secrets/sk',
+      EBSD_BOTMUX_REPOSITORY_ROOT: '/srv/repos',
+    };
+    expect(adapter.sandboxReadonlyPaths?.(serviceEnv)).toEqual(['/srv/repos']);
+    expect(adapter.sandboxSecretReadonlyPaths?.(serviceEnv)).toEqual([
+      '/run/secrets/diag',
+      '/run/secrets/ak',
+      '/run/secrets/sk',
+    ]);
+  });
+
+  it('resumes only an exact transcript and rejects escaping ids', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const dir = ebsdBotmuxSessionDir('sid-ebsd');
+    mkdirSync(dir, { recursive: true });
+    const transcript = join(dir, 'session.jsonl');
+    writeFileSync(transcript, '{}\n');
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'sid-ebsd' })).toBe(true);
+    expect(adapter.buildArgs({ sessionId: 'sid-ebsd', resume: true })).toEqual([
+      'botmux', '--session-id', 'sid-ebsd', '--auth-mode', 'service', '--resume',
+    ]);
+    expect(() => adapter.buildArgs({ sessionId: '../sibling', resume: false })).toThrow(
+      'Invalid BotMux session id for ebsd',
+    );
+    expect(() => adapter.buildArgs({ sessionId: 'x'.repeat(256), resume: false })).toThrow(
+      'Invalid BotMux session id for ebsd',
+    );
   });
 });
 

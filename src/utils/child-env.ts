@@ -416,6 +416,15 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // CLI-specific non-interactive/resume startup controls.
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
+  // ebsd service mode receives only endpoint/identity metadata and paths to
+  // host-managed credential files. Credential contents never enter this env.
+  'EBSD_BOTMUX_DIAG_ENDPOINT',
+  'EBSD_BOTMUX_DIAG_TOKEN_FILE',
+  'EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE',
+  'EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE',
+  'EBSD_BOTMUX_SUBJECT',
+  'EBSD_BOTMUX_REPOSITORY_ROOT',
+  'EBSD_NO_UPDATE_CHECK',
 ] as const;
 
 /**

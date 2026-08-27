@@ -25,6 +25,7 @@ import {
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -150,6 +151,27 @@ describe('buildFsPolicy', () => {
     expect(args[carve - 1]).toBe('--bind');
     expect(args.lastIndexOf(sessionsRoot)).toBeGreaterThan(carve);
     expect(args[args.lastIndexOf(sessionsRoot) - 1]).toBe('--remount-ro');
+  });
+
+  it('isolates ebsd sibling transcripts while retaining service state', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const sessionsRoot = '/home/u/.ebsd/agent/sessions';
+    const ownSessionDir = `${sessionsRoot}/botmux/self`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+      mandatoryDenyPaths: [sessionsRoot],
+      extraWritePaths: [ownSessionDir],
+    }));
+    expect(accessForPath(p.rules, '/home/u/.ebsd/agent/agent.db').access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${ownSessionDir}/turn.jsonl`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sessionsRoot}/botmux/sibling/secret.jsonl`).access).toBe('deny');
   });
 
   it('reasonix state root is read-write so identity, sessions, leases and skills persist in sandbox', () => {
@@ -657,13 +679,18 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
     expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");
     expect(src).toMatch(/ompCurrentSessionDir\s*=\s*cliAdapter\.id === 'oh-my-pi'[\s\S]*?ompSessionDir\(effectiveAdapterSessionId\)/);
-    const precreate = src.indexOf('if (ompCurrentSessionDir) mkdirSync(ompCurrentSessionDir');
+    // ebsd shares the same exact-session carve-out shape through its own
+    // adapter-owned session dir; both feed the generalized managed dir.
+    expect(src).toContain("import { ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';");
+    expect(src).toMatch(/ebsdCurrentSessionDir\s*=\s*cliAdapter\.id === 'ebsd'[\s\S]*?ebsdBotmuxSessionDir\(effectiveAdapterSessionId\)/);
+    expect(src).toContain('const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;');
+    const precreate = src.indexOf('if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir');
     const policyAssembly = src.indexOf('const fsPolicyCtx =', precreate);
     expect(precreate).toBeGreaterThan(-1);
     expect(policyAssembly).toBeGreaterThan(precreate);
-    expect(src).toContain("relative(canonicalOmpSessionsRoot, canonicalOmpSessionDir) !== join('botmux', effectiveAdapterSessionId)");
-    expect(src).toContain('mandatoryDenyPaths.push(canonicalOmpSessionsRoot)');
-    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalOmpSessionDir])');
+    expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
+    expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
+    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {
