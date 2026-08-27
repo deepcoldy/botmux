@@ -18,6 +18,11 @@ import {
   isV3SupportedCli,
   type BotSnapshot,
 } from './contract.js';
+import {
+  codexModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
+  isCodexReasoningEffort,
+} from '../../services/codex-reasoning-effort.js';
 
 export function resolveBotConfig(selector: string | undefined, bots: BotConfig[]): BotConfig {
   if (!selector) {
@@ -73,6 +78,7 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     cliId: bot.cliId,
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
     ...(bot.sandbox === true ? { sandbox: true } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
@@ -137,6 +143,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliId',
     'cliPathOverride',
     'model',
+    'reasoningEffort',
     'sandbox',
     'sandboxPaths',
     'sandboxHidePaths',
@@ -169,6 +176,16 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
+    }
+    const snapshotModel = typeof obj.model === 'string' ? obj.model : undefined;
+    if (obj.reasoningEffort !== undefined && (
+      !isCodexReasoningCliId(obj.cliId as string)
+      || !isCodexReasoningEffort(obj.reasoningEffort)
+      || !codexModelSupportsReasoningEffort(snapshotModel, obj.reasoningEffort)
+    )) {
+      throw new Error(
+        `bots.snapshot.json[${JSON.stringify(key)}].reasoningEffort is not supported by its Codex CLI/model`,
+      );
     }
     for (const field of ['sandbox', 'sandboxNetwork'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'boolean') {
@@ -208,6 +225,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
+      ...(obj.reasoningEffort !== undefined ? { reasoningEffort: obj.reasoningEffort as BotSnapshot['reasoningEffort'] } : {}),
       ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),
       ...(obj.sandboxHidePaths !== undefined ? { sandboxHidePaths: [...obj.sandboxHidePaths as string[]] } : {}),

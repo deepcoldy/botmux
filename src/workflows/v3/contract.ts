@@ -15,6 +15,7 @@
  */
 
 import type { CliId } from '../../adapters/cli/types.js';
+import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import type { V3GoalNode } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
 import type { V3ArmedAttemptWorkerFence } from './worker-fence.js';
@@ -145,8 +146,8 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * The spawn-relevant bot config, FROZEN when the run starts and persisted in
  * the runDir.  The pool spawns ephemeral workers from this snapshot rather
  * than re-reading `bots.json` at execution time, so a retry / daemon-restart
- * reproduces the original cliId / model / workingDir even if the live bot
- * config drifted (codex point 1).
+ * reproduces the original cliId / model / reasoning effort / workingDir even
+ * if the live bot config drifted (codex point 1).
  *
  * Deliberately omits `larkAppSecret`: secrets are not written into the runDir.
  * The pool re-reads the secret by `larkAppId` from the live registry at spawn
@@ -158,6 +159,7 @@ export interface BotSnapshot {
   cliId: CliId;
   cliPathOverride?: string;
   model?: string;
+  reasoningEffort?: CodexReasoningEffort;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. */
   sandbox?: boolean;
