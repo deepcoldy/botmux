@@ -55,6 +55,19 @@ node -e '
       WRAPPER_MARK: process.env.WRAPPER_MARK,
       AGENT_BASE_URL: process.env.AGENT_BASE_URL,
       MOJO_PPE_ENV: process.env.MOJO_PPE_ENV,
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      LANG: process.env.LANG,
+      PM2_HOME: process.env.PM2_HOME,
+      pm_id: process.env.pm_id,
+      pm_exec_path: process.env.pm_exec_path,
+      env: process.env.env,
+      name: process.env.name,
+      axm_options: process.env.axm_options,
+      BOTMUX_DAEMON_INSTANCE: process.env.BOTMUX_DAEMON_INSTANCE,
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      http_proxy: process.env.http_proxy,
+      NO_PROXY: process.env.NO_PROXY,
     },
   }, null, 2));
 ' -- "$@"
@@ -394,6 +407,73 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     const { invocation } = await runWorker({});
     expect(invocation.argv).not.toContain('--cloud');
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('isolates a host Mojo child from pm2 metadata while preserving ambient proxies', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: {
+        pm_id: '5',
+        pm_exec_path: '/opt/botmux/index-daemon.js',
+        pm_cwd: '/opt/botmux',
+        env: '[object Object]',
+        name: 'botmux-daemon',
+        axm_options: '{}',
+        instance_var: 'BOTMUX_DAEMON_INSTANCE',
+        BOTMUX_DAEMON_INSTANCE: '5',
+        PM2_HOME: '/tmp/pm2-home',
+        HTTP_PROXY: 'http://ambient-proxy',
+        http_proxy: 'http://ambient-lower-proxy',
+        NO_PROXY: '127.0.0.1,localhost',
+      },
+    });
+
+    for (const key of [
+      'pm_id', 'pm_exec_path', 'env', 'name', 'axm_options',
+      'BOTMUX_DAEMON_INSTANCE',
+    ] as const) {
+      expect(invocation.env[key], key).toBeUndefined();
+    }
+    expect(invocation.env.PM2_HOME).toBe('/tmp/pm2-home');
+    expect(invocation.env.PATH).toContain(process.env.PATH ?? '');
+    expect(invocation.env.HOME).toBeTruthy();
+    expect(invocation.env.BOTMUX_SESSION_ID).toBe('sid-mojo-wiring');
+    expect(invocation.env.HTTP_PROXY).toBe('http://ambient-proxy');
+    expect(invocation.env.http_proxy).toBe('http://ambient-lower-proxy');
+    expect(invocation.env.NO_PROXY).toBe('127.0.0.1,localhost');
+  }, 40_000);
+
+  it('keeps cloud proxy inheritance but still removes pm2 metadata', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: {
+        pm_id: '7',
+        env: '[object Object]',
+        name: 'botmux-daemon',
+        HTTP_PROXY: 'http://cloud-proxy',
+        NO_PROXY: '127.0.0.1,localhost',
+      },
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    expect(invocation.env.pm_id).toBeUndefined();
+    expect(invocation.env.env).toBeUndefined();
+    expect(invocation.env.name).toBeUndefined();
+    expect(invocation.env.HTTP_PROXY).toBe('http://cloud-proxy');
+    expect(invocation.env.NO_PROXY).toBe('127.0.0.1,localhost');
+  }, 40_000);
+
+  it('lets explicit Mojo env override an inherited host proxy', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: {
+        pm_id: '9',
+        env: '[object Object]',
+        HTTP_PROXY: 'http://ambient-proxy',
+      },
+      botEntry: { mojo: { env: { HTTP_PROXY: 'http://explicit-proxy' } } },
+      init: { backendConfig: { env: { HTTP_PROXY: 'http://explicit-proxy' } } },
+    });
+    expect(invocation.env.pm_id).toBeUndefined();
+    expect(invocation.env.env).toBeUndefined();
+    expect(invocation.env.HTTP_PROXY).toBe('http://explicit-proxy');
   }, 40_000);
 
   it('an ambient AGENT_LOCAL_DAEMON=0 cannot disable default host execution', async () => {

@@ -118,9 +118,123 @@ export const MOJO_IDENTITY_KEYS = [
 ] as const;
 
 /**
+ * pm2 process-description fields observed in managed Botmux daemons.
+ *
+ * pm2 flattens these fields into the managed process environment. They are not
+ * user configuration and the Mojo CLI must not pass them on to its local agent
+ * daemon. Ambiguous names such as `name`, `status` and `env` are only removed
+ * after a pm2 provenance marker is found, and only from the ambient/base layer.
+ * Explicit bot `env` / `mojo.env` values are applied afterwards and therefore
+ * remain an intentional escape hatch.
+ *
+ * `PM2_HOME` is intentionally absent: botmux's PM2 restart helper explicitly
+ * reuses it to address the current PM2 session, and it is not process metadata.
+ */
+export const MOJO_PM2_AMBIENT_ENV_KEYS = [
+    'automation',
+    'args',
+    'autorestart',
+    'autostart',
+    'axm_actions',
+    'axm_dynamic',
+    'axm_monitor',
+    'axm_options',
+    'created_at',
+    'command',
+    'cwd',
+    'env',
+    'error_file',
+    'exec_interpreter',
+    'exec_mode',
+    'exit_code',
+    'filter_env',
+    'instance_var',
+    'instances',
+    'kill_retry_time',
+    'kill_timeout',
+    'km_link',
+    'log_date_format',
+    'max_restarts',
+    'merge_logs',
+    'name',
+    'namespace',
+    'node_args',
+    'node_version',
+    'MODULE_DEBUG',
+    'pm_cwd',
+    'pm_err_log_path',
+    'pm_exec_path',
+    'pm_id',
+    'pm_log_path',
+    'pm_out_log_path',
+    'pm_pid_path',
+    'pm_uptime',
+    'pmx',
+    'pmx_module',
+    'prev_restart_delay',
+    'out_file',
+    'restart_delay',
+    'restart_time',
+    'source_map_support',
+    'status',
+    'stop_exit_codes',
+    'treekill',
+    'unique_id',
+    'unstable_restarts',
+    'unstable_restart',
+    'username',
+    'vizion',
+    'vizion_runing',
+    'vizion_running',
+    'version',
+    'versioning',
+    'watch',
+    'windowsHide',
+    'NODE_APP_INSTANCE',
+    'PM2_JSON_PROCESSING',
+    'PM2_USAGE',
+] as const;
+
+function hasPm2AmbientProvenance(env: NodeJS.ProcessEnv): boolean {
+    return Object.prototype.hasOwnProperty.call(env, 'pm_id')
+        || env.env === '[object Object]'
+        || (
+            Object.prototype.hasOwnProperty.call(env, 'pm_exec_path')
+            && Object.prototype.hasOwnProperty.call(env, 'pm_cwd')
+        );
+}
+
+/**
+ * Return a scrubbed COPY of the ambient layer used for a Mojo child.
+ *
+ * Direct/manual Mojo launches keep their ordinary shell environment intact.
+ * When the base came from pm2, process metadata is removed in every execution
+ * mode. Ambient proxy variables are deliberately preserved: host-local Mojo
+ * may still need them for control-plane/model network access, and the current
+ * real-device evidence does not isolate proxies from the proven pm2 metadata
+ * pollution. Explicit bot `env` / `mojo.env` can still override them.
+ */
+export function scrubMojoAmbientEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...base };
+    if (!hasPm2AmbientProvenance(env)) return env;
+
+    const pmId = env.pm_id;
+    const dynamicInstanceKey = env.instance_var?.trim();
+    const dynamicInstanceValue = dynamicInstanceKey ? env[dynamicInstanceKey] : undefined;
+    for (const key of MOJO_PM2_AMBIENT_ENV_KEYS) delete env[key];
+    // `instance_var` is operator-configurable in pm2. Only remove the pointed
+    // key when its value really is this process's pm_id; this prevents a bad
+    // value such as instance_var=PATH from deleting a required runtime var.
+    if (dynamicInstanceKey && pmId !== undefined && dynamicInstanceValue === pmId) {
+        delete env[dynamicInstanceKey];
+    }
+    return env;
+}
+
+/**
  * The child's effective environment, layered lowest → highest precedence:
  *
- *   base (worker-supplied session env / process env)
+ *   ambient/base (Mojo-only pm2 scrub, when requested)
  *   → bot `env`      (bots.json top-level, already sanitized)
  *   → `mojo.env`     (bots.json mojo block — highest)
  *
@@ -132,15 +246,23 @@ export const MOJO_IDENTITY_KEYS = [
  * as a gateway, that means executing under the wrong identity.
  *
  * Callers that need control-plane hygiene must still strip
- * MOJO_CONTROL_ENV_KEYS afterwards; this helper only fixes the layering.
+ * MOJO_CONTROL_ENV_KEYS afterwards; this helper only fixes layering and the
+ * Mojo-specific ambient process boundary.
  */
 export function buildEffectiveChildEnv(layers: {
     base?: NodeJS.ProcessEnv;
     botEnv?: NodeJS.ProcessEnv;
     mojoEnv?: Record<string, string> | undefined;
+    /** Undefined means a non-Mojo caller and preserves the old merge exactly.
+     *  Either boolean value identifies Mojo; PM2 metadata scrubbing is the same
+     *  for host and cloud/sandbox execution. */
+    mojoHostExecution?: boolean;
 }): NodeJS.ProcessEnv {
+    const base = layers.mojoHostExecution === undefined
+        ? (layers.base ?? {})
+        : scrubMojoAmbientEnv(layers.base ?? {});
     return {
-        ...(layers.base ?? {}),
+        ...base,
         ...(layers.botEnv ?? {}),
         ...(layers.mojoEnv ?? {}),
     };
