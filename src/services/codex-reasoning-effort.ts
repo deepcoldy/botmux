@@ -10,6 +10,9 @@ const SIX_LEVEL_MODELS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra']);
 const FIVE_LEVEL_MODELS = new Set(['gpt-5.6-luna']);
 const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
+  ['seed-evolving', []],
+  ['seed-2.1-pro', []],
+  ['seed-2.1-turbo', []],
   ['openrouter-3o', CODEX_REASONING_EFFORTS.slice(0, 5)],
   ['openrouter-2o', CODEX_REASONING_EFFORTS.slice(0, 5)],
   ['gpt-5.6-sol', ['low', 'medium', 'high', 'xhigh', 'ultra']],
@@ -24,6 +27,7 @@ const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoning
   ['deepseek-v4-pro', TRAEX_COMMON_REASONING_EFFORTS],
   ['deepseek-v4-flash', TRAEX_COMMON_REASONING_EFFORTS],
   ['seed-dogfooding-2.0', TRAEX_COMMON_REASONING_EFFORTS],
+  ['seed-code', []],
   ['openrouter-1o', ['low', 'medium', 'high', 'max']],
   ['openrouter-1', ['low', 'medium', 'high', 'max']],
   ['gemini-3.1-pro-preview', TRAEX_COMMON_REASONING_EFFORTS],
@@ -63,8 +67,8 @@ export function grokReasoningEffortsForModel(model: string | undefined): readonl
 
 export function traexReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
   const normalized = model?.trim().toLowerCase() ?? '';
-  if (!normalized) return [];
-  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(normalized) ?? [];
+  if (!normalized) return TRAEX_COMMON_REASONING_EFFORTS;
+  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(normalized) ?? TRAEX_COMMON_REASONING_EFFORTS;
 }
 
 /** Reasoning choices exposed by a CLI's Botmux control plane. */

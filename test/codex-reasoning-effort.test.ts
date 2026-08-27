@@ -60,8 +60,10 @@ describe('TraeX model-aware reasoning efforts', () => {
       expect(reasoningEffortsForCliModel('traex', model)).toEqual([]);
       expect(cliModelSupportsReasoningEffort('traex', model, 'medium')).toBe(false);
     }
-    expect(cliModelSupportsReasoningEffort('traex', undefined, 'medium')).toBe(false);
-    expect(reasoningEffortsForCliModel('traex', 'custom-model')).toEqual([]);
-    expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'medium')).toBe(false);
+    expect(reasoningEffortsForCliModel('traex', undefined)).toEqual(['low', 'medium', 'high']);
+    expect(cliModelSupportsReasoningEffort('traex', undefined, 'medium')).toBe(true);
+    expect(reasoningEffortsForCliModel('traex', 'custom-model')).toEqual(['low', 'medium', 'high']);
+    expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'medium')).toBe(true);
+    expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'xhigh')).toBe(false);
   });
 });

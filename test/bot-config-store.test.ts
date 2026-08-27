@@ -587,6 +587,15 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
   });
 
+  it('allows TraeX common reasoning effort when model is unset', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex' });
+    const spec = store.findConfigField('reasoningEffort')!;
+    const r = await store.applyConfigField('app_default', spec, 'medium');
+    expect(r.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('medium');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
+  });
+
   it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
     const unsupportedCli = await loaded({ cliId: 'claude-code' });
     const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
