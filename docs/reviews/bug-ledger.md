@@ -59,22 +59,22 @@
 - 修复说明：
   - 在 `buildEffectiveChildEnv()` 增加仅对 Mojo 生效的 ambient/base 环境隔离开关；未传开关的非 Mojo 调用保持原有合并行为。
   - 仅在发现 `pm_id`、`env=[object Object]` 或成对 PM2 路径字段时判定为 PM2 污染，避免误删普通手工启动环境中的同名变量。
-  - PM2 元数据在 host / cloud / sandbox 三种 Mojo 模式下均从 ambient 层移除；清单覆盖 PM2 `Common.js keysToIgnore` 及容器额外写入的日志路径、版本和实例字段，动态 `instance_var` 指向的实例变量一并移除。
+  - PM2 元数据在 host / cloud / sandbox 三种 Mojo 模式下均从 ambient 层移除；清单覆盖 PM2 `Common.js keysToIgnore` 及容器额外写入的日志路径、版本和实例字段。动态 `instance_var` 仅在值符合 PM2 非负实例序号且键名不属于路径、会话、凭据、证书、代理等关键运行变量时移除，避免错误配置删除 `PATH` 等必需环境。
   - host / cloud / sandbox 均保留宿主代理变量：现有真机证据尚未把代理与 `env=[object Object]` 等 PM2 元数据单独隔离，默认删除可能让依赖代理出网的宿主断网。
   - Bot 顶层 `env` 与 `mojo.env` 在清洗后按原优先级合并，显式配置可覆盖或置空代理变量，`mojo.env` 继续具有最高优先级。
   - worker 的 wrapper 解析与 Mojo backend 的真实 spawn 共同使用同一环境构造函数，避免“解析 wrapper 的 PATH”和“子进程真正运行的 PATH/环境”再次分叉。
 
 #### 验证记录
 
-- 验证方式：实现者自动化验证 + 一轮独立代码复审；指定的第二安全复审待完成
+- 验证方式：实现者自动化验证 + 两名未参与改动的 Reviewer 独立代码复审；审查修订后的最终增量已复核通过
 - 验证设备 / 环境：macOS arm64 + Node/Bun 自动化
 - 自动化结果：
   - 修复前 focused 基线：3 个测试文件，135 项通过。
-  - 最终候选 focused gate：4 个测试文件，183 项通过、1 项平台跳过；新增覆盖 host/cloud 代理保留、显式代理覆盖与置空、动态 PM2 instance key、防止恶意 instance key 删除 PATH、PM2 `Common.js` 元数据清单漂移、输入不变及非 Mojo 零影响。
-  - 全部 Mojo 测试串行复跑：34 个文件中 33 通过、1 个平台跳过；663 项通过、32 项平台跳过、0 失败。并行初跑曾有 4 个一秒等待超时，相关 3 文件单独复跑 16 项通过、8 项跳过、0 失败，判定为负载抖动而非回归。
+  - 原候选 focused gate：4 个测试文件，183 项通过、1 项平台跳过；审查修订后直接相关的 2 个测试文件 103 项通过。覆盖 host/cloud 代理保留、显式代理覆盖与置空、真实 PM2 实例序号与 `pm_id` 不相等、自定义实例变量不得删除 `PATH`/Botmux 会话路由、PM2 `Common.js` 元数据清单漂移、输入不变及非 Mojo 零影响。
+  - 审查修订后全部 Mojo 测试串行复跑：34 个文件中 33 通过、1 个平台跳过；664 项通过、32 项平台跳过、0 失败。此前并行初跑曾有 4 个一秒等待超时，相关 3 文件单独复跑 16 项通过、8 项跳过、0 失败，判定为负载抖动而非回归。
   - `npx --yes bun@1.4.0 run build` 通过；domain audit、主 TypeScript、scripts TypeScript、dashboard bundle 与 dist audit 均通过。
 - 真机结果：环境边界验证通过，但端到端回合仍未通过。有效缓存登录态下，候选代码生成的真实 Mojo 子进程环境中 PM2 污染键为 0，继承的 6 个大小写代理键均保留，stderr 无认证错误；随后回合连续 25 秒没有事件，`status=timeout`、`error.code=stalled`、`num_tool_calls=0`，Bash marker 未出现。新启动的 CLI 与 daemon 已按精确 PID 回收，临时验证文件已删除，无残留测试进程。
 - 认证证据：`mojo auth status --json` 于本轮复验时返回 `logged_in=true`、缓存凭据未过期、可刷新；本次失败不能归因于登录过期。
 - 后续真机补充：云端真实 Bash 成功，host daemon online 且声明 Bash 能力；host 在完整环境和“保留代理的最小环境”下仍未稳定完成，结果覆盖无工具事件停滞、Bash 前 `turn_error`、Bash 命令成功后回合 `turn_error` 三种形态。
-- 合并门禁：候选分支已无冲突更新到最新 `origin/master`（领先 2、落后 0），但指定的第二安全复审尚未完成，host 端到端真机回合也未通过；因此仍不能 push / 提 PR。
-- 独立复审状态：一轮独立代码复审确认 PM2 元数据隔离、误删边界、wrapper/backend 同策略和测试覆盖无 blocker；默认删除宿主代理的早期方案已撤回，最终实现为所有 Mojo 模式仅清理 PM2 元数据并保留代理。指定的第二安全复审因对方认证错误尚未完成。
+- 合并门禁：候选分支已无冲突更新到最新 `origin/master`（本次修订提交后领先 3、落后 0），完整 Mojo 回归、构建和独立代码复审均通过；但 host 端到端真机回合仍未通过，因此仍不能 push / 提 PR。
+- 独立复审状态：首名 Reviewer 确认 PM2 元数据隔离、误删边界、wrapper/backend 同策略和测试覆盖无 blocker；指定的 V37F Reviewer 因其自身 API key 401 未能进入审查，Sekiro 替补路径又遇模型服务错误。随后 Wallpaper 完成实质终审并给出 `PASS`（blocker 0、major 0、minor 4）；Lead 全部采纳并修正真实 PM2 实例序号判断、关键环境键保护、测试依赖报错、Mojo 开关命名和 `PM2_HOME` 说明。Wallpaper 对修订增量再次给出 `PASS`（blocker 0、major 0），其两条可读性 minor 已通过测试名和注释澄清；关于未列入 Botmux 会话白名单的自定义 `BOTMUX_*` 实例键提醒不改，因为这类键被明确配置为 PM2 `instance_var` 时属于应清理的 PM2 元数据。

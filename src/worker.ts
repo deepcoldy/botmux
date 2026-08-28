@@ -331,7 +331,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import { buildEffectiveChildEnv, buildEffectiveMojoConfig, deriveMojoExecutionMode, findReservedMojoCliFlags, normalizeMojoConfig, normalizeMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
+import { buildEffectiveChildEnv, buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, normalizeMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
 import { builtinSkillBlockForInjectsSessionContext } from './skills/injection-mode.js';
 import { whiteboardEnabled } from './services/whiteboard-store.js';
 import {
@@ -15636,9 +15636,7 @@ async function spawnCli(
         mojoEnv: effectiveBackendType === 'mojo'
           ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
           : undefined,
-        mojoHostExecution: effectiveBackendType === 'mojo'
-          ? deriveMojoExecutionMode(riffBackendConfig as EffectiveMojoConfig | undefined).agentLocalDaemon === '1'
-          : undefined,
+        mojoChild: effectiveBackendType === 'mojo',
       });
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
         ttadkModel: cfg.model,

@@ -419,7 +419,8 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
         name: 'botmux-daemon',
         axm_options: '{}',
         instance_var: 'BOTMUX_DAEMON_INSTANCE',
-        BOTMUX_DAEMON_INSTANCE: '5',
+        // Same-app PM2 instance ordinal; deliberately differs from pm_id.
+        BOTMUX_DAEMON_INSTANCE: '0',
         PM2_HOME: '/tmp/pm2-home',
         HTTP_PROXY: 'http://ambient-proxy',
         http_proxy: 'http://ambient-lower-proxy',

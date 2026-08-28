@@ -7,6 +7,8 @@
  * documented in one place.
  */
 
+import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
+
 /**
  * USER-CONFIGURABLE mojo settings — the `bots[].mojo` block in bots.json,
  * `/config set mojo` and the dashboard.
@@ -127,8 +129,9 @@ export const MOJO_IDENTITY_KEYS = [
  * Explicit bot `env` / `mojo.env` values are applied afterwards and therefore
  * remain an intentional escape hatch.
  *
- * `PM2_HOME` is intentionally absent: botmux's PM2 restart helper explicitly
- * reuses it to address the current PM2 session, and it is not process metadata.
+ * `PM2_HOME` is intentionally absent: it selects which PM2 home/socket a
+ * deliberate PM2 client command addresses, rather than describing this one
+ * managed process. Preserving it keeps those explicit operator actions usable.
  */
 export const MOJO_PM2_AMBIENT_ENV_KEYS = [
     'automation',
@@ -195,6 +198,55 @@ export const MOJO_PM2_AMBIENT_ENV_KEYS = [
     'PM2_USAGE',
 ] as const;
 
+/**
+ * Environment keys a malformed pm2 `instance_var` must never erase.
+ *
+ * pm2 lets operators choose the key name and writes a non-negative instance
+ * ordinal to it. That value alone is not enough authority to delete PATH,
+ * session routing, credentials, certificates or proxy settings. Normalize to
+ * upper case so the safety boundary also holds on case-insensitive platforms.
+ */
+const MOJO_PM2_DYNAMIC_INSTANCE_PROTECTED_ENV_KEYS = new Set<string>([
+    ...BOTMUX_INJECTED_ENV_KEYS,
+    ...PROXY_ENV_KEYS,
+    'PATH',
+    'HOME',
+    'USER',
+    'USERNAME',
+    'LOGNAME',
+    'SHELL',
+    'TMPDIR',
+    'TMP',
+    'TEMP',
+    'PWD',
+    'OLDPWD',
+    'LANG',
+    'LANGUAGE',
+    'LC_ALL',
+    'TERM',
+    'COLORTERM',
+    'TZ',
+    'NODE_OPTIONS',
+    'NODE_PATH',
+    'NODE_EXTRA_CA_CERTS',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+    // These canonical constants are declared later beside the code that owns
+    // them. Repeating the names here avoids a module-initialization TDZ while
+    // keeping the dynamic-delete safety boundary explicit.
+    'X_JWT_TOKEN',
+    'AGENT_BASE_URL',
+    'MOJO_PPE_ENV',
+    'AGENT_LOCAL_DAEMON',
+].map(key => key.toUpperCase()));
+
+function isSafePm2DynamicInstanceKey(key: string, value: string | undefined): boolean {
+    return value !== undefined
+        && /^(?:0|[1-9]\d*)$/.test(value)
+        && !MOJO_PM2_DYNAMIC_INSTANCE_PROTECTED_ENV_KEYS.has(key.toUpperCase())
+        && !key.toUpperCase().startsWith('LC_');
+}
+
 function hasPm2AmbientProvenance(env: NodeJS.ProcessEnv): boolean {
     return Object.prototype.hasOwnProperty.call(env, 'pm_id')
         || env.env === '[object Object]'
@@ -218,14 +270,13 @@ export function scrubMojoAmbientEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
     const env: NodeJS.ProcessEnv = { ...base };
     if (!hasPm2AmbientProvenance(env)) return env;
 
-    const pmId = env.pm_id;
     const dynamicInstanceKey = env.instance_var?.trim();
     const dynamicInstanceValue = dynamicInstanceKey ? env[dynamicInstanceKey] : undefined;
     for (const key of MOJO_PM2_AMBIENT_ENV_KEYS) delete env[key];
-    // `instance_var` is operator-configurable in pm2. Only remove the pointed
-    // key when its value really is this process's pm_id; this prevents a bad
-    // value such as instance_var=PATH from deleting a required runtime var.
-    if (dynamicInstanceKey && pmId !== undefined && dynamicInstanceValue === pmId) {
+    // pm2 writes the same-app instance ordinal (0, 1, 2, …), not pm_id, to the
+    // operator-configurable `instance_var` key. Delete that metadata only when
+    // the value has the real pm2 shape and the key is not runtime-critical.
+    if (dynamicInstanceKey && isSafePm2DynamicInstanceKey(dynamicInstanceKey, dynamicInstanceValue)) {
         delete env[dynamicInstanceKey];
     }
     return env;
@@ -253,14 +304,13 @@ export function buildEffectiveChildEnv(layers: {
     base?: NodeJS.ProcessEnv;
     botEnv?: NodeJS.ProcessEnv;
     mojoEnv?: Record<string, string> | undefined;
-    /** Undefined means a non-Mojo caller and preserves the old merge exactly.
-     *  Either boolean value identifies Mojo; PM2 metadata scrubbing is the same
-     *  for host and cloud/sandbox execution. */
-    mojoHostExecution?: boolean;
+    /** True means this environment belongs to a Mojo child and needs the PM2
+     *  ambient scrub. Undefined/false preserves the old non-Mojo merge. */
+    mojoChild?: boolean;
 }): NodeJS.ProcessEnv {
-    const base = layers.mojoHostExecution === undefined
-        ? (layers.base ?? {})
-        : scrubMojoAmbientEnv(layers.base ?? {});
+    const base = layers.mojoChild
+        ? scrubMojoAmbientEnv(layers.base ?? {})
+        : (layers.base ?? {});
     return {
         ...base,
         ...(layers.botEnv ?? {}),

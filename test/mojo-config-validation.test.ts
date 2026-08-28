@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/mojo-config-validation.test.ts
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -185,14 +185,16 @@ describe('Mojo ambient child environment isolation', () => {
     node_version: '24.0.0',
     version: '3.17.0',
     instance_var: 'BOTMUX_DAEMON_INSTANCE',
-    BOTMUX_DAEMON_INSTANCE: '5',
+    // pm2 writes the same-app instance ordinal here, not pm_id. Keep them
+    // deliberately different so the fixture matches a multi-app PM2 fleet.
+    BOTMUX_DAEMON_INSTANCE: '0',
     HTTP_PROXY: 'http://ambient-proxy',
     http_proxy: 'http://ambient-lower-proxy',
     NO_PROXY: '127.0.0.1,localhost',
   };
 
   it('removes pm2 metadata while preserving ambient proxies for host execution', () => {
-    const out = buildEffectiveChildEnv({ base: pollutedBase, mojoHostExecution: true });
+    const out = buildEffectiveChildEnv({ base: pollutedBase, mojoChild: true });
     for (const key of [
       'pm_id', 'pm_exec_path', 'pm_cwd', 'env', 'name', 'axm_options',
       'error_file', 'out_file', 'pm_log_path', 'node_version', 'version',
@@ -214,8 +216,8 @@ describe('Mojo ambient child environment isolation', () => {
     expect(pollutedBase.HTTP_PROXY).toBe('http://ambient-proxy');
   });
 
-  it('keeps ambient proxies for cloud/sandbox execution while removing pm2 metadata', () => {
-    const out = buildEffectiveChildEnv({ base: pollutedBase, mojoHostExecution: false });
+  it('uses the same PM2 scrub for every Mojo child while preserving proxies', () => {
+    const out = buildEffectiveChildEnv({ base: pollutedBase, mojoChild: true });
     expect(out.pm_id).toBeUndefined();
     expect(out.env).toBeUndefined();
     expect(out.BOTMUX_DAEMON_INSTANCE).toBeUndefined();
@@ -233,16 +235,29 @@ describe('Mojo ambient child environment isolation', () => {
     const out = scrubMojoAmbientEnv({
       pm_id: '5',
       instance_var: 'PATH',
-      PATH: '/usr/bin:/bin',
+      // Numeric on purpose: value-shape validation alone must not authorize
+      // deletion of a required runtime key.
+      PATH: '0',
     });
-    expect(out.PATH).toBe('/usr/bin:/bin');
+    expect(out.PATH).toBe('0');
+  });
+
+  it('does not let a numeric pm2 instance_var delete Botmux session routing', () => {
+    const out = scrubMojoAmbientEnv({
+      pm_id: '5',
+      instance_var: 'BOTMUX_SESSION_ID',
+      BOTMUX_SESSION_ID: '0',
+    });
+    expect(out.BOTMUX_SESSION_ID).toBe('0');
   });
 
   it('covers every PM2 Common.js process-metadata key', () => {
-    const common = readFileSync(
-      new URL('../node_modules/pm2/lib/Common.js', import.meta.url),
-      'utf-8',
-    );
+    const commonUrl = new URL('../node_modules/pm2/lib/Common.js', import.meta.url);
+    expect(
+      existsSync(commonUrl),
+      'pm2 is a declared runtime dependency; update this drift guard deliberately if that dependency is removed',
+    ).toBe(true);
+    const common = readFileSync(commonUrl, 'utf-8');
     const match = common.match(/var keysToIgnore\s*=\s*\[([\s\S]*?)\];/);
     expect(match).not.toBeNull();
     const pm2Keys = [...(match?.[1] ?? '').matchAll(/['"]([^'"]+)['"]/g)]
@@ -258,7 +273,7 @@ describe('Mojo ambient child environment isolation', () => {
       base: pollutedBase,
       botEnv: { HTTP_PROXY: 'http://bot-proxy', EXPLICIT: 'bot' },
       mojoEnv: { HTTP_PROXY: 'http://mojo-proxy', EXPLICIT: 'mojo' },
-      mojoHostExecution: true,
+      mojoChild: true,
     });
     expect(out.HTTP_PROXY).toBe('http://mojo-proxy');
     expect(out.EXPLICIT).toBe('mojo');
@@ -269,7 +284,7 @@ describe('Mojo ambient child environment isolation', () => {
     const out = buildEffectiveChildEnv({
       base: pollutedBase,
       mojoEnv: { HTTP_PROXY: '' },
-      mojoHostExecution: true,
+      mojoChild: true,
     });
     expect(out.HTTP_PROXY).toBe('');
     expect(out.pm_id).toBeUndefined();
