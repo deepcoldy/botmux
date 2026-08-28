@@ -39,16 +39,19 @@
 
 #### 证据
 
-- macOS arm64，`@byted/mojo` 1.0.11，本地无工具聊天可用，云端工具调用可用。
+- macOS arm64，`@byted/mojo` 1.0.11。2026-08-28 有效登录态复验时，云端链路恢复：无工具后台查询和真实云端 Bash 均成功；本地 host 模式仍会在工具调用前后不稳定失败。
 - 当前运行环境存在 PM2 通用元数据、通用小写 `env=[object Object]` 和重复大小写代理变量。
 - Botmux 3.16.0 与 3.17.0 的 Mojo 环境合并核心文件逐字节一致，说明升级/重启是暴露事件，不足以证明缺陷由 3.17.0 新引入。
 - 对照实验只记录变量名和通过/失败结果，不记录凭据或代理值。
+- 清理 5 个服务端已离线或已无记录的孤儿 daemon 后重新启动：初次查询仍为 0 个在线环境；稍后服务端将新 daemon 标为 online，并上报 `bash/read/write/...` 能力，但 host 回合仍未稳定完成。
+- 对照结果：完整宿主环境经候选代码清除 PM2 元数据后，host 回合可在 Bash 前直接失败；改用最小白名单环境并继续保留全部 6 个大小写代理变量后，一次回合到达 Bash 且 daemon 日志显示命令成功，最终仍以 `turn_error` 失败，重复一次又在 Bash 前失败。代理不是该现象的必要条件，PM2 清理也不足以单独恢复真实主链路。
 
 #### 初步判断
 
 - 疑似根因：worker 以 `process.env` 为 Mojo 基础环境，Mojo backend 再将其与显式 Bot/Mojo 环境整体合并；当前边界只剔除少量控制变量，PM2 管理元数据会进入 Mojo 进程。
-- 次要问题：Mojo 在 macOS 上的辅助组件 bootstrap 失败会影响无关本地工具，需另向 Mojo 侧反馈。
-- 临时 workaround：用最小环境启动单次 Mojo；仅用于诊断，不作为多人正式方案。
+- 当前外部阻塞：Mojo daemon 已连接、注册、Ready 并被控制面标为 online，能力表也包含 Bash，但 host 回合仍随机在工具派发前或工具成功返回后进入 `turn_error`。同一登录态、模型和提示在 cloud sandbox 下可完成 Bash，故问题收敛到 Mojo 本地 daemon 执行链路；该异常与本次 PM2 环境清理是两个问题。
+- 次要问题：Mojo 在 macOS 上的辅助组件 bootstrap 反复报告 internal channel 仅发布 Linux binary，需另向 Mojo 侧反馈。
+- 临时 workaround：`mojo.cloud=true` 可完成 Bash，但会把工具移到云端，无法等价替代需要访问 Botmux 宿主机的本地模式；不能静默启用。最小环境对照也不稳定，不作为 workaround。
 
 #### 修复记录
 
@@ -70,5 +73,8 @@
   - 最终候选 focused gate：4 个测试文件，183 项通过、1 项平台跳过；新增覆盖 host/cloud 代理保留、显式代理覆盖与置空、动态 PM2 instance key、防止恶意 instance key 删除 PATH、PM2 `Common.js` 元数据清单漂移、输入不变及非 Mojo 零影响。
   - 全部 Mojo 测试串行复跑：34 个文件中 33 通过、1 个平台跳过；663 项通过、32 项平台跳过、0 失败。并行初跑曾有 4 个一秒等待超时，相关 3 文件单独复跑 16 项通过、8 项跳过、0 失败，判定为负载抖动而非回归。
   - `npx --yes bun@1.4.0 run build` 通过；domain audit、主 TypeScript、scripts TypeScript、dashboard bundle 与 dist audit 均通过。
-- 真机结果：尚未通过。macOS 上三种隔离方式启动真实 Mojo 均在进入 Bash 前超时；测试进程已按精确 PID 回收，临时目录已清理。`mojo auth status --json` 显示缓存身份存在但 `expires_at` 已过，需重新登录后复验，不能据此宣称修复已生效。
-- 独立复审状态：一轮独立代码复审确认 PM2 元数据隔离、误删边界、wrapper/backend 同策略和测试覆盖无 blocker；默认删除宿主代理的早期方案已撤回，最终实现为所有 Mojo 模式仅清理 PM2 元数据并保留代理。指定的第二安全复审因对方认证错误尚未完成；同时尚未完成有效登录态下的真机验证，因此未进入 push / PR。
+- 真机结果：环境边界验证通过，但端到端回合仍未通过。有效缓存登录态下，候选代码生成的真实 Mojo 子进程环境中 PM2 污染键为 0，继承的 6 个大小写代理键均保留，stderr 无认证错误；随后回合连续 25 秒没有事件，`status=timeout`、`error.code=stalled`、`num_tool_calls=0`，Bash marker 未出现。新启动的 CLI 与 daemon 已按精确 PID 回收，临时验证文件已删除，无残留测试进程。
+- 认证证据：`mojo auth status --json` 于本轮复验时返回 `logged_in=true`、缓存凭据未过期、可刷新；本次失败不能归因于登录过期。
+- 后续真机补充：云端真实 Bash 成功，host daemon online 且声明 Bash 能力；host 在完整环境和“保留代理的最小环境”下仍未稳定完成，结果覆盖无工具事件停滞、Bash 前 `turn_error`、Bash 命令成功后回合 `turn_error` 三种形态。
+- 合并门禁：候选分支已无冲突更新到最新 `origin/master`（领先 2、落后 0），但指定的第二安全复审尚未完成，host 端到端真机回合也未通过；因此仍不能 push / 提 PR。
+- 独立复审状态：一轮独立代码复审确认 PM2 元数据隔离、误删边界、wrapper/backend 同策略和测试覆盖无 blocker；默认删除宿主代理的早期方案已撤回，最终实现为所有 Mojo 模式仅清理 PM2 元数据并保留代理。指定的第二安全复审因对方认证错误尚未完成。
