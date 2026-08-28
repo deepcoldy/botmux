@@ -14,6 +14,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import {
@@ -472,15 +473,18 @@ function startRunner(
   delete env.BOTMUX_CODEX_APP_CONTROL_NONCE;
   delete env.BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP;
   if (controlBootstrapPath !== null) env.BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP = controlBootstrapPath;
+  // argv is assembled as a variable here, so take the loader prefix rather than
+  // the spawnTsScript wrapper: Node needs `--import tsx`, Bun needs nothing.
+  const { command: runnerCommand, prefixArgs } = tsRunnerPrefix();
   const runnerArgs = [
-    '--import', 'tsx', RUNNER_PATH,
+    ...prefixArgs, RUNNER_PATH,
     '--session-id', SESSION_ID,
     '--codex-bin', fakeCodex,
     '--cwd', cwd,
     ...(options.threadId ? ['--thread-id', options.threadId] : []),
     ...extraArgs,
   ];
-  const child = spawn(process.execPath, runnerArgs, {
+  const child = spawn(runnerCommand, runnerArgs, {
     cwd: resolve('.'),
     env,
     stdio: ['pipe', 'pipe', 'pipe'],

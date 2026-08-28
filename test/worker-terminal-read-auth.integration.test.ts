@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
 import {
@@ -153,7 +154,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'terminal-auth-session';
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -411,7 +412,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'view-central-session';
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -534,7 +535,7 @@ setInterval(() => {}, 1_000);
     };
     const spawnWorker = async (): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
       const logs: string[] = [];
-      const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      const child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -655,7 +656,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'ws-handshake-race-session';
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

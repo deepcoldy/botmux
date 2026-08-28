@@ -6,17 +6,20 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
+
 describe('botmux root help workflow surface', () => {
   it('advertises v3 Saved/ad-hoc commands and isolates v2 under the migration namespace', () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-root-help-'));
     try {
       const env = { ...process.env, HOME: home };
       delete env.BOTMUX_WORKFLOW;
+      // execFileSync 形态，wrapper 表达不了，用 runner 前缀拼 argv。
+      const { command, prefixArgs } = tsRunnerPrefix();
       const stdout = execFileSync(
-        process.execPath,
+        command,
         [
-          '--import',
-          'tsx',
+          ...prefixArgs,
           fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
           '--help',
         ],
@@ -71,11 +74,12 @@ describe('botmux root help workflow surface', () => {
       };
       delete env.BOTMUX_WORKFLOW;
       const before = readdirSync(home).sort();
+      // 注意：本测试的 `command` 是被测子命令参数，runner 可执行文件另起名避免遮蔽。
+      const { command: runner, prefixArgs } = tsRunnerPrefix();
       const stdout = execFileSync(
-        process.execPath,
+        runner,
         [
-          '--import',
-          'tsx',
+          ...prefixArgs,
           fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
           command,
           flag,

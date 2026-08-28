@@ -106,6 +106,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const APP_ID = 'app';
 const HOOK = resolve('test/fixtures/mojo-e2e-destroy-hook.ts');
@@ -247,9 +248,11 @@ exit 0
 `);
   chmodSync(bin, 0o755);
 
-  // --import tsx first so the .ts hook below can be loaded at all.
-  child = spawn(process.execPath, [
-    '--import', 'tsx',
+  // Node needs `--import tsx` first so the .ts hook below can be loaded at all;
+  // under Bun the prefix is empty (native TS) and `--import` is a --preload alias.
+  const { command, prefixArgs } = tsRunnerPrefix();
+  child = spawn(command, [
+    ...prefixArgs,
     '--import', pathToFileURL(HOOK).href,
     resolve('src/worker.ts'),
   ], {

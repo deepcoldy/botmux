@@ -12,7 +12,7 @@
  *
  * Run:  pnpm vitest run test/mojo-worker-wiring.integration.test.ts
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,6 +20,7 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 interface Invocation {
   argv: string[];
@@ -128,7 +129,7 @@ async function runWorker(opts: {
     }]));
 
     const startedAt = Date.now();
-    child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -235,7 +236,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
 `);
       chmodSync(bin, 0o755);
 
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -690,7 +691,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -770,7 +771,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -891,7 +892,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
         writeFakeMojo(root);
 
         const errors: string[] = [];
-        child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        child = spawnTsScript(resolve('src/worker.ts'), [], {
           cwd: resolve('.'),
           env: {
             ...process.env,
@@ -969,7 +970,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       chmodSync(bin, 0o755);
 
       let ready = 0;
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -1049,7 +1050,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,

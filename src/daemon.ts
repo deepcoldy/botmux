@@ -1,6 +1,6 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
@@ -25,6 +25,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
+import { isStandaloneBinary } from './core/self-spawn.js';
 import {
   evaluateOverload,
   formatOverloadAlert,
@@ -97,7 +98,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
-import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -201,6 +202,8 @@ import {
   type WorkerSessionReplyOptions,
   migrateMojoSessionIdentities,
   mojoLivePatchForSession,
+  silentIdleCardFlag,
+  recordTurnExplicitMention,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
@@ -3940,14 +3943,33 @@ function writePidFile(): void {
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
   // regardless of whether the package was installed globally.  The wrapper
-  // points at THIS daemon's dist/cli.js, so it's always the same version.
+  // points at THIS daemon's dist/cli.js — or, when we ARE a compiled binary, at
+  // the binary itself (see botmuxWrapperFiles' standalone branch: there is no
+  // cli.js on disk, only a process-private /$bunfs/ path).
   try {
     mkdirSync(BOTMUX_BIN_DIR, { recursive: true });
     const cliScript = join(__dirname, 'cli.js');  // dist/cli.js
+    const standalone = isStandaloneBinary();
     // POSIX `sh` wrapper always; plus a `botmux.cmd` on Windows so native shells
     // resolve `botmux` (otherwise `botmux send` from a Windows CLI session fails).
-    for (const file of botmuxWrapperFiles(cliScript, process.execPath)) {
+    for (const file of botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone)) {
       const wrapper = join(BOTMUX_BIN_DIR, file.name);
+      // NEVER overwrite the running executable. install.sh installs the compiled
+      // binary to exactly this path (~/.botmux/bin/botmux), so without this guard
+      // the daemon replaced its own 94MB executable with a 47-byte script on every
+      // boot — verified, inode and all. The `existing !== file.content` check below
+      // is NOT protection: a binary's bytes never equal the wrapper text, so it
+      // rewrote every single start. Compare resolved real paths because either side
+      // may be a symlink, and skip rather than fail: the binary already IS a working
+      // `botmux` on PATH, so there is nothing a wrapper needs to add.
+      let isRunningBinary = false;
+      try {
+        isRunningBinary = realpathSync(wrapper) === realpathSync(process.execPath);
+      } catch { /* wrapper absent (first boot) or unreadable → not the binary */ }
+      if (isRunningBinary) {
+        logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
+        continue;
+      }
       // Only write if changed (avoid unnecessary disk writes on every restart)
       let existing = '';
       try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* doesn't exist yet */ }
@@ -3955,7 +3977,7 @@ function writePidFile(): void {
         // 原子写：并发会话随时在 exec 这个 wrapper，半截脚本会让它们的
         // `botmux send` 全体失败。
         atomicWriteFileSync(wrapper, file.content, { mode: file.mode });
-        logger.info(`Wrapper script written: ${wrapper} → ${cliScript}`);
+        logger.info(`Wrapper script written: ${wrapper} → ${standalone ? process.execPath : cliScript}`);
       }
     }
   } catch (err: any) {
@@ -4687,6 +4709,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
     const prevTitle = ds.currentTurnTitle || ds.session.title || runtimeDisplayName || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
     const previousCodexTierBadge = codexServiceTierBadge(effectiveCliId, ds.codexServiceTier);
+    const previousSilentIdle = silentIdleCardFlag(ds);
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
       ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
@@ -4697,6 +4720,9 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
       runtimeDisplayName,
       previousCodexTierBadge,
+      // A silently-closed previous turn freezes with its honest label
+      // (「已处理 · 判定无需回复」), not a misleading 「等待输入」.
+      silentIdleCardFlag(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -4711,6 +4737,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
         displayMode: prevMode,
         imageKey: ds.currentImageKey,
         ...(previousCodexTierBadge ? { codexServiceTierBadge: previousCodexTierBadge } : {}),
+        ...(previousSilentIdle ? { silentIdle: true } : {}),
       });
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
@@ -4719,6 +4746,13 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
   }
+  // New turn — the previous turn's deliberate-silence marker (if any) has been
+  // baked into the frozen card above; live cards return to normal labels.
+  ds.silentIdleTurnId = undefined;
+  // Lineage anchor for the deliberate-silence label: a turn_terminal that lands
+  // AFTER this point belongs to an older turn (type-ahead admits the follow-up
+  // while the previous turn is still running) and must not relabel this card.
+  ds.currentTurnId = turnId;
   ds.usageLimit = undefined;
   ds.streamCardPending = true;
   ds.streamCardPendingTurnId = turnId;
@@ -4766,7 +4800,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     );
   }
 
-  beginNewTurn(ds, title, turnId);
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
@@ -4793,6 +4826,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     if (!sendWorkerInput(ds, cliInput, turnId)) {
       throw new Error('doc-watch warmup worker input was not accepted');
     }
+    beginNewTurn(ds, title, turnId);
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
@@ -4808,7 +4842,10 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, ds.hasHistory);
+    if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
+      throw new Error('doc-watch warmup worker fork was not accepted');
+    }
+    beginNewTurn(ds, title, turnId);
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
@@ -17246,8 +17283,7 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    beginNewTurn(ds, commandContent, turn.messageId);
-    sendWorkerSessionInput(ds, {
+    const accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       // Same reason as the worker-pool raw_input send: a passthrough is a real
@@ -17255,6 +17291,11 @@ function deliverPassthroughToExistingSession(
       ...(mojoLivePatchForSession(ds) ?? {}),
       turnId: turn.messageId,
     });
+    if (!accepted) {
+      logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
+      return;
+    }
+    beginNewTurn(ds, commandContent, turn.messageId);
     turn.onDelivered?.();
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
@@ -19911,7 +19952,7 @@ async function handleThreadReplyAdmitted(
       // guard (the builder's own note only covers ds.pendingSender's top-level
       // tag, and is absent entirely when pendingSender is undefined).
       const followUpSenderBlock = renderBufferedSenderBlock(
-        followUpSender, getBot(larkAppId).config.cliId, localeForBot(larkAppId),
+        followUpSender, getBot(larkAppId).config.cliId, localeForBot(larkAppId), larkAppId,
       );
       if (followUpSenderBlock) {
         enriched = `${followUpSenderBlock}\n${enriched}`;
@@ -20285,6 +20326,22 @@ async function handleThreadReplyAdmitted(
   messageQueue.appendMessage(anchor, parsed);
   publishSessionMessagePreviewPatch(ds);
 
+  // Turn-origin record for the deliberate-silence receipt: an explicitly-@'d
+  // turn is a dispatched task, so if the model later closes it with a bare
+  // nothing-to-send sentinel, turn_terminal owes the thread an auto receipt
+  // instead of ghosting the dispatcher. Recorded for BOTH the live-worker and
+  // refork branches below (same parsed.messageId turn identity); undispatched
+  // early-return turns never record. Raw `data.message.content` rides along so
+  // post-message inline `at` nodes count the same as `mentions[]` entries.
+  {
+    const selfBotForMention = getBot(larkAppId);
+    recordTurnExplicitMention(ds, parsed.messageId, messageMentionsBot(
+      { mentions: parsed.mentions, content: data?.message?.content },
+      larkAppId,
+      selfBotForMention.botOpenId,
+    ));
+  }
+
   // codexAppSteerable was computed ONCE above (R5-B1-1), before every admission /
   // fork branch; reuse that frozen value for the live-worker / worker-null split.
 
@@ -20360,7 +20417,6 @@ async function handleThreadReplyAdmitted(
         sessionBackendType: ds.session.backendType,
         turnId: parsed.messageId,
         });
-    beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
@@ -20380,6 +20436,7 @@ async function handleThreadReplyAdmitted(
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
+        beginNewTurn(ds, parsed.content, parsed.messageId);
         rememberLastCliInput(ds, promptContent, cliInput);
       }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
@@ -20418,6 +20475,11 @@ async function handleThreadReplyAdmitted(
     ds.streamCardPending = true;
     ds.streamCardPendingTurnId = parsed.messageId;
     ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+    // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it):
+    // without clearing, a previous turn's deliberate-silence marker survives the
+    // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
+    ds.silentIdleTurnId = undefined;
+    ds.currentTurnId = parsed.messageId;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -21026,7 +21088,6 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           mode: 'live',
           turnId,
         });
-        beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
@@ -21039,6 +21100,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         if (!sendWorkerInput(ds, cliInput, turnId)) {
           throw new Error('worker became unavailable during comment:live-send');
         }
+        beginNewTurn(ds, text, turnId);
         logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
         return;
       }
@@ -21054,6 +21116,10 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       ds.streamCardPending = true;
       ds.streamCardPendingTurnId = turnId;
       ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+      // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
+      // see the Lark-message re-fork branch above.
+      ds.silentIdleTurnId = undefined;
+      ds.currentTurnId = turnId;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
@@ -21394,6 +21460,11 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // 会话存储 SQLite 能力硬门：package.json engines 只要求 node>=22（npm 对
+  // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
+  // 信息可行动，避免拖到首次落盘才炸。
+  sessionStore.assertSqliteSupported();
+
   // Survive a fire-and-forget rejection instead of dying from it. Installed here
   // rather than in index-daemon.ts on purpose: startDaemon has TWO entry points
   // (index-daemon.ts and index-core-only.ts), so guarding the entry file would
@@ -21406,6 +21477,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // live Lark session too. The rejection is logged loudly at error level — this
   // is a backstop for the next missed `.catch`, not permission to omit them.
   installDaemonRejectionGuard(logger);
+
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
   // a user-held tmux server can outlive every botmux pane and still leak stale
@@ -22069,9 +22141,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // so riff never triggers into a racing durable restore (codex P1).
 
   // Publish daemon ownership immediately after IPC binds, then perform the
-  // first session-file load under SessionStore's cross-process lock. An
-  // offline CLI either observes this descriptor and delegates, or it already
-  // holds the file lock; in the latter case this load waits and sees its atomic
+  // first session-store load under the store's cross-process write exclusion
+  // (the shared file lock on JSON, a BEGIN IMMEDIATE read on SQLite — a plain
+  // SELECT would NOT wait for an in-flight offline writer). An offline CLI
+  // either observes this descriptor and delegates, or it already holds the
+  // write exclusion; in the latter case this load waits and sees its atomic
   // mutation. Never load a stale cache in an unadvertised startup window.
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);

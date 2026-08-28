@@ -698,6 +698,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     thinkingCard: body.thinkingCard,
+    senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -1023,6 +1024,9 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {bot.cliId === 'codex' ? (
+              <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             {bot.cliId !== 'riff' && bot.sandbox === true ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
@@ -1067,6 +1071,9 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
+                所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
+            <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -2118,7 +2125,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'grok' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: (cliKey === 'grok' || cliKey === 'traex' || cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -2302,11 +2309,11 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
-  const isReasoningSelection = isCodexSelection || cliKey === 'grok';
+  const isReasoningSelection = isCodexSelection || cliKey === 'grok' || cliKey === 'traex';
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = cliKey === 'dsh';
   const reasoningEffortOptions = useMemo(
-    () => reasoningEffortsForCliModel(cliKey === 'grok' ? 'grok' : isCodexSelection ? 'codex' : undefined, model),
+    () => reasoningEffortsForCliModel(cliKey === 'grok' || cliKey === 'traex' ? cliKey : isCodexSelection ? 'codex' : undefined, model),
     [cliKey, isCodexSelection, model],
   );
 
@@ -2577,6 +2584,8 @@ export function BotAgentSection(props: {
                   label: tr(
                     cliKey === 'grok'
                       ? 'botDefaults.agentReasoningEffortDefaultGrok'
+                      : cliKey === 'traex'
+                        ? 'botDefaults.agentReasoningEffortDefaultTraex'
                       : isCodexSelection
                         ? 'botDefaults.agentReasoningEffortDefaultCodex'
                         : 'botDefaults.agentReasoningEffortDefault',
@@ -2862,6 +2871,60 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
         <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
       </div>
     </div>
+  );
+}
+
+function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [authMode, setAuthMode] = useState<'shared' | 'isolated'>(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authStatus, setAuthStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => setAuthMode(bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared'), [bot.codexAuthSync]);
+
+  async function saveAuthMode(next: 'shared' | 'isolated'): Promise<void> {
+    const previous = authMode;
+    setAuthMode(next);
+    setAuthStatus(null);
+    setAuthBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/codex-auth-sync`, { codexAuthSync: next });
+      if (res.ok && res.body.ok) {
+        patchBot(bot.larkAppId, { codexAuthSync: next });
+        setAuthStatus({ text: `✓ ${tr('botDefaults.codexAuthSyncSaved')}`, ok: true });
+      } else {
+        setAuthMode(previous);
+        setAuthStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setAuthMode(previous);
+      setAuthStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAuth')}</h3>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.codexAuthSyncLabel')}</span>
+          <select
+            data-input="codexAuthSync"
+            value={authMode}
+            disabled={authBusy}
+            onChange={event => void saveAuthMode(event.currentTarget.value as 'shared' | 'isolated')}
+          >
+            <option value="shared">{tr('botDefaults.codexAuthSyncShared')}</option>
+            <option value="isolated">{tr('botDefaults.codexAuthSyncIsolated')}</option>
+          </select>
+        </label>
+        <small>{tr('botDefaults.codexAuthSyncHelp')}</small>
+        <StatusSpan status={authStatus} attr={{ 'data-codex-auth-sync-status': '' }} />
+      </div>
+    </section>
   );
 }
 
@@ -3717,6 +3780,55 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
       <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+  const tr = useT();
+  const [on, setOn] = useState(props.bot.senderTag !== false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setOn(props.bot.senderTag !== false), [props.bot.senderTag]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = on;
+    setOn(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ senderTag: next });
+      if (res.ok) {
+        props.patchBot(props.bot.larkAppId, { senderTag: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setOn(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setOn(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-sender-tag>
+      <h3 className="bd-section-title">{tr('botDefaults.senderTag')}</h3>
+      <ToggleRow
+        checked={on}
+        disabled={busy}
+        dataAction="toggle-sender-tag"
+        title={tr('botDefaults.senderTagInject')}
+        help={tr('botDefaults.senderTagHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.senderTagNote')}</small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-sender-tag-status': '' }} />
       </div>
     </section>
   );

@@ -90,7 +90,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, silentIdleCardFlag, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -2887,6 +2887,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -3283,6 +3284,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              silentIdleCardFlag(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -3329,6 +3331,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
+          frozen.silentIdle === true,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -3373,6 +3376,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3442,6 +3446,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3494,6 +3499,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

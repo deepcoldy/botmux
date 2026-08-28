@@ -6,7 +6,7 @@
  * locally while a live owner daemon is authoritative, carries the current
  * session capability, and retains an offline fallback.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -20,6 +20,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import {
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -125,11 +126,11 @@ function runDelete(
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) delete env[key];
     }
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', CLI_PATH, 'delete', ...args],
+    const child = spawnTsScript(
+      CLI_PATH,
+      ['delete', ...args],
       { env, stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    ) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');

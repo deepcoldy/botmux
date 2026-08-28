@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 
 import {
   filterMatches,
@@ -352,17 +353,19 @@ describe('runHookCommandForTest', () => {
 
   it('does not keep CLI-style emitHookEvent processes alive for running hooks', () => {
     const started = Date.now();
+    // Node needs `--import tsx` on top of the eval args because the snippet
+    // imports a repo .ts module; Bun runs TypeScript natively.
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
-          "emitHookEvent('outbound.send', { content: 'hello' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
+            "emitHookEvent('outbound.send', { content: 'hello' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),
@@ -389,17 +392,17 @@ describe('runHookCommandForTest', () => {
     // session-scoped env leaked into the process (e.g. pm2 startOrRestart
     // injecting the caller's environment after an in-session `botmux restart`).
     const marker = join(tmpDir, 'daemon-local-spawn-touched');
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
-          "emitHookEventLocal('outbound.send', { content: 'hi' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
+            "emitHookEventLocal('outbound.send', { content: 'hi' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),
@@ -434,17 +437,17 @@ describe('runHookCommandForTest', () => {
     // running, so findOnlineDaemon returns null and the forward silently
     // drops — the local-spawn marker file therefore must not appear.
     const marker = join(tmpDir, 'local-spawn-touched');
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
-          "emitHookEvent('outbound.send', { content: 'hi' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
+            "emitHookEvent('outbound.send', { content: 'hi' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),

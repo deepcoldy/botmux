@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useCallback,
   useEffect,
@@ -351,7 +352,7 @@ export type { TerminalPaneControlMode };
  * 自己再收一次焦点是兜底：将来若有调用方出于别的理由把 iframe 留着，至少焦点先
  * 离开它；对读屏用户来说，这一屏也确实是此刻该被读出来的东西。
  */
-function TerminalControlUnknown(props: { onRetry(): void }): JSX.Element {
+function TerminalControlUnknown(props: { onRetry(): void }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     try { ref.current?.focus?.(); } catch { /* 没有 DOM 的宿主（SSR / 组件测试） */ }
@@ -393,7 +394,7 @@ export function TerminalPane(props: PaneCommonProps & {
   /** 同上，注入「这块 iframe 自报能不能写」的读数源（生产走
    *  `readTerminalFrameWrite`，读终端页同源的 `wsHasWrite`）。 */
   readFrameWrite?: (frame: HTMLIFrameElement | null) => TerminalFrameWrite;
-}): JSX.Element {
+}): React.JSX.Element {
   // 控制权的唯一状态机。散着的 useState 版本让观察轮询和写操作共用一个
   // generation，15 秒一发的轮询会把在途写的回执丢掉；失败又一律乐观压成只读。
   const [model, dispatch] = useReducer(terminalControlReducer, undefined, initialTerminalControlModel);
@@ -925,7 +926,7 @@ const CLOSED_PREVIEW: PreviewInteractionState = {
   securityNotice: '交互遮罩用于防误触，不是应用级安全边界。',
 };
 
-export function WebPane(props: PaneCommonProps): JSX.Element {
+export function WebPane(props: PaneCommonProps): React.JSX.Element {
   const previewPath = workbenchPreviewHref(props.session);
   const [interaction, setInteraction] = useState<PreviewInteractionState>(CLOSED_PREVIEW);
   const [phase, setPhase] = useState<'loading' | 'ready' | 'busy' | 'error'>('loading');
@@ -1086,7 +1087,7 @@ interface PaneTreeProps extends PaneCommonProps {
   onRatioChange(ratio: number): void;
 }
 
-function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { type: 'split' }> }): JSX.Element {
+function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { type: 'split' }> }): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const drag = (event: ReactPointerEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -1148,7 +1149,7 @@ function SplitPane(props: PaneTreeProps & { tree: Extract<WorkbenchPaneTree, { t
   );
 }
 
-function PaneTreeNode(props: PaneTreeProps): JSX.Element {
+function PaneTreeNode(props: PaneTreeProps): React.JSX.Element {
   if (props.tree.type === 'split') return <SplitPane {...props} tree={props.tree} />;
   return props.tree.pane === 'terminal'
     ? <TerminalPane session={props.session} api={props.api} authenticated={props.authenticated} capabilities={props.capabilities} now={props.now} location={props.location} />
@@ -1160,7 +1161,7 @@ export function WorkbenchPaneRegion(props: PaneCommonProps & {
   effectivePaneMode: 'focus' | 'split';
   location: WorkbenchTerminalLocation | null;
   onRatioChange(ratio: number): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const effective = useMemo(
     () => paneTreeForLayout({ ...props.layout, paneMode: props.effectivePaneMode }),
     [props.effectivePaneMode, props.layout],
@@ -1181,7 +1182,7 @@ export function WorkbenchPaneRegion(props: PaneCommonProps & {
   );
 }
 
-export function WorkbenchInfo(props: { session: WorkbenchSessionRow }): JSX.Element {
+export function WorkbenchInfo(props: { session: WorkbenchSessionRow }): React.JSX.Element {
   const session = props.session;
   const entries = [
     ['会话 ID', session.sessionId],
@@ -1208,7 +1209,7 @@ export function WorkbenchInfo(props: { session: WorkbenchSessionRow }): JSX.Elem
   );
 }
 
-export function WorkbenchInfoDrawer(props: { session: WorkbenchSessionRow; open: boolean; onClose(): void }): JSX.Element | null {
+export function WorkbenchInfoDrawer(props: { session: WorkbenchSessionRow; open: boolean; onClose(): void }): React.JSX.Element | null {
   if (!props.open) return null;
   return (
     <aside className="wb-info-drawer" role="dialog" aria-modal="false" aria-labelledby="wb-info-title">

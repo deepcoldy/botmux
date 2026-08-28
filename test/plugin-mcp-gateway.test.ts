@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -33,6 +33,7 @@ import {
 } from '../src/core/plugins/mcp/environment.js';
 import { mcpGatewayAuthTokenPath } from '../src/core/plugins/mcp/socket-auth.js';
 import { buildSeatbeltProfile } from '../src/adapters/cli/read-isolation.js';
+import { isBunRuntime, spawnSyncTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -88,9 +89,13 @@ describe('plugin MCP Gateway', () => {
   ): Promise<Client> {
     const env = mcpServeEnvironment(sessionId);
     if (options.dataDir !== undefined) env.SESSION_DATA_DIR = options.dataDir;
+    // Node needs an ABSOLUTE tsx specifier here (not the shared prefix's bare
+    // `tsx`): one case below runs with `cwd` outside the repo, where a bare
+    // specifier cannot be resolved. Bun runs TypeScript natively, so no prefix.
+    const tsxPrefix = isBunRuntime() ? [] : ['--import', import.meta.resolve('tsx')];
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', import.meta.resolve('tsx'), resolve('src/cli.ts'), 'mcp', 'serve'],
+      args: [...tsxPrefix, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: options.cwd ?? resolve('.'),
       env,
       stderr: 'pipe',
@@ -450,8 +455,8 @@ describe('plugin MCP Gateway', () => {
     });
     const host = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -487,8 +492,8 @@ describe('plugin MCP Gateway', () => {
     });
     const host1 = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -632,8 +637,8 @@ describe('plugin MCP Gateway', () => {
     writeMcpGatewayLaunchRecord(dataDir, sessionId, host1.socketPath);
 
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -685,9 +690,9 @@ describe('plugin MCP Gateway', () => {
   }, 30_000);
 
   it('fails closed when a managed relay loses its worker-owned socket', () => {
-    const run = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+    const run = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['mcp', 'serve'],
       {
         cwd: resolve('.'),
         env: {
@@ -703,9 +708,9 @@ describe('plugin MCP Gateway', () => {
   });
 
   it('fails closed when a managed relay has a socket but no authentication token', () => {
-    const run = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+    const run = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['mcp', 'serve'],
       {
         cwd: resolve('.'),
         env: {

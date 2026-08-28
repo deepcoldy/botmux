@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackEventType, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
 
@@ -369,9 +369,9 @@ const MIGRATE_V4_TO_V5 = `
 
 export class SkillFeedbackStore {
   readonly path: string;
-  private readonly db: DatabaseSyncType;
+  private readonly db: DatabaseSyncLike;
 
-  private constructor(dataDir: string, db: DatabaseSyncType) {
+  private constructor(dataDir: string, db: DatabaseSyncLike) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'botmux-feedback.sqlite');
     this.db = db;
@@ -500,10 +500,11 @@ export class SkillFeedbackStore {
   }
 
   static async open(dataDir: string): Promise<SkillFeedbackStore> {
-    const { DatabaseSync } = await import('node:sqlite');
     const path = join(dataDir, 'botmux-feedback.sqlite');
     mkdirSync(dataDir, { recursive: true });
-    const db = new DatabaseSync(path);
+    // Runtime-agnostic open: node:sqlite on Node, bun:sqlite on the compiled
+    // binary (node:sqlite is absent under Bun). Same synchronous handle either way.
+    const db = await openDatabaseSync(path);
     try {
       return new SkillFeedbackStore(dataDir, db);
     } catch (error) {

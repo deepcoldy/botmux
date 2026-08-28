@@ -256,7 +256,7 @@ function navClassName(item: NavItem): string | undefined {
 }
 
 /** 侧边栏导航锚点：桌面分组导航与移动端横向 rail 共用同一份渲染。 */
-function renderNavAnchor(item: NavItem): JSX.Element {
+function renderNavAnchor(item: NavItem): React.JSX.Element {
   return (
     <a
       href={item.href}
@@ -1286,7 +1286,7 @@ function DashboardShell(): React.JSX.Element {
               <ThemeMenuSlot />
               <a
                 className="topbar-docs-link"
-                href="https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/"
+                href="https://deepcoldy.github.io/botmux/"
                 target="_blank"
                 rel="noopener noreferrer"
                 title={t('nav.docs')}

@@ -41,7 +41,6 @@ import {
   statSync,
 } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -58,6 +57,7 @@ import {
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
 } from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
+import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 
@@ -102,34 +102,29 @@ type StatementSyncLike = {
   all(...params: unknown[]): any[];
 };
 
-let sqliteModule: { DatabaseSync: new (path: string) => DatabaseSyncLike } | null = null;
-let sqliteLoadAttempted = false;
-
-function loadSqlite(): typeof sqliteModule {
-  if (sqliteLoadAttempted) return sqliteModule;
-  sqliteLoadAttempted = true;
-  try {
-    const req = createRequire(import.meta.url);
-    sqliteModule = req('node:sqlite') as typeof sqliteModule;
-  } catch {
-    sqliteModule = null;
-  }
-  return sqliteModule;
-}
-
 function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const mod = loadSqlite();
-  if (!mod) return null;
   const dbPath = traeStateDbPath();
   if (!existsSync(dbPath)) return null;
-  let db: DatabaseSyncLike | undefined;
+  // Runtime-agnostic open: `node:sqlite` on Node, `bun:sqlite` on the compiled
+  // single-file binary. This MUST NOT go back to requiring `node:sqlite`
+  // directly — botmux ships as a `bun build --compile` executable, and taking
+  // that path there loses TRAE session lookup silently (the shim's null return
+  // is indistinguishable from "no db", so resume/verification just degrades
+  // with no error). See src/services/sqlite-compat.ts.
+  //
+  // NOTE for future merges: this file arrived from master with a direct
+  // `createRequire('node:sqlite')` and produced NO merge conflict, because the
+  // logic had moved here from the traex adapter — where the Bun fix lived. A
+  // clean merge is not a correct merge; re-check this call whenever the file
+  // moves again.
+  const db = openDatabaseSyncNow(dbPath) as DatabaseSyncLike | null;
+  if (!db) return null;
   try {
-    db = new mod.DatabaseSync(dbPath);
     return fn(db);
   } catch {
     return null;
   } finally {
-    try { db?.close(); } catch { /* ignore */ }
+    try { db.close(); } catch { /* ignore */ }
   }
 }
 

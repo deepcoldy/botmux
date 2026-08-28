@@ -55,8 +55,8 @@ npx vitest run test/bounded-map.test.ts test/grant-pending.test.ts test/session-
 ## 3. 怎么验证「真省资源」——基准
 
 ```bash
-pnpm bench:resource          # 三项，A 的堆数字需 --expose-gc（脚本已带）
-pnpm bench:resource --json   # 末尾附机器可读 JSON
+bun run bench:resource          # 三项，A 的堆数字需 --expose-gc（脚本已带）
+bun run bench:resource --json   # 末尾附机器可读 JSON
 ```
 
 脚本：`scripts/bench-resource.ts`。每项在同一进程里构造**「修复前」「修复后」两条等价路径**对比，

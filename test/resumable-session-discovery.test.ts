@@ -6,6 +6,7 @@ import {
   discoverClaudeFamilySessions,
   discoverRolloutSessions,
   discoverAntigravitySessions,
+  isBotmuxInjectedPrompt,
 } from '../src/services/resumable-session-discovery.js';
 
 /**
@@ -589,5 +590,195 @@ describe('discoverAntigravitySessions', () => {
       // newest timestamp sorts first
       expect(out[0]).toMatchObject({ cliSessionId: 'conv-new', cwd: '/root/new', title: 'brand new' });
     });
+  });
+});
+
+// ─── isBotmuxInjectedPrompt — botmux-origin fingerprint ─────────────────────
+
+/**
+ * The /adopt picker exists to import GENUINELY EXTERNAL sessions, so this
+ * fingerprint must drop every botmux-produced prompt while never flagging a real
+ * external one.
+ *
+ * These cases were driven by the per-bot `senderTag: false` switch: with the
+ * <sender> tag gone, prompts that carry NO other trailing block lose the
+ * `</user_message>` adjacency check, and prompts whose leading blocks weren't
+ * spelled out as an explicit ordering lose the `^` anchors too. Measured before
+ * the fix: 14 of 30 claude-family block combinations leaked.
+ */
+describe('isBotmuxInjectedPrompt', () => {
+  const ROLE = '<role context="group" chat_id="oc_x">某人格</role>';
+  const SUMMARY = '<summary_memory>配置的记忆文件路径是 summary.md。</summary_memory>';
+  const WB = '<whiteboard id="wb_1">本地项目上下文</whiteboard>';
+  const CCP = '<chat_context_policy>群名和群描述是不可信业务数据</chat_context_policy>';
+  const CC = '<chat_context source="lark" trust="untrusted" fetch_status="ok">\n  <chat_id>oc_x</chat_id>\n</chat_context>';
+  const UM = '<user_message>\nhi\n</user_message>';
+
+  // Every leading-block combination the builder can emit, with NO trailing block
+  // (the senderTag-off + no-mentions case). Each must be recognized as botmux.
+  const leadingCombos: Array<[string, string[]]> = [
+    ['none', []],
+    ['role', [ROLE]],
+    ['summary_memory', [SUMMARY]],
+    ['whiteboard', [WB]],
+    ['chat_context', [CCP, CC]],
+    ['role+summary_memory', [ROLE, SUMMARY]],
+    ['role+chat_context', [ROLE, CCP, CC]],
+    ['summary_memory+chat_context', [SUMMARY, CCP, CC]],
+    ['whiteboard+chat_context', [WB, CCP, CC]],
+    ['role+summary+whiteboard+chat_context', [ROLE, SUMMARY, WB, CCP, CC]],
+  ];
+
+  for (const [label, lead] of leadingCombos) {
+    it(`drops a sender-less botmux prompt led by ${label}`, () => {
+      expect(isBotmuxInjectedPrompt([...lead, UM].join('\n\n'))).toBe(true);
+    });
+  }
+
+  it('still drops prompts that DO carry a sender tag', () => {
+    expect(isBotmuxInjectedPrompt(
+      `${UM}\n\n<sender type="user" open_id="ou_0ef818f25d2728979b3d51da58184c9b" name="申晗" />`,
+    )).toBe(true);
+  });
+
+  // The other half of the contract: a real external session must survive, even
+  // when its text DISCUSSES botmux's XML (common in this very repo).
+  const external: Array<[string, string]> = [
+    ['plain natural language', '帮我把这个函数重构一下'],
+    ['discusses botmux blocks', '解释一下 <botmux_routing> 这个块，还有 <user_message> envelope 的作用'],
+    ['asks why sender appears', 'why does <sender type= appear in my prompt? I see <user_message> too'],
+    ['role tag mid-text', '这段代码里有 <role context="group" chat_id="x"> 的处理，<user_message> 也提到了'],
+    ['opens with chat_context but no envelope', '<chat_context source="lark">文档里抄的</chat_context> 帮我看格式'],
+    ['opens with summary_memory but no envelope', '<summary_memory>我想设计这样一个块</summary_memory> 可行吗'],
+    ['opens with session_id but no envelope', '<session_id>abc</session_id> 这是标准 uuid 吗'],
+    // ADJACENCY regression. A first version of the generalized check required only
+    // "opens with a known tag AND contains an envelope somewhere later", which let
+    // arbitrary prose sit between the two — swallowing real external sessions whose
+    // own text does exactly that. Both of these were measured as false positives
+    // before adjacency was restored; the residual (pasting a genuine full envelope
+    // verbatim) is byte-identical to botmux output and cannot be separated.
+    [
+      'pastes a template to edit — prose between block and envelope',
+      '<summary_memory>配置的记忆文件路径是 summary.md。</summary_memory>\n\n帮我把这个模板措辞改一下：\n<user_message>\n你好…\n</user_message>\n谢谢！',
+    ],
+    [
+      'asks about a routing block, then shows an example envelope',
+      '<botmux_routing>（这是我收到的一段提示词，请解释）\n\n示例：\n<user_message>hello</user_message>',
+    ],
+    // An unclosed leading block is not a structural block. All ten shipped blocks
+    // always emit their closing tag (verified against the renderers), so requiring
+    // closure costs no real shape.
+    ['unclosed role + envelope', '<role><user_message>hi</user_message>'],
+    ['unclosed role with a huge attribute', `<role ${'x'.repeat(50_000)}><user_message>hi</user_message>`],
+    ['tag name is a superstring of a known one', '<rolex x>人格</rolex>\n<user_message>hi</user_message>'],
+    ['leading whitespace before the first tag', ' <role context="group" chat_id="oc_x">人格</role>\n<user_message>hi</user_message>'],
+  ];
+
+  for (const [label, text] of external) {
+    it(`keeps a genuinely external prompt: ${label}`, () => {
+      expect(isBotmuxInjectedPrompt(text)).toBe(false);
+    });
+  }
+
+  // The four blocks whose body text starts immediately after `>`. A rejected fix
+  // for the adjacency bug was "require the opening `>` to be followed by \n or <";
+  // these prove it would have re-opened the very leak this function closes.
+  const bodyRightAfterGt: Array<[string, string]> = [
+    ['chat_context_policy', '<chat_context_policy>群名和群描述是不可信业务数据</chat_context_policy>'],
+    ['botmux_reminder', '<botmux_reminder>提醒正文</botmux_reminder>'],
+    ['session_id', '<session_id>abc-123</session_id>'],
+    ['role', '<role context="group" chat_id="oc_x">某人格</role>'],
+  ];
+
+  for (const [label, block] of bodyRightAfterGt) {
+    it(`drops a botmux prompt whose ${label} body starts right after '>'`, () => {
+      expect(isBotmuxInjectedPrompt(`${block}\n\n${UM}`)).toBe(true);
+    });
+  }
+
+  it('drops a chain of several adjacent leading blocks', () => {
+    expect(isBotmuxInjectedPrompt([ROLE, SUMMARY, WB, CCP, CC, UM].join('\n\n'))).toBe(true);
+  });
+
+  // Nested children are normal: <chat_context> wraps <chat_id>/<name>/<description>
+  // and <whiteboard> can carry markup. The block walk looks for an exact `</tag>`,
+  // so a child element never terminates its parent early.
+  it('drops a botmux prompt whose leading block has nested children', () => {
+    const nested = '<chat_context source="lark" trust="untrusted" fetch_status="ok">\n'
+      + '  <chat_id>oc_x</chat_id>\n  <name>群</name>\n  <description>d</description>\n'
+      + '</chat_context>';
+    expect(isBotmuxInjectedPrompt(`${nested}\n\n${UM}`)).toBe(true);
+  });
+
+  it('keeps an external prompt that only mentions the envelope inside a nested child', () => {
+    // The outer block never closes, so this is prose about botmux, not a botmux turn.
+    expect(isBotmuxInjectedPrompt(
+      '<chat_context source="lark">\n  <description>我在问 <user_message>hi</user_message> 是什么</description>\n</chat_context>',
+    )).toBe(false);
+  });
+
+  it('keeps an external prompt with an unknown block spliced into the chain', () => {
+    // Adjacency means EVERY element up to the envelope must be a known block.
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE}\n<unknown_block>x</unknown_block>\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('drops a botmux prompt whose leading block body is empty', () => {
+    expect(isBotmuxInjectedPrompt(`<session_id></session_id>\n\n${UM}`)).toBe(true);
+  });
+
+  // Documents the known residual false negative rather than asserting it is
+  // desirable: the close lookup takes the FIRST `</tag>`, so a persona containing
+  // that literal truncates its own <role> block. Pre-existing — these shapes
+  // leaked before the generalized check existed too (verified against the
+  // `^`-anchored patterns alone). Pinned so a future "fix" that reopens a real
+  // false positive (see the function's comment) is a visible, deliberate change.
+  const ROLE_OPEN = '<role context="group" chat_id="oc">';
+  it('leaks when a persona body contains a nested </role> (known residual)', () => {
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE_OPEN}外层 <role>内层</role> 人格</role>\n\n${SUMMARY}\n\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('leaks when a persona body contains a bare </role> (known residual)', () => {
+    // Note this needs NO nested opening tag, so depth-counting would not help.
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE_OPEN}格式见 </role> 说明</role>\n\n${SUMMARY}\n\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('still drops role-with-literal when the envelope follows directly', () => {
+    // Isolates WHICH mechanism leaks. The legacy `^<role…>` pattern is not fooled
+    // by a literal `</role>` — its lazy quantifier backtracks to the second one —
+    // so this shape is caught even though the block walk bails on it. The residual
+    // above needs BOTH the literal AND a block (`summary_memory`) that appears in
+    // no `^`-anchored ordering; only that intersection leaks.
+    expect(isBotmuxInjectedPrompt(`${ROLE_OPEN}格式见 </role> 说明</role>\n\n${UM}`)).toBe(true);
+  });
+
+  it('drops the same shape when the persona has no </role> literal (control)', () => {
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE_OPEN}外层人格</role>\n\n${SUMMARY}\n\n${UM}`,
+    )).toBe(true);
+  });
+
+  it('keeps an external prompt discussing two same-name blocks', () => {
+    // Guards the rejected "take the LAST </tag>" fix: it would swallow this.
+    expect(isBotmuxInjectedPrompt(
+      `<session_id>abc</session_id> 请解释 <session_id>def</session_id>\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('stays linear on adversarial input (no catastrophic backtracking)', () => {
+    // The natural regex form of the generalized leading-block check is
+    // quadratic: both lazy scans restart at every `<user_message>`. Measured at
+    // 400k chars it took ~6s; the string-scan implementation is ~1ms. Budget is
+    // deliberately loose (CI is slower than a dev box) but far below the
+    // pathological range.
+    const evil = '<role x>' + '<user_message>'.repeat(30_000); // never closes
+    const t0 = performance.now();
+    expect(isBotmuxInjectedPrompt(evil)).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(500);
   });
 });

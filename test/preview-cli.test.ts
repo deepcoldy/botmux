@@ -1,9 +1,10 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
@@ -52,11 +53,11 @@ function runPreview(input: {
       BOTMUX_WORKFLOW: input.workflow,
     };
     for (const [name, value] of Object.entries(env)) if (value === undefined) delete env[name];
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', CLI_PATH, 'preview', ...input.args],
+    const child = spawnTsScript(
+      CLI_PATH,
+      ['preview', ...input.args],
       { env, stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    ) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');

@@ -58,12 +58,25 @@ describe('带外写权限控制帧', () => {
     const source = decodeTerminalWriteFrame.toString();
     expect(source).not.toContain('`');
     // 引用外部标识符就意味着嵌进页面后是另一段语义（甚至直接 ReferenceError）。
-    expect(source).toContain(WRITABLE);
-    expect(source).toContain(READONLY);
+    expect(source).not.toMatch(/WRITABLE_FRAME|READONLY_FRAME/);
+    // 两个字面量必须**内联**在函数体里。不能直接 toContain(WRITABLE)：那要求源码里
+    // 的引号风格与本文件常量逐字一致，而这段源码来自当前 transform（tsc 保留单引号，
+    // 某些测试 transform 会重新输出成双引号加转义 `"{\"botmux\"…`），断言会因为
+    // 「谁来 transform」而红——测的是工具产物形态，不是通道契约。改成解析出源码里的
+    // 字符串字面量再做**值**比较，与引号风格无关。
+    const literals = [...source.matchAll(/(['"])((?:\\.|(?!\1).)*)\1/g)].map(m => {
+      try { return JSON.parse(`"${m[2].replace(/\\'/g, "'")}"`); } catch { return m[2]; }
+    });
+    expect(literals).toContain(WRITABLE);
+    expect(literals).toContain(READONLY);
+    // 最终保证：把源码原样嵌进别处重建，行为与本模块一致（这才是页面真正依赖的东西）。
     // eslint-disable-next-line no-new-func
     const rebuilt = new Function(`return (${source})`)() as typeof decodeTerminalWriteFrame;
     expect(rebuilt(WRITABLE, true)).toBe(true);
+    expect(rebuilt(READONLY, true)).toBe(false);
     expect(rebuilt(WRITABLE, false)).toBeNull();
+    expect(rebuilt(' ' + WRITABLE, true)).toBeNull();
+    expect(rebuilt(`日志输出${WRITABLE}`, true)).toBeNull();
   });
 });
 

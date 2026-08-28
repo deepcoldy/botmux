@@ -119,13 +119,13 @@ export interface VcMeetingAgentGlobalConfig {
 }
 
 export interface WorkflowFeatureGlobalConfig {
-  /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== false`
-   *  preserves the legacy behavior (feature ON). Set false to turn the whole
-   *  workflow feature off on this host: the `/workflow` grill + Saved-Workflow
-   *  run/save entries are refused, the `botmux-workflow` family of skills stops
-   *  being advertised/installed, and the CLI authoring/run subcommands refuse.
+  /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== true`
+   *  keeps the feature OFF (disabled by default). Set true to turn the whole
+   *  workflow feature on for this host: the `/workflow` grill + Saved-Workflow
+   *  run/save entries are accepted, the `botmux-workflow` family of skills is
+   *  advertised/installed, and the CLI authoring/run subcommands work.
    *  In-flight run management (cancel / retry / grant) stays available so a run
-   *  started before the flip can still be wound down. The multi-bot
+   *  started before a flip can still be wound down. The multi-bot
    *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
    *  separate long-running-orchestration capability, not a v3 workflow. */
   enabled?: boolean;
@@ -161,8 +161,8 @@ export interface GlobalConfig {
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
   vcMeetingAgent?: VcMeetingAgentGlobalConfig;
-  /** Machine-wide v3 Workflow kill-switch. Missing / enabled !== false keeps
-   *  the feature ON (legacy behavior); set false to disable it host-wide. The
+  /** Machine-wide v3 Workflow switch. Missing / enabled !== true keeps the
+   *  feature OFF; set true to enable it host-wide. The
    *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
   workflow?: WorkflowFeatureGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
@@ -758,13 +758,13 @@ export function isRemoteAccessEnabled(): boolean {
 
 /** Machine-wide v3 Workflow feature kill-switch.
  *
- * Missing / `workflow.enabled !== false` means ON (backwards compatible — the
- * feature has always been on). An explicit `false` in `~/.botmux/config.json`
- * disables it. The `BOTMUX_WORKFLOW_ENABLED` env var, when set to a non-empty
- * value, OVERRIDES the config file either way (`true`/`1`/`yes`/`on` ⇒ enabled,
- * anything else ⇒ disabled) — it is both the escape hatch if the config gate
- * misfires and the channel the worker injects into CLI panes so a pane's
- * `botmux workflow …` subcommand agrees with the daemon that spawned it.
+ * Missing / `workflow.enabled !== true` means OFF (disabled by default). An
+ * explicit `true` in `~/.botmux/config.json` turns it on. The
+ * `BOTMUX_WORKFLOW_ENABLED` env var, when set to a non-empty value, OVERRIDES
+ * the config file either way (`true`/`1`/`yes`/`on` ⇒ enabled, anything else ⇒
+ * disabled) — it is both the escape hatch if the config gate misfires and the
+ * channel the worker injects into CLI panes so a pane's `botmux workflow …`
+ * subcommand agrees with the daemon that spawned it.
  *
  * Read live off the short-TTL config cache so a dashboard toggle takes effect on
  * the next session/turn without a daemon restart (mirrors whiteboardEnabled /
@@ -775,7 +775,7 @@ export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): 
     const v = flag.trim().toLowerCase();
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
-  return readGlobalConfig().workflow?.enabled !== false;
+  return readGlobalConfig().workflow?.enabled === true;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

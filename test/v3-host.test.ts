@@ -24,6 +24,7 @@ import { SPEC_SCHEMA_VERSION, type BotSnapshot } from '../src/workflows/v3/contr
 import { DagValidationError } from '../src/workflows/v3/dag.js';
 import { loadAuthorizedV3Run, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 function base(): string {
   return mkdtempSync(join(tmpdir(), 'v3-host-'));
@@ -41,7 +42,10 @@ function runTsChild(script: string): {
   exited: () => boolean;
   result: Promise<{ created: boolean; authorizedAt: string }>;
 } {
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+  // 不能用 spawnTsEval：内联脚本要 import 仓库内的 .ts 模块（.js specifier），
+  // Node 下丢掉 --import tsx 子进程会 ERR_MODULE_NOT_FOUND，所以拼 runner 前缀 + eval 参数。
+  const { command, prefixArgs } = tsRunnerPrefix();
+  const child = spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });

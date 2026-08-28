@@ -205,7 +205,6 @@ import {
   writeRestartIntent,
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
-import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
 // Host children the dashboard forks (start/stop-bot, global install). They live
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
@@ -1485,7 +1484,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
-    workflow: { enabled: global.workflow?.enabled !== false }, // default ON
+    workflow: { enabled: global.workflow?.enabled === true }, // default OFF
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -4307,25 +4306,10 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
-      // The real restart runs in a detached `botmux restart` child, whose
-      // shutdown-capability throw would only reach the maintenance-restart log
-      // — the UI would then poll a reconnect that never happens and mislabel it
-      // as "restart is slow". Detect that fail-closed boundary synchronously so
-      // we can return a precise, actionable error instead of firing a restart
-      // that is guaranteed to die silently. A read failure is non-authoritative
-      // and falls through to the existing behavior (never fabricate a block).
-      try {
-        const preflight = evaluateRestartShutdownPreflight();
-        if (preflight.bootstrapRequired) {
-          return jsonRes(res, 409, {
-            ok: false,
-            error: 'bootstrap_shutdown_protocol_required',
-            unsafeDaemons: preflight.unsafeDaemonNames,
-          });
-        }
-      } catch (error) {
-        logger.warn(`[dashboard] restart shutdown-capability preflight unavailable: ${error instanceof Error ? error.message : error}`);
-      }
+      // (pm2 shutdown-capability preflight removed with the fleet pm2→supervisor
+      // migration: the supervisor has no "bootstrap-shutdown-protocol" policy to
+      // probe. A restart failure surfaces through the detached child's own error
+      // path.)
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
@@ -6025,6 +6009,23 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-env`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/codex-auth-sync — per-bot Codex credential policy.
+    let mBotCodexAuthSync: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCodexAuthSync = url.pathname.match(/^\/api\/bots\/([^/]+)\/codex-auth-sync$/))) {
+      const appId = decodeURIComponent(mBotCodexAuthSync[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-codex-auth-sync`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

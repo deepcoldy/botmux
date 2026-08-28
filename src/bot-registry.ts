@@ -1384,7 +1384,7 @@ export interface BotConfig {
    * toggle; the worker resolves the effective adapter at spawn time.
    */
   dshRuntime?: 'official' | 'tui';
-  /** Default Codex reasoning effort for newly created sessions. */
+  /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
@@ -1409,6 +1409,34 @@ export interface BotConfig {
    */
   envelopeInjection?: 'auto' | 'off';
   /**
+   * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
+   * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
+   * explicit `false` disables), so existing prompts stay byte-for-byte.
+   *
+   * Turn it off for a bot whose model mishandles the tag (cursor-agent copies
+   * `ou_xxx:名字` into its reply — see {@link renderCursorSenderNote}) or when
+   * the operator does not want per-message identity in the CLI transcript.
+   * The cursor anti-echo note is gated on the tag's presence, so it disappears
+   * together with it. `botmux send --mention-back` is UNAFFECTED: it reads
+   * `replyTargets[turnId].senderOpenId` (core/reply-target.ts), a daemon-side
+   * record independent of this prompt block.
+   *
+   * TWO OBSERVABILITY COSTS, both measured — see the `/config senderTag` hint:
+   *   1. `/adopt`'s botmux-origin filter loses one of its fingerprints. The
+   *      remaining structural anchors cover the shapes we ship (see
+   *      BOTMUX_INJECTION_PATTERNS in services/resumable-session-discovery.ts,
+   *      whose `^<chat_context_policy>` / `^<summary_memory>` anchors exist
+   *      precisely so a sender-less prompt is still recognized).
+   *   2. Dashboard session insight can no longer label a turn's sender type /
+   *      A2A agent name from the tag (services/insight/prompt.ts); it falls
+   *      back to the `[来自 … 的 @mention]` handoff marker when present.
+   *
+   * This is the first member of a per-bot prompt-block toggle cluster; keep
+   * future block switches (e.g. `<chat_context>`) adjacent so the gates stay
+   * discoverable together.
+   */
+  senderTag?: boolean;
+  /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
    * attached to a botmux-owned app-server thread, so input can't be dropped by
@@ -1425,6 +1453,12 @@ export interface BotConfig {
    * new-session workflow until the operator explicitly selects a shared thread.
    */
   existingAppServer?: ExistingAppServerConfig;
+  /**
+   * Codex credential policy. Missing/`shared` preserves the historical global
+   * auth refresh; `isolated` always redirects Codex into this bot's private
+   * CODEX_HOME and never reads or copies global auth, with or without sandbox.
+   */
+  codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -3093,6 +3127,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
+      // Missing keeps the historical every-cold-spawn global auth refresh.
+      codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -3173,6 +3209,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,
+      // Default ON, same convention as thinkingCard: an absent key means the
+      // <sender> tag is injected, so existing prompts are unchanged.
+      senderTag: entry.senderTag === false ? false : undefined,
       noCotChats: Array.isArray(entry.noCotChats)
         ? entry.noCotChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,

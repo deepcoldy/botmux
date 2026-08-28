@@ -222,7 +222,7 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
-    workflow: { enabled: s?.workflow?.enabled !== false },
+    workflow: { enabled: s?.workflow?.enabled === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',

@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { persistV3StartIntent } from '../src/workflows/v3/start-intent.js';
+import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -26,7 +27,10 @@ function startIntentChild(runDir: string, readyPath: string, barrierPath: string
     persistV3StartIntent(process.env.RUN_ID, process.env.RUN_DIR);
     persistV3StartIntent(process.env.RUN_ID, process.env.RUN_DIR);
   `;
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+  // 不能用 spawnTsEval：内联脚本要 import 仓库内的 .ts 模块（.js specifier），
+  // Node 下丢掉 --import tsx 子进程会 ERR_MODULE_NOT_FOUND，所以拼 runner 前缀 + eval 参数。
+  const { command, prefixArgs } = tsRunnerPrefix();
+  const child = spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: process.cwd(),
     env: {
       ...process.env,

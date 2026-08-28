@@ -26,7 +26,7 @@ Before creating a new ZMX-backed session, botmux checks the executable, version,
 
 > **⚠️ Upgrading from 0.6**: replacing the `zmx` binary on disk does not replace per-session daemons that are already running; after upgrading to 0.7.0+, manually stop and recreate every session launched by 0.6, then restart botmux. botmux performs **no automatic cold migration**, and `botmux restart` alone is insufficient. ZMX's IPC `Tag` enum is non-exhaustive (unknown tags fall through the `_` arm and are ignored), so a 0.6 daemon **discards** the new `.Send` tag outright while `zmx send` still exits 0 — the command reports success and the input never arrives.
 
-For contributors, the default `pnpm test` command runs mocked/pure unit tests and **does not require ZMX to be installed**. Coverage that launches a real `zmx` binary lives in `*.e2e.ts`, runs only when E2E is requested explicitly, and skips automatically when ZMX is unavailable—the same pattern already used by the tmux and Herdr E2E suites.
+For contributors, the default `bun run test` command runs mocked/pure unit tests and **does not require ZMX to be installed**. Coverage that launches a real `zmx` binary lives in `*.e2e.ts`, runs only when E2E is requested explicitly, and skips automatically when ZMX is unavailable—the same pattern already used by the tmux and Herdr E2E suites.
 
 ## Enable ZMX
 

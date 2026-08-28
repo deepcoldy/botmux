@@ -14,12 +14,12 @@
 ## 部署步骤
 
 ```bash
-# 0. 环境:node >=22;pnpm 用 corepack
-corepack enable                       # 或 npm i -g pnpm@9.5.0
+# 0. 环境:node >=22;包管理器用 bun
+npm i -g bun                          # 或见 https://bun.sh
 
 # 1. 克隆 + 构建(仓库 public,拉取无需 token)
 git clone https://github.com/xu4wang/botmux.git && cd botmux
-pnpm install && pnpm build
+bun install --frozen-lockfile && bun run build
 
 # 2. 全局 wrapper 进 PATH(一次性写进 ~/.zshrc)
 echo 'export PATH="$HOME/.botmux/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc

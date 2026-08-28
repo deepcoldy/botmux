@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const { Terminal } = xtermHeadless;
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -196,7 +197,10 @@ async function spawnPicker(
     'BOTMUX_DAEMON_IPC_PORT',
   ]) delete env[key];
 
-  const child = pty.spawn(process.execPath, ['--import', 'tsx', CLI_PATH, 'list'], {
+  // node-pty takes command and args separately, so build the runtime-aware
+  // prefix by hand instead of going through the spawnTsScript wrapper.
+  const { command, prefixArgs } = tsRunnerPrefix();
+  const child = pty.spawn(command, [...prefixArgs, CLI_PATH, 'list'], {
     cwd: join(TEST_DIR, '..'),
     env,
     cols,

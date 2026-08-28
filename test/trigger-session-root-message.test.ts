@@ -263,6 +263,37 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.session.reasoningEffort).toBe('xhigh');
   });
 
+  it('stamps per-turn model + reasoningEffort onto a TraeX session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'traex', workingDir: '/tmp' },
+      botName: 'TraeX', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'DeepSeek-V4-Pro', reasoningEffort: 'medium' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBe('DeepSeek-V4-Pro');
+    expect(ds?.session.model).toBeUndefined();
+    expect(ds?.session.reasoningEffort).toBe('medium');
+  });
+
+  it('rejects an unsupported TraeX reasoning effort pair', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'traex', workingDir: '/tmp', model: 'DeepSeek-V4-Pro' },
+      botName: 'TraeX', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
   it('rejects a model-only override that forms an unsupported effective pair', async () => {
     mockGetBot.mockReturnValue({
       config: {

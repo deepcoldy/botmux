@@ -1,3 +1,4 @@
+import { existsSync, statSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
@@ -226,7 +227,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -254,6 +255,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         ...goalEnvConfigArgs(),
       ];
       if (model && model.trim()) baseArgs.push('--model', model.trim());
+      if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 

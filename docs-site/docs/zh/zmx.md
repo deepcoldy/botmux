@@ -26,7 +26,7 @@ zmx list
 
 > **⚠️ 从 0.6 升级**：替换磁盘上的 `zmx` 二进制不会替换已经运行的逐会话 daemon；升级到 0.7.0+ 后，请手动关闭并重新创建所有 0.6 会话，再重启 botmux。botmux **不会自动冷迁移**旧会话，只运行 `botmux restart` 也不够。ZMX 的 IPC `Tag` 枚举是 non-exhaustive 的（未知 tag 走 `_` 分支被忽略），所以 0.6 daemon 收到新的 `.Send` tag 会**直接丢弃**，而 `zmx send` 仍然退出码 0 —— 表现为命令成功但输入从未送达。
 
-开发时，默认 `pnpm test` 只跑 mock / 纯函数单测，**不要求本机安装 ZMX**。会启动真实 `zmx` 的覆盖位于 `*.e2e.ts`，只在显式运行 E2E 时参与，并在 ZMX 不可用时自动跳过；这与仓库现有 tmux / Herdr E2E 的处理方式一致。
+开发时，默认 `bun run test` 只跑 mock / 纯函数单测，**不要求本机安装 ZMX**。会启动真实 `zmx` 的覆盖位于 `*.e2e.ts`，只在显式运行 E2E 时参与，并在 ZMX 不可用时自动跳过；这与仓库现有 tmux / Herdr E2E 的处理方式一致。
 
 ## 开启 ZMX
 

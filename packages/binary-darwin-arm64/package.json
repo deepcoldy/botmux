@@ -1,0 +1,25 @@
+{
+  "name": "botmux-darwin-arm64",
+  "version": "0.0.0",
+  "description": "The macOS arm64 (Apple Silicon) binary for botmux",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepcoldy/botmux.git",
+    "directory": "packages/binary-darwin-arm64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "botmux"
+  ],
+  "preferUnplugged": true,
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

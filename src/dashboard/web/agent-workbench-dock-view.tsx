@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import {
   buildWorkbenchHash,
@@ -48,7 +49,7 @@ function firstSessionId(sessions: readonly WorkbenchSessionRow[]): string | null
   return groups['needs-you'][0]?.sessionId ?? groups.active[0]?.sessionId ?? groups.recent[0]?.sessionId ?? null;
 }
 
-export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.Element {
+export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): React.JSX.Element {
   const api = useMemo(() => props.api ?? createWorkbenchApi(), [props.api]);
   // 坞和完整工作台是同一份外观：挂载期间落到文档根，离开时还回全站机制。
   useWorkbenchAppearanceRoot();

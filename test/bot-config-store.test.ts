@@ -568,6 +568,63 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.cliId).toBe('codex');
   });
 
+  it('reasoningEffort is a next-session enum field', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex', model: 'DeepSeek-V4-Pro' });
+    const spec = store.findConfigField('reasoningEffort')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(store.coerceConfigValue(spec, 'MEDIUM')).toEqual({ ok: true, value: 'medium' });
+    expect(store.coerceConfigValue(spec, 'extreme')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const r1 = await store.applyConfigField('app_default', spec, 'medium');
+    expect(r1.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('medium');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('allows TraeX common reasoning effort when model is unset', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex' });
+    const spec = store.findConfigField('reasoningEffort')!;
+    const r = await store.applyConfigField('app_default', spec, 'medium');
+    expect(r.ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('medium');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
+  });
+
+  it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
+    const unsupportedCli = await loaded({ cliId: 'claude-code' });
+    const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
+    const r1 = await unsupportedCli.store.applyConfigField('app_default', spec, 'medium');
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.reason).toBe('reasoning_effort_not_supported');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(unsupportedCli.registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+
+    const unsupportedPair = await loaded({ cliId: 'traex', model: 'DeepSeek-V4-Pro' });
+    const r2 = await unsupportedPair.store.applyConfigField('app_default', spec, 'xhigh');
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toBe('reasoning_effort_not_supported_by_model');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(unsupportedPair.registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('rejects model writes that would make the stored reasoningEffort invalid', async () => {
+    const { registry, store } = await loaded({ cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'xhigh' });
+    const spec = store.findConfigField('model')!;
+    const r = await store.applyConfigField('app_default', spec, 'DeepSeek-V4-Pro');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reasoning_effort_not_supported_by_model');
+    expect(readConfig().model).toBe('GPT-5.5');
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.model).toBe('GPT-5.5');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+  });
+
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('customPassthroughCommands')!;
@@ -691,6 +748,23 @@ describe('bot-config store', () => {
     const cliSpec = store.findConfigField('cli')!;
     expect(store.coerceConfigValue(cliSpec, 'codex')).toEqual({ ok: true, value: 'codex' });
     expect(store.coerceConfigValue(cliSpec, 'bogus-cli')).toEqual({ ok: false, reason: 'invalid_cli' });
+    const authSpec = store.findConfigField('codexAuthSync')!;
+    expect(store.coerceConfigValue(authSpec, 'ISOLATED')).toEqual({ ok: true, value: 'isolated' });
+    expect(store.coerceConfigValue(authSpec, 'global')).toEqual({ ok: false, reason: 'invalid_enum' });
+  });
+
+  it('persists codexAuthSync through the generic /config store path', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('codexAuthSync')!;
+    const set = await store.applyConfigField('app_default', spec, 'isolated');
+    expect(set.ok).toBe(true);
+    expect(readConfig().codexAuthSync).toBe('isolated');
+    expect(registry.getBot('app_default').config.codexAuthSync).toBe('isolated');
+
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared.ok).toBe(true);
+    expect(readConfig().codexAuthSync).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexAuthSync).toBeUndefined();
   });
 
   it('getConfigCardData returns the card view (booleans + cli options + model choices)', async () => {

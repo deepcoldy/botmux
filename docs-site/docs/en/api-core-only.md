@@ -150,7 +150,7 @@ The trigger/poll/cancel **four-state contract is identical to a normal bot** —
 - **An HTTP response mode is mandatory**: an apiOnly bot's trigger must set `options.waitForFinalOutput` (sync) or `options.asyncReturnSessionId` (async), else `400 bad_request` (apiOnly has no Feishu group to reply into, so the result must come back over HTTP).
 - An async trigger returns a synthetic `http_async_*` chatId plus a real `sessionId`; poll `trigger-result` with that `sessionId`.
 - The user instruction goes in the top-level **`instruction`** field (rendered as a trusted `<botmux_task>`) — not `prompt`.
-- `options.model` / `options.reasoningEffort` apply to codex-family and grok fresh triggers.
+- `options.model` / `options.reasoningEffort` apply to codex-family, traex, and grok fresh triggers.
 - **Poll `trigger-result` with the full sessionId** (UUID), not the `[worker:xxxxxxxx]` short tag from logs — the short tag ≠ sessionId and yields `session_not_found`.
 
 ```bash

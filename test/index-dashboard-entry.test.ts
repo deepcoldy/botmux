@@ -116,16 +116,6 @@ describe('index-dashboard.ts — Dashboard PM2 entry', () => {
     expect(src).not.toMatch(/from\s+['"]\.\.\/config\.js['"]/);
     expect(src).not.toMatch(/from\s+['"]\.\.\/dashboard\//);
   });
-
-  it('cli.ts points the botmux-dashboard PM2 app at dist/index-dashboard.js', () => {
-    const cli = read('cli.ts');
-    const appAt = cli.indexOf("name: 'botmux-dashboard'");
-    expect(appAt).toBeGreaterThan(-1);
-    // The script assignment sits inside the app object right after the name.
-    const app = cli.slice(appAt, appAt + 1200);
-    expect(app).toContain("join(PKG_ROOT, 'dist', 'index-dashboard.js')");
-    expect(app).not.toContain("join(PKG_ROOT, 'dist', 'dashboard.js')");
-  });
 });
 
 /**

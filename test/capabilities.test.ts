@@ -1,8 +1,9 @@
-import { spawnSync } from 'node:child_process';
+import { type SpawnSyncReturns } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import {
   BOTMUX_CAPABILITIES_SCHEMA_VERSION,
   botmuxCapabilities,
@@ -44,15 +45,15 @@ describe('botmux capabilities contract', () => {
   it('prints only the fixed JSON document and creates no runtime state', () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-capabilities-'));
     homes.push(home);
-    const result = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'capabilities', '--json'],
+    const result = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['capabilities', '--json'],
       {
         cwd: resolve('.'),
         env: { ...process.env, HOME: home },
         encoding: 'utf8',
       },
-    );
+    ) as SpawnSyncReturns<string>;
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe('');

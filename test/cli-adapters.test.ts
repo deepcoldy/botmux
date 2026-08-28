@@ -554,6 +554,49 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('thread-123');
   });
 
+  it('canonicalizes a symlinked codex so --codex-bin matches the sandbox-authorized path', () => {
+    // Regression, same class as the dsh case below: `codex` on PATH is commonly a
+    // symlink CHAIN — measured on the dev box, ~/.local/bin/codex →
+    // …/standalone/current/bin/codex → …/releases/<version>/bin/codex, where the
+    // middle `current` hop re-points on every upgrade. The file sandbox authorizes
+    // only dirname(realpath(bin)) (worker.ts `execDirs`), while
+    // codex-app-runner.ts spawns --codex-bin verbatim → `execvp … No such file or
+    // directory` inside the sandbox and an app-server crash-loop.
+    //
+    // Verified against a real bwrap sandbox: raw path → execvp ENOENT, canonical
+    // path → exit 0. All three call sites must agree, since they share one cache.
+    const root = mkdtempSync(join(tmpdir(), 'codex-symlink-'));
+    try {
+      const realDir = join(root, 'releases', '1.2.3', 'bin');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'codex');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      // Two hops, mirroring the real install: link/codex → current/codex → realBin.
+      const midDir = join(root, 'current', 'bin');
+      mkdirSync(midDir, { recursive: true });
+      const midBin = join(midDir, 'codex');
+      symlinkSync(realBin, midBin);
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'codex');
+      symlinkSync(midBin, linkBin);
+
+      const symlinkAdapter = createCodexAppAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+      expect(linkBin).not.toBe(canonicalReal); // the hazard exists in this fixture
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const binIdx = args.indexOf('--codex-bin');
+      expect(binIdx).toBeGreaterThanOrEqual(0);
+      expect(args[binIdx + 1]).toBe(canonicalReal);
+      // Must equal the argv exactly — the sandbox authorizes from THIS list while
+      // the runner spawns the argv; any divergence is the bug.
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('passes the opt-in browser bridge only to the Codex App runner', () => {
     const disabled = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
     expect(disabled).not.toContain('--browser-family');
@@ -808,6 +851,54 @@ describe('mir buildArgs (runner model)', () => {
   it('omits --mircli-bin when no cliPathOverride is configured', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     expect(args).not.toContain('--mircli-bin');
+  });
+
+  it('canonicalizes a symlinked mircli so --mircli-bin matches the sandbox-authorized path', () => {
+    // Same defect class as codex-app above and dsh below: mir-runner.ts spawns
+    // `this.mircliBin || MIRCLI_BIN || 'mircli'` verbatim, while the file sandbox
+    // authorizes only dirname(realpath(bin)) (worker.ts `execDirs`) → a raw
+    // symlink path ENOENTs inside the sandbox.
+    //
+    // mir's gap used to be the WIDEST of the three: before this it declared no
+    // sandboxExtraExecPaths at all, so the second-stage binary was never exposed.
+    const root = mkdtempSync(join(tmpdir(), 'mircli-symlink-'));
+    try {
+      const realDir = join(root, 'releases', '2.0.0', 'bin');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'mircli');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      // Two hops, matching how versioned CLIs are usually installed.
+      const midDir = join(root, 'current', 'bin');
+      mkdirSync(midDir, { recursive: true });
+      const midBin = join(midDir, 'mircli');
+      symlinkSync(realBin, midBin);
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'mircli');
+      symlinkSync(midBin, linkBin);
+
+      const symlinkAdapter = createMirAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+      expect(linkBin).not.toBe(canonicalReal); // the hazard exists in this fixture
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const idx = args.indexOf('--mircli-bin');
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1]).toBe(canonicalReal);
+      // The sandbox authorizes from this list while the runner spawns the argv —
+      // any divergence between the two IS the bug.
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('declares no sandbox exec path when there is no cliPathOverride', () => {
+    // Without an override the runner resolves `mircli` from PATH *inside* the
+    // sandbox, which the adapter cannot know here — so it declares nothing rather
+    // than guessing. Documents the remaining gap (tracked as a follow-up): that
+    // PATH entry may not be bind-mounted, and would still ENOENT.
+    expect(adapter.sandboxExtraExecPaths?.()).toEqual([]);
   });
 
   it('has no portable copy-paste resume command (mircli owns the session store)', () => {
@@ -1944,6 +2035,22 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('injects structured reasoning effort as a TraeX launch config', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-effort',
+      resume: false,
+      reasoningEffort: 'medium',
+    });
+    const i = args.indexOf('model_reasoning_effort="medium"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it('omits the reasoning effort launch config when none is configured', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-effort', resume: false });
+    expect(args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
   it('bypasses both permission and hook-review gates for automation when the hook-trust toggle is on', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false, bypassHookTrust: true });
     expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');

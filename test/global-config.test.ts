@@ -194,28 +194,28 @@ describe('global dashboard config', () => {
     expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
   });
 
-  it('workflow feature defaults ON and reads workflow.enabled as a top-level kill-switch', () => {
-    // No config file / no env: ON (backwards compatible).
-    expect(isWorkflowFeatureEnabled()).toBe(true);
-    expect(readGlobalConfig().workflow).toBeUndefined();
-    // Explicit false disables; round-trips as a typed field.
-    mergeGlobalConfig({ workflow: { enabled: false } });
-    expect(readGlobalConfig().workflow).toEqual({ enabled: false });
+  it('workflow feature defaults OFF and reads workflow.enabled as a top-level opt-in', () => {
+    // No config file / no env: OFF (disabled by default).
     expect(isWorkflowFeatureEnabled()).toBe(false);
-    // Explicit true re-enables.
+    expect(readGlobalConfig().workflow).toBeUndefined();
+    // Explicit true enables; round-trips as a typed field.
     mergeGlobalConfig({ workflow: { enabled: true } });
+    expect(readGlobalConfig().workflow).toEqual({ enabled: true });
     expect(isWorkflowFeatureEnabled()).toBe(true);
+    // Explicit false disables again.
+    mergeGlobalConfig({ workflow: { enabled: false } });
+    expect(isWorkflowFeatureEnabled()).toBe(false);
   });
 
-  it('ignores a non-boolean workflow.enabled (falls back to default ON)', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({ workflow: { enabled: 'no' } }));
+  it('ignores a non-boolean workflow.enabled (falls back to default OFF)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ workflow: { enabled: 'yes' } }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().workflow).toBeUndefined();
-    expect(isWorkflowFeatureEnabled()).toBe(true);
+    expect(isWorkflowFeatureEnabled()).toBe(false);
   });
 
   it('BOTMUX_WORKFLOW_ENABLED env overrides the config file both ways', () => {
-    // Config says disabled, env forces it back on.
+    // Config says disabled, env forces it on.
     mergeGlobalConfig({ workflow: { enabled: false } });
     expect(isWorkflowFeatureEnabled()).toBe(false);
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'true');

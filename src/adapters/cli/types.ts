@@ -144,8 +144,8 @@ export interface CliAdapter {
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
-     *  grok `--reasoning-effort`). Only adapters with an explicit reasoning
-     *  control honor it; others ignore. */
+     *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
+     *  with an explicit reasoning control honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;

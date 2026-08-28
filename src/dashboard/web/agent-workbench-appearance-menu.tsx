@@ -16,6 +16,7 @@ import {
   useState,
   useSyncExternalStore,
   type CSSProperties,
+  type JSX,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { t, ui } from './ui.js';

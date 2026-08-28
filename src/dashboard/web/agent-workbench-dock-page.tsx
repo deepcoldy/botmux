@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useEffect, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useDashboardStore } from './react-hooks.js';
@@ -5,7 +6,7 @@ import { ui } from './ui.js';
 import { parseWorkbenchHash, type WorkbenchSessionRow } from './agent-workbench-model.js';
 import { AgentWorkbenchDockView } from './agent-workbench-dock-view.js';
 
-function AgentWorkbenchDockRoutePage(): JSX.Element {
+function AgentWorkbenchDockRoutePage(): React.JSX.Element {
   const snapshot = useDashboardStore();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {

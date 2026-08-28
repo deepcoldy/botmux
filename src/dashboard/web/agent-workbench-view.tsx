@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useCallback,
   useEffect,
@@ -148,7 +149,7 @@ function nextLayout(
   };
 }
 
-export function AgentWorkbenchView(props: AgentWorkbenchViewProps): JSX.Element {
+export function AgentWorkbenchView(props: AgentWorkbenchViewProps): React.JSX.Element {
   const api = useMemo(() => props.api ?? createWorkbenchApi(), [props.api]);
   const storage = props.storage === undefined ? browserStorage() : props.storage;
   const location = props.location === undefined ? browserLocation() : props.location;

@@ -1,0 +1,3 @@
+# CI drops the compiled Bun binary here right before publishing (~100MB).
+# Never commit it — the published tarball gets it via `files: ["botmux"]`.
+botmux

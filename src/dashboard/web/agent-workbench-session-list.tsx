@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useEffect,
   useMemo,
@@ -114,7 +115,7 @@ function FeishuChatAnchor(props: {
   ariaLabel: string;
   onActivate?: () => void;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <a
       className={props.className}
@@ -218,7 +219,7 @@ function useTouchRowMetrics(): boolean {
   return touch;
 }
 
-export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Element {
+export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JSX.Element {
   const touchRows = useTouchRowMetrics();
   const [query, setQuery] = useState('');
   const [scrollTop, setScrollTop] = useState(0);

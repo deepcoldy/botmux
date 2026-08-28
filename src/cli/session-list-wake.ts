@@ -22,8 +22,18 @@ export function canWakeDormantBackendForAttach(input: {
   attachBackend?: 'tmux' | 'zmx';
   target?: PersistentBackendTarget;
 }): boolean {
+  // tmux 3.6b on macOS reports an absent server socket as a connection-level
+  // failure, which the shared destructive probe correctly keeps `unknown`:
+  // another process could still own an unreachable/unlinked server. A picker
+  // wake is different — it does not claim the old pane is dead or delete it.
+  // The owning daemon serializes the attempt, an existing worker wins as
+  // `already_running`, and tmux session-name uniqueness fences a reachable old
+  // pane. Keep ZMX unknown fail-closed because its attach identity is PID/label
+  // sensitive rather than name-fenced by one shared server.
+  const recoverableProbe = input.probe === 'missing'
+    || (input.probe === 'unknown' && input.attachBackend === 'tmux');
   return !input.isAdopt
-    && input.probe === 'missing'
+    && recoverableProbe
     && input.realManagedSession
     && !!input.attachBackend
     && !!input.target;

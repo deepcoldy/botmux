@@ -1,11 +1,12 @@
 import { createHmac } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { parseExactChatGrantCliArgs } from '../src/cli/exact-chat-grant.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
@@ -20,10 +21,10 @@ function runCli(
   env: NodeJS.ProcessEnv,
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, ...args], {
+    const child = spawnTsScript(CLI_PATH, args, {
       env: { ...process.env, ...env, BOTMUX_WORKFLOW: '' },
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');

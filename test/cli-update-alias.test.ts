@@ -1,8 +1,9 @@
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const PROJECT_ROOT = join(__dirname, '..');
@@ -18,7 +19,7 @@ afterAll(() => {
 });
 
 function runCli(command: string): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(process.execPath, ['--import', 'tsx', CLI_PATH, command], {
+  const result = spawnSyncTsScript(CLI_PATH, [command], {
     cwd: PROJECT_ROOT,
     env: {
       ...process.env,
@@ -30,7 +31,8 @@ function runCli(command: string): { status: number | null; stdout: string; stder
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  // 助手返回 string | Buffer(不带 spawnSync 的 encoding 重载narrowing);此处 encoding:'utf8' 保证是 string。
+  return { status: result.status, stdout: result.stdout as string, stderr: result.stderr as string };
 }
 
 describe('botmux update alias', () => {

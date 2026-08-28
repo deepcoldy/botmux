@@ -1,0 +1,25 @@
+{
+  "name": "botmux-darwin-x64",
+  "version": "0.0.0",
+  "description": "The macOS x64 binary for botmux",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepcoldy/botmux.git",
+    "directory": "packages/binary-darwin-x64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "botmux"
+  ],
+  "preferUnplugged": true,
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

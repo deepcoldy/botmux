@@ -1,4 +1,3 @@
-import { createRequire } from 'node:module';
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
@@ -36,9 +35,16 @@ import {
 import type { CliId } from '../adapters/cli/types.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 
-const require = createRequire(import.meta.url);
-const QRCode = require('qrcode-terminal/vendor/QRCode') as any;
-const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel') as Record<string, unknown>;
+// Static default-imports of qrcode-terminal's vendored QRCode class (its public
+// API only prints to a terminal; we need the low-level class to render a QR into
+// a data structure). Explicit `.js` file specifiers — NOT `createRequire(...)`
+// with a bare dir path — so `bun build --compile` traces and EMBEDS them into
+// the single-file binary. The old dynamic require left them unbundled, and the
+// compiled dashboard crashed at runtime with "Cannot find module
+// 'qrcode-terminal/vendor/QRCode' from /$bunfs/…". Both files are `module.exports
+// = …` CJS; ESM default-import interop gives the export on both Node and Bun.
+import QRCode from 'qrcode-terminal/vendor/QRCode/index.js';
+import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js';
 
 export type BotOnboardingStatus =
   | 'starting'

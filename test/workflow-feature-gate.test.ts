@@ -180,11 +180,11 @@ describe('workflow feature gate — conditional installer (ensureWorkflowSkills)
   });
 });
 
-describe('workflow feature gate — accessor smoke (default ON, no config/env)', () => {
-  it('defaults to enabled when neither env nor config forces it', () => {
+describe('workflow feature gate — accessor smoke (default OFF, no config/env)', () => {
+  it('defaults to disabled when neither env nor config forces it', () => {
     // Guard: the test process must not be leaking an override.
     if (process.env.BOTMUX_WORKFLOW_ENABLED == null) {
-      expect(isWorkflowFeatureEnabled()).toBe(true);
+      expect(isWorkflowFeatureEnabled()).toBe(false);
     }
   });
 });

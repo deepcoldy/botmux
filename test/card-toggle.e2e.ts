@@ -46,10 +46,12 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   // migrated cards from `expanded:boolean` to a tri-mode enum). The mock
   // surfaces it as `displayMode` so assertions can inspect the queued/sent
   // PATCH payloads.
-  buildStreamingCard: vi.fn(
-    (_sid: string, _rid: string, _url: string, _title: string, _content: string, _status: string, _cliId: string, displayMode?: string) =>
-      JSON.stringify({ displayMode: displayMode ?? 'hidden', content: _content, status: _status }),
-  ),
+  buildStreamingCard: vi.fn((...args: any[]) => JSON.stringify({
+    displayMode: args[7] ?? 'hidden',
+    content: args[4],
+    status: args[5],
+    silentIdle: args[19] === true,
+  })),
   buildSessionCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
@@ -159,10 +161,11 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
   };
 }
 
-function makeToggleAction(cardNonce?: string) {
+function makeToggleAction(cardNonce?: string, openMessageId?: string) {
   return {
     action: { value: { action: 'toggle_stream', root_id: ROOT_ID, ...(cardNonce ? { card_nonce: cardNonce } : {}) } },
     operator: { open_id: 'ou_user' },
+    ...(openMessageId ? { context: { open_message_id: openMessageId } } : {}),
   };
 }
 
@@ -193,6 +196,32 @@ describe('Streaming card toggle_stream', () => {
   // ── Bug 1: Old card toggle should NOT affect latest card ──────────────────
 
   describe('Bug 1: clicking toggle on OLD frozen card', () => {
+    it.each([
+      { frozenSilent: false, liveSilent: true },
+      { frozenSilent: true, liveSilent: false },
+    ])('keeps the frozen card own silent label ($frozenSilent) instead of borrowing the live turn ($liveSilent)', async ({ frozenSilent, liveSilent }) => {
+      const ds = makeDaemonSession({
+        silentIdleTurnId: liveSilent ? 'om_live_turn' : undefined,
+        frozenCards: new Map([[NONCE_OLD, {
+          messageId: 'om_old_card',
+          content: 'old output',
+          title: 'old turn',
+          displayMode: 'hidden',
+          silentIdle: frozenSilent,
+        }]]),
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+
+      const result = await handleCardAction(
+        makeToggleAction(NONCE_OLD, 'om_old_card'),
+        makeDeps(sessions),
+        APP_ID,
+      ) as any;
+
+      expect(result?.silentIdle).toBe(frozenSilent);
+    });
+
     it('self-heals live displayMode on a stale-nonce click, but queues no PATCH without a clicked message id', async () => {
       const ds = makeDaemonSession({ displayMode: 'hidden' });
       const sessions = new Map<string, DaemonSession>();

@@ -31,6 +31,12 @@ describe('staticModelChoices（静态候选，shell-free）', () => {
     expect(staticModelChoices('codex-app')).toEqual(staticModelChoices('codex'));
   });
 
+  it('traex returns a curated model list that includes reasoning-capable models', () => {
+    const models = staticModelChoices('traex');
+    expect(models).toContain('DeepSeek-V4-Pro');
+    expect(models).toContain('gpt-5.5');
+  });
+
   it('aiden-x-claude 网关键回退到底层 claude-code 候选', () => {
     // 非 ttadk 网关（aiden/cjadk）不拦截，读底层适配器的 modelChoices。
     expect(staticModelChoices('aiden-x-claude')).toContain('sonnet');

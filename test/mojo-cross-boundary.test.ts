@@ -19,11 +19,12 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 
 import { describe, expect, it, vi } from 'vitest';
 
 import type { DaemonToWorker } from '../src/types.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -118,7 +119,7 @@ function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): H
     mojo: { cloud: true, ...(opts.mojo ?? {}) },
   }]));
   const logs: string[] = [];
-  const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+  const child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,

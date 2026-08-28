@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   BOTMUX_SHELL_HINTS,
@@ -18,7 +18,10 @@ afterEach(() => {
   if (restoreNoVisibleOutputHint) Object.defineProperty(config, 'noVisibleOutputHint', restoreNoVisibleOutputHint);
 });
 
-describe('always-on Workflow discovery hint', () => {
+describe('Workflow discovery hint (enabled hosts)', () => {
+  beforeEach(() => { process.env.BOTMUX_WORKFLOW_ENABLED = 'true'; });
+  afterEach(() => { delete process.env.BOTMUX_WORKFLOW_ENABLED; });
+
   it('advertises bounded DAGs and reuse in zh/en shell hints', () => {
     const zh = buildBotmuxShellHints('zh').find((line) => line.startsWith('Workflow：'));
     const en = buildBotmuxShellHints('en').find((line) => line.startsWith('Workflow:'));

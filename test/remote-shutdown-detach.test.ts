@@ -21,6 +21,7 @@ import {
 } from '../src/core/remote-shutdown-detach.js';
 import { sendWorkerInput } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { mutatePersistedSessionRow } from './helpers/session-store-disk.js';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -107,14 +108,15 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     session.backendType = 'riff';
     session.riffParentTaskId = 'task-before';
     sessionStore.updateSession(session);
-    const blockedDataDir = join(dataDir, 'not-a-directory');
-    writeFileSync(blockedDataDir, 'block');
-    config.session.dataDir = blockedDataDir;
+    // SQLite 行写不经过文件路径拼装，失败注入改走 store 的 test-only 钩子。
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('simulated durable lineage write failure'); });
 
-    expect(() => sessionStore.persistActiveRemoteLineageExact(session.sessionId, 'task-after')).toThrow();
-    expect(session.riffParentTaskId).toBe('task-before');
-
-    config.session.dataDir = dataDir;
+    try {
+      expect(() => sessionStore.persistActiveRemoteLineageExact(session.sessionId, 'task-after')).toThrow();
+      expect(session.riffParentTaskId).toBe('task-before');
+    } finally {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    }
     expect(sessionStore.getSessionFresh(session.sessionId)?.riffParentTaskId).toBe('task-before');
   });
 
@@ -836,10 +838,9 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
         queueMicrotask(() => {
           // Simulate a different process advancing the durable owner after
           // prepare, without changing this daemon's runtime generation.
-          const sessionsPath = join(dataDir, 'sessions-app.json');
-          const projection = JSON.parse(readFileSync(sessionsPath, 'utf8')) as Record<string, any>;
-          projection[f.ds.session.sessionId]!.riffParentTaskId = 'task-external-owner';
-          writeFileSync(sessionsPath, JSON.stringify(projection, null, 2));
+          mutatePersistedSessionRow(dataDir, 'app', f.ds.session.sessionId, (row) => {
+            row.riffParentTaskId = 'task-external-owner';
+          });
           worker.emit('message', {
             type: 'remote_shutdown_result', requestId: message.requestId,
             phase: 'prepare', ok: true, taskId: 'task-prepared-child',
@@ -865,10 +866,9 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     const f = fixture('task-parent', (worker, message) => {
       if (message.type === 'remote_shutdown_prepare') {
         queueMicrotask(() => {
-          const sessionsPath = join(dataDir, 'sessions-app.json');
-          const projection = JSON.parse(readFileSync(sessionsPath, 'utf8')) as Record<string, any>;
-          projection[f.ds.session.sessionId]!.pid = 999_999;
-          writeFileSync(sessionsPath, JSON.stringify(projection, null, 2));
+          mutatePersistedSessionRow(dataDir, 'app', f.ds.session.sessionId, (row) => {
+            row.pid = 999_999;
+          });
           worker.emit('message', {
             type: 'remote_shutdown_result', requestId: message.requestId,
             phase: 'prepare', ok: true, taskId: 'task-prepared-child',
@@ -897,10 +897,9 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
         const result = originalPersist(sessionId, taskId, options);
         // Exact replacement race: CAS wrote the expected task, then a new
         // durable owner published the same task before the separate readback.
-        const sessionsPath = join(dataDir, 'sessions-app.json');
-        const projection = JSON.parse(readFileSync(sessionsPath, 'utf8')) as Record<string, any>;
-        projection[sessionId]!.pid = 888_888;
-        writeFileSync(sessionsPath, JSON.stringify(projection, null, 2));
+        mutatePersistedSessionRow(dataDir, 'app', sessionId, (row) => {
+          row.pid = 888_888;
+        });
         return result;
       },
     );

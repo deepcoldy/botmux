@@ -79,7 +79,7 @@ export function globalWrapperPath(): string {
 /** Is `dir` a botmux source checkout we may update: a git worktree whose
  *  package.json says it's botmux? Repo-identity guards against pulling/building
  *  an unrelated repo a hijacked wrapper path might point at. Deliberately does
- *  NOT require `dist/cli.js` — `pnpm use:here` allows a fresh checkout without a
+ *  NOT require `dist/cli.js` — `bun run use:here` allows a fresh checkout without a
  *  build, and local-dev update is exactly what produces that dist. */
 export function isBotmuxCheckout(dir: string): boolean {
   if (!existsSync(join(dir, '.git'))) return false;

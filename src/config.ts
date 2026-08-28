@@ -1,5 +1,6 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
   globalVcMeetingAgentListenerBotAppId,
@@ -62,14 +63,45 @@ function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
   return 'tmux';
 }
 
-// Computed once: the packaged fallback data dir. The effective dir is read
-// lazily (getter below) so that a SESSION_DATA_DIR set *after* this module is
-// first imported — e.g. cli.ts subcommands doing
-// `process.env.SESSION_DATA_DIR ??= resolveDataDir()` — is still honored. A
-// static value would freeze the packaged default at import time and make those
-// readers (resolveTeamRoleFile / getBotCapability / …) silently look in the
-// wrong directory. Mirrors the web/dashboard externalHost getters below.
-const packagedDataDir = new URL('../data', import.meta.url).pathname;
+// The fallback data dir used when SESSION_DATA_DIR is not set. Resolved through
+// the CANONICAL resolver (core/data-dir.ts), which is HOME-based:
+//   explicit SESSION_DATA_DIR → ~/.botmux/.data-dir breadcrumb → ~/.botmux/data
+// and never returns an install-relative path.
+//
+// It used to be `new URL('../data', import.meta.url)` — the INSTALL directory's
+// sibling. That was wrong in two ways and only stayed hidden because pm2's
+// ecosystem config baked SESSION_DATA_DIR into every managed app's env, so the
+// `??` branch was effectively dead in production:
+//   1. It pointed at a directory that does not exist and is not shipped
+//      (package.json `files` has no `data/`), so any reader that fell through
+//      here silently used a DIFFERENT store than the CLI's own
+//      resolveBotmuxDataDir() — cross-store drift for the ~389 readers of
+//      config.session.dataDir (broken /pair codes, hubsSynced:0, …).
+//   2. Inside a `bun build --compile` binary the install root is the read-only
+//      virtual `/$bunfs`, so writers hit EACCES (observed: the codex-notifier
+//      worker lease failing to mkdir '/$bunfs/data').
+// The built-in supervisor replaced pm2 and does not bake that env for free, so
+// the fallback has to be correct on its own. It is still read through the lazy
+// getter below so a SESSION_DATA_DIR set AFTER this module is first imported
+// (e.g. cli.ts subcommands doing `process.env.SESSION_DATA_DIR ??= …`) still wins.
+//
+// MEMOISED because the getter is on a HOT path: ~389 call sites read
+// `config.session.dataDir`, some in loops, and resolveBotmuxDataDir() performs up
+// to four filesystem syscalls (lstat + readFile + existsSync + stat) probing the
+// `~/.botmux/.data-dir` breadcrumb. Measured: 6.27µs per uncached call vs 0.50µs
+// for the env-set early return — 12.5×. The previous code computed its (wrong,
+// install-relative) fallback exactly once at module load, so making it lazy must
+// not also make it repeat the I/O on every read.
+//
+// Safe to cache: the fallback is only consulted when SESSION_DATA_DIR is unset,
+// and it derives from HOME plus a breadcrumb that the daemon writes at startup —
+// neither changes within a process's lifetime. A process that sets
+// SESSION_DATA_DIR later never reaches this function at all, because the getter
+// checks the env first.
+let cachedFallbackDataDir: string | undefined;
+function fallbackDataDir(): string {
+  return (cachedFallbackDataDir ??= resolveBotmuxDataDir());
+}
 
 export interface ChatBotDiscoveryConfig {
   listBotsApiEnabled: boolean;
@@ -167,7 +199,7 @@ export const config = {
     appSecret: process.env.LARK_APP_SECRET ?? '',
   },
   session: {
-    get dataDir() { return process.env.SESSION_DATA_DIR ?? packagedDataDir; },
+    get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
     // Writable for back-compat: callers/tests historically assigned
     // `config.session.dataDir = ...`. Map writes onto SESSION_DATA_DIR so the
     // getter reflects them and the old assignable contract is preserved.

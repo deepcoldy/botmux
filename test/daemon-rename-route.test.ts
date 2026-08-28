@@ -208,8 +208,6 @@ import { admitQueuedActivationTail } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
 
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
@@ -1494,15 +1492,20 @@ describe('/rename production routing — must not pre-create a session (review P
   });
 
   it('new topic: passes the accepted Lark message id into the first worker', async () => {
-    await handleNewTopic(
-      makeEventData('om_workflow_new', '/workflow new 修复首轮授权'),
-      makeCtx('om_workflow_new', 'om_workflow_new'),
-    );
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      await handleNewTopic(
+        makeEventData('om_workflow_new', '/workflow new 修复首轮授权'),
+        makeCtx('om_workflow_new', 'om_workflow_new'),
+      );
 
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ turnId: 'om_workflow_new' }));
-    const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
-    expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ turnId: 'om_workflow_new' }));
+      const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
+      expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
   });
 
   it('R6-B1: a plain-human Codex App NEW TOPIC freezes steer authorization onto the opening fork payload', async () => {
@@ -1543,14 +1546,19 @@ describe('/rename production routing — must not pre-create a session (review P
     // A real human sends `/workflow new …`, but the generated/rewritten control
     // prompt must NOT be steerable (locked "v3-grill serial"). This is the
     // fail-open codex caught: the new-topic ds hardcoded threadGrill:false.
-    await handleNewTopic(
-      makeEventData('om_grill_new', '/workflow new 修复首轮授权'),
-      makeCtx('om_grill_new', 'om_grill_new'),
-    );
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      await handleNewTopic(
+        makeEventData('om_grill_new', '/workflow new 修复首轮授权'),
+        makeCtx('om_grill_new', 'om_grill_new'),
+      );
 
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
-    expect(openingPayload?.codexAppSteerable).toBeUndefined();
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      expect(openingPayload?.codexAppSteerable).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
   });
 
   it('R6/R7-B1: a Feishu bot-sender NEW TOPIC that forks stays forced-serial (no steer authorization)', async () => {

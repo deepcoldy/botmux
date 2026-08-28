@@ -19,11 +19,12 @@
  * kept OUT of every other column (title, session id, working dir), so a matched
  * substring can only have come from the target label the fix produces.
  */
-import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const APP_ID = 'cli_list_riff_test';
@@ -85,9 +86,9 @@ function runList(
       HOME: homeDir,
       USERPROFILE: homeDir,
     };
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', CLI_PATH, 'list', ...args],
+    const child = spawnTsScript(
+      CLI_PATH,
+      ['list', ...args],
       { env, stdio: ['ignore', 'pipe', 'pipe'] },
     );
     let stdout = '';
