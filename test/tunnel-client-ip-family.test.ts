@@ -9,9 +9,11 @@ const { FakeWebSocket, createWebSocketStream, netConnect } = vi.hoisted(() => {
       on: vi.fn(),
       pipe: vi.fn(),
       destroy: vi.fn(),
+      setNoDelay: vi.fn(),
     };
     stream.on.mockReturnValue(stream);
     stream.pipe.mockReturnValue(stream);
+    stream.setNoDelay.mockReturnValue(stream);
     return stream;
   };
 
@@ -138,6 +140,9 @@ describe('tunnel-client 不强制协议族', () => {
     expect(dataDials[0]!.terminate).not.toHaveBeenCalled();
     expect(createWebSocketStream).toHaveBeenCalledWith(dataDials[0]);
     expect(netConnect).toHaveBeenCalledWith(7891, '127.0.0.1');
+    // 桥接到本机 dashboard 的裸 socket 必须关 Nagle：交互式终端分帧小包否则被
+    // delayed-ACK 扣住(~40ms)→ Web 终端经隧道中转周期卡顿。锁住这条行为，删源码那行会红。
+    expect(netConnect.mock.results[0]!.value.setNoDelay).toHaveBeenCalledWith(true);
     handle.stop();
   });
 

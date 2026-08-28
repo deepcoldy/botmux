@@ -72,6 +72,7 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   brandLabel?: string | null;
   sandbox?: boolean;
+  codexAuthSync?: 'shared' | 'isolated';
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
@@ -90,6 +91,9 @@ export type BotDefaultsRow = {
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   thinkingCard?: boolean;
+  /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
+   *  explicit false means the tag is suppressed. */
+  senderTag?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };

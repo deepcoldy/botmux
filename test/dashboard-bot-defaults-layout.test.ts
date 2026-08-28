@@ -115,6 +115,16 @@ describe('bot defaults focused layout', () => {
     expect(css).toMatch(/\.bot-defaults-page \.bd-description-modal\s*\{[\s\S]*?max-height:\s*min\(720px,\s*calc\(100vh - 32px\)\);/);
   });
 
+  it('offers the Codex auth policy with explicit sandbox-independent scope copy', () => {
+    expect(page).toContain('data-input="codexAuthSync"');
+    expect(page).toContain("<CodexAuthSection bot={bot} patchBot={patchBot} />");
+    expect(page).toContain("botDefaults.sectionCodexAuth");
+    expect(page).toContain('/codex-auth-sync');
+    expect(i18n.match(/'botDefaults\.codexAuthSyncHelp'/g)).toHaveLength(2);
+    expect(i18n).toContain('无论是否启用沙箱都使用本 bot 的 CODEX_HOME');
+    expect(i18n).toContain("with or without the sandbox");
+  });
+
   it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');

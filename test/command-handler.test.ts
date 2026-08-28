@@ -160,6 +160,8 @@ vi.mock('../src/services/session-store.js', () => ({
   })),
   updateSession: vi.fn(),
   getSession: vi.fn(() => undefined),
+  getOwnedSession: vi.fn(() => undefined),
+  listSessions: vi.fn(() => []),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
 
@@ -358,6 +360,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   buildNewTopicCliInput: vi.fn((prompt: string) => ({ content: `WRAPPED:${prompt}` })),
   ensureSessionWhiteboard: vi.fn((ds: any) => { ds.session.whiteboardId = 'wb_test'; }),
   getAvailableBots: vi.fn(async () => []),
+  resumeSession: vi.fn(),
 }));
 
 // Only the two discovery/validation entrypoints are stubbed; keep the real
@@ -520,7 +523,7 @@ import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-ev
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
@@ -1543,6 +1546,9 @@ describe('handleCommand', () => {
     vi.mocked(forkSession).mockResolvedValue({ ok: true, childSessionId: 'child-sess-1' });
     vi.mocked(isForkCapableSession).mockReturnValue(true);
     vi.mocked(sessionStore.getSession).mockReturnValue(undefined);
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
+    vi.mocked(sessionStore.listSessions).mockReturnValue([]);
+    vi.mocked(resumeSession).mockReset();
   });
 
   describe('/fork sub-topic', () => {
@@ -4726,6 +4732,159 @@ describe('handleCommand', () => {
       expect(discoverAdoptableSessions).toHaveBeenCalledWith('claude-code');
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('未发现可接入');
+    });
+
+    it('resumes an exact closed Botmux session id instead of treating it as a tmux pane', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const restored = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'ad24e30d-25fa-4450-8e84-9e108cb74c92',
+          status: 'active',
+          cliId: 'claude-code',
+          cliSessionId: 'ad24e30d-25fa-4450-8e84-9e108cb74c92',
+        }),
+      });
+      const closed = {
+        ...restored.session,
+        status: 'closed' as const,
+      };
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt ad24e30d-25fa-4450-8e84-9e108cb74c92'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).toHaveBeenCalledWith(closed.sessionId, deps.activeSessions);
+      expect(discoverAdoptableSessions).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('会话已恢复');
+      expect(reply).not.toContain('tmux pane');
+    });
+
+    it('resolves a closed Botmux session by its CLI-native id without duplicating ownership', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'botmux-session-id',
+        status: 'closed',
+        cliId: 'codex',
+        cliSessionId: 'native-thread-id',
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.listSessions).mockReturnValueOnce([closed]);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt native-thread-id'), deps, LARK_APP_ID);
+
+      expect(resumeSession).toHaveBeenCalledWith('botmux-session-id', deps.activeSessions);
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('tmux pane');
+    });
+
+    it('does not move a managed session from another topic through /adopt', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'other-topic-session',
+        status: 'closed',
+        rootMessageId: 'om_other_topic',
+        cliSessionId: 'native-other-topic',
+      });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      const deps = makeDeps(scratch);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt other-topic-session'), deps, LARK_APP_ID);
+
+      expect(resumeSession).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('另一个话题');
+      expect(reply).toContain('botmux resume other-topic-session');
+      expect(reply).not.toContain('tmux pane');
+    });
+
+    it('does not resume a materialized scheduled run from the containing chat anchor', async () => {
+      const scratch = makeDaemonSession({
+        scope: 'chat',
+        chatId: CHAT_ID,
+        hasHistory: false,
+        session: makeSession({
+          sessionId: 'scratch-session',
+          scope: 'chat',
+          chatId: CHAT_ID,
+          cliId: undefined,
+        }),
+      });
+      const closed = makeSession({
+        sessionId: 'materialized-schedule-run',
+        status: 'closed',
+        scope: 'chat',
+        chatId: CHAT_ID,
+        rootMessageId: 'om_materialized_root',
+        deferredScheduleRun: {
+          taskId: 'task-1',
+          turnId: 'schedule:task-1:run-1',
+          routingAnchor: 'schedule-run:task-1:run-1',
+          createdAt: '2026-08-27T00:00:00.000Z',
+        },
+      });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt materialized-schedule-run'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('另一个话题');
+    });
+
+    it('says when an exact managed session will resume as a fresh CLI session', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'cursor-without-native-id',
+        status: 'closed',
+        cliId: 'cursor',
+        cliSessionId: undefined,
+      });
+      const restored = makeDaemonSession({ session: { ...closed, status: 'active' } });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: true, ds: restored });
+      const deps = makeDeps(scratch);
+
+      await handleCommand(
+        '/adopt',
+        ROOT_ID,
+        makeLarkMessage('/adopt cursor-without-native-id'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(resumeSession).toHaveBeenCalledWith(closed.sessionId, deps.activeSessions);
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('新起干净会话');
+      expect(reply).toContain('旧上下文不会带回');
     });
 
     it('passes the bot current custom Codex executable into live adopt discovery', async () => {

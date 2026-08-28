@@ -369,6 +369,15 @@ describe('buildBotmuxEnvAssignments()', () => {
       .toEqual(['HTTPS_PROXY=http://127.0.0.1:7890']);
   });
 
+  it('builds independent provider env for sibling bots without cross-key leakage', () => {
+    const botA = buildBotmuxEnvAssignments({}, { OPENAI_API_KEY: 'key-a' });
+    const botB = buildBotmuxEnvAssignments({}, { OPENAI_API_KEY: 'key-b' });
+    expect(botA).toEqual(['OPENAI_API_KEY=key-a']);
+    expect(botB).toEqual(['OPENAI_API_KEY=key-b']);
+    expect(botA).not.toContain('OPENAI_API_KEY=key-b');
+    expect(botB).not.toContain('OPENAI_API_KEY=key-a');
+  });
+
   it('re-sanitizes injectEnv: drops botmux-reserved keys even if they sneak in', () => {
     const out = buildBotmuxEnvAssignments(
       { BOTMUX: '1' },

@@ -748,6 +748,23 @@ describe('bot-config store', () => {
     const cliSpec = store.findConfigField('cli')!;
     expect(store.coerceConfigValue(cliSpec, 'codex')).toEqual({ ok: true, value: 'codex' });
     expect(store.coerceConfigValue(cliSpec, 'bogus-cli')).toEqual({ ok: false, reason: 'invalid_cli' });
+    const authSpec = store.findConfigField('codexAuthSync')!;
+    expect(store.coerceConfigValue(authSpec, 'ISOLATED')).toEqual({ ok: true, value: 'isolated' });
+    expect(store.coerceConfigValue(authSpec, 'global')).toEqual({ ok: false, reason: 'invalid_enum' });
+  });
+
+  it('persists codexAuthSync through the generic /config store path', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('codexAuthSync')!;
+    const set = await store.applyConfigField('app_default', spec, 'isolated');
+    expect(set.ok).toBe(true);
+    expect(readConfig().codexAuthSync).toBe('isolated');
+    expect(registry.getBot('app_default').config.codexAuthSync).toBe('isolated');
+
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared.ok).toBe(true);
+    expect(readConfig().codexAuthSync).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexAuthSync).toBeUndefined();
   });
 
   it('getConfigCardData returns the card view (booleans + cli options + model choices)', async () => {

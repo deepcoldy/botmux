@@ -403,6 +403,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
       undefined,
+      // 20th arg: silent-idle label flag — no deliberately-silent turn here.
+      false,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
@@ -894,6 +896,7 @@ describe('parkStreamCard', () => {
     ds.codexServiceTier = {
       model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
     };
+    ds.silentIdleTurnId = 'om_live_turn';
 
     parkStreamCard(ds);
 
@@ -905,6 +908,7 @@ describe('parkStreamCard', () => {
     expect(entry?.displayMode).toBe('screenshot');
     expect(entry?.imageKey).toBe('img_key_xyz');
     expect(entry?.codexServiceTierBadge).toBe('⚡ priority');
+    expect(entry?.silentIdle).toBe(true);
     expect(ds.parkedStreamCardNonce).toBe('nonce_live');
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);

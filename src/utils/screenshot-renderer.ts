@@ -211,8 +211,13 @@ export interface CaptureOpts {
   startY: number;
 }
 
-/** Capture a section of the terminal buffer to a PNG buffer. */
-export function captureToPng(terminal: Terminal, opts: CaptureOpts): Buffer {
+/** Capture a section of the terminal buffer to a PNG buffer.
+ *  异步：PNG 编码走 @napi-rs/canvas 的 `encode('png')`（Rust 线程池），不阻塞
+ *  Node 主线程 event loop。改自同步 `toBuffer('image/png')`——它会把整段 zlib
+ *  压缩压在主线程，10s 一次的截图循环因此每 10s 顿一下主线程；而网页终端的
+ *  xterm WS 也由同一 worker event loop 中转，用户就感到「过几秒卡一次」（TUI
+ *  满屏高频重绘尤其明显）。逐格绘制仍同步，但 napi-rs 原生渲染很快，主阻塞在编码侧。 */
+export async function captureToPng(terminal: Terminal, opts: CaptureOpts): Promise<Buffer> {
   ensureFontRegistered();
   const { cols, rows, startY } = opts;
   const buffer = terminal.buffer.active;
@@ -280,5 +285,5 @@ export function captureToPng(terminal: Terminal, opts: CaptureOpts): Buffer {
     }
   }
 
-  return canvas.toBuffer('image/png');
+  return await canvas.encode('png');
 }

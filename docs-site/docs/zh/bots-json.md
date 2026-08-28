@@ -195,6 +195,34 @@
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
 
+## Prompt 注入
+
+| 字段 | 说明 |
+|------|------|
+| `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
+
+关掉后模型看不到发言人身份：多人会话里无法区分谁说的、也无法按人称呼。适合模型会把标签内容抄进回复正文的 CLI（如 cursor，见 `<sender_note>` 反抄写提示——标签关掉后该提示也一并消失），或不希望把每条消息的身份写进 CLI 记录的场景。
+
+可由 owner / `allowedUsers` 通过 `/botconfig` 热更新，无需重启 daemon：
+
+```text
+/botconfig set senderTag off
+/botconfig set senderTag on
+```
+
+也可直接写进对应 bot 的配置：
+
+```json
+{
+  "senderTag": false
+}
+```
+
+- **`botmux send --mention-back` 不受影响**：它读的是 daemon 侧独立记录的本轮触发者（`replyTargets[turnId].senderOpenId`），与 prompt 里的这个标签是两条链路。
+- 关闭有两项**可观测性代价**：① `/adopt` 少一条识别「本 bot 自产会话」的指纹（其余结构判据仍覆盖现有 prompt 形态，不会因此把自产会话当外部会话列出）；② dashboard 会话洞察无法再从标签判断发言人类型与 A2A 对方名字，只能靠 `[来自 … 的 @mention]` 交棒文本标记兜底，没有该标记时该轮不显示来源。
+- 立即生效（下一轮起），不改写已排队或正在执行的 turn，也不回填既有历史。
+- dashboard「发言人标签」开关保存的就是这个字段。
+
 ## 主动开工
 
 | 字段 | 说明 |

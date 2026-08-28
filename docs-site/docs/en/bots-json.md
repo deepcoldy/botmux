@@ -195,6 +195,34 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `writableTerminalLinkInCard` | When `true`, the card body directly embeds a **writable** terminal link (with token, anyone who can see the card can operate it); by default it's hidden behind a "Get write permission" button and sent privately to whoever clicks. Meaningless when `disableStreamingCard` is enabled |
 | `privateCard` | When `true`, `/card` uses an ephemeral private card visible only to `allowedUsers` (talk grantees and the bare triggerer don't receive it), only effective in plain `group` chats, and cannot live-update. Only affects the `/card` command itself |
 
+## Prompt injection
+
+| Field | Description |
+|-------|-------------|
+| `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
+
+With it off the model cannot see speaker identity: in a multi-person chat it cannot tell participants apart or address them by name. Useful for a CLI whose model copies the tag into its reply body (e.g. cursor — see the `<sender_note>` anti-echo hint, which disappears together with the tag), or when you do not want per-message identity written into the CLI transcript.
+
+Hot-updatable by the owner / `allowedUsers` via `/botconfig`, no daemon restart:
+
+```text
+/botconfig set senderTag off
+/botconfig set senderTag on
+```
+
+Or write it directly into the bot's config:
+
+```json
+{
+  "senderTag": false
+}
+```
+
+- **`botmux send --mention-back` is unaffected**: it reads the daemon-side record of this turn's triggerer (`replyTargets[turnId].senderOpenId`), a separate path from this prompt tag.
+- Turning it off costs two **observability** signals: (1) `/adopt` loses one fingerprint for recognizing this bot's own sessions (the remaining structural checks still cover every prompt shape we ship, so self-produced sessions are not listed as external); (2) dashboard session insight can no longer read speaker type or A2A agent name from the tag, falling back to the `[来自 … 的 @mention]` handoff marker — with no such marker, that turn shows no source.
+- Applies immediately (from the next turn); it does not rewrite queued or in-flight turns, nor backfill existing history.
+- The dashboard "Speaker Tag" toggle saves this field.
+
 ## Proactive start
 
 | Field | Description |

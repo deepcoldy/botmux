@@ -9,8 +9,16 @@
  *
  * Both back the same tiny synchronous API botmux uses (open, exec, prepare→
  * get/run/all, close), so we expose one `DatabaseSyncLike` interface and pick
- * the backing engine by runtime. Callers import `openDatabaseSync` here instead
- * of importing `node:sqlite` directly.
+ * the backing engine by runtime. Callers import from here instead of
+ * importing `node:sqlite` directly.
+ *
+ * Two open contracts:
+ *   • `openDatabaseSyncNow` — best-effort (adapters / feedback): any failure
+ *     returns null, including a missing module AND a corrupt file.
+ *   • `sqliteEngineAvailable` + `openDatabaseSyncOrThrow` — fail-closed
+ *     stores (session-store): module-load failure is "no engine"; a
+ *     corrupt/locked file surfaces at first exec/query after the engine
+ *     loaded (not a missing runtime). Do not collapse the two.
  *
  * Kept deliberately synchronous to match the existing feedback store's contract
  * (a synchronous write under a busy_timeout serializes concurrent opens without
@@ -75,6 +83,34 @@ function wrapBunDatabase(db: {
   };
 }
 
+function openWithLoadedEngine(path: string, opts: OpenOptions = {}): DatabaseSyncLike {
+  const require = createRequire(import.meta.url);
+  if (isBunRuntime()) {
+    const { Database } = require('bun:sqlite');
+    const db = opts.readOnly ? new Database(path, { readonly: true }) : new Database(path);
+    return wrapBunDatabase(db as never);
+  }
+  const { DatabaseSync } = require('node:sqlite');
+  const db = opts.readOnly ? new DatabaseSync(path, { readOnly: true }) : new DatabaseSync(path);
+  return db as unknown as DatabaseSyncLike;
+}
+
+/** Probe whether a SQLite engine can be loaded. Does not open a file, so a
+ *  corrupt database is not mistaken for a missing runtime. */
+export function sqliteEngineAvailable(): boolean {
+  try {
+    const require = createRequire(import.meta.url);
+    if (isBunRuntime()) {
+      require('bun:sqlite');
+      return true;
+    }
+    require('node:sqlite');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Open a SQLite database with the right engine for the current runtime, returning
  * a unified synchronous handle. Async because Node's binding is imported lazily
@@ -101,21 +137,30 @@ export async function openDatabaseSync(path: string, opts: OpenOptions = {}): Pr
  * Synchronous open, for call sites that must stay sync (e.g. the opencode/traex
  * adapters' `withDb`, which run inside synchronous input-delivery paths). Uses
  * `createRequire` so the runtime-specific specifier stays out of the bundler's
- * static graph. Returns null if the engine can't be loaded (caller degrades),
- * matching the adapters' existing best-effort contract.
+ * static graph. Returns null if the engine can't be loaded OR the open fails
+ * (caller degrades), matching the adapters' existing best-effort contract.
  */
 export function openDatabaseSyncNow(path: string, opts: OpenOptions = {}): DatabaseSyncLike | null {
   try {
-    const require = createRequire(import.meta.url);
-    if (isBunRuntime()) {
-      const { Database } = require('bun:sqlite');
-      const db = opts.readOnly ? new Database(path, { readonly: true }) : new Database(path);
-      return wrapBunDatabase(db as never);
-    }
-    const { DatabaseSync } = require('node:sqlite');
-    const db = opts.readOnly ? new DatabaseSync(path, { readOnly: true }) : new DatabaseSync(path);
-    return db as unknown as DatabaseSyncLike;
+    return openWithLoadedEngine(path, opts);
   } catch {
     return null;
   }
+}
+
+/**
+ * Synchronous open that distinguishes "no engine" from "engine loaded, file
+ * unusable". Module-load errors throw from `require`. Neither runtime validates
+ * the file in the constructor, and `PRAGMA busy_timeout` does not either (it is
+ * connection-level and touches no page). A corrupt / locked file is rejected by
+ * the first PAGE-TOUCHING statement, which differs per path:
+ *   • write path (`openDbForOwnStore`): `PRAGMA journal_mode` — inside the helper.
+ *   • read path (`openDbForRead`): the helper RETURNS A HANDLE; the caller's
+ *     first SELECT throws (`file is not a database`).
+ * Either way the throw lands inside a scan loop's try, which rethrows only
+ * `SessionStoreSqliteUnavailableError` and skips everything else — so
+ * SQLITE_NOTADB stays "skippable store", never "runtime has no SQLite".
+ */
+export function openDatabaseSyncOrThrow(path: string, opts: OpenOptions = {}): DatabaseSyncLike {
+  return openWithLoadedEngine(path, opts);
 }

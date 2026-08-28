@@ -840,11 +840,14 @@ const STREAM_TEMPLATE_MAP = {
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    case 'idle': return t('card.status.idle', undefined, locale);
+    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
+    // from a hung session; say "handled, judged no reply needed" instead.
+    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -933,6 +936,7 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
+  silentIdle?: boolean,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1086,7 +1090,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,

@@ -16,7 +16,7 @@ describe('dashboard bot payload helpers', () => {
     const editableFields = [
       'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
       'autoStartOnGroupJoinPrompt', 'autoStartOnNewTopic', 'backendType',
-      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput',
+      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput', 'codexAuthSync',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
       'envelopeInjection', 'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
@@ -24,10 +24,16 @@ describe('dashboard bot payload helpers', () => {
       'overloadAlert', 'p2pMode', 'p2pOpen', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',
+      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'senderTag', 'writableTerminalLinkInCard',
       'sessionOwnerReminder',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
+  it('normalizes the Codex auth policy to the upgrade-compatible shared default', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ codexAuthSync: 'shared' });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { codexAuthSync: 'isolated' }))
+      .toMatchObject({ codexAuthSync: 'isolated' });
   });
 
   it('exposes feedback policy only in private Bot Defaults payloads', () => {

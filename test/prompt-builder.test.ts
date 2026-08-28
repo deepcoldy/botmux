@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/prompt-builder.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -50,10 +50,15 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: vi.fn(async () => []),
 }));
 
+// Mutable per-test bot config so the senderTag gate can be exercised in both
+// states. Default shape matches the previous static mock byte-for-byte, so every
+// pre-existing test keeps its original behavior.
+const mockBotConfig: Record<string, unknown> = {
+  larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
+};
+
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
-  })),
+  getBot: vi.fn(() => ({ config: mockBotConfig })),
   getAllBots: vi.fn(() => []),
 }));
 
@@ -721,6 +726,95 @@ describe('renderSenderTag', () => {
     // And the tag's outer quotes are not eaten by inner ones.
     expect(out.startsWith('<sender ')).toBe(true);
     expect(out.endsWith(' />')).toBe(true);
+  });
+});
+
+// ─── senderTag switch — per-bot gate over the <sender> block ────────────────
+
+describe('senderTag switch', () => {
+  const sender = { openId: 'ou_gate1234567890', type: 'user' as const, name: '申晗' };
+
+  afterEach(() => { delete mockBotConfig.senderTag; });
+
+  it('injects the tag when senderTag is absent (default ON)', () => {
+    expect(renderSenderTag(sender, 'app_test')).toContain('open_id="ou_gate1234567890"');
+  });
+
+  it('injects the tag when senderTag is explicitly true', () => {
+    mockBotConfig.senderTag = true;
+    expect(renderSenderTag(sender, 'app_test')).toContain('<sender ');
+  });
+
+  it('suppresses the tag when senderTag is false', () => {
+    mockBotConfig.senderTag = false;
+    expect(renderSenderTag(sender, 'app_test')).toBe('');
+  });
+
+  it('ignores the switch when no larkAppId is supplied (synthetic callers)', () => {
+    mockBotConfig.senderTag = false;
+    // Without an appId there is no bot to consult, so behavior must stay exactly
+    // as it was before the switch existed.
+    expect(renderSenderTag(sender)).toContain('<sender ');
+  });
+
+  it('fails OPEN when the bot cannot be read', async () => {
+    const { getBot } = await import('../src/bot-registry.js');
+    vi.mocked(getBot).mockImplementationOnce(() => { throw new Error('unknown bot'); });
+    // A config-read failure must never silently strip per-turn attribution.
+    expect(renderSenderTag(sender, 'app_test')).toContain('<sender ');
+  });
+
+  it('drops the tag from a new-topic prompt when off, keeping every other block', () => {
+    mockBotConfig.senderTag = false;
+    const off = buildNewTopicPrompt(
+      '帮我看下', 'sess-1', 'claude-code', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(off).not.toContain('<sender ');
+    expect(off).toContain('<user_message>');
+
+    delete mockBotConfig.senderTag;
+    const on = buildNewTopicPrompt(
+      '帮我看下', 'sess-1', 'claude-code', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(on).toContain('<sender ');
+    // The ONLY difference is the sender block — nothing else shifts.
+    expect(on.replace(/\n*<sender [^>]*\/>/, '')).toBe(off);
+  });
+
+  it('drops the tag from a follow-up turn when off', () => {
+    mockBotConfig.senderTag = false;
+    const out = buildFollowUpContent('继续', 'sess-2', {
+      sender, larkAppId: 'app_test', chatId: 'oc_1', cliId: 'claude-code', locale: 'zh',
+    });
+    expect(out).not.toContain('<sender ');
+    expect(out).toContain('<user_message>');
+  });
+
+  it('drops the cursor anti-echo note together with the tag', () => {
+    // The note exists only to stop cursor echoing an inline tag. With no tag
+    // there is nothing to misread, so the note must go too.
+    mockBotConfig.senderTag = false;
+    const out = buildFollowUpContent('继续', 'sess-3', {
+      sender, larkAppId: 'app_test', chatId: 'oc_1', cliId: 'cursor', locale: 'zh',
+    });
+    expect(out).not.toContain('<sender ');
+    expect(out).not.toContain('<sender_note>');
+
+    delete mockBotConfig.senderTag;
+    const on = buildFollowUpContent('继续', 'sess-3', {
+      sender, larkAppId: 'app_test', chatId: 'oc_1', cliId: 'cursor', locale: 'zh',
+    });
+    expect(on).toContain('<sender ');
+    expect(on).toContain('<sender_note>');
+  });
+
+  it('gates the daemon buffered-follow-up path too', () => {
+    mockBotConfig.senderTag = false;
+    expect(renderBufferedSenderBlock(sender, 'cursor', 'zh', 'app_test')).toBe('');
+    delete mockBotConfig.senderTag;
+    expect(renderBufferedSenderBlock(sender, 'cursor', 'zh', 'app_test')).toContain('<sender ');
   });
 });
 

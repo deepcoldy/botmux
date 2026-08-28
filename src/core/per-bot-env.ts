@@ -20,10 +20,11 @@
  * This is NOT a secret vault: values live in `bots.json` and the process
  * environment in plaintext, visible to local diagnostic tools.
  *
- * Caveat — file sandbox: when a session runs inside the bwrap file sandbox the
- * CLI's env is carried via `bwrap --setenv` (not the backend's injectEnv path),
- * so per-bot env may not reach a sandboxed CLI. The common provider use case
- * (GLM etc.) doesn't run sandboxed; sandbox + per-bot env is a possible follow-up.
+ * File sandbox: the backend applies this per-pane/per-child env to the outer
+ * bwrap/Seatbelt process. Neither wrapper clears inherited env, so the values
+ * reach the CLI without being placed in bwrap argv; bwrap's own `--setenv`
+ * pairs only override botmux-managed sandbox values such as HOME/PATH/relay.
+ * Both paths retain the same per-bot boundary and are regression-tested.
  */
 
 /** Valid POSIX-ish env var name: letter/underscore start, then word chars. */

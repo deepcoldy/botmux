@@ -726,6 +726,7 @@ describe('empty-started session — first real business turn must use the new-to
   it('a rejected live send restores the pending opening for the next message', async () => {
     const anchor = 'om_reject_root';
     const ds = seedEmptyStarted(anchor);
+    ds.currentTurnId = 'om_previous_accepted';
     mocks.sendWorkerInput.mockReturnValueOnce(false);
 
     await handleThreadReply(
@@ -737,6 +738,9 @@ describe('empty-started session — first real business turn must use the new-to
     expect(liveInputs()[0]!.content).toContain('<botmux_routing>');
     // … but the worker refused it, so the one-shot state goes back.
     expect(ds.session.initialUserTurnPending).toBe(true);
+    // The rejected turn never became authoritative. Keeping the previous
+    // lineage lets its late nothing-to-send terminal still close the live card.
+    expect(ds.currentTurnId).toBe('om_previous_accepted');
 
     await handleThreadReply(
       makeEventData('om_retry', '再试一次', anchor),
@@ -744,6 +748,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
     expect(liveInputs()[1]!.content).toContain('<botmux_routing>');
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ds.currentTurnId).toBe('om_retry');
   });
 
   it('a throwing cold fork restores the pending opening', async () => {

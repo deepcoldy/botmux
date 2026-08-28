@@ -143,9 +143,118 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
   /用户发送了：\s*\n-{3,}[\s\S]*?\n-{3,}[\s\S]*?Session ID:\s*[0-9a-f]{8}-[0-9a-f]{4}-/i,
 ];
 
+/** Leading blocks botmux may place BEFORE `<user_message>`. Order-independent by
+ *  construction: {@link startsWithBotmuxLeadingBlock} walks whichever of these
+ *  the prompt opens with, so a new block needs one entry here rather than a new
+ *  ordering permutation in BOTMUX_INJECTION_PATTERNS. */
+const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
+  'botmux_routing', 'botmux_builtin_skills', 'identity', 'session_id', 'role',
+  'summary_memory', 'botmux_reminder', 'whiteboard', 'chat_context_policy', 'chat_context',
+];
+
+/** True when `text` is an UNBROKEN CHAIN of botmux leading blocks followed by a
+ *  complete `<user_message>…</user_message>` envelope — only blocks and
+ *  whitespace in between, never prose.
+ *
+ *  Why this exists: the `^`-anchored patterns above enumerate exact block
+ *  ORDERINGS, so each new leading block multiplies the permutations — and any
+ *  chain nobody spelled out leaked into the /adopt picker as if external.
+ *  Measured: 14 of 30 claude-family combinations leaked (every prefix
+ *  containing `<summary_memory>` or `<chat_context…>`, e.g. `role+summary`,
+ *  `wb+chatctx`) — those match no `^` anchor, and with a bot running
+ *  `senderTag: false` and no @mentions that turn, nothing follows
+ *  `</user_message>` either, so the trailing-adjacency pattern misses too.
+ *
+ *  ADJACENCY IS LOAD-BEARING. A first version required only "opens with a known
+ *  tag AND contains an envelope somewhere later", which let arbitrary prose sit
+ *  between the two — and that false-positives on a REAL external session whose
+ *  own text happens to do this, e.g. a user pasting a prompt template to edit:
+ *  `<summary_memory>…</summary_memory>\n\n帮我改措辞：\n<user_message>…</user_message>`.
+ *  Such a session belongs in the picker; swallowing it defeats the point. The
+ *  earlier `^` patterns got this right by demanding structural adjacency, so this
+ *  restores it while staying order-independent. (Rejected alternative: requiring
+ *  the opening `>` be followed by `\n`/`<`. Four shipped blocks put body text
+ *  directly after `>` — `<chat_context_policy>群名…`, `<botmux_reminder>提醒…`,
+ *  `<session_id>abc-123…`, `<role …>某人格…` — so that rule would re-open the
+ *  very leak this function exists to close. Verified by rendering each block.)
+ *
+ *  A prompt that pastes a genuine full botmux envelope verbatim is still a false
+ *  positive, but that input is byte-identical to botmux's own output, so no
+ *  content-based check can separate them; accepted as residual.
+ *
+ *  KNOWN RESIDUAL FALSE NEGATIVE (this function cannot ADD one — see below): the
+ *  close lookup takes the FIRST `</tag>`, so a block whose own body contains that
+ *  literal string ends early and the walk then hits prose and bails. Reachable
+ *  only through `<role>`: `renderRoleContextBlock` interpolates persona text
+ *  unescaped, so a persona containing `</role>` (nested or bare) truncates the
+ *  block. Measured: such prompts leak, while the same shape without the literal
+ *  is correctly dropped. Deliberately NOT fixed — the two candidate fixes are
+ *  both worse:
+ *    - depth-counting `<role …>` vs `</role>` only handles the NESTED variant; a
+ *      bare `</role>` in the body has no opening tag to count, so it still leaks;
+ *    - taking the LAST `</tag>` before the envelope fixes both but introduces a
+ *      real false positive — an external prompt discussing two of the same block
+ *      (`<session_id>abc</session_id> 请解释 <session_id>def</session_id>` +
+ *      envelope) then gets swallowed, which is the failure direction that
+ *      actually costs the user something.
+ *
+ *  Why "cannot ADD a false negative" is structural, not just sampled:
+ *  `isBotmuxInjectedPrompt` ORs this check BEFORE the pattern list, so the
+ *  function is a pure disjunctive addition — it can only turn `false` into
+ *  `true`, never the reverse. Any prompt the pre-existing patterns dropped is
+ *  still dropped. (Spot-checked over 4,000 generated block chains: zero cases
+ *  where the old verdict was `true` and the new one `false`.) The residual above
+ *  is therefore inherited, not introduced: the affected shapes — role-with-literal
+ *  plus `<summary_memory>` — leaked before this function existed, because
+ *  `summary_memory` appears in none of the `^`-anchored orderings. Note the
+ *  legacy `^<role…>` pattern is NOT itself fooled by a literal `</role>`: its
+ *  lazy quantifier backtracks to the second one, so `role-with-literal` directly
+ *  followed by the envelope still matches there. The two mechanisms fail on
+ *  different inputs; only their intersection leaks.
+ *  Failure direction is a session merely APPEARING in the /adopt list.
+ *
+ *  Deliberately NOT a regex. The natural regex form
+ *  (`^<(?:tag|…)\b[^>]*>[\s\S]*?<user_message>[\s\S]*?<\/user_message>`) is
+ *  quadratic: both lazy scans restart at every `<user_message>` occurrence, so
+ *  a prompt of repeated `<user_message>` opens with no close took 374ms at 100k
+ *  chars and 5969ms at 400k (4× input → 16× time), against 0.3ms for the
+ *  pre-existing patterns on the same input. Every scan below is `startsWith` /
+ *  `indexOf` over a strictly advancing cursor — linear, cannot backtrack. A
+ *  failed `indexOf` returns immediately, so at most one full-length scan happens
+ *  per call: a 50k-block chain measured 20.7ms, a 1.5MB adversarial input ~3ms. */
+function startsWithBotmuxLeadingBlock(text: string): boolean {
+  if (!text.startsWith('<')) return false;
+  let i = 0;
+  let sawBlock = false;
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+    if (text.startsWith('<user_message>', i)) {
+      // Require at least one preceding block: a bare `^<user_message>` prompt is
+      // already covered by the first pattern above.
+      return sawBlock && text.indexOf('</user_message>', i + '<user_message>'.length) !== -1;
+    }
+    if (text[i] !== '<') return false;
+    // Tag name ends at the first whitespace or '>' after the opening '<'.
+    let nameEnd = -1;
+    for (let j = i + 1; j < text.length; j++) {
+      const ch = text[j]!;
+      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r') { nameEnd = j; break; }
+    }
+    if (nameEnd < i + 2) return false;
+    const tag = text.slice(i + 1, nameEnd);
+    if (!BOTMUX_LEADING_BLOCK_TAGS.includes(tag)) return false;
+    // An unclosed block is not a structural block — bail rather than scan on.
+    const close = text.indexOf(`</${tag}>`, nameEnd);
+    if (close === -1) return false;
+    i = close + tag.length + 3;
+    sawBlock = true;
+  }
+}
+
 /** True when `text` is a botmux-generated user turn (structural envelope).
  *  Shared by Claude/Codex/Grok adopt discovery so filters stay consistent. */
 export function isBotmuxInjectedPrompt(text: string): boolean {
+  if (startsWithBotmuxLeadingBlock(text)) return true;
   return BOTMUX_INJECTION_PATTERNS.some((re) => re.test(text));
 }
 

@@ -741,13 +741,36 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 }
 
 /**
+ * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
+ * (getBot throws for an unknown appId) or an absent key both mean "inject",
+ * matching `thinkingCard`'s convention — only an explicit `false` disables, so
+ * a config-read failure can never silently strip per-turn attribution.
+ */
+function senderTagEnabled(larkAppId: string): boolean {
+  try {
+    return getBot(larkAppId).config.senderTag !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
  * (open_id + type + optional name/email) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
+ *
+ * `larkAppId` opts this into the per-bot `senderTag` switch (default ON — only
+ * an explicit `senderTag: false` suppresses the tag). The gate lives HERE, not
+ * at the call sites, so all five injection points (new topic, its codex-app
+ * sidecar, follow-up blocks, the follow-up codex-app sidecar, and daemon's
+ * buffered-follow-up path via {@link renderBufferedSenderBlock}) share one
+ * judgment and cannot drift apart. Omitting `larkAppId` — synthetic callers and
+ * existing tests — keeps the historical always-inject behavior.
  */
-export function renderSenderTag(sender?: ResolvedSender): string {
+export function renderSenderTag(sender?: ResolvedSender, larkAppId?: string): string {
   if (!sender || !sender.openId) return '';
+  if (larkAppId && !senderTagEnabled(larkAppId)) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
   if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
@@ -777,10 +800,17 @@ export function renderCursorSenderNote(cliId: CliId | undefined, hasSender: bool
  * `<sender>`; otherwise an inline `ou_xxx:name` reaches cursor with no adjacent
  * note (the builder's note only covers `ds.pendingSender`'s top-level tag, and
  * may be absent entirely when pendingSender is undefined). Returns '' when
- * there is no sender to attribute.
+ * there is no sender to attribute, and also when the bot has `senderTag: false`
+ * (the gate inside renderSenderTag) — the note is skipped with it, since there
+ * is then no inline tag for cursor to misread.
  */
-export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cliId: CliId | undefined, locale?: Locale): string {
-  const tag = renderSenderTag(sender);
+export function renderBufferedSenderBlock(
+  sender: ResolvedSender | undefined,
+  cliId: CliId | undefined,
+  locale?: Locale,
+  larkAppId?: string,
+): string {
+  const tag = renderSenderTag(sender, larkAppId);
   if (!tag) return '';
   const note = renderCursorSenderNote(cliId, true, locale);
   return note ? `${tag}\n${note}` : tag;
@@ -1135,7 +1165,7 @@ export function buildNewTopicPrompt(
 
   parts.push(userBlock);
 
-  const senderBlock = renderSenderTag(sender);
+  const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   if (senderBlock) parts.push(senderBlock);
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
@@ -1198,7 +1228,7 @@ export function buildNewTopicCliInput(
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
-  const senderBlock = renderSenderTag(sender);
+  const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(attachments, locale);
@@ -1306,7 +1336,7 @@ function buildFollowUpBlocks(
 
   blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
 
-  const senderBlock = renderSenderTag(opts?.sender);
+  const senderBlock = renderSenderTag(opts?.sender, opts?.larkAppId);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
@@ -1460,7 +1490,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId);
-  const senderBlock = renderSenderTag(opts.sender);
+  const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);

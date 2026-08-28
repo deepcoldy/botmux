@@ -37,6 +37,7 @@ import {
   buildNewTopicCliInput,
   ensureSessionWhiteboard,
   getAvailableBots,
+  resumeSession,
 } from './session-manager.js';
 import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
@@ -92,7 +93,7 @@ import {
 } from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1 } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
@@ -108,6 +109,7 @@ import {
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
+import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -3092,6 +3094,50 @@ export async function handleCommand(
         const botCliId = botCfgForAdopt?.cliId;
         const adoptSession = ds?.session;
         const adoptAnchor = ds ? sessionAnchorId(ds) : undefined;
+        const directTarget = adoptArgs;
+
+        // The picker deliberately hides Botmux-managed history, but an exact
+        // id is explicit user intent. Resume the original closed record here;
+        // importing its CLI transcript into this command scratch would create
+        // two Botmux owners for one underlying history session.
+        if (directTarget) {
+          const managedTarget = sessionStore.getOwnedSession(directTarget)
+            ?? sessionStore.listSessions().find(s => s.cliSessionId === directTarget);
+          if (managedTarget) {
+            const managedAnchor = storedSessionAnchorId(managedTarget);
+            if (!ds || !adoptAnchor || managedAnchor !== adoptAnchor) {
+              await sessionReply(rootId, t('cmd.adopt.managed_other_topic', {
+                id: managedTarget.sessionId,
+              }, loc));
+              break;
+            }
+
+            const result = await resumeSession(managedTarget.sessionId, activeSessions);
+            if (result.ok) {
+              const cliName = sessionCliDisplayName(result.ds);
+              const resumeMsg = resumeStartsFresh(result.ds.session)
+                ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+                : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+              await sessionReply(rootId, resumeMsg);
+            } else if (result.error === 'not_closed') {
+              await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
+            } else if (result.error === 'anchor_occupied') {
+              const detail = result.activeSessionId
+                ? t('card.action.resume_anchor_holder', { short: result.activeSessionId.substring(0, 8) }, loc)
+                : '';
+              await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, loc));
+            } else if (result.error === 'adopt_unsupported') {
+              await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, loc));
+            } else if (result.error === 'deferred_unmaterialized') {
+              await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
+            } else if (result.error === 'resume_cancelled') {
+              await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, loc));
+            }
+            break;
+          }
+        }
 
         // Discover every supported backend, but only offer live sessions for
         // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
@@ -3130,7 +3176,6 @@ export async function handleCommand(
           break;
         }
 
-        const directTarget = adoptArgs;
         if (directTarget) {
           // Match a tmux address ("session:window.pane") OR a zellij target
           // ("session:paneId" / "session/paneId") against the merged list.

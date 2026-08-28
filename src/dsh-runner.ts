@@ -263,16 +263,21 @@ ${providersYaml}
 `;
 }
 
-/** Load ~/.dsh/.credentials.yaml (flat KEY: value) as a string map. Missing
- *  file → empty (the runtime then falls back to the ambient environment). */
+/** Load credential references from ~/.dsh/.credentials.yaml as an env map.
+ *  Current DSH writes `{ version: 1, refs: { KEY: value } }`; retain support
+ *  for the pre-release flat `KEY: value` layout used by older installations.
+ *  Missing file → empty (the runtime then falls back to ambient environment). */
 function loadCredentials(): Record<string, string> {
   const credPath = join(homedir(), '.dsh', '.credentials.yaml');
   if (!existsSync(credPath)) return {};
   const parsed = parseYaml(readFileSync(credPath, 'utf8')) as unknown;
+  const source = isRecord(parsed) && parsed.version === 1 && isRecord(parsed.refs)
+    ? parsed.refs
+    : parsed;
   const out: Record<string, string> = {};
-  if (isRecord(parsed)) {
-    for (const [k, v] of Object.entries(parsed)) {
-      if (typeof v === 'string') out[k] = v;
+  if (isRecord(source)) {
+    for (const [k, v] of Object.entries(source)) {
+      if (typeof v === 'string' && v.length > 0) out[k] = v;
     }
   }
   return out;
