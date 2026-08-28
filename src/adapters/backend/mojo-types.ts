@@ -36,7 +36,17 @@ export interface MojoConfig {
     jwtEnv?: string;
     /** `AGENT_BASE_URL`. */
     baseUrl?: string;
-    /** `AGENT_LOCAL_DAEMON=1` — runs tools on the bot host. Off by default. */
+    /**
+     * `AGENT_LOCAL_DAEMON=1` — runs tools on the bot host. Host execution is
+     * the DEFAULT when `cloud` is not enabled (matching every other CLI
+     * adapter); set `cloud: true` for the fully-remote sandbox, or an explicit
+     * `false` here to opt out of host tools without going fully remote.
+     *
+     * Note: `localDaemon: false` alone does NOT restore fully-remote
+     * treatment — isMojoFullyRemote() requires `cloud === true`, so the local
+     * sandbox and device-isolation blockers stay engaged as if the session
+     * ran on this host.
+     */
     localDaemon?: boolean;
     /** `MOJO_PPE_ENV`. */
     ppeEnv?: string;
@@ -548,6 +558,54 @@ export function mojoUnprovableEnvKeys(
     // read it from" pointer, never a name the child reads — so it has no business
     // widening a proof about which binary executes.
     return keys.filter(k => k !== MOJO_CANONICAL_JWT_ENV_KEY).sort();
+}
+
+/**
+ * Single source of truth for the execution mode a mojo config asks for.
+ *
+ * buildArgs (`--cloud`), buildEnv (`AGENT_LOCAL_DAEMON`) and the spawn audit
+ * log MUST all derive from this one function — they were previously three
+ * hand-kept copies and drifted twice (review F2: the audit label disagreed
+ * with the env for cloud+localDaemon both set, and for non-boolean values
+ * smuggled past strictBoolean by an old frozen snapshot).
+ *
+ * Precedence (review F3): an explicit `localDaemon: true` WINS over
+ * `cloud: true` and suppresses the `--cloud` flag entirely — previously both
+ * were emitted and the CLI received contradictory instructions. This stays
+ * consistent with isMojoFullyRemote(), which already returns false whenever
+ * `localDaemon === true`.
+ *
+ * Strict comparisons on purpose: a non-boolean survivor (e.g. the string
+ * "false" in a frozen snapshot written before strictBoolean existed) fails
+ * closed into the sandbox fallback rather than enabling host execution.
+ */
+export function deriveMojoExecutionMode(
+    cfg?: { cloud?: boolean; localDaemon?: boolean },
+): { agentLocalDaemon: '0' | '1'; passCloudFlag: boolean; label: string } {
+    const cloud = cfg?.cloud;
+    const local = cfg?.localDaemon;
+    if (local === true) {
+        return {
+            agentLocalDaemon: '1',
+            passCloudFlag: false,
+            label: cloud === true
+                ? 'host (explicit localDaemon; cloud flag suppressed)'
+                : 'host (explicit localDaemon)',
+        };
+    }
+    if (cloud === true) {
+        return { agentLocalDaemon: '0', passCloudFlag: true, label: 'cloud-sandbox (--cloud)' };
+    }
+    if (local === undefined) {
+        return { agentLocalDaemon: '1', passCloudFlag: false, label: 'host (default)' };
+    }
+    return {
+        agentLocalDaemon: '0',
+        passCloudFlag: false,
+        label: local === false
+            ? 'sandbox-fallback (localDaemon=false, cloud off)'
+            : 'sandbox-fallback (invalid localDaemon value)',
+    };
 }
 
 export function isMojoFullyRemote(

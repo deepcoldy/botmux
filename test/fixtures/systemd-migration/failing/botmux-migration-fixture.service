@@ -1,0 +1,14 @@
+[Unit]
+Description=botmux systemd failed-stop fixture
+
+[Service]
+Type=forking
+PIDFile=%t/botmux-migration-god.pid
+KillMode=process
+KillSignal=SIGCONT
+RestartKillSignal=SIGCONT
+FinalKillSignal=SIGCONT
+SendSIGKILL=no
+TimeoutStopSec=300ms
+ExecStart=/bin/sh -c 'pid="$(cat %t/botmux-migration-god.owner 2>/dev/null || true)"; if kill -0 "$pid" 2>/dev/null; then echo "$pid" > %t/botmux-migration-god.pid; else sleep 300 & pid=$!; echo "$pid" > %t/botmux-migration-god.owner; echo "$pid" > %t/botmux-migration-god.pid; fi'
+ExecStop=/bin/false

@@ -134,6 +134,7 @@ function seedTerminalAdHocRun(
 
 function parameterizedRevision(): SavedWorkflowRevisionDraft {
   const dagTemplate: V3DagTemplate = {
+    schemaVersion: 2,
     nodes: [{
       id: 'work',
       type: 'goal',
@@ -173,6 +174,7 @@ function parameterizedRevision(): SavedWorkflowRevisionDraft {
 
 function scheduleRevision(): SavedWorkflowRevisionDraft {
   const dagTemplate = validateDagTemplate({
+    schemaVersion: 2,
     nodes: [{
       id: 'schedule',
       type: 'host',

@@ -89,6 +89,29 @@ export function publishLastInputFromBotPatch(ds: DaemonSession): void {
   });
 }
 
+/**
+ * Immediately project a newly learned native topic id into the Dashboard's
+ * cached row. `markSessionActivity()` intentionally publishes only timestamp
+ * data, so it cannot make a first-time `larkThreadId` visible to a dashboard
+ * that has already hydrated this session.
+ *
+ * The row composer owns the brand-aware AppLink and validates the `omt_...`
+ * id again. Returning false keeps accidental callers with a chat/invalid id
+ * from publishing a misleading patch.
+ */
+export function publishNativeTopicLinkPatch(ds: DaemonSession): boolean {
+  const feishuThreadLink = composeRowFromActive(ds).feishuThreadLink;
+  if (!feishuThreadLink) return false;
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: ds.session.sessionId,
+      patch: { feishuThreadLink },
+    },
+  });
+  return true;
+}
+
 /** Push the current attention signals (repo-selection pending / TUI prompt
  *  open) to the dashboard. Call after mutating `ds.pendingRepo` or
  *  `ds.tuiPromptCardId` so the board view's needs-you column tracks live

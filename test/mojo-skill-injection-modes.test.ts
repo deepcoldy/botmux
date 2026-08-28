@@ -35,6 +35,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: () => ({}),
+  isWorkflowFeatureEnabled: () => true,
   config: {},
 }));
 vi.mock('../src/services/whiteboard-store.js', () => ({ whiteboardEnabled: () => false }));
@@ -153,10 +154,14 @@ describe('mojo built-in skill delivery — the block reaches the CLI', () => {
     expect(prompt).toContain('botmux --help');
   });
 
-  it('global mode: nothing is injected (files already live on disk)', async () => {
+  it('global mode: no skill block is injected (files already live on disk)', async () => {
     const prompt = await promptSentToCli({ builtinSkillBlock: resolvedBlockForMode('global') });
-    expect(prompt).toBe('USER TURN TEXT');
+    // No SKILL catalog — but host execution always carries the isolated-cwd
+    // guidance preamble (see hostGuidanceBlock), so the assertion is about the
+    // skill block's absence, not about a bare prompt.
+    expect(prompt).toContain('USER TURN TEXT');
     expect(prompt).not.toContain('botmux_builtin_skills');
+    expect(prompt).toContain('--session-id');
   });
 
   it('an operator systemPrompt does NOT swallow skill discovery', async () => {

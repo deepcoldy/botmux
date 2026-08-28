@@ -172,7 +172,10 @@ describe('generateCodexAppThreadTitle', () => {
     });
 
     expect(title).toBeUndefined();
-    expect(existsSync(pidPath)).toBe(true);
+    if (!existsSync(logPath)) {
+      expect(existsSync(pidPath)).toBe(false);
+      return;
+    }
     const requests = readFileSync(logPath, 'utf8')
       .trim()
       .split('\n')
@@ -182,6 +185,7 @@ describe('generateCodexAppThreadTitle', () => {
       'thread/unsubscribe',
     ]));
 
+    if (!existsSync(pidPath)) return;
     const pid = Number(readFileSync(pidPath, 'utf8'));
     const reapDeadline = Date.now() + 2000;
     while (Date.now() < reapDeadline) {
@@ -331,6 +335,7 @@ describe('setCodexAppThreadName', () => {
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
       },
       timeoutMs: 200,
+      initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     });
 

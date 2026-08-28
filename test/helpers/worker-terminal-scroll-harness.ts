@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach } from 'vitest';
 import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
+import { spawnTsScript } from './ts-runner.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -112,7 +113,7 @@ setInterval(() => {}, 1_000);
 
   const logs: string[] = [];
   const sessionId = `readonly-scroll-${cliId}`;
-  const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+  const child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,

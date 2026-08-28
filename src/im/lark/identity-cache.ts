@@ -2,15 +2,17 @@
  * User / bot identity cache for prompt injection.
  *
  * Lark events only carry the sender's open_id (no name). To inject a
- * `<sender name="张三" ... />` tag into the CLI prompt we need a name → open_id
- * dictionary. Three population sources, ordered by cost:
+ * `<sender name="张三" email="zhangsan@example.com" ... />` tag into the CLI
+ * prompt we need an identity dictionary keyed by open_id. Three population
+ * sources, ordered by cost:
  *
  *   1. mentions — free. Lark mention payloads carry (name, open_id) pairs,
  *      so every @ that flows through us teaches the cache.
  *   2. sender — free, but only learns open_id + type, not name.
- *   3. contact API — `contact.v3.user.get` for users; only used as fallback
- *      when 1+2 didn't give us a name. Requires `contact:user.base:readonly`
- *      (already in `BOTMUX_REQUIRED_SCOPES`).
+ *   3. contact API — `contact.v3.user.get` for users; used to fill a missing
+ *      name and email. Requires `contact:user.base:readonly` plus
+ *      `contact:user.email:readonly` for the email field (both are already in
+ *      the setup scope manifest).
  *
  * Scope: per Lark app. Open_id values are app-scoped on Lark's side, so the
  * cache file follows the same `identities-${larkAppId}.json` shape as the
@@ -31,6 +33,9 @@ export interface IdentityRecord {
   openId: string;
   type: IdentityType;
   name?: string;
+  email?: string;
+  /** A successful contact API lookup, including a valid "no email" result. */
+  contactResolvedAt?: number;
   source: 'sender' | 'mention' | 'contact_api' | 'message_api' | 'bot_cross_ref' | 'bot_info';
   updatedAt: number;
 }
@@ -109,14 +114,21 @@ export function flushIdentityCacheSync(): void {
 }
 
 /**
- * Merge a partial identity record into the cache. Existing `name` is preserved
- * unless the incoming record carries a real name (no clobbering). Existing
- * `type` is only overridden when the incoming value is more specific
- * (anything other than `unknown`).
+ * Merge a partial identity record into the cache. Existing `name` and `email`
+ * are preserved unless the incoming record carries a real value (no
+ * clobbering). Existing `type` is only overridden when the incoming value is
+ * more specific (anything other than `unknown`).
  */
 export function recordIdentity(
   larkAppId: string,
-  rec: { openId: string; type?: IdentityType; name?: string; source?: IdentityRecord['source'] },
+  rec: {
+    openId: string;
+    type?: IdentityType;
+    name?: string;
+    email?: string;
+    contactResolvedAt?: number;
+    source?: IdentityRecord['source'];
+  },
 ): void {
   if (!rec.openId) return;
   const store = getStore(larkAppId);
@@ -126,12 +138,20 @@ export function recordIdentity(
     openId: rec.openId,
     type: incomingType ?? existing?.type ?? 'unknown',
     name: rec.name ?? existing?.name,
+    email: rec.email ?? existing?.email,
+    contactResolvedAt: rec.contactResolvedAt ?? existing?.contactResolvedAt,
     source: rec.source ?? existing?.source ?? 'sender',
     updatedAt: Date.now(),
   };
   // Skip persist when nothing meaningful changed — avoids disk churn from
   // every sender event re-bumping updatedAt.
-  if (existing && existing.type === merged.type && existing.name === merged.name) {
+  if (
+    existing
+    && existing.type === merged.type
+    && existing.name === merged.name
+    && existing.email === merged.email
+    && existing.contactResolvedAt === merged.contactResolvedAt
+  ) {
     return;
   }
   store.set(rec.openId, merged);
@@ -173,13 +193,27 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
   if (!openId) return undefined;
   const cached = getIdentity(larkAppId, openId);
   if (cached?.name) return cached.name;
+  await ensureContactProfile(larkAppId, openId);
+  return getIdentity(larkAppId, openId)?.name;
+}
+
+/**
+ * Ensure a human identity has had one successful contact profile lookup.
+ * Unlike resolveName, this intentionally does not short-circuit on a cached
+ * display name: name may have come from a mention/message while email is still
+ * unknown. Successful empty profiles are negative-cached via contactResolvedAt.
+ */
+async function ensureContactProfile(larkAppId: string, openId: string): Promise<void> {
+  if (!openId) return;
+  const cached = getIdentity(larkAppId, openId);
+  if (cached?.contactResolvedAt) return;
   if (cached?.type === 'bot' || cached?.type === 'app') return undefined;
-  if (scopeUnavailable.has(larkAppId)) return undefined;
+  if (scopeUnavailable.has(larkAppId)) return;
 
   const key = `${larkAppId}:${openId}`;
   let pending = inflight.get(key);
   if (!pending) {
-    pending = fetchUserName(larkAppId, openId);
+    pending = fetchUserProfile(larkAppId, openId);
     inflight.set(key, pending);
     // Identity-guarded cleanup. A request that times out is evicted by the
     // catch below; if its underlying fetch later settles, we must NOT clobber
@@ -187,9 +221,9 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
     // newer caller. Comparing by reference catches both this race and the
     // simple "settled normally" case.
     //
-    // `.then(cleanup, cleanup)` (not `.finally`) so a future fetchUserName
+    // `.then(cleanup, cleanup)` (not `.finally`) so a future fetchUserProfile
     // refactor that rejects can't leave the returned cleanup promise as an
-    // unhandled rejection. Current fetchUserName swallows everything to
+    // unhandled rejection. Current fetchUserProfile swallows everything to
     // logger.debug, but that's an undocumented invariant we shouldn't rely on.
     const local = pending;
     const cleanup = () => { if (inflight.get(key) === local) inflight.delete(key); };
@@ -209,20 +243,31 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
     // rejection and this line.
     if (inflight.get(key) === pending) inflight.delete(key);
   }
-  return getIdentity(larkAppId, openId)?.name;
 }
 
-async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
+async function fetchUserProfile(larkAppId: string, openId: string): Promise<void> {
   try {
     const c = getBotClient(larkAppId);
     const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
       user_id_type: 'open_id',
     });
     if (res?.code === 0) {
-      const name: string | undefined = res.data?.user?.name;
-      if (name) {
-        recordIdentity(larkAppId, { openId, name, type: 'user', source: 'contact_api' });
-      }
+      const rawName: unknown = res.data?.user?.name;
+      const rawEmail: unknown = res.data?.user?.email;
+      const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+      const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+      // Mark a successful lookup even when email is absent. Without this
+      // negative cache, users who do not have an email would trigger a contact
+      // API request on every message. Failed/time-out lookups never set it, so
+      // a later turn can retry.
+      recordIdentity(larkAppId, {
+        openId,
+        name,
+        email,
+        contactResolvedAt: Date.now(),
+        type: 'user',
+        source: 'contact_api',
+      });
       return;
     }
     // 99991672 = app身份缺权限 (contact:user.base:readonly 没开)
@@ -299,6 +344,46 @@ export interface ResolvedSender {
   openId: string;
   type: 'user' | 'bot';
   name?: string;
+  email?: string;
+}
+
+/**
+ * Resolve a human user from the authoritative contact API for a
+ * security-sensitive current-turn identity check. Unlike resolveSender(), this
+ * deliberately bypasses the persisted display cache: an old cached email must
+ * not authorize a new credential operation.
+ */
+export async function resolveVerifiedUserIdentity(
+  larkAppId: string,
+  openId: string,
+): Promise<{ openId: string; type: 'user'; name?: string; email?: string } | undefined> {
+  if (!openId) return undefined;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    const user = res?.code === 0 ? res?.data?.user : undefined;
+    if (!user) return undefined;
+    const rawName: unknown = user.name;
+    const rawEmail: unknown = user.enterprise_email ?? user.email;
+    const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+    const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+    recordIdentity(larkAppId, {
+      openId,
+      name,
+      email,
+      contactResolvedAt: Date.now(),
+      type: 'user',
+      source: 'contact_api',
+    });
+    return { openId, type: 'user', name, email };
+  } catch (err: any) {
+    logger.debug(
+      `[identity] strict contact lookup for ${openId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -311,9 +396,11 @@ export interface ResolvedSender {
  * (e.g. a known foreign-bot display name from `bot-openids-${appId}.json`)
  * win over cache.
  *
- * Name resolution order (each step only runs if the prior didn't yield a name):
+ * Identity resolution order:
  *   1. hint / cache — free, in-memory.
- *   2. contact API — users only; needs `contact:user.base:readonly`.
+ *   2. contact API — users only; fills missing name/email and needs
+ *      `contact:user.base:readonly` plus `contact:user.email:readonly` for
+ *      email. A successful no-email result is negatively cached.
  *   3. message.get(`with_sender_name=true`) — fallback when `messageId` is
  *      supplied and steps 1–2 came up empty. Covers users AND bots, and works
  *      without the contact scope (the server names whoever sent that message).
@@ -339,9 +426,15 @@ export async function resolveSender(
 
   recordIdentity(larkAppId, { openId, type, source: 'sender' });
 
-  let name = hint?.name ?? getIdentity(larkAppId, openId)?.name;
-  if (!name && type === 'user') {
-    name = await resolveName(larkAppId, openId);
+  let identity = getIdentity(larkAppId, openId);
+  let name = hint?.name ?? identity?.name;
+  if (type === 'user' && (!name || !identity?.contactResolvedAt)) {
+    // Call even when a mention already supplied name if this cache record has
+    // never been contact-enriched: old name-only caches must get one chance to
+    // learn email.
+    await ensureContactProfile(larkAppId, openId);
+    identity = getIdentity(larkAppId, openId);
+    name ??= identity?.name;
   }
   // Last-resort fallback: server-side sender_name via message.get. Covers the
   // gap the contact API can't (bots, missing scope, out-of-range users) but
@@ -349,5 +442,6 @@ export async function resolveSender(
   if (!name && hint?.messageId) {
     name = await resolveNameViaMessage(larkAppId, openId, hint.messageId, type);
   }
-  return { openId, type, name };
+  const email = type === 'user' ? identity?.email : undefined;
+  return { openId, type, name, email };
 }

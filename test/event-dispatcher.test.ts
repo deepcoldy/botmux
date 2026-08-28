@@ -932,6 +932,10 @@ function makeUserMessageEvent(opts: {
   chatType?: string;
   messageId?: string;
   mentions?: TestMention[];
+  /** Lark message_type. Defaults to 'text' — the substitute trigger only fires
+   *  on hand-typed text/post, so tests exercising a trigger must carry a real
+   *  type (real WS events always do; the field is only optional here). */
+  messageType?: string;
 }) {
   const threadId = opts.threadId === null
     ? undefined
@@ -943,6 +947,7 @@ function makeUserMessageEvent(opts: {
       thread_id: threadId,
       chat_id: opts.chatId ?? 'chat-001',
       chat_type: opts.chatType ?? 'group',
+      message_type: opts.messageType ?? 'text',
       content: opts.content,
       mentions: opts.mentions,
     },
@@ -3546,6 +3551,75 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  // Regression for the msg-type gate: a forwarded interactive card / merge_forward
+  // inherits the forwarded content's original recipients into the event's top-level
+  // mentions. Those are NOT a hand-typed @ by the sender, so they must never trigger
+  // the substitute. Only text/post (typed by the sender in the composer) may.
+  for (const badType of ['interactive', 'merge_forward', 'file', 'image']) {
+    it(`substituteMode: ${badType} carrying an inherited @substitute in top-level mentions does NOT trigger`, async () => {
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupReplyMode: 'new-topic',
+        substituteMode: {
+          enabled: true,
+          targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+          disclosure: 'prefix',
+        },
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      handlers.isSessionOwner.mockReturnValue(false);
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '发送给:@Sub Person' }),
+        messageId: `msg-substitute-${badType}`,
+        chatId: 'chat-substitute',
+        chatType: 'group',
+        messageType: badType,
+        // Same mention shape a genuine text @ would carry — proving the gate keys
+        // off message_type, not off whether the mention "looks" real.
+        mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+      });
+
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+  }
+
+  it('substituteMode: a message with no message_type does NOT trigger (fail-closed contract)', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_sub', name: 'Sub Person' }],
+        disclosure: 'prefix',
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-notype',
+      chatId: 'chat-substitute',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_sub' } }],
+    });
+    // Model an event that reached the resolver without a resolved type: neither
+    // WS (always sets message_type) nor the polled path (coalesces msg_type)
+    // should do this, so the gate must fail closed rather than trigger.
+    delete (event.message as any).message_type;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('substituteMode: top-level @substitute carries replyRootId=messageId so each trigger has its own reply anchor', async () => {
     // Regression: without replyRootId, multiple substitute triggers in the same
     // chat-scope session share/clear the currentReplyTarget, causing replies to
@@ -3714,6 +3788,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       messageId: 'msg-substitute-post',
       chatId: 'chat-substitute-post',
       chatType: 'group',
+      messageType: 'post',
     });
 
     await capturedHandlers['im.message.receive_v1'](event);
@@ -6837,6 +6912,22 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
 
     expect(result).toEqual({});
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('wraps a truthy empty object into an invalid empty-body card patch (why resume must bare-return, not `return {}`)', async () => {
+    // Guards the resume-branch fix: a handler returning `{}` is truthy and gets
+    // shaped into `{card:{type:raw,data:{}}}` — an in-place patch with an empty
+    // card body, NOT a no-UI ACK. The resume branch must bare-return (→ undefined)
+    // to land on the genuine empty-ACK `{}` asserted in the test above.
+    handlers.handleCardAction.mockResolvedValue({});
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'repo_switch', root_id: 'root-empty-obj' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_empty_obj_card' },
+    });
+
+    expect(result).toEqual({ card: { type: 'raw', data: {} } });
   });
 
   it('still returns a valid empty ACK when a card handler rejects', async () => {

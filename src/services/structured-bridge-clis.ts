@@ -23,6 +23,7 @@ export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
   'hermes',
   'mtr',
   'pi',
+  'oh-my-pi',
   'grok',
 ] as const satisfies readonly CliId[];
 
@@ -55,17 +56,25 @@ const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
  *  stop/length-without-toolcall and on the hard error/aborted edges (verified
  *  against pi 0.84.2: `terminate:true` is still not persisted and the newer
  *  pending/deferred StopReasons never reach the session JSONL), so a started
- *  Pi turn may suppress the screen-ready heuristic. Accepted gap: a custom
+ *  Pi turn may suppress the screen-ready heuristic. OMP additionally retains
+ *  terminal records provisionally until a decisive record or guarded quiet
+ *  tick proves no plugin continuation follows. Accepted gap: a custom
  *  tool returning `terminate:true` leaves a started turn with no on-disk
  *  terminal — the card stays working until the NEXT user turn's transcript
  *  user event HOL-drops the unclosed head (botmux ships no such tool; same
- *  bounded-recovery shape Codex accepts for lost rollout finals). Other
- *  structured drivers still use the queue for attribution, but their
- *  interrupted/error shapes are not yet complete enough to let a started turn
- *  suppress screen-ready forever. */
+ *  bounded-recovery shape Codex accepts for lost rollout finals). Grok's
+ *  updates.jsonl exposes an authoritative user_message_chunk → turn_completed
+ *  lifecycle; the parser maps end_turn, cancelled, error, and unknown stop
+ *  reasons to explicit terminal outcomes, while worker exit owns the remaining
+ *  ambiguous boundary. Keep a transient TUI prompt from publishing idle until
+ *  that structured terminal settles the turn. Other structured drivers still
+ *  use the queue for attribution, but their interrupted/error shapes are not
+ *  yet complete enough to let a started turn suppress screen-ready forever. */
 export const STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS = [
   'codex',
   'pi',
+  'oh-my-pi',
+  'grok',
 ] as const satisfies readonly CliId[];
 
 const LIFECYCLE_BLOCKING_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS);

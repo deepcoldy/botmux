@@ -28,6 +28,22 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
+/**
+ * 中央前门 → worker 的「平台只读访客」**展示层**提示头（#933 回归修复）。
+ *
+ * 背景：平台注入的 Cookie / `X-Botmux-Role` 在两条路上都会被 dashboard 前门剥掉
+ * （显式 query capability 走 P1-6 的 stripBrowserCredentials；无 capability 时换成
+ * 内部签名 grant）。剥掉之后 worker 的 `platformReadonly` 恒为 false，只读终端页
+ * 便不再显示「owner 登录后可操作 →」的 SSO 引导——冷打开飞书卡片链接的平台访客
+ * 被困在一个没有任何登录入口的只读页里。
+ *
+ * 该头只影响只读页渲染哪条横幅（登录引导 vs 纯只读提示），**不进入任何读/写授权
+ * 判定**：直连 worker 伪造它，最多让一个本来就只读的页面多显示一条登录引导链接。
+ * 前门在 terminalForwardHeaders 丢弃全部客户端 `x-botmux-*` 之后才设置它，浏览器
+ * 无法夹带。
+ */
+export const TERMINAL_PLATFORM_READONLY_HINT_HEADER = 'x-botmux-platform-readonly';
+
 export interface TerminalWriteInput {
   /** Value of the `X-Botmux-Role` request header (normalized to a single string, or undefined). */
   role: string | undefined;
@@ -51,24 +67,27 @@ export interface TerminalAccessDecision {
   platformReadonly: boolean;
 }
 
-/**
- * Derive a stable, read-only terminal capability for one session.  The domain
- * separator prevents this HMAC from being confused with any other use of the
- * dashboard secret, while binding to sessionId keeps a token from opening a
- * different worker.  The host-only secret is masked from sandboxed CLIs.
- */
-export function deriveTerminalViewToken(secret: string, sessionId: string): string {
-  return createHmac('sha256', secret)
-    .update('botmux-terminal-view-v1\0')
-    .update(sessionId)
-    .digest('base64url');
-}
+// NOTE(P1-5): the stable read capability (`deriveTerminalViewToken`, HMAC of
+// secret+sessionId) was deliberately REMOVED. A stable view token could never
+// be revoked: an H5 viewer who fetched it once kept terminal read access after
+// logout/expiry, and a worker restart re-derived the very same value. Read
+// access is now either
+//   • the worker's per-boot random `viewToken` (Feishu card links — dies with
+//     the worker generation), or
+//   • a short-lived signed read grant carried in `?viewToken=` (dashboard
+//     view-link API — bound to sessionId + authSessionId + expiresAt, plus
+//     `audience: central` and the worker's boot generation; the worker accepts
+//     it only when the central front proxy countersigned the hop, so a raw
+//     copied URL dialled straight at the worker/daemon port cannot spend it).
+// Every previously issued stable view token therefore fails on new workers.
+// The WRITE capability below intentionally stays stable — an explicitly issued
+// 「操作链接」 is an independent capability that must survive restarts.
 
 /**
- * Derive a stable WRITE (operate) capability for one session. Mirrors
- * deriveTerminalViewToken but uses a DISTINCT domain separator so the two
- * capabilities can never collide — knowing the view token must never yield the
- * write token (and vice versa) even for the same session+secret.
+ * Derive a stable WRITE (operate) capability for one session. Uses a DISTINCT
+ * domain separator from the retired stable view token so the two capabilities
+ * can never collide — knowing a read capability must never yield the write
+ * token (and vice versa) even for the same session+secret.
  *
  * Rationale: the write token used to be a per-process `randomBytes(16)`, so an
  * already-issued 「操作链接」/write link (`?token=`) died the moment its worker

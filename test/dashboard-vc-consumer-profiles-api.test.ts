@@ -8,27 +8,24 @@ import {
   vcMeetingConsumerProfilesFromDtos,
 } from '../src/dashboard/vc-consumer-profiles-api.js';
 import type {
-  VcMeetingAgentOptionDto,
   VcMeetingConsumerProfileDto,
   VcMeetingConsumerProfilesApiDeps,
   VcMeetingPermissionPreset,
 } from '../src/dashboard/vc-consumer-profiles-api.js';
-import {
-  seedVcMeetingDefaultConsumerProfile,
-  selectVcMeetingDefaultConsumerAgent,
-} from '../src/services/vc-meeting-consumer-profile-bootstrap.js';
-import type { VcMeetingConsumerProfileConfig } from '../src/types.js';
-import type { VcMeetingConsumerProfilesSnapshot } from '../src/services/vc-meeting-consumer-profile-store.js';
+import type { VcMeetingSharedConsumerProfile } from '../src/global-config.js';
+import type {
+  VcMeetingSharedConsumerCatalogSnapshot,
+} from '../src/services/vc-meeting-shared-consumer-catalog-store.js';
 import type { BotConfig } from '../src/bot-registry.js';
 
 const READ = 'meeting.read';
 const OUTPUT = 'meeting.output.request';
 const LISTENER = 'listener.output.request';
 
-function canonical(over: Partial<VcMeetingConsumerProfileConfig> = {}): VcMeetingConsumerProfileConfig {
+/** 共享目录条目刻意**不带** `agentAppId`：执行方在读路径绑定为收到事件的 bot。 */
+function canonical(over: Partial<VcMeetingSharedConsumerProfile> = {}): VcMeetingSharedConsumerProfile {
   return {
     id: 'minutes',
-    agentAppId: 'app_agent',
     role: 'minutes',
     responseMode: 'silent',
     capabilities: [READ],
@@ -39,7 +36,6 @@ function canonical(over: Partial<VcMeetingConsumerProfileConfig> = {}): VcMeetin
 function dto(over: Partial<VcMeetingConsumerProfileDto> = {}): VcMeetingConsumerProfileDto {
   return {
     id: 'minutes',
-    agentAppId: 'app_agent',
     responseMode: 'silent',
     permissionPreset: 'observe_only',
     ...over,
@@ -47,7 +43,7 @@ function dto(over: Partial<VcMeetingConsumerProfileDto> = {}): VcMeetingConsumer
 }
 
 describe('deriveVcMeetingPermissionPreset', () => {
-  const cases: Array<[VcMeetingPermissionPreset, VcMeetingConsumerProfileConfig]> = [
+  const cases: Array<[VcMeetingPermissionPreset, VcMeetingSharedConsumerProfile]> = [
     ['observe_only', canonical()],
     ['observe_only', canonical({ responseMode: 'listener_thread', capabilities: [LISTENER, READ] })],
     ['meeting_text', canonical({ capabilities: [OUTPUT, READ], ownedSinks: ['meeting_text'] })],
@@ -239,7 +235,6 @@ describe('vcMeetingConsumerProfilesFromDtos ↔ vcMeetingConsumerProfileToDto', 
   it('reports field-level errors with DTO paths', () => {
     const mapped = vcMeetingConsumerProfilesFromDtos([
       dto({ id: '  ' }),
-      dto({ id: 'b', agentAppId: '' }),
       dto({ id: 'c', responseMode: 'broadcast' as never }),
       dto({ id: 'd', permissionPreset: 'root' as never }),
       dto({ id: 'e', activityTypes: ['transcript_received', 'nope'] }),
@@ -250,13 +245,22 @@ describe('vcMeetingConsumerProfilesFromDtos ↔ vcMeetingConsumerProfileToDto', 
     if (mapped.ok) return;
     expect(mapped.fieldErrors.map(e => e.path)).toEqual([
       'profiles[0].id',
-      'profiles[1].agentAppId',
-      'profiles[2].responseMode',
-      'profiles[3].permissionPreset',
-      'profiles[4].activityTypes',
-      'profiles[5].instructions',
-      'profiles[6].listenerPlacement',
+      'profiles[1].responseMode',
+      'profiles[2].permissionPreset',
+      'profiles[3].activityTypes',
+      'profiles[4].instructions',
+      'profiles[5].listenerPlacement',
     ]);
+  });
+
+  // 共享目录里没有执行方这一维：DTO 夹带 agentAppId 也不会被写进去。
+  it('ignores an injected agentAppId — the shared catalog has no executor field', () => {
+    const mapped = vcMeetingConsumerProfilesFromDtos(
+      [{ ...dto(), agentAppId: 'app_other_bot' } as VcMeetingConsumerProfileDto], [],
+    );
+    expect(mapped.ok).toBe(true);
+    if (!mapped.ok) return;
+    expect(mapped.profiles[0]).not.toHaveProperty('agentAppId');
   });
 
   it('trims label/instructions, drops empties, sorts+dedups activityTypes', () => {
@@ -276,9 +280,10 @@ describe('vcMeetingConsumerProfilesFromDtos ↔ vcMeetingConsumerProfileToDto', 
   });
 });
 
-function snapshot(over: Partial<VcMeetingConsumerProfilesSnapshot> = {}): VcMeetingConsumerProfilesSnapshot {
+function snapshot(
+  over: Partial<VcMeetingSharedConsumerCatalogSnapshot> = {},
+): VcMeetingSharedConsumerCatalogSnapshot {
   return {
-    listenerBotAppId: 'app_listener',
     revision: 'sha256:rev1',
     catalogState: 'profiles',
     defaultMode: 'listenOnly',
@@ -293,8 +298,8 @@ function makeDeps(over: Partial<VcMeetingConsumerProfilesApiDeps> = {}): VcMeeti
     larkAppId: 'app_agent', name: 'agent-a', displayName: 'Agent A', cliId: 'claude',
   } as unknown as BotConfig;
   return {
-    readSnapshot: vi.fn(async () => snapshot()),
-    updateSnapshot: vi.fn(async (_id, input) => ({
+    readCatalog: vi.fn(async () => snapshot()),
+    updateCatalog: vi.fn(async input => ({
       ok: true as const,
       snapshot: snapshot({
         revision: 'sha256:rev2',
@@ -311,13 +316,26 @@ function makeDeps(over: Partial<VcMeetingConsumerProfilesApiDeps> = {}): VcMeeti
     managedSideEffectEligible: vi.fn(() => true),
     sandboxIsolated: vi.fn(() => true),
     reloadDaemons: vi.fn(async () => {}),
+    applyBotOutputPolicy: vi.fn(async () => ({ ok: true })),
     ...over,
   };
 }
 
+const DEFAULT_POLICY_FIELDS = {
+  // 缺省 = 接收会议事件：VC 对每个连着飞书的 bot 默认可用，enabled:false 才是退出。
+  vcEnabled: true,
+  vcEligible: true,
+  textOutputPolicy: null,
+  voiceOutputPolicy: null,
+  // 实时语音能力默认开启（未显式配 = 开）；语音生效值随之默认 allow。
+  realtimeVoiceEnabled: true,
+  catalogDefaultConsumerId: null,
+  effectiveTextOutputPolicy: 'allow',
+  effectiveVoiceOutputPolicy: 'allow',
+} as const;
+
 function putRequest(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    listenerBotAppId: 'app_listener',
     expectedRevision: 'sha256:rev1',
     defaultMode: 'listenOnly',
     defaultConsumerIds: [],
@@ -327,7 +345,7 @@ function putRequest(over: Record<string, unknown> = {}): Record<string, unknown>
 }
 
 describe('buildVcMeetingAgentOptions', () => {
-  it('maps registry bots to the isolation-aware option DTO (listener not excluded)', () => {
+  it('maps registry bots to the isolation-aware option DTO', () => {
     const deps = makeDeps();
     expect(buildVcMeetingAgentOptions(deps)).toEqual([{
       appId: 'app_agent',
@@ -338,6 +356,7 @@ describe('buildVcMeetingAgentOptions', () => {
       reliableTurnTerminal: true,
       managedSideEffectEligible: true,
       sandboxIsolated: true,
+      ...DEFAULT_POLICY_FIELDS,
     }]);
   });
 
@@ -358,7 +377,24 @@ describe('buildVcMeetingAgentOptions', () => {
       reliableTurnTerminal: false,
       managedSideEffectEligible: true,
       sandboxIsolated: true,
+      ...DEFAULT_POLICY_FIELDS,
     }]);
+  });
+
+  it('shows an OFFLINE bot\'s persisted Feishu name (not the raw appId)', () => {
+    // Regression: cli_xxx bots that are offline used to fall through to appId in
+    // the dropdown. The dashboard now feeds onlineBotName from bots-info.json so
+    // an offline bot keeps its friendly name. Here isOnline=false but the name
+    // resolver still returns the persisted name.
+    const bot = { larkAppId: 'cli_offline', name: '' } as unknown as BotConfig;
+    const deps = makeDeps({
+      loadBotConfigs: vi.fn(() => [bot]),
+      onlineBotName: vi.fn(() => 'LastResort(Codex)'),
+      isOnline: vi.fn(() => false),
+    });
+    const options = buildVcMeetingAgentOptions(deps);
+    expect(options[0]?.label).toBe('LastResort(Codex)');
+    expect(options[0]?.online).toBe(false);
   });
 
   it('returns [] when config loading throws (options degrade, not 500)', () => {
@@ -375,127 +411,35 @@ describe('buildVcMeetingAgentOptions', () => {
     expect(buildVcMeetingAgentOptions(deps).map(option => option.appId))
       .toEqual(['app_a', 'app_m', 'app_z']);
   });
-});
 
-function agentOption(
-  appId: string,
-  over: Partial<VcMeetingAgentOptionDto> = {},
-): VcMeetingAgentOptionDto {
-  return {
-    appId,
-    label: appId,
-    online: true,
-    workingDirReady: true,
-    reliableTurnTerminal: true,
-    managedSideEffectEligible: true,
-    sandboxIsolated: true,
-    ...over,
-  };
-}
-
-describe('default VC consumer profile bootstrap', () => {
-  it('selects an eligible explicit preference, then listener self, then lexical external fallback', () => {
-    const options = [agentOption('app_z'), agentOption('app_listener'), agentOption('app_a')];
-    expect(selectVcMeetingDefaultConsumerAgent('app_listener', options, ['app_z'])?.appId).toBe('app_z');
-    expect(selectVcMeetingDefaultConsumerAgent('app_listener', options)?.appId).toBe('app_listener');
-    expect(selectVcMeetingDefaultConsumerAgent('missing_listener', options)?.appId).toBe('app_a');
-  });
-
-  it('requires structural readiness but ignores transient online state', () => {
-    const options = [
-      agentOption('app_no_dir', { workingDirReady: false }),
-      agentOption('app_no_terminal', { reliableTurnTerminal: false }),
-      agentOption('app_ineligible', { managedSideEffectEligible: false }),
-      agentOption('app_offline_ready', { online: false }),
-    ];
-    expect(selectVcMeetingDefaultConsumerAgent('app_no_dir', options)?.appId)
-      .toBe('app_offline_ready');
-    expect(selectVcMeetingDefaultConsumerAgent('x', options.slice(0, 3))).toBeUndefined();
-  });
-
-  it('seeds a visible full-capability minutes profile on the first enable', () => {
-    const meetingConsumer: Record<string, unknown> = {
-      enabled: true,
-      injectIntervalMs: 30_000,
-    };
-    expect(seedVcMeetingDefaultConsumerProfile(
-      meetingConsumer,
-      'app_listener',
-      [agentOption('app_z'), agentOption('app_listener')],
-    )).toBe(true);
-    expect(meetingConsumer).toMatchObject({
-      enabled: true,
-      injectIntervalMs: 30_000,
-      defaultMode: 'agents',
-      defaultConsumerIds: ['minutes'],
-      consumerProfiles: [{
-        id: 'minutes',
-        agentAppId: 'app_listener',
-        label: '会议纪要',
-        role: 'minutes',
-        responseMode: 'listener_thread',
-        capabilities: ['listener.output.request', 'meeting.output.request', 'meeting.read'],
-        ownedSinks: ['meeting_text', 'meeting_voice'],
-      }],
-    });
-    expect((meetingConsumer.consumerProfiles as Array<Record<string, unknown>>)[0]?.instructions)
-      .toContain('无实质增量时保持静默');
-    expect(meetingConsumer.defaultProfileBootstrap).toMatchObject({
-      generatorVersion: 2,
-      profileId: 'minutes',
-    });
-  });
-
-  it('does not seed without a structurally eligible agent', () => {
-    const meetingConsumer: Record<string, unknown> = { enabled: true };
-    expect(seedVcMeetingDefaultConsumerProfile(
-      meetingConsumer,
-      'app_listener',
-      [agentOption('app_listener', { reliableTurnTerminal: false })],
-    )).toBe(false);
-    expect(meetingConsumer).toEqual({ enabled: true });
-  });
-
-  it.each([
-    ['an explicit empty catalog', { consumerProfiles: [] }],
-    ['an existing catalog', { consumerProfiles: [{ id: 'existing' }] }],
-    ['legacy defaultAgentAppId', { defaultAgentAppId: 'app_old' }],
-    ['legacy defaultAgent alias', { defaultAgent: 'app_old' }],
-    ['legacy candidate list', { agentCandidates: [] }],
-    ['legacy agents alias', { agents: [] }],
-    ['legacy agent mode', { defaultMode: 'agent' }],
-    ['an explicit listen-only mode', { defaultMode: 'listenOnly' }],
-    ['an incomplete profile default', { defaultMode: 'agents' }],
-    ['explicit profile ids', { defaultConsumerIds: [] }],
-  ])('preserves %s instead of implicitly migrating it', (_name, existing) => {
-    const meetingConsumer: Record<string, unknown> = { enabled: true, ...existing };
-    const before = structuredClone(meetingConsumer);
-    expect(seedVcMeetingDefaultConsumerProfile(
-      meetingConsumer,
-      'app_listener',
-      [agentOption('app_listener')],
-    )).toBe(false);
-    expect(meetingConsumer).toEqual(before);
+  // 每个 bot 一行开关取代了旧的「会议事件接收 Bot」单选：缺省接收，显式
+  // enabled:false 才退出，apiOnly（无飞书连接）结构上不可能收会议事件。
+  it('exposes the per-bot VC receive switch: default on, explicit off, apiOnly ineligible', () => {
+    const bots = [
+      { larkAppId: 'app_default', cliId: 'claude' },
+      { larkAppId: 'app_off', cliId: 'claude', vcMeetingAgent: { enabled: false } },
+      { larkAppId: 'app_api_only', cliId: 'claude', apiOnly: true },
+      { larkAppId: 'app_on', cliId: 'claude', vcMeetingAgent: { enabled: true } },
+    ] as unknown as BotConfig[];
+    const deps = makeDeps({ loadBotConfigs: vi.fn(() => bots) });
+    expect(buildVcMeetingAgentOptions(deps).map(o => [o.appId, o.vcEnabled, o.vcEligible])).toEqual([
+      ['app_api_only', false, false],
+      ['app_default', true, true],
+      ['app_off', false, true],
+      ['app_on', true, true],
+    ]);
   });
 });
 
 describe('handleVcMeetingConsumerProfilesGet', () => {
-  it('400 on empty listenerBotAppId', async () => {
-    const out = await handleVcMeetingConsumerProfilesGet('  ', makeDeps());
-    expect(out.status).toBe(400);
-  });
-
-  it('404 when bot missing, 503 when config unreadable', async () => {
+  it('503 when the shared catalog is unreadable', async () => {
     expect((await handleVcMeetingConsumerProfilesGet(
-      'x', makeDeps({ readSnapshot: vi.fn(async () => undefined) }),
-    )).status).toBe(404);
-    expect((await handleVcMeetingConsumerProfilesGet(
-      'x', makeDeps({ readSnapshot: vi.fn(async () => { throw new Error('io'); }) }),
+      makeDeps({ readCatalog: vi.fn(async () => { throw new Error('io'); }) }),
     )).status).toBe(503);
   });
 
   it('200 returns DTO profiles + agentOptions + revision', async () => {
-    const out = await handleVcMeetingConsumerProfilesGet('app_listener', makeDeps());
+    const out = await handleVcMeetingConsumerProfilesGet(makeDeps());
     expect(out.status).toBe(200);
     if (out.status !== 200) return;
     expect(out.body.revision).toBe('sha256:rev1');
@@ -507,36 +451,37 @@ describe('handleVcMeetingConsumerProfilesGet', () => {
       templates: [
         { templateId: 'important-information-sync', version: 1, source: 'builtin' },
         { templateId: 'meeting-minutes', version: 2, source: 'builtin' },
-        { templateId: 'meeting-facilitator', version: 1, source: 'builtin' },
+        { templateId: 'meeting-facilitator', version: 2, source: 'builtin' },
         { templateId: 'solution-review-risk-challenge', version: 1, source: 'builtin' },
         { templateId: 'interview-requirement-insights', version: 1, source: 'builtin' },
       ],
     });
   });
 
-  it('GET exposes an explicit legacy-seed migration offer without mutating config', async () => {
+  // 「从没配置过」也要有可跑的角色：Dashboard 直接展示内置默认目录，读路径不写盘。
+  it('GET on a never-configured catalog exposes the built-in default without writing', async () => {
     const deps = makeDeps({
-      readSnapshot: vi.fn(async () => snapshot({
-        migrationOffer: 'enable_seeded_minutes_default',
+      readCatalog: vi.fn(async () => snapshot({
+        catalogState: 'uninitialized',
+        defaultMode: 'agents',
+        defaultConsumerIds: ['minutes'],
       })),
     });
-    const out = await handleVcMeetingConsumerProfilesGet('app_listener', deps);
+    const out = await handleVcMeetingConsumerProfilesGet(deps);
     expect(out.status).toBe(200);
     if (out.status !== 200) return;
-    expect(out.body.migrationOffer).toBe('enable_seeded_minutes_default');
-    expect(deps.updateSnapshot).not.toHaveBeenCalled();
+    expect(out.body.catalogState).toBe('uninitialized');
+    expect(out.body.defaultConsumerIds).toEqual(['minutes']);
+    expect(deps.updateCatalog).not.toHaveBeenCalled();
   });
 });
 
 describe('handleVcMeetingConsumerProfilesPut', () => {
-  it('400 on non-object payload / missing appId / missing revision', async () => {
+  it('400 on non-object payload / missing revision', async () => {
     const deps = makeDeps();
     for (const payload of [null, 'x', [1]]) {
       expect((await handleVcMeetingConsumerProfilesPut(payload, deps)).status).toBe(400);
     }
-    expect((await handleVcMeetingConsumerProfilesPut(
-      putRequest({ listenerBotAppId: ' ' }), deps,
-    )).body).toMatchObject({ error: 'listenerBotAppId_required' });
     expect((await handleVcMeetingConsumerProfilesPut(
       putRequest({ expectedRevision: undefined }), deps,
     )).body).toMatchObject({ error: 'expectedRevision_required' });
@@ -555,7 +500,7 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
       expect(out.status).toBe(422);
       expect(out.status === 422 && out.body.fieldErrors?.[0]?.path).toBe(path);
     }
-    expect(deps.updateSnapshot).not.toHaveBeenCalled();
+    expect(deps.updateCatalog).not.toHaveBeenCalled();
   });
 
   it('422 on DTO mapping failure without touching the store', async () => {
@@ -565,17 +510,17 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
     );
     expect(out.status).toBe(422);
     expect(out.status === 422 && out.body.fieldErrors?.[0]?.path).toBe('profiles[0].permissionPreset');
-    expect(deps.updateSnapshot).not.toHaveBeenCalled();
+    expect(deps.updateCatalog).not.toHaveBeenCalled();
   });
 
   it('custom reuse maps from the CURRENT stored policy of the same id', async () => {
     const stored = canonical({ capabilities: [LISTENER, OUTPUT, READ], ownedSinks: ['meeting_text'] });
-    const deps = makeDeps({ readSnapshot: vi.fn(async () => snapshot({ profiles: [stored] })) });
+    const deps = makeDeps({ readCatalog: vi.fn(async () => snapshot({ profiles: [stored] })) });
     const out = await handleVcMeetingConsumerProfilesPut(
       putRequest({ profiles: [dto({ permissionPreset: 'custom' })] }), deps,
     );
     expect(out.status).toBe(200);
-    const sent = vi.mocked(deps.updateSnapshot).mock.calls[0][1];
+    const sent = vi.mocked(deps.updateCatalog).mock.calls[0][0];
     expect(sent.profiles[0].capabilities).toEqual([LISTENER, OUTPUT, READ]);
     expect(sent.profiles[0].ownedSinks).toEqual(['meeting_text']);
   });
@@ -585,23 +530,22 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
     await handleVcMeetingConsumerProfilesPut(
       putRequest({ defaultMode: 'agents', defaultConsumerIds: ['ghost', 'minutes'] }), deps,
     );
-    expect(vi.mocked(deps.updateSnapshot).mock.calls[0][1].defaultConsumerIds)
+    expect(vi.mocked(deps.updateCatalog).mock.calls[0][0].defaultConsumerIds)
       .toEqual(['ghost', 'minutes']);
   });
 
-  it('maps store outcomes: 409 conflict / 422 fieldErrors passthrough / 404 / 503', async () => {
-    const failures: Array<[Parameters<typeof makeDeps>[0]['updateSnapshot'], number]> = [
+  it('maps store outcomes: 409 conflict / 422 fieldErrors passthrough / 503', async () => {
+    const failures: Array<[Parameters<typeof makeDeps>[0]['updateCatalog'], number]> = [
       [vi.fn(async () => ({ ok: false as const, reason: 'config_conflict' as const })), 409],
       [vi.fn(async () => ({
         ok: false as const,
         reason: 'validation_failed' as const,
         fieldErrors: [{ path: 'defaultConsumerIds', message: '未知 id' }],
       })), 422],
-      [vi.fn(async () => ({ ok: false as const, reason: 'bot_not_in_config' as const })), 404],
       [vi.fn(async () => ({ ok: false as const, reason: 'config_unavailable' as const })), 503],
     ];
-    for (const [updateSnapshot, status] of failures) {
-      const deps = makeDeps({ updateSnapshot });
+    for (const [updateCatalog, status] of failures) {
+      const deps = makeDeps({ updateCatalog });
       const out = await handleVcMeetingConsumerProfilesPut(putRequest(), deps);
       expect(out.status).toBe(status);
       if (status === 422 && out.status === 422) {
@@ -611,18 +555,149 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
     }
   });
 
-  it('success returns the fresh snapshot and hot-reloads the listener daemon', async () => {
+  // 共享目录走 daemon 侧 mtime 缓存的 live 读，下一个会议事件自然生效：
+  // 只保存预设时不该给任何 daemon 发 reload。
+  it('success returns the fresh snapshot and reloads nobody when only the catalog changed', async () => {
     const deps = makeDeps();
     const out = await handleVcMeetingConsumerProfilesPut(putRequest(), deps);
     expect(out.status).toBe(200);
     if (out.status !== 200) return;
     expect(out.body.revision).toBe('sha256:rev2');
-    expect(deps.reloadDaemons).toHaveBeenCalledWith(['app_listener']);
+    expect(deps.reloadDaemons).toHaveBeenCalledWith([]);
   });
 
   it('reload failure does not fail the PUT (config already persisted)', async () => {
     const deps = makeDeps({ reloadDaemons: vi.fn(async () => { throw new Error('ipc down'); }) });
     const out = await handleVcMeetingConsumerProfilesPut(putRequest(), deps);
     expect(out.status).toBe(200);
+  });
+
+  it('applies per-bot output-policy patches through the locked RMW dep and reloads those bots', async () => {
+    const deps = makeDeps();
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [{
+        appId: 'app_agent',
+        vcEnabled: false,
+        textOutputPolicy: 'approval',
+        voiceOutputPolicy: null,
+        realtimeVoiceEnabled: true,
+      }],
+    }), deps);
+    expect(out.status).toBe(200);
+    expect(deps.applyBotOutputPolicy).toHaveBeenCalledWith({
+      appId: 'app_agent',
+      vcEnabled: false,
+      textOutputPolicy: 'approval',
+      voiceOutputPolicy: null,
+      realtimeVoiceEnabled: true,
+      catalogDefaultConsumerId: null,
+    });
+    expect(deps.reloadDaemons).toHaveBeenCalledWith(['app_agent']);
+  });
+
+  // 老客户端不发 vcEnabled：缺省必须是「保持接收」，绝不能被解释成关掉这个 bot。
+  it('defaults a missing vcEnabled to true instead of silently disabling the bot', async () => {
+    const deps = makeDeps();
+    await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [{
+        appId: 'app_agent',
+        textOutputPolicy: null,
+        voiceOutputPolicy: null,
+        realtimeVoiceEnabled: false,
+      }],
+    }), deps);
+    expect(deps.applyBotOutputPolicy).toHaveBeenCalledWith(
+      expect.objectContaining({ appId: 'app_agent', vcEnabled: true }),
+    );
+  });
+
+  it('422 rejects a non-boolean vcEnabled before writing anything', async () => {
+    const deps = makeDeps();
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [{
+        appId: 'app_agent',
+        vcEnabled: 'yes',
+        textOutputPolicy: null,
+        voiceOutputPolicy: null,
+        realtimeVoiceEnabled: false,
+      }],
+    }), deps);
+    expect(out.status).toBe(422);
+    if (out.status !== 422) return;
+    expect(out.body.fieldErrors?.map(err => err.path)).toEqual(['botOutputPolicies[0].vcEnabled']);
+    expect(deps.updateCatalog).not.toHaveBeenCalled();
+    expect(deps.applyBotOutputPolicy).not.toHaveBeenCalled();
+  });
+
+  it('422 rejects unknown appId / bad policy values in botOutputPolicies before writing anything', async () => {
+    const deps = makeDeps();
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [
+        { appId: 'app_ghost', textOutputPolicy: 'allow', voiceOutputPolicy: null, realtimeVoiceEnabled: false },
+        { appId: 'app_agent', textOutputPolicy: 'shout', voiceOutputPolicy: null, realtimeVoiceEnabled: false },
+      ],
+    }), deps);
+    expect(out.status).toBe(422);
+    if (out.status !== 422) return;
+    expect(out.body.fieldErrors?.map(err => err.path)).toEqual([
+      'botOutputPolicies[0].appId',
+      'botOutputPolicies[1].textOutputPolicy',
+    ]);
+    expect(deps.updateCatalog).not.toHaveBeenCalled();
+    expect(deps.applyBotOutputPolicy).not.toHaveBeenCalled();
+  });
+
+  it('503 bot_policy_write_failed when the locked RMW write fails (snapshot already committed, UI re-GETs)', async () => {
+    const deps = makeDeps({
+      applyBotOutputPolicy: vi.fn(async () => ({ ok: false, reason: 'bot_not_in_config' })),
+    });
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [{
+        appId: 'app_agent',
+        vcEnabled: true,
+        textOutputPolicy: null,
+        voiceOutputPolicy: 'deny',
+        realtimeVoiceEnabled: false,
+      }],
+    }), deps);
+    expect(out.status).toBe(503);
+    if (out.status !== 503) return;
+    expect(out.body.error).toBe('bot_policy_write_failed');
+    // Reload still ran so daemons converge on whatever actually landed.
+    expect(deps.reloadDaemons).toHaveBeenCalledWith(['app_agent']);
+  });
+
+  it('agent options expose configured + effective output policies (realtime voice on by default)', () => {
+    const bot = {
+      larkAppId: 'app_agent',
+      cliId: 'claude',
+      vcMeetingAgent: {
+        meetingConsumer: { textOutputPolicy: 'approval' },
+        realtimeVoice: { enabled: true },
+      },
+    } as unknown as BotConfig;
+    const deps = makeDeps({ loadBotConfigs: vi.fn(() => [bot]) });
+    const [option] = buildVcMeetingAgentOptions(deps);
+    expect(option).toMatchObject({
+      textOutputPolicy: 'approval',
+      voiceOutputPolicy: null,
+      realtimeVoiceEnabled: true,
+      effectiveTextOutputPolicy: 'approval',
+      effectiveVoiceOutputPolicy: 'allow',
+    });
+  });
+
+  it('an explicit realtimeVoice.enabled=false opts a bot out (voice denied)', () => {
+    const bot = {
+      larkAppId: 'app_agent',
+      cliId: 'claude',
+      vcMeetingAgent: { realtimeVoice: { enabled: false } },
+    } as unknown as BotConfig;
+    const deps = makeDeps({ loadBotConfigs: vi.fn(() => [bot]) });
+    const [option] = buildVcMeetingAgentOptions(deps);
+    expect(option).toMatchObject({
+      realtimeVoiceEnabled: false,
+      effectiveVoiceOutputPolicy: 'deny',
+    });
   });
 });

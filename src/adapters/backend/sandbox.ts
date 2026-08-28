@@ -600,6 +600,14 @@ export function prepareDirectSandbox(opts: {
   trustedBotmuxCommandPaths?: readonly string[];
   /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
   mcpGatewaySocketPath?: string;
+  /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
+   *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
+   *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
+   *  the SAME keystore the policy denied/carved-out — NOT the lexical env value, which on a
+   *  symlinked data root resolves to an unbound path inside the sandbox (ENOENT → auth
+   *  breaks) or a namespace the policy never anchored. Absent/empty →
+   *  unset in the child (default store, matching the policy's default resolution). */
+  larkCliDataDir?: string | null;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   if (!ensureSandboxDeps()) return null;
@@ -749,6 +757,20 @@ export function prepareDirectSandbox(opts: {
   }
   args.push('--unsetenv', 'BOTS_CONFIG');
   args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
+  // LARKSUITE_CLI_DATA_DIR relocates the lark-cli keystore dir on Linux to
+  // `<value>/lark-cli`. Pin the child to the CANONICAL data root the worker resolved
+  // (opts.larkCliDataDir = dirname of the frozen keystore dir) so the in-sandbox lark-cli
+  // opens EXACTLY the keystore the policy denied/carved-out — same canonical namespace,
+  // not the lexical env value (which on a symlinked data root resolves to an unbound path
+  // inside the sandbox → ENOENT/auth-break, or a namespace the policy never anchored).
+  // Absent → unset so the child falls back to $HOME/.local/share,
+  // matching the policy's default resolution. Authoritative: applied last, and bwrap has
+  // no --clearenv so this overrides any inherited/rc-injected value.
+  if (opts.larkCliDataDir && opts.larkCliDataDir.startsWith('/')) {
+    args.push('--setenv', 'LARKSUITE_CLI_DATA_DIR', opts.larkCliDataDir);
+  } else {
+    args.push('--unsetenv', 'LARKSUITE_CLI_DATA_DIR');
+  }
   for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
   // Canonicalize the CLI binary before execvp: on a symlinked-$HOME host
   // (e.g. /home/u → /data00/home/u shared-drive mount) the worker hands us the

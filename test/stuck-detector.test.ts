@@ -10,13 +10,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { StuckDetector, matchHookReviewScreen } from '../src/utils/stuck-detector.js';
+import {
+  StuckDetector,
+  matchHookReviewScreen,
+  shouldHoldInputForHookReview,
+} from '../src/utils/stuck-detector.js';
 
 // Official Codex TUI snapshots read from fixture files (not inline constants)
 // so the classifier is tested against the real on-disk representation.
 const FIXTURES = join(__dirname, 'fixtures');
 const LEVEL_1_SNAPSHOT = readFileSync(join(FIXTURES, 'codex-hooks-browser-level1.snap'), 'utf-8');
 const LEVEL_2_SNAPSHOT = readFileSync(join(FIXTURES, 'codex-hooks-browser-level2.snap'), 'utf-8');
+const STARTUP_HOOKS_REVIEW_SNAPSHOT = readFileSync(
+  join(FIXTURES, 'codex-startup-hooks-review-rust-v0.147.0.snap'),
+  'utf-8',
+);
 
 describe('StuckDetector', () => {
   beforeEach(() => {
@@ -203,6 +211,30 @@ describe('StuckDetector', () => {
 
     expect(onStuck).toHaveBeenCalledTimes(1);
     detector.dispose();
+  });
+});
+
+describe('shouldHoldInputForHookReview', () => {
+  it('holds input on the official Codex startup review snapshot so Enter cannot trust all', () => {
+    expect(shouldHoldInputForHookReview(STARTUP_HOOKS_REVIEW_SNAPSHOT)).toBe(true);
+  });
+
+  it('accepts the singular count and a selection arrow on any option', () => {
+    const singularWithThirdSelected = STARTUP_HOOKS_REVIEW_SNAPSHOT
+      .replace('2 hooks are new or changed.', '1 hook is new or changed.')
+      .replace('› 1. Review hooks', '  1. Review hooks')
+      .replace('  3. Continue without trusting (hooks won\'t run)', '› 3. Continue without trusting (hooks won\'t run)');
+    expect(shouldHoldInputForHookReview(singularWithThirdSelected)).toBe(true);
+  });
+
+  it('releases input on an ordinary Codex composer', () => {
+    expect(shouldHoldInputForHookReview('› Ask Codex to do anything')).toBe(false);
+  });
+
+  it('does not mistake quoted startup-review text for an active menu', () => {
+    expect(shouldHoldInputForHookReview(
+      `The terminal printed:\n${STARTUP_HOOKS_REVIEW_SNAPSHOT}\n\n› Ask Codex to do anything`,
+    )).toBe(false);
   });
 });
 

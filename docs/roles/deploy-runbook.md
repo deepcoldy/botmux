@@ -1,7 +1,7 @@
 # 角色系统部署 runbook
 
 前提：PR1-3（`docs/role-system-design.md` §11.3 的 brandLabel 变量替换 / TUI idle 注入队列 +
-`botmux slash` / `botmux role switch`）已合入并部署（`pnpm switch:here && botmux restart`）。
+`botmux slash` / `botmux role switch`）已合入并部署（`bun run switch:here && bun run daemon:restart`）。
 
 > 命名：角色切换命令为 `botmux role switch <目录>`（曾用名 `botmux cd`，已移除）。
 > ⚠️ 存量部署的 `~/botmux-roles/<appId>/_role-protocol.md`（及各角色目录内的副本）里的
@@ -134,7 +134,7 @@ bot 自己的子树**：切到别的 bot 的角色目录会被拒（`outside_own
 ## 6. `botmux restart` 后真机验证
 
 ```bash
-pnpm switch:here && botmux restart
+bun run switch:here && bun run daemon:restart
 ```
 
 按下列清单逐项在飞书真机验收，全部打勾（内容照搬 `docs/role-system-design.md` §12，

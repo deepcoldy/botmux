@@ -260,6 +260,21 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(receiver.session.sessionId).not.toBe(ordinary.session.sessionId);
   });
 
+  it('Plan B: a meeting-agent session is keyed at the ordinary chat slot, not an isolated vc-receiver key', () => {
+    // The one-line root cause of the "meeting listener totally broken" report:
+    // activeSessionKey used to key a vcMeetingReceiver session by
+    // `vc-receiver:${sessionId}`, splitting it into a second routing universe so
+    // plain IM (keyed by the chat anchor) could never reach it. Under Plan B the
+    // marker is pure delivery metadata and the session lives at the normal
+    // (chatId, appId) slot — so IM and transcripts fold into the SAME session.
+    const receiver = seedReceiverSession();
+    expect(activeSessionKey(receiver)).toBe(sessionKey(CHAT, APP));
+    expect(activeSessionKey(receiver)).not.toContain('vc-receiver:');
+    // The map slot the meeting agent occupies IS the ordinary chat key, so an
+    // inbound message to this chat resolves this exact session.
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(receiver);
+  });
+
   it('keeps receiver hook attribution when no ordinary chat session exists', async () => {
     const receiver = seedReceiverSession();
 

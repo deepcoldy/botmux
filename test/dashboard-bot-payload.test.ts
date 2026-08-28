@@ -16,17 +16,24 @@ describe('dashboard bot payload helpers', () => {
     const editableFields = [
       'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
       'autoStartOnGroupJoinPrompt', 'autoStartOnNewTopic', 'backendType',
-      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput',
+      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput', 'codexAuthSync',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
-      'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
+      'envelopeInjection', 'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
       'feedback',
       'overloadAlert', 'p2pMode', 'p2pOpen', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',
+      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'senderTag', 'writableTerminalLinkInCard',
+      'sessionOwnerReminder',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
+  it('normalizes the Codex auth policy to the upgrade-compatible shared default', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ codexAuthSync: 'shared' });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { codexAuthSync: 'isolated' }))
+      .toMatchObject({ codexAuthSync: 'isolated' });
   });
 
   it('exposes feedback policy only in private Bot Defaults payloads', () => {
@@ -172,6 +179,15 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ codexAppCleanInput: false });
     expect(botDefaultsPayload(daemon, { codexAppCleanInput: true }))
       .toMatchObject({ codexAppCleanInput: true });
+  });
+
+  it('projects hook envelope injection so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'off' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'auto' }))
+      .toMatchObject({ envelopeInjection: 'auto' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'invalid' }))
+      .toMatchObject({ envelopeInjection: 'off' });
   });
 
   it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {

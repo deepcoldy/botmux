@@ -6,15 +6,14 @@
  * runs `<cli> --resume <id>` in the recorded cwd.
  *
  * Three storage shapes are covered (one parser each, shared across CLIs):
- *   - Claude-family JSONL  (`claude-code`, `seed`, `relay`): <dataDir>/projects/<hash>/<id>.jsonl
+ *   - Claude-family JSONL  (`claude-code`, `seed`, `relay`, `genius`): <dataDir>/projects/<hash>/<id>.jsonl
  *   - Codex/TRAE rollout   (`codex`, `traex`):       <sessionsRoot>/YYYY/MM/DD/rollout-*.jsonl
  *   - Antigravity history  (`antigravity`):          <home>/history.jsonl (flat submit log)
  *
  * All scans are daemon-side, pure filesystem (no PTY / subprocess), and run
- * only on an explicit `/adopt` — so we favour correctness over cleverness: take
- * the most-recent files by mtime, then stream each line by line (NOT a bounded
- * byte prefix, which truncates oversized records and hides an append-only log's
- * fresh tail), stopping early once the needed metadata is in hand.
+ * only on an explicit `/adopt`: take the most-recent files by mtime, stream
+ * metadata records line by line, and use a bounded tail window for Claude
+ * `/rename` records. Parsers stop early once metadata is in hand where possible.
  */
 import { promises as fs, createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -23,15 +22,24 @@ import type { ResumableSession } from '../adapters/cli/types.js';
 
 const TITLE_MAX = 80;
 
-/** Safety cap on lines scanned per transcript when searching for the metadata
- *  we need (session id / cwd / first prompt). All three live near the top of
- *  claude/rollout transcripts, so the early-stop almost always fires first;
- *  this only bounds pathological / corrupt files. Antigravity's flat submit log
- *  is read in full (see its own higher cap) so tail entries are never missed. */
-const MAX_LINES_PER_FILE = 5_000;
+/** Forward/head cap for transcript metadata; Claude custom titles use the
+ *  separate bounded tail read below. Antigravity has its own higher cap. */
+const MAX_HEAD_LINES_PER_FILE = 5_000;
+/** Maximum bytes inspected from the end for the latest valid customTitle. */
+const CLAUDE_CUSTOM_TITLE_TAIL_BYTES = 4 * 1024 * 1024;
 
 function asRecord(v: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  const line = raw.trim();
+  if (!line) return null;
+  try {
+    return asRecord(JSON.parse(line));
+  } catch {
+    return null;
+  }
 }
 
 /** Stream a JSONL file line by line, invoking `onLine` for each parsed object.
@@ -44,7 +52,7 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 async function forEachJsonLine(
   path: string,
   onLine: (rec: Record<string, unknown>) => boolean | void,
-  maxLines = MAX_LINES_PER_FILE,
+  maxLines = MAX_HEAD_LINES_PER_FILE,
 ): Promise<void> {
   const stream = createReadStream(path, { encoding: 'utf8' });
   // A missing/unreadable file emits 'error' asynchronously; without a listener
@@ -55,13 +63,8 @@ async function forEachJsonLine(
   let n = 0;
   try {
     for await (const raw of rl) {
-      const line = raw.trim();
-      if (line) {
-        let parsed: unknown = null;
-        try { parsed = JSON.parse(line); } catch { /* corrupt line — skip */ }
-        const rec = asRecord(parsed);
-        if (rec && onLine(rec) === true) break;
-      }
+      const rec = parseJsonRecord(raw);
+      if (rec && onLine(rec) === true) break;
       if (++n >= maxLines) break;
     }
   } catch {
@@ -140,9 +143,118 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
   /用户发送了：\s*\n-{3,}[\s\S]*?\n-{3,}[\s\S]*?Session ID:\s*[0-9a-f]{8}-[0-9a-f]{4}-/i,
 ];
 
+/** Leading blocks botmux may place BEFORE `<user_message>`. Order-independent by
+ *  construction: {@link startsWithBotmuxLeadingBlock} walks whichever of these
+ *  the prompt opens with, so a new block needs one entry here rather than a new
+ *  ordering permutation in BOTMUX_INJECTION_PATTERNS. */
+const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
+  'botmux_routing', 'botmux_builtin_skills', 'identity', 'session_id', 'role',
+  'summary_memory', 'botmux_reminder', 'whiteboard', 'chat_context_policy', 'chat_context',
+];
+
+/** True when `text` is an UNBROKEN CHAIN of botmux leading blocks followed by a
+ *  complete `<user_message>…</user_message>` envelope — only blocks and
+ *  whitespace in between, never prose.
+ *
+ *  Why this exists: the `^`-anchored patterns above enumerate exact block
+ *  ORDERINGS, so each new leading block multiplies the permutations — and any
+ *  chain nobody spelled out leaked into the /adopt picker as if external.
+ *  Measured: 14 of 30 claude-family combinations leaked (every prefix
+ *  containing `<summary_memory>` or `<chat_context…>`, e.g. `role+summary`,
+ *  `wb+chatctx`) — those match no `^` anchor, and with a bot running
+ *  `senderTag: false` and no @mentions that turn, nothing follows
+ *  `</user_message>` either, so the trailing-adjacency pattern misses too.
+ *
+ *  ADJACENCY IS LOAD-BEARING. A first version required only "opens with a known
+ *  tag AND contains an envelope somewhere later", which let arbitrary prose sit
+ *  between the two — and that false-positives on a REAL external session whose
+ *  own text happens to do this, e.g. a user pasting a prompt template to edit:
+ *  `<summary_memory>…</summary_memory>\n\n帮我改措辞：\n<user_message>…</user_message>`.
+ *  Such a session belongs in the picker; swallowing it defeats the point. The
+ *  earlier `^` patterns got this right by demanding structural adjacency, so this
+ *  restores it while staying order-independent. (Rejected alternative: requiring
+ *  the opening `>` be followed by `\n`/`<`. Four shipped blocks put body text
+ *  directly after `>` — `<chat_context_policy>群名…`, `<botmux_reminder>提醒…`,
+ *  `<session_id>abc-123…`, `<role …>某人格…` — so that rule would re-open the
+ *  very leak this function exists to close. Verified by rendering each block.)
+ *
+ *  A prompt that pastes a genuine full botmux envelope verbatim is still a false
+ *  positive, but that input is byte-identical to botmux's own output, so no
+ *  content-based check can separate them; accepted as residual.
+ *
+ *  KNOWN RESIDUAL FALSE NEGATIVE (this function cannot ADD one — see below): the
+ *  close lookup takes the FIRST `</tag>`, so a block whose own body contains that
+ *  literal string ends early and the walk then hits prose and bails. Reachable
+ *  only through `<role>`: `renderRoleContextBlock` interpolates persona text
+ *  unescaped, so a persona containing `</role>` (nested or bare) truncates the
+ *  block. Measured: such prompts leak, while the same shape without the literal
+ *  is correctly dropped. Deliberately NOT fixed — the two candidate fixes are
+ *  both worse:
+ *    - depth-counting `<role …>` vs `</role>` only handles the NESTED variant; a
+ *      bare `</role>` in the body has no opening tag to count, so it still leaks;
+ *    - taking the LAST `</tag>` before the envelope fixes both but introduces a
+ *      real false positive — an external prompt discussing two of the same block
+ *      (`<session_id>abc</session_id> 请解释 <session_id>def</session_id>` +
+ *      envelope) then gets swallowed, which is the failure direction that
+ *      actually costs the user something.
+ *
+ *  Why "cannot ADD a false negative" is structural, not just sampled:
+ *  `isBotmuxInjectedPrompt` ORs this check BEFORE the pattern list, so the
+ *  function is a pure disjunctive addition — it can only turn `false` into
+ *  `true`, never the reverse. Any prompt the pre-existing patterns dropped is
+ *  still dropped. (Spot-checked over 4,000 generated block chains: zero cases
+ *  where the old verdict was `true` and the new one `false`.) The residual above
+ *  is therefore inherited, not introduced: the affected shapes — role-with-literal
+ *  plus `<summary_memory>` — leaked before this function existed, because
+ *  `summary_memory` appears in none of the `^`-anchored orderings. Note the
+ *  legacy `^<role…>` pattern is NOT itself fooled by a literal `</role>`: its
+ *  lazy quantifier backtracks to the second one, so `role-with-literal` directly
+ *  followed by the envelope still matches there. The two mechanisms fail on
+ *  different inputs; only their intersection leaks.
+ *  Failure direction is a session merely APPEARING in the /adopt list.
+ *
+ *  Deliberately NOT a regex. The natural regex form
+ *  (`^<(?:tag|…)\b[^>]*>[\s\S]*?<user_message>[\s\S]*?<\/user_message>`) is
+ *  quadratic: both lazy scans restart at every `<user_message>` occurrence, so
+ *  a prompt of repeated `<user_message>` opens with no close took 374ms at 100k
+ *  chars and 5969ms at 400k (4× input → 16× time), against 0.3ms for the
+ *  pre-existing patterns on the same input. Every scan below is `startsWith` /
+ *  `indexOf` over a strictly advancing cursor — linear, cannot backtrack. A
+ *  failed `indexOf` returns immediately, so at most one full-length scan happens
+ *  per call: a 50k-block chain measured 20.7ms, a 1.5MB adversarial input ~3ms. */
+function startsWithBotmuxLeadingBlock(text: string): boolean {
+  if (!text.startsWith('<')) return false;
+  let i = 0;
+  let sawBlock = false;
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+    if (text.startsWith('<user_message>', i)) {
+      // Require at least one preceding block: a bare `^<user_message>` prompt is
+      // already covered by the first pattern above.
+      return sawBlock && text.indexOf('</user_message>', i + '<user_message>'.length) !== -1;
+    }
+    if (text[i] !== '<') return false;
+    // Tag name ends at the first whitespace or '>' after the opening '<'.
+    let nameEnd = -1;
+    for (let j = i + 1; j < text.length; j++) {
+      const ch = text[j]!;
+      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r') { nameEnd = j; break; }
+    }
+    if (nameEnd < i + 2) return false;
+    const tag = text.slice(i + 1, nameEnd);
+    if (!BOTMUX_LEADING_BLOCK_TAGS.includes(tag)) return false;
+    // An unclosed block is not a structural block — bail rather than scan on.
+    const close = text.indexOf(`</${tag}>`, nameEnd);
+    if (close === -1) return false;
+    i = close + tag.length + 3;
+    sawBlock = true;
+  }
+}
+
 /** True when `text` is a botmux-generated user turn (structural envelope).
  *  Shared by Claude/Codex/Grok adopt discovery so filters stay consistent. */
 export function isBotmuxInjectedPrompt(text: string): boolean {
+  if (startsWithBotmuxLeadingBlock(text)) return true;
   return BOTMUX_INJECTION_PATTERNS.some((re) => re.test(text));
 }
 
@@ -189,35 +301,110 @@ async function collectRecentJsonl(
   return out.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit);
 }
 
-// ─── Claude-family JSONL (claude-code, seed, relay) ──────────────────────────
+// ─── Claude-family JSONL (claude-code, seed, relay, genius) ──────────────────
 
-/** Parse one Claude JSONL transcript. The session id is the filename; cwd +
- *  first user prompt come from the content (streamed line by line, stopping
- *  once both are found). Sidechain / synthetic / slash-command entries are
- *  skipped so the title is the user's real first turn. */
+/** Scan a bounded tail for the latest valid customTitle. Skip the first line
+ *  only when the byte boundary cuts through it. */
+async function findLatestClaudeCustomTitle(path: string): Promise<string> {
+  let stat;
+  try {
+    stat = await fs.stat(path);
+  } catch {
+    return '';
+  }
+  if (stat.size <= 0) return '';
+
+  const start = Math.max(0, stat.size - CLAUDE_CUSTOM_TITLE_TAIL_BYTES);
+  let skipFirstLine = false;
+  if (start > 0) {
+    let handle;
+    try {
+      handle = await fs.open(path, 'r');
+      const previous = Buffer.alloc(1);
+      const { bytesRead } = await handle.read(previous, 0, 1, start - 1);
+      // If the tail starts immediately after a newline, its first line is
+      // complete. Otherwise it is the residual of a line cut by the byte cap.
+      skipFirstLine = bytesRead !== 1 || previous[0] !== 0x0a;
+    } catch {
+      // Prefer dropping a possibly partial first line if the probe races with
+      // a rotated/unreadable transcript.
+      skipFirstLine = true;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+  const stream = createReadStream(path, {
+    encoding: 'utf8',
+    start,
+    end: stat.size - 1,
+  });
+  stream.on('error', () => { /* handled via try/catch */ });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  let latest = '';
+  let first = true;
+  try {
+    for await (const raw of rl) {
+      if (first && skipFirstLine) {
+        first = false;
+        continue;
+      }
+      first = false;
+      const rec = parseJsonRecord(raw);
+      if (!rec || rec.isSidechain === true || typeof rec.customTitle !== 'string') continue;
+      const title = truncateTitle(rec.customTitle);
+      if (title) latest = title;
+    }
+  } catch {
+    // Missing, unreadable, or concurrently rotated transcripts return what we have.
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  return latest;
+}
+
+/** Parse one Claude JSONL transcript. The session id is the filename; cwd,
+ *  first user prompt, and the latest valid customTitle come from the content.
+ *  Sidechain / synthetic / slash-command entries are skipped. The head pass
+ *  finds the identity/origin metadata, then a bounded tail pass finds the
+ *  latest valid custom title. A custom title wins when present; otherwise the
+ *  user's real first turn is the fallback. */
 async function parseClaudeTranscript(path: string, mtimeMs: number): Promise<ResumableSession | null> {
   const cliSessionId = basename(path, '.jsonl');
   if (!cliSessionId) return null;
   // Accumulate into an object (see parseRolloutTranscript) so the post-loop
   // guard narrows correctly despite closure mutation.
-  const acc: { cwd: string | null; title: string; botmux: boolean } = { cwd: null, title: '', botmux: false };
+  const acc: { cwd: string | null; fallbackTitle: string; botmux: boolean } = {
+    cwd: null,
+    fallbackTitle: '',
+    botmux: false,
+  };
   await forEachJsonLine(path, (rec) => {
     if (rec.isSidechain === true) return;
     if (!acc.cwd && typeof rec.cwd === 'string') acc.cwd = rec.cwd;
-    if (rec.type === 'user') {
+    // Origin and fallback title are both determined by the first meaningful
+    // user turn. Do not reclassify an external session if it is later resumed
+    // through botmux while we continue scanning for a rename.
+    if (!acc.fallbackTitle && rec.type === 'user') {
       const raw = rawClaudeUserText(rec.message);
       if (raw && isBotmuxInjected(raw)) { acc.botmux = true; return true; } // botmux-origin → drop
-      if (!acc.title && raw) {
+      if (raw) {
         const clean = cleanUserPromptForTitle(raw);
-        if (clean) acc.title = truncateTitle(clean);
+        if (clean) acc.fallbackTitle = truncateTitle(clean);
       }
     }
-    return Boolean(acc.cwd && acc.title); // stop once we have everything
+    return Boolean(acc.cwd && acc.fallbackTitle);
   });
   // Drop botmux-origin sessions and empties (no real user prompt → command-only
   // / aborted — not worth importing).
-  if (acc.botmux || !acc.cwd || !acc.title) return null;
-  return { cliSessionId, cwd: acc.cwd, title: acc.title, lastActivityAt: mtimeMs };
+  if (acc.botmux || !acc.cwd || !acc.fallbackTitle) return null;
+  const tailTitle = await findLatestClaudeCustomTitle(path);
+  return {
+    cliSessionId,
+    cwd: acc.cwd,
+    title: tailTitle || acc.fallbackTitle,
+    lastActivityAt: mtimeMs,
+  };
 }
 
 /** Pull plain user text out of a Claude `message` field (string content or the
@@ -261,11 +448,49 @@ export async function discoverClaudeFamilySessions(
 
 // ─── Codex / TRAE rollout (codex, traex) ─────────────────────────────────────
 
-/** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd;
- *  the first `event_msg`/`user_message` carries the user's first prompt (the
- *  `response_item` role:user entries include the synthetic
- *  <environment_context>/<permissions> preamble, so we prefer user_message).
- *  Streamed line by line, stopping once id + cwd + title are found. */
+/** Codex >=0.147 rollouts no longer emit `event_msg`/`user_message`; user turns
+ *  then live in `response_item` message role:user entries. The FIRST of those is
+ *  a synthetic startup preamble, never a real prompt. Observed shapes (verified
+ *  against ~80 live ~/.codex rollouts): the `<environment_context>` block, the
+ *  `<recommended_plugins>` list, the legacy `<permissions>` block, and codex's
+ *  `# AGENTS.md instructions for …` injection (which may share the message with
+ *  `<environment_context>` via multiple input_text blocks). */
+const SYNTHETIC_PREAMBLE_PATTERNS: readonly RegExp[] = [
+  // 锚定行首：合成 preamble 总是独立条目或以 tag 开头；不锚定会误杀散文中
+  // 提及这些标签的真实 prompt（如「<environment_context> 是什么意思」）。
+  /^<environment_context\b/,
+  /^<recommended_plugins\b/,
+  /^<permissions\b/,
+];
+
+function isSyntheticPreamble(text: string): boolean {
+  if (SYNTHETIC_PREAMBLE_PATTERNS.some((re) => re.test(text))) return true;
+  return /^# AGENTS\.md instructions\b/.test(text);
+}
+
+/** Join all `input_text` blocks of a rollout `response_item` message payload —
+ *  content is an array of `{type, text}` and a single user turn may span several
+ *  blocks (e.g. AGENTS.md instructions + environment_context). Mirrors
+ *  joinTextBlocks in codex-transcript; kept local so this discovery service has
+ *  no cross-service dependency. Trimmed so the ^-anchored botmux/synthetic
+ *  checks below see the real start of the prompt. */
+function rolloutResponseItemText(payload: Record<string, unknown>): string {
+  const content = payload.content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    const b = asRecord(block);
+    if (b?.type === 'input_text' && typeof b.text === 'string') parts.push(b.text);
+  }
+  return parts.join('').trim();
+}
+
+/** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd.
+ *  Title preference: the first `event_msg`/`user_message` (legacy format); when
+ *  absent (Codex >=0.147), the first non-synthetic `response_item` role:user
+ *  message — skipping the startup preamble and botmux-injected turns (which mark
+ *  the whole session botmux-origin, same as the user_message path). Streamed
+ *  line by line, stopping once id + cwd + title are found. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
@@ -274,7 +499,9 @@ async function parseRolloutTranscript(
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
-  const acc: { id: string | null; cwd: string | null; title: string; botmux: boolean } = { id: null, cwd: null, title: '', botmux: false };
+  const acc: { id: string | null; cwd: string | null; title: string; fallbackTitle: string; botmux: boolean } = {
+    id: null, cwd: null, title: '', fallbackTitle: '', botmux: false,
+  };
   let excluded = false;
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
@@ -289,11 +516,28 @@ async function parseRolloutTranscript(
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
       if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
+    } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+      // New-format (>=0.147) fallback title source. The first meaningful user
+      // turn determines origin, mirroring parseClaudeTranscript: a synthetic
+      // preamble is skipped, a botmux-wrapped turn drops the session, and the
+      // first raw turn becomes the fallback title (a later event_msg/user_message
+      // still wins when the rollout carries both).
+      const text = rolloutResponseItemText(payload);
+      if (!text) return; // empty / non-text content — not a title candidate
+      if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
+      if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+      // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
+      // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
+      // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合
+      // 格式文件中 legacy 条目按时间序在前，acc.title 会先命中早退，不受影响。
+      if (acc.id && acc.cwd && acc.fallbackTitle) return true;
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  if (excluded || acc.botmux || !acc.id || !acc.cwd || !acc.title) return null;
-  return { cliSessionId: acc.id, cwd: acc.cwd, title: acc.title, lastActivityAt: mtimeMs };
+  const title = acc.title || acc.fallbackTitle;
+  if (excluded || acc.botmux || !acc.id || !acc.cwd || !title) return null;
+  return { cliSessionId: acc.id, cwd: acc.cwd, title, lastActivityAt: mtimeMs };
 }
 
 export async function discoverRolloutSessions(

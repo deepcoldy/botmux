@@ -5,18 +5,32 @@
 ```bash
 git clone https://github.com/deepcoldy/botmux.git
 cd botmux
-pnpm install
-pnpm build
+bun install --frozen-lockfile
+bun run build
 
 # Run directly (no PM2)
-pnpm daemon
+bun run daemon
 
 # Or with PM2
-pnpm daemon:start
-pnpm daemon:logs
+bun run daemon:start
+bun run daemon:logs
 ```
 
-> Every code change requires `pnpm build` then `pnpm daemon:restart`.
+> Every code change requires `bun run build` then `bun run daemon:restart`.
+
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.0`,
+> lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
+> `node-pty`: bun does not run dependency lifecycle scripts by default, and
+> `node-pty` needs its install hook to build `build/Release/pty.node` — without
+> it the PTY layer is dead and the compiled single-file binary cannot be built.
+> The list is deliberately just `["electron","node-pty"]` (identical to the
+> `onlyBuiltDependencies` it replaced) — don't "complete" it by adding esbuild:
+> its binary comes from the `@esbuild/<platform>` package, not its postinstall.
+>
+> This is about *building botmux from source*. How **end users install botmux**
+> is a separate matter — `pnpm i -g botmux` is still a supported install path
+> (see `InstallKind` in `src/utils/install-diagnostics.ts`), so don't "convert"
+> those to bun.
 
 ## Architecture
 
@@ -166,19 +180,19 @@ Tests are split into two Vitest projects with different execution profiles
 
 - **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
   Runs with **file parallelism on** (one process per file). This is what
-  `pnpm test` runs, so the default is fast (~10s) and needs no real CLI binary
+  `bun run test` runs, so the default is fast (~10s) and needs no real CLI binary
   or browser.
 - **`e2e`** (`*.e2e.ts`) — spawns real CLIs / drives the Feishu web UI through a
   shared daemon, so files run **sequentially**. Opt-in only.
 
 ```bash
-pnpm test                # Unit tests only — parallel, ~10s (default)
-pnpm test:all            # Unit + E2E (needs real CLIs / browser session)
-pnpm test:e2e            # All *.e2e.ts (sequential)
-pnpm test:codex          # Codex input E2E
-pnpm test:gemini         # Gemini CLI input E2E
-pnpm test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
-pnpm test:bench --compare   # serial vs parallel vs parallel+time-scale table
+bun run test                # Unit tests only — parallel, ~10s (default)
+bun run test:all            # Unit + E2E (needs real CLIs / browser session)
+bun run test:e2e            # All *.e2e.ts (sequential)
+bun run test:codex          # Codex input E2E
+bun run test:gemini         # Gemini CLI input E2E
+bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
+bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
 
 > **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a

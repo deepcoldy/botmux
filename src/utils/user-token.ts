@@ -401,7 +401,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
   const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
-    return '❌ 授权失败：state 不匹配或已过期，请重新执行 /login';
+    return '❌ 授权失败：state 不匹配或已过期，请重新发起授权';
   }
 
   pendingLogins.delete(state);

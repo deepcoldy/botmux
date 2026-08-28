@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 
 export type RepoPickerMode = 'all' | 'repos';
@@ -88,14 +89,46 @@ export interface HostOverloadBrowserTargetConfig {
   enabled?: boolean;
 }
 
+/**
+ * 共享会议角色预设条目。刻意不带 `agentAppId`：执行方永远是「被拉进这场会议的
+ * 那个 bot」，在合并进 per-bot 配置时才绑定。历史上预设把 `agentAppId` 写死，
+ * 结果拉 A 进会却把 B 拉进监听群——共享目录从类型上就消灭了这条路径。
+ */
+export type VcMeetingSharedConsumerProfile =
+  Omit<VcMeetingConsumerProfileConfig, 'agentAppId'>;
+
+/** 全 fleet 共享的会议角色预设目录。任何没有自己 `consumerProfiles` 的 bot
+ *  都继承这份目录。 */
+export interface VcMeetingSharedConsumerCatalog {
+  profiles: VcMeetingSharedConsumerProfile[];
+  defaultMode: 'listenOnly' | 'agents';
+  defaultConsumerIds: string[];
+}
+
 export interface VcMeetingAgentGlobalConfig {
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
    *  whether a given bot responds to meetings. */
   enabled?: boolean;
-  /** Optional bot app id that is allowed to own new VC meeting listeners. When
-   *  unset, legacy per-bot vcMeetingAgent.enabled routing is preserved. */
+  /** DEPRECATED (2026-08): the single-listener pin is retired — every bot with
+   *  VC active handles the meeting events it receives. Kept only so an existing
+   *  config round-trips without data loss; readers must ignore it. */
   listenerBotAppId?: string;
+  /** 共享角色预设目录，见 {@link VcMeetingSharedConsumerCatalog}。 */
+  consumerCatalog?: VcMeetingSharedConsumerCatalog;
+}
+
+export interface WorkflowFeatureGlobalConfig {
+  /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== true`
+   *  keeps the feature OFF (disabled by default). Set true to turn the whole
+   *  workflow feature on for this host: the `/workflow` grill + Saved-Workflow
+   *  run/save entries are accepted, the `botmux-workflow` family of skills is
+   *  advertised/installed, and the CLI authoring/run subcommands work.
+   *  In-flight run management (cancel / retry / grant) stays available so a run
+   *  started before a flip can still be wound down. The multi-bot
+   *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
+   *  separate long-running-orchestration capability, not a v3 workflow. */
+  enabled?: boolean;
 }
 
 export interface GlobalConfig {
@@ -128,6 +161,10 @@ export interface GlobalConfig {
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
   vcMeetingAgent?: VcMeetingAgentGlobalConfig;
+  /** Machine-wide v3 Workflow switch. Missing / enabled !== true keeps the
+   *  feature OFF; set true to enable it host-wide. The
+   *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
+  workflow?: WorkflowFeatureGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
@@ -465,6 +502,31 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * 只做结构层解析（是不是数组 / defaultMode 枚举 / id 是不是非空串），字段级
+ * 权威校验留给 bot-registry 的严格 normalizer——它在目录被合进某个 bot 时运行，
+ * 且失败只降级这一个 bot，不会让一份坏的全局目录把整个 fleet 的配置解析炸掉。
+ */
+function readVcMeetingConsumerCatalog(raw: unknown): VcMeetingSharedConsumerCatalog | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  if (!Array.isArray(v.profiles)) return undefined;
+  const profiles = v.profiles.filter(
+    (entry): entry is VcMeetingSharedConsumerProfile =>
+      !!entry && typeof entry === 'object' && !Array.isArray(entry)
+      && typeof (entry as Record<string, unknown>).id === 'string'
+      && (entry as Record<string, unknown>).id !== '',
+  );
+  const defaultConsumerIds = Array.isArray(v.defaultConsumerIds)
+    ? v.defaultConsumerIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+    : [];
+  return {
+    profiles,
+    defaultMode: v.defaultMode === 'agents' && defaultConsumerIds.length > 0 ? 'agents' : 'listenOnly',
+    defaultConsumerIds,
+  };
+}
+
 /** Parse the `browserRestartTargets` array from config. Keep only entries with a
  *  non-blank string bundleId; coerce the optional fields defensively so a
  *  hand-edited config can't inject non-strings. Returns undefined when there's
@@ -497,6 +559,16 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
   }
+  const catalog = readVcMeetingConsumerCatalog(v.consumerCatalog);
+  if (catalog) out.consumerCatalog = catalog;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WorkflowFeatureGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -566,6 +638,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
+  const workflow = readWorkflowFeature(raw.workflow);
+  if (workflow) out.workflow = workflow;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
@@ -624,9 +698,47 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
   const config: VcMeetingAgentGlobalConfig = {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
+    ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
   };
   vcMeetingAgentLiveCache = { path, mtimeMs, config };
   return config;
+}
+
+/** 共享角色预设目录（live 读，随 mtime 失效）。undefined = 还没配置过。 */
+export function globalVcMeetingSharedConsumerCatalog(): VcMeetingSharedConsumerCatalog | undefined {
+  return globalVcMeetingAgentConfigLive().consumerCatalog;
+}
+
+/**
+ * 未经归一化的共享目录原始值（可能是 undefined / 任意形状）。写路径用它算乐观
+ * 并发 revision——手改配置即使被 forgiving 读路径归一化掉，也必须让 revision 变。
+ */
+export function rawGlobalVcMeetingSharedConsumerCatalog(): unknown {
+  const vcAgent = readRawConfig().vcMeetingAgent;
+  if (!vcAgent || typeof vcAgent !== 'object' || Array.isArray(vcAgent)) return undefined;
+  return (vcAgent as Record<string, unknown>).consumerCatalog;
+}
+
+/**
+ * 写共享角色预设目录。`null` 清空目录（所有 bot 回到「无预设」）。
+ *
+ * `mergeGlobalConfig` 只做顶层 key 合并，所以这里先读出现有 `vcMeetingAgent`
+ * 对象再整体写回——否则会把同一层的 `enabled` 抹掉。未知字段原样保留。
+ */
+export function writeGlobalVcMeetingSharedConsumerCatalog(
+  catalog: VcMeetingSharedConsumerCatalog | null,
+): void {
+  const raw = readRawConfig();
+  const current = raw.vcMeetingAgent && typeof raw.vcMeetingAgent === 'object' && !Array.isArray(raw.vcMeetingAgent)
+    ? { ...(raw.vcMeetingAgent as Record<string, unknown>) }
+    : {};
+  if (catalog === null) delete current.consumerCatalog;
+  else current.consumerCatalog = catalog;
+  mergeGlobalConfig({
+    vcMeetingAgent: (Object.keys(current).length > 0
+      ? current
+      : undefined) as GlobalConfig['vcMeetingAgent'],
+  });
 }
 
 export function isGlobalVcMeetingAgentEnabled(): boolean {
@@ -642,6 +754,28 @@ export function globalVcMeetingAgentListenerBotAppId(): string | undefined {
  *  URLs are emitted (see buildTerminalUrl / publicWebhookUrl). */
 export function isRemoteAccessEnabled(): boolean {
   return readGlobalConfig().remoteAccess === true;
+}
+
+/** Machine-wide v3 Workflow feature kill-switch.
+ *
+ * Missing / `workflow.enabled !== true` means OFF (disabled by default). An
+ * explicit `true` in `~/.botmux/config.json` turns it on. The
+ * `BOTMUX_WORKFLOW_ENABLED` env var, when set to a non-empty value, OVERRIDES
+ * the config file either way (`true`/`1`/`yes`/`on` ⇒ enabled, anything else ⇒
+ * disabled) — it is both the escape hatch if the config gate misfires and the
+ * channel the worker injects into CLI panes so a pane's `botmux workflow …`
+ * subcommand agrees with the daemon that spawned it.
+ *
+ * Read live off the short-TTL config cache so a dashboard toggle takes effect on
+ * the next session/turn without a daemon restart (mirrors whiteboardEnabled /
+ * isGlobalVcMeetingAgentEnabled). */
+export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_WORKFLOW_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().workflow?.enabled === true;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

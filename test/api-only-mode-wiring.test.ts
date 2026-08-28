@@ -139,11 +139,13 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     // bot-registry.test.ts), which returns undefined for apiOnly.
     const block = region(daemonSource, 'function effectiveVcMeetingAgentConfig(', 'function configuredVcMeetingListenerChatId(');
     expect(block).toContain('vcMeetingAgentConfigActive(getBot(larkAppId)?.config)');
-    // The predicate itself fail-closes apiOnly BEFORE the enabled check.
+    // The predicate itself fail-closes apiOnly BEFORE any enabled logic.
     const pred = region(registrySource, 'export function vcMeetingAgentConfigActive(', 'export function registerBot(');
     expect(pred).toContain('if (cfg.apiOnly === true) return undefined;');
+    // Bot-agnostic join (2026-08): VC is active by default; enabled:false is the
+    // per-bot opt-out. apiOnly must still short-circuit BEFORE that opt-out check.
     expect(pred.indexOf('apiOnly === true) return undefined'))
-      .toBeLessThan(pred.indexOf('vcMeetingAgent?.enabled === true'));
+      .toBeLessThan(pred.indexOf('vcMeetingAgent?.enabled === false'));
   });
 });
 
@@ -187,26 +189,113 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain("assertLarkTransport(larkAppId, 'downloadMessageResource')");
   });
 
-  it('worker-pool suppresses ALL aux UI for no-transport sessions at auxUiSuppressedFor', () => {
-    // The check moved out of the `managedAuxUiSuppressed` closure into the shared
-    // auxUiSuppressedFor() so the mojo quarantine notice could not drift from this
-    // policy. The closure now just delegates, so lock BOTH: the delegation and the
-    // no-transport gate in its new home.
+  it('worker-pool suppresses ALL aux UI for no-transport sessions in managedAuxUiSuppressed', () => {
+    // Plan B merge (2026-08): master had refactored this into a shared
+    // auxUiSuppressedFor() that managedAuxUiSuppressed delegated to — but that
+    // shared helper gates on the pre-Plan-B `vcMeetingReceiver` blanket, which
+    // would re-suppress a plain user turn on a meeting-agent chat session (the
+    // "手动@不回复" regression). So the merge KEEPS managedAuxUiSuppressed inline
+    // with the no-transport gate + isMeetingDrivenTurn. Lock the no-transport
+    // gate in its live home (the closure), not the delegation.
     const closure = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
-    expect(closure).toContain('auxUiSuppressedFor(ds, turnId, dispatchAttempt)');
+    expect(closure).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+    expect(closure).toContain('return true;');
+    // auxUiSuppressedFor still exists for the mojo quarantine caller and keeps its
+    // own no-transport gate (fail-closed behaviour covered behaviourally in
+    // test/mojo-quarantine-notice-policy.test.ts).
     const shared = region(workerPoolSource, 'export function auxUiSuppressedFor(', 'isSilentScheduledTurn');
     expect(shared).toContain('larkTransportEnabled({');
     expect(shared).toContain('apiOnly: getBot(ds.larkAppId).config.apiOnly,');
-    // Fail CLOSED if the bot is gone. The region above spans BOTH `return true;`
-    // statements (the no-transport path, already locked by the two assertions
-    // above, and the catch), so asserting on that text here guarded nothing:
-    // flipping the catch to `return false` — the exact regression the comment
-    // warns about — left all 43 cases green. Narrowed to the catch block itself.
-    // The real guard is behavioural and lives in
-    // test/mojo-quarantine-notice-policy.test.ts ('fails closed when the bot is
-    // deregistered'), which DOES fail on that flip.
-    const catchBlock = region(workerPoolSource, '    // Bot deregistered — fail closed.', '  if (isSilentScheduledTurn');
-    expect(catchBlock).toContain('return true;');
+  });
+
+  it('managedAuxUiSuppressed no longer special-cases a VC meeting agent (Plan B: ordinary chat session)', () => {
+    // Plan B: a VC meeting agent is an ordinary chat-scope session, so its
+    // streaming card / reactions flow through the ordinary suppression path just
+    // like any group session. The old `vcMeetingReceiver` branch (and the
+    // exposeReceiverStreamingCard opt-in it delegated to) is gone; the final
+    // group-posting policy (silent vs listener_thread) is enforced separately in
+    // managedFinalOutputSuppressed, not here.
+    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
+    expect(block).not.toContain('vcMeetingReceiver');
+    expect(block).not.toContain('vcReceiverStreamingCardSuppressed');
+    expect(block).toContain('return ordinaryManagedSuppression(turnId, dispatchAttempt);');
+  });
+
+  it('managedFinalOutputSuppressed gates the VC durable policy to meeting-driven turns only (plain user turns post normally)', () => {
+    // Plan B: the meeting agent hosts BOTH transcript deliveries and plain user
+    // IM turns. The durable silent/listener_thread policy must apply only to a
+    // meeting-driven turn — a durable delivery (dispatchAttempt) or a stamped
+    // meeting @mention follow-up (isMeetingDrivenTurn). A plain user turn has
+    // neither and must fall to ordinaryManagedSuppression so the user's own reply
+    // is never wrongly suppressed.
+    const block = region(workerPoolSource, 'const managedFinalOutputSuppressed', 'const bot = getBot(ds.larkAppId);');
+    expect(block).toContain('if (!isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) {');
+    expect(block).toContain('return ordinaryManagedSuppression(turnId, dispatchAttempt);');
+    // The durable send-policy check still runs for meeting-driven turns.
+    expect(block).toContain('evaluateVcMeetingManagedSend(config.session.dataDir, {');
+  });
+
+  it('isMeetingDrivenTurn distinguishes transcript deliveries / stamped follow-ups from plain user turns', () => {
+    // The shared module-level gate both managedAuxUiSuppressed /
+    // managedFinalOutputSuppressed (setupWorkerHandlers) and deliverFinalOutput
+    // consult. A non-meeting session is never meeting-driven; a delivery carries a
+    // dispatchAttempt; an @mention follow-up is recognised by its stamped origin.
+    const block = region(workerPoolSource, 'function isMeetingDrivenTurn(', 'function setupWorkerHandlers(');
+    expect(block).toContain('if (!ds.session.vcMeetingReceiver) return false;');
+    expect(block).toContain('if (dispatchAttempt !== undefined) return true;');
+    expect(block).toContain('return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;');
+  });
+
+  it('VC delivery dispatch arms the streaming-card turn (beginNewTurn) for every meeting-agent delivery', () => {
+    // triggerSessionTurn (the VC transcript-delivery route) never calls
+    // beginNewTurn, so the card lifecycle must be armed here — for every delivery
+    // turn now that the meeting agent is an ordinary session whose card should
+    // surface (no exposeReceiverStreamingCard opt-in gate anymore).
+    const block = region(daemonSource, 'dispatchTurn: (request, context) => {', 'return triggerSessionTurn(');
+    expect(block).not.toContain('exposeReceiverStreamingCard');
+    expect(block).toContain('beginNewTurn(target, title, context.stableTurnId)');
+    expect(block).toContain('target?.session.vcMeetingReceiver && context.stableTurnId');
+  });
+
+  it('Plan B keeps in-meeting output: action-request still recognises the meeting agent via the retained marker', () => {
+    // The whole in-meeting text/voice output chain (request-output → action-request
+    // → managed-action) authorizes against the RETAINED vcMeetingReceiver marker +
+    // managedTurnOrigin/vcMeetingImTurnOrigin, all keyed by sessionId — never by the
+    // activeSessions map key that Stage 1 changed. This is why in-meeting output
+    // survives the normal-session refactor with no code change. Pin the entry guard
+    // so a future marker cleanup can't silently kill 会中发言.
+    const block = region(daemonSource, "ipcRoute('POST', '/api/vc-meetings/action-request'", 'const claimedAttempt =');
+    expect(block).toContain('findActiveBySessionId(receiverSessionId)');
+    expect(block).toContain('if (!ds?.session.vcMeetingReceiver) {');
+    expect(block).toContain("errorCode: 'not_receiver_session'");
+  });
+
+  it('Plan B idle-gap: request-output falls back to the durable receipt when the live managedTurnOrigin was cleared', () => {
+    // A meeting agent reaches idle between the delivery turn (which armed
+    // ds.managedTurnOrigin) and the moment it runs request-output — the origin is
+    // cleared at the delivery turn's terminal edge, so the live-origin gate fails.
+    // The handler must fall back to re-deriving authority from the DURABLE delivery
+    // receipt (evaluateVcMeetingManagedSend) for a claimed delivery origin, which
+    // never authorizes anything the receipt itself wouldn't (attempt match +
+    // dispatched/completed status + active projection). It uses forInMeetingOutput
+    // so a silent responseMode (which only gates listener auto-post) does NOT block
+    // in-meeting speech — the hub still applies capability + text/voiceOutputPolicy.
+    const block = region(daemonSource, 'let effectiveVerified = verified;', 'if (!effectiveVerified.ok) return jsonRes');
+    // The fallback runs whenever live verification failed — including while a
+    // delivery turn is still executing. Live verification proves origin via the
+    // rotating worker capability only, and non-sandboxed sessions have no
+    // origin-channel transport for it, so gating the fallback on "live origin
+    // cleared" (the old `!ds.managedTurnOrigin` guard) hard-bricked in-turn
+    // speech from non-sandboxed meeting agents (idle-gap gate #5).
+    expect(block).not.toContain('!ds.managedTurnOrigin');
+    expect(block).toContain('claimedAttempt !== undefined');
+    expect(block).toContain('evaluateVcMeetingManagedSend(config.session.dataDir, {');
+    expect(block).toContain('allowTerminalReceipt: true');
+    // In-meeting output channel is silent-independent (decoupled from responseMode).
+    expect(block).toContain('forInMeetingOutput: true');
+    // Only a listener_thread durable decision synthesizes the verified origin.
+    expect(block).toContain("durable.ok && durable.kind === 'listener_thread'");
+    expect(block).toContain('dispatchAttempt: claimedAttempt');
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
@@ -273,7 +362,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const routes: Array<[string, string, string]> = [
       ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
       ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
-      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'replyMessage('],
+      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'sendSessionOwnerThreadNotification('],
     ];
     for (const [name, start, end] of routes) {
       const body = region(ipcSource, start, end);
@@ -322,16 +411,22 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(fedRoster).toContain('larkTransportEnabled: b.larkTransportEnabled,');
   });
 
-  it('no-transport session FORCES read isolation on fresh/resume/restart; adopt is refused at restore', () => {
-    // fresh-spawn forkWorker (shared by fresh/resume/restart) forces read
-    // isolation for a no-transport session — the fail-closed credential boundary.
+  it('no-transport session read isolation FOLLOWS local sandbox config (no forced isolation); adopt is refused at restore', () => {
+    // fresh-spawn forkWorker (shared by fresh/resume/restart) NO LONGER force-
+    // isolates a no-transport session. readIsolation is opt-in only, driven purely
+    // by explicit per-bot `readIsolation`; a no-transport session with no sandbox
+    // config reads bots.json like a normal chat (accepted trade-off — lateral
+    // sibling-cred protection now depends on the owner enabling sandbox).
     const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    expect(wp).toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })');
+    expect(wp).toContain('readIsolation: botCfg.readIsolation === true,');
+    // The old forced-isolation disjunct is gone: readIsolation must NOT be tied to
+    // transport state anymore.
+    expect(wp).not.toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled(');
     // Adopt does NOT gate via the init field (the observe branch returns before
     // fs-policy is built — an init readIsolation would be a dead no-op). Instead
     // adoptSandboxBlocked refuses a no-transport adopt at daemon restore and
-    // converts it to cold-start, covering "normal adopt session later flipped to
-    // apiOnly then restarted".
+    // converts it to cold-start: adopt attaches to an ALREADY-running external CLI
+    // that could never be wrapped, so a no-transport turn must cold-start instead.
     const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
     expect(gate).toContain('botCfg.apiOnly === true');
     expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");
@@ -389,7 +484,7 @@ describe('API-only bot mode — apiOnly survives config reconstruction (source l
     expect(envInjections.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('skips open-platform rename/avatar handler registration for apiOnly bots', () => {
+  it('skips open-platform rename/avatar/description handler registration for apiOnly bots', () => {
     // These drive the console via a browser web-session (NOT getBotClient), so
     // the bot-level gate can't catch them — skip registration entirely.
     const daemonSrc = readFileSync(resolve('src/daemon.ts'), 'utf8');
@@ -397,6 +492,7 @@ describe('API-only bot mode — apiOnly survives config reconstruction (source l
     expect(block).toContain('if (!cfg.apiOnly) {');
     expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotRenamer('));
     expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotAvatarChanger('));
+    expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotDescriptionManager('));
   });
 });
 
@@ -411,20 +507,47 @@ describe('API-only bot mode — riff env re-freeze + VC listener exclusion (sour
     expect(block.indexOf('...cfg.backendConfig.env')).toBeLessThan(block.indexOf('delete mergedEnv.BOTMUX_LARK_APP_SECRET;'));
   });
 
-  it('excludes apiOnly bots from VC listener options and fail-closes scope fetch', () => {
+  it('excludes apiOnly bots from VC meeting preflight and fail-closes scope fetch', () => {
+    // 全局「会议事件接收 Bot」下拉退役后（daemon 侧改成谁收到会议事件谁处理），
+    // 会给某个 bot 开权限/订事件的入口只剩这一个 preflight。apiOnly bot 结构上收不到
+    // 飞书事件，必须在跑开放平台自动化之前就被挡住。
     const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
-    const optsBlock = region(dashSource, 'function vcMeetingListenerBotOptions(', '.map(bot => ({');
-    expect(optsBlock).toContain('bot.apiOnly !== true');
+    const preflightBlock = region(dashSource, 'async function preflightVcMeetingBot(', '\n}\n');
+    const guardAt = preflightBlock.indexOf("if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingBot_preflight_api_only' };");
+    expect(guardAt).toBeGreaterThan(-1);
+    // 拦截必须排在任何开放平台调用之前（自动化 + scope 回读）。
+    for (const call of ['await automateOpenPlatformSetup(', 'await validateVcMeetingScopesForBot(']) {
+      const callAt = preflightBlock.indexOf(call);
+      expect(callAt, `${call} not found`).toBeGreaterThan(-1);
+      expect(guardAt, `apiOnly guard must precede ${call}`).toBeLessThan(callAt);
+    }
     const fetchBlock = region(dashSource, 'async function fetchGrantedScopesForBot(', 'const brand =');
     expect(fetchBlock).toContain('bot.apiOnly === true');
     expect(fetchBlock).toContain('api_only_bot_has_no_feishu_credentials');
   });
 
-  it('skips open-platform rename/avatar handler registration for apiOnly (fails closed to local rename)', () => {
+  it('never seeds per-bot meeting roles while granting permissions (the cross-bot invite regression)', () => {
+    // 「拉 A 进会却把 B 拉进监听群」的根因是给 bot 配置时顺手播种了一条 per-bot
+    // 预设，并把执行方 appId 焊了进去（本 bot 结构上不合格时还会静默换成别人）。
+    // 角色预设现在归 fleet 共享目录，执行方在读路径绑定为收到会议事件的 bot 自己；
+    // 这个入口只负责权限与事件订阅，落盘只允许补 larkCliProfile。
+    const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
+    const preflightBlock = region(dashSource, 'async function preflightVcMeetingBot(', '\n}\n');
+    for (const forbidden of ['consumerProfiles', 'defaultConsumerIds', 'defaultProfileBootstrap', 'agentAppId']) {
+      expect(preflightBlock, `preflight must not touch ${forbidden}`).not.toContain(`${forbidden} =`);
+      expect(preflightBlock, `preflight must not touch ${forbidden}`).not.toContain(`${forbidden}:`);
+    }
+    // 唯一允许的落盘字段。
+    const writeBlock = region(preflightBlock, 'await withFileLock(', '\n    });');
+    expect(writeBlock).toContain('next.larkCliProfile = targetAppId;');
+    expect(writeBlock).not.toMatch(/next\.(?!larkCliProfile\b)[A-Za-z]+\s*=/u);
+  });
+
+  it('skips open-platform rename/avatar/description handler registration for apiOnly (fails closed to local rename)', () => {
     // Daemon owns the config: with the handler unregistered, the IPC route
     // returns renamer_not_wired (local displayName only, no console/Feishu call).
     const daemonSrc = readFileSync(resolve('src/daemon.ts'), 'utf8');
-    expect(daemonSrc).toContain('} // end !cfg.apiOnly (open-platform rename/avatar handlers)');
+    expect(daemonSrc).toContain('} // end !cfg.apiOnly (open-platform profile handlers)');
   });
 });
 
@@ -450,12 +573,118 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
   it('worker turns an unconfined no-transport layout into a fail-closed spawn abort', () => {
     // FsPolicyConfigError (external bots-config / workingDir-is-authority) must
     // abort the spawn with a diagnostic, never fall through to an unconfined run.
-    expect(workerSource).toContain('import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError }');
+    // Assert the meaningful imports are present (not a frozen full-literal named-import
+    // list — that list legitimately grows, e.g. resolveLarkCliLinuxStoreDir for the
+    // Linux keystore fix — so match the module + the two symbols this test relies on).
+    const fsPolicyImport = region(workerSource, "import {", "} from './adapters/cli/fs-policy.js';");
+    expect(fsPolicyImport).toContain('buildFsPolicy');
+    expect(fsPolicyImport).toContain('FsPolicyConfigError');
     const block = region(workerSource, 'const policy = (() => {', 'suppressedAuthorityPaths?.length');
     expect(block).toContain('if (err instanceof FsPolicyConfigError) {');
     expect(block).toContain('refusing to start no-transport session');
     // suppressed (dropped) authority allow paths are LOGGED, not silent
     expect(workerSource).toContain('no-transport suppressed');
+  });
+
+  it('persistent-pane guard: state-machine + injectable executor wiring (behavioral tests in read-isolation)', () => {
+    // The reattach guard delegates the DECISION to evaluatePersistentPaneMigration
+    // and the ORDERED, fail-closed side effects to executePersistentPaneMigration.
+    // Behavioral truth table + failure-path ordering live in read-isolation.test.ts
+    // (real behavioral tests, not source-locks). Here we lock the WORKER WIRING.
+    expect(workerSource).toContain('const migration = evaluatePersistentPaneMigration({');
+    expect(workerSource).toContain('executePersistentPaneMigration(migration, migrationEffects)');
+    expect(workerSource).not.toContain('persistentPaneReattachGuardEngaged');
+    // issue #1 + #4: the gate must ENTER without requiring provenance for the
+    // live-pane arms (a NEITHER-file no-transport tmux pane still reaches the
+    // state machine), AND must ALSO enter on ANY session/backend that has stale
+    // provenance on disk — so a dead pane's leftover marker/tombstone is cleared
+    // before cold-spawn even for a transport-enabled chat that turned sandbox OFF
+    // (else re-enabling sandbox warm-reattaches a fresh UNisolated pane as
+    // "isolated" against the stale matching marker).
+    expect(workerSource).toContain(
+      'const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0\n'
+      + '    || (noTransportSession && isolationCapableBackend)\n'
+      + '    || stalePaneMarkerPresent || policyOffTombstonePresent;',
+    );
+    // issue #3: tombstone authorization requires a SECURE read + schema validation,
+    // not a bare lstat "present".
+    expect(workerSource).toContain('policyOffTombstoneValid(readManagedOriginAuthorityFile(policyOffTombstoneFilePath))');
+    // Provenance removal is VERIFIED (unlink → re-probe → throw if still present).
+    const remover = region(workerSource,
+      'const removeProvenanceOrThrow =', 'const staleSessionName = persistentSessionName;');
+    expect(remover).toContain('hostEntryExistsNoFollow(path)');
+    expect(remover).toContain('could not remove stale');
+    // The effects wire the real kill/probe/clear/reselect; the executor enforces
+    // ordering + stop-on-failure (proven behaviorally in read-isolation.test.ts).
+    const effects = region(workerSource,
+      'const migrationEffects: PersistentPaneMigrationEffects = {',
+      'executePersistentPaneMigration(migration, migrationEffects)');
+    expect(effects).toContain('killStalePane:');
+    expect(effects).toContain('confirmPaneGone:');
+    // Tri-state fix: migration teardown fail-closes on ANY non-`missing` post-kill
+    // probe for EVERY backend (kill unconfirmed on `unknown` — tmux swallows kill
+    // errors, zellij ignores its exit — must not publish a new generation). This is
+    // STRICTER than the shared shouldRejectPersistentPostKillProbe (ZMX-only
+    // unknown), which the migration path deliberately no longer uses.
+    expect(effects).toContain("postKillProbe !== 'missing'");
+    expect(effects).not.toContain('shouldRejectPersistentPostKillProbe(');
+    // Tri-state fix: an inconclusive (`unknown`) liveness probe fails closed via a
+    // dedicated effect — never clear provenance / cold-spawn around a possibly-live
+    // confined pane.
+    expect(effects).toContain('refuseInconclusiveProbe:');
+    expect(workerSource).toContain('could not verify existing ${effectiveBackendType} pane');
+    expect(effects).toContain('clearProvenanceVerified:');
+    expect(effects).toContain('reselectBackend:');
+    // Generational-race fix: provenance is written PENDING before spawn (a nonce
+    // record both validators reject) and only rewritten to committed AFTER spawn
+    // confirms a fresh, non-reattached generation.
+    expect(workerSource).toContain('provenancePendingContent(nonce)');
+    expect(workerSource).toContain('let pendingProvenanceCommit: PersistentPaneCommit | null = null;');
+    // The PENDING presence is fed into the state machine as a dominant input.
+    expect(workerSource).toContain('pendingProvenancePresent,');
+    expect(workerSource).toContain('provenancePendingNonce(readManagedOriginAuthorityFile(stalePaneMarkerPath))');
+    // Commit runs AFTER actuallyReattachedPersistent is known, with a generation
+    // fence + compare-before-replace on the pending nonce.
+    const commitBlock = region(workerSource,
+      'if (pendingProvenanceCommit) {', 'finalizeCodexAppControlGeneration(');
+    // Condition #2: a predicted-fresh launch that dynamically reattached a late
+    // pane must tear down + refuse, not silently keep running.
+    expect(commitBlock).toContain('if (actuallyReattachedPersistent) {');
+    expect(commitBlock).toContain('dynamically reattached a late-arriving pane');
+    // Option B: isolation-capable zellij never commits (stays pending → cold-spawn).
+    expect(commitBlock).toContain("effectiveBackendType === 'zellij'");
+    expect(commitBlock).toContain('does not warm-reattach');
+    // Condition #3: fence + compare-before-replace + commit-fail teardown.
+    expect(commitBlock).toContain('spawnGeneration !== cliSpawnGeneration');
+    expect(commitBlock).toContain('provenancePendingNonce(readManagedOriginAuthorityFile(commit.path))');
+    expect(commitBlock).toContain('pending proof nonce mismatch');
+    expect(commitBlock).toContain('replaceManagedOriginCapabilityFile(commit.path, commit.committedContent)');
+    // Teardown = kill the EXACT backend target → confirm authoritative missing →
+    // else keep pending + refuse (never erase evidence of a possibly-live pane).
+    // CRITICAL: must NOT name-only kill — an isolated/MCP herdr agent lives on the
+    // SHARED host session `botmux`, so a name-only killPersistentSession('herdr',
+    // 'botmux') would tear down every bot's agent. Mirror the migration effects:
+    // target helper for herdr's agent scope, frozen-PID path for ZMX identity.
+    const teardown = region(commitBlock,
+      'const teardownTarget = selectedBackend.persistentBackendTarget;', 'Condition #2:');
+    // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
+    expect(teardown).toContain('persistentTeardownKillKind({');
+    expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
+    expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
+    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)');
+    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe');
+    expect(teardown).toContain("postKill !== 'missing'");
+    expect(teardown).toContain('pending proof retained');
+
+    // Blocker #3: the policy-ON PENDING write is a spawn-time ADMISSION
+    // PRECONDITION, not best-effort — a write failure must THROW before spawn (else
+    // a late-flip reattach skips the pendingProvenanceCommit-gated teardown and
+    // runs unattributed). Assert the policy-ON arm fails closed, same as policy-off.
+    const pendingWrite = region(workerSource,
+      "if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {",
+      "} else if (appliedIsolationCapabilities.length === 0");
+    expect(pendingWrite).toContain('could not record pending isolation-marker generation proof');
+    expect(pendingWrite).not.toContain('non-fatal');
   });
 
   it('daemon freezes the actual loaded bots-config path into the worker init message', () => {

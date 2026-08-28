@@ -12,16 +12,19 @@ describe('desktop local source installer docs', () => {
     expect(script).toContain('resolve_app_version');
     expect(script).toContain('BOTMUX_DESKTOP_VERSION');
     expect(script).toContain('-c.extraMetadata.version="$APP_VERSION"');
-    expect(script).toContain('pnpm desktop:bundle');
-    expect(script).toContain('pnpm desktop:runtime');
-    expect(script).toContain('pnpm build');
+    expect(script).toContain('bun run desktop:bundle');
+    expect(script).toContain('bun run desktop:runtime');
+    expect(script).toContain('bun run build');
     expect(script).toContain('electron-builder --mac dir');
     expect(script).toContain('codesign --force --deep --sign -');
     expect(script).toContain('xattr -dr com.apple.quarantine');
     expect(script).toContain('pgrep -x "Botmux"');
+    expect(script).toContain('bun install --frozen-lockfile');
+    // The installer must not depend on a package manager the repo no longer uses:
+    // this box happens to have pnpm on PATH while CI does not, so a leftover
+    // `pnpm …` call passes locally and only fails on a clean machine.
+    expect(script).not.toMatch(/(^|[^-\w])pnpm\s/m);
     expect(script).not.toContain('osascript');
-    expect(script).not.toContain('pnpm link --global');
-    expect(script).not.toContain('pnpm use:here');
     expect(script).not.toContain('--skip-link');
     expect(script).not.toContain('botmux app');
 

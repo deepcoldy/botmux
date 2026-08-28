@@ -7,7 +7,9 @@
  * supported; known Yarn layouts are identified for diagnostics but rejected
  * until their global-dir/bin-dir semantics are handled explicitly.
  */
+import { spawnSync } from 'node:child_process';
 import { readdirSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { botmuxInstallRoot } from './install-info.js';
 
@@ -38,6 +40,51 @@ export class UnsupportedGlobalInstallError extends Error {
 
 function normalized(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/** Node resolves pnpm 11's global botmux symlink to this store realpath. */
+function pnpmV11StoreMatch(root: string): RegExpMatchArray | null {
+  return root.match(
+    /^(.*\/pnpm)\/store\/(v\d+)\/links\/@\/botmux\/[^/]+\/[^/]+\/node_modules\/botmux$/i,
+  );
+}
+
+function pnpmGlobalDir(
+  pathImpl: typeof posix,
+  layout: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const command = platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+  const result = spawnSync(command, ['list', '-g', '--depth', '0', '--json'], {
+    cwd: homedir(),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    // .cmd shims are not directly executable: without cmd.exe the Windows
+    // install path fails with ENOENT/EINVAL. Mirror the update execution
+    // strategy (installLatestBotmuxSync / runGlobalInstall). Args are fixed
+    // literals, so the shell cannot reinterpret anything.
+    shell: platform === 'win32',
+    // This probe runs on request-serving paths (dashboard settings, update
+    // status, scheduled maintenance) with no plan cache before the first
+    // successful update, so a hung pnpm or wedged disk must never freeze the
+    // event loop. Any timeout/error keeps callers on the fail-closed path
+    // (status !== 0 -> undefined). SIGKILL cannot be trapped by the child.
+    timeout: 5_000,
+    killSignal: 'SIGKILL',
+    maxBuffer: 256 * 1024,
+  });
+  if (result.status !== 0 || typeof result.stdout !== 'string') return undefined;
+  let globalRoot: string | undefined;
+  try {
+    const listing = JSON.parse(result.stdout);
+    globalRoot = Array.isArray(listing) && typeof listing[0]?.path === 'string'
+      ? normalized(listing[0].path)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+  if (!globalRoot) return undefined;
+  return globalRoot.endsWith(`/${layout}`) ? pathImpl.dirname(globalRoot) : undefined;
 }
 
 /**
@@ -87,6 +134,7 @@ export function detectGlobalInstallManager(
   // Node normally resolves pnpm's stable symlink to this versioned virtual-store
   // path. Match it before the generic node_modules layouts below.
   if (root.includes('/.pnpm/')) return 'pnpm';
+  if (pnpmV11StoreMatch(root)) return 'pnpm';
 
   // Known non-npm managers must never fall through to npm, especially on
   // Windows where all three can end in <prefix>/node_modules/botmux.
@@ -135,14 +183,21 @@ export function resolveGlobalInstallPlan(
     const marker = '/.pnpm/';
     const markerIndex = root.toLowerCase().indexOf(marker);
     const pnpmV11Match = root.match(/^(.*\/pnpm\/global)\/(v\d+)\/[^/]+\/node_modules\/botmux$/i);
+    const pnpmV11Store = pnpmV11StoreMatch(root);
     // Use the capture from the normalized path. Besides avoiding a fragile
     // separator search, this preserves Windows drive letters while converting
     // backslashes to the separator expected by pnpm's command arguments.
-    const globalDir = pnpmV11Match?.[1];
+    const globalDir = pnpmV11Match?.[1]
+      ?? (pnpmV11Store ? pnpmGlobalDir(path, pnpmV11Store[2], platform) : undefined);
+    if (pnpmV11Store && !globalDir) {
+      throw new UnsupportedGlobalInstallError('pnpm', packageRoot);
+    }
     const globalInstallDir = pnpmV11Match
       ? path.join(globalDir!, pnpmV11Match[2])
+      : pnpmV11Store
+        ? path.join(globalDir!, pnpmV11Store[2])
       : markerIndex >= 0
-        ? root.slice(0, markerIndex)
+      ? root.slice(0, markerIndex)
       : path.dirname(path.dirname(packageRoot));
     // pnpm appends its global layout version (currently "5", or "v11") to
     // --global-dir. The pnpm 11 runtime adds another temporary directory below
@@ -150,7 +205,12 @@ export function resolveGlobalInstallPlan(
     const resolvedGlobalDir = globalDir ?? path.dirname(globalInstallDir);
     const activePackageRoot = pnpmV11Match
       ? pnpmV11StablePackageRoot(packageRoot, resolvedGlobalDir, pnpmV11Match[2], path)
+      : pnpmV11Store
+        ? pnpmV11StablePackageRoot(packageRoot, resolvedGlobalDir, pnpmV11Store[2], path)
       : path.join(globalInstallDir, 'node_modules', 'botmux');
+    if (pnpmV11Store && activePackageRoot === packageRoot) {
+      throw new UnsupportedGlobalInstallError('pnpm', packageRoot);
+    }
     return {
       manager,
       command: 'pnpm',

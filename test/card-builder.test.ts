@@ -110,9 +110,10 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
+    expect(texts[0]).not.toContain('Session ID:');
   });
 
-  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+  it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],
       'om_root',
@@ -121,10 +122,23 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
-    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
     expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('distinguishes otherwise identical history candidates without showing their session ids', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', [
+      { cliSessionId: 'hidden-one', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+      { cliSessionId: 'hidden-two', cwd: '/work/proj', title: 'same task', lastActivityAt: 1 },
+    ]));
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain('Candidate: #1');
+    expect(texts[1]).toContain('Candidate: #2');
+    expect(JSON.stringify(texts)).not.toContain('hidden-one');
+    expect(JSON.stringify(texts)).not.toContain('hidden-two');
   });
 
   it('uses a configured runtime name for both live and resume rows', () => {
@@ -910,6 +924,26 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
+    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).not.toContain('等待输入');
+    });
+
+    it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, true,
+      ));
+      expect(card.header.title.content).toContain('工作中');
+    });
+
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
@@ -1283,6 +1317,55 @@ describe('buildStreamingCard', () => {
 
       expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
       expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+    });
+  });
+
+  // ── Writable terminal link (writableTerminalLinkInCard opt-in) ──────────
+
+  describe('writable terminal link', () => {
+    const WURL = 'https://example.com/writable?token=secret';
+
+    const buildWithWritable = (locale: 'zh' | 'en' = 'zh') => parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+      undefined, undefined, false, false, locale, undefined, WURL,
+    ));
+
+    const allActionButtons = (card: any): any[] =>
+      card.elements.filter((e: any) => e.tag === 'action').flatMap((row: any) => row.actions);
+
+    it('renders the writable URL as a primary URL button instead of a raw markdown link', () => {
+      const card = buildWithWritable();
+      // No markdown element carries the token URL (the previous shape rendered
+      // the long URL as a raw markdown link blob).
+      const mdLinks = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(mdLinks.every((m: any) => !m.content.includes('?token='))).toBe(true);
+
+      const writableBtn = allActionButtons(card).find((a: any) => a.multi_url?.url.includes('?token='));
+      expect(writableBtn).toBeDefined();
+      expect(writableBtn.type).toBe('primary');
+      expect(writableBtn.text.content).toContain('可操作');
+      expectDirectUrl(writableBtn.multi_url.url, WURL);
+      expectDirectUrl(writableBtn.multi_url.pc_url, WURL);
+      expect(writableBtn.multi_url.android_url).toBe(WURL);
+      expect(writableBtn.multi_url.ios_url).toBe(WURL);
+    });
+
+    it('keeps the group-visible warning as a note under the button (zh + en)', () => {
+      const zh = buildWithWritable('zh');
+      const zhNote = zh.elements.find((e: any) => e.tag === 'note');
+      expect(zhNote).toBeDefined();
+      expect(JSON.stringify(zhNote)).toContain('群内可见');
+
+      const en = buildWithWritable('en');
+      const enNote = en.elements.find((e: any) => e.tag === 'note');
+      expect(enNote).toBeDefined();
+      expect(JSON.stringify(enNote)).toContain('visible to everyone');
+    });
+
+    it('omits the writable button and warning when no writable URL is set', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
+      expect(allActionButtons(card).some((a: any) => a.multi_url?.url.includes('?token='))).toBe(false);
+      expect(card.elements.some((e: any) => e.tag === 'note')).toBe(false);
     });
   });
 
@@ -1662,6 +1745,34 @@ describe('buildSessionClosedCard', () => {
     const md = findMarkdownContent(card);
     expect(md).toContain('不支持');
     expect(md).not.toMatch(/```/);
+  });
+
+  it('warns that resume starts a FRESH session when resumeStartsFresh is set', () => {
+    // Copilot/Kimi without a persisted cliSessionId: resuming reactivates the
+    // topic route, but the next spawn starts a fresh session — the card must
+    // not imply history is restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-fresh', 'om_root', 'topic', 'copilot', undefined, null, 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('新起干净会话');
+    expect(md).toContain('重新激活');
+    // The generic "可在飞书内 resume" line must NOT appear — it implies the
+    // CLI history comes back.
+    expect(md).not.toContain('可在飞书内 resume');
+    expect(md).not.toMatch(/```/);
+  });
+
+  it('does not show the fresh-session warning when a precise resume command exists', () => {
+    // resumeStartsFresh is only meaningful in the no-command branch; with a
+    // precise command the history really will be restored.
+    const card = parse(buildSessionClosedCard(
+      'sess-cmd', 'om_root', 'topic', 'cursor', undefined,
+      'cursor-agent --resume chat-1', 'zh', undefined, true,
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('cursor-agent --resume chat-1');
+    expect(md).not.toContain('新起干净会话');
   });
 
   it('emits a Resume button targeting the closed sessionId', () => {

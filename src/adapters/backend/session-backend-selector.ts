@@ -411,16 +411,59 @@ export function selectSessionBackend(opts: {
           + 'close it explicitly before enabling isolation or MCP',
         );
       }
-    } else if (HerdrBackend.hasSession(ownedSessionName)) {
-      return {
-        backend: new HerdrBackend(ownedSessionName, { isReattach: true }),
-        isTmuxMode: false,
-        isPipeMode: true,
-        isZellijMode: false,
-        persistentSessionName: ownedSessionName,
-        persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
-        isReattach: true,
-      };
+    } else {
+      // Owned isolation/MCP host. The reattach decision must be AGENT-precise, not
+      // session-level: herdr can keep a live host session whose `botmux` agent row
+      // has disappeared (killSession's own comment records that session dir, agent
+      // metadata and process state diverge). Predicting reattach from the SESSION
+      // alone would, when the agent is gone, make HerdrBackend.spawn's frozen
+      // reattach guard throw every launch (kill-loop) — and the worker would have
+      // skipped the cold-path setup (PENDING proof + credential-only wrapper, gated
+      // on !willReattachPersistent), so a silent fresh-start would run UNWRAPPED.
+      //
+      // Use TRI-STATE probes (never `hasSession && hasAgent` — those collapse
+      // `unknown` to false and re-introduce fail-open). Table:
+      //   host unknown                     → refuse (no kill, no spawn)
+      //   host missing                     → fall through to the shared-host cold path
+      //   host exists, agent unknown       → refuse
+      //   host exists, agent exists        → reattach the same owned host
+      //   host exists, agent missing       → COLD start IN the same owned host
+      //                                      (isReattach:false → worker writes
+      //                                      PENDING + assembles the wrapper, then
+      //                                      Herdr `agent start`s a new generation);
+      //                                      no teardown of the still-live host.
+      const ownedAgentName = HerdrBackend.defaultAgentName();
+      const hostProbe = HerdrBackend.probeSession(ownedSessionName);
+      if (hostProbe === 'unknown') {
+        throw new Error(
+          `owned herdr session ${ownedSessionName} probe inconclusive; `
+          + 'refusing isolation/MCP reattach-vs-fresh decision',
+        );
+      }
+      if (hostProbe === 'exists') {
+        const agentProbe = HerdrBackend.probeAgent(ownedSessionName, ownedAgentName);
+        if (agentProbe === 'unknown') {
+          throw new Error(
+            `owned herdr agent ${ownedAgentName} in ${ownedSessionName} probe inconclusive; `
+            + 'refusing isolation/MCP reattach-vs-fresh decision',
+          );
+        }
+        const agentLive = agentProbe === 'exists';
+        return {
+          backend: new HerdrBackend(ownedSessionName, {
+            // agent missing on a live host → in-place cold start (create the agent,
+            // NOT the session, which already exists).
+            isReattach: agentLive,
+          }),
+          isTmuxMode: false,
+          isPipeMode: true,
+          isZellijMode: false,
+          persistentSessionName: ownedSessionName,
+          persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
+          isReattach: agentLive,
+        };
+      }
+      // host missing → fall through to the shared-host cold path below.
     }
 
     // Every fresh agent actively launched by this machine's Botmux shares the

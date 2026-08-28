@@ -2,6 +2,8 @@
  * Session cost calculator — computes token usage from JSONL logs.
  */
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
@@ -53,6 +55,8 @@ export interface SessionUsageSnapshot {
   context: SessionContextUsage | null;
   tokens: SessionTokenUsage | null;
   turnTokens: { in: number; out: number } | null;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 export interface SessionTokenUsageQuery {
@@ -85,6 +89,16 @@ export function getSessionCost(sessionId: string, cwd: string): SessionCost | nu
 
 function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return '';
 }
 
 function pickNum(obj: any, keys: readonly string[]): number {
@@ -215,11 +229,12 @@ interface TokenUsageAggregate {
    *  show a small "this turn" delta alongside the large cumulative total. */
   turnInputTokens: number;
   turnOutputTokens: number;
+  reasoningEffort: string;
 }
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
-type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'generic';
+type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'generic';
 
 interface UsageSourceRecord {
   offset: number;
@@ -255,6 +270,8 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
       return 'coco';
     case 'pi':
       return 'pi';
+    case 'grok':
+      return 'grok';
     default:
       return 'generic';
   }
@@ -275,6 +292,7 @@ function newTokenUsageAggregate(): TokenUsageAggregate {
     modelSource: null,
     turnInputTokens: 0,
     turnOutputTokens: 0,
+    reasoningEffort: '',
   };
 }
 
@@ -379,6 +397,148 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+/** Pi transcripts carry per-turn usage but no context window of their own;
+ *  the window comes from ~/.pi/agent/models.json. Cache by mtime so the fold
+ *  never re-reads a stable file (models.json is edited rarely). */
+const PI_MODELS_JSON_PATH = join(homedir(), '.pi', 'agent', 'models.json');
+
+interface PiModelsCacheEntry {
+  mtimeMs: number;
+  size: number;
+  contextByModelId: Map<string, number>;
+  contextByProviderModel: Map<string, number>;
+}
+
+let piModelsCache: (PiModelsCacheEntry & { ambiguousBareIds?: Set<string> }) | null = null;
+
+interface PiModelsWindows {
+  byBareId: Map<string, number>;
+  byProviderModel: Map<string, number>;
+  ambiguousBareIds: Set<string>;
+}
+
+function readPiModelsContextWindows(): PiModelsWindows | null {
+  try {
+    const st = statSync(PI_MODELS_JSON_PATH);
+    if (piModelsCache && piModelsCache.mtimeMs === st.mtimeMs && piModelsCache.size === st.size) {
+      return { byBareId: piModelsCache.contextByModelId, byProviderModel: piModelsCache.contextByProviderModel, ambiguousBareIds: piModelsCache.ambiguousBareIds ?? new Set() };
+    }
+    const parsed = JSON.parse(readFileSync(PI_MODELS_JSON_PATH, 'utf-8')) as any;
+    const contextByModelId = new Map<string, number>();
+    const contextByProviderModel = new Map<string, number>();
+    const ambiguousBareIds = new Set<string>();
+    const providers = parsed?.providers;
+    if (providers && typeof providers === 'object') {
+      for (const [providerName, provider] of Object.entries<any>(providers)) {
+        if (!provider || typeof provider !== 'object') continue;
+        const models = provider.models;
+        if (!Array.isArray(models)) continue;
+        for (const model of models) {
+          if (model && typeof model.id === 'string' && typeof model.contextWindow === 'number' && model.contextWindow > 0) {
+            const existing = contextByModelId.get(model.id);
+            if (existing !== undefined && existing !== model.contextWindow) {
+              // Same bare id with a different window under another provider: bare-id
+              // lookup would silently pick one, so mark it ambiguous and only allow
+              // provider-qualified resolution.
+              ambiguousBareIds.add(model.id);
+            } else {
+              contextByModelId.set(model.id, model.contextWindow);
+            }
+            contextByProviderModel.set(`${providerName}/${model.id}`, model.contextWindow);
+          }
+        }
+      }
+    }
+    for (const id of ambiguousBareIds) contextByModelId.delete(id);
+    piModelsCache = { mtimeMs: st.mtimeMs, size: st.size, contextByModelId, contextByProviderModel, ambiguousBareIds };
+    return { byBareId: contextByModelId, byProviderModel: contextByProviderModel, ambiguousBareIds };
+  } catch {
+    // models.json missing or unparseable: fall back to used-tokens-only context
+    // (no window, no percentage), same as Claude Code sessions.
+    return null;
+  }
+}
+
+/** Resolve a model's context window, tolerating pi's bare model ids as well as
+ *  the "provider/model" and "model:variant" shapes used in configs. */
+function piModelContextWindow(modelId: string, provider?: string): number | undefined {
+  const windows = readPiModelsContextWindows();
+  if (!windows) return undefined;
+  // Prefer the exact provider+model identity recorded in the transcript.
+  if (provider) {
+    const qualified = windows.byProviderModel.get(`${provider}/${modelId}`);
+    if (qualified !== undefined) return qualified;
+  }
+  if (windows.byBareId.has(modelId)) return windows.byBareId.get(modelId);
+  const bare = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+  if (provider) {
+    const qualifiedBare = windows.byProviderModel.get(`${provider}/${bare}`);
+    if (qualifiedBare !== undefined) return qualifiedBare;
+  }
+  if (windows.byBareId.has(bare)) return windows.byBareId.get(bare);
+  const withoutVariant = bare.includes(':') ? bare.slice(0, bare.indexOf(':')) : bare;
+  if (withoutVariant !== bare) {
+    if (provider) {
+      const qualifiedNoVariant = windows.byProviderModel.get(`${provider}/${withoutVariant}`);
+      if (qualifiedNoVariant !== undefined) return qualifiedNoVariant;
+    }
+    if (windows.byBareId.has(withoutVariant)) return windows.byBareId.get(withoutVariant);
+  }
+  return undefined;
+}
+
+/** pi's usage is per-turn prompt-side totals; the latest measurement is the
+ *  context gauge. The window (and therefore the percentage) comes from
+ *  ~/.pi/agent/models.json when the model id can be resolved. */
+function buildPiContextUsage(usedTokens: number, modelId: string, provider?: string): SessionContextUsage {
+  const windowTokens = piModelContextWindow(modelId, provider);
+  if (!windowTokens) return { usedTokens };
+  const percentUsed = Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100);
+  return { usedTokens, windowTokens, percentUsed };
+}
+
+/** Grok Build persists ACP updates. `turn_completed.usage` is an exact
+ *  per-turn provider total (input includes cached input); companion
+ *  signals.json supplies the live context gauge and user-facing model id. */
+function foldGrokLine(agg: TokenUsageAggregate, entry: any): void {
+  // Grok writes two sibling `_meta` objects. `params._meta` is almost always
+  // present (eventId / totalTokens) and must not shadow `update._meta.modelId`
+  // on `user_message_chunk` — that is the first-turn user-facing model before
+  // signals.json exists.
+  const paramsMeta = entry?.params?._meta;
+  const updateMeta = entry?.params?.update?._meta;
+  const contextTokens = num(paramsMeta?.totalTokens) || num(updateMeta?.totalTokens);
+  if (contextTokens > 0) {
+    agg.latestContextUsage = { usedTokens: contextTokens };
+  }
+  const eventModel = firstNonEmptyString(updateMeta?.modelId, paramsMeta?.modelId);
+  if (eventModel) agg.model = eventModel;
+  const update = entry?.params?.update;
+  if (update?.sessionUpdate !== 'turn_completed') return;
+  const u = update.usage;
+  if (!u || typeof u !== 'object') return;
+  const partitioned = partitionInclusiveInputTokens(
+    pickNum(u, ['inputTokens', 'input_tokens']),
+    pickNum(u, ['cachedReadTokens', 'cache_read_input_tokens']),
+    pickNum(u, ['cacheCreationTokens', 'cache_creation_input_tokens']),
+  );
+  const output = pickNum(u, ['outputTokens', 'output_tokens']);
+  agg.inputTokens += partitioned.inputTokens;
+  agg.outputTokens += output;
+  agg.cacheReadTokens += partitioned.cacheReadTokens;
+  agg.cacheCreateTokens += partitioned.cacheCreateTokens;
+  // The terminal event is one complete turn, so latest-turn counters replace
+  // the preceding turn instead of accumulating across the session.
+  agg.turnInputTokens = partitioned.rawInputTokens;
+  agg.turnOutputTokens = output;
+  const modelUsage = u.modelUsage;
+  if (!agg.model && modelUsage && typeof modelUsage === 'object') {
+    const modelId = Object.keys(modelUsage).find(key => key.trim().length > 0);
+    if (modelId) agg.model = modelId;
+  }
+  agg.turns++;
+}
+
 function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
   if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
   const msg = entry.message;
@@ -393,6 +553,18 @@ function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry
   agg.outputTokens += num(u.output);
   agg.cacheReadTokens += num(u.cacheRead);
   agg.cacheCreateTokens += num(u.cacheWrite);
+  // Pi 0.84+ native context accounting prefers usage.totalTokens; fall back to
+  // the four-part sum (input + output + cacheRead + cacheWrite). input alone
+  // excludes the current turn's output, which undercounts the real context.
+  const totalTokens = num(u.totalTokens);
+  const contextTokens = totalTokens > 0
+    ? totalTokens
+    : num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite);
+  // Synthetic/empty assistant records (e.g. around compaction) must not erase
+  // the last native context measurement.
+  if (contextTokens > 0) {
+    agg.latestContextUsage = buildPiContextUsage(contextTokens, typeof msg.model === 'string' ? msg.model : '', typeof msg.provider === 'string' ? msg.provider : '');
+  }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
 }
@@ -440,6 +612,8 @@ function foldUsageLine(
       return foldCocoLine(agg, entry);
     case 'pi':
       return foldPiLine(agg, seenMessageIds, entry);
+    case 'grok':
+      return foldGrokLine(agg, entry);
     case 'generic':
       return foldGenericLine(agg, seenMessageIds, entry);
   }
@@ -544,6 +718,7 @@ const warnedOversizedUsageFiles = new Set<string>();
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
   warnedOversizedUsageFiles.clear();
+  piModelsCache = null;
   __resetTranscriptResolverCacheForTest();
 }
 
@@ -1129,7 +1304,59 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;
-  return readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  const read = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  if (q.cliId !== 'grok' || !read) return read;
+  // signals.json is a small rewritten snapshot beside updates.jsonl. Read it
+  // on every card refresh: the append-only JSONL cache may legitimately be
+  // throttled, while the live context gauge and model can change independently.
+  const agg = cloneAggregate(read.agg);
+  let result = read.result ? { ...read.result } : null;
+  const grokSessionDir = dirname(resolved.path);
+  try {
+    const signals = JSON.parse(readFileSync(join(grokSessionDir, 'signals.json'), 'utf8'));
+    const usedTokens = num(signals?.contextTokensUsed);
+    const windowTokens = num(signals?.contextWindowTokens);
+    const reportedPercent = num(signals?.contextWindowUsage);
+    if (usedTokens > 0 || windowTokens > 0) {
+      const percentUsed = reportedPercent > 0
+        ? Math.max(0, Math.min(100, Math.round(reportedPercent)))
+        : windowTokens > 0
+          ? Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100)
+          : undefined;
+      agg.latestContextUsage = {
+        usedTokens,
+        ...(windowTokens > 0 ? { windowTokens } : {}),
+        ...(percentUsed !== undefined ? { percentUsed } : {}),
+      };
+    }
+    const model = typeof signals?.primaryModelId === 'string' ? signals.primaryModelId.trim() : '';
+    if (model) {
+      agg.model = model;
+      if (result) result = { ...result, model };
+    }
+  } catch {
+    // A brand-new Grok session may not have written signals.json yet.
+  }
+  try {
+    const summary = JSON.parse(readFileSync(join(grokSessionDir, 'summary.json'), 'utf8'));
+    const reasoningEffort = typeof summary?.reasoning_effort === 'string'
+      ? summary.reasoning_effort.trim()
+      : '';
+    if (reasoningEffort) agg.reasoningEffort = reasoningEffort;
+    // signals.json is rewritten at turn end. A first-turn working card only
+    // has summary.current_model_id until then — use it when fold/signals
+    // did not already supply a model.
+    const summaryModel = typeof summary?.current_model_id === 'string'
+      ? summary.current_model_id.trim()
+      : '';
+    if (summaryModel && !agg.model) {
+      agg.model = summaryModel;
+      if (result) result = { ...result, model: summaryModel };
+    }
+  } catch {
+    // summary.json is also created lazily; reasoning effort is optional.
+  }
+  return { agg, result };
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
@@ -1150,6 +1377,11 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     context: agg?.latestContextUsage ?? null,
     tokens: read?.result ?? null,
     turnTokens,
+    // Grok exposes a stable user-facing primaryModelId in signals.json.
+    // Keep other CLIs unchanged: Relay-family transcript model strings may
+    // be internal routing codes and intentionally never surface on cards.
+    ...(q.cliId === 'grok' && agg?.model ? { model: agg.model } : {}),
+    ...(q.cliId === 'grok' && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
   };
 }
 

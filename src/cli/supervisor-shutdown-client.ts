@@ -2,7 +2,22 @@ import { spawnSync } from 'node:child_process';
 import { daemonIpcAuthHeaders } from '../core/daemon-ipc-auth.js';
 import { readSupervisorProcessStartIdentity } from '../core/process-start-identity.js';
 import { SUPERVISOR_SHUTDOWN_ROUTE } from '../core/supervisor-shutdown-ipc.js';
-import type { AttestedPm2DaemonShutdownTarget } from './pm2-shutdown-capability.js';
+
+/** A daemon addressable for a graceful shutdown request. Relocated here from the
+ *  retired pm2-shutdown-capability guard module (the fleet pm2 guards were removed
+ *  when supervision moved off pm2); the daemon-shutdown IPC client below is the
+ *  only remaining consumer, so the type lives with it now. */
+export interface SupervisorShutdownTarget {
+  name: string;
+  pid: number;
+}
+
+export interface AttestedPm2DaemonShutdownTarget extends SupervisorShutdownTarget {
+  larkAppId: string;
+  ipcPort: number;
+  bootInstanceId: string;
+  processStartIdentity: string;
+}
 
 export interface SupervisorShutdownHttpResult {
   status?: number;

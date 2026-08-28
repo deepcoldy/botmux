@@ -877,6 +877,9 @@ describe('RiffBackend', () => {
       });
       (be as any).currentTaskId = 'task-A';
       const p = (be as any).fetchDirectAccessUrl('task-A');
+      // getJwt is now async, so the task-detail fetch (which assigns resolveDetail)
+      // only fires after a microtask. Flush before driving the response.
+      await flush();
       (be as any).currentTaskId = 'task-B';
       resolveDetail(Response.json({ success: true, data: { task: { directAccessUrl: 'https://old-a.example/' } } }));
       await p;
@@ -1501,6 +1504,65 @@ describe('RiffBackend', () => {
       expect(urls[urls.length - 1]).toBe(`${BASE}/sandbox-access?sessionId=z`);
       await flush();
       expect(urls[urls.length - 1]).toBe('https://port-8080-z.sandbox.example.com/');
+    });
+  });
+
+  describe('create/follow-up 401 retry with refreshed JWT (申晗: startup must actually get a JWT)', () => {
+    /** A task-execute fetch mock: first POST 401s, the retry (if any) 200s.
+     *  task-stream stays pending; task-detail/cancel resolve instantly. */
+    function authRetryFetch(): { execHeaders: Array<string | undefined> } {
+      const execHeaders: Array<string | undefined> = [];
+      let execCount = 0;
+      const mock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes('/api/task-execute')) {
+          execCount += 1;
+          const h = (init?.headers ?? {}) as Record<string, string>;
+          execHeaders.push(h['x-jwt-token']);
+          return execCount === 1
+            ? new Response('unauthorized', { status: 401 })
+            : Response.json({ success: true, data: { id: 'task-ok', status: 'running' } });
+        }
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        return Response.json({ success: true, data: {} });
+      });
+      vi.stubGlobal('fetch', mock);
+      return { execHeaders };
+    }
+
+    it('retries ONCE with a freshly-refreshed token after a 401 and succeeds', async () => {
+      const { execHeaders } = authRetryFetch();
+      const be = makeBackend();
+      // Script getJwt: stale token first, forced refresh yields a different one.
+      const gj = vi.spyOn(be as any, 'getJwt').mockImplementation(async (opts: any) => {
+        return opts?.forceRefresh ? 'JWT-FRESH' : 'JWT-STALE';
+      });
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush(); await flush();
+
+      // Two task-execute POSTs: the stale-token attempt (401), then the refreshed retry.
+      expect(execHeaders).toEqual(['JWT-STALE', 'JWT-FRESH']);
+      // The retry used a forced refresh.
+      expect(gj.mock.calls.some(c => (c[0] as any)?.forceRefresh === true)).toBe(true);
+      // Task adopted → currentTaskId set from the successful retry.
+      expect((be as any).currentTaskId).toBe('task-ok');
+    });
+
+    it('does NOT retry when the forced refresh yields the SAME token (no pointless replay)', async () => {
+      const { execHeaders } = authRetryFetch();
+      const be = makeBackend();
+      // Refresh produces nothing new — same token both times.
+      vi.spyOn(be as any, 'getJwt').mockResolvedValue('JWT-SAME');
+      const emitErr = vi.spyOn(be as any, 'emitError');
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush(); await flush();
+
+      // Only the first POST happened; no retry because the token was unchanged.
+      expect(execHeaders).toEqual(['JWT-SAME']);
+      // The 401 surfaces as a turn-ending error (unchanged pre-existing behaviour).
+      expect(emitErr).toHaveBeenCalled();
     });
   });
 });

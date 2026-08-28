@@ -5,7 +5,7 @@
  * Run:  pnpm vitest run test/lark-hosts.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { larkHosts, normalizeBrand, sdkDomain, chatAppLink } from '../src/im/lark/lark-hosts.js';
+import { appCenterAppLink, larkHosts, normalizeBrand, sdkDomain, chatAppLink, threadAppLink } from '../src/im/lark/lark-hosts.js';
 
 describe('lark-hosts', () => {
   describe('normalizeBrand', () => {
@@ -68,6 +68,44 @@ describe('lark-hosts', () => {
     });
     it('defaults to the feishu applink host', () => {
       expect(chatAppLink('oc_x')).toContain('applink.feishu.cn');
+    });
+  });
+
+  describe('threadAppLink', () => {
+    it('uses the Lark applink host and native thread id', () => {
+      const link = new URL(threadAppLink('oc_abc', 'omt_topic', 'lark'));
+      expect(link.origin).toBe('https://applink.larksuite.com');
+      expect(link.pathname).toBe('/client/thread/open');
+      expect(link.searchParams.get('open_thread_id')).toBe('omt_topic');
+      expect(link.searchParams.get('thread_position')).toBe('-1');
+    });
+  });
+
+  describe('appCenterAppLink', () => {
+    const target = 'http://10.0.0.7:7891/?t=tok-abc#/agent-workbench';
+
+    it('builds a feishu appCenter web_url AppLink', () => {
+      expect(appCenterAppLink(target, 'feishu')).toBe(
+        'https://applink.feishu.cn/client/web_url/open?mode=appCenter'
+        + '&url=http%3A%2F%2F10.0.0.7%3A7891%2F%3Ft%3Dtok-abc%23%2Fagent-workbench',
+      );
+    });
+
+    it('builds a lark appCenter web_url AppLink', () => {
+      expect(appCenterAppLink(target, 'lark')).toContain('https://applink.larksuite.com/client/web_url/open');
+    });
+
+    it('defaults to the feishu applink host', () => {
+      expect(appCenterAppLink(target)).toContain('applink.feishu.cn');
+    });
+
+    it('escapes the whole target so `?t=` and `#/…` survive as ONE url param', () => {
+      const link = appCenterAppLink(target, 'feishu');
+      // A raw `#` would truncate the AppLink at the fragment and a raw `&`/`?`
+      // would fork into extra AppLink params — the target must round-trip whole.
+      expect(link).not.toContain('#');
+      expect(new URL(link).searchParams.get('url')).toBe(target);
+      expect(new URL(link).searchParams.get('mode')).toBe('appCenter');
     });
   });
 });

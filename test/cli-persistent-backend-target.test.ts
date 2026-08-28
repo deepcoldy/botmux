@@ -5,7 +5,7 @@
  * exercise the same list/auto-prune/offline-delete paths users invoke while
  * proving a shared host session is never collapsed back to bmx-<sid8>.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   chmodSync,
   mkdirSync,
@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = join(TEST_DIR, '..', 'src', 'cli.ts');
@@ -115,10 +116,10 @@ function runCli(
     ]) {
       delete env[key];
     }
-    const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, ...args], {
+    const child = spawnTsScript(CLI_PATH, args, {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createWriteStream, existsSync } from 'node:fs';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -29,32 +29,30 @@ async function stageBotmuxRuntime() {
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const stagedVersion = normalizeVersion(process.env.BOTMUX_DESKTOP_VERSION);
   if (stagedVersion) pkg.version = stagedVersion;
-  // pnpm 9 reads supportedArchitectures from package.json. Keep this mirror in
-  // addition to pnpm-workspace.yaml below so both pnpm 9 and 11 stage the same
-  // Universal runtime dependency set.
-  pkg.pnpm = {
-    ...(pkg.pnpm ?? {}),
-    supportedArchitectures: { os: ['darwin'], cpu: ['arm64', 'x64'] },
-  };
+  // The `pkg.pnpm.supportedArchitectures` mirror that used to live here is gone
+  // with pnpm: bun selects optional-dependency arches via install flags (see the
+  // `--os` / `--cpu` below), not project config, so there is nothing to inject
+  // into the staged package.json.
   delete pkg.scripts;
   await writeFile(join(runtimeDir, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`);
-  await cp(join(root, 'pnpm-lock.yaml'), join(runtimeDir, 'pnpm-lock.yaml'));
-  // pnpm 11 reads project settings from pnpm-workspace.yaml. Install both
-  // macOS optional dependency variants so the Universal app's bundled runtime
-  // works natively on Intel and ARM Macs.
-  await writeFile(join(runtimeDir, 'pnpm-workspace.yaml'), [
-    'packages:',
-    "  - '.'",
-    'supportedArchitectures:',
-    '  os:',
-    '    - darwin',
-    '  cpu:',
-    '    - arm64',
-    '    - x64',
-    '',
-  ].join('\n'));
+  await cp(join(root, 'bun.lock'), join(runtimeDir, 'bun.lock'));
 
-  run('pnpm', ['install', '--prod', '--frozen-lockfile', '--ignore-scripts'], runtimeDir);
+  // The Universal app's bundled runtime must carry BOTH macOS optional-dependency
+  // variants so it runs natively on Intel and ARM Macs. Under pnpm that was a
+  // `supportedArchitectures` block (mirrored into package.json + a generated
+  // pnpm-workspace.yaml, because pnpm 9 and 11 read it from different places);
+  // bun takes it as install flags instead, so the whole generated-config dance is
+  // gone: `--os darwin --cpu '*'` fetches every arch's optional deps rather than
+  // just the builder machine's. assertBundledCanvasArchitectures() below is what
+  // actually proves both arches landed, and it is unchanged.
+  run('bun', [
+    'install',
+    '--production',
+    '--frozen-lockfile',
+    '--ignore-scripts',
+    '--os', 'darwin',
+    '--cpu', '*',
+  ], runtimeDir);
   await assertBundledCanvasArchitectures();
   // electron-builder applies the app-level `!node_modules/**` exclusion to
   // extraResources and expands pnpm symlinks into duplicate dependency trees.
@@ -70,11 +68,17 @@ async function stageBotmuxRuntime() {
 }
 
 async function assertBundledCanvasArchitectures() {
-  const entries = await readdir(join(runtimeDir, 'node_modules', '.pnpm'));
+  // Prove BOTH macOS arches were staged, so the Universal app is not silently
+  // half-native. This used to enumerate pnpm's content-addressed store
+  // (`node_modules/.pnpm/@napi-rs+canvas-darwin-<arch>@…`), which does not exist
+  // under bun's flat layout — it would have thrown on a perfectly correct
+  // install. Assert on the PACKAGE PATH instead, which both layouts share: an
+  // installed optional dep is always reachable at
+  // node_modules/@napi-rs/canvas-darwin-<arch>.
   for (const arch of ['arm64', 'x64']) {
-    const prefix = `@napi-rs+canvas-darwin-${arch}@`;
-    if (!entries.some(entry => entry.startsWith(prefix))) {
-      throw new Error(`Bundled runtime is missing @napi-rs/canvas-darwin-${arch}`);
+    const pkgDir = join(runtimeDir, 'node_modules', '@napi-rs', `canvas-darwin-${arch}`);
+    if (!existsSync(pkgDir)) {
+      throw new Error(`Bundled runtime is missing @napi-rs/canvas-darwin-${arch} (looked for ${pkgDir})`);
     }
   }
 }

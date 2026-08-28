@@ -21,6 +21,7 @@ import {
   SAVED_WORKFLOW_ID_RE,
   SAVED_WORKFLOW_METADATA_SCHEMA_VERSION,
   SAVED_WORKFLOW_REVISION_ID_RE,
+  SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
   buildSavedWorkflowRevision,
   canonicalJsonStringify,
   loadSavedWorkflowRevision,
@@ -200,6 +201,14 @@ function buildRevisionPayload(
   };
 }
 
+function assertCurrentDagAuthoringVersion(draft: SavedWorkflowRevisionDraft): void {
+  if (draft.dagTemplate.schemaVersion !== 2) {
+    throw new Error(
+      'new Saved Workflow revision requires dagTemplate.schemaVersion=2 and stable outputs/output keys',
+    );
+  }
+}
+
 function loadedFromStored(stored: StoredSavedWorkflowRevision): LoadedSavedWorkflowRevision {
   return loadSavedWorkflowRevision(stored, {
     workflowId: (stored.payload as SavedWorkflowRevisionPayloadV1).workflowId,
@@ -228,7 +237,9 @@ function exactLibraryBytes(input: CreateOrRecoverExactSavedWorkflowInput): {
     workflowId: metadata.workflowId,
     revisionId: input.expectedRevision.revisionId,
   });
-  const rebuiltRevision = buildSavedWorkflowRevision(loadedRevision.payload);
+  const rebuiltRevision = input.expectedRevision.schemaVersion === SAVED_WORKFLOW_REVISION_SCHEMA_VERSION
+    ? buildSavedWorkflowRevision(loadedRevision.payload)
+    : input.expectedRevision;
   if (canonicalJsonStringify(rebuiltRevision) !== canonicalJsonStringify(input.expectedRevision)) {
     throw new SavedWorkflowConflictError('Expected Saved Workflow revision is not canonical');
   }
@@ -506,7 +517,10 @@ export async function verifyExactSavedWorkflowOrigin(
       try {
         const parsed = JSON.parse(bytes) as unknown;
         const loaded = loadSavedWorkflowRevision(parsed, { workflowId, revisionId });
-        if (bytes !== `${canonicalJsonStringify(buildSavedWorkflowRevision(loaded.payload))}\n`) {
+        const canonical = (parsed as StoredSavedWorkflowRevision).schemaVersion === SAVED_WORKFLOW_REVISION_SCHEMA_VERSION
+          ? buildSavedWorkflowRevision(loaded.payload)
+          : parsed;
+        if (bytes !== `${canonicalJsonStringify(canonical)}\n`) {
           throw new Error('non-canonical');
         }
         loadedRevisions.push(loaded);
@@ -565,6 +579,7 @@ export async function createSavedWorkflow(
   const workflowId = input.workflowId ?? mintSavedWorkflowId();
   assertWorkflowId(workflowId);
   const now = (input.now ?? new Date()).toISOString();
+  assertCurrentDagAuthoringVersion(input.revision);
   const stored = buildSavedWorkflowRevision(
     buildRevisionPayload(workflowId, 1, now, input.owner, input.revision),
   );
@@ -680,6 +695,7 @@ export async function appendSavedWorkflowRevision(
     }
     const previous = await readSavedWorkflowRevision(dataDir, workflowId, metadata.latestRevision);
     const now = (input.now ?? new Date()).toISOString();
+    assertCurrentDagAuthoringVersion(input.revision);
     const stored = buildSavedWorkflowRevision(
       buildRevisionPayload(
         workflowId,

@@ -140,7 +140,11 @@ describe('worker adopt/native-rename coordination', () => {
 });
 
 describe('worker raw_input delivery', () => {
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 7000);
+  // The span only has to cover deliverRawInput's body; it is not itself an
+  // assertion. Kept comfortably ahead of the last anchor below (the previous
+  // 7000 left ~2 chars of slack, so any added line broke these tests for
+  // reasons that had nothing to do with what they check).
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 7600);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');

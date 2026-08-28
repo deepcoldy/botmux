@@ -5,7 +5,10 @@ import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
+import { updateResponseNeedsRestart } from './update-action.js';
 import { ui } from './ui.js';
+import { confirm } from './confirm-modal.js';
+import { toast } from './toast.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -64,14 +67,6 @@ interface DashboardSettings {
   noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
-    listenerBotAppId: string | null;
-    listenerBotOptions: Array<{
-      larkAppId: string;
-      botName?: string | null;
-      cliId?: string;
-      vcMeetingAgentEnabled?: boolean;
-      hasLarkCliProfile?: boolean;
-    }>;
     larkCliVersion?: string | null;
     larkCliMeetsRequirement?: boolean;
     larkCliMinVersion?: string;
@@ -81,7 +76,10 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
+  workflow: { enabled: boolean };
   remoteAccess: boolean;
+  /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
+  oauthRedirectBase: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -117,6 +115,8 @@ interface UpdateStatus {
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
   localDevInstall: boolean;
+  /** Local-dev checkout is a git worktree → self-update via git pull + build. */
+  localDevUpdatable?: boolean;
   updateSupported: boolean;
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
   updateCommand: string | null;
@@ -126,6 +126,19 @@ interface UpdateStatus {
 interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
 
 type StatusMessage = { text: string; cls?: string } | null;
+
+interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
+}
+
+function parseAutostartState(value: unknown): AutostartState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const state = value as Record<string, unknown>;
+  return typeof state.supported === 'boolean' && typeof state.enabled === 'boolean'
+    ? { supported: state.supported, enabled: state.enabled }
+    : null;
+}
 
 /** Map a `herdrTraexInstall` result (returned by PUT /api/settings when the
  *  write triggered a live TraeX plugin install) to a settings status message. */
@@ -200,8 +213,6 @@ function parseSettings(s: any): DashboardSettings {
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
-      listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
-      listenerBotOptions: Array.isArray(s?.vcMeetingAgent?.listenerBotOptions) ? s.vcMeetingAgent.listenerBotOptions : [],
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
       larkCliMeetsRequirement: s?.vcMeetingAgent?.larkCliMeetsRequirement === true,
       larkCliMinVersion: typeof s?.vcMeetingAgent?.larkCliMinVersion === 'string' ? s.vcMeetingAgent.larkCliMinVersion : undefined,
@@ -211,7 +222,9 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
+    workflow: { enabled: s?.workflow?.enabled === true },
     remoteAccess: s?.remoteAccess === true,
+    oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -260,6 +273,12 @@ function SettingsPage() {
   const [upBusy, setUpBusy] = useState(false);
   const [upMsg, setUpMsg] = useState<StatusMessage>(null);
 
+  const [autostartState, setAutostartState] = useState<AutostartState | null>(null);
+  const [autostartLoading, setAutostartLoading] = useState(false);
+  const [autostartError, setAutostartError] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
+
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
     timersRef.current.clear();
@@ -290,6 +309,24 @@ function SettingsPage() {
       if (!mountedRef.current) return;
       setUpStatus(null);
       setUpStatusError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const fetchAutostart = useCallback(async () => {
+    setAutostartLoading(true);
+    try {
+      const response = await fetch('/api/autostart', { cache: 'no-store' });
+      const body = await response.json().catch(() => ({}));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('invalid_state');
+      if (!mountedRef.current) return;
+      setAutostartState(state);
+      setAutostartError(false);
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartError(true);
+    } finally {
+      if (mountedRef.current) setAutostartLoading(false);
     }
   }, []);
 
@@ -331,8 +368,40 @@ function SettingsPage() {
     setUpBusy(false);
     setUpMsg(null);
     setUpChangelogOpen(false);
-    if (canWrite) void fetchStatus();
-  }, [canWrite, fetchStatus, settingsLoaded]);
+    setAutostartMsg(null);
+    if (canWrite) {
+      void fetchStatus();
+      void fetchAutostart();
+    }
+  }, [canWrite, fetchAutostart, fetchStatus, settingsLoaded]);
+
+  async function setAutostartEnabled(enabled: boolean): Promise<void> {
+    if (!autostartState || autostartBusy) return;
+    const before = autostartState;
+    setAutostartBusy(true);
+    setAutostartState({ ...before, enabled });
+    setAutostartMsg({ text: tr('settings.autostartSaving') });
+    try {
+      const response = await fetch('/api/autostart', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const body = await response.json().catch(() => ({}));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('save_failed');
+      if (!mountedRef.current) return;
+      setAutostartState(state);
+      setAutostartMsg({ text: tr('settings.autostartSaved'), cls: 'hint-ok' });
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartState(before);
+      setAutostartMsg({ text: tr('settings.autostartSaveFailed'), cls: 'hint-warn-inline' });
+      void fetchAutostart();
+    } finally {
+      if (mountedRef.current) setAutostartBusy(false);
+    }
+  }
 
   async function saveSettings(
     key: string,
@@ -365,6 +434,10 @@ function SettingsPage() {
       // instead of the generic "saved" toast.
       const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
       setSettingsMsg(traexMsg ?? { text: tr('settings.saved'), cls: 'hint-ok' });
+      // 成功轻反馈 1.5s 后淡出；错误/安装结果不自动清
+      if (!traexMsg) {
+        setTimer(() => { if (mountedRef.current) setSettingsMsg(null); }, 1500);
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       // The PUT may have committed before a proxy/browser timeout dropped its
@@ -453,6 +526,16 @@ function SettingsPage() {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok || body.ok === false) {
+        // Local-dev drift/absence between run and restart: the built checkout is
+        // gone or moved (e.g. a concurrent `use:here`). Surface an actionable
+        // message and re-read status rather than a raw error code.
+        if (body.error === 'update_target_unavailable' || body.error === 'update_target_drifted') {
+          if (!mountedRef.current) return;
+          setUpBusy(false);
+          setUpMsg({ text: tr(`update.${body.error}`, { dir: String(body.dir ?? '') }), cls: 'hint-warn-inline' });
+          void fetchStatus();
+          return;
+        }
         throw new Error(String(body.detail ?? body.error ?? `HTTP ${response.status}`));
       }
       if (!mountedRef.current) return;
@@ -469,37 +552,59 @@ function SettingsPage() {
     const s = upStatus;
     if (!s) return;
     if (!s.node.ok) {
-      window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
+      toast(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }), { kind: 'warning' });
       return;
     }
-    if (!s.updateSupported || !s.updateCommand) {
-      window.alert(tr('update.unsupportedInstall'));
+    const localDev = s.localDevInstall === true;
+    if (localDev) {
+      if (!s.localDevUpdatable) { toast(tr('update.localDev'), { kind: 'warning' }); return; }
+    } else if (!s.updateSupported || !s.updateCommand) {
+      toast(tr('update.unsupportedInstall'), { kind: 'warning' });
       return;
     }
     if (s.installs.multiple) {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
-      if (!window.confirm(tr('update.confirmMultiInstall', { paths }))) return;
+      if (!await confirm({ title: tr('update.confirmMultiInstallTitle'), message: tr('update.confirmMultiInstall', { paths }), confirmLabel: tr('update.btnContinue'), cancelLabel: tr('update.btnCancel') })) return;
     }
-    const confirmMsg = s.latest
-      ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand })
-      : tr('update.confirmUpdateNoVer', { command: s.updateCommand });
-    if (!window.confirm(confirmMsg)) return;
+    const confirmMsg = localDev
+      ? tr('update.confirmUpdateLocalDev')
+      : s.latest
+        ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
+        : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
+    if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
-    setUpMsg({ text: tr('update.updating', { command: s.updateCommand }) });
+    setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) return;
       if (!r.ok || body.ok === false) {
+        // Dirty worktree fails closed — surface the file list so the user can act.
+        if (body?.error === 'dirty_worktree') {
+          setUpBusy(false);
+          setUpMsg({ text: tr('update.dirtyWorktree', { detail: String(body.detail ?? '') }), cls: 'hint-warn-inline' });
+          return;
+        }
         const detail = body?.detail ?? body?.error ?? `HTTP ${r.status}`;
         setUpBusy(false);
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
-      if (body.changed) {
+      // A restart is needed when the server says so (local-dev build always
+      // regenerates dist/, even when HEAD didn't move) or when the version
+      // changed (generic npm/pnpm/bun path, which sets no restartRequired).
+      const needsRestart = updateResponseNeedsRestart(body);
+      if (needsRestart) {
         setUpBusy(false);
-        setUpMsg({ text: tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` }), cls: 'hint-ok' });
-        if (window.confirm(tr('update.confirmRestart'))) {
+        // `changed` reflects whether the source actually advanced; a build-only
+        // local-dev update (HEAD unchanged) still needs a restart to apply.
+        setUpMsg({
+          text: body.changed
+            ? tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` })
+            : tr('update.builtNeedsRestart'),
+          cls: 'hint-ok',
+        });
+        if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnLater') })) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
           setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
@@ -515,6 +620,19 @@ function SettingsPage() {
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
     }
   }
+
+  const autostartBlock = (
+    <AutostartCard
+      canWrite={canWrite}
+      state={autostartState}
+      loading={autostartLoading}
+      error={autostartError}
+      busy={autostartBusy}
+      message={autostartMsg}
+      onChange={enabled => { void setAutostartEnabled(enabled); }}
+      onRetry={() => { void fetchAutostart(); }}
+    />
+  );
 
   const updateBlock = (
     <UpdateCard
@@ -542,7 +660,7 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
-      onRestart={() => { if (window.confirm(tr('update.confirmPlainRestart'))) void doRestart(null); }}
+      onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
 
@@ -553,9 +671,11 @@ function SettingsPage() {
       bound={bound}
       savingKey={savingKey}
       message={settingsMsg}
+      autostartBlock={autostartBlock}
       updateBlock={updateBlock}
       feishuLoginQr={feishuLoginQr}
       onCloseFeishuLoginQr={() => setFeishuLoginQr(null)}
+      onFeishuLoginQr={setFeishuLoginQr}
       onSave={saveSettings}
     />
   ) : loadError ? (
@@ -583,9 +703,12 @@ function SettingsBody(props: {
   bound: boolean;
   savingKey: string | null;
   message: StatusMessage;
+  autostartBlock: ReactNode;
   updateBlock: ReactNode;
   feishuLoginQr: string | null;
   onCloseFeishuLoginQr(): void;
+  /** per-bot 前置配置失败且需要重新登录开放平台时，把二维码顶到本页已有的扫码面板。 */
+  onFeishuLoginQr(qr: string | null): void;
   onSave(key: string, payload: unknown, optimistic: (settings: DashboardSettings) => DashboardSettings): Promise<void>;
 }) {
   const tr = useT();
@@ -627,21 +750,10 @@ function SettingsBody(props: {
     { value: 'attach' as const, label: tr('settings.localCliOpenModeAttach') },
     { value: 'resume' as const, label: tr('settings.localCliOpenModeResume') },
   ], [tr]);
-  const vcListenerOptions = useMemo(() => [
-    { value: '', label: tr('settings.vcMeetingListenerBotAuto') },
-    ...settings.vcMeetingAgent.listenerBotOptions.map(bot => {
-      const label = bot.botName || bot.larkAppId;
-      const detail = bot.cliId ? ` · ${bot.cliId}` : '';
-      const suffixParts = [
-        bot.vcMeetingAgentEnabled === true ? undefined : tr('settings.vcMeetingListenerBotDisabled'),
-        bot.hasLarkCliProfile === true ? undefined : tr('settings.vcMeetingListenerBotNoProfile'),
-      ].filter(Boolean);
-      const suffix = suffixParts.length > 0 ? ` · ${suffixParts.join(' · ')}` : '';
-      return { value: bot.larkAppId, label: `${label}${detail}${suffix}` };
-    }),
-  ], [settings.vcMeetingAgent.listenerBotOptions, tr]);
   return (
     <div className="settings-layout">
+      <SettingsNav tr={tr} />
+      <div className="settings-content">
       {canWrite ? null : (
         <article className="bd-card settings-card settings-alert-card">
           <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
@@ -652,7 +764,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleGeneralHelp')}
       >
       <SettingsGroup className="settings-group-main">
-        <SettingsBlock title={tr('settings.sectionAccess')}>
+        <SettingsBlock id="settings-access" title={tr('settings.sectionAccess')}>
           <ToggleRow
             title={tr('settings.publicReadOnly')}
             help={tr('settings.publicReadOnlyHelp')}
@@ -669,8 +781,17 @@ function SettingsBody(props: {
               onChange={value => saveBoolean('remoteAccess', value)}
             />
           ) : null}
+          <OAuthRedirectBaseRow
+            value={settings.oauthRedirectBase}
+            disabled={dis || savingKey === 'oauthRedirectBase'}
+            onSave={value => props.onSave(
+              'oauthRedirectBase',
+              { oauthRedirectBase: value },
+              s => ({ ...s, oauthRedirectBase: value }),
+            )}
+          />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionCards')}>
+        <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
           <ToggleRow
             title={tr('settings.openTerminalInFeishu')}
             help={tr('settings.openTerminalInFeishuHelp')}
@@ -700,7 +821,7 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionGroupCreation')}>
+        <SettingsBlock id="settings-group-creation" title={tr('settings.sectionGroupCreation')}>
           <GroupNamePrefixRow
             value={settings.groupNamePrefix}
             disabled={dis || savingKey === 'groupNamePrefix'}
@@ -711,7 +832,7 @@ function SettingsBody(props: {
             )}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionExperimental')}>
+        <SettingsBlock id="settings-experimental" title={tr('settings.sectionExperimental')}>
           <ToggleRow
             title={tr('settings.chatBotDiscovery')}
             help={tr('settings.chatBotDiscoveryHelp')}
@@ -761,7 +882,7 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionHostOverloadAlert')}>
+        <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>
           <HostOverloadAlertSettingsEditor
             value={settings.hostOverloadAlert}
             disabled={dis}
@@ -769,7 +890,7 @@ function SettingsBody(props: {
             onSave={saveHostOverloadAlert}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionWhiteboard')}>
+        <SettingsBlock id="settings-whiteboard" title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
             title={tr('settings.whiteboardEnable')}
             help={tr('settings.whiteboardEnableHelp')}
@@ -780,7 +901,18 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionRepoPicker')}>
+        <SettingsBlock title={tr('settings.sectionWorkflow')}>
+          <ToggleRow
+            title={tr('settings.workflowEnable')}
+            help={tr('settings.workflowEnableHelp')}
+            checked={settings.workflow.enabled}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-repo-picker" title={tr('settings.sectionRepoPicker')}>
           <div className="settings-field-row">
             <FieldTitle help={tr('settings.repoPickerModeHelp')}>{tr('settings.repoPickerMode')}</FieldTitle>
             <DropdownMenu
@@ -796,7 +928,7 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionSchedule')}>
+        <SettingsBlock id="settings-schedule" title={tr('settings.sectionSchedule')}>
           <TimeZoneRow
             value={settings.scheduleTimeZone}
             host={settings.hostTimeZone}
@@ -819,7 +951,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleMeetingHelp')}
       >
       <SettingsGroup className="settings-group-meeting">
-        <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
+        <SettingsBlock id="settings-vc" className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
           <ToggleRow
             title={tr('settings.vcMeetingAgent')}
             help={tr('settings.vcMeetingAgentHelp')}
@@ -833,31 +965,11 @@ function SettingsBody(props: {
               );
             }}
           />
-          <div className="settings-field-row">
-            <FieldTitle help={tr('settings.vcMeetingListenerBotHelp')}>{tr('settings.vcMeetingListenerBot')}</FieldTitle>
-            <DropdownMenu
-              className="settings-field-menu"
-              ariaLabel={tr('settings.vcMeetingListenerBot')}
-              disabled={dis || savingKey === 'vcMeetingAgent'}
-              value={settings.vcMeetingAgent.listenerBotAppId ?? ''}
-              label={dropdownLabel(vcListenerOptions, settings.vcMeetingAgent.listenerBotAppId ?? '')}
-              options={vcListenerOptions}
-              onChange={value => {
-                const next = value || null;
-                void props.onSave(
-                  'vcMeetingAgent',
-                  { vcMeetingAgent: { listenerBotAppId: next } },
-                  s => ({ ...s, vcMeetingAgent: { ...s.vcMeetingAgent, listenerBotAppId: next } }),
-                );
-              }}
-            />
-          </div>
           <LarkCliStatus settings={settings.vcMeetingAgent} />
           <VcConsumerProfilesGate
             enabled={settings.vcMeetingAgent.enabled}
             canWrite={canWrite}
-            listenerBotAppId={settings.vcMeetingAgent.listenerBotAppId}
-            listenerBotOptions={settings.vcMeetingAgent.listenerBotOptions}
+            onFeishuLoginQr={props.onFeishuLoginQr}
           />
           {props.feishuLoginQr ? (
             <div className="settings-feishu-login">
@@ -880,7 +992,9 @@ function SettingsBody(props: {
         description={tr('settings.moduleSystemHelp')}
       >
       <SettingsGroup className="settings-group-ops">
+        {props.autostartBlock}
         <SettingsBlock
+          id="settings-maintenance"
           title={tr('settings.sectionMaintenance')}
           titleExtra={settings.localDevInstall
             ? <span className="settings-title-note">{tr('settings.autoUpdateLocalDev')}</span>
@@ -938,13 +1052,67 @@ function SettingsBody(props: {
             </div>
           </div>
         </SettingsBlock>
-        {props.updateBlock}
+        <div id="settings-update">{props.updateBlock}</div>
       </SettingsGroup>
       </SettingsModule>
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
+      </div>
     </div>
+  );
+}
+
+function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+  const tr = props.tr;
+  const groups = [
+    {
+      label: tr('settings.moduleGeneral'),
+      items: [
+        { id: 'settings-access', label: tr('settings.sectionAccess') },
+        { id: 'settings-cards', label: tr('settings.sectionCards') },
+        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
+        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
+        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
+        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
+        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
+        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
+      ],
+    },
+    {
+      label: tr('settings.moduleMeeting'),
+      items: [
+        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
+      ],
+    },
+    {
+      label: tr('settings.moduleSystem'),
+      items: [
+        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
+        { id: 'settings-update', label: tr('settings.sectionUpdate') },
+      ],
+    },
+  ];
+  return (
+    <nav className="settings-nav" aria-label={tr('settings.title')}>
+      {groups.map(group => (
+        <div key={group.label} className="settings-nav-group">
+          <p className="settings-nav-group-label">{group.label}</p>
+          {group.items.map(item => (
+            <button
+              key={item.id}
+              type="button"
+              className="settings-nav-link"
+              onClick={() => {
+                document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      ))}
+    </nav>
   );
 }
 
@@ -1001,13 +1169,14 @@ function SettingsGroup(props: {
 
 function SettingsBlock(props: {
   className?: string;
+  id?: string;
   title: ReactNode;
   titleExtra?: ReactNode;
   children: ReactNode;
 }): React.JSX.Element {
   const cls = ['settings-block', props.className].filter(Boolean).join(' ');
   return (
-    <section className={cls}>
+    <section className={cls} id={props.id}>
       <article className="bd-card settings-card">
         <div className="settings-block-title-row">
           <h2 className="bd-section-title">{props.title}</h2>
@@ -1382,6 +1551,105 @@ export function GroupNamePrefixRow(props: {
   );
 }
 
+/** 从 `location.href` 取当前访问 origin。浏览器最清楚自己是从哪个地址打开的
+ *  Dashboard —— 中心化平台的隧道会重写 Host 且不带 X-Forwarded-Host，服务端反而
+ *  推不准（见 platform/binding.ts 的注释），所以「一键填入」这颗按钮的价值就在于
+ *  用浏览器视角覆盖服务端视角。非浏览器宿主 / URL 解析失败时返回 ''。 */
+export function currentBrowserOrigin(): string {
+  try {
+    if (typeof location === 'undefined' || !location?.href) return '';
+    const origin = new URL(location.href).origin;
+    // 只认 http(s) origin：opaque origin 会给出 'null'，本地打开的 file:// 页在
+    // Chrome 下给出 'file://'——两者填进去都是废值，不如把按钮直接置灰。
+    return isValidOAuthRedirectBase(origin) ? origin : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
+ *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+export function isValidOAuthRedirectBase(raw: string): boolean {
+  const value = raw.trim();
+  if (!/^https?:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value.replace(/\/+$/, ''));
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (!url.hostname) return false;
+    if (url.username || url.password || url.search || url.hash) return false;
+    return url.pathname === '' || url.pathname === '/';
+  } catch {
+    return false;
+  }
+}
+
+/** OAuth 回跳基址：配了之后授权链接回跳 `<base>/oauth/callback`，Dashboard 自动收下，
+ *  用户不用再复制粘贴回调 URL。留空 = 退回 127.0.0.1 粘贴流程。 */
+export function OAuthRedirectBaseRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  // 与服务端同款归一：削尾斜杠。这样「保存的」和「看到的」是同一个串，也不会因为
+  // 多一条斜杠让保存按钮永远亮着（服务端存的是削过的）。
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串是合法输入（=清除配置），只有「填了但不是 http(s) origin」才拦。
+  const valid = trimmed === '' || isValidOAuthRedirectBase(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-oauth-redirect-base-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.oauthRedirectBaseHelp')}>{tr('settings.oauthRedirectBase')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="oauthRedirectBase"
+          value={draft}
+          placeholder={tr('settings.oauthRedirectBasePlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-oauth-redirect-base-preview>
+        {trimmed === ''
+          ? tr('settings.oauthRedirectBaseUnset')
+          : valid
+            ? tr('settings.oauthRedirectBasePreview', { url: `${trimmed}/oauth/callback` })
+            : tr('settings.oauthRedirectBaseInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          data-action="oauth-redirect-base-use-current"
+          disabled={props.disabled || !currentBrowserOrigin()}
+          onClick={() => setDraft(currentBrowserOrigin())}
+        >
+          {tr('settings.oauthRedirectBaseUseCurrent')}
+        </button>
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="oauth-redirect-base-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.oauthRedirectBaseSave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TraexPluginEditor(props: {
   value: DashboardSettings['herdrTraexPlugin'];
   disabled: boolean;
@@ -1463,6 +1731,58 @@ function TraexPluginEditor(props: {
   );
 }
 
+function AutostartCard(props: {
+  canWrite: boolean;
+  state: AutostartState | null;
+  loading: boolean;
+  error: boolean;
+  busy: boolean;
+  message: StatusMessage;
+  onChange(enabled: boolean): void;
+  onRetry(): void;
+}) {
+  const tr = useT();
+  let content: ReactNode;
+
+  if (!props.canWrite) {
+    content = <p className="hint-warn">{tr('settings.autostartLoginRequired')}</p>;
+  } else if (props.loading && !props.state) {
+    content = <LoadingState label={tr('settings.autostartLoading')} compact />;
+  } else if (props.error && !props.state) {
+    content = (
+      <>
+        <p className="hint-warn">{tr('settings.autostartLoadFailed')}</p>
+        <div className="update-actions">
+          <button type="button" onClick={props.onRetry}>{tr('settings.autostartRetry')}</button>
+        </div>
+      </>
+    );
+  } else if (props.state?.supported === false) {
+    content = <p className="hint-warn">{tr('settings.autostartUnsupported')}</p>;
+  } else if (props.state) {
+    content = (
+      <>
+        <ToggleRow
+          title={tr('settings.autostartToggle')}
+          help={tr('settings.autostartHelp')}
+          checked={props.state.enabled}
+          disabled={props.busy}
+          onChange={props.onChange}
+        />
+        {props.message ? (
+          <p className={`oncall-status ${props.message.cls ?? ''}`} role="status" aria-live="polite">
+            {props.message.text}
+          </p>
+        ) : null}
+      </>
+    );
+  } else {
+    content = null;
+  }
+
+  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
+}
+
 function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
@@ -1494,7 +1814,12 @@ function UpdateCard(props: {
     inner = <LoadingState label={tr('update.loading')} compact />;
   } else {
     const s = props.status;
-    const updateDisabled = s.localDevInstall || !s.updateSupported || props.busy;
+    // Local-dev: enable the button only when the checkout is a git worktree we
+    // can pull; the generic path still requires a supported package manager.
+    const updateDisabled = props.busy || (s.localDevInstall
+      ? !s.localDevUpdatable
+      : !s.updateSupported);
+    const updateLabel = s.localDevInstall ? tr('update.btnUpdateLocalDev') : tr('update.btnUpdate');
     inner = (
       <>
         <p className="update-version">
@@ -1503,13 +1828,14 @@ function UpdateCard(props: {
         </p>
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
+        {s.localDevInstall ? <p className="hint">{s.localDevUpdatable ? tr('update.localDevUpdatable') : tr('update.localDev')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
           <button type="button" data-up="check" disabled={props.busy} onClick={props.onCheck}>{tr('update.btnCheck')}</button>
           <button type="button" data-up="changelog" disabled={props.busy} onClick={props.onToggleChangelog}>
             {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
           </button>
-          <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{tr('update.btnUpdate')}</button>
+          <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
@@ -1530,7 +1856,7 @@ function UpdateCard(props: {
       className="settings-update-block"
       title={tr('update.section')}
       titleExtra={props.status?.localDevInstall
-        ? <span className="settings-title-note">{tr('update.localDev')}</span>
+        ? <span className="settings-title-note">{props.status.localDevUpdatable ? tr('update.localDevNote') : tr('update.localDev')}</span>
         : props.status && !props.status.updateSupported
           ? <span className="settings-title-note">{tr('update.unsupportedInstall')}</span>
           : null}

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   CLI_RUNTIME_UPDATE_CHECK_INTERVAL_MS,
   buildCliRuntimeUpdateCard,
@@ -39,6 +39,7 @@ function updateEntry(
     runtimeId: 'codex',
     displayName: 'Codex',
     binPath: 'codex',
+    installationPath: overrides.installationPath ?? resolve(overrides.binPath ?? 'codex'),
     provider: 'internal',
     managed: true,
     current: '0.144.1',
@@ -1073,6 +1074,7 @@ describe('runCliRuntimeUpdateAudit', () => {
       runtimeId: 'vendor-codex',
       displayName: 'Vendor Codex',
       binPath: '/opt/vendor-codex',
+      installationPath: '/opt/vendor-codex',
       provider: 'npm',
       packageName: '@vendor/codex-new',
       sourceFingerprint: JSON.stringify(['npm', '@vendor/codex-new']),
@@ -1334,5 +1336,338 @@ describe('CLI runtime update store and card', () => {
 
     expect(card).toContain('Unknown Codex');
     expect(card).not.toContain('codex update');
+  });
+});
+
+describe('runCliRuntimeUpdateAudit with FNM rotating launcher symlinks', () => {
+  let dir: string;
+  let realInstall: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-cli-runtime-fnm-'));
+    // One real installation, mirroring @openai/codex under an fnm node version.
+    mkdirSync(join(dir, 'install', 'bin'), { recursive: true });
+    realInstall = join(dir, 'install', 'bin', 'codex.js');
+    writeFileSync(realInstall, '#!/usr/bin/env node\n');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Mint a fresh per-shell launcher symlink like fnm's
+   * `/run/user/.../fnm_multishells/<pid>_.../bin/codex`, all resolving to the
+   * single real install. */
+  function rotatingBin(shellId: string): string {
+    const shellBin = join(dir, 'multishells', shellId, 'bin');
+    mkdirSync(shellBin, { recursive: true });
+    const link = join(shellBin, 'codex');
+    symlinkSync(realInstall, link);
+    return link;
+  }
+
+  it('does not re-probe or re-notify within 24h when the raw path rotates but realpath is stable (criteria 1)', async () => {
+    let now = 1_000_000;
+    let store: CliRuntimeUpdateStore = { entries: {} };
+    const probe = vi.fn(async (target: CliRuntimeUpdateTarget) => ({
+      current: '0.146.0',
+      latest: '0.147.0',
+      managed: true,
+      updateCommand: `${target.binPath} update`,
+    }));
+    const notified: string[] = [];
+    const deps = (binPath: string) => ({
+      now: () => now,
+      targets: () => [runtimeTarget({ runtimeId: 'codex', binPath, provider: 'internal' })],
+      readStore: () => store,
+      writeStore: (next: CliRuntimeUpdateStore) => { store = structuredClone(next); },
+      probe,
+      notify: async (entry: CliRuntimeUpdateEntry) => { notified.push(entry.latest!); },
+    });
+
+    // First tick: fresh shell -> probe + notify once.
+    await runCliRuntimeUpdateAudit(deps(rotatingBin('101_aaa')));
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(notified).toEqual(['0.147.0']);
+
+    const key = `codex:${realInstall}`;
+    expect(Object.keys(store.entries)).toEqual([key]);
+    expect(store.entries[key].installationPath).toBe(realInstall);
+
+    // Second tick 1h later: new fnm shell -> new raw path, same realpath.
+    // TTL must hold and the watermark must survive: no probe, no notify.
+    now += 60 * 60 * 1_000;
+    await runCliRuntimeUpdateAudit(deps(rotatingBin('202_bbb')));
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(notified).toEqual(['0.147.0']);
+    expect(Object.keys(store.entries)).toEqual([key]);
+  });
+
+  it('re-probes after 24h through a rotated path but does not notify again for the same latest (criteria 2)', async () => {
+    let now = 1_000_000;
+    let store: CliRuntimeUpdateStore = { entries: {} };
+    const probe = vi.fn(async () => ({
+      current: '0.146.0',
+      latest: '0.147.0',
+      managed: true,
+      updateCommand: 'codex update',
+    }));
+    const notified: string[] = [];
+    const deps = (binPath: string) => ({
+      now: () => now,
+      targets: () => [runtimeTarget({ runtimeId: 'codex', binPath, provider: 'internal' })],
+      readStore: () => store,
+      writeStore: (next: CliRuntimeUpdateStore) => { store = structuredClone(next); },
+      probe,
+      notify: async (entry: CliRuntimeUpdateEntry) => { notified.push(entry.latest!); },
+    });
+
+    await runCliRuntimeUpdateAudit(deps(rotatingBin('301_aaa')));
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(notified).toEqual(['0.147.0']);
+
+    // > 24h later, through a rotated launcher path: TTL elapses so we re-probe,
+    // but the unchanged latest must not notify again.
+    now += CLI_RUNTIME_UPDATE_CHECK_INTERVAL_MS + 1;
+    await runCliRuntimeUpdateAudit(deps(rotatingBin('302_bbb')));
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(notified).toEqual(['0.147.0']);
+  });
+
+  it('treats a launcher retargeted to a different real install as a new identity (criteria 3)', async () => {
+    let now = 1_000_000;
+    let store: CliRuntimeUpdateStore = { entries: {} };
+    const probe = vi.fn(async () => ({
+      current: '0.146.0',
+      latest: '0.147.0',
+      managed: true,
+      updateCommand: 'codex update',
+    }));
+    const notified: string[] = [];
+    const deps = (binPath: string) => ({
+      now: () => now,
+      targets: () => [runtimeTarget({ runtimeId: 'codex', binPath, provider: 'internal' })],
+      readStore: () => store,
+      writeStore: (next: CliRuntimeUpdateStore) => { store = structuredClone(next); },
+      probe,
+      notify: async (entry: CliRuntimeUpdateEntry) => { notified.push(entry.latest!); },
+    });
+
+    await runCliRuntimeUpdateAudit(deps(rotatingBin('401_aaa')));
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(notified).toEqual(['0.147.0']);
+    const firstKey = `codex:${realInstall}`;
+
+    // A genuinely different install (upgrade to a new node version dir) is a new
+    // realpath. Even within the old TTL window it must re-probe under its own
+    // key and notify on its own merits — not inherit the prior watermark.
+    mkdirSync(join(dir, 'install-v2', 'bin'), { recursive: true });
+    const realInstallV2 = join(dir, 'install-v2', 'bin', 'codex.js');
+    writeFileSync(realInstallV2, '#!/usr/bin/env node\n');
+    const shellBin = join(dir, 'multishells', '402_bbb', 'bin');
+    mkdirSync(shellBin, { recursive: true });
+    const link = join(shellBin, 'codex');
+    symlinkSync(realInstallV2, link);
+
+    now += 60 * 60 * 1_000; // still inside the 24h TTL of the old entry
+    await runCliRuntimeUpdateAudit(deps(link));
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(notified).toEqual(['0.147.0', '0.147.0']);
+    const secondKey = `codex:${realInstallV2}`;
+    expect(secondKey).not.toBe(firstKey);
+    expect(store.entries[secondKey].installationPath).toBe(realInstallV2);
+  });
+
+  it('migrates a legacy raw-path entry onto the stable key without re-notifying (criteria = safe upgrade)', async () => {
+    const now = 5_000_000;
+    // Store written by an older build: keyed by a now-dead fnm launcher path,
+    // no installationPath, already carrying a notification watermark.
+    const deadRawPath = join(dir, 'multishells', 'OLD_dead', 'bin', 'codex');
+    const legacyKey = `codex:${deadRawPath}`;
+    let store: CliRuntimeUpdateStore = {
+      entries: {
+        [legacyKey]: {
+          ...updateEntry({
+            runtimeId: 'codex',
+            binPath: deadRawPath,
+            provider: 'internal',
+            current: '0.146.0',
+            latest: '0.147.0',
+            updateCommand: 'codex update',
+            lastCheckedAt: now - 1_000,
+            lastNotifiedVersion: '0.147.0',
+          }),
+          // Simulate a pre-fix persisted row: identity field absent.
+          installationPath: undefined as unknown as string,
+        },
+      },
+    };
+    const probe = vi.fn(async () => ({
+      current: '0.146.0',
+      latest: '0.147.0',
+      managed: true,
+      updateCommand: 'codex update',
+    }));
+    const notify = vi.fn(async () => {});
+
+    // A live shell resolves to the real install; TTL has not elapsed.
+    await runCliRuntimeUpdateAudit({
+      now: () => now,
+      targets: () => [runtimeTarget({ runtimeId: 'codex', binPath: rotatingBin('501_live'), provider: 'internal' })],
+      readStore: () => store,
+      writeStore: (next: CliRuntimeUpdateStore) => { store = structuredClone(next); },
+      probe,
+      notify,
+    });
+
+    const stableKey = `codex:${realInstall}`;
+    // Legacy row was moved onto the stable identity; watermark carried over so
+    // upgrading botmux does not fire one more notification, and TTL is honored.
+    expect(Object.keys(store.entries)).toEqual([stableKey]);
+    expect(store.entries[stableKey]).toMatchObject({
+      installationPath: realInstall,
+      lastNotifiedVersion: '0.147.0',
+      latest: '0.147.0',
+    });
+    expect(probe).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('does not migrate a dead orphan onto an arbitrary install when two live installs share runtimeId+source (ambiguous group)', async () => {
+    const now = 5_500_000;
+    // Two genuinely distinct installs of the same distribution (e.g. one under
+    // an old node version dir, one under a new one), both currently live and
+    // both sharing runtimeId 'codex' + the same update source. Neither has a
+    // persisted entry yet.
+    mkdirSync(join(dir, 'install-b', 'bin'), { recursive: true });
+    mkdirSync(join(dir, 'install-c', 'bin'), { recursive: true });
+    const installB = join(dir, 'install-b', 'bin', 'codex.js');
+    const installC = join(dir, 'install-c', 'bin', 'codex.js');
+    writeFileSync(installB, '#!/usr/bin/env node\n');
+    writeFileSync(installC, '#!/usr/bin/env node\n');
+    const binB = join(dir, 'multishells', 'B_live', 'bin');
+    const binC = join(dir, 'multishells', 'C_live', 'bin');
+    mkdirSync(binB, { recursive: true });
+    mkdirSync(binC, { recursive: true });
+    symlinkSync(installB, join(binB, 'codex'));
+    symlinkSync(installC, join(binC, 'codex'));
+
+    // A single dead orphan from a removed install, same runtimeId+source,
+    // carrying a within-TTL watermark. Adopting it onto B or C by iteration
+    // order would suppress that install's next probe/notify — the bug.
+    const deadRawPath = join(dir, 'multishells', 'OLD_dead', 'bin', 'codex');
+    const orphanKey = `codex:${resolve(deadRawPath)}`;
+    let store: CliRuntimeUpdateStore = {
+      entries: {
+        [orphanKey]: updateEntry({
+          runtimeId: 'codex',
+          binPath: deadRawPath,
+          provider: 'internal',
+          current: '0.146.0',
+          latest: '0.147.0',
+          updateCommand: 'codex update',
+          lastCheckedAt: now - 1_000,
+          lastNotifiedVersion: '0.147.0',
+        }),
+      },
+    };
+    const probe = vi.fn(async () => ({
+      current: '0.146.0',
+      latest: '0.147.0',
+      managed: true,
+      updateCommand: 'codex update',
+    }));
+    const notified: string[] = [];
+
+    await runCliRuntimeUpdateAudit({
+      now: () => now,
+      targets: () => [
+        runtimeTarget({ runtimeId: 'codex', binPath: join(binB, 'codex'), provider: 'internal' }),
+        runtimeTarget({ runtimeId: 'codex', binPath: join(binC, 'codex'), provider: 'internal' }),
+      ],
+      readStore: () => store,
+      writeStore: (next: CliRuntimeUpdateStore) => { store = structuredClone(next); },
+      probe,
+      notify: async (entry: CliRuntimeUpdateEntry) => { notified.push(entry.latest!); },
+    });
+
+    // Ambiguous group: no migration. Each live install probes and notifies
+    // under its own canonical identity; the dead orphan is pruned.
+    const keyB = `codex:${installB}`;
+    const keyC = `codex:${installC}`;
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(notified).toEqual(['0.147.0', '0.147.0']);
+    expect(Object.keys(store.entries).sort()).toEqual([keyB, keyC].sort());
+    expect(store.entries[keyB]?.installationPath).toBe(installB);
+    expect(store.entries[keyC]?.installationPath).toBe(installC);
+  });
+
+  it('reindexes a pre-fix entry whose rotating symlink is still alive, keeping its watermark (criteria 1/4 boundary)', async () => {
+    const now = 6_000_000;
+    // Reviewer boundary: an older build persisted this row keyed by a rotating
+    // launcher path that HAPPENS to still resolve at upgrade time, and the row
+    // has no installationPath. The real reader must recover the stable identity
+    // from that live path so the entry reindexes (not "stale-only migrates")
+    // onto the canonical key — otherwise the carried watermark would be lost and
+    // the first post-upgrade audit would notify once more.
+    const aliveOldBin = rotatingBin('601_old_alive');
+    const legacyKey = `codex:${aliveOldBin}`; // pre-fix key = raw path
+    // Write a v-without-installationPath store straight to disk, then read it
+    // back through the production reader (not an in-memory shortcut).
+    writeFileSync(cliRuntimeUpdateStorePathIn(dir), JSON.stringify({
+      entries: {
+        [legacyKey]: {
+          cliId: 'codex',
+          runtimeId: 'codex',
+          displayName: 'Codex',
+          binPath: aliveOldBin,
+          provider: 'internal',
+          managed: true,
+          current: '0.146.0',
+          latest: '0.147.0',
+          updateAvailable: true,
+          updateCommand: 'codex update',
+          lastCheckedAt: now - 1_000,
+          lastNotifiedVersion: '0.147.0',
+          // installationPath intentionally absent (pre-fix store).
+        },
+      },
+    }));
+    // The reader derives installationPath from the still-live raw path.
+    const recovered = readCliRuntimeUpdateStoreFrom(dir);
+    expect(recovered.entries[legacyKey]?.installationPath).toBe(realInstall);
+
+    const probe = vi.fn(async () => ({
+      current: '0.146.0',
+      latest: '0.147.0',
+      managed: true,
+      updateCommand: 'codex update',
+    }));
+    const notify = vi.fn(async () => {});
+
+    // Next audit uses a freshly rotated launcher path (different raw path, same
+    // realpath), still inside the 24h TTL.
+    await runCliRuntimeUpdateAudit({
+      now: () => now,
+      targets: () => [runtimeTarget({ runtimeId: 'codex', binPath: rotatingBin('602_new_alive'), provider: 'internal' })],
+      readStore: () => readCliRuntimeUpdateStoreFrom(dir),
+      writeStore: (next: CliRuntimeUpdateStore) => { writeCliRuntimeUpdateStoreTo(dir, next); },
+      probe,
+      notify,
+    });
+
+    const persisted = JSON.parse(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8')) as {
+      entries: Record<string, CliRuntimeUpdateEntry>;
+    };
+    const stableKey = `codex:${realInstall}`;
+    expect(Object.keys(persisted.entries)).toEqual([stableKey]);
+    expect(persisted.entries[stableKey]).toMatchObject({
+      installationPath: realInstall,
+      lastNotifiedVersion: '0.147.0',
+      lastCheckedAt: now - 1_000,
+    });
+    // Watermark survived and TTL held: no re-probe, no extra notification.
+    expect(probe).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
   });
 });

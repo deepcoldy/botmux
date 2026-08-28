@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -70,7 +71,7 @@ async function waitFor<T>(
 }
 
 function spawnWorker(dataDir: string, sessionId: string, logs: string[]): ChildProcess {
-  const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+  const child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,

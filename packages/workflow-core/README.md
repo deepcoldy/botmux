@@ -54,7 +54,7 @@ Build a real npm tarball from the Botmux checkout:
 
 ```bash
 cd /path/to/botmux
-pnpm workflow-core:pack
+bun run workflow-core:pack
 ```
 
 The command prints the absolute `.tgz` path. Install that artifact from the

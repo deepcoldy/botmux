@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { resolveCommand } from './registry.js';
+import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 
@@ -37,31 +37,39 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   let cachedDshBin: string | undefined;
   return {
     id: 'dsh',
-    // The runner writes its vendored cordis.yml and session JSONL under
-    // ~/.botmux/dsh/. Keep the whole dir REAL under the file sandbox so
-    // both survive (see adapters CLAUDE.md sandbox notes). Pre-created in
-    // buildArgs so the sandbox's keepExisting filter doesn't drop it.
-    authPaths: ['~/.botmux/dsh'],
+    // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
+    // its generated composition + sessions under ~/.dsh/botmux/ and
+    // ~/.dsh/sessions/botmux/. Keep the whole native dsh home REAL under the
+    // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
+    // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't
+    // drop it.
+    authPaths: ['~/.dsh'],
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the real dsh runtime is spawned
-    // by the runner. Declare it so the file sandbox can re-expose its bin dir
-    // when it lives under /run (fnm/nvm) — else --tmpfs /run masks it and the
-    // in-sandbox spawn ENOENTs into a crash-loop. Same lazy resolve+cache as
+    // by the runner. Declare its CANONICAL path so the file sandbox re-exposes
+    // its bin dir when it lives under /run (fnm/nvm) — else --tmpfs /run masks
+    // it and the in-sandbox spawn ENOENTs into a crash-loop. Must match the
+    // path handed to --dsh-bin below (both canonical via resolveCommandReal) so
+    // the authorized dir and the spawned path agree. Same lazy resolve+cache as
     // buildArgs; only an executable path, never the cwd.
     sandboxExtraExecPaths() {
-      return [(cachedDshBin ??= resolveCommand(rawDshBin))];
+      return [(cachedDshBin ??= resolveCommandReal(rawDshBin))];
     },
 
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs }) {
-      // Pre-create the persistent dsh dir in the real HOME before the worker
-      // enters the sandbox: the sandbox's keepExisting filter drops authPaths
-      // that don't exist yet, and the runner can't create them from inside.
-      mkdirSync(join(homedir(), '.botmux', 'dsh'), { recursive: true });
+      // Pre-create the native dsh home + botmux subdirs in the real HOME
+      // before the worker enters the sandbox: the sandbox's keepExisting
+      // filter drops authPaths that don't exist yet, and the runner can't
+      // create them from inside.
+      const dshHome = join(homedir(), '.dsh');
+      mkdirSync(dshHome, { recursive: true });
+      mkdirSync(join(dshHome, 'botmux'), { recursive: true });
+      mkdirSync(join(dshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
         runnerPath(),
         '--session-id', sessionId,
-        '--dsh-bin', (cachedDshBin ??= resolveCommand(rawDshBin)),
+        '--dsh-bin', (cachedDshBin ??= resolveCommandReal(rawDshBin)),
       ];
       pushOpt(args, '--cwd', workingDir);
       pushOpt(args, '--bot-name', botName);

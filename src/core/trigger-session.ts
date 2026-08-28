@@ -34,7 +34,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -687,8 +687,8 @@ function buildExistingSessionContent(
   const botCfg = getBot(larkAppId).config;
   return buildFollowUpCliInput(prompt, ds.session.sessionId, {
     isAdoptMode: false,
-    cliId: ds.session.cliId ?? botCfg.cliId,
-    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     locale: localeForBot(larkAppId),
     larkAppId,
     chatId,
@@ -1548,17 +1548,17 @@ async function triggerSessionTurnAdmitted(
   }
 
   const bot = getBot(larkAppId);
-  const isCodexFamily = isCodexReasoningCliId(bot.config.cliId);
+  const hasReasoningControl = isConfigurableReasoningCliId(bot.config.cliId);
   const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
-  if (isCodexFamily && effectiveReasoningEffort
-      && !codexModelSupportsReasoningEffort(effectiveModel, effectiveReasoningEffort)) {
+  if (hasReasoningControl && effectiveReasoningEffort
+      && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,
       errorCode: 'bad_request',
-      error: `模型 ${effectiveModel || '（Codex 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
+      error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
     };
   }
   const chatMode: ChatMode = httpVirtual
@@ -1606,19 +1606,25 @@ async function triggerSessionTurnAdmitted(
     session.lastMessageAt = new Date(now).toISOString();
     session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
-    // Per-turn model / reasoning-effort override — scoped to codex-family bots
-    // (the documented B-mode target) and to a freshly-created trigger session.
+    // Per-turn model / reasoning-effort override — scoped to CLIs with an
+    // explicit reasoning control and to a freshly-created trigger session.
     // Gating on cliId keeps the contract honest and bounded: it never silently
     // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
-    // worker never reaches here. reasoningEffort is codex-only regardless (other
-    // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
-    if (isCodexFamily) {
-      if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-        session.model = req.options.model.trim();
-      }
-      if (req.options?.reasoningEffort) {
-        session.reasoningEffort = req.options.reasoningEffort;
-      }
+    // worker never reaches here. Model is gated here so it cannot leak to
+    // other CLIs whose adapters do not implement this contract.
+    //
+    // The model override lands on the in-memory DaemonSession below, NOT on the
+    // persisted session record: the documented semantics are per-trigger, and a
+    // persisted copy used to survive every later resume and outrank the bot's
+    // configured model forever (see sessionAgentConfig). reasoningEffort stays
+    // persisted with the session (unchanged by that PR).
+    const triggerModelOverride = hasReasoningControl
+      && typeof req.options?.model === 'string'
+      && req.options.model.trim()
+      ? req.options.model.trim()
+      : undefined;
+    if (hasReasoningControl && req.options?.reasoningEffort) {
+      session.reasoningEffort = req.options.reasoningEffort;
     }
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
@@ -1637,6 +1643,7 @@ async function triggerSessionTurnAdmitted(
       lastMessageAt: now,
       hasHistory: false,
       workingDir: wd.workingDir,
+      ...(triggerModelOverride ? { spawnModelOverride: triggerModelOverride } : {}),
     };
     // Retain the complete opening input until a worker or repo workflow has
     // synchronously accepted it. This is both the route reservation and the
@@ -1730,8 +1737,8 @@ async function triggerSessionTurnAdmitted(
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
-    bot.config.cliId,
-    bot.config.cliPathOverride,
+    session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+    session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
     undefined,
     undefined,
     availableBots,

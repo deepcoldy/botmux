@@ -59,11 +59,12 @@ function restricted(): void {
   bot.resolvedAllowedUsers = ['ou_owner'];
 }
 
-/** 布置一个平台团队：CHAT 是其协作群、MEMBER_UNION 是其成员（走 teamMember 腿）。 */
+/** 布置一个平台团队：本 bot APP 在其 bots roster、MEMBER_UNION 是其成员（走 teamMember
+ *  腿）。teamMember 腿现在锚在「本 bot ∈ 同队 bots」，不看 chatId，故 chatId 仅用于占位。 */
 function recordPlatformTeamMember(chatId: string, memberUnionId: string): void {
   applyPlatformTeamSync(tempDir, {
     rev: 'rev-1',
-    teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [chatId], memberUnionIds: [memberUnionId], bots: [] }],
+    teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [chatId], memberUnionIds: [memberUnionId], bots: [{ appId: APP }] }],
   });
 }
 

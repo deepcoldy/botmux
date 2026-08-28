@@ -25,6 +25,7 @@ describe('botmux skills diagnostics commands', () => {
     src = mkdtempSync(join(tmpdir(), 'botmux-skill-src-'));
     repo = mkdtempSync(join(tmpdir(), 'botmux-skill-repo-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('BOTS_CONFIG', join(home, '.botmux', 'bots.json'));
   });
 
   afterEach(() => {

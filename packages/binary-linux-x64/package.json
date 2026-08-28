@@ -1,0 +1,25 @@
+{
+  "name": "botmux-linux-x64",
+  "version": "0.0.0",
+  "description": "The Linux x64 binary for botmux",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepcoldy/botmux.git",
+    "directory": "packages/binary-linux-x64"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "botmux"
+  ],
+  "preferUnplugged": true,
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

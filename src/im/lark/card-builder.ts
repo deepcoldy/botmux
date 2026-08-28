@@ -291,6 +291,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'riff': 'Riff',
   'reasonix': 'Reasonix',
   'dsh': 'DeepSeek Harness',
+  'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
 };
 
@@ -502,13 +503,19 @@ export function buildSessionClosedCard(
   cliResumeCommand?: string | null,
   locale?: Locale,
   runtimeDisplayName?: string,
+  resumeStartsFresh?: boolean,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
     ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
+    : resumeStartsFresh
+      // The CLI can only resume a precise session id and none was persisted:
+      // resuming reactivates the topic's message route, but the next spawn
+      // starts a FRESH session — say so instead of implying history is back.
+      ? t('card.body.resume_starts_fresh', { cliName: escapeMd(cliName) }, locale)
+      : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
@@ -832,11 +839,14 @@ const STREAM_TEMPLATE_MAP = {
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    case 'idle': return t('card.status.idle', undefined, locale);
+    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
+    // from a hung session; say "handled, judged no reply needed" instead.
+    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -925,6 +935,7 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
+  silentIdle?: boolean,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1016,10 +1027,25 @@ export function buildStreamingCard(
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
   // link right in the card so anyone here can open a writable terminal without
   // the get-write-link → DM round-trip. The link is intentionally group-visible.
+  // Rendered as a URL button (same shape as the read-only terminal button),
+  // not a markdown link: the token URL is long and wrapped into an ugly raw
+  // URL blob in the card. The group-visible warning stays as a note below.
   if (writableTerminalUrl) {
     elements.push({
-      tag: 'markdown',
-      content: t('card.writable_terminal_link', { url: writableTerminalUrl }, locale),
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.open_writable_terminal', undefined, locale) },
+        type: 'primary',
+        multi_url: terminalMultiUrl(writableTerminalUrl),
+      }],
+    });
+    elements.push({
+      tag: 'note',
+      elements: [{
+        tag: 'lark_md',
+        content: t('card.writable_terminal_warning', undefined, locale),
+      }],
     });
   }
 
@@ -1063,7 +1089,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
@@ -2323,6 +2349,8 @@ export interface AdoptPickerEntry {
   target?: string;
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
+  /** One-based position among history candidates, for same-screen disambiguation. */
+  candidateNumber?: number;
 }
 
 /** Deterministic key for a live adoptable session (tmux/herdr/zellij).
@@ -2375,18 +2403,19 @@ export function buildAdoptEntries(
       timeMs: s.startedAt,
     };
   });
-  const resume: AdoptPickerEntry[] = resumable.map((r) => {
+  const resume: AdoptPickerEntry[] = resumable.map((r, index) => {
     const project = r.cwd.split('/').pop() || r.cwd;
     return {
       key: `resume:${r.cliSessionId}`,
       kind: 'resume' as const,
       cliId: resumeCliId,
       ...(customName ? { cliDisplayName: customName } : {}),
-      title: r.title || r.cliSessionId.slice(0, 8),
+      title: r.title || project,
       project,
       cwd: r.cwd,
       sessionId: r.cliSessionId,
       timeMs: r.lastActivityAt || undefined,
+      candidateNumber: index + 1,
     };
   });
   return [...live, ...resume];
@@ -2507,7 +2536,7 @@ export function buildAdoptSelectCard(
   const labelKind    = t('card.adopt.field_kind',    undefined, locale);
   const labelCli     = t('card.adopt.field_cli',     undefined, locale);
   const labelDir     = t('card.adopt.field_dir',     undefined, locale);
-  const labelSession = t('card.adopt.field_session', undefined, locale);
+  const labelCandidate = t('card.adopt.field_candidate', undefined, locale);
   const labelTarget  = t('card.adopt.field_target',  undefined, locale);
   const selectedTag  = t('card.adopt.selected_tag',  undefined, locale);
   const selectedEntry = selectedKey ? filtered.find(e => e.key === selectedKey) : undefined;
@@ -2534,8 +2563,8 @@ export function buildAdoptSelectCard(
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
       `${labelDir}: \`${escapeMd(e.cwd)}\``,
-      `${labelSession}: \`${escapeMd(e.sessionId || sessionUnknown)}\``,
     ];
+    if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
     if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({

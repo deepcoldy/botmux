@@ -18,6 +18,12 @@ export interface PlatformBotInfo {
   /** bot 自己的租户稳定 union_id（自家消息回声学到，见 bot-union-ids-store）。
    *  平台按团队聚合成 roster 随 team-sync 下发，成员机器据此免 /grant 互信。 */
   unionId?: string;
+  /** 团队维度 Agent 互查（additive，交接契约）：owner 预配的专长标签，
+   *  发现/拉群的匹配依据。**agent 自报 → 仅展示、不可信**，绝不当能力凭据。
+   *  不报 = 空默认值（平台侧 additive 接受）。 */
+  specialties?: string[];
+  /** 是否有飞书传输身份能被 @（core-only/apiOnly → false）。**自报 → 仅展示、不可信**。 */
+  mentionable?: boolean;
 }
 
 /** 平台 team-sync 下发的原始负载（校验/落盘在 platform-team-store）。 */
@@ -372,6 +378,10 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       // 数据流必须关 permessage-deflate（连接创建时已设），否则大文件帧经网关压缩协商错位 → RSV1 断流。
       const dup = createWebSocketStream(winner);
       const tcp = net.connect(opts.getDashboardPort(), '127.0.0.1');
+      // 交互式终端关 Nagle：终端输出常被拆成「回显字符 + 光标/颜色控制序列」这类分帧小包，
+      // Nagle 会把紧随其后的小包扣到对端 delayed-ACK(~40ms)才发出。网页终端经平台隧道中转时
+      // 这条桥接 socket 串在链路中间，用户就感到每隔一下卡 ~40ms；本机直连不经隧道故不卡。
+      tcp.setNoDelay(true);
       const kill = () => {
         try { dup.destroy(); } catch { /* ignore */ }
         try { tcp.destroy(); } catch { /* ignore */ }

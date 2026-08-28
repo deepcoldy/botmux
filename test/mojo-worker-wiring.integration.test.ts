@@ -12,7 +12,7 @@
  *
  * Run:  pnpm vitest run test/mojo-worker-wiring.integration.test.ts
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,6 +20,7 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 interface Invocation {
   argv: string[];
@@ -33,7 +34,7 @@ interface Invocation {
  * Write a fake `mojo` that dumps its invocation, then emits a minimal valid
  * stream (init + result) so the turn settles like a real one.
  */
-function writeFakeMojo(dir: string, fileName = 'mojo'): string {
+function writeFakeMojo(dir: string, fileName = 'mojo', streamScript?: string): string {
   const bin = join(dir, fileName);
   // `self` is how the cliPathOverride / wrapper assertions know WHICH binary ran.
   writeFileSync(bin, `#!/usr/bin/env bash
@@ -56,8 +57,8 @@ node -e '
     },
   }, null, 2));
 ' -- "$@"
-echo '{"type":"system","subtype":"init","session_id":"sid-fake-1"}'
-echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-fake-1","warnings":[]}'
+${streamScript ?? `echo '{"type":"system","subtype":"init","session_id":"sid-fake-1"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-fake-1","warnings":[]}'`}
 `);
   chmodSync(bin, 0o755);
   return bin;
@@ -97,12 +98,20 @@ async function runWorker(opts: {
   workerEnv?: Record<string, string>;
   /** Point cliPathOverride at the fake binary written for this run. */
   cliPathOverrideFromBin?: boolean;
+  /** Replace the fake binary's event stream (final-answer bridge tests). The
+   *  shell fragment runs after the invocation dump; `$MARKER_FILE` points at the
+   *  `botmux send` marker file this session's worker reads. */
+  fakeStream?: string;
+  /** Keep the worker alive until this substring shows up in its log. Needed by
+   *  tests that assert on messages emitted at the TURN BOUNDARY: the invocation
+   *  dump lands long before the stream is parsed. */
+  awaitLog?: string;
 }): Promise<RunResult> {
   // realpathSync: macOS os.tmpdir() is a symlink (/var → /private/var); the child
   // reports the resolved path, so normalize here to keep cwd assertions portable.
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-worker-')));
   const dump = join(root, 'invocation.json');
-  const bin = writeFakeMojo(root, opts.binName ?? 'mojo');
+  const bin = writeFakeMojo(root, opts.binName ?? 'mojo', opts.fakeStream);
   let child: ChildProcess | undefined;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
@@ -120,7 +129,7 @@ async function runWorker(opts: {
     }]));
 
     const startedAt = Date.now();
-    child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -176,6 +185,14 @@ async function runWorker(opts: {
       opts.timeoutMs ?? 20_000,
       () => `mojo was never invoked (or its dump never became parseable)\n${logs.join('')}`,
     );
+    if (opts.awaitLog) {
+      const needle = opts.awaitLog;
+      await waitFor(
+        () => logs.join('').includes(needle),
+        opts.timeoutMs ?? 20_000,
+        () => `worker never logged ${JSON.stringify(needle)}\n${logs.join('')}`,
+      );
+    }
     return {
       bin,
       invocation: invocation!,
@@ -219,7 +236,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
 `);
       chmodSync(bin, 0o755);
 
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -358,7 +375,90 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     // Per-bot env and the mojo-specific env block both land in the child.
     expect(invocation.env.PER_BOT_TOKEN).toBe('per-bot-value');
     expect(invocation.env.MOJO_BLOCK_ONLY).toBe('mojo-block-value');
-    // A bot host must never run mojo's local execution daemon by default.
+    // cloud=true (localDaemon unset) is the fully-remote shape — no host daemon.
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
+  }, 40_000);
+
+  it('defaults to host execution when neither cloud nor localDaemon is set', async () => {
+    // Parity with every other CLI adapter (they all run on the bot host): the
+    // old forced AGENT_LOCAL_DAEMON=0 without --cloud dropped the session into
+    // a cloud sandbox where `botmux` does not exist while the skill catalog
+    // still taught `botmux send` — no host access AND no reply path.
+    const { invocation } = await runWorker({});
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('an ambient AGENT_LOCAL_DAEMON=0 cannot disable default host execution', async () => {
+    // "Always written, never inherited" is a two-way invariant: the ambient=1
+    // case is covered below with cloud:true; this is the reverse direction.
+    const { invocation } = await runWorker({
+      workerEnv: { AGENT_LOCAL_DAEMON: '0' },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('host mode runs the CLI in a per-session isolated workspace (T2) with repo guidance (T3)', async () => {
+    const { invocation } = await runWorker({});
+    // T2: cwd is the isolated per-session dir, NOT the repo — realpath
+    // uniqueness is what gives every session its own mojo daemon + env.
+    // (The fake binary dumps a filtered env, so the shape is asserted off the
+    // reported cwd itself; realpath mechanics are pinned by the module tests.)
+    // Root-agnostic: the workspace root is env-fenced in tests
+    // (BOTMUX_MOJO_WORKSPACE_ROOT, see test/unit-setup.ts).
+    expect(invocation.cwd.replace(/\\/g, '/')).toMatch(/mojo-workspaces\/sid-mojo-wiring$/);
+    // The dir necessarily existed at spawn time (the fake binary ran with it
+    // as cwd; spawn would ENOENT otherwise) — the harness removes its tmp
+    // root on return, so no on-disk assertion here. mkdir/realpath mechanics
+    // are pinned by test/mojo-isolated-workspace.test.ts.
+    // T3: the preamble points the agent back at the real repo and pins every
+    // botmux command to this session id (env-independent routing).
+    const positional = invocation.argv[invocation.argv.length - 1];
+    expect(positional).toContain('--session-id sid-mojo-wiring');
+    expect(positional).toContain('会话隔离目录');
+  }, 40_000);
+
+  it('cloud mode keeps the original cwd and gets no host guidance (T4)', async () => {
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    expect(invocation.cwd).not.toContain('mojo-workspaces');
+    const positional = invocation.argv[invocation.argv.length - 1];
+    expect(positional).not.toContain('--session-id sid-mojo-wiring');
+    expect(positional).not.toContain('会话隔离目录');
+    expect(invocation.argv).toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
+  }, 40_000);
+
+  it('an explicit localDaemon=true runs on the host without --cloud', async () => {
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { localDaemon: true } },
+      init: { backendConfig: { localDaemon: true } },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('localDaemon=true wins over cloud=true and suppresses --cloud (review F3)', async () => {
+    // Previously both flags were emitted and the CLI received contradictory
+    // instructions (env said host, argv said cloud — and the real CLI obeys
+    // --cloud). Explicit localDaemon now takes precedence.
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { cloud: true, localDaemon: true } },
+      init: { backendConfig: { cloud: true, localDaemon: true } },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('1');
+  }, 40_000);
+
+  it('an explicit localDaemon=false still opts out of host execution', async () => {
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { localDaemon: false } },
+      init: { backendConfig: { localDaemon: false } },
+    });
+    expect(invocation.argv).not.toContain('--cloud');
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
   }, 40_000);
 
@@ -376,6 +476,89 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       init: { backendConfig: { cloud: true } },
     });
     expect(invocation.argv).toContain('--yolo');
+  }, 40_000);
+
+  // ── Final-answer bridge ───────────────────────────────────────────────────
+  // A headless backend has no terminal to fall back on: an answer the agent
+  // never `botmux send`s exists only on the streaming card, so the thread shows
+  // the turn finishing with no reply at all. These three cases pin the whole
+  // policy: deliver by default, and defer to the two existing suppression rules
+  // (explicit send this turn / nothing-to-send sentinel) rather than inventing
+  // a second dedup scheme.
+  const TURN_SETTLED_LOG = 'task finished — re-arming prompt-ready';
+
+  /** Shell fragment: simulate `botmux send` by appending the same marker line
+   *  cli.ts writes. Deliberately derived from the child's OWN env, so it also
+   *  proves the mojo child inherits what the real CLI needs to find the file. */
+  const WRITE_SEND_MARKER = `node -e '
+  const fs = require("fs"), p = require("path");
+  const dir = p.join(process.env.SESSION_DATA_DIR, "turn-sends");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(
+    p.join(dir, process.env.BOTMUX_SESSION_ID + ".jsonl"),
+    JSON.stringify({ sentAtMs: Date.now(), messageId: "om_explicit_send", contentLength: 4000 }) + "\\n",
+  );
+'`;
+
+  function finalOutputs(messages: WorkerToDaemon[]): Extract<WorkerToDaemon, { type: 'final_output' }>[] {
+    return messages.filter(
+      (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
+    );
+  }
+
+  it('bridges the turn answer into the thread when the agent never called botmux send', async () => {
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-deliver"}'`,
+        `echo '{"type":"result","status":"ok","result":"最终答案是 42","session_id":"sid-bridge-deliver","warnings":[]}'`,
+      ].join('\n'),
+      // Ordinary IM turn shape: the answer must be attributed to the turn that
+      // asked, so the daemon can resolve its reply target and dedupe a retry.
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    const finals = finalOutputs(messages);
+    expect(finals, `no final_output emitted\n${logs}`).toHaveLength(1);
+    expect(finals[0].content).toContain('最终答案是 42');
+    // Stable per turn — the daemon derives both its dedupe key and the Lark
+    // idempotency uuid from lastUuid, so a retry must collapse into one message.
+    expect(finals[0].lastUuid).toBe(finals[0].turnId);
+  }, 40_000);
+
+  it('does not repeat an answer the agent already sent itself', async () => {
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-sent"}'`,
+        WRITE_SEND_MARKER,
+        `echo '{"type":"result","status":"ok","result":"最终答案是 42","session_id":"sid-bridge-sent","warnings":[]}'`,
+      ].join('\n'),
+      // Ordinary IM turn shape: the answer must be attributed to the turn that
+      // asked, so the daemon can resolve its reply target and dedupe a retry.
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    expect(finalOutputs(messages), `duplicate reply delivered\n${logs}`).toHaveLength(0);
+    expect(logs).toContain('model already called botmux send');
+    // The suppressed turn still tells observers which message WAS the reply.
+    expect(messages.some(m => m.type === 'explicit_reply_observed')).toBe(true);
+  }, 40_000);
+
+  it('delivers nothing when the answer is the nothing-to-send sentinel', async () => {
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-sentinel"}'`,
+        `echo '{"type":"result","status":"ok","result":"BOTMUX_NOTHING_TO_SEND","session_id":"sid-bridge-sentinel","warnings":[]}'`,
+      ].join('\n'),
+      // Ordinary IM turn shape: the answer must be attributed to the turn that
+      // asked, so the daemon can resolve its reply target and dedupe a retry.
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    expect(finalOutputs(messages), `sentinel leaked into the thread\n${logs}`).toHaveLength(0);
+    expect(logs).toContain('nothing-to-send sentinel');
   }, 40_000);
 
   it('resumes the persisted lineage from riffParentTaskId', async () => {
@@ -508,7 +691,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -588,7 +771,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -709,7 +892,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
         writeFakeMojo(root);
 
         const errors: string[] = [];
-        child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        child = spawnTsScript(resolve('src/worker.ts'), [], {
           cwd: resolve('.'),
           env: {
             ...process.env,
@@ -787,7 +970,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       chmodSync(bin, 0o755);
 
       let ready = 0;
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -867,7 +1050,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,

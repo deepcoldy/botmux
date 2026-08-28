@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -42,6 +42,7 @@ import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
   composeSpawnCodexAppContext,
@@ -87,6 +88,7 @@ import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
+import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -185,8 +187,8 @@ async function resumeRestoredPendingRepoSetup(
     const input = buildNewTopicCliInput(
       setup.prompt,
       ds.session.sessionId,
-      ds.session.cliId ?? bot.config.cliId,
-      ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+      ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
       ds.pendingAttachments,
       ds.pendingMentions,
       availableBots,
@@ -208,6 +210,38 @@ async function resumeRestoredPendingRepoSetup(
     forkWorker(ds, input, { resume: false, turnId: setup.turnId });
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
+}
+
+/**
+ * Drop a persisted `previewTarget` that belonged to the previous worker
+ * generation, before this restore pass rebuilds a DaemonSession from the row.
+ *
+ * `previewTarget` is the literal loopback (host, port) an agent registered with
+ * `botmux preview <port>`; it is routing state for the worker that was live at
+ * registration time, not a durable property of the conversation. Restore always
+ * opens a NEW generation — every row here is rebuilt with `worker: null`, and
+ * killStalePids has just reaped the previous run's CLI processes — so whatever
+ * served that port is gone and the OS may hand the number to any unrelated
+ * local service. The preview proxy dials a registered target by host/port
+ * alone, so carrying one across the restart can proxy a user's preview into
+ * someone else's local server. Applies to adopt rows too: a surviving adopted
+ * CLI is no proof that its dev server survived, and re-registering costs one
+ * command inside the session.
+ *
+ * Cleanup only — registration (`POST /api/sessions/:id/preview`, which probes
+ * reachability first) and the proxy are untouched; the session simply
+ * re-registers. A failed save is logged and swallowed: the in-memory row this
+ * pass registers is already clear (so nothing dials the stale target), and the
+ * next successful save converges the file.
+ */
+function clearRestoredPreviewTarget(session: Session): void {
+  // P1-13：与 worker 换代 / suspend / exit / close 走同一个收口（清字段 + 落盘 +
+  // 广播 `preview: null`），restore 只是「代次边界」的又一种形态，不该有第二份实现。
+  if (!clearSessionPreviewTarget(session, 'restore opens a new worker generation')) return;
+  logger.debug(
+    `[${session.sessionId.substring(0, 8)}] Dropped preview target registered by the previous worker `
+    + `generation; the session must re-register with \`botmux preview <port>\``,
+  );
 }
 
 function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
@@ -245,6 +279,7 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  if (ds.session.cliLaunchSnapshot?.state === 'resolved') return null;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
   let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
@@ -324,6 +359,11 @@ function armCliMismatchResweep(ds: DaemonSession): void {
 }
 
 async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
+  // A Codex App shared adopt deliberately runs the plain `codex` remote TUI
+  // even when this bot's normal/new-session runtime remains `codex-app`.
+  // That is not a bot configuration drift and must never trigger the ordinary
+  // "kill mismatched CLI" cleanup during daemon restore or a live config edit.
+  if (isSharedAdoptSession(ds)) return 'not_mismatched';
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return 'not_mismatched';
 
@@ -437,7 +477,7 @@ export async function closeCliMismatchedSessionsForBot(
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
-    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (isSharedAdoptSession(ds) || ds.session.title?.startsWith('Adopt:')) continue;
     // Defense in depth: the dashboard toggle preflights the whole bot before
     // changing config. Never let a refused suspend fall through into
     // closeSession: close is explicit abandon, and a settings toggle is not.
@@ -482,7 +522,7 @@ export async function suspendActiveSessionsForBot(larkAppId: string): Promise<nu
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
-    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (isSharedAdoptSession(ds) || ds.session.title?.startsWith('Adopt:')) continue;
     // A settings helper is never an explicit abandon boundary. In particular,
     // suspendWorker intentionally refuses pending Codex App ownership; do not
     // reinterpret that refusal as permission to close and erase the FIFO.
@@ -701,15 +741,39 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 }
 
 /**
+ * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
+ * (getBot throws for an unknown appId) or an absent key both mean "inject",
+ * matching `thinkingCard`'s convention — only an explicit `false` disables, so
+ * a config-read failure can never silently strip per-turn attribution.
+ */
+function senderTagEnabled(larkAppId: string): boolean {
+  try {
+    return getBot(larkAppId).config.senderTag !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
- * (open_id + type + optional name) via `resolveSender(...)` in identity-cache.
+ * (open_id + type + optional name/email) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
+ *
+ * `larkAppId` opts this into the per-bot `senderTag` switch (default ON — only
+ * an explicit `senderTag: false` suppresses the tag). The gate lives HERE, not
+ * at the call sites, so all five injection points (new topic, its codex-app
+ * sidecar, follow-up blocks, the follow-up codex-app sidecar, and daemon's
+ * buffered-follow-up path via {@link renderBufferedSenderBlock}) share one
+ * judgment and cannot drift apart. Omitting `larkAppId` — synthetic callers and
+ * existing tests — keeps the historical always-inject behavior.
  */
-export function renderSenderTag(sender?: ResolvedSender): string {
+export function renderSenderTag(sender?: ResolvedSender, larkAppId?: string): string {
   if (!sender || !sender.openId) return '';
+  if (larkAppId && !senderTagEnabled(larkAppId)) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
+  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -736,10 +800,17 @@ export function renderCursorSenderNote(cliId: CliId | undefined, hasSender: bool
  * `<sender>`; otherwise an inline `ou_xxx:name` reaches cursor with no adjacent
  * note (the builder's note only covers `ds.pendingSender`'s top-level tag, and
  * may be absent entirely when pendingSender is undefined). Returns '' when
- * there is no sender to attribute.
+ * there is no sender to attribute, and also when the bot has `senderTag: false`
+ * (the gate inside renderSenderTag) — the note is skipped with it, since there
+ * is then no inline tag for cursor to misread.
  */
-export function renderBufferedSenderBlock(sender: ResolvedSender | undefined, cliId: CliId | undefined, locale?: Locale): string {
-  const tag = renderSenderTag(sender);
+export function renderBufferedSenderBlock(
+  sender: ResolvedSender | undefined,
+  cliId: CliId | undefined,
+  locale?: Locale,
+  larkAppId?: string,
+): string {
+  const tag = renderSenderTag(sender, larkAppId);
   if (!tag) return '';
   const note = renderCursorSenderNote(cliId, true, locale);
   return note ? `${tag}\n${note}` : tag;
@@ -1091,7 +1162,7 @@ export function buildNewTopicPrompt(
 
   parts.push(userBlock);
 
-  const senderBlock = renderSenderTag(sender);
+  const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   if (senderBlock) parts.push(senderBlock);
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
@@ -1154,7 +1225,7 @@ export function buildNewTopicCliInput(
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
-  const senderBlock = renderSenderTag(sender);
+  const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(attachments, locale);
@@ -1262,7 +1333,7 @@ function buildFollowUpBlocks(
 
   blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
 
-  const senderBlock = renderSenderTag(opts?.sender);
+  const senderBlock = renderSenderTag(opts?.sender, opts?.larkAppId);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
@@ -1402,7 +1473,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId);
-  const senderBlock = renderSenderTag(opts.sender);
+  const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
@@ -1626,6 +1697,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
+    s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
@@ -1638,6 +1710,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
+  s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
@@ -1666,7 +1739,7 @@ export function rememberLastCliInput(
   const normalized = typeof cliInput === 'string' ? { content: cliInput } : cliInput;
   ds.lastCliInput = normalized.content;
   const botCfg = getBot(ds.larkAppId).config;
-  const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
+  const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
   const keepCodexAppInput = opts?.codexAppInputAccepted ?? (
     effectiveCliId === 'codex-app' &&
     botCfg.codexAppCleanInput === true &&
@@ -1752,7 +1825,7 @@ export async function restoreActiveSessions(
 ): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
-    if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
+    if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;
     if (session.queued) return 1;
     return 0; // disposable daemon-command scratch
   };
@@ -1814,6 +1887,12 @@ export async function restoreActiveSessions(
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
     }
+    // New worker generation ⇒ no registered preview port. Runs before every
+    // branch below (adopt / queued / ordinary / close / quarantine — including
+    // the mojo journal reconciliation right after, which has its own `continue`
+    // paths) so no rebuilt DaemonSession or announced row, and no row persisted
+    // by a quarantine/recovered close, can carry the old target.
+    clearRestoredPreviewTarget(session);
     // Freeze the mojo control plane BEFORE this row becomes visible in the active
     // map. The dispatcher is already live during restore, so a row registered
     // first could be woken — or `/close`d — while still reading live bot config,
@@ -2041,6 +2120,7 @@ export async function restoreActiveSessions(
           adoptedFrom: adopted,
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
+          streamCardReplyTargetKey: session.streamCardReplyTargetKey,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -2231,9 +2311,11 @@ export async function restoreActiveSessions(
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
-      hasHistory: session.queuedActivationPending
-        ? (session.queuedActivationResume ?? false)
-        : true,  // restored ordinary sessions have prior CLI history
+      hasHistory: session.cliLaunchSnapshot?.state === 'pending'
+        ? false
+        : session.queuedActivationPending
+          ? (session.queuedActivationResume ?? false)
+          : true,  // restored ordinary sessions have prior CLI history
       initialStartPending: session.queuedActivationPending === true
         || (session.queuedActivationTail?.length ?? 0) > 0,
       workingDir: session.workingDir,
@@ -2245,6 +2327,7 @@ export async function restoreActiveSessions(
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
+      streamCardReplyTargetKey: session.streamCardReplyTargetKey,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -2447,6 +2530,13 @@ export async function restoreActiveSessions(
       );
       continue;
     }
+  }
+
+  // Re-arm persisted semantic-recovery timers only after the whole restore
+  // pass has registered collision winners. A zero-delay overdue backoff must
+  // not wake while a later row is still competing for the same route.
+  for (const ds of restoredByThisInvocation) {
+    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -2718,9 +2808,6 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          a fresh thread session); refuse rather than clobber
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
- *   - 'vc_receiver_managed' — dedicated meeting receivers are reconstructed
- *                          through the meeting membership/hub lifecycle; a
- *                          manual resume could resurrect a stale member epoch
  *   - 'deferred_unmaterialized' — a silent fresh-topic run finished without
  *                          publishing, so it has no conversation to resume
  *   - 'resume_cancelled' — a concurrent close won while resume was committing
@@ -2729,22 +2816,16 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
-  // A dedicated VC receiver is not an ordinary chat conversation. Its
-  // identity is fenced by (meeting, member, epoch) and its active-map slot is
-  // reconstructed by the meeting hub/membership lifecycle. Reactivating a
-  // closed receiver through the generic dashboard/card/CLI path would bypass
-  // that ownership check, potentially revive a stale epoch, and (before the
-  // dedicated-key fix) collapse it into the listener chat's ordinary slot.
-  // Keep it closed and let the authoritative meeting lifecycle create or
-  // recover the correct receiver binding.
-  if (session.vcMeetingReceiver) {
-    return { ok: false, error: 'vc_receiver_managed' };
-  }
+  // Plan B: a VC meeting agent is an ordinary chat-scope session, so a closed one
+  // resumes into its normal (chatId, appId) slot like any chat session — the old
+  // `vc_receiver_managed` refusal is gone. (Reviving into the ordinary slot is now
+  // the intended behavior, not a hazard; the meeting lifecycle re-stamps the
+  // delivery binding via ensureVcMeetingReceiverSession when the meeting is live.)
 
   // Auto-closed invisible schedule runs are audit records, not conversations.
   // Without a materialized binding, resuming one would wake a virtual chat-
@@ -2758,7 +2839,7 @@ export async function resumeSession(
   // Adopt sessions don't survive /close — the user's tmux pane and original
   // CLI pid have already moved on, and bringing the bridge back without a live
   // pane is meaningless.
-  if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
+  if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
 
@@ -2773,12 +2854,11 @@ export async function resumeSession(
   const latest = sessionStore.getSession(sessionId);
   if (!latest) return { ok: false as const, error: 'not_found' as const };
   if (latest.status !== 'closed') return { ok: false as const, error: 'not_closed' as const };
-  if (latest.vcMeetingReceiver) return { ok: false as const, error: 'vc_receiver_managed' as const };
   if (latest.deferredScheduleRun
     && !readDeferredTopicBinding(config.session.dataDir, latest.sessionId)) {
     return { ok: false as const, error: 'deferred_unmaterialized' as const };
   }
-  if (latest.title?.startsWith('Adopt:') || latest.adoptedFrom) {
+  if (latest.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(latest)) {
     return { ok: false as const, error: 'adopt_unsupported' as const };
   }
   session = latest;
@@ -2918,6 +2998,7 @@ export async function resumeSession(
     ownerOpenId: session.ownerOpenId,
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
+    streamCardReplyTargetKey: session.streamCardReplyTargetKey,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
@@ -3310,8 +3391,8 @@ export async function executeScheduledTask(
         }
         const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
           isAdoptMode: false,
-          cliId: existing.session.cliId ?? bot.config.cliId,
-          cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+          cliId: existing.session.cliLaunchSnapshot?.cliId ?? existing.session.cliId ?? bot.config.cliId,
+          cliPathOverride: existing.session.cliLaunchSnapshot?.cliPathOverride ?? existing.session.cliPathOverride ?? bot.config.cliPathOverride,
           locale: localeForBot(larkAppId),
           larkAppId,
           chatId: task.chatId,
@@ -3406,7 +3487,7 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -3504,7 +3585,7 @@ async function forkOrShowRepoCard(
   }
 
   const buildPrompt = () => buildNewTopicCliInput(
-    userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
+    userContent, ds.session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
     ds.pendingAttachments, ds.pendingMentions, undefined, ds.pendingFollowUps,
     { name: bot.botName, openId: bot.botOpenId }, locale, ds.pendingSender,
     {

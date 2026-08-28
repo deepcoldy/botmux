@@ -486,7 +486,7 @@ describe('worker structured-turn status wiring', () => {
     expect(tickPrune).toBeGreaterThan(finallyBlock);
   });
 
-  it('routes Pi external idle through the busy-viewport guard; ZMX stays fail-open', () => {
+  it('routes Pi and OMP external idle through the busy-viewport guard; ZMX stays fail-open', () => {
     const callback = source.slice(
       source.indexOf('idleDetector.onIdle(async (evidenceSource)'),
       source.indexOf('drainBridgesThenMarkReady(evidenceSource);'),
@@ -495,7 +495,7 @@ describe('worker structured-turn status wiring', () => {
     // Working... — an external idle landing while the authoritative viewport
     // still shows busy must defer exactly like a screen idle.
     expect(callback).toContain("evidenceSource === 'screen'");
-    expect(callback).toContain("evidenceSource === 'external' && structuredBridgeIsPi()");
+    expect(callback).toContain('structuredBridgeIsPi() || structuredBridgeIsOmp()');
     expect(callback).toContain('deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)');
 
     // The guard fail-opens on non-authoritative screens (ZMX) BEFORE testing
@@ -514,6 +514,28 @@ describe('worker structured-turn status wiring', () => {
     // so a deferred ZMX turn can never be pinned by the probe loop.
     const probe = functionSlice('scheduleBusyPatternIdleProbe', 'spawnCli');
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+  });
+
+  it('flushes an OMP trailing candidate only after a complete quiet tick and non-busy viewport', () => {
+    const quiet = functionSlice('maybeFlushOmpTrailingFinalOnQuietTick', 'maybeEmitCodexStructuredRateLimit');
+    const arm = quiet.indexOf('ompQuietCandidateCompleteOffset = codexBridgeOffset');
+    const tailGate = quiet.indexOf('codexBridgePendingTail', arm);
+    const lifecycleGate = quiet.indexOf('hasStructuredLifecycleBlock()', arm);
+    const authoritativeGate = quiet.indexOf('backendScreenEvidenceIsAuthoritativeForMutation()', arm);
+    const capture = quiet.indexOf('captureBackendScreen(backend)', authoritativeGate);
+    const busy = quiet.indexOf('cliAdapter.busyPattern.test(busyProbeRegion(screen))', capture);
+    const flush = quiet.indexOf('codexBridgeIngest({ flushOmpTrailingFinal: true })', busy);
+    expect(arm).toBeGreaterThanOrEqual(0);
+    expect(tailGate).toBeGreaterThan(arm);
+    expect(lifecycleGate).toBeGreaterThan(arm);
+    expect(authoritativeGate).toBeGreaterThan(arm);
+    expect(capture).toBeGreaterThan(authoritativeGate);
+    expect(busy).toBeGreaterThan(capture);
+    expect(flush).toBeGreaterThan(busy);
+
+    const ticker = functionSlice('codexBridgeStartTimer', 'hermesBridgeAttach');
+    expect(ticker.indexOf('codexBridgeIngest()'))
+      .toBeLessThan(ticker.indexOf('maybeFlushOmpTrailingFinalOnQuietTick()'));
   });
 
   it('publishes first-turn working from the projected status for argv-baked prompts, as a pure publisher', () => {
@@ -601,7 +623,7 @@ describe('worker structured-turn status wiring', () => {
     const markStart = body.indexOf('function markPromptReady(): void');
     expect(markStart).toBeGreaterThanOrEqual(0);
     const evidenceGate = body.indexOf('if (spawnArgvTurnStartGateHolds()) {', markStart);
-    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock()) {', markStart);
+    const lifecycleGate = body.indexOf('if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {', markStart);
     expect(evidenceGate).toBeGreaterThanOrEqual(0);
     expect(lifecycleGate).toBeGreaterThan(evidenceGate);
     expect(body.slice(evidenceGate, lifecycleGate)).not.toContain('flushQueuedInputAfterTurnStartEvidence');

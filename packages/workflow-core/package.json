@@ -62,10 +62,10 @@
   ],
   "scripts": {
     "build": "node ../../scripts/build-workflow-core-package.mjs",
-    "test": "pnpm run build && node ../../scripts/test-workflow-core-package.mjs",
-    "pack:local": "pnpm run build && node ../../scripts/pack-workflow-core-package.mjs",
-    "prepare": "pnpm run build",
-    "prepublishOnly": "pnpm run test"
+    "test": "npm run build && node ../../scripts/test-workflow-core-package.mjs",
+    "pack:local": "npm run build && node ../../scripts/pack-workflow-core-package.mjs",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run test"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

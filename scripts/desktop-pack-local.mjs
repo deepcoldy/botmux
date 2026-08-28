@@ -51,12 +51,14 @@ function run(command, args) {
 const appVersion = resolveAppVersion();
 process.env.BOTMUX_DESKTOP_VERSION = appVersion;
 
-run('pnpm', ['build']);
-run('pnpm', ['desktop:bundle']);
-run('pnpm', ['desktop:runtime']);
-run('pnpm', [
-  'exec',
-  'electron-builder',
+run('bun', ['run', 'build']);
+run('bun', ['run', 'desktop:bundle']);
+run('bun', ['run', 'desktop:runtime']);
+// Invoke the locally installed binary directly rather than via `bunx`: bunx will
+// silently fetch a package from the network when it is not found in
+// node_modules, which for a packaging/signing step is the wrong failure mode —
+// we want a hard error if the dependency is missing, not a surprise download.
+run('./node_modules/.bin/electron-builder', [
   '--mac',
   'dmg',
   'zip',

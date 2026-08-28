@@ -14,11 +14,12 @@
  * exact roster: with a throwaway app secret the API call fails either way, so
  * this stays offline-safe while still failing when the registration is missing.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const APP_ID = 'cli_isolated_roster';
@@ -31,10 +32,10 @@ afterEach(() => {
 
 function runCli(args: string[], env: NodeJS.ProcessEnv) {
   return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, ...args], {
+    const child = spawnTsScript(CLI_PATH, args, {
       env: { ...process.env, ...env, BOTMUX_WORKFLOW: '' },
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');

@@ -692,7 +692,7 @@ export interface V3BlockedInfo {
    *  node tried to revisit → the daemon posts a revisit-grant card. */
   revisitTo?: string;
   /** No generic retry may mint a fresh idempotency key for this attempt. */
-  retryForbidden?: 'host-effect-uncertain';
+  retryForbidden?: 'host-effect-uncertain' | 'revise-workflow-required';
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
@@ -708,6 +708,7 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
         errorClass: e.errorClass,
         errorCode: e.errorCode,
         message: e.message,
+        ...(e.recovery === 'reviseWorkflow' ? { retryForbidden: 'revise-workflow-required' as const } : {}),
         ...(e.ask ? { ask: e.ask } : {}),
         ...(e.revisitTo ? { revisitTo: e.revisitTo } : {}),
       };
@@ -1103,7 +1104,7 @@ export function requestV3RunCancel(
 export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
-  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' };
+  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' | 'revise-workflow-required' };
 
 type V3RetryAnswerInput =
   | { selected: string; by: string }
@@ -1194,6 +1195,9 @@ export function requestV3Retry(
   const previousAttemptId = latestAttemptIdFor(events, attemptKey);
   if (!previousAttemptId) return { kind: 'stale-run', reason: 'not-blocked' };
   const info = blockedInfoFor(events, nodeId);
+  if (info.retryForbidden === 'revise-workflow-required') {
+    return { kind: 'stale-run', reason: 'revise-workflow-required' };
+  }
   if (events.some((event) =>
     (event.type === 'hostEffectIntent' || event.type === 'hostEffectUncertain') &&
     event.attemptId === previousAttemptId)) {

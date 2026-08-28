@@ -39,10 +39,27 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 > 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
 
 ```bash
-npm install -g botmux        # 需要 Node >= 22
+npm install -g botmux        # 需要 Node >= 22 装包本身
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
+
+> npm 包内已经带了对应平台的**自包含二进制**（按 os/arch 只装匹配的那一个），安装时会把 `~/.botmux/bin/botmux` 指向它。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。把 `~/.botmux/bin` 放进 PATH 即可（安装日志会提示命令）。
+
+<details>
+<summary>不想装 Node？直接下单文件可执行（连装包都不需要 Node）</summary>
+
+同一个自包含二进制也可以脱离 npm 直接下载，**自带运行时、不依赖机器上的任何 Node**。macOS / Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+botmux setup
+botmux start
+```
+
+装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），自动按 OS/arch 拉对应二进制并校验 SHA-256。命令用法与 npm 版完全一致。Windows 仍走 `npm i -g botmux`（daemon 是 Unix-only）。
+
+</details>
 
 然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
 
@@ -60,11 +77,21 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 ## 支持的 CLI / Agent
 
-`bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff、mojo——通过 API / 远端接入，非本地进程）。代表项：
+`bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `mira` · `riff`(云 Agent) … · `mojo`(云 Agent) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
 
 当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
+
+### 会话级 CLI 选择
+
+在会话尚未启动前，可以用 `/cli <cliId>` 为当前会话选择已注册的 CLI，例如：
+
+```text
+/cli codex
+```
+
+这个选择只切换裸 CLI 适配器，不继承当前 bot 配置中的 `wrapperCli`、`model` 或 `startupCommands`。因此依赖 `ttadk`、`aiden` 等 wrapper / 网关才能启动的 CLI，不适合用会话级选择切换；应直接把 bot 默认配置设为对应的 wrapper 组合。会话启动后 CLI 选择冻结，后续消息和恢复都会继续使用该 CLI。
 
 ### 最终回答反馈（按 bot、默认关闭）
 

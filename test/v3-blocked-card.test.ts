@@ -65,6 +65,21 @@ describe('buildV3BlockedCard', () => {
     expect(json).not.toContain(V3_BLOCKED_RETRY_ACTION);
   });
 
+  it('产物契约错误提示修订 Workflow 且不提供普通重试', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      errorClass: 'artifactContractInvalid',
+      errorCode: 'OUTPUT_CONTRACT_VIOLATION',
+      retryForbidden: 'revise-workflow-required',
+    }));
+
+    expect(card.header.template).toBe('red');
+    expect(card.header.title.content).toContain('需要修订 Workflow');
+    const json = JSON.stringify(card);
+    expect(json).toContain('output key');
+    expect(json).not.toContain(V3_BLOCKED_RETRY_ACTION);
+  });
+
   it('retried 冻结卡：green + 无重试按钮 + 显示新 attempt', () => {
     const card = JSON.parse(buildV3BlockedCard({ ...INPUT, retried: { nextAttemptId: 'deploy/attempts/002', by: 'ou_x' } }));
     expect(card.header.template).toBe('green');

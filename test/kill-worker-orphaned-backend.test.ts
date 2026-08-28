@@ -23,6 +23,7 @@ import type { DaemonSession } from '../src/core/types.js';
 
 const {
   tmuxKill,
+  tmuxList,
   herdrKill,
   herdrKillAgent,
   herdrKillAgents,
@@ -33,6 +34,7 @@ const {
   getBotMock,
 } = vi.hoisted(() => ({
   tmuxKill: vi.fn(),
+  tmuxList: vi.fn(() => [] as string[]),
   herdrKill: vi.fn(),
   herdrKillAgent: vi.fn(),
   herdrKillAgents: vi.fn(),
@@ -44,7 +46,11 @@ const {
 }));
 
 vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
-  TmuxBackend: { sessionName: (id: string) => `bmx-${id.slice(0, 8)}`, killSession: tmuxKill },
+  TmuxBackend: {
+    sessionName: (id: string) => `bmx-${id.slice(0, 8)}`,
+    killSession: tmuxKill,
+    listBotmuxSessions: tmuxList,
+  },
 }));
 vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   HerdrBackend: {
@@ -121,12 +127,33 @@ const ds = (over: Partial<DaemonSession> = {}, initOver: any = {}): DaemonSessio
 
 beforeEach(() => {
   vi.clearAllMocks();
+  tmuxList.mockReturnValue([]);
   herdrList.mockReturnValue([]);
   zmxList.mockReturnValue([]);
   getBotMock.mockReturnValue({ resolvedAllowedUsers: [], config: {} } as any);
 });
 
 describe('killStalePids — ZMX CLI-change cleanup', () => {
+  it('signals only the stale worker PID for an existing App Server share', () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
+    const sharedPid = 42_424;
+
+    try {
+      killStalePids([{
+        sessionId: SID,
+        pid: sharedPid,
+        backendType: 'pty',
+        existingAppServerEndpoint: 'unix:///tmp/codex-app-server.sock',
+      } as any]);
+
+      expect(kill).toHaveBeenCalledWith(sharedPid, 0);
+      expect(kill).toHaveBeenCalledWith(sharedPid, 'SIGTERM');
+      expect(kill).not.toHaveBeenCalledWith(-sharedPid, 'SIGTERM');
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
   it('keeps the complete owning session identity and does not issue a second name-only kill', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-zmx-cli-change-'));
     const previousDataDirEnv = process.env.SESSION_DATA_DIR;

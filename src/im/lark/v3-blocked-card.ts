@@ -54,7 +54,7 @@ export interface V3BlockedCardInput {
   errorClass?: string;
   errorCode?: string;
   message?: string;
-  retryForbidden?: 'host-effect-uncertain';
+  retryForbidden?: 'host-effect-uncertain' | 'revise-workflow-required';
   /** 省略则按 runId/nodeId/attemptId 推导（幂等校验用）。 */
   nonce?: string;
   webDetailUrl?: string;
@@ -93,6 +93,9 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   else if (retried) { title = `已重试：节点 ${input.nodeId}`; template = 'green'; }
   else if (input.retryForbidden === 'host-effect-uncertain') {
     title = `外部效果待核实：${input.nodeId}`;
+    template = 'red';
+  } else if (input.retryForbidden === 'revise-workflow-required') {
+    title = `需要修订 Workflow：${input.nodeId}`;
     template = 'red';
   } else { title = `节点受阻：${input.nodeId}`; template = 'orange'; }
 
@@ -207,6 +210,16 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
           content:
             '⚠️ 该 attempt 可能已产生外部副作用。请先在目标系统对账；为避免重复发送/创建，不提供普通重试。' +
             ` P0 暂不支持手工补写 provider 回执，对账后请用 \`/workflow cancel ${escapeMd(input.runId)}\` 收口并保留审计记录。`,
+        },
+      });
+    } else if (input.retryForbidden === 'revise-workflow-required') {
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            '⛔ 公开产物契约与实际 Manifest 不一致，普通重试不会改变定义。' +
+            '请修订 Workflow 的 outputs / output key 后创建或发布新版本；当前 run 保留用于审计。',
         },
       });
     } else {

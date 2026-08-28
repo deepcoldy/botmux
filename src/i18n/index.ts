@@ -74,12 +74,50 @@ function interpolate(template: string, params: Record<string, string | number>):
 }
 
 /**
- * Translate a key. Falls back to the Chinese dictionary, then to the key
- * itself if neither dictionary has the entry (so missing keys are loud
- * rather than silently producing empty strings).
+ * Optional user-override resolver for built-in prompt copy. Registered by the
+ * customization store (via a thin adapter) so i18n stays pure — no filesystem
+ * import, no dependency cycle (same DI shape as {@link setBotLookup}).
+ *
+ * Returns the override string for (key, locale) when the user has customized it
+ * AND customization is enabled, else `undefined` to fall through to the shipped
+ * dictionary. Returning `undefined` for every key when there are no overrides is
+ * what keeps the prompt byte-identical to the pre-feature baseline.
+ */
+export type PromptOverrideResolver = (key: string, locale: Locale) => string | undefined;
+
+let promptOverrideResolver: PromptOverrideResolver | undefined;
+
+export function setPromptOverrideResolver(resolver: PromptOverrideResolver | undefined): void {
+  promptOverrideResolver = resolver;
+}
+
+/**
+ * The SHIPPED (factory) dictionary value for a key, bypassing any registered
+ * override resolver. Used by the customization UI/CLI to show "factory vs your
+ * override" and to prefill editors — where consulting the override (as `t()`
+ * does) would be circular. Same fallback chain as `t()` minus the override step.
+ */
+export function shippedText(key: string, locale?: Locale): string {
+  const loc = locale ?? defaultLocale;
+  return dictionaries[loc]?.[key] ?? dictionaries.zh[key] ?? key;
+}
+
+/**
+ * Translate a key. Resolution order:
+ *   1. a user override for (key, resolved-locale), when registered
+ *   2. the active-locale dictionary
+ *   3. the Chinese dictionary (fallback)
+ *   4. the key itself (so missing keys are loud, not empty)
+ *
+ * The override lookup is wrapped so a faulty resolver can never break prompt
+ * building — any throw falls through to the shipped string.
  */
 export function t(key: string, params?: Record<string, string | number>, locale?: Locale): string {
   const loc = locale ?? defaultLocale;
-  const tpl = dictionaries[loc]?.[key] ?? dictionaries.zh[key] ?? key;
+  let tpl: string | undefined;
+  if (promptOverrideResolver) {
+    try { tpl = promptOverrideResolver(key, loc); } catch { tpl = undefined; }
+  }
+  if (tpl === undefined) tpl = dictionaries[loc]?.[key] ?? dictionaries.zh[key] ?? key;
   return params ? interpolate(tpl, params) : tpl;
 }

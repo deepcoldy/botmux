@@ -69,6 +69,7 @@ describe('bot defaults focused layout', () => {
     // 会话后端 stays under 高级; 启动环境(Shell+env) stays under 高级 too.
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');
+    expect(advanced).toContain('<SessionOwnerReminderSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
@@ -104,6 +105,26 @@ describe('bot defaults focused layout', () => {
     }
   });
 
+  it('places the Feishu description editor inside the profile header main column', () => {
+    const profileStart = page.indexOf('<BotProfileIdentity');
+    const tabsStart = page.indexOf('<BotDefaultsTabs', profileStart);
+    const profileHead = page.slice(profileStart, tabsStart);
+
+    expect(profileHead).toContain('<BotDescriptionControl bot={bot} />');
+    expect(css).toMatch(/\.bot-defaults-page \.bd-description-preview\s*\{[\s\S]*?-webkit-line-clamp:\s*2;/);
+    expect(css).toMatch(/\.bot-defaults-page \.bd-description-modal\s*\{[\s\S]*?max-height:\s*min\(720px,\s*calc\(100vh - 32px\)\);/);
+  });
+
+  it('offers the Codex auth policy with explicit sandbox-independent scope copy', () => {
+    expect(page).toContain('data-input="codexAuthSync"');
+    expect(page).toContain("<CodexAuthSection bot={bot} patchBot={patchBot} />");
+    expect(page).toContain("botDefaults.sectionCodexAuth");
+    expect(page).toContain('/codex-auth-sync');
+    expect(i18n.match(/'botDefaults\.codexAuthSyncHelp'/g)).toHaveLength(2);
+    expect(i18n).toContain('无论是否启用沙箱都使用本 bot 的 CODEX_HOME');
+    expect(i18n).toContain("with or without the sandbox");
+  });
+
   it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');
@@ -124,5 +145,15 @@ describe('bot defaults focused layout', () => {
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
     expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
+  });
+
+  it('offers granular Session owner reminder controls in advanced settings', () => {
+    expect(page).toContain('function SessionOwnerReminderSection');
+    for (const state of ['idle', 'dormant', 'pending_repo', 'tui_prompt', 'agent_attention', 'limited']) {
+      expect(page).toContain(`value: '${state}'`);
+    }
+    for (const key of ['ownerReminderTitle', 'ownerReminderInterval', 'ownerReminderText', 'ownerReminderStates']) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
   });
 });

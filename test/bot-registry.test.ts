@@ -215,6 +215,24 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps only a valid sessionOwnerReminder configuration', () => {
+    const reminder = {
+      enabled: true,
+      intervalMinutes: 45,
+      text: '请处理当前会话。',
+      states: ['idle', 'agent_attention'],
+    };
+    const [valid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', sessionOwnerReminder: reminder },
+    ]));
+    expect(valid.sessionOwnerReminder).toEqual(reminder);
+
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', sessionOwnerReminder: { ...reminder, intervalMinutes: 0 } },
+    ]));
+    expect(invalid.sessionOwnerReminder).toBeUndefined();
+  });
+
   it('keeps a trimmed displayName and drops blank/non-string values', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', displayName: '  小助手  ' },
@@ -327,6 +345,49 @@ describe('parseBotConfigsFromText — brand', () => {
       wrapperCli: 'gateway codex',
       cliRuntime: runtime,
     }]))).toThrow(/cannot be combined with wrapperCli/);
+  });
+
+  it('accepts existingAppServer on a Codex App bot but rejects unrelated CLIs', () => {
+    const endpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-share',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      existingAppServer: { endpoint },
+    }]));
+    expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.existingAppServer).toEqual({ endpoint });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-app-server-cli',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      existingAppServer: { endpoint },
+    }]))).toThrow(/only for cliId "codex" or "codex-app"/);
+  });
+
+  it('keeps the Codex browser bridge opt-in and restricted to owned Codex App sessions', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-browser',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexBrowser: true,
+    }]));
+    expect(cfg.codexBrowser).toEqual({ enabled: true, family: 'chrome' });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-browser-cli',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      codexBrowser: true,
+    }]))).toThrow(/only for cliId "codex-app"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'isolated-browser',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      codexBrowser: true,
+      sandbox: true,
+    }]))).toThrow(/sandbox or readIsolation/);
   });
 
   it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
@@ -493,8 +554,48 @@ describe('parseBotConfigsFromText — brand', () => {
     });
   });
 
-  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {
+  it('parses meetingConsumer in/out policies', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          realtimeVoice: { enabled: true },
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'approval',
+            voiceOutputPolicy: 'allow',
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBe('approval');
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBe('allow');
+  });
+
+  it('drops invalid in/out policy values', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'sometimes', // invalid → dropped
+            voiceOutputPolicy: 42, // invalid → dropped
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBeUndefined();
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBeUndefined();
+  });
+
+  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'a',
         larkAppSecret: 's',
@@ -1745,16 +1846,40 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
       .toBeUndefined();
   });
 
-  it('returns undefined when VC is not enabled (normal bot)', () => {
+  it('is active by default for a Feishu bot; only enabled:false opts out', () => {
+    // Bot-agnostic join: any invited Feishu bot should join, so VC is active
+    // unless explicitly disabled. enabled:false is the per-bot opt-out.
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: { enabled: false } as any }))
       .toBeUndefined();
-    expect(mod.vcMeetingAgentConfigActive({})).toBeUndefined();
+    // Unset enabled / no vcMeetingAgent block → active with an effective config
+    // (empty object is fine; downstream reads fall back to their own defaults).
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: {} as any })).toEqual({});
+    expect(mod.vcMeetingAgentConfigActive({})).toEqual({});
     expect(mod.vcMeetingAgentConfigActive(undefined)).toBeUndefined();
   });
 
   it('apiOnly wins over enabled regardless of field order / extra keys (fail-closed)', () => {
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
       .toBeUndefined();
+  });
+
+  // 回归(PR#916 codex阻断①):VC/实时语音默认开翻转后,enabled:false 是显式退出,
+  // 必须能 round-trip 存活。这里**过真实 parseBotConfigsFromText → vcMeetingAgentConfigActive**
+  // (而不是手搓对象喂 active),否则 normalizer 丢 false 的 bug 会被假绿掩盖。
+  it('a persisted vcMeetingAgent.enabled:false round-trips through parse and stays opted out', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_off', larkAppSecret: 's', vcMeetingAgent: { enabled: false } },
+    ]));
+    expect(cfg.vcMeetingAgent?.enabled).toBe(false);
+    expect(mod.vcMeetingAgentConfigActive(cfg)).toBeUndefined();
+  });
+
+  it('a persisted realtimeVoice.enabled:false round-trips through parse (voice stays off)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_v', larkAppSecret: 's', vcMeetingAgent: { realtimeVoice: { enabled: false } } },
+    ]));
+    // 顶层不 enabled:false → bot 仍接收会议事件,但实时语音显式关闭必须保留。
+    expect(cfg.vcMeetingAgent?.realtimeVoice?.enabled).toBe(false);
   });
 });
 

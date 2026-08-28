@@ -21,6 +21,20 @@ export interface BotmuxUpdateResult {
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * Decide whether a successful `/api/update/run` response requires a restart to
+ * take effect. A restart is needed when the server explicitly says so
+ * (`restartRequired` — set for local-dev, whose build regenerates dist/ even
+ * when HEAD didn't move) OR when the installed version changed (the generic
+ * npm/pnpm/bun path, which sends no `restartRequired`). Pure so the Settings
+ * update flow can be regression-tested without rendering the component.
+ */
+export function updateResponseNeedsRestart(
+  body: { restartRequired?: unknown; changed?: unknown },
+): boolean {
+  return body.restartRequired === true || body.changed === true;
+}
+
 async function responseBody(response: Response): Promise<Record<string, unknown>> {
   const body = await response.json().catch(() => null);
   return body && typeof body === 'object' ? body as Record<string, unknown> : {};

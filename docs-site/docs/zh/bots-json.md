@@ -45,7 +45,8 @@
 |------|------|
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
-| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选 |
+| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
+| `reasoningEffort` | 新会话默认思考强度。仅对 `codex` / `codex-app` / `traex` / `grok` 这类有结构化思考强度控制的 CLI 生效；按 CLI 与模型能力校验，不支持或未声明支持的组合会被拒绝或忽略 |
 | `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
 | `cliPathOverride` | 旧版 CLI 入口覆盖，继续兼容 wrapper / router 和存量自定义二进制。新接入的 Codex 兼容发行版优先用 `cliRuntime`。为支持降级到旧版 BotMux，写入端会同时保存一个与 `cliRuntime.executable` 完全相同的兼容影子；不要手工配置不一致的两者 |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
@@ -55,6 +56,7 @@
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
+| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
 
 ### Codex 兼容发行版
 
@@ -129,6 +131,23 @@
 - `/botconfig` 切换在**下一次派发给 Codex worker**时采样；普通 live 消息通常就是下一条消息，等待 repo 选择的首轮则在 repo commit 时采样。已排队或正在执行的 turn 不会被中途改写，也不会回填既有历史。
 - `additionalContext` 不出现在 Codex App 的普通用户消息气泡中，但仍可能保存在原始 rollout / 诊断记录里。开启时 Botmux 自身也会保留 legacy prompt 与结构化 sidecar 以支持兼容降级和 `retry_last_task`。此功能只解决 App 展示与普通历史阅读的整洁度，**不是**隐私擦除或安全脱敏机制。
 
+### Codex App 浏览器桥接（实验性）
+
+此能力只解决 Botmux 以 app-server 协议运行 Codex 时无法继承 Codex App 内置 Chrome 工具的问题。它是 Botmux 自身的可选适配层，不依赖任何业务仓库、Harness 或本地代理工程。
+
+```json
+{
+  "cliId": "codex-app",
+  "codexBrowser": true
+}
+```
+
+- 需要先在同一 OS 用户的 Chrome / Edge 中安装并启用 Codex 浏览器扩展；Botmux 默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存中选择最新完整版本。只有维护自定义插件目录时才填写绝对路径 `pluginRoot`。
+- 开启后仅给新建的 Codex App thread 注册一个 `botmux_browser` 动态工具。旧 thread 不会被原地改写，请新开一个飞书话题 / 会话验证。
+- 工具只暴露标签页、可访问性树交互、导航和截图等高层操作，不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史、剪贴板或文件传输。
+- 每个 Botmux runner 独立持有浏览器会话状态；默认关闭，未配置的 bot 启动参数和行为完全不变。
+- 当前不支持与 `existingAppServer`、`sandbox` 或 `readIsolation` 组合，配置冲突会在启动时直接报错，避免以不完整隔离边界运行。
+
 ## 工作目录
 
 | 字段 | 说明 |
@@ -175,6 +194,34 @@
 | `doneReactionEmoji` | 无卡片会话「已完成」reaction 的飞书 emoji_type；`undefined`=默认 `DONE`（✅）。设成与 `receivedReactionEmoji` 相同值可让完成态不翻脸——适合 idle 判定可能提前触发的 CLI（如 Pi），避免过早出现误导性的 ✅ |
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
+
+## Prompt 注入
+
+| 字段 | 说明 |
+|------|------|
+| `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
+
+关掉后模型看不到发言人身份：多人会话里无法区分谁说的、也无法按人称呼。适合模型会把标签内容抄进回复正文的 CLI（如 cursor，见 `<sender_note>` 反抄写提示——标签关掉后该提示也一并消失），或不希望把每条消息的身份写进 CLI 记录的场景。
+
+可由 owner / `allowedUsers` 通过 `/botconfig` 热更新，无需重启 daemon：
+
+```text
+/botconfig set senderTag off
+/botconfig set senderTag on
+```
+
+也可直接写进对应 bot 的配置：
+
+```json
+{
+  "senderTag": false
+}
+```
+
+- **`botmux send --mention-back` 不受影响**：它读的是 daemon 侧独立记录的本轮触发者（`replyTargets[turnId].senderOpenId`），与 prompt 里的这个标签是两条链路。
+- 关闭有两项**可观测性代价**：① `/adopt` 少一条识别「本 bot 自产会话」的指纹（其余结构判据仍覆盖现有 prompt 形态，不会因此把自产会话当外部会话列出）；② dashboard 会话洞察无法再从标签判断发言人类型与 A2A 对方名字，只能靠 `[来自 … 的 @mention]` 交棒文本标记兜底，没有该标记时该轮不显示来源。
+- 立即生效（下一轮起），不改写已排队或正在执行的 turn，也不回填既有历史。
+- dashboard「发言人标签」开关保存的就是这个字段。
 
 ## 主动开工
 

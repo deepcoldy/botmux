@@ -89,11 +89,12 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, silentIdleCardFlag, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
-import { fallbackTurnId } from '../../core/reply-target.js';
+import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -118,6 +119,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -298,7 +300,7 @@ function getSessionByActionValue(
 }
 
 function sessionCliId(ds: DaemonSession) {
-  return ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
 }
 
 /** A session's configured distribution name is frozen with its launch config.
@@ -772,6 +774,7 @@ export async function commitRepoSelection(
         }
         current.streamCardId = undefined;
         current.streamCardNonce = undefined;
+        rehomeReplyTargetState(current);
         current.streamCardPending = undefined;
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;
@@ -2183,7 +2186,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const target = resumable.find(r => r.cliSessionId === cliSessionId);
       if (!target) {
-        await pickerReply(t('cmd.adopt.resume_not_found', { id: cliSessionId }, localeForBot(ds.larkAppId)));
+        await pickerReply(t('cmd.adopt.resume_not_found', undefined, localeForBot(ds.larkAppId)));
         clearAdoptCandidates(rootId);
         if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
         return;
@@ -2423,8 +2426,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // already omits the restart button when adoptMode=true, but a stale
       // pre-fix card or a malformed action payload could still arrive.
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
-        logger.warn(`[${tag(ds)}] Rejected restart on adopt session — would kill user's pane`);
+      if (isSharedAdoptSession(ds)) {
+        logger.warn(`[${tag(ds)}] Rejected restart on shared adopt — would replace the source conversation client`);
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
@@ -2489,6 +2492,49 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
+      // Historical cards can still carry the old `close` action. A shared
+      // adopt must never interpret it as permission to terminate the source
+      // conversation; treat it as "disconnect BotMux" just like /close does.
+      if (isSharedAdoptSession(ds)) {
+        const targetSessionId = ds.session.sessionId;
+        const disconnected = await withBotTurnMutation(ds.larkAppId, async () => {
+          const current = [...activeSessions.values()].find(
+            candidate => candidate.session.sessionId === targetSessionId,
+          );
+          if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+          try {
+            const result = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
+            if (!result.ok) return 'refused' as const;
+            return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+          } catch {
+            return 'refused' as const;
+          }
+        });
+        const locDs = localeForBot(ds.larkAppId);
+        if (disconnected === 'missing') {
+          return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+        }
+        if (disconnected === 'refused') {
+          await sessionReply(rootId, t('cmd.detach.failed', undefined, locDs));
+          return;
+        }
+        if (disconnected === 'residual') {
+          await sessionReply(rootId, t('cmd.detach.residual', undefined, locDs));
+          return;
+        }
+        await sessionReply(
+          rootId,
+          t(
+            ds.session.existingAppServerEndpoint
+              ? 'cmd.detach.existing_app_server_success'
+              : 'cmd.detach.success',
+            undefined,
+            locDs,
+          ),
+        );
+        logger.info(`[${tag(ds)}] Historical close action treated as shared-adopt disconnect`);
+        return;
+      }
       const targetSessionId = ds.session.sessionId;
       const closed = await withBotTurnMutation(ds.larkAppId, async () => {
         // Card payload roots survive transfers. Re-resolve by immutable session
@@ -2503,9 +2549,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Build the closed card BEFORE closeWorkerPoolSession — it reads the
         // live session's identity off `current`.
         const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+        // The clicked card IS the live streaming card in the common in-thread
+        // (non-private) case. When so, patch it in place via the callback return
+        // below instead of sending a separate closed card — a stray extra card
+        // (and its now-dead buttons) is what we're avoiding. Only when the
+        // clicked message is that streaming card and we're not in private mode.
+        const patchClickedCardInPlace = !!cardMessageId
+          && cardMessageId === current.streamCardId
+          && value?.visibility !== 'private'
+          && !botCfg.privateCard;
         let closeResult;
         try {
-          closeResult = await closeWorkerPoolSession(targetSessionId);
+          // Don't await the worker exiting — a busy CLI only dies at the ~7s
+          // SIGKILL backstop, which blows past Lark's ~3s card-ACK window and
+          // surfaces the client-side "code: 300000" toast. The logical close is
+          // synchronous; the worker is killed in the background.
+          closeResult = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
           return { status: 'teardown_failed' as const, err };
@@ -2528,7 +2587,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             residual: closeResult.residual,
           };
         }
-        return { status: 'closed' as const, current, botCfg, card };
+        return { status: 'closed' as const, current, botCfg, card, patchClickedCardInPlace };
       });
       if (!closed) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
@@ -2570,7 +2629,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           },
         };
       }
-      const { current, botCfg, card } = closed;
+      const { current, botCfg, card, patchClickedCardInPlace } = closed;
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
       // closed card ephemeral to the same owner audience instead. No group
@@ -2586,6 +2645,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
         logger.info(`[${tag(current)}] Closed via card button (private close card → ${audience.length} owner(s))`);
       } else {
+        if (patchClickedCardInPlace) {
+          // Return the closed card as the callback response → Lark patches the
+          // just-clicked streaming card in place (no delete, no separate send,
+          // no "code: 300000" race). The "等待输入" card becomes the closed card
+          // with its now-dead buttons removed.
+          logger.info(`[${tag(current)}] Closed via card button (in-place patch)`);
+          return JSON.parse(card);
+        }
         await deliverEphemeralOrReply(current, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
         logger.info(`[${tag(current)}] Closed via card button`);
       }
@@ -2600,7 +2667,52 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const result = await resumeSession(targetSessionId, activeSessions);
         if (result.ok) {
           const cliName = sessionCliDisplayName(result.ds);
-          const resumeMsg = t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          // Distinguish "route reactivated" from "CLI history restored": when
+          // the adapter can only resume a precise cliSessionId and none was
+          // persisted, the next spawn starts a FRESH session — say so instead
+          // of claiming history is back.
+          const resumeMsg = resumeStartsFresh(result.ds.session)
+            ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+            : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
+          // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST (old closed card
+          // recalled, fresh card posted at the thread bottom), AND send the
+          // "✅ 会话已恢复…" text follow-up — both are wanted.
+          // Ordering is load-bearing for two reasons:
+          //   1) ACK the callback FIRST (bare `return` → empty ACK), THEN
+          //      post/delete in the background — deleting the just-clicked card
+          //      inside the callback response races it and triggers client
+          //      "code: 300000".
+          //   2) POST the fresh card BEFORE deleting the old one, so the thread
+          //      never briefly shows zero cards (same invariant as park→recall).
+          // Skip in private-card mode (clicked card may be an ephemeral snapshot).
+          const botCfgResume = getBot(result.ds.larkAppId).config;
+          if (cardMessageId && value?.visibility !== 'private' && !botCfgResume.privateCard) {
+            const staleCardId = cardMessageId;
+            const resumedDs = result.ds;
+            void (async () => {
+              try {
+                const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
+                resumedDs.streamCardId = freshCardId;
+                persistStreamCardState(resumedDs);
+                await deleteMessage(resumedDs.larkAppId, staleCardId).catch(() => { /* already withdrawn/expired */ });
+                // Also send the "✅ 会话已恢复…" text follow-up (the original resume
+                // behavior). Both are wanted: the live streaming card AND the text
+                // prompt telling the user to send a message to continue.
+                await deliverEphemeralOrReply(resumedDs, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
+                logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button (withdraw + repost streaming card + text)`);
+              } catch (err) {
+                logger.warn(`[${targetSessionId.substring(0, 8)}] resume card repost failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            })();
+            // Bare `return` (→ undefined) so the dispatcher's shaper emits a
+            // genuine empty ACK `{}`. Returning `{}` here would instead be
+            // truthy and get wrapped as `{card:{type:raw,data:{}}}` — an
+            // in-place patch with an empty card body (invalid), racing the
+            // background deleteMessage above. Matches every other empty-ACK in
+            // this handler.
+            return; // fast empty ACK; card work happens in background
+          }
           await deliverEphemeralOrReply(result.ds, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
         } else if (result.error === 'not_found') {
@@ -2628,14 +2740,28 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const current = [...activeSessions.values()].find(
           candidate => candidate.session.sessionId === targetSessionId,
         );
-        if (!current) return undefined;
-        await closeWorkerPoolSession(targetSessionId);
-        return current;
+        if (!current) return 'missing' as const;
+        try {
+          const result = await closeWorkerPoolSession(targetSessionId);
+          if (!result.ok) return 'refused' as const;
+          return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+        } catch {
+          return 'refused' as const;
+        }
       });
-      if (!disconnected) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (disconnected === 'missing') {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
-      await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
+      if (disconnected === 'refused') {
+        await sessionReply(rootId, t('cmd.detach.failed', undefined, locDs));
+        return;
+      }
+      if (disconnected === 'residual') {
+        await sessionReply(rootId, t('cmd.detach.residual', undefined, locDs));
+        return;
+      }
+      await sessionReply(rootId, t('card.action.disconnected', undefined, locDs));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);
     }
 
@@ -2711,7 +2837,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'hidden',
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           locDs,
           undefined,
@@ -2720,6 +2846,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -3041,7 +3168,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.session.title || getCliDisplayName(effectiveCliId),
           effectiveCliId,
           true, // showManageButtons — write-link card includes restart & close
-          !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
+          isSharedAdoptSession(ds), // shared adopt — disconnect, never close the source conversation
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
@@ -3107,7 +3234,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               next,
               ds.streamCardNonce,
               ds.currentImageKey,
-              !!ds.adoptedFrom,
+              isSharedAdoptSession(ds),
               false,
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
@@ -3116,6 +3243,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              silentIdleCardFlag(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -3153,7 +3281,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           next,
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3162,6 +3290,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
+          frozen.silentIdle === true,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -3197,7 +3326,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           next,
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3206,6 +3335,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3266,7 +3396,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3275,6 +3405,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3318,7 +3449,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
           ds.currentImageKey,
-          !!ds.adoptedFrom,
+          isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
@@ -3327,6 +3458,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
@@ -3534,7 +3666,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!selected.threadId) return;
 
     const botCfg = getBot(ds.larkAppId).config;
-    if (botCfg.cliId !== 'codex-app') return;
+    if (botCfg.cliId !== 'codex-app' && !botCfg.existingAppServer) return;
 
     const { listCodexAppThreads } = await import('../../services/codex-app-threads.js');
     let threads: Awaited<ReturnType<typeof listCodexAppThreads>>;

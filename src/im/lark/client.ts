@@ -142,6 +142,39 @@ export function __testOnly_resetAllBotClients(): void {
   allBotClientsFingerprint = null;
 }
 
+/**
+ * Find the first locally-configured (non-apiOnly) bot that is a member of
+ * `chatId`, using the QUIET probe clients (probeLarkLogger) — so misses for
+ * bots not in the chat don't splash AxiosError blobs to stdout/logs the way a
+ * plain getBotClient()+isInChat loop does.
+ *
+ * Used by `bots invite`'s auto-add flow to pick a proxy bot already in the
+ * target group (Feishu requires the adding app to be a member). Returns the
+ * matching bot's appId+cliId, or null if none of our bots are in that chat.
+ * `preferAppId` (e.g. the current session bot) is checked first.
+ */
+export async function findLocalBotInChat(
+  chatId: string,
+  preferAppId?: string,
+): Promise<{ larkAppId: string; cliId: string } | null> {
+  const clients = getAllBotClients();
+  const ordered = [
+    ...clients.filter((c) => c.appId === preferAppId),
+    ...clients.filter((c) => c.appId !== preferAppId),
+  ];
+  for (const { appId, cliId, client } of ordered) {
+    try {
+      const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+      if ((res.code === 0 || res.code === undefined) && res.data?.is_in_chat) {
+        return { larkAppId: appId, cliId };
+      }
+    } catch {
+      /* probe miss (other-tenant / no scope / not in chat) — quiet, try next */
+    }
+  }
+  return null;
+}
+
 // ─── Error types ──────────────────────────────────────────────────────────────
 
 /** Thrown when the target message has been withdrawn (Lark code 230011). */

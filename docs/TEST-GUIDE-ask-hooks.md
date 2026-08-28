@@ -8,8 +8,8 @@
 cd <你的 botmux 仓库目录>
 git fetch origin
 git checkout feat/botmux-ask-hooks      # 已在该分支则 git pull
-pnpm install
-pnpm build                              # tsc 干净，产出 dist/
+bun install --frozen-lockfile
+bun run build                           # tsc 干净，产出 dist/
 ```
 
 确认 botmux 可执行指向这个仓库的 dist：

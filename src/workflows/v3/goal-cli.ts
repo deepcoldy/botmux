@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { expandHomePath } from '../../utils/working-dir.js';
 import { validateDag, MAX_NODE_TIMEOUT_SEC, type V3Dag } from './dag.js';
@@ -107,6 +108,9 @@ export interface GoalCliDependencies {
   newRunId: () => string;
   stdout: Pick<NodeJS.WriteStream, 'write'> & { fd?: number };
   stderr: Pick<NodeJS.WriteStream, 'write'>;
+  /** Process env read by the machine-wide workflow kill-switch. Injectable so
+   *  tests can flip BOTMUX_WORKFLOW_ENABLED without mutating process.env. */
+  env: NodeJS.ProcessEnv;
 }
 
 function defaultDependencies(): GoalCliDependencies {
@@ -135,6 +139,7 @@ function defaultDependencies(): GoalCliDependencies {
     newRunId: () => `goal-${Date.now()}-${randomUUID().slice(0, 8)}`,
     stdout: process.stdout,
     stderr: process.stderr,
+    env: process.env,
   };
 }
 
@@ -530,6 +535,19 @@ export async function cmdGoal(
   let result: GoalRunResultV1 | undefined;
   if (sub !== 'run') {
     result = errorResult('error', 'USAGE', 'usage: botmux goal run <goal> [options]', null);
+  } else if (!isWorkflowFeatureEnabled(deps.env)) {
+    // Machine-wide workflow kill-switch. `botmux goal run` reuses the SAME v3
+    // runtime (runWorkflow + ephemeral pool + journal + drive lease) as the
+    // gated `botmux v3 run`, so it is an operator/agent-facing real-run launch
+    // and must refuse too. NOTE: this does NOT touch in-flight node execution —
+    // the ephemeral pool runs a node by sending the `/goal` slash prompt into a
+    // CLI pane (buildGoalCommand), never by invoking this subcommand.
+    result = errorResult(
+      'error',
+      'WORKFLOW_DISABLED',
+      '本机已关闭「工作流(Workflow)」功能，`botmux goal run` 不可用。如需开启，请在 Dashboard 设置页打开「工作流功能」开关，或设置 BOTMUX_WORKFLOW_ENABLED=true。',
+      valueFor(rest, '--run-id') ?? null,
+    );
   } else {
     let args: GoalRunArgs | undefined;
     try {

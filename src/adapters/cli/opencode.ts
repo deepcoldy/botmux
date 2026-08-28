@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
@@ -64,39 +64,23 @@ type StatementSyncLike = {
   all(...params: unknown[]): any[];
 };
 
-let sqliteModule: { DatabaseSync: new (path: string, opts?: { readOnly?: boolean }) => DatabaseSyncLike } | null = null;
-let sqliteLoadAttempted = false;
-
-function loadSqlite(): typeof sqliteModule {
-  if (sqliteLoadAttempted) return sqliteModule;
-  sqliteLoadAttempted = true;
-  // ESM 下没有裸 require（ReferenceError），必须走 createRequire —— traex.ts 曾因
-  // 裸 require 被 try/catch 吞掉而在生产 dist 里整条 SQLite 链路静默失效。
-  try {
-    const req = createRequire(import.meta.url);
-    sqliteModule = req('node:sqlite') as typeof sqliteModule;
-  } catch {
-    sqliteModule = null;
-  }
-  return sqliteModule;
-}
-
 /** 只读打开 opencode.db 执行一次查询。DB 是 WAL 模式且被活跃 OpenCode 进程持有，
  *  read-only 连接可并发读；任何失败（模块缺失/文件不存在/短暂锁忙）都回落 null，
  *  上层按"无法验证"降级，不影响输入投递本身。opencode2 与 opencode 共用该库。 */
 export function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const mod = loadSqlite();
-  if (!mod) return null;
   const dbPath = opencodeDbPath();
   if (!existsSync(dbPath)) return null;
-  let db: DatabaseSyncLike | undefined;
+  // Runtime-agnostic open: node:sqlite on Node, bun:sqlite on the compiled
+  // binary (node:sqlite is absent under Bun). Returns null if neither loads,
+  // matching the best-effort degrade below.
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true }) as DatabaseSyncLike | null;
+  if (!db) return null;
   try {
-    db = new mod.DatabaseSync(dbPath, { readOnly: true });
     return fn(db);
   } catch {
     return null;
   } finally {
-    try { db?.close(); } catch { /* ignore */ }
+    try { db.close(); } catch { /* ignore */ }
   }
 }
 
@@ -237,7 +221,7 @@ export function listOpenCodeResumableSessions(opts: { limit: number; exclude?: R
     out.push({
       cliSessionId: r.id,
       cwd: r.directory,
-      title: (r.title ?? '').trim() || r.id,
+      title: (r.title ?? '').trim(),
       lastActivityAt: r.timeUpdated,
     });
   }

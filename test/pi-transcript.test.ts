@@ -124,16 +124,35 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(finals[0].terminalErrorCode).toBe('pi_turn_aborted');
   });
 
-  it('emits assistant_final on stopReason:error with empty text → failed/pi_turn_error', () => {
+  it('classifies a stopReason:error record via its errorMessage → failed/codex_upstream_error + redacted summary (model-gateway outage)', () => {
+    // Real captured shape (pi 0.84.2, live incident): the model gateway
+    // cancelled the stream mid-turn; errorMessage sits on `message`.
     const path = writeTranscript([
       sessionHeader(),
       userMsg('trigger a backend error'),
-      assistantFinal('error', '', '2026-08-03T05:14:05.000Z', 'upstream stream error: Cancelled by backend'),
+      assistantFinal('error', '', '2026-08-03T05:14:05.000Z',
+        'upstream stream error: rpc error: code = 1 desc = Cancelled by backend [biz error]'),
+    ]);
+    const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].terminalStatus).toBe('failed');
+    // Shared Codex-family classifier: gateway/upstream failure, NOT the
+    // opaque pi_turn_error → the failure card names the real cause.
+    expect(finals[0].terminalErrorCode).toBe('codex_upstream_error');
+    expect(finals[0].terminalErrorSummary).toContain('Cancelled by backend');
+  });
+
+  it('keeps failed/pi_turn_error (no summary) when the error record has NO errorMessage', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('trigger a backend error'),
+      assistantFinal('error', '', '2026-08-03T05:14:05.000Z'),
     ]);
     const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
     expect(finals).toHaveLength(1);
     expect(finals[0].terminalStatus).toBe('failed');
     expect(finals[0].terminalErrorCode).toBe('pi_turn_error');
+    expect(finals[0].terminalErrorSummary).toBeUndefined();
   });
 
   it('emits assistant_final on stopReason:length as a completed (truncated) answer', () => {

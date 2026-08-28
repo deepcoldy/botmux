@@ -219,6 +219,68 @@ describe('transferSession', () => {
     expect(registry.has(sessionKey('om_dm_topic_root', 'cli_app_test'))).toBe(true);
   });
 
+  it('re-homes buffered reply metadata so the resumed worker cannot route back to the source topic', async () => {
+    const ds = makeDs({
+      currentReplyTarget: {
+        rootMessageId: 'om_source_reply',
+        turnId: 'turn-source',
+        updatedAt: new Date().toISOString(),
+      },
+      replyThreadAliases: {
+        om_source_reply: {
+          createdAt: new Date().toISOString(),
+          lastUsedAt: new Date().toISOString(),
+        },
+      },
+      streamCardReplyTargetKey: 'thread:om_source_reply',
+    });
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.replyThreadAliases = ds.replyThreadAliases;
+    ds.session.streamCardReplyTargetKey = 'thread:om_source_reply';
+    ds.session.turnReplyContexts = {
+      'turn-source': {
+        target: { mode: 'thread', rootMessageId: 'om_source_reply' },
+        quoteTargetId: 'om_source_message',
+        replyTargetSenderOpenId: 'ou_user',
+      },
+    };
+    ds.session.replyTargets = {
+      'turn-source': {
+        rootMessageId: 'om_source_reply',
+        quoteOnly: true,
+        substitute: true,
+        updatedAt: new Date().toISOString(),
+        senderOpenId: 'ou_user',
+      },
+    };
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const result = await callTransfer(
+      ds.session.sessionId,
+      'oc_target',
+      'om_target_topic',
+      'group',
+      'thread',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(ds.currentReplyTarget).toBeUndefined();
+    expect(ds.replyThreadAliases).toBeUndefined();
+    expect(ds.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(ds.session.replyThreadAliases).toBeUndefined();
+    expect(ds.session.streamCardReplyTargetKey).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.['turn-source']).toEqual({
+      target: { mode: 'thread', rootMessageId: 'om_target_topic' },
+      replyTargetSenderOpenId: 'ou_user',
+    });
+    expect(ds.session.replyTargets?.['turn-source']).toEqual({
+      updatedAt: expect.any(String),
+      senderOpenId: 'ou_user',
+    });
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
   it('returns session_not_active when sessionId not in registry', async () => {
     const r = await callTransfer('does-not-exist', 'oc_target', 'om_target_root');
     expect(r.ok).toBe(false);

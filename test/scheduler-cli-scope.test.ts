@@ -8,6 +8,11 @@ describe('schedule CLI session scope propagation', () => {
     expect(cliSource).toContain("scope?: 'thread' | 'chat';");
     expect(cliSource).toMatch(/function detectCurrentSession[\s\S]*?scope: s\.scope,/);
     expect(cliSource).toMatch(/const executionPosition: 'top-level' \| 'topic' \| 'new-topic' =[\s\S]*?cur\?\.scope/);
+    // Group/topic_group sessions default to top-level (never pin results to the
+    // topic the schedule was created in — e.g. an adopted one); only p2p keeps
+    // the legacy scope-based inference.
+    expect(cliSource).toMatch(/cur\?\.chatType === 'p2p'/);
+    expect(cliSource).toMatch(/rootMessageId: executionPosition === 'topic' \? rootMessageId : undefined/);
     expect(cliSource).toMatch(/const scope: 'thread' \| 'chat' = executionPosition === 'topic'/);
     expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?\bscope,[\s\S]*?\bexecutionPosition,[\s\S]*?\btopicTitle,[\s\S]*?\}\);/);
     expect(cliSource).not.toContain('--new-topic 与 --silent 不能同时使用');

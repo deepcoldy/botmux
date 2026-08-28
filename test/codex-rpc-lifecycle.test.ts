@@ -25,6 +25,14 @@ describe('codexRpcEligible — the eligible base case', () => {
     expect(codexRpcEligible(baseCfg({ cliId: 'traex' }))).toBe(true);
     expect(RPC_CAPABLE_CLIS.has('traex')).toBe(true);
   });
+  it('traex reasoningEffort stays eligible for RPC input', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliId: 'traex',
+      model: 'DeepSeek-V4-Pro',
+      reasoningEffort: 'medium',
+      startupCommands: undefined,
+    }))).toBe(true);
+  });
   it('a resume (no prompt but resume + cliSessionId) is eligible', () => {
     expect(codexRpcEligible(baseCfg({ prompt: '', resume: true, cliSessionId: 'thread-1' }))).toBe(true);
   });

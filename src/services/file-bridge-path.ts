@@ -15,6 +15,7 @@ import { cocoEventsPathForSession, findCocoSessionByPid } from './coco-transcrip
 import { findPiTranscriptByPid, findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokSessionByPid, findGrokUpdatesBySessionId } from './grok-transcript.js';
 import { findCursorTranscriptByChatId, findCursorTranscriptByPid } from './cursor-transcript.js';
+import { ompTranscriptPath } from '../adapters/cli/oh-my-pi.js';
 
 export interface FileBridgePathOpts {
   sessionId?: string;
@@ -48,6 +49,8 @@ function resolveBySessionId(cliId: string, sessionId: string, cwd?: string): str
     }
     case 'pi':
       return findPiTranscriptBySessionId(sessionId, cwd);
+    case 'oh-my-pi':
+      return ompTranscriptPath(sessionId) ?? undefined;
     case 'grok':
       return findGrokUpdatesBySessionId(sessionId, cwd);
     case 'traex':

@@ -31,6 +31,7 @@ import {
   recordPending,
   recordCompleted,
   recordFailedStrict,
+  recordTerminalFailureStrict,
   lookup,
   deleteResults,
 } from '../src/services/async-trigger-store.js';
@@ -222,5 +223,29 @@ describe('recordFailedStrict (authoritative dispatch_unknown terminal)', () => {
 
   it('requires ownerLarkAppId', () => {
     expect(() => recordFailedStrict('sessN', 'trg_n', 1, '')).toThrow(/ownerLarkAppId/);
+  });
+});
+
+describe('recordTerminalFailureStrict (explicit worker terminal)', () => {
+  it('persists the structured terminal code and preserves createdAt', () => {
+    recordPending('sessT', 'trg_t', 1000, 'cli_test');
+    recordTerminalFailureStrict('sessT', 'trg_t', 7000, 'cli_test', 'provider_unexpected_eof');
+
+    expect(lookup('sessT', 'trg_t')?.result).toEqual({
+      status: 'failed',
+      createdAt: 1000,
+      failedAt: 7000,
+      errorCode: 'trigger_failed',
+      reason: 'turn_terminal',
+      terminalErrorCode: 'provider_unexpected_eof',
+    });
+  });
+
+  it('keeps a completed result stronger than a late failure terminal', () => {
+    recordCompleted('sessTC', 'trg_tc', 'done', 5000, 'cli_test');
+    expect(recordTerminalFailureStrict(
+      'sessTC', 'trg_tc', 7000, 'cli_test', 'provider_server_error',
+    )).toBe('already_completed');
+    expect(lookup('sessTC', 'trg_tc')?.result.status).toBe('completed');
   });
 });

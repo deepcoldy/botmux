@@ -1,9 +1,9 @@
-import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 import {
   managedOriginCapabilityPath,
@@ -20,9 +20,7 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
   stderr: string;
 }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [
-      '--import', 'tsx', join(__dirname, '..', 'src', 'cli.ts'), ...args,
-    ], {
+    const child = spawnTsScript(join(__dirname, '..', 'src', 'cli.ts'), args, {
       cwd: join(__dirname, '..'),
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -185,28 +183,28 @@ describe('cmdSend hook context wiring', () => {
           larkAppId: 'app-a',
         },
       }));
-      const result = spawnSync(process.execPath, [
-        '--import', 'tsx',
+      const result = spawnSyncTsScript(
         join(__dirname, '..', 'src', 'cli.ts'),
-        'send', 'must-not-leak', '--session-id', 'destination', '--no-mention',
-      ], {
-        cwd: join(__dirname, '..'),
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          SESSION_DATA_DIR: dataDir,
-          BOTMUX_SESSION_ID: 'origin',
-          // These are inherited spawn-time fallbacks, not a live marker or
-          // protected capability. They must not select (or bypass) a sink.
-          BOTMUX_TURN_ID: 'turn-stale',
-          BOTMUX_DISPATCH_ATTEMPT: '99',
-          BOTMUX_HOST_RELAY_AUTHORIZED: '',
-          BOTMUX_SEND_RELAY: '',
-          BOTMUX_WORKFLOW: '',
-          BOTMUX_LARK_APP_ID: '',
-          BOTMUX_LARK_APP_SECRET: '',
+        ['send', 'must-not-leak', '--session-id', 'destination', '--no-mention'],
+        {
+          cwd: join(__dirname, '..'),
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'origin',
+            // These are inherited spawn-time fallbacks, not a live marker or
+            // protected capability. They must not select (or bypass) a sink.
+            BOTMUX_TURN_ID: 'turn-stale',
+            BOTMUX_DISPATCH_ATTEMPT: '99',
+            BOTMUX_HOST_RELAY_AUTHORIZED: '',
+            BOTMUX_SEND_RELAY: '',
+            BOTMUX_WORKFLOW: '',
+            BOTMUX_LARK_APP_ID: '',
+            BOTMUX_LARK_APP_SECRET: '',
+          },
         },
-      });
+      );
       expect(result.status).toBe(2);
       expect(result.stderr).toContain('unsettled durable output but no fresh authoritative dispatch identity');
       expect(result.stderr).not.toContain('must-not-leak');

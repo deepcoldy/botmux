@@ -11,7 +11,7 @@ export const messages: Record<string, string> = {
   'card.btn.open_local_codex': '打开 Codex',
   'card.btn.open_local_trae': '打开 TRAE',
   'card.btn.get_write_link': '🔑 获取操作链接',
-  'card.writable_terminal_link': '🔑 可操作终端（群内可见，任何人可直接操控）：[{url}]({url})',
+  'card.writable_terminal_warning': '🔑 可操作终端（群内可见，任何人可直接操控）',
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',
@@ -35,6 +35,7 @@ export const messages: Record<string, string> = {
   'card.status.starting': '启动中…',
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
+  'card.status.idle_silent': '已处理 · 判定无需回复',
   'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',
   'card.status.stalled': '长时间无进展',
@@ -57,10 +58,13 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_or_run': '点击「恢复会话」继续，或在终端执行：',
   'card.body.click_resume_only': '点击「恢复会话」继续。',
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
+  'card.body.resume_starts_fresh': '点击「恢复会话」可重新激活本话题的消息路由；但 {cliName} 没有可精确恢复的历史会话，下次对话将**新起干净会话**，旧上下文不会带回。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
+  'worker.rate_limit_notify.rate': '⚠️ {cliName} 触发限流，本轮任务已暂停。请在 {retryLabel} 后重发上一条任务，或直接发送新消息继续。',
+  'worker.rate_limit_notify.usage': '⚠️ {cliName} 已达使用限额，本轮任务已暂停。额度刷新后（{retryLabel}）请重发上一条任务，或直接发送新消息继续。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
   'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
 
@@ -170,7 +174,7 @@ export const messages: Record<string, string> = {
   'card.adopt.section_resume': '**恢复历史会话**（从磁盘 resume 导入，无需进程在跑）',
   'card.adopt.placeholder_resume': '选择要 resume 的历史会话',
   // V2 picker (search + card list + pagination), replacing the two dropdowns.
-  'card.adopt.search_placeholder': '🔍 搜索会话（标题/项目/路径/会话 ID）',
+  'card.adopt.search_placeholder': '🔍 搜索会话（标题/项目/路径）',
   'card.adopt.empty': '当前没有可接入的会话。\n（运行中：tmux / zellij / herdr 里正在跑的本机 CLI；历史：本 bot 同类 CLI 从磁盘可 resume 的会话。）',
   'card.adopt.empty_filtered': '没有匹配「{query}」的会话，请换个关键词。',
   'card.adopt.kind_live': '🟢 运行中',
@@ -178,7 +182,7 @@ export const messages: Record<string, string> = {
   'card.adopt.field_kind': '来源',
   'card.adopt.field_cli': 'CLI',
   'card.adopt.field_dir': '路径',
-  'card.adopt.field_session': '会话 ID',
+  'card.adopt.field_candidate': '候选',
   'card.adopt.field_time_live': '已运行',
   'card.adopt.field_time_resume': '最近活动',
   'card.adopt.field_target': '位置',
@@ -186,7 +190,6 @@ export const messages: Record<string, string> = {
   'card.adopt.hint_pick_first': '点击上方任意会话以选中，再点下方按钮确认接入。',
   'card.adopt.btn_confirm_live': '确认接管到本话题',
   'card.adopt.btn_confirm_resume': '确认恢复到本话题',
-  'card.adopt.session_unknown': '（未探测到）',
   'card.adopt.truncated': '⚠️ 历史会话较多，仅列出最近 {limit} 条，请用上方搜索缩小范围。',
   'card.adopt.toast_not_invoker': '这张菜单是别人召唤的，请自己发 /adopt 召唤一张。',
   'card.adopt.toast_no_perm': '你没有该会话的操作权限。',
@@ -417,13 +420,19 @@ export const messages: Record<string, string> = {
   'card.adopt_blocked.body': '本话题正在等待你选择仓库，无法直接 /adopt 接管已在运行的 CLI。\n\n请点下方「关闭会话」结束当前的选仓会话，然后重新 /adopt 接管你的 CLI（原 CLI 不受影响）。',
   'cmd.adopt.success': '📡 已接入 {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ 已恢复 {cliName} 历史会话 · {project} —「{title}」',
-  'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用（{id}）',
+  'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用。',
+  'cmd.adopt.managed_other_topic': '⚠️ 该 ID 是另一个话题的 Botmux 会话，不能用 /adopt 搬到当前话题。请到原话题点击「恢复会话」，或在本机运行 `botmux resume {id}`。',
   'cmd.detach.success': '⏏ 已断开，原 CLI 会话不受影响',
+  'cmd.detach.existing_app_server_success': '⏏ 已断开飞书侧的 Codex 远程客户端；开发机 App Server 和 Codex App 会话仍在运行。',
+  'cmd.detach.failed': '⚠️ 未能安全断开 BotMux 共享入口；原 Codex App 会话未受影响，请稍后重试。',
+  'cmd.detach.residual': '⚠️ BotMux 共享入口未能确认完全断开；原 Codex App 会话未受影响，请检查会话状态后重试。',
   'cmd.detach.not_adopted': '本话题不是 /adopt 接入的会话，/detach 不适用。要结束 botmux 会话用 /close（会一并结束 CLI 进程）。',
   'cmd.codex_app_adopt.no_threads': '未发现可继续的 Codex App 对话',
   'cmd.codex_app_adopt.thread_not_found': '未找到 Codex App 对话 {threadId}',
   'cmd.codex_app_adopt.list_failed': '读取 Codex App 对话失败：{error}',
   'cmd.codex_app_adopt.success': '📱 已继续 Codex App 对话：{title}',
+  'cmd.codex_existing_app_server_adopt.success': '🔗 已共享接入现有 Codex App 对话：{title}。飞书与 Codex App 连接同一条 thread；BotMux 不会新建或停止开发机 App Server。\n\n若远程终端首次显示 “Hooks need review”，请在 Web Terminal 中选择 “Continue without trusting”；BotMux 不会自动信任全部 Hook。',
+  'cmd.codex_existing_app_server_adopt.already_attached': '本话题已共享接入一条 Codex App 对话。请先 `/detach` 断开 BotMux 侧客户端，再选择另一条 thread；请避免两端同时提交不同任务。',
   'cmd.oncall.need_group': '/oncall 需要在群聊中、以新话题方式使用。',
   'cmd.oncall.not_bound': '当前 bot 在本群尚未绑定 oncall 项目。\n\n用法：\n/oncall bind <path>     — 把当前 bot 在本群绑到某个项目目录，跳过仓库选择卡片\n/oncall unbind          — 解除当前 bot 在本群的 oncall 绑定\n/oncall status          — 查看当前 bot 的绑定状态\n\noncall 绑定按 bot 计：只影响被 @ 的那个 bot；多个 bot 一起绑用 @bot1 @bot2 /oncall bind <path>。\n绑定后：群内任何成员都可以 @ 机器人提问；仅 allowedUsers 能点卡片按钮、执行 /cd /restart /close 等命令。',
   'cmd.oncall.bound': '🟢 已绑定 oncall\n工作目录：{dir}\n\n/oncall unbind 可解除绑定；/cd <path> 切换工作目录（仍保留 oncall 模式）。',
@@ -700,6 +709,9 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',
+  'ai.routing.workflow_hint': 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。',
+  'ai.routing.feedback_response_kind': '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。',
+  'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
   'ai.send.after_success_hint': '若还有要发给用户的内容，继续 `botmux send`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
@@ -793,6 +805,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 已重新启动 {cliName}',
   'card.action.resume_missing_session_id': '⚠️ 缺少 session_id，无法恢复。',
   'card.action.resume_success': '✅ 会话已恢复，发条消息继续与 {cliName} 对话。',
+  'card.action.resume_success_fresh': '✅ 话题路由已重新激活。{cliName} 没有可精确恢复的历史会话，下条消息将**新起干净会话**，旧上下文不会带回。',
   'card.action.resume_not_found': '⚠️ 找不到会话 {short}，可能已被清理。',
   'card.action.resume_not_closed': '会话已是活跃状态，无需恢复。',
   'card.action.resume_anchor_occupied': '⚠️ 当前话题已有新会话{detail}，无法恢复旧会话。',
@@ -845,6 +858,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
   'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
+  'worker.mojo_legacy_pinned': '⚠️ 本 mojo 会话创建于「本机执行」升级之前，已被固定在旧的沙箱回退模式——这里的工具和回复基本不可用。这是刻意为之（升级绝不能把活跃会话悄悄切到本机执行）。\n请关闭本会话（❌ 按钮或 /close），再发一条新消息即可用新行为开启全新会话。',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.input_delivery_failed': '⚠️ Worker 未能接收这条消息。Botmux 已在同一 Worker 上自动重试，但仍未完成接收；为避免跨进程重复执行，没有继续重投。请重发本条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
@@ -854,11 +868,20 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
+  'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
+  'worker.silent_turn_receipt': '🪧 本轮已处理完毕：我判定这条消息无需回复（自动回执）。如需我必须回话，请再 @ 我并明确要求答复。',
   'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
+  'worker.empty_final_failed_upstream': '⚠️ {cliName} 遇到模型网关/上游服务故障：{reason}\n这是服务端暂态错误，与你的消息内容无关；请稍后重发消息重试。',
+  'worker.ordinary_recovery_exhausted': '⚠️ Claude 因暂态模型服务故障中断，Botmux 已自动续跑 2 次但仍未恢复。会话已停止自动续跑，避免重复外部操作；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
+  'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude 因暂态模型服务故障中断，但 Botmux 无法安全提交自动续跑。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_delivery_failed': '⚠️ Claude 因暂态模型服务故障中断，但自动续跑未能送达 Worker。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux 在自动续跑交接期间重启，当前执行状态无法确认。为避免重复外部操作，Botmux 没有重放本次续跑；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_non_retryable': '⚠️ Claude 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
+  'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
@@ -1112,6 +1135,16 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
   'card.dashboard.overview.goto_groups': '📂 群组',
+  // 「打开工作台」是纯链接按钮（appCenter AppLink），不是 dash_overview_* 回调。
+  'card.dashboard.overview.open_workbench': '打开工作台',
+  // 按钮链接带长期 token、常驻不过期（产品决策，见 core/workbench-link.ts）。这行
+  // 小字承担用户侧的知情权：告诉他这个入口不会过期，也告诉他怀疑泄漏时怎么自己
+  // 作废。卡片里只有按钮、没有明文链接行，所以这里也不写链接本体，只写 rotate。
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 常驻入口，不会过期；怀疑泄漏用 <font color="grey">botmux dashboard rotate</font> 轮换 token 立即作废',
+  // 降级路径：读不到 token 时按钮链接不带凭证，如实说明，别吹「常驻不过期」。
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 暂时读不到 Dashboard 凭证，打开后需在浏览器里登录',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
@@ -1238,6 +1271,7 @@ export const messages: Record<string, string> = {
   'card.adopt_last_round': '📜 /adopt 前最后一轮',
   'card.local_turn_resumed': '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）',
   'card.local_turn': '🖥️ 终端本地对话（在 adopted pane 中直接输入，已同步至飞书）',
+  'card.codex_app_shared_turn': '🖥️ Codex App 共享对话（已同步至飞书）',
 
   // Scheduler announcements
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
@@ -1302,8 +1336,30 @@ export const messages: Record<string, string> = {
   'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
   'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
-  'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏分组还挂不上（{reason}）：消息分组是你的个人数据，需要你授权一次。点此授权：\n{url}\n\n⚠️ 授权完成后浏览器会跳到一个打不开的本机回调地址（127.0.0.1）——这是正常的，请把浏览器地址栏的完整链接复制发给我即可完成授权。也可以在 Dashboard 改用「群标签」模式（无需任何授权）。',
+  // 回跳地址按本次链接实际用的 redirect_uri 填（{redirect}），不写死 127.0.0.1：
+  // 配了 oauthRedirectBase / 平台绑定 / 反代的机器压根不会跳 loopback。
+  'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏分组还挂不上（{reason}）：消息分组是你的个人数据，需要你授权一次。点此授权：\n{url}\n\n⚠️ 授权完成后浏览器会跳到回调地址（{redirect}）；如果那个页面打不开是正常的，请把浏览器地址栏的完整链接复制发给我即可完成授权。也可以在 Dashboard 改用「群标签」模式（无需任何授权）。',
   'sg.tag_scope_nudge': '🏷️ 会话群已创建，但群标签还打不上：应用缺少「{scope}」租户权限。点此一键开通（管理员，无需授权流程，即时生效）：\n{url}\n\n开通后新建的会话群会自动打上标签。若无法开通（部分租户权限目录中没有该权限），可在 Dashboard 会话设置中把标签模式改为 feed-group（用户消息分组，授权一次即可）或 off。',
   'cmd.login.tags_title': '🏷️ 会话群标签授权（消息分组）',
-  'cmd.login.tags_footer': '授权后，新建的会话群会自动进入侧边栏「Botmux群会话」分组（一次授权长期有效，token 自动续期）。',
+  // 分组名不再写死：默认是「<bot 名>会话」，也可以在 Dashboard 里自定义，所以这里
+  // 只说「侧边栏分组」，不点名具体分组。
+  'cmd.login.tags_footer': '授权后，新建的会话群会自动进入侧边栏对应的消息分组（一次授权长期有效，token 自动续期）。',
+  'cmd.cot.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /cot。',
+  'cmd.cot.off_ok': '🔕 已关闭本群思考过程消息，turn 进行中不再出思考气泡。/cot on 恢复。',
+  'cmd.cot.on_ok': '🧠 已恢复本群思考过程消息，下个 turn 生效。',
+  'cmd.cot.on_master_off': '🧠 已恢复本群思考过程消息，但 bot 级总开关未开——需要先 /botconfig set thinkingCard on 才会出思考气泡。',
+  'cmd.cot.status_on': '🧠 思考过程消息：开启中（总开关开 + 本群未关闭）。/cot off 可关闭本群。',
+  'cmd.cot.status_chat_off': '🔕 思考过程消息：本群已关闭。/cot on 恢复。',
+  'cmd.cot.status_master_off': '🔕 思考过程消息：bot 级总开关未开。/botconfig set thinkingCard on 开启（本群未单独关闭）。',
+  'cmd.cot.fail': '⚠️ 操作失败：{reason}',
+  'cmd.cot.show_now': '🧠 已召唤本 turn 的思考气泡（含目前已累积的思考过程；本 turn 结束后自动恢复原设置）。',
+  'cmd.cot.show_armed': '🧠 当前没有进行中的思考——下个 turn 将展示一次思考气泡，结束后自动恢复原设置。',
+  'cmd.cot.usage': '用法：/cot（查看状态）| /cot off（本群关思考消息）| /cot on（恢复）| /cot show（临时看一次）',
+  'help.cot': '/cot        - 思考过程消息开关（当前群）：/cot off 关闭、/cot on 恢复、/cot show 临时看一次、/cot 查状态（bot 总开关见 /botconfig thinkingCard）',
+  'cot.tool.bash': '执行命令',
+  'cot.tool.write': '编辑文件',
+  'cot.tool.read': '读取文件',
+  'cot.tool.search': '搜索',
+  'cot.tool.task': '任务管理',
+  'cot.tool.default': '调用 {name}',
 };

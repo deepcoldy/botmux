@@ -117,7 +117,7 @@ export async function snapshotToPng(
     // the *current* visible rows, not buffer rows 0..N-1 which may be
     // stale scrollback after that scroll.
     const startY = terminal.buffer.active.baseY;
-    const png = captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
+    const png = await captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
     const content = readViewportText(terminal, { filter: true, startY, rows: snap.rows });
     return { png, ansi: snap.ansi, content };
   } finally {

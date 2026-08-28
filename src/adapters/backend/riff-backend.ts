@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { join, delimiter } from 'node:path';
+import { execFileSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import type {
   SessionBackend,
@@ -83,6 +84,28 @@ export interface RiffBackendConfig {
   jwt?: string;
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
   jwtEnv?: string;
+  /**
+   * Command to refresh the ByteCloud JWT when the keychain holds no live token.
+   * When neither `config.jwt` nor the env token is set and `readBytecloudKeychainJwt`
+   * returns null (every candidate expired / within the safety window / absent),
+   * riff task creation would fail with a 401 that aborts the whole turn. Before
+   * giving up, we run this command ONCE (debounced) to let the owning CLI
+   * (bytedcli / kaboo-cli) refresh credentials and rewrite the keychain, then
+   * re-read. bytedcli is the ByteCloud JWT owner: `bytedcli auth
+   * get-bytecloud-jwt-token --force-refresh` refreshes via its Auth SDK and
+   * writes the token to `~/.local/share/bytedcli/data/bytecloud-auth/…`, which is
+   * already a `bytecloudKeychainCandidates` path.
+   *
+   * Shape: [binary, ...args]. When unset, resolves in order:
+   *   1. env `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split, e.g. `bytedcli auth get-bytecloud-jwt-token --force-refresh`)
+   *   2. a `bytedcli` binary found on PATH → `bytedcli auth get-bytecloud-jwt-token --force-refresh`
+   *   3. otherwise no auto-refresh (fail-closed to the old behaviour — a 401).
+   * We intentionally do NOT default to `npx @bytedance-dev/bytedcli@latest`: an
+   * uncached/`@latest` npx resolve can block ~30s per call, far too slow for a
+   * synchronous pre-request refresh. Deployments wanting npx must set the env
+   * explicitly (and ideally pin the version).
+   */
+  jwtRefreshCmd?: string[];
   /** Sandbox resource pool selected for newly-created tasks. Riff defaults to
    *  BOE when omitted; follow-ups inherit the parent task's sandbox. */
   sandboxCluster?: RiffSandboxCluster;
@@ -252,7 +275,7 @@ export async function cancelRiffTaskById(
 ): Promise<boolean> {
   const attempt = async (): Promise<void> => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel')['resolveJwt']();
+    const jwt = await new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel')['resolveJwt']({ allowRefresh: false });
     if (jwt) headers['x-jwt-token'] = jwt;
     const resp = await fetch(`${cfg.baseUrl}/api/task-cancel`, {
       method: 'POST', headers, body: JSON.stringify({ id: taskId }), signal: AbortSignal.timeout(4000),
@@ -307,6 +330,13 @@ function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
   const user = env.AIME_CURRENT_USER?.trim();
   if (!workspace || !user) return null;
   return join(workspace, sanitizeAimeUser(user), '.local', 'share');
+}
+
+/** True when BOTH AIME vars are set (trimmed non-empty), i.e. bytedcli swaps its
+ *  storage root to the AIME workspace. In that runtime we must not trigger a
+ *  host-identity JWT refresh — see resolveJwt's fail-closed skip. */
+function isFullAimeRuntime(env: NodeJS.ProcessEnv): boolean {
+  return aimeDataHome(env) !== null;
 }
 
 /**
@@ -502,6 +532,145 @@ export function readBytecloudKeychainJwt(
     if (!bestLive || exp > bestLive.exp) bestLive = { jwt, exp };
   }
   return bestLive?.jwt ?? opaqueFallback;
+}
+
+/**
+ * Locate a `bytedcli` binary on PATH (used to build the default JWT-refresh
+ * command). Returns the bare name `bytedcli` when found so execFileSync resolves
+ * it via PATH, or null when absent. Injectable env/platform for testing.
+ *
+ * We look for a real installed binary rather than defaulting to
+ * `npx @bytedance-dev/bytedcli@latest`: an uncached / `@latest` npx resolve can
+ * block ~30s, which is unacceptable on the synchronous pre-request path. If
+ * bytedcli is not installed we simply do not auto-refresh (fail-closed to the
+ * prior behaviour — the request may 401, exactly as before this change).
+ */
+export function findBytedcliBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const pathVar = env.PATH ?? env.Path ?? '';
+  if (!pathVar) return null;
+  const names = platform === 'win32' ? ['bytedcli.cmd', 'bytedcli.exe', 'bytedcli'] : ['bytedcli'];
+  for (const dir of pathVar.split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      try {
+        if (existsSync(join(dir, name))) return 'bytedcli';
+      } catch { /* ignore unreadable PATH entry */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the JWT-refresh command: explicit config → env
+ * `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split) → a PATH-resident bytedcli →
+ * null (no auto-refresh). See RiffBackendConfig.jwtRefreshCmd for the rationale.
+ */
+export function resolveJwtRefreshCmd(
+  configured: string[] | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] | null {
+  if (configured && configured.length > 0) return configured;
+  const fromEnv = env.BOTMUX_RIFF_JWT_REFRESH_CMD?.trim();
+  if (fromEnv) {
+    const parts = fromEnv.split(/\s+/).filter(Boolean);
+    if (parts.length > 0) return parts;
+  }
+  const bin = findBytedcliBinary(env, platform);
+  if (bin) return [bin, 'auth', 'get-bytecloud-jwt-token', '--force-refresh'];
+  return null;
+}
+
+/** Minimum gap between speculative JWT refresh attempts. When the keychain
+ *  holds no live token, a reconnect/follow-up loop would otherwise trigger a
+ *  refresh on EVERY getJwt() call; we cap proactive refreshes at one per window
+ *  and let the shared keychain re-read serve the rest. Also caps the cost of a
+ *  refresh command that keeps failing (e.g. bytedcli not logged in). A refresh
+ *  driven by an actual server 401 bypasses this window (see `force`). */
+export const JWT_REFRESH_DEBOUNCE_MS = 60_000;
+
+/** How long a single refresh command may run before we give up. Once the
+ *  refresh is asynchronous (below) this no longer blocks the event loop — it
+ *  only bounds one awaited child process — so we keep it generous: a cold
+ *  bytedcli token fetch can take a few seconds, and a session that cannot get a
+ *  JWT has nothing useful to do anyway. */
+export const JWT_REFRESH_TIMEOUT_MS = 30_000;
+
+/** Process-wide last-attempt timestamp (ms). Shared across RiffBackend instances
+ *  because the orphan-cancel path builds a throwaway instance per call — a
+ *  per-instance clock there would never debounce. `-Infinity` means "never
+ *  attempted", so the first call always runs regardless of the clock's
+ *  magnitude. Reset helper for tests. */
+let lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+/** In-flight refresh, shared process-wide so concurrent callers COALESCE onto a
+ *  single child process instead of each spawning their own bytedcli. `null`
+ *  between attempts. */
+let inFlightJwtRefresh: Promise<boolean> | null = null;
+export function __resetJwtRefreshDebounceForTest(): void {
+  lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+  inFlightJwtRefresh = null;
+}
+
+export interface RefreshBytecloudJwtOpts {
+  /** Injectable async runner (defaults to a real execFile). */
+  runner?: (bin: string, args: string[]) => Promise<void>;
+  /** Injectable clock for the debounce window (defaults to Date.now()). */
+  nowMs?: number;
+  /** Bypass the debounce window. Set only when an actual server 401/403 proved
+   *  the current token is bad — a rejection is authoritative evidence worth one
+   *  more attempt even inside the window. Never set for speculative refreshes. */
+  force?: boolean;
+}
+
+/**
+ * Run the JWT-refresh command once, ASYNCHRONOUSLY. Never throws: a missing
+ * command, a non-zero exit, or a timeout all resolve to `false` (the caller then
+ * falls back to whatever the keychain holds — i.e. the pre-change behaviour).
+ * Resolves true only when a command actually ran to completion.
+ *
+ * Async + injectable (runner / now / force) so it never blocks the event loop
+ * (critical on the daemon-side orphan-cancel path) and the debounce / coalesce /
+ * fail-closed paths are unit-testable without spawning a real process.
+ *
+ * COALESCE: if a refresh is already in flight, ride it instead of spawning a
+ * second bytedcli — concurrent getJwt() callers share one refresh.
+ */
+export function refreshBytecloudJwt(
+  cmd: string[] | null,
+  opts: RefreshBytecloudJwtOpts = {},
+): Promise<boolean> {
+  const { runner = defaultJwtRefreshRunner, nowMs = Date.now(), force = false } = opts;
+  if (!cmd || cmd.length === 0) return Promise.resolve(false);
+  // Coalesce first: a forced caller still rides an in-flight refresh rather than
+  // racing a second child — the running one will rewrite the keychain either way.
+  if (inFlightJwtRefresh) return inFlightJwtRefresh;
+  // Debounce: cap the cost of a refresh that keeps failing. A forced (401-driven)
+  // refresh bypasses the window — the token was provably rejected.
+  if (!force && nowMs - lastJwtRefreshAtMs < JWT_REFRESH_DEBOUNCE_MS) return Promise.resolve(false);
+  lastJwtRefreshAtMs = nowMs;
+  const [bin, ...args] = cmd;
+  const run = (async (): Promise<boolean> => {
+    try {
+      await runner(bin!, args);
+      return true;
+    } catch (err) {
+      logger.warn(`[riff] JWT refresh command failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  })();
+  inFlightJwtRefresh = run;
+  return run.finally(() => { if (inFlightJwtRefresh === run) inFlightJwtRefresh = null; });
+}
+
+const execFileAsync = promisify(execFile);
+/** Default refresh runner: async execFile with a bounded timeout. stdout/stderr
+ *  are discarded — the command's SIDE EFFECT (rewriting the keychain) is what
+ *  matters; we re-read the keychain afterwards rather than parse its output. */
+async function defaultJwtRefreshRunner(bin: string, args: string[]): Promise<void> {
+  await execFileAsync(bin, args, { timeout: JWT_REFRESH_TIMEOUT_MS });
 }
 
 function defaultRunGit(cwd: string): (args: string[]) => string | null {
@@ -711,12 +880,20 @@ export class RiffBackend implements SessionBackend {
     if (this.currentTaskId) cb(this.currentTaskId);
   }
 
-  /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh works. */
-  private getJwt(): string | null {
-    return this.resolveJwt();
+  /** Resolve JWT dynamically — re-reads env/keychain each call so auto-refresh
+   *  works. Async because a keychain miss may trigger a (non-blocking) CLI
+   *  refresh. `opts.allowRefresh=false` skips the refresh entirely (daemon-side
+   *  orphan-cancel: a best-effort teardown must never freeze the daemon on a
+   *  host-identity refresh). `opts.forceRefresh=true` bypasses the debounce
+   *  window (an actual server 401 proved the token bad). */
+  private getJwt(opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {}): Promise<string | null> {
+    return this.resolveJwt(opts);
   }
 
-  private resolveJwt(): string | null {
+  private async resolveJwt(
+    opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {},
+  ): Promise<string | null> {
+    const { allowRefresh = true, forceRefresh = false } = opts;
     if (this.config.jwt) return this.config.jwt;
     const envKey = this.config.jwtEnv ?? 'RIFF_JWT';
     const fromEnv = process.env[envKey];
@@ -724,11 +901,38 @@ export class RiffBackend implements SessionBackend {
 
     // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk / bytedcli)
     const fromKeychain = this.readJwtFromBytecloudKeychain();
-    if (fromKeychain) {
+    // A forced refresh (post-401) intentionally ignores an existing keychain
+    // token: the server just rejected whatever we had, so re-reading the same
+    // store without refreshing first would hand back the same bad token.
+    if (fromKeychain && !forceRefresh) {
       logger.info(`[riff] JWT loaded from ByteCloud keychain`);
       return fromKeychain;
     }
 
+    // No live keychain token (or a forced post-401 refresh) — every candidate is
+    // expired, within the safety window, or absent. This is exactly the "token
+    // expired mid-task" / "expired at startup" case (the JWT is re-read per
+    // request). Before giving up to a 401 that would abort the turn, ask the
+    // owning CLI to refresh (non-blocking async, coalesced, non-fatal), then
+    // re-read once. Skipped when allowRefresh=false (daemon-side orphan-cancel)
+    // and inside a full AIME runtime (fail-closed identity boundary — we never
+    // trigger a host-identity refresh there; the AIME store is refreshed inside
+    // AIME).
+    if (allowRefresh && !isFullAimeRuntime(process.env)) {
+      const cmd = resolveJwtRefreshCmd(this.config.jwtRefreshCmd);
+      if (await refreshBytecloudJwt(cmd, { force: forceRefresh })) {
+        const refreshed = this.readJwtFromBytecloudKeychain();
+        if (refreshed) {
+          logger.info(`[riff] JWT refreshed via ByteCloud CLI and reloaded from keychain`);
+          return refreshed;
+        }
+      }
+    }
+
+    // Forced refresh found nothing new — fall back to the (rejected) keychain
+    // token rather than null: a stale token is no worse than no token, and the
+    // caller already knows it 401'd.
+    if (fromKeychain) return fromKeychain;
     logger.warn(`[riff] JWT not found in config, env ${envKey}, or ByteCloud keychain; API calls will fail`);
     return null;
   }
@@ -1383,10 +1587,32 @@ export class RiffBackend implements SessionBackend {
     }
 
     // Resolve JWT last — right before the request — so the safety-window
-    // freshness check reflects the token that actually goes on the wire.
-    const jwt = this.getJwt();
-    if (jwt) headers['x-jwt-token'] = jwt;
-    const resp = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(this.createTimeoutMs) });
+    // freshness check reflects the token that actually goes on the wire. `body`
+    // (string or FormData) is re-extractable per fetch, so the retry below can
+    // reuse it.
+    const post = (jwt: string | null): Promise<Response> => {
+      const h = { ...headers };
+      if (jwt) h['x-jwt-token'] = jwt;
+      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(this.createTimeoutMs) });
+    };
+
+    const firstJwt = await this.getJwt();
+    let resp = await post(firstJwt);
+
+    // One retry on an auth rejection. A 401/403 is authoritative proof the token
+    // was bad (expired mid-flight / stale at startup), so it justifies forcing a
+    // JWT refresh that bypasses the debounce window. We retry ONLY when the
+    // refresh produced a genuinely different token — otherwise the second POST
+    // would just replay the same rejected credential (this also naturally
+    // no-ops inside a full AIME runtime, where the host refresh is skipped).
+    // Other statuses (400/5xx) are not auth problems and are not retried.
+    if (resp.status === 401 || resp.status === 403) {
+      const freshJwt = await this.getJwt({ forceRefresh: true });
+      if (freshJwt && freshJwt !== firstJwt) {
+        logger.warn(`[riff] task create/follow-up got HTTP ${resp.status}; retrying once with a refreshed JWT`);
+        resp = await post(freshJwt);
+      }
+    }
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
     const result = (await resp.json()) as RiffTaskResponse;
@@ -1454,7 +1680,7 @@ export class RiffBackend implements SessionBackend {
   private async cancelTask(taskId: string): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-cancel`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = this.getJwt();
+    const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
     const resp = await fetch(url, {
       method: 'POST',
@@ -1495,7 +1721,7 @@ export class RiffBackend implements SessionBackend {
   private async streamTask(taskId: string): Promise<void> {
     const url = `${this.config.baseUrl}/api2/task-stream?id=${encodeURIComponent(taskId)}`;
     const headers: Record<string, string> = {};
-    const jwt = this.getJwt();
+    const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
 
     this.abortController = new AbortController();
@@ -1806,7 +2032,7 @@ export class RiffBackend implements SessionBackend {
     try {
       const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
       const headers: Record<string, string> = {};
-      const jwt = this.getJwt();
+      const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) return;
@@ -1838,7 +2064,7 @@ export class RiffBackend implements SessionBackend {
     try {
       const url = `${this.config.baseUrl}/api/task-detail?id=${encodeURIComponent(taskId)}`;
       const headers: Record<string, string> = {};
-      const jwt = this.getJwt();
+      const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
 
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });

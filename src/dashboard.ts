@@ -1,6 +1,6 @@
 // src/dashboard.ts
-import { createServer, get as httpGet, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createServer as createTcpServer, connect as netConnect } from 'node:net';
+import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
@@ -9,16 +9,31 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
+  parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
+  projectWorkbenchOperationCapabilities, previewInteractionWriteAllowed,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
+import {
+  resolveDashboardIdentity,
+  resolveDashboardRequestGate,
+  type DashboardRequestIdentity,
+} from './dashboard/request-identity.js';
+import { AuthSessionConnectionRegistry } from './dashboard/auth-session-connections.js';
+import { createDashboardEventsStream, type DashboardEventAudience } from './dashboard/events-sse.js';
+import {
+  ControlCsrfTokens,
+  classifyManagementUpgrade,
+  guardControlRequest,
+  injectControlCsrfMeta,
+  managementUpgradeOrigin,
+} from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
@@ -35,9 +50,28 @@ import {
   proxyDashboardAskAnswer,
 } from './dashboard/desktop-asks.js';
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
+import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
+import {
+  mintPreviewContentCapability,
+  verifyPreviewContentCapability,
+} from './dashboard/preview-content-capability.js';
+import {
+  previewDescriptorFromRow,
+  previewTeardownForDaemonEvent,
+  projectSessionDetailForBrowser,
+  projectSessionPreviewEventForBrowser,
+  projectSessionPreviewsForBrowser,
+  resolveSessionPreviewForProxy,
+} from './dashboard/preview-contract.js';
+import {
+  sameSessionPreviewTarget,
+  sessionPreviewTargetStillOwned,
+  type SessionPreviewTarget,
+} from './core/session-preview.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
+import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
 import {
@@ -49,11 +83,12 @@ import {
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
+  projectSessionEventForAudience,
+  projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
-  redactSessionEventForPublic,
-  redactSessionsForPublic,
   redactSettingsForPublic,
+  sessionBoardAudienceFor,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
@@ -66,6 +101,37 @@ import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dash
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
 import {
+  createDashboardH5AuthController,
+  DashboardSessionStore,
+  resolveDashboardH5AuthConfig,
+} from './dashboard/h5-auth.js';
+import { FileControlAuditSink } from './dashboard/control-audit.js';
+import {
+  TerminalControlManager,
+  terminalControlTtlFromEnv,
+} from './dashboard/terminal-control.js';
+import {
+  matchTerminalControlRoute,
+  resolveTerminalControlAction,
+} from './dashboard/terminal-control-route.js';
+import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
+import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
+import { handleWorkbenchDoctor } from './dashboard/workbench-doctor.js';
+import {
+  handleWorkbenchTicketRedemption,
+  revokeWorkbenchTicketsOutsideGeneration,
+  workbenchTicketGeneration,
+} from './dashboard/workbench-ticket.js';
+import { handleWorkbenchStandingLink } from './dashboard/standing-link.js';
+import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
+import {
+  centralViewLinkPath,
+  mintTerminalViewCapability,
+  terminalViewCapabilityAuthSession,
+  terminalViewForwardProof,
+  upstreamWorkerViewGeneration,
+} from './dashboard/terminal-view-capability.js';
+import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
   isTtadkWrapper,
@@ -73,6 +139,11 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from './setup/cli-selection.js';
+import {
+  staticModelChoices,
+  isKnownSelectionKey,
+  buildModelChoicesResponse,
+} from './services/model-catalog.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
@@ -80,6 +151,7 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
   buildPlatformDashboardLoginUrl,
+  workbenchEntryUrl,
   type DashboardUrls,
 } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -87,8 +159,8 @@ import { parseCloseResidual, type ParsedCloseResidual } from './core/close-resid
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
-import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot } from './utils/install-info.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
   fetchReleasesSince,
@@ -101,7 +173,15 @@ import {
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
-import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
+import { spawnDetachedRestart, globalInstallUpdateLockTarget } from './core/maintenance.js';
+import {
+  resolveLocalDevCheckoutDir,
+  resolveLocalDevRestartTarget,
+  isGitWorktree,
+  gitPorcelainStatus,
+  gitHeadSha,
+  localDevUpdateSteps,
+} from './utils/local-dev-update.js';
 import {
   detectGlobalInstallManager,
   formatGlobalInstallCommand,
@@ -125,8 +205,10 @@ import {
   writeRestartIntent,
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
-import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
-import { spawn } from 'node:child_process';
+// Host children the dashboard forks (start/stop-bot, global install). They live
+// in their own module because every one of them must run on a REDACTED env —
+// see dashboard/managed-spawn.ts.
+import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive } from './dashboard/managed-spawn.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -177,7 +259,7 @@ import {
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
-import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
+import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
   installCodexNotifierHook,
@@ -199,16 +281,12 @@ import {
   handleVcMeetingConsumerProfilesPut,
   type VcMeetingConsumerProfilesApiDeps,
 } from './dashboard/vc-consumer-profiles-api.js';
-import {
-  buildVcMeetingConsumerBootstrapAgents,
-  seedVcMeetingDefaultConsumerProfile,
-} from './services/vc-meeting-consumer-profile-bootstrap.js';
 import { evaluateVcMeetingConsumerIsolation } from './services/vc-meeting-consumer-isolation.js';
 import { resolvePairedSpawnBackendType } from './core/persistent-backend.js';
 import {
-  readVcMeetingConsumerProfiles,
-  updateVcMeetingConsumerProfiles,
-} from './services/vc-meeting-consumer-profile-store.js';
+  readVcMeetingSharedConsumerCatalogSnapshot,
+  updateVcMeetingSharedConsumerCatalog,
+} from './services/vc-meeting-shared-consumer-catalog-store.js';
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
@@ -216,6 +294,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
+import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
@@ -224,6 +303,7 @@ import {
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
@@ -246,6 +326,12 @@ import {
   parseDashboardSummaryRows,
 } from './dashboard/dashboard-summary.js';
 import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
+import {
+  createDashboardAutostartController,
+  DashboardAutostartError,
+  dashboardAutostartErrorStatus,
+  parseAutostartWrite,
+} from './dashboard/autostart-api.js';
 import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
 
 // The dashboard is an independent long-lived PM2 app and can be resurrected
@@ -257,6 +343,14 @@ scrubWorkflowWorkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+const AUTOSTART_CONFIG_DIR = join(homedir(), '.botmux');
+const dashboardAutostart = createDashboardAutostartController({
+  opts: {
+    pkgRoot: botmuxInstallRoot(),
+    configDir: AUTOSTART_CONFIG_DIR,
+    logDir: join(AUTOSTART_CONFIG_DIR, 'logs'),
+  },
+});
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
@@ -307,6 +401,125 @@ function currentDashboardToken(): string | null {
 let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
+
+const dashboardControlAudit = new FileControlAuditSink();
+const dashboardH5AuthConfig = resolveDashboardH5AuthConfig();
+const dashboardSessions = new DashboardSessionStore({ ttlMs: dashboardH5AuthConfig.sessionTtlMs });
+const dashboardH5Auth = createDashboardH5AuthController({
+  config: dashboardH5AuthConfig,
+  sessions: dashboardSessions,
+  audit: dashboardControlAudit,
+});
+const terminalControl = new TerminalControlManager({
+  secret: SECRET,
+  audit: dashboardControlAudit,
+  ttlMs: terminalControlTtlFromEnv(),
+});
+const previewInteraction = new PreviewInteractionManager({ audit: dashboardControlAudit });
+
+function legacyDashboardAuthSessionId(token: string): string {
+  return createHmac('sha256', SECRET)
+    .update('botmux-legacy-dashboard-session-id-v1\0')
+    .update(token)
+    .digest('base64url');
+}
+
+/** Stable per-machine scope for platform-dashboard actors. Shared between
+ * identity resolution and the read-capability liveness check so the two can
+ * never drift apart on the authSessionId format. */
+function platformDashboardActorScope(machineId: string): string {
+  return createHmac('sha256', SECRET)
+    .update('botmux-platform-dashboard-actor-v1\0')
+    .update(machineId)
+    .digest('base64url');
+}
+
+/**
+ * P1-5 liveness for a bound terminal read capability: `false` means the auth
+ * session it was minted under is over (H5 logout/expiry, dashboard token
+ * rotation, platform unbind), so the front proxy refuses the capability even
+ * though its signature/expiry would still verify at the worker.
+ */
+function terminalAuthSessionLive(authSessionId: string): boolean {
+  if (dashboardSessions.liveAuthSession(authSessionId)) return true;
+  const activeToken = currentDashboardToken();
+  if (activeToken && authSessionId === legacyDashboardAuthSessionId(activeToken)) return true;
+  const binding = readPlatformBinding();
+  if (binding) {
+    const scope = platformDashboardActorScope(binding.machineId);
+    if (authSessionId === `${scope}:owner`
+      || authSessionId === `${scope}:teammate`
+      || authSessionId === `${scope}:guest`) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** P1-8：预览内容凭据所属的认证会话（校验失败 → null，不予绑定）。 */
+function previewContentCapabilityAuthSession(capability: string, sessionId: string): string | null {
+  const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
+  return verified.ok ? verified.claims.authSessionId : null;
+}
+
+/** P1-7：身份判定只此一处（legacy > 平台角色 > H5），门禁选择也只读它的结论。 */
+function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentity | null {
+  return resolveDashboardIdentity({
+    legacyCookie: parseCookie(req.headers.cookie),
+    // The persisted file is the active-token authority (currentDashboardToken);
+    // there is no module-level mirror to compare against any more.
+    activeToken: currentDashboardToken(),
+    roleHeader: req.headers['x-botmux-role'],
+    platformMachineId: readPlatformBinding()?.machineId ?? null,
+    platformActorScope: platformDashboardActorScope,
+    legacyAuthSessionId: legacyDashboardAuthSessionId,
+    h5: dashboardH5Auth.resolve(req),
+  });
+}
+
+/** P1-8：authSession → 已建立的长连接（/events SSE、Preview SSE/长响应、
+ *  Preview WS）。身份一结束就遍历关闭，不等对端自己断。 */
+const authSessionConnections = new AuthSessionConnectionRegistry();
+/** P1-11：控制类端点的一次性 CSRF 票据（页面加载现签、绑定认证会话）。 */
+const controlCsrfTokens = new ControlCsrfTokens();
+
+/**
+ * 身份结束的统一收口：H5 logout/到期、legacy token rotate、平台解绑三条来源都
+ * 走这里，少走一条就等于留一扇后窗（P1-5 关写租约/读 socket，P1-8 关其余长连接，
+ * P1-11 作废该会话签出的 CSRF 票据）。
+ */
+function endDashboardAuthSession(authSessionId: string): void {
+  terminalControl.releaseByAuthSession(authSessionId);
+  previewInteraction.relockAuthSession(authSessionId);
+  authSessionConnections.closeAuthSession(authSessionId);
+  controlCsrfTokens.revokeAuthSession(authSessionId);
+}
+
+/**
+ * P1-8 平台解绑/改绑：`botmux bind|unbind` 先写 platform.json 再捅
+ * `/__cli/reload-binding`，所以进入 handler 时磁盘上已经是**新**值——想知道刚
+ * 才被吊销的是谁，只能由本进程自己记住上一次认可的 machineId。
+ */
+let observedPlatformMachineId: string | null = readPlatformBinding()?.machineId ?? null;
+
+function syncPlatformBindingRevocation(): void {
+  const current = readPlatformBinding()?.machineId ?? null;
+  if (observedPlatformMachineId && observedPlatformMachineId !== current) {
+    const scope = platformDashboardActorScope(observedPlatformMachineId);
+    for (const role of ['owner', 'teammate', 'guest'] as const) {
+      endDashboardAuthSession(`${scope}:${role}`);
+    }
+  }
+  observedPlatformMachineId = current;
+}
+
+dashboardSessions.onEnd(identity => {
+  // Ends BOTH capabilities of the authentication (P1-5): write leases AND every
+  // read socket the auth session opened (bound view-link capabilities included,
+  // via the front proxy's read-socket index). New connections with a capability
+  // minted under this authSessionId are refused by terminalAuthSessionLive.
+  endDashboardAuthSession(identity.authSessionId);
+});
 
 function tcpPortAvailable(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -360,6 +573,157 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+/**
+ * P1-13：一个会话的预览目标失效时的收口动作（本进程侧）。
+ *
+ * 「失效」= 目标没了或换了主人：worker 换代 / 切 CLI / 会话关闭 / 端口被别的进程接管。
+ * 这三件事必须一起做，少一件就留一扇后窗：
+ *   1. 断掉该会话已经建立的预览 SSE / 长响应 / WebSocket——它们握手时是合法的，此刻
+ *      仍在把一个**不再属于这个会话**的进程的内容送进浏览器；
+ *   2. 收回该会话上的交互租约（resume 出来的新一代不得继承旧的「交互模式」授权）；
+ *   3. 让持有会话的 daemon 清掉 previewTarget 并广播 `preview: null`——代理进程只有
+ *      procfs 的只读视角，改不了会话行。
+ */
+const previewInvalidationsInFlight = new Set<string>();
+function teardownSessionPreview(sessionId: string): void {
+  authSessionConnections.closeSessionStreams(sessionId);
+  previewInteraction.relockSession(sessionId);
+}
+function invalidateStalePreviewTarget(
+  sessionId: string,
+  ownerLarkAppId: string | undefined,
+  staleTarget: SessionPreviewTarget,
+): void {
+  teardownSessionPreview(sessionId);
+  if (!ownerLarkAppId || previewInvalidationsInFlight.has(sessionId)) return;
+  // 每个会话同一时刻只发一次清理请求：刷新一次页面就是几十条子资源请求，逐条捅
+  // daemon 会把一次失效放大成一场风暴。拒绝本身已经生效，这里只是让状态收敛。
+  previewInvalidationsInFlight.add(sessionId);
+  // P1-3：指名要作废的是判定失效的**那一次注册**。这条 DELETE 跨进程飞过去的途中，
+  // 会话完全可以合法地重注册一个新目标；不带 revision 的清空会把它一起抹掉。
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/preview`
+    + `?expectedRegisteredAt=${encodeURIComponent(staleTarget.registeredAt)}`;
+  void proxyToDaemon(ownerLarkAppId, path, { method: 'DELETE' })
+    .catch(() => { /* 清理是收敛动作；失败时本次拒绝依旧成立 */ })
+    .finally(() => previewInvalidationsInFlight.delete(sessionId));
+}
+
+/**
+ * 每一跳预览请求的判定入口（HTTP、WebSocket 升级、guard 页面共用同一条）。
+ *
+ * P1-12：归属复核只读 /proc/net/tcp{,6} 与 /proc/<pid>/stat（全体可读），所以即便
+ * 代理进程与 daemon 不是同一个用户也能在每次落地前重新核验。
+ */
+function resolveDashboardSessionPreview(sessionId: string): PreviewProxyResolution {
+  const owner = aggregator.ownerOf(sessionId);
+  return resolveSessionPreviewForProxy({
+    row: aggregator.getSession(sessionId),
+    sessionId,
+    ownerLarkAppId: owner,
+    daemonOnline: !!owner && !!registry.getByAppId(owner),
+    isTargetOwned: target => sessionPreviewTargetStillOwned(target),
+    onStaleTarget: (staleSessionId, staleTarget) =>
+      invalidateStalePreviewTarget(staleSessionId, owner, staleTarget),
+  });
+}
+const sessionPreviewProxy = createSessionPreviewProxy({
+  // Preview HTTP/WS never accepts ?t=. The user must first establish either
+  // the legacy management cookie or an allow-listed short H5 session.
+  authenticated: req => dashboardRequestIdentity(req) !== null,
+  resolve: resolveDashboardSessionPreview,
+  // P0: the sandboxed content stream is an opaque origin, so it carries no
+  // cookie of any kind. Its path-scoped capability is the only credential —
+  // signature + session binding + expiry here, plus central revocation
+  // (logout / token rotation / platform unbind) through the same auth-session
+  // liveness the bound terminal read capability uses.
+  verifyContentCapability: (capability, sessionId) => {
+    const verified = verifyPreviewContentCapability(SECRET, capability, sessionId);
+    return verified.ok && terminalAuthSessionLive(verified.claims.authSessionId);
+  },
+  // P1-8: preview SSE / long responses / WebSocket bridges outlive the handshake
+  // that authorised them. Index each stream under its auth session so logout /
+  // rotation / unbind tears it down immediately. The content path carries no
+  // cookie, so its owner is the capability's own authSessionId.
+  // P1-13：同一条流再按 sessionId 建第二个索引。预览目标失效（换代 / 关闭 / 端口易主）
+  // 时身份仍然有效，只能靠这个索引定点断流。
+  // P1-4：这里同时是「登记点」和「最后一次判定点」。授权发生在拨号之前，而 dev
+  // server 的握手最长可以拖 45 秒；这段窗口里的登出/到期/rotate/解绑扫描不到一条
+  // 还没入索引的流。所以登记前把身份重新解一遍并复核存活：解不出身份（cookie 那条
+  // 路的会话已经没了）或已不存活，一律 fail closed，由代理销毁上游、不回 101/200。
+  // P1-1：同一段窗口里换靶也要 fail closed。身份没变、目标却已经换代 / 切 CLI /
+  // 端口易主时，旧流握完手照样能拿到 200/101，还会被**重新登记**进索引——换靶那一刻
+  // 的 teardown 扫的是索引，扫不到一条还没入索引的流。所以登记前把目标重解一遍
+  // （`resolveDashboardSessionPreview` 内含每跳的 owner 复核）并与拨号时那个比指纹：
+  // 不是同一次注册就不登记、不回 101/200，由代理销毁上游。
+  bindStream: (req, ctx, close) => {
+    const authSessionId = ctx.contentCapability
+      ? previewContentCapabilityAuthSession(ctx.contentCapability, ctx.sessionId)
+      : dashboardRequestIdentity(req)?.authSessionId ?? null;
+    if (!authSessionId || !terminalAuthSessionLive(authSessionId)) return false;
+    const current = resolveDashboardSessionPreview(ctx.sessionId);
+    if (!current.ok || !sameSessionPreviewTarget(current.target, ctx.target)) return false;
+    return authSessionConnections.register(authSessionId, close, ctx.sessionId);
+  },
+});
+/**
+ * P1-13：daemon 侧生命周期事件 → 预览收口。
+ *
+ * daemon 在每个权威换代边界广播 `preview: null`（worker 换代 / suspend / exit /
+ * close），会话彻底结束时广播 `session.exited`。中央 Dashboard 订阅这些事件，把本地
+ * 还挂着的预览长连接断掉、交互租约收回——否则「服务端已经没有目标了，浏览器那条流
+ * 还在流」，而且 resume 之后旧的交互授权会直接落到新一代 CLI 上。
+ *
+ * P1-1：`session.spawned` 也要认。daemon 重启期间广播的 `preview: null` 是丢的（事件
+ * 总线没有 replay buffer），重连之后只以 spawned 重放形式补齐。判据与记忆都在
+ * `previewTeardownForDaemonEvent` 里——只有目标指纹**确实变了**才收口，否则每次 SSE
+ * 重连都会误杀全部预览长连接。
+ */
+const lastSeenPreviewFingerprints = new Map<string, string>();
+aggregator.on(ev => {
+  const sessionId = previewTeardownForDaemonEvent(ev, lastSeenPreviewFingerprints);
+  if (sessionId) teardownSessionPreview(sessionId);
+});
+const previewGuardPage = createPreviewGuardPage({
+  authenticated: req => dashboardRequestIdentity(req) !== null,
+  resolve: resolveDashboardSessionPreview,
+  mintContentCapability: (req, sessionId) => {
+    const identity = dashboardRequestIdentity(req);
+    return identity
+      ? mintPreviewContentCapability(SECRET, sessionId, {
+        userId: identity.userId,
+        authSessionId: identity.authSessionId,
+        expiresAt: identity.expiresAt,
+      })
+      : null;
+  },
+  // P1-11: the guard shell is same-origin with the dashboard and POSTs
+  // unlock/activity/lock itself, so it needs its own control ticket.
+  mintCsrfToken: req => {
+    const identity = dashboardRequestIdentity(req);
+    return identity ? controlCsrfTokens.mint(identity.authSessionId) : null;
+  },
+  // P2：解锁按钮按能力渲染，与工作台面板用同一份投影（canInteract）。平台
+  // teammate/guest 这类 previewCapability=readonly 的身份，解锁 POST 本来就会被
+  // 下面的 preview-interaction 路由 403；壳里不再画那个按钮，避免「点了才知道
+  // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
+  canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
+});
+const terminalFrontProxy = createTerminalFrontProxy({
+  resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
+  resolveActor: dashboardRequestIdentity,
+  control: terminalControl,
+  // P1-5: bound `?viewToken=` capabilities are refused once the auth session
+  // they were minted under ended, and their bridged sockets are indexed so
+  // logout/expiry closes them immediately (see dashboardSessions.onEnd).
+  viewCapabilityAuthSession: (sessionId, viewToken) =>
+    terminalViewCapabilityAuthSession(SECRET, sessionId, viewToken),
+  isAuthSessionLive: terminalAuthSessionLive,
+  // P1-5: this proxy is the ONLY consumer allowed to spend a view capability.
+  // The countersignature proves the loopback hop passed through here — and
+  // therefore through the liveness check above — so a raw view URL aimed at the
+  // worker port or the daemon's own `/s/` proxy is refused by the worker.
+  viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+});
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
   onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
@@ -383,6 +747,11 @@ aggregator.on(sessionPresentation.onEvent);
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
   getActiveToken: currentDashboardToken,
+  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
+  // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
+  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把裸 shell
+  // 开放给平台上的任何人。
+  isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -461,99 +830,6 @@ function resolveScheduleOwner(id: string): string | undefined {
   const primary = registry.list().find(d => d.botIndex === 0);
   return primary?.larkAppId;
 }
-/**
- * Bring a freshly-onboarded bot online without a fleet-wide restart by spawning
- * `botmux start-bot <appId> --json` (see cli.ts:ensureBotDaemonStarted). The new
- * daemon is forked+supervised by pm2 (reparented off this process), self-registers
- * and opens its Feishu WSClient, then publishes a descriptor the DaemonRegistry
- * auto-discovers — so no dashboard reload is needed either. Runs `botmux` on the
- * SAME host as the dashboard (shared pm2 home / bots.json — the documented
- * dashboard↔daemon co-location assumption). Resolves best-effort; the caller
- * falls back to the restart hint on failure.
- */
-function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    let out = '';
-    let err = '';
-    let settled = false;
-    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
-    try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'start-bot', appId, '--json'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-        // Run from HOME, not the dashboard's cwd (pm2 `cwd: PKG_ROOT`): a global
-        // package update replaces that dir, so a still-running dashboard would spawn
-        // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
-        cwd: globalInstallUpdateCwd(),
-      });
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        done({ ok: false, message: 'start-bot 超时（30s）' });
-      }, 30_000);
-      timer.unref?.();
-      child.stdout?.on('data', (d) => { out += String(d); });
-      child.stderr?.on('data', (d) => { err += String(d); });
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        // `start-bot --json` prints a single StartBotLiveResult object; prefer its
-        // own message/processName over the raw exit code.
-        let parsed: any;
-        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON → fall through */ }
-        if (code === 0) {
-          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已上线` : undefined });
-        } else {
-          done({ ok: false, message: parsed?.message || err.trim() || `start-bot 退出码 ${code}` });
-        }
-      });
-    } catch (e) {
-      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-    }
-  });
-}
-
-function spawnStopBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    let out = '';
-    let err = '';
-    let settled = false;
-    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
-    try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), 'stop-bot', appId, '--json'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
-        cwd: globalInstallUpdateCwd(),
-      });
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        done({ ok: false, message: 'stop-bot 超时（30s）' });
-      }, 30_000);
-      timer.unref?.();
-      child.stdout?.on('data', (d) => { out += String(d); });
-      child.stderr?.on('data', (d) => { err += String(d); });
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        let parsed: any;
-        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON */ }
-        if (code === 0) {
-          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已停止` : undefined });
-        } else {
-          done({ ok: false, message: parsed?.message || err.trim() || `stop-bot 退出码 ${code}` });
-        }
-      });
-    } catch (e) {
-      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
-    }
-  });
-}
-
 const botOnboarding = new BotOnboardingManager({
   botsJsonPath: BOTS_JSON_PATH,
   stopBotLive: spawnStopBotLive,
@@ -624,14 +900,6 @@ interface ResolvedDashboardSettings {
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
-    listenerBotAppId?: string | null;
-    listenerBotOptions: Array<{
-      larkAppId: string;
-      botName?: string | null;
-      cliId?: string;
-      vcMeetingAgentEnabled: boolean;
-      hasLarkCliProfile: boolean;
-    }>;
     /** Detected lark-cli version, or null if not installed. */
     larkCliVersion?: string | null;
     /** True when the installed lark-cli meets the VC bot minimum version. */
@@ -648,9 +916,17 @@ interface ResolvedDashboardSettings {
   autoUpdateSupported: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
+  /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
+   *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
+   *  family, and the CLI authoring/run subcommands host-wide. */
+  workflow: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
+  /** OAuth 授权回跳基址（`<base>/oauth/callback`），null = 未配置 ⇒ 退回
+   *  `http://127.0.0.1:9768/callback` 的手工粘贴流程。见 global-config 的
+   *  `oauthRedirectBase`。 */
+  oauthRedirectBase: string | null;
   /** Configured schedule-task timezone override (IANA), or null when unset
    *  ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone: string | null;
@@ -661,43 +937,6 @@ interface ResolvedDashboardSettings {
    *  "currently effective" — never reconstruct it from configured||host, which
    *  ignores the env override. */
   effectiveScheduleTimeZone: string;
-}
-
-function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgent']['listenerBotOptions'] {
-  try {
-    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
-    // Exclude core-only (apiOnly) bots: a VC listener attends real Feishu
-    // meetings and needs open-platform scopes + a live Lark connection, which a
-    // no-Feishu bot categorically cannot have. Offering it would let setup
-    // raw-fetch token/application APIs with its synthetic/empty credentials.
-    return loadBotConfigs().filter(bot => bot.apiOnly !== true).map(bot => ({
-      larkAppId: bot.larkAppId,
-      botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
-      cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
-      vcMeetingAgentEnabled: bot.vcMeetingAgent?.enabled === true,
-      hasLarkCliProfile: typeof bot.vcMeetingAgent?.larkCliProfile === 'string' && bot.vcMeetingAgent.larkCliProfile.trim().length > 0,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-
-async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: true } | { ok: false; error: string }> {
-  let bots: BotConfig[];
-  try {
-    bots = loadBotConfigs();
-  } catch (err: any) {
-    return { ok: false, error: `vcMeetingAgent_listenerBot_config_unavailable: ${err?.message ?? err}` };
-  }
-  const bot = bots.find(b => b.larkAppId === appId);
-  if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
-  // Core-only (apiOnly) bots cannot attend Feishu meetings (no Feishu connection,
-  // no open-platform scopes). Reject at the settings WRITE boundary so a manual
-  // PUT can't select one and drive syncVcMeetingListenerBotConfig →
-  // automateOpenPlatformSetup against the open platform with synthetic creds.
-  if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingAgent_listenerBot_api_only' };
-  return { ok: true };
 }
 
 async function validateCodexNotifierTargetBotAppId(
@@ -814,13 +1053,36 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
+/** Map appId → persisted Feishu-probed botName from bots-info.json (offline
+ *  bots keep a friendly name in the dashboard). Best-effort; empty on any error. */
+function readPersistedBotNames(): Map<string, string> {
+  const out = new Map<string, string>();
+  try {
+    const fp = join(config.session.dataDir, 'bots-info.json');
+    if (!existsSync(fp)) return out;
+    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{ larkAppId?: string; botName?: string | null }>;
+    if (!Array.isArray(entries)) return out;
+    for (const e of entries) {
+      if (typeof e?.larkAppId === 'string' && typeof e?.botName === 'string' && e.botName.trim()) {
+        out.set(e.larkAppId, e.botName.trim());
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
 function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
+  // Persisted Feishu-probed names, so an OFFLINE bot still shows its friendly
+  // name in the agent dropdown instead of falling back to the raw appId. The
+  // live registry only knows online bots; bots-info.json is written when a bot
+  // is probed and survives across restarts. Built once per deps construction.
+  const persistedBotNames = readPersistedBotNames();
   return {
-    readSnapshot: readVcMeetingConsumerProfiles,
-    updateSnapshot: updateVcMeetingConsumerProfiles,
+    readCatalog: readVcMeetingSharedConsumerCatalogSnapshot,
+    updateCatalog: updateVcMeetingSharedConsumerCatalog,
     loadBotConfigs,
     effectiveDefaultWorkingDir,
-    onlineBotName: appId => registry.getByAppId(appId)?.botName,
+    onlineBotName: appId => registry.getByAppId(appId)?.botName ?? persistedBotNames.get(appId),
     isOnline: appId => !!registry.getByAppId(appId),
     adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
       if (!cliId) return false;
@@ -854,6 +1116,48 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
       return decision.ok && decision.isolated;
     },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
+    applyBotOutputPolicy: async (patch) => {
+      const res = await rmwBotEntry(patch.appId, (entry) => {
+        const vc = (entry.vcMeetingAgent && typeof entry.vcMeetingAgent === 'object' && !Array.isArray(entry.vcMeetingAgent))
+          ? entry.vcMeetingAgent
+          : {};
+        // 「接收会议事件」开关。VC 对每个连着飞书的 bot 默认可用，`enabled: false`
+        // 才是显式退出——所以打开时删掉这个 key 回到默认，而不是写 `enabled: true`。
+        if (patch.vcEnabled) delete vc.enabled;
+        else vc.enabled = false;
+        const consumer = (vc.meetingConsumer && typeof vc.meetingConsumer === 'object' && !Array.isArray(vc.meetingConsumer))
+          ? vc.meetingConsumer
+          : {};
+        if (patch.textOutputPolicy === null) delete consumer.textOutputPolicy;
+        else consumer.textOutputPolicy = patch.textOutputPolicy;
+        if (patch.voiceOutputPolicy === null) delete consumer.voiceOutputPolicy;
+        else consumer.voiceOutputPolicy = patch.voiceOutputPolicy;
+        // per-bot 默认角色:null/空 = 跟随全局默认(删 key);否则写 catalogDefaultConsumerId。
+        if (patch.catalogDefaultConsumerId === null || patch.catalogDefaultConsumerId === '') {
+          delete consumer.catalogDefaultConsumerId;
+        } else {
+          consumer.catalogDefaultConsumerId = patch.catalogDefaultConsumerId;
+        }
+        if (Object.keys(consumer).length > 0) vc.meetingConsumer = consumer;
+        else delete vc.meetingConsumer;
+        const rtv = (vc.realtimeVoice && typeof vc.realtimeVoice === 'object' && !Array.isArray(vc.realtimeVoice))
+          ? vc.realtimeVoice
+          : {};
+        // 实时语音能力默认开启（未配 = 开）。所以「勾上」= 回到默认，删掉 enabled key
+        // （避免写死 true，与其它默认字段的处理一致）；「取消勾选」= 必须写显式 false
+        // 才能真正关掉（保留其它 realtimeVoice 设置如采样率）。
+        if (patch.realtimeVoiceEnabled) {
+          delete rtv.enabled;
+        } else {
+          rtv.enabled = false;
+        }
+        if (Object.keys(rtv).length > 0) vc.realtimeVoice = rtv;
+        else delete vc.realtimeVoice;
+        entry.vcMeetingAgent = vc;
+        return { write: true, result: undefined };
+      });
+      return res.ok ? { ok: true } : { ok: false, reason: res.reason };
+    },
   };
 }
 
@@ -965,230 +1269,159 @@ async function waitForFeishuLoginQr(timeoutMs = 8_000, intervalMs = 200): Promis
   return null;
 }
 
-async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, previousListenerBotAppId?: string | null): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
-  const nextAppId = listenerBotAppId?.trim() || null;
-  const prevAppId = previousListenerBotAppId?.trim() || null;
-  if (!nextAppId && !prevAppId) return { ok: true };
+/**
+ * 让某个 bot 具备「收会议事件 + 以 bot 身份入会」的开放平台前置条件。
+ *
+ * 这是全局「会议事件接收 Bot」下拉退役后留下的唯一实质工作：那个下拉真正干的事
+ * 不是「选一个人来监听」（daemon 侧早已改成谁收到谁处理），而是顺手替被选中的 bot
+ * 开权限、订事件、装 larkCliProfile。所以下拉删掉，这段保留，改成按 bot 手动触发
+ * 的一次性动作（Dashboard 的「配置权限」按钮）——不能在勾选开关时自动跑：
+ * 「接收会议事件」默认就是开的，压根没有 off→on 的跃迁可挂；也不能在页面加载时
+ * 对整个 fleet 跑，47 个 bot 就是 94 次开放平台调用。
+ *
+ * 与旧实现的关键差异：这里**只做前置条件**，绝不再往 meetingConsumer 里塞默认角色。
+ * 旧的 seedVcMeetingDefaultConsumerProfile 会把「另一个 bot」的 appId 焊进预设，
+ * 正是「拉 A 进会却把 B 拉进群」的源头。
+ */
+async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }> {
+  const targetAppId = appId?.trim() || null;
+  if (!targetAppId) return { ok: false, error: 'vcMeetingBot_preflight_missing_appId' };
 
-  // Defense-in-depth: even though the settings validator rejects apiOnly, guard
-  // the sync entry too so no caller reaches automateOpenPlatformSetup / the
-  // open-platform raw fetches for a core-only bot.
-  if (nextAppId) {
+  let bots: BotConfig[];
+  try {
+    bots = loadBotConfigs();
+  } catch (err: any) {
+    return { ok: false, error: `vcMeetingBot_preflight_config_unavailable: ${err?.message ?? err}` };
+  }
+  const bot = bots.find(b => b.larkAppId === targetAppId);
+  if (!bot) return { ok: false, error: 'vcMeetingBot_preflight_bot_not_found' };
+  // apiOnly bot 结构上就收不到飞书事件，别让它把 automateOpenPlatformSetup /
+  // 开放平台裸 fetch 跑起来（写边界拦住，手搓 POST 也进不去）。
+  if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingBot_preflight_api_only' };
+
+  // VC bot 入会命令(vc +meeting-join/events/message-send --as bot)要求
+  // lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT；更老的版本会以
+  // "this command only supports: user" 静默拒绝 `--as bot`。
+  const larkCli = checkLarkCliVersion();
+  if (!larkCli) {
+    return { ok: false, error: 'vcMeetingBot_preflight_larkCli_not_found: 未检测到 lark-cli，请先安装 `npm i -g @larksuite/cli`' };
+  }
+  if (!larkCli.meetsVcBotRequirement) {
+    return {
+      ok: false,
+      error: `vcMeetingBot_preflight_larkCli_too_old: 当前 lark-cli ${larkCli.version} 不支持 VC bot 入会，需要 >= ${MIN_LARK_CLI_VERSION_FOR_VC_BOT}。请运行 \`npm i -g @larksuite/cli@latest\` 升级`,
+    };
+  }
+
+  // 开放平台自动化只支持 feishu.cn；`brand: 'lark'` 的 bot 跳过自动化，但仍然校验
+  // 权限是否已具备，免得报「配置好了」其实收不到事件。
+  const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
+  if (brand === 'lark') {
+    logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${targetAppId} (feishu.cn only)`);
+    const scopeCheck = await validateVcMeetingScopesForBot(bot);
+    if (!scopeCheck.ok) {
+      return { ok: false, error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}` };
+    }
+  } else {
     try {
-      const bot = loadBotConfigs().find(b => b.larkAppId === nextAppId);
-      if (bot?.apiOnly === true) {
-        return { ok: false, error: 'vcMeetingAgent_listenerBot_api_only' };
-      }
-    } catch { /* fall through to normal errors below */ }
-  }
-
-  // Require lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT for VC bot meeting commands
-  // (vc +meeting-join/events/message-send --as bot). Earlier versions silently reject
-  // `--as bot` with "this command only supports: user", so the listener bot can
-  // never actually join a meeting.
-  if (nextAppId) {
-    const larkCli = checkLarkCliVersion();
-    if (!larkCli) {
-      return { ok: false, error: 'vcMeetingAgent_listenerBot_larkCli_not_found: 未检测到 lark-cli，请先安装 `npm i -g @larksuite/cli`' };
-    }
-    if (!larkCli.meetsVcBotRequirement) {
-      return {
-        ok: false,
-        error: `vcMeetingAgent_listenerBot_larkCli_too_old: 当前 lark-cli ${larkCli.version} 不支持 VC bot 入会，需要 >= ${MIN_LARK_CLI_VERSION_FOR_VC_BOT}。请运行 \`npm i -g @larksuite/cli@latest\` 升级`,
-      };
-    }
-  }
-
-  // Best-effort auto-import VC meeting scopes via Open Platform automation.
-  // Run BEFORE writing bots.json so that hard failures (missing session, needs QR)
-  // don't leave per-bot vcMeetingAgent in a half-configured state.
-  // For `brand: 'lark'` bots the open-platform automation only supports feishu.cn;
-  // skip it silently and let the user configure manually.
-  if (nextAppId) {
-    const bots = loadBotConfigs();
-    const bot = bots.find(b => b.larkAppId === nextAppId);
-    const brand = bot?.brand === 'lark' ? 'lark' : 'feishu';
-    if (brand === 'lark') {
-      logger.info(`[vc-agent] skipping open-platform automation for lark-brand bot ${nextAppId} (feishu.cn only)`);
-      // For lark brand, still validate that required scopes exist before saving
-      if (bot) {
+      const result = await automateOpenPlatformSetup({
+        appId: targetAppId,
+        brand,
+        maxWaitMs: 5_000,
+        onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+      });
+      if (result.ok) {
+        logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for bot ${targetAppId}`);
+        if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
+        if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
+        // 自动化「成功」不等于权限真开了：internal scope/update 可能静默跳过本租户
+        // 不可用的 scope。必须回读一次，否则会给用户一个「已配置」的假绿灯。
         const scopeCheck = await validateVcMeetingScopesForBot(bot);
         if (!scopeCheck.ok) {
-          return { ok: false, error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}` };
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
+          };
+        }
+        // 事件订阅同样关键：缺任一 VC 事件都收不到会议邀请(用 missingVcEvents 判定,
+        // 总 count 无法区分缺的是不是 VC)。
+        const eventGateError = vcListenerEventGateError(result);
+        if (eventGateError) {
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
+          };
+        }
+      } else {
+        const reason = result.reason;
+        // 登录/会话类失败是硬失败：没有有效的开放平台会话就无从自动配置，直接把
+        // 扫码二维码回给前端。
+        if (
+          reason === 'missing_session'
+          || reason === 'invalid_session'
+          || reason === 'missing_csrf'
+          || reason === 'qr_expired'
+          || reason === 'timeout'
+          || reason === 'login_failed'
+        ) {
+          feishuLogin.start();
+          // start() 立刻返回 status='starting'，二维码是在 onQrCode 里异步塞进去的；
+          // 稍等一下拿到再回，前端才能直接内联展示而不是只给一句错误。
+          const qrDataUrl = await waitForFeishuLoginQr();
+          const hint = '请用飞书扫码完成开放平台登录，登录后重新点「配置权限」即可自动开通';
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_scope_auto_import_failed: ${reason}: ${hint}`,
+            feishuLoginQr: qrDataUrl ?? undefined,
+          };
+        }
+        // 非登录类失败(网络、api_error 等)是 best-effort，不因此判死；但权限与事件
+        // 订阅仍然要回读确认，否则等于谎报配置成功。
+        logger.warn(`[vc-agent] open-platform automation failed for ${targetAppId}: ${reason}: ${result.message}`);
+        const scopeCheck = await validateVcMeetingScopesForBot(bot);
+        if (!scopeCheck.ok) {
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
+          };
+        }
+        const eventGateError = vcListenerEventGateError(result);
+        if (eventGateError) {
+          return {
+            ok: false,
+            error: `vcMeetingBot_preflight_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
+          };
         }
       }
-    } else {
-      try {
-        const result = await automateOpenPlatformSetup({
-          appId: nextAppId,
-          brand,
-          maxWaitMs: 5_000,
-          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
-        });
-        if (result.ok) {
-          logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for listener bot ${nextAppId}`);
-          if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
-          if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
-          // Post-validation: verify VC meeting scopes are actually granted after automation.
-          // The internal scope/update may silently skip some scopes (e.g. not available
-          // in this tenant). Without this check, a bot without VC scopes could be saved
-          // as global listener and silently drop all meeting events.
-          if (bot) {
-            const scopeCheck = await validateVcMeetingScopesForBot(bot);
-            if (!scopeCheck.ok) {
-              return {
-                ok: false,
-                error: `vcMeetingAgent_listenerBot_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
-              };
-            }
-          }
-          // Event subscription is also critical: listener 缺任一 VC 事件都收不到
-          // 会议邀请(missingVcEvents 判定,总 count 无法区分缺的是不是 VC)。
-          const eventGateError = vcListenerEventGateError(result);
-          if (eventGateError) {
-            return {
-              ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。请到开放平台手动订阅 VC 会议事件后重试。`,
-            };
-          }
-        } else {
-          const reason = result.reason;
-          // Session/login-related failures are hard failures — return QR so user can re-login.
-          // Without a valid Open Platform session, scope/event auto-import is impossible.
-          if (
-            reason === 'missing_session'
-            || reason === 'invalid_session'
-            || reason === 'missing_csrf'
-            || reason === 'qr_expired'
-            || reason === 'timeout'
-            || reason === 'login_failed'
-          ) {
-            feishuLogin.start();
-            // feishuLogin.start() returns immediately with status='starting'; the QR
-            // code is set asynchronously in onQrCode. Wait briefly for it to be ready
-            // so the frontend can display it inline instead of showing an error without
-            // a scan entry.
-            const qrDataUrl = await waitForFeishuLoginQr();
-            const hint = '请用飞书扫码完成开放平台登录，登录后重新选择监听 bot 即可自动配置权限';
-            return {
-              ok: false,
-              error: `vcMeetingAgent_listenerBot_scope_auto_import_failed: ${reason}: ${hint}`,
-              feishuLoginQr: qrDataUrl ?? undefined,
-            };
-          }
-          // Non-login failures (network, api_error, etc.) are best-effort — don't
-          // block the save. The user can fix scopes manually in the console.
-          logger.warn(`[vc-agent] open-platform automation failed for ${nextAppId}: ${reason}: ${result.message}`);
-          // Even on non-login automation failure, verify scopes before saving —
-          // if the bot genuinely lacks VC permissions, don't silently make it listener.
-          if (bot) {
-            const scopeCheck = await validateVcMeetingScopesForBot(bot);
-            if (!scopeCheck.ok) {
-              return {
-                ok: false,
-                error: `vcMeetingAgent_listenerBot_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
-              };
-            }
-          }
-          // Also check event subscription status — automation 走到订阅阶段时
-          // missingVcEvents 会带回来;listener 缺任一 VC 事件都不能保存。
-          const eventGateError = vcListenerEventGateError(result);
-          if (eventGateError) {
-            return {
-              ok: false,
-              error: `vcMeetingAgent_listenerBot_event_subscribe_failed: ${eventGateError}，bot 无法接收会议邀请事件。自动化配置失败(${reason})，请手动订阅 VC 会议事件后重试。`,
-            };
-          }
-        }
-      } catch (err: any) {
-        logger.warn(`[vc-agent] open-platform automation error for ${nextAppId}: ${err?.message ?? err}`);
-      }
+    } catch (err: any) {
+      logger.warn(`[vc-agent] open-platform automation error for ${targetAppId}: ${err?.message ?? err}`);
     }
   }
 
-  const changedAppIds = new Set<string>();
+  // 唯一的落盘：补一个默认 larkCliProfile。既不写 enabled(默认就是接收)，也不碰
+  // meetingConsumer——角色预设归 fleet 共享目录管，这里不产生任何 per-bot 预设。
+  let changed = false;
   try {
     const path = requireConfigPath();
     await withFileLock(path, async () => {
       const raw = await readRawConfig(path);
-      let changed = false;
-
-      if (nextAppId) {
-        const idx = findEntryIndex(raw, nextAppId);
-        if (idx < 0) throw new Error('bot_not_in_config');
-        const entry = raw[idx] as Record<string, unknown>;
-        const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-        let entryChanged = false;
-        const firstEnable = next.enabled !== true;
-        if (firstEnable) {
-          next.enabled = true;
-          next.dashboardManagedListener = true;
-          entryChanged = true;
-        }
-        if (!next.larkCliProfile) {
-          next.larkCliProfile = nextAppId;
-          entryChanged = true;
-        }
-        const mc = next.meetingConsumer;
-        const mcRec = mc && typeof mc === 'object' && !Array.isArray(mc)
-          ? { ...(mc as Record<string, unknown>) }
-          : {};
-        // Selecting a global listener is the Dashboard's explicit opt-in to the
-        // complete meeting pipeline. It intentionally re-enables the listener's
-        // consumer surface; profile/default ownership is still preserved by the
-        // own-property gates in seedVcMeetingDefaultConsumerProfile below.
-        if (mcRec.enabled !== true) {
-          mcRec.enabled = true;
-          entryChanged = true;
-        }
-        if (seedVcMeetingDefaultConsumerProfile(
-          mcRec,
-          nextAppId,
-          // Resolve against the latest locked bots.json snapshot, not a stale
-          // pre-lock load. This also makes fallback selection independent of
-          // the order in which bot entries happen to be stored.
-          buildVcMeetingConsumerBootstrapAgents(
-            parseBotConfigsFromText(JSON.stringify(raw)),
-          ),
-        )) {
-          entryChanged = true;
-        }
-        next.meetingConsumer = mcRec;
-        if (entryChanged) {
-          compactVcMeetingAgentEntry(entry, next);
-          changed = true;
-          changedAppIds.add(nextAppId);
-        }
-      }
-
-      if (prevAppId && prevAppId !== nextAppId) {
-        const idx = findEntryIndex(raw, prevAppId);
-        if (idx >= 0) {
-          const entry = raw[idx] as Record<string, unknown>;
-          const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-          if (next.dashboardManagedListener === true) {
-            delete next.dashboardManagedListener;
-            if (next.enabled === true) delete next.enabled;
-            compactVcMeetingAgentEntry(entry, next);
-            changed = true;
-            changedAppIds.add(prevAppId);
-          }
-        }
-      }
-
-      if (changed) {
-        // Validate the complete post-mutation file before replacing bots.json.
-        // Keep this path symmetric with daemon bootstrap so a future generated
-        // default cannot make the Dashboard persist an invalid registry.
-        parseBotConfigsFromText(JSON.stringify(raw));
-        await writeRawConfigAtomic(path, raw);
-      }
+      const idx = findEntryIndex(raw, targetAppId);
+      if (idx < 0) throw new Error('bot_not_in_config');
+      const entry = raw[idx] as Record<string, unknown>;
+      const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+      if (next.larkCliProfile) return;
+      next.larkCliProfile = targetAppId;
+      compactVcMeetingAgentEntry(entry, next);
+      // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
+      parseBotConfigsFromText(JSON.stringify(raw));
+      await writeRawConfigAtomic(path, raw);
+      changed = true;
     });
   } catch (err: any) {
-    return { ok: false, error: `vcMeetingAgent_listenerBot_config_write_failed: ${err?.message ?? err}` };
+    return { ok: false, error: `vcMeetingBot_preflight_config_write_failed: ${err?.message ?? err}` };
   }
 
-  if (changedAppIds.size > 0) await reloadVcMeetingBotConfigOnDaemons([...changedAppIds]);
+  if (changed) await reloadVcMeetingBotConfigOnDaemons([targetAppId]);
 
   return { ok: true };
 }
@@ -1242,8 +1475,6 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
-      listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
-      listenerBotOptions: vcMeetingListenerBotOptions(),
       larkCliVersion: larkCli?.version ?? null,
       larkCliMeetsRequirement: larkCli?.meetsVcBotRequirement ?? false,
       larkCliMinVersion: MIN_LARK_CLI_VERSION_FOR_VC_BOT,
@@ -1253,7 +1484,9 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
+    workflow: { enabled: global.workflow?.enabled === true }, // default OFF
     remoteAccess: global.remoteAccess === true,
+    oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
     effectiveScheduleTimeZone: scheduleTimeZone(),
@@ -1269,8 +1502,6 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
   ));
 }
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
-settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
-settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 
@@ -1338,6 +1569,15 @@ let updateInFlight = false;
 // the successful plan (including its stable package root) so follow-up status,
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
+
+// Local-dev counterpart: the checkout a successful /api/update/run built, and
+// its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
+// build's target — not a wrapper that a concurrent `pnpm use:here` in another
+// worktree may have re-pointed between the two requests (run builds B, wrapper
+// flips to C, restart would otherwise restart C or fall back to A). Cleared
+// once consumed by a restart. A plain "restart" (no preceding run) still
+// resolves the wrapper live.
+let pendingLocalDevRestart: { dir: string; head: string } | undefined;
 
 // Cache the upstream version/changelog lookups so the nav-badge check + the
 // Settings card don't hammer the npm registry / GitHub on every page load.
@@ -1417,35 +1657,39 @@ function currentInstalledVersion(): string {
 }
 
 /**
- * Run the ownership-aware npm/pnpm/Bun update for the manual-update flow WITHOUT blocking
- * the event loop (async spawn, not execSync — the dashboard must keep serving
- * during the ~10-30s install). Resolves on exit 0; rejects with the tail of
- * stdout/stderr on a non-zero exit, spawn error, or 3-minute timeout. Args are
- * a fixed literal — no shell interpolation of untrusted input.
+ * Local-dev update: git-clean check (fail closed) → git pull --ff-only →
+ * pnpm build, all in the checkout the global wrapper points at. Mirrors the CLI
+ * `cmdUpgradeLocalDev` via the shared local-dev-update helpers. Returns the
+ * checkout dir, its version before/after, and whether HEAD advanced; the caller
+ * applies the restart through the existing lease/intent path. A successful
+ * build always requires a restart to take effect (dist/ is regenerated), which
+ * the caller signals independently of `changed`. Rejects with a stable `code`
+ * on the recoverable, UI-actionable failures.
  */
-function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn(plan.command, plan.args, {
-      cwd: globalInstallUpdateCwd(),
-      env: { ...process.env, ...plan.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // resolve npm.cmd / pnpm.cmd / bun.exe
+async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string }> {
+  const dir = resolveLocalDevCheckoutDir();
+  if (!isGitWorktree(dir)) {
+    throw Object.assign(new Error(`${dir} is not a git worktree`), { code: 'not_a_worktree', dir });
+  }
+  let status: string;
+  try {
+    status = gitPorcelainStatus(dir);
+  } catch (e) {
+    throw Object.assign(new Error(e instanceof Error ? e.message : String(e)), { code: 'git_status_failed', dir });
+  }
+  if (status) {
+    throw Object.assign(new Error('working tree has uncommitted changes'), {
+      code: 'dirty_worktree', dir, status,
     });
-    let tail = '';
-    const capture = (d: Buffer): void => { tail = (tail + d.toString()).slice(-2000); };
-    child.stdout?.on('data', capture);
-    child.stderr?.on('data', capture);
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`${plan.manager} install timed out after 180s`));
-    }, 180_000);
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${plan.manager} exited ${code}: ${tail.trim().slice(-500)}`));
-    });
-  });
+  }
+  const before = gitHeadSha(dir);
+  const oldVersion = resolveCurrentVersionAt(dir);
+  for (const { command, args } of localDevUpdateSteps()) {
+    await runLocalDevStep(dir, command, args);
+  }
+  const after = gitHeadSha(dir);
+  const newVersion = resolveCurrentVersionAt(dir);
+  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after };
 }
 
 /**
@@ -1675,7 +1919,12 @@ function injectDevReload(html: string): string {
   return html.includes('</body>') ? html.replace('</body>', `${snippet}\n</body>`) : `${html}\n${snippet}`;
 }
 
-function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+function serveStatic(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathname: string,
+  options: { injectHtml?: (html: string) => string } = {},
+): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const fp = resolve(WEB_DIR, rel);
   const webRoot = resolve(WEB_DIR);
@@ -1690,13 +1939,17 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
     const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
-    const devIndex = relToRoot === 'index.html' && dashboardDevReloadEnabled();
+    const isIndex = relToRoot === 'index.html';
+    const devIndex = isIndex && dashboardDevReloadEnabled();
+    // 注入 CSRF 票据的壳是每次请求现生成的：ETag 只反映磁盘文件，走 304 会让浏览
+    // 器复用上一次（可能已随认证结束作废）的票据，所以这条路径不缓存、不 304。
+    const dynamicIndex = devIndex || (isIndex && !!options.injectHtml);
     const headers: Record<string, string> = {
       'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
-      'cache-control': devIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
+      'cache-control': dynamicIndex ? 'no-store' : immutableChunk ? 'public, max-age=31536000, immutable' : 'no-cache',
       etag,
     };
-    if (!devIndex && req.headers['if-none-match'] === etag) {
+    if (!dynamicIndex && req.headers['if-none-match'] === etag) {
       res.writeHead(304, headers);
       res.end();
       return true;
@@ -1706,8 +1959,11 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string
       res.end();
       return true;
     }
-    if (devIndex) {
-      res.end(injectDevReload(readFileSync(fp, 'utf8')));
+    if (dynamicIndex) {
+      let html = readFileSync(fp, 'utf8');
+      if (options.injectHtml) html = options.injectHtml(html);
+      if (devIndex) html = injectDevReload(html);
+      res.end(html);
     } else {
       res.end(readFileSync(fp));
     }
@@ -2159,7 +2415,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2172,18 +2428,19 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       model: b.model,
       reasoningEffort: b.reasoningEffort,
       turnTimeoutMs: b.turnTimeoutMs,
+      dshRuntime: b.dshRuntime,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2193,6 +2450,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     model: bot.model || fallback?.model,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
+    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
   };
 }
 
@@ -2769,13 +3027,60 @@ async function dashboardSkillReferences(skillName: string): Promise<SkillReferen
   return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [], packs: [] };
 }
 
-/** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
- *  the first path segment after `/s/` (stops at the next `/`; query/hash are
- *  already stripped by URL.pathname). undefined when there's no segment. */
-function parseTerminalSessionId(pathname: string): string | undefined {
-  if (!pathname.startsWith('/s/')) return undefined;
-  const seg = pathname.slice(3).split('/')[0];
-  return seg || undefined;
+function dashboardControlJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+  });
+  res.end(JSON.stringify(body));
+}
+
+/**
+ * P1-11：控制类端点的跨站伪造门禁。返回 false 表示已经写完 403 响应，调用方直接
+ * return。只作用于「有副作用且可被无 body 表单触发」的 POST：终端接管/释放、
+ * 预览交互 unlock/activity/lock、话题定位。
+ *
+ * GET 不进门禁（读没有副作用，且壳/前端的状态轮询本身就是 GET）；Preview 自身的
+ * 不透明来源请求走 preview 专用路径的路径内凭据，不经过这里。
+ */
+function enforceControlCsrf(
+  req: IncomingMessage,
+  res: ServerResponse,
+  identity: DashboardRequestIdentity,
+): boolean {
+  if ((req.method ?? 'GET').toUpperCase() === 'GET') return true;
+  const verdict = guardControlRequest({
+    headers: req.headers,
+    authSessionId: identity.authSessionId,
+    tokens: controlCsrfTokens,
+  });
+  if (verdict.ok) return true;
+  dashboardControlJson(res, verdict.status, { ok: false, error: verdict.error });
+  return false;
+}
+
+function terminalControlAvailability(sessionId: string):
+  | { ok: true }
+  | { ok: false; status: number; error: string } {
+  const row = aggregator.getSession(sessionId) as {
+    status?: unknown;
+    larkAppId?: unknown;
+    webPort?: unknown;
+    proxyPort?: unknown;
+    riffAccessUrl?: unknown;
+  } | undefined;
+  if (!row || !aggregator.ownerOf(sessionId)) return { ok: false, status: 404, error: 'unknown_session' };
+  if (row.status === 'closed') return { ok: false, status: 409, error: 'session_not_active' };
+  if (typeof row.riffAccessUrl === 'string' && row.riffAccessUrl) {
+    return { ok: false, status: 409, error: 'terminal_external_only' };
+  }
+  const owner = aggregator.ownerOf(sessionId);
+  if (!owner || !registry.getByAppId(owner)) return { ok: false, status: 503, error: 'daemon_offline' };
+  if (!aggregator.terminalProxyPortOf(sessionId) || typeof row.webPort !== 'number') {
+    return { ok: false, status: 409, error: 'terminal_unavailable' };
+  }
+  return { ok: true };
 }
 
 /**
@@ -2866,6 +3171,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Configurable Feishu/Lark H5 passwordless entry and code exchange. It is
+    // self-authenticating and must run before the ordinary Dashboard cookie
+    // gate; no authorization code or session capability is ever put in a URL.
+    if (await dashboardH5Auth.handle(req, res, url)) return;
+
+    // Session Web preview is an authenticated, same-origin reverse proxy to an
+    // agent-registered literal loopback target. It owns its auth gate because
+    // WebSocket upgrades do not pass through decideDashboardAuth; using one
+    // manager for HTTP + WS keeps the cookie/ownership/SSRF contract identical.
+    if (previewGuardPage.handle(req, res, url)) return;
+    if (await sessionPreviewProxy.handleHttp(req, res, url)) return;
+
     // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's
     // terminal proxy. The central platform only tunnels the dashboard port, so
     // terminal links served under the machine subdomain
@@ -2876,27 +3193,12 @@ const server = createServer(async (req, res) => {
     // response straight back. Mounted before the dashboard auth gate because the
     // worker independently requires a view/write capability or authenticated
     // dashboard cookie before serving either HTTP or WebSocket terminal data.
-    if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
-      const sessionId = parseTerminalSessionId(url.pathname);
-      const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
-      if (!tport) {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-        return res.end('session terminal not available');
-      }
-      const upstream = httpRequest(
-        { host: '127.0.0.1', port: tport, method: req.method, path: req.url, headers: req.headers },
-        (up) => {
-          res.writeHead(up.statusCode ?? 502, up.headers);
-          up.pipe(res);
-        },
-      );
-      upstream.on('error', () => {
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('terminal proxy error');
-      });
-      req.pipe(upstream);
-      return;
-    }
+    // Since P1-5 this hop is also LOAD-BEARING for revocation, not just
+    // reachability: a signed view capability is checked here against live auth
+    // sessions and countersigned for the worker, which refuses one that arrived
+    // any other way. That is why the view-link API hands out a same-origin path
+    // instead of the daemon/worker origin — this is the only door.
+    if (terminalFrontProxy.handleHttp(req, res, url)) return;
 
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
@@ -2972,8 +3274,27 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      const previousToken = currentDashboardToken();
       try {
         const token = rotatePersistedToken(TOKEN_PATH);
+        // The previous link is dead once the write lands: drop terminal control
+        // leases, re-lock preview interaction, and (P1-8) close every long-lived
+        // connection the old link opened — otherwise the old management SSE
+        // keeps streaming rows minted AFTER the rotation, including freshly
+        // issued `riffAccessUrl` write credentials.
+        // Ordered after the durable write so a failed rotation keeps both the
+        // old token and its live grants intact.
+        if (previousToken && previousToken !== token) {
+          endDashboardAuthSession(legacyDashboardAuthSessionId(previousToken));
+        }
+        // P1-6: the same reasoning covers the workbench entry tickets sitting in
+        // Feishu card history. They redeem into "whatever token is active now",
+        // so without this a ticket leaked BEFORE the rotation would hand out the
+        // freshly minted management cookie — rotation would protect nothing in
+        // exactly the case it is used for. Ticket verification independently
+        // requires the bound generation to still be current, so this call is the
+        // cleanup (drop dead rows from the shared file), not the guarantee.
+        revokeWorkbenchTicketsOutsideGeneration(workbenchTicketGeneration(token));
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
@@ -3027,31 +3348,62 @@ const server = createServer(async (req, res) => {
         /* ignore */
       }
       platformTunnel = null;
+      // P1-8：解绑/改绑之后旧平台身份的短请求立刻 401，但它建立的 SSE / Preview
+      // 长连接不会自己断，三个角色作用域在这里一起收口。
+      syncPlatformBindingRevocation();
       startPlatformTunnelIfBound();
       return jsonRes(res, 200, { ok: true });
     }
 
     const activeToken = currentDashboardToken();
-    const presentedToken = authedToken(req, url, activeToken);
+    const requestIdentity = dashboardRequestIdentity(req);
     const globalDashboardConfig = readGlobalConfig().dashboard;
-    const decision = decideDashboardAuth({
+    const publicReadOnly = globalDashboardConfig?.publicReadOnly
+      ?? config.dashboard.publicReadOnly;
+    // P1-7：门禁选择与身份判定同源。旧代码在这里另算一遍 `h5Identity`，于是
+    // 「legacy owner + H5 cookie 并存」的浏览器被判成 workbench-only，管理读写
+    // 全 401，连正确的 `?t=` 也被一起清掉（详见 request-identity.ts 顶注）。
+    // Only the local legacy Dashboard cookie is management authority. Platform
+    // identities — owner included — retain terminal/preview capability through
+    // signed proxy grants, but cannot cross into host administration APIs.
+    const { legacyAuthed, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
-      presentedToken,
-      activeToken: activeToken ?? '',
-      publicReadOnly: globalDashboardConfig?.publicReadOnly
-        ?? config.dashboard.publicReadOnly,
+      identity: requestIdentity,
+      tokenFromRequest: authedToken(req, url, activeToken),
+      activeToken,
+      publicReadOnly,
     });
-    // `authed` is consumed by route handlers that distinguish the public-read
-    // carve-out from a valid management cookie (notably v3 run details).
-    const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
+    // `authed` is deliberately the local management capability, not merely a
+    // valid Workbench/platform identity. Privileged mutations and management
+    // reads (settings, schedules, groups) therefore cannot be widened by H5
+    // authentication.
+    const authed = legacyAuthed;
+    // The session board is the one surface where `!authed` must NOT mean
+    // "anonymous". `/api/sessions` and `/events` are exactly the two paths
+    // workbenchH5Capability grants as `workbench.view`, and the same identity
+    // holds `preview.view`/`preview.operate`; reusing the anonymous projection
+    // here deleted the `preview` descriptor those capabilities operate on, so
+    // the mobile Workbench and the Dock showed 「无网页预览」 unconditionally.
+    // The three-way audience keeps management/anonymous behavior byte-identical
+    // and only restores display fields for an authenticated Workbench viewer —
+    // the Riff sandbox bearer write URL stays stripped (see public-redact.ts).
+    const sessionBoardAudience = sessionBoardAudienceFor({
+      legacyAuthed,
+      workbenchIdentity: workbenchOnlyIdentity,
+    });
 
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
+        // A valid H5/platform Workbench identity is expected to be denied by
+        // management-only endpoints such as /api/settings. Let the SPA tell
+        // that narrow denial from an expired identity, otherwise its global
+        // fetch wrapper covers a healthy Workbench with the login overlay.
+        ...(workbenchOnlyIdentity ? { 'x-botmux-auth-scope': 'workbench' } : {}),
         ...(loginUrl ? { 'x-botmux-login-url': loginUrl } : {}),
       });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
@@ -3067,12 +3419,143 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie
+    // 流程——语义同款：验票通过就种同一个 legacy cookie，再 302 进工作台。票据由
+    // /dashboard 卡片构建时现 mint（TTL 30 分钟、可多端重复打开，落盘只存 hash，
+    // 见 dashboard/workbench-ticket.ts），长期管理 token 从此不再写进持久化卡片；
+    // 无效/过期回一个无凭据中文提示页。该 GET 在 decideDashboardAuth 里与静态壳
+    // 同级放行（票据本身就是凭证），其余方法不豁免。P1-10：正因为它在 auth gate
+    // 之前放行，端点自带每 IP + 全局限流，IP 口径与 H5 兑换口共用同一份可信代理
+    // 配置——否则两个公开面对同一个 `x-forwarded-for` 会得出不同结论。
+    if (handleWorkbenchTicketRedemption(req, res, url, {
+      activeToken: () => activeToken,
+      trustedProxyHops: dashboardH5AuthConfig.trustedProxyHops,
+    })) {
+      return;
+    }
+
     if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
       return jsonRes(res, 410, {
         ok: false,
         error: 'legacy_workflow_retired',
         message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
       });
+    }
+
+    // Authenticated, non-secret metadata used only to build Feishu appCenter
+    // and >=350px sidebar AppLinks. App secret and allowlist never cross this
+    // projection; the route is intentionally absent from public-read allowlists.
+    if (req.method === 'GET' && url.pathname === '/api/workbench/h5-context') {
+      return jsonRes(res, 200, {
+        ok: true,
+        h5: {
+          enabled: dashboardH5AuthConfig.enabled,
+          appId: dashboardH5AuthConfig.appId,
+          brand: dashboardH5AuthConfig.brand,
+          entryPath: dashboardH5AuthConfig.entryPath,
+        },
+      });
+    }
+
+    // P1-4：最小操作能力集投影。前端只据此渲染操作入口（定位 / 接管输入 / 开启
+    // 交互），投影函数复算的是本文件三条真实路由的同一套门禁（路由级 auth 决策 +
+    // terminalCapability/previewCapability 角色检查），见 auth.ts 的函数注释。
+    // 匿名请求到不了这里（该路径不在 publicReadOnly 白名单，decideDashboardAuth
+    // 已 401）；前端把任何非 200/缺字段一律回落为全 false。注意 canControl 只描述
+    // 无显式 token 的默认能力——显式 write token 走终端前置代理的独立授权（P1-6），
+    // 与本投影无关。
+    if (req.method === 'GET' && url.pathname === '/api/workbench/capabilities') {
+      return jsonRes(res, 200, {
+        ok: true,
+        capabilities: projectWorkbenchOperationCapabilities(requestIdentity),
+      });
+    }
+
+    // owner 在工作台内自取常驻链接（`<base>/workbench?t=<当前活跃 token>`）。
+    // 只有本机完整管理身份能取：上面的门禁已经把 workbench-only / 平台角色 /
+    // 匿名 deny401，处理器再自己判一次 kind === 'legacy-dashboard'（两层独立，
+    // 见 dashboard/standing-link.ts 顶注）。同源校验 + no-store + 每次落一条
+    // `auth.standing_link_issued` 审计；token 现读落盘的活跃值，所以
+    // `dashboard rotate` 之后这里自然发新链接。
+    if (handleWorkbenchStandingLink(req, res, url, {
+      identity: requestIdentity,
+      activeToken: () => activeToken,
+      standingLinkUrl: token => workbenchEntryUrl(dashboardUrlsFor(token).url),
+      audit: dashboardControlAudit,
+    })) {
+      return;
+    }
+
+    // Server-authoritative terminal control lease. The API returns only mode
+    // and timestamps; its signed read/write grant stays inside the central
+    // proxy and is never placed in a URL or response body.
+    //
+    // The dispatch itself lives in dashboard/terminal-control-route.ts — the ONE
+    // implementation that the acceptance scripts drive as well. It used to be
+    // inlined here, and the copy in the scripts drifted: they read the `?expect=`
+    // compare-and-swap condition while this one did not, so conditional release
+    // never actually applied in production.
+    const terminalControlMatch = matchTerminalControlRoute(url.pathname);
+    if (terminalControlMatch) {
+      if (!requestIdentity) {
+        return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      }
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      if (!terminalControlMatch.ok) {
+        return dashboardControlJson(res, 400, { ok: false, error: terminalControlMatch.error });
+      }
+      const sessionId = terminalControlMatch.sessionId;
+      const availability = terminalControlAvailability(sessionId);
+      if (!availability.ok) {
+        return dashboardControlJson(res, availability.status, { ok: false, error: availability.error });
+      }
+      const answer = resolveTerminalControlAction({
+        method: req.method ?? 'GET',
+        action: terminalControlMatch.action,
+        sessionId,
+        search: url.searchParams,
+        identity: requestIdentity,
+        control: terminalControl,
+      });
+      return dashboardControlJson(res, answer.status, answer.body);
+    }
+
+    // Preview interaction is separately scoped per authenticated browser
+    // session. Default is always the visibly labelled preview overlay; unlock
+    // and activity are explicit, and the server hard-relocks after 15m idle.
+    const controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+    if (controlMatch) {
+      if (!requestIdentity) {
+        return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      }
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(controlMatch[1]); }
+      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      const resolution = resolveDashboardSessionPreview(sessionId);
+      if (!resolution.ok) {
+        return dashboardControlJson(res, resolution.status, { ok: false, error: resolution.error });
+      }
+      const action = controlMatch[2];
+      if (req.method === 'GET' && !action) {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.state(requestIdentity, sessionId) });
+      }
+      // 唯一权威的角色门禁。guard 壳与工作台是否渲染解锁按钮，走的是同一个
+      // previewInteractionWriteAllowed（经 canInteract 投影），所以「按能力隐藏
+      // 按钮」永远只是把一次必然 403 的点击省掉，不会替代这里的检查。
+      if (!previewInteractionWriteAllowed(requestIdentity)) {
+        return dashboardControlJson(res, 403, { ok: false, error: 'preview_operation_forbidden' });
+      }
+      if (req.method === 'POST' && action === 'unlock') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.unlock(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'activity') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.activity(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'lock') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.lock(requestIdentity, sessionId) });
+      }
+      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
     }
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
@@ -3113,6 +3596,9 @@ const server = createServer(async (req, res) => {
       || url.pathname.startsWith('/api/debug-terminal/')
       || url.pathname.startsWith('/debug-terminal/')
     ) {
+      // H5 sessions are scoped to Dashboard/workbench control. They never
+      // inherit the legacy owner's unrestricted debug shell.
+      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
       if (debugTerminalManager.handleHttp(req, res, url)) return;
     }
 
@@ -3123,6 +3609,56 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname.startsWith('/plugins/')) {
       if (servePluginStatic(res, url.pathname)) return;
       res.writeHead(404); res.end(); return;
+    }
+
+    // Fragment-free entry points. The card's terminal AppLink works with a plain
+    // `/s/<id>?token=` URL; ours carried `#/agent-workbench`, and a fragment is
+    // the one structural difference between the two. Clients that re-encode or
+    // truncate an AppLink's `url` lose it and land on the Dashboard home, so
+    // offer a path that survives regardless.
+    if ((req.method === 'GET' || req.method === 'HEAD')
+      && (url.pathname === '/workbench' || url.pathname === '/workbench/dock')) {
+      const target = url.pathname === '/workbench/dock' ? '#/agent-workbench-dock' : '#/agent-workbench';
+      const token = url.searchParams.get('t');
+      const query = token ? `?t=${encodeURIComponent(token)}` : '';
+      res.writeHead(302, { location: `/${query}${target}`, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
+    // Self-service diagnostics for the same phone that cannot render the
+    // Workbench terminal. Desktop browsers and Chromium's mobile emulation both
+    // succeed, so the failing device has to report its own conditions: which
+    // build it cached, whether its cookie rides along, whether the terminal's
+    // HTTP and WebSocket hops are reachable from its network. Zero external
+    // resources and no SPA bundle — it must open precisely when the SPA cannot,
+    // which is also why it is allow-listed beside the static shell in
+    // `decideDashboardAuth`. It probes only the visitor's own reachability and
+    // echoes no token or secret.
+    if (handleWorkbenchDoctor(req, res, url)) return;
+
+    // Installable Workbench: Feishu has no way to pin a custom app into its
+    // mobile tab bar, so the closest thing to a permanent entry is the phone's
+    // own home screen. A manifest makes "add to home screen" launch straight
+    // into the session list, standalone and chrome-less.
+    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/workbench.webmanifest') {
+      const manifest = {
+        name: 'Botmux Workbench',
+        short_name: 'Workbench',
+        start_url: '/#/agent-workbench',
+        scope: '/',
+        display: 'standalone',
+        orientation: 'any',
+        background_color: '#080b10',
+        theme_color: '#080b10',
+        icons: [
+          { src: '/apple-touch-icon.png', sizes: '180x180', type: 'image/png' },
+          { src: '/favicon.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        ],
+      };
+      res.writeHead(200, { 'content-type': 'application/manifest+json', 'cache-control': 'no-cache' });
+      res.end(JSON.stringify(manifest));
+      return;
     }
 
     // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
@@ -3151,7 +3687,13 @@ const server = createServer(async (req, res) => {
         : url.pathname === '/favicon.ico'
           ? '/favicon.png'
         : url.pathname;
-      if (serveStatic(req, res, lookupPath)) return;
+      if (serveStatic(req, res, lookupPath, {
+        // P1-11：只给已认证身份签票据；匿名 public-read 壳不含票据，控制类端点
+        // 对它本来就 401/403。
+        injectHtml: requestIdentity
+          ? html => injectControlCsrfMeta(html, controlCsrfTokens.mint(requestIdentity.authSessionId))
+          : undefined,
+      })) return;
       if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
     }
 
@@ -3199,8 +3741,9 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       }), groupsMatrixSnapshot.peekPresentation());
+      const browserSessions = projectSessionPreviewsForBrowser(sessions);
       return jsonRes(res, 200, {
-        sessions: authed ? sessions : redactSessionsForPublic(sessions),
+        sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
     }
 
@@ -3376,6 +3919,37 @@ const server = createServer(async (req, res) => {
         : { ok: true, settings: result.settings });
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/autostart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      res.setHeader('cache-control', 'no-store');
+      return jsonRes(res, 200, { ok: true, state: await dashboardAutostart.getState() });
+    }
+    if (req.method === 'PUT' && url.pathname === '/api/autostart') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      res.setHeader('cache-control', 'no-store');
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const parsed = parseAutostartWrite(body);
+      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+      try {
+        const state = await dashboardAutostart.setEnabled(parsed.enabled);
+        return jsonRes(res, 200, { ok: true, state });
+      } catch (error) {
+        if (error instanceof DashboardAutostartError) {
+          logger.warn(`[dashboard-autostart] ${error.code}: ${error.message}`);
+          return jsonRes(res, dashboardAutostartErrorStatus(error), {
+            ok: false,
+            error: error.code,
+          });
+        }
+        throw error;
+      }
+    }
+
     // ─── Version & manual update ─────────────────────────────────────────────
     // Global package updates and a host restart are privileged: none of these paths
     // are on PUBLIC_READ_PATHS, so decideDashboardAuth already 401s an
@@ -3419,6 +3993,7 @@ const server = createServer(async (req, res) => {
         ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
         lastCheckedAt: entry.lastCheckedAt,
       }));
+      const localDev = isLocalDevInstall();
       return jsonRes(res, 200, {
         current,
         latest,
@@ -3426,7 +4001,11 @@ const server = createServer(async (req, res) => {
         behind: !!latest && isNewerVersion(latest, current),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
-        localDevInstall: isLocalDevInstall(),
+        localDevInstall: localDev,
+        // Local-dev can self-update via git pull + build only when the checkout
+        // the wrapper points at is a real git worktree; otherwise the button
+        // stays disabled (there is nothing to pull).
+        localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
         updateSupported: installPlan !== null,
         updateManager: installPlan?.manager ?? installManager,
         updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
@@ -3455,7 +4034,60 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
-      if (isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'local_dev_no_update' });
+      // 本地 checkout：走 git pull --ff-only + pnpm build（与 CLI cmdUpgradeLocalDev
+      // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
+      // /api/update/restart 的 lease/intent 路径。
+      if (isLocalDevInstall()) {
+        const node = checkNode();
+        if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let result: { dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string } | undefined;
+        try {
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            result = await runLocalDevUpdate();
+          }, { maxWaitMs: 2_000 });
+        } catch (e) {
+          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          const code = (e as { code?: string }).code;
+          if (code === 'dirty_worktree') {
+            return jsonRes(res, 409, {
+              ok: false, error: 'dirty_worktree',
+              detail: (e as { status?: string }).status ?? '',
+              dir: (e as { dir?: string }).dir ?? '',
+            });
+          }
+          if (code === 'not_a_worktree') {
+            return jsonRes(res, 400, { ok: false, error: 'not_a_worktree', dir: (e as { dir?: string }).dir ?? '' });
+          }
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+        } finally {
+          updateInFlight = false;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        // Pin THIS build's checkout + HEAD so the follow-up restart applies it,
+        // even if the wrapper is re-pointed by a concurrent `use:here` before the
+        // user confirms the restart. Consumed (and re-verified) in /api/update/restart.
+        if (result) pendingLocalDevRestart = { dir: result.dir, head: result.head };
+        return jsonRes(res, 200, {
+          ok: true,
+          // Versions of the checkout we actually updated (may differ from the
+          // running process's install root when wrapper→B, dashboard runs A).
+          oldVersion: result?.oldVersion ?? '',
+          newVersion: result?.newVersion ?? '',
+          // changed = HEAD advanced (or version string changed) — for display.
+          changed: result?.changed === true || result?.oldVersion !== result?.newVersion,
+          // A successful build regenerates dist/, so a restart is ALWAYS needed
+          // to apply it — independent of whether HEAD moved (the checkout may
+          // have been pulled already and only needed a build).
+          restartRequired: true,
+          localDev: true,
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
         const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
@@ -3674,31 +4306,40 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
-      // The real restart runs in a detached `botmux restart` child, whose
-      // shutdown-capability throw would only reach the maintenance-restart log
-      // — the UI would then poll a reconnect that never happens and mislabel it
-      // as "restart is slow". Detect that fail-closed boundary synchronously so
-      // we can return a precise, actionable error instead of firing a restart
-      // that is guaranteed to die silently. A read failure is non-authoritative
-      // and falls through to the existing behavior (never fabricate a block).
-      try {
-        const preflight = evaluateRestartShutdownPreflight();
-        if (preflight.bootstrapRequired) {
-          return jsonRes(res, 409, {
-            ok: false,
-            error: 'bootstrap_shutdown_protocol_required',
-            unsafeDaemons: preflight.unsafeDaemonNames,
-          });
-        }
-      } catch (error) {
-        logger.warn(`[dashboard] restart shutdown-capability preflight unavailable: ${error instanceof Error ? error.message : error}`);
-      }
+      // (pm2 shutdown-capability preflight removed with the fleet pm2→supervisor
+      // migration: the supervisor has no "bootstrap-shutdown-protocol" policy to
+      // probe. A restart failure surfaces through the detached child's own error
+      // path.)
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
         if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
       } catch { /* empty / bad body → plain restart */ }
       const upd = body.update && typeof body.update === 'object' ? body.update as Record<string, unknown> : null;
+      // Resolve the local-dev restart target BEFORE claiming the lease so a
+      // fail-closed drift check can't leave a dangling lease. Prefer the plan a
+      // preceding /api/update/run pinned (dir + post-build HEAD); a plain manual
+      // restart (no pending plan) resolves the wrapper live. Verify the target's
+      // dist/cli.js exists and — for a pinned plan — that HEAD hasn't moved since
+      // the build; on drift/absence fail closed rather than restart the wrong tree.
+      let localDevRestartError: { status: number; body: Record<string, unknown> } | undefined;
+      let localDevTarget: string | undefined;
+      if (isLocalDevInstall()) {
+        const pinned = pendingLocalDevRestart;
+        pendingLocalDevRestart = undefined; // consume regardless of outcome
+        const decision = resolveLocalDevRestartTarget(pinned, resolveLocalDevCheckoutDir(), {
+          cliEntryExists: (dir) => existsSync(botmuxCliEntryAt(dir)),
+          headOf: (dir) => gitHeadSha(dir),
+        });
+        if (decision.action === 'fail') {
+          localDevRestartError = { status: 409, body: { ok: false, error: decision.reason, dir: decision.dir } };
+        } else if (decision.action === 'restart') {
+          localDevTarget = decision.dir;
+        } else {
+          localDevTarget = undefined; // fallback-running-root
+        }
+      }
+      if (localDevRestartError) return jsonRes(res, localDevRestartError.status, localDevRestartError.body);
       let acquired = false;
       let leaseId: string | null = null;
       let activePackageRoot: string | undefined;
@@ -3728,7 +4369,14 @@ const server = createServer(async (req, res) => {
             });
             return;
           }
-          activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          // Local-dev restarts from the target resolved above (pinned build's
+          // checkout, verified present + at the built HEAD); undefined falls back
+          // to this dashboard process's own cli.js via spawnDetachedRestart.
+          if (isLocalDevInstall()) {
+            activePackageRoot = localDevTarget;
+          } else {
+            activePackageRoot = (lastSuccessfulUpdatePlan ?? tryResolveGlobalInstallPlan())?.activePackageRoot;
+          }
           // Send acknowledgement while holding the lock, then release immediately.
           // The lease itself prevents concurrent restarts — no need to hold the
           // lock across the network round-trip waiting for res.finish.
@@ -4043,6 +4691,13 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // ─── Customization center (built-in prompt/skill overrides) ──────────────
+    // GET is a public read (overview only, no secrets); all mutations are
+    // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
+    if (await handleCustomizationApi(req, res, url)) {
+      return;
+    }
+
     if (await handleConnectorApi(req, res, url)) {
       return;
     }
@@ -4070,12 +4725,22 @@ const server = createServer(async (req, res) => {
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
           }, { shellFallback: false });
+          // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
+          // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
+          // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
+          let modelChoices: string[] = [];
+          try {
+            modelChoices = [...staticModelChoices(o.key)];
+          } catch {
+            modelChoices = [];
+          }
           return {
             id: o.key,
             label: o.label,
             available: availability.available,
             command: availability.command,
             availabilityReason: availability.reason,
+            modelChoices,
             // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
             ...(isTtadkWrapper(o.wrapperCli)
               ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
@@ -4088,6 +4753,18 @@ const server = createServer(async (req, res) => {
         suggestedAppName: botOnboarding.suggestedAppName(),
         webSession,
       });
+    }
+
+    // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
+    // 不做全量扫描——20+ CLI 各自 shell out 会让表单打开即卡。静态候选已随
+    // /api/cli-options 的 modelChoices 字段下发，本端点只补 live 增量并合并去重。
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/models') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const body = await buildModelChoicesResponse(key);
+      return jsonRes(res, 200, body);
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
@@ -4335,6 +5012,8 @@ const server = createServer(async (req, res) => {
     let m: RegExpMatchArray | null;
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
+      // P1-11：locate 与接管/解锁同属工作台三项操作能力，同样是无 body POST。
+      if (op === 'locate' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       // Defensive client-side deadline: the daemon side of every op here replies
@@ -4428,9 +5107,16 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
+      const raw = await upstream.text();
+      if (!upstream.ok) {
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(raw);
+        return;
+      }
+      let body: unknown;
+      try { body = JSON.parse(raw); }
+      catch { return jsonRes(res, 502, { ok: false, error: 'invalid_daemon_response' }); }
+      return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
     }
 
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
@@ -4475,6 +5161,10 @@ const server = createServer(async (req, res) => {
     // so decideDashboardAuth has already 401'd unauthenticated callers before we
     // get here — the token only reaches authenticated dashboard sessions.
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/write-link$/))) {
+      // Short H5 sessions use the tokenless /control/takeover lease. Returning
+      // the legacy stable capability here would bypass release/expiry/disconnect
+      // enforcement and leak a token into browser-visible JSON.
+      if (!legacyAuthed) return dashboardControlJson(res, 403, { ok: false, error: 'control_takeover_required' });
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -4484,10 +5174,68 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Read-only web-terminal link. The Workbench terminal pane uses it so the
+    // frame authenticates by capability instead of by Dashboard cookie, which
+    // a Feishu WebView's WebSocket does not carry.
+    //
+    // Two things about the daemon's answer never reach the browser (P1-5):
+    //   • its `?viewToken=` is the worker's per-boot card token, unbound to the
+    //     requesting authentication. It is consumed here — converted to a
+    //     one-way worker generation id — and REPLACED with a short-lived signed
+    //     read grant bound to sessionId + authSessionId + expiresAt + that
+    //     generation + `audience: central`;
+    //   • its ORIGIN is the daemon terminal proxy / worker port, both network
+    //     reachable and both blind to logout. We answer with a same-origin
+    //     relative path instead, so the only entry point the browser ever learns
+    //     is this dashboard's front proxy — the one place that checks auth
+    //     session liveness and countersigns the hop for the worker.
+    // A view capability can never send input, so this stays safe for any
+    // identity allowed to observe the session; unauthenticated callers were
+    // already rejected by the auth decision above (no public allow-list).
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/view-link$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/view-link`, { method: 'GET' });
+      if (upstream.status !== 200) {
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      let upstreamUrl: unknown;
+      try {
+        upstreamUrl = (JSON.parse(await upstream.text()) as { url?: unknown }).url;
+      } catch {
+        upstreamUrl = undefined;
+      }
+      // No generation ⇒ no pinned capability. Fail closed rather than mint one
+      // that would outlive the worker boot it was meant for.
+      const generation = upstreamWorkerViewGeneration(SECRET, upstreamUrl);
+      const minted = requestIdentity && generation
+        ? mintTerminalViewCapability(SECRET, sid, requestIdentity, generation)
+        : null;
+      const rewritten = minted ? centralViewLinkPath(sid, minted.token) : null;
+      // Fail closed rather than fall back to the unbound upstream token/origin.
+      if (!minted || !rewritten) return jsonRes(res, 502, { ok: false, error: 'view_link_unavailable' });
+      return jsonRes(res, 200, { ok: true, url: rewritten, expiresAt: minted.expiresAt });
+    }
+
+    // Browser-safe preview metadata. The literal loopback host/port remains in
+    // the aggregator only; this authenticated API returns a same-origin path.
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const resolution = resolveDashboardSessionPreview(sid);
+      if (!resolution.ok) return jsonRes(res, resolution.status, { ok: false, error: resolution.error });
+      const preview = previewDescriptorFromRow(aggregator.getSession(sid));
+      if (!preview) return jsonRes(res, 404, { ok: false, error: 'preview_not_registered' });
+      return jsonRes(res, 200, { ok: true, preview });
+    }
+
 
     // Dashboard「复现命令」：透传到 owning daemon 取该 session 的真实 CLI 调用。
     // 与 write-link 同样只在管理 cookie（写权限）下可达：命令含 token/凭证。
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/spawn-command$/))) {
+      if (!legacyAuthed) return dashboardControlJson(res, 403, { ok: false, error: 'legacy_owner_required' });
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -4741,10 +5489,7 @@ const server = createServer(async (req, res) => {
     // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
     if (url.pathname === '/api/vc-meeting/consumer-profiles') {
       if (req.method === 'GET') {
-        const out = await handleVcMeetingConsumerProfilesGet(
-          url.searchParams.get('listenerBotAppId') ?? '',
-          vcMeetingConsumerProfilesApiDeps(),
-        );
+        const out = await handleVcMeetingConsumerProfilesGet(vcMeetingConsumerProfilesApiDeps());
         return jsonRes(res, out.status, out.body);
       }
       if (req.method === 'PUT') {
@@ -4758,6 +5503,63 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, out.status, out.body);
       }
       return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
+    // 按 bot 手动触发的开放平台前置配置（开权限 + 订 VC 事件 + 补 larkCliProfile）。
+    // 私有 API，同样不在 PUBLIC_READ_PATHS。做成显式动作而不是随勾选自动跑：
+    // 「接收会议事件」默认就是开的，没有 off→on 跃迁可挂；页面加载时对整个 fleet
+    // 跑一遍则是几十上百次开放平台调用。
+    if (url.pathname === '/api/vc-meeting/bot-preflight') {
+      if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const appId = (parsed as { appId?: unknown } | null)?.appId;
+      if (typeof appId !== 'string' || !appId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'missing_appId' });
+      }
+      const out = await preflightVcMeetingBot(appId);
+      if (out.ok) return jsonRes(res, 200, { ok: true });
+      return jsonRes(res, 400, { ok: false, error: out.error, feishuLoginQr: out.feishuLoginQr });
+    }
+
+    // 「一键修复开放平台 redirect 白名单」批量入口：一次扫码，把全部（或 body 里
+    // 点名的）存量 bot 的回调白名单补齐。白名单缺失是 authorize 的硬失败（20029），
+    // 而存量 bot 今天没有任何自愈路径会去补它 —— 所以做成显式动作。
+    // 私有 API，同样不在 PUBLIC_READ_PATHS，未认证已被 decideDashboardAuth 401。
+    if (url.pathname === '/api/open-platform/repair-redirects') {
+      if (req.method !== 'POST') return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const rawAppIds = (parsed as { appIds?: unknown } | null)?.appIds;
+      let appIds: string[] | undefined;
+      if (rawAppIds !== undefined && rawAppIds !== null) {
+        if (!Array.isArray(rawAppIds) || rawAppIds.some(id => typeof id !== 'string')) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_appIds' });
+        }
+        appIds = rawAppIds as string[];
+      }
+      const out = await repairOpenPlatformRedirects({ appIds });
+      if (out.ok) return jsonRes(res, 200, { ok: true, results: out.results, wanted: out.wanted });
+      // 已有一批在跑 → 409（single-flight 在 service 侧，见 open-platform-redirect-repair.ts）：
+      // 用户点两下不该排队等上一批跑完，也不该让两批抢同一份 session/csrf。
+      if (out.reason === 'in_flight') {
+        return jsonRes(res, 409, { ok: false, errorCode: 'repair_in_flight', message: out.message });
+      }
+      // 缺登录态不是错误，是「还差一步」：回 200 让前端走已有的扫码流程
+      //（POST /api/feishu-login/start + GET /api/feishu-login/status）后重试，
+      // 与 VC preflight 遇到同类失败时弹二维码是同一套登录态。
+      if (out.reason === 'login_required') {
+        return jsonRes(res, 200, { ok: false, errorCode: 'feishu_login_required', message: out.message });
+      }
+      return jsonRes(res, 502, { ok: false, errorCode: out.reason, message: out.message });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/role-profiles') {
@@ -5004,6 +5806,7 @@ const server = createServer(async (req, res) => {
             model: j.model || d.model,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
             turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
+            dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
           }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));
@@ -5206,6 +6009,23 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-env`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/codex-auth-sync — per-bot Codex credential policy.
+    let mBotCodexAuthSync: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCodexAuthSync = url.pathname.match(/^\/api\/bots\/([^/]+)\/codex-auth-sync$/))) {
+      const appId = decodeURIComponent(mBotCodexAuthSync[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-codex-auth-sync`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -5528,6 +6348,46 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // GET/PUT /api/bots/:appId/description — proxy to that bot's daemon. GET
+    // returns the localized descriptions read straight off the Open Platform;
+    // PUT body `{ descriptions: Record<lang, string> }` republishes them. The
+    // daemon owns all validation/publish/language-set semantics; this proxy only
+    // forwards, bounding the PUT body so a malicious client can't buffer freely.
+    let mBotDescription: RegExpMatchArray | null;
+    if (
+      (req.method === 'GET' || req.method === 'PUT') &&
+      (mBotDescription = url.pathname.match(/^\/api\/bots\/([^/]+)\/description$/))
+    ) {
+      const appId = decodeURIComponent(mBotDescription[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(appId, `/api/bot-description`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      for await (const c of req) {
+        received += (c as Buffer).length;
+        // Descriptions are tiny (≤20 langs × ≤120 chars); cap before buffering more.
+        if (received > 64 * 1024) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'body_too_large' }));
+          return;
+        }
+        chunks.push(c as Buffer);
+      }
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-description`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/avatar — proxy to that bot's daemon. Body
     // `{ imageBase64: string }` (512×512 PNG, canvas-normalized by the web UI).
     // The daemon runs the Open Platform automation (upload icon + base_info +
@@ -5633,6 +6493,24 @@ const server = createServer(async (req, res) => {
         error: loginRequired ? 'user_login_required' : 'feed_group_api_unavailable',
         message: loginRequired ? '尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。' : '没有可用于读取标签的飞书机器人。',
       });
+    }
+
+    // PUT /api/bots/:appId/session-owner-reminder — per-Bot periodic owner
+    // reminder policy. The owning daemon validates, persists, and hot-applies.
+    let mBotOwnerReminder: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotOwnerReminder = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-owner-reminder$/))) {
+      const appId = decodeURIComponent(mBotOwnerReminder[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-session-owner-reminder`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
     }
 
     // Create a new chat — pick a creator from the user-selected larkAppIds
@@ -5904,14 +6782,45 @@ const server = createServer(async (req, res) => {
         'connection': 'keep-alive',
       });
       res.write('retry: 5000\n\n');
+      // P1-8：这条流的寿命必须等于建立它的那次认证的寿命。建流时登记进
+      // authSession→长连接索引（logout/rotate/解绑时被主动 destroy），并在每帧
+      // 推送前复核身份仍有效——否则 rotate 之后新签的 `riffAccessUrl`（Riff 沙箱
+      // 写凭据）会顺着这条老连接送给上一任持有者。匿名 public-read 连接没有认证
+      // 会话，行为不变。
+      // P1-14 姊妹项：这条流的能力口径必须与 REST 同源。Workbench-only 身份对
+      // `GET /api/schedules` 是明确的 401，`/events` 就不能把同一份排程（含
+      // prompt / workingDir / fired 的 error 原文）换个管子送出去——过滤在
+      // createDashboardEventsStream 内部按 audience 执行，见 events-sse.ts。
+      const eventsAudience: DashboardEventAudience = authed
+        ? 'management'
+        : workbenchOnlyIdentity ? 'workbench' : 'anonymous';
+      const stream = createDashboardEventsStream({
+        res,
+        authSessionId: requestIdentity?.authSessionId ?? null,
+        audience: eventsAudience,
+        isAuthSessionLive: terminalAuthSessionLive,
+        bind: (authSessionId, close) => authSessionConnections.register(authSessionId, close),
+      });
       const off = aggregator.on(ev => {
-        // Mirror the GET /api/schedules carve-out: schedule events carry the
-        // full task object — strip the prompt AND workingDir for anonymous SSE
-        // listeners, or the REST-side scrub would be trivially bypassed by
-        // `/events`.
-        let body = authed
-          ? ev.body
-          : redactSessionEventForPublic(ev.type, ev.body) as typeof ev.body;
+        // Session rows follow the same three-way audience as GET /api/sessions,
+        // or a Workbench viewer would receive the preview descriptor on the
+        // initial REST fetch and then lose it on the first live patch.
+        const projectedBody = projectSessionPreviewEventForBrowser(ev.type, ev.body) as typeof ev.body;
+        let body = projectSessionEventForAudience(
+          ev.type,
+          projectedBody,
+          sessionBoardAudience,
+        ) as typeof ev.body;
+        // Schedules stay on the MANAGEMENT gate, mirroring the GET
+        // /api/schedules carve-out: schedule events carry the full task object
+        // (prompt = business instructions, workingDir = repo/customer path) and
+        // `/api/schedules` is not a Workbench capability, so widening this to
+        // `sessionBoardAudience` would let an H5 identity read over `/events`
+        // what the REST route refuses it.
+        // Workbench-only identities never reach this redaction at all — the
+        // stream drops every `schedule.*` frame for them (P1-14 sibling); this
+        // branch is the ANONYMOUS publicReadOnly path, which the REST route
+        // does serve, redacted the same way.
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {
@@ -5920,10 +6829,10 @@ const server = createServer(async (req, res) => {
             ...(b.patch ? { patch: { ...b.patch, prompt: undefined, workingDir: undefined } } : {}),
           } as typeof ev.body;
         }
-        res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body })}\n\n`);
+        stream.write(ev.type, { larkAppId: ev.larkAppId, body });
       });
       const hb = setInterval(() => {
-        res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+        stream.write('heartbeat', { ts: Date.now() });
       }, 15_000);
       // Push a bots.changed frame whenever the online bot roster actually
       // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
@@ -5935,9 +6844,9 @@ const server = createServer(async (req, res) => {
         const sig = botsRosterSignature(online);
         if (sig === lastRoster) return;
         lastRoster = sig;
-        res.write(`event: bots.changed\ndata: ${JSON.stringify({ body: { signature: sig } })}\n\n`);
+        stream.write('bots.changed', { body: { signature: sig } });
       });
-      res.on('close', () => { off(); offRoster(); clearInterval(hb); });
+      res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
       return;
     }
 
@@ -5993,38 +6902,37 @@ oauthCallbackServer.listen(9768, '127.0.0.1', () => {
 server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
-    // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
-    if (rawUrl.startsWith('/debug-terminal/')) {
+    // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
+    // 凭据是路径里的 content capability，绝不能被下面的管理类 Origin 校验误杀。
+    if (sessionPreviewProxy.handleUpgrade(req, clientSocket, head)) return;
+    // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
+    // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
+    // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
+    //
+    // 判之前**先按 path 分流**可信来源档位：会话终端 `/s/*` 认平台 `m-`+`t-`（分享
+    // 出去的终端页就住在 `t-`），而 `/debug-terminal/*` 的另一头是宿主裸 bash，只认
+    // management 档。合在一起判的话，`t-` 就连带成了裸 bash 那条 WS 的可信 Origin。
+    const upgradeRoute = classifyManagementUpgrade(rawUrl);
+    const upgradeOrigin = managementUpgradeOrigin(req.headers, upgradeRoute.surface);
+    if (!upgradeOrigin.ok) {
+      const body = JSON.stringify({ ok: false, error: upgradeOrigin.error });
+      clientSocket.end([
+        'HTTP/1.1 403 Forbidden',
+        'content-type: application/json; charset=utf-8',
+        'cache-control: no-store',
+        'connection: close',
+        `content-length: ${Buffer.byteLength(body)}`,
+        '',
+        body,
+      ].join('\r\n'));
+      return;
+    }
+    // 调试终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
+    if (upgradeRoute.route === 'debug-terminal') {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
-    if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
-      return clientSocket.destroy();
-    }
-    // Strip query/hash before extracting the sessionId path segment.
-    const pathname = rawUrl.split(/[?#]/)[0];
-    const sessionId = parseTerminalSessionId(pathname);
-    const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
-    if (!tport) return clientSocket.destroy();
-
-    const upstream = netConnect(tport, '127.0.0.1', () => {
-      // rawHeaders is a flat [k, v, k, v, ...] list — preserves casing/duplicates.
-      const lines = [`${req.method} ${req.url} HTTP/1.1`];
-      const rh = req.rawHeaders;
-      for (let i = 0; i + 1 < rh.length; i += 2) lines.push(`${rh[i]}: ${rh[i + 1]}`);
-      lines.push('', '');
-      upstream.write(lines.join('\r\n'));
-      if (head?.length) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
-    const cleanup = () => {
-      try { upstream.destroy(); } catch { /* ignore */ }
-      try { clientSocket.destroy(); } catch { /* ignore */ }
-    };
-    upstream.on('error', cleanup);
-    clientSocket.on('error', cleanup);
-    upstream.on('close', () => clientSocket.destroy());
-    clientSocket.on('close', () => upstream.destroy());
+    if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
+    clientSocket.destroy();
   } catch {
     try { clientSocket.destroy(); } catch { /* ignore */ }
   }
@@ -6125,11 +7033,12 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
     // Merge per-bot team-visibility config (showInTeam) from bots.json by
     // larkAppId so the platform team page can hide bots. Default: showInTeam =
     // true (shown). bots.json may be unreadable from the dashboard process →
-    // fall back to the default.
-    const cfgByAppId = new Map<string, { showInTeam?: boolean }>();
+    // fall back to the default. apiOnly is read from the same config to derive
+    // `mentionable` (a core-only bot has no Feishu transport → can't be @-ed).
+    const cfgByAppId = new Map<string, { showInTeam?: boolean; apiOnly?: boolean }>();
     try {
       for (const cfg of loadBotConfigs()) {
-        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam });
+        cfgByAppId.set(cfg.larkAppId, { showInTeam: cfg.showInTeam, apiOnly: cfg.apiOnly });
       }
     } catch {
       /* defaults below */
@@ -6147,6 +7056,13 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
           unionId: e.larkAppId ? getBotUnionId(config.session.dataDir, e.larkAppId) : undefined,
+          // 团队维度 Agent 互查（additive，交接契约 §端点2 / register|heartbeat）：
+          //  · specialties：owner 预配的专长标签（bot-profiles），发现/拉群匹配依据，仅展示不可信。
+          //  · mentionable：是否有飞书传输身份能被 @（core-only/apiOnly → false）。cfg 读不到
+          //    时保守按可传输(true)，与 team-bot-directory「undefined 按可传输」同源
+          //    （fail-open 仅在本机自报、无跨部署放大风险；真正的 no-transport 由 apiOnly 明示）。
+          specialties: e.larkAppId ? getBotSpecialties(config.session.dataDir, e.larkAppId) : [],
+          mentionable: cfg?.apiOnly !== true,
         };
       })
       .filter((b) => b.appId);

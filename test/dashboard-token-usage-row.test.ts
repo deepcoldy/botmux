@@ -15,7 +15,7 @@ vi.mock('../src/core/cost-calculator.js', () => ({
 }));
 
 import { getSessionTokenUsage } from '../src/core/cost-calculator.js';
-import { composeRowFromActive, composeRowFromClosed } from '../src/core/dashboard-rows.js';
+import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 
 function makeDs(): DaemonSession {
   return {
@@ -43,6 +43,34 @@ function makeDs(): DaemonSession {
     workingDir: '/repo',
   } as DaemonSession;
 }
+
+describe('dashboard SessionRow status projection', () => {
+  it('projects working (not starting) during a long first turn once the worker initialized', () => {
+    // Regression: meeting-agent sessions are fed a transcript delivery right at
+    // spawn, so the CLI runs a minutes-long first turn before its first idle
+    // prompt — screen updates are suppressed until then (awaitingFirstPrompt),
+    // leaving lastScreenStatus unset. These sessions used to sit in「启动中」the
+    // whole time even though the CLI was actively working.
+    const ds = makeDs();
+    (ds as { worker: unknown }).worker = { killed: false };
+    (ds as { workerReady?: boolean }).workerReady = true;
+    expect(composeRowFromActive(ds).status).toBe('working');
+  });
+
+  it('keeps starting while the worker has not finished init', () => {
+    const ds = makeDs();
+    (ds as { worker: unknown }).worker = { killed: false };
+    expect(composeRowFromActive(ds).status).toBe('starting');
+  });
+
+  it('screen status still wins once reported', () => {
+    const ds = makeDs();
+    (ds as { worker: unknown }).worker = { killed: false };
+    (ds as { workerReady?: boolean }).workerReady = true;
+    (ds as { lastScreenStatus?: string }).lastScreenStatus = 'idle';
+    expect(composeRowFromActive(ds).status).toBe('idle');
+  });
+});
 
 describe('dashboard SessionRow token usage', () => {
   it('carries native token in/out totals for the sessions table', () => {
@@ -83,5 +111,27 @@ describe('dashboard SessionRow token usage', () => {
       status: 'closed',
       createdAt: new Date(1000).toISOString(),
     }).chatType).toBe('group');
+  });
+
+  it('exposes a direct topic link only from a persisted native omt id', () => {
+    const active = makeDs();
+    active.session.scope = 'thread';
+    active.session.larkThreadId = 'omt_topic';
+    expect(composeRowFromActive(active).feishuThreadLink).toContain('/client/thread/open?');
+    expect(composeRowFromActive(active).feishuThreadLink).toContain('open_thread_id=omt_topic');
+
+    const persisted = { ...active.session, status: 'active' as const };
+    expect(composeRowFromPersistedActive(persisted).feishuThreadLink).toContain('open_thread_id=omt_topic');
+    const closed = { ...active.session, status: 'closed' as const };
+    expect(composeRowFromClosed(closed).feishuThreadLink).toContain('open_thread_id=omt_topic');
+
+    const legacy = makeDs();
+    legacy.session.scope = 'thread';
+    expect(composeRowFromActive(legacy).feishuThreadLink).toBeUndefined();
+
+    const corrupt = makeDs();
+    corrupt.session.scope = 'thread';
+    corrupt.session.larkThreadId = 'om_not_a_topic';
+    expect(composeRowFromActive(corrupt).feishuThreadLink).toBeUndefined();
   });
 });

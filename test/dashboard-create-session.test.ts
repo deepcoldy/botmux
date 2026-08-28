@@ -70,6 +70,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
     map.set(k, ds);

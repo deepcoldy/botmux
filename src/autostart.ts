@@ -28,6 +28,12 @@ export interface AutostartOpts {
   logDir: string;
 }
 
+/** Minimal registration state used by the Dashboard toggle. */
+export interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
+}
+
 const LABEL = 'com.botmux.daemon';
 const SERVICE_NAME = 'botmux.service';
 const WINDOWS_TASK_NAME = 'botmux-daemon';
@@ -190,7 +196,7 @@ function statusMac(): void {
   console.log(`Plist 存在: ${existsSync(path) ? 'yes' : 'no'}`);
   console.log(`launchd 已加载: ${loaded ? 'yes' : 'no'}`);
   if (existsSync(path) && !loaded) {
-    console.log(`提示: plist 存在但未加载，运行 botmux autostart enable 重新激活`);
+    console.log(`提示: plist 已注册，将在下次登录时由 launchd 加载`);
   }
 }
 
@@ -467,6 +473,31 @@ function statusWindows(): void {
 }
 
 // ─── Public dispatch ─────────────────────────────────────────────────────────
+
+export function inspectAutostart(): AutostartState {
+  switch (platform()) {
+    case 'macos':
+      return { supported: true, enabled: existsSync(plistPath()) };
+    case 'linux': {
+      if (!userSystemdAvailable()) {
+        return { supported: true, enabled: existsSync(unitPath()) };
+      }
+      const result = spawnSync(
+        'systemctl',
+        ['--user', 'is-enabled', SERVICE_NAME],
+        { stdio: 'pipe' },
+      );
+      return { supported: true, enabled: result.status === 0 };
+    }
+    case 'windows':
+      return {
+        supported: true,
+        enabled: windowsTaskExists() || existsSync(windowsStartupLauncherPath()),
+      };
+    default:
+      return { supported: false, enabled: false };
+  }
+}
 
 export function enableAutostart(opts: AutostartOpts): void {
   switch (platform()) {

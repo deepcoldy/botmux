@@ -56,10 +56,11 @@ Hard constraints (all validated; violations return 400):
 - **`envelope.trusted` must be `false`**. This is an injection-defense design: `trusted:false` declares "the envelope content is untrusted external data", so the daemon wraps it as an untrusted event and does not execute instructions embedded inside it. Put what you actually want the bot to do in the top-level `instruction` (the trusted directive), not in the envelope.
 - **Omitting `chatId`** requires `options` to contain either `waitForFinalOutput` or `asyncReturnSessionId`, else `target_required`.
 - **`options.timeoutMs` range `[1000, 300000]`** (1s–5min); out of range returns 400. Defaults to 120000.
-- **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app bots only**): override the model and reasoning level for this trigger.
-  - `model`: a codex model id (≤200 chars); `reasoningEffort`: `low` / `medium` / `high` / `xhigh` (passed to codex verbatim — no downgrade).
-  - **Fresh-session only**: frozen only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
-  - **Scoped to the codex family**: ignored when the target bot is not codex/codex-app (never changes a Claude/Gemini/CoCo bot's model).
+- **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app / traex / grok bots only**): override the model and reasoning level for this trigger.
+  - `model`: a model id for that CLI (≤200 chars); `reasoningEffort` is validated against the selected CLI/model. Common levels are `low` / `medium` / `high` / `xhigh`, with `max` / `ultra` available on some models. Missing or unknown models expose only the safe common levels; explicitly unsupported or out-of-range efforts return 400.
+  - **Fresh-session only**: recorded only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
+  - `model` is **held in memory, never persisted**: it applies to every launch of that session within this daemon's lifetime and is not restored after a daemon restart — later launches use the bot's configured model. `reasoningEffort` is still persisted with the session.
+  - **Scoped to CLIs with an explicit reasoning control**: ignored when the target bot is not codex/codex-app/traex/grok (never changes a Claude/Gemini/CoCo bot's model).
 
 ### Sync mode (waitForFinalOutput)
 

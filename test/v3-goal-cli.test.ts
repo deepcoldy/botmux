@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import {
   existsSync,
@@ -28,6 +28,7 @@ import {
 } from '../src/workflows/v3/manifest.js';
 import { materialize } from '../src/workflows/v3/state.js';
 import { GOAL_ENV, type Manifest, type RunNode, type ValidateManifest } from '../src/workflows/v3/contract.js';
+import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const TEST_BOT: BotConfig = {
   larkAppId: 'cli_goal_test',
@@ -101,6 +102,7 @@ function harness(baseDir: string, runNode: RunNode) {
     signalEmitter: signals as unknown as GoalCliDependencies['signalEmitter'],
     now: () => new Date('2026-07-22T00:00:00.000Z'),
     newRunId: () => 'generated-goal-run',
+    env: { BOTMUX_WORKFLOW_ENABLED: 'true' },
     stdout: stdout as unknown as GoalCliDependencies['stdout'],
     stderr: stderr as unknown as GoalCliDependencies['stderr'],
   };
@@ -168,9 +170,11 @@ describe('botmux goal run — machine terminal contract', () => {
 
   it('keeps real process stdout to one JSON document and routes no runtime log into it', () => {
     const base = root();
+    // execFileSync 形态，wrapper 表达不了，用 runner 前缀拼 argv。
+    const { command, prefixArgs } = tsRunnerPrefix();
     const stdout = execFileSync(
-      process.execPath,
-      ['--import', 'tsx', 'test/fixtures/run-goal-cli-success.ts', base, 'wire-json'],
+      command,
+      [...prefixArgs, 'test/fixtures/run-goal-cli-success.ts', base, 'wire-json'],
       { cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     const parsed = JSON.parse(stdout) as GoalRunResultV1;
@@ -349,9 +353,9 @@ describe('botmux goal run — machine terminal contract', () => {
   it.runIf(process.platform === 'linux')('kill -9 leaves a retryable journal; same runId re-drives as attempt 002', async () => {
     const base = root();
     const readyPath = join(base, 'ready');
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', 'test/fixtures/run-goal-cli-crash.ts', base, 'kill9-recover', readyPath],
+    const child = spawnTsScript(
+      'test/fixtures/run-goal-cli-crash.ts',
+      [base, 'kill9-recover', readyPath],
       { cwd: process.cwd(), stdio: 'ignore' },
     );
     children.push(child);
@@ -390,4 +394,45 @@ describe('botmux goal run — machine terminal contract', () => {
     expect(events.filter((event) => event.type === 'nodeDispatched').map((event) => event.attemptId))
       .toEqual(['goal#001/attempts/001', 'goal#001/attempts/002']);
   }, 15_000);
+});
+
+describe('botmux goal run — workflow kill-switch gate', () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+    roots.length = 0;
+  });
+  function root(): string {
+    const value = mkdtempSync(join(tmpdir(), 'botmux-goal-gate-'));
+    roots.push(value);
+    return value;
+  }
+
+  it('refuses to launch (exit 14, WORKFLOW_DISABLED) and never invokes the ephemeral runNode when disabled', async () => {
+    const base = root();
+    let runNodeCalls = 0;
+    const runNode: RunNode = (async () => { runNodeCalls++; throw new Error('runNode must not be reached when workflow disabled'); }) as unknown as RunNode;
+    const h = harness(base, runNode);
+    const exitCode = await cmdGoal('run', h.args('gated-run'), {
+      ...h.deps,
+      env: { BOTMUX_WORKFLOW_ENABLED: 'false' },
+    });
+    expect(exitCode).toBe(GOAL_RUN_EXIT.error); // 14
+    expect(runNodeCalls).toBe(0); // gate is BEFORE any run launch
+    const result = onlyJson(h.stdout);
+    expect(result.state).toBe('error');
+    expect(result.error?.code).toBe('WORKFLOW_DISABLED');
+  });
+
+  it('passes the gate and launches when explicitly enabled via env', async () => {
+    const base = root();
+    let runNodeCalls = 0;
+    const h = harness(base, successfulRunNode(() => { runNodeCalls++; }));
+    const exitCode = await cmdGoal('run', h.args('enabled-run'), {
+      ...h.deps,
+      env: { BOTMUX_WORKFLOW_ENABLED: 'true' },
+    });
+    expect(exitCode).toBe(GOAL_RUN_EXIT.succeeded);
+    expect(runNodeCalls).toBe(1); // reached the real run
+  });
 });

@@ -38,6 +38,12 @@ import {
   readDashboardClientShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
+import { ToastStack } from './toast.js';
+import { ConfirmModalRoot } from './confirm-modal.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  parseWorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -83,6 +89,7 @@ const MANAGE_ROUTES = [
   'role-profiles',
   'bot-defaults',
   'skills',
+  'customization',
   'plugins',
   'team',
   'connectors',
@@ -106,6 +113,14 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
+  {
+    // 驾驶舱（Agent Workbench）：桌面/移动壳内仍是无边框壳（见 workbenchSurface），
+    // 从侧边栏进入时走正常壳。不属于 manage 项。
+    id: 'agent-workbench',
+    href: '#/agent-workbench',
+    labelKey: 'nav.workbench',
+    icon: <><rect x="2" y="3" width="12" height="10" rx="1.5" /><path d="M4.5 6.5l2 1.5-2 1.5M8 10h3" /></>,
+  },
   {
     id: 'groups',
     href: '#/groups',
@@ -150,10 +165,25 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
   { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
+  { id: 'customization', href: '#/customization', labelKey: 'nav.customization', manage: true, icon: <><path d="M11.5 2.5l2 2-7 7-2.6.6.6-2.6z" /><path d="M2.5 13.5h5" /></> },
   { id: 'plugins', href: '#/plugins', label: '插件', manage: true, icon: <><path d="M6.4 1.8h3.2v3h2.8v3.2H9.6v2.8H6.4V8H3.6V4.8h2.8z" /><path d="M2.2 11.8h11.6v2.4H2.2z" /></> },
   { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
   { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
+];
+
+/**
+ * 侧边栏分组（顺序即渲染顺序）。组内只存 NavItem id，渲染时从
+ * {@link sidebarNavItems} 的结果里按 id 取——manage 过滤、client-shell 过滤、
+ * pinned plugin 插入都仍由那条链路负责，这里不复制任何权限/可见性逻辑。
+ * pinned plugin 项没有自己的组，统一挂在「管理」组的「插件」之后。
+ */
+const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
+  { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
+  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
+  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'bot-defaults'] },
+  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
+  { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];
 
 let pinnedPluginNavItems: NavItem[] = [];
@@ -223,6 +253,32 @@ function navClassName(item: NavItem): string | undefined {
   if (isActiveNav(item, activeHash)) classes.push('active');
   if (item.id === 'settings' && updateBehind) classes.push('nav-has-update');
   return classes.length ? classes.join(' ') : undefined;
+}
+
+/** 侧边栏导航锚点：桌面分组导航与移动端横向 rail 共用同一份渲染。 */
+function renderNavAnchor(item: NavItem): React.JSX.Element {
+  return (
+    <a
+      href={item.href}
+      data-route={item.id}
+      className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
+      title={item.plugin ? labelOf(item) : undefined}
+    >
+      {icon(item.icon)}
+      <span className="sidebar-nav-label">{labelOf(item)}</span>
+      {item.id === 'settings' && updateBehind ? (
+        <InfoTip
+          className="nav-update-tip"
+          label={updateBadgeTitle()}
+          trigger={<span className="nav-update-dot" aria-hidden="true" />}
+          preventClick={false}
+          focusable={false}
+        >
+          {updateBadgeTitle()}
+        </InfoTip>
+      ) : null}
+    </a>
+  );
 }
 
 function readShellLocale(): DashboardLocale | null {
@@ -1166,6 +1222,38 @@ function DashboardShell(): React.JSX.Element {
     expiredShown = false;
     setAuthExpiredOpen(false);
   };
+  // 工作台默认是无边框壳（没有 topbar / 侧栏），但无边框只留给桌面 / 移动客户端
+  // （botmuxClientShell）：从侧边栏等网页入口点进 #/agent-workbench 时必须保持正常
+  // 壳，否则导航一去不回。client-shell 参数可能挂在 search 也可能挂在 hash（桌面端
+  // 为过登录重定向把壳标记放在 hash 里），readDashboardClientShell 两种都认。
+  const workbenchSurface = readDashboardClientShell()
+    ? activeHash.startsWith('#/agent-workbench-dock')
+      ? 'dock'
+      : activeHash.startsWith('#/agent-workbench')
+        ? 'appCenter'
+        : null
+    : null;
+  if (workbenchSurface) {
+    return (
+      <>
+        <div className="workbench-route-host" data-workbench-surface={workbenchSurface}>
+          <main id="root" ref={setRouteRoot} />
+        </div>
+        {/* 工作台是无边框壳（没有 topbar / 侧栏），登录态失效时这个浮层是它唯一
+            的自救出口——漏传 loginUrl 会让浮层退化成「访问链接已失效 / 知道了」
+            的死胡同，一键登录压根不渲染。与下面普通壳的传参保持一致。 */}
+        <AuthExpiredOverlay
+          open={authExpiredOpen}
+          loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+          onClose={closeAuthExpired}
+        />
+        {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关）。
+            workbench 无边框壳也需要挂载，否则将来 workbench 内调用 confirm() 会永久挂起。 */}
+        <ToastStack />
+        <ConfirmModalRoot />
+      </>
+    );
+  }
   return (
     <>
       <div className="aurora" aria-hidden="true"><i className="a1" /><i className="a2" /><i className="a3" /></div>
@@ -1198,7 +1286,7 @@ function DashboardShell(): React.JSX.Element {
               <ThemeMenuSlot />
               <a
                 className="topbar-docs-link"
-                href="https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/"
+                href="https://deepcoldy.github.io/botmux/"
                 target="_blank"
                 rel="noopener noreferrer"
                 title={t('nav.docs')}
@@ -1240,29 +1328,26 @@ function DashboardShell(): React.JSX.Element {
               </div>
             ) : null}
             <nav className="sidebar-nav" aria-label="Dashboard">
-              {sidebarNavItems().filter(item => isAuthed || !item.manage).map(item => (
-                <a
-                  key={item.id}
-                  href={item.href}
-                  data-route={item.id}
-                  className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
-                  title={item.plugin ? labelOf(item) : undefined}
-                >
-                  {icon(item.icon)}
-                  <span className="sidebar-nav-label">{labelOf(item)}</span>
-                  {item.id === 'settings' && updateBehind ? (
-                    <InfoTip
-                      className="nav-update-tip"
-                      label={updateBadgeTitle()}
-                      trigger={<span className="nav-update-dot" aria-hidden="true" />}
-                      preventClick={false}
-                      focusable={false}
-                    >
-                      {updateBadgeTitle()}
-                    </InfoTip>
-                  ) : null}
-                </a>
-            ))}
+              {(() => {
+                const visible = sidebarNavItems().filter(item => isAuthed || !item.manage);
+                const byId = new Map(visible.map(item => [item.id, item]));
+                // pinned plugin 项没有自己的组，跟在「管理」组的「插件」之后。
+                const pinnedPlugins = visible.filter(item => item.plugin);
+                return NAV_GROUPS.map(group => {
+                  const items = group.items.flatMap(id => {
+                    const item = byId.get(id);
+                    if (!item) return [];
+                    return item.id === 'plugins' ? [item, ...pinnedPlugins] : [item];
+                  });
+                  if (items.length === 0) return null;
+                  return (
+                    <div className="nav-group" key={group.id}>
+                      <div className="nav-group-title">{t(group.labelKey)}</div>
+                      {items.map(renderNavAnchor)}
+                    </div>
+                  );
+                });
+              })()}
             </nav>
           </aside>
           <div className="workspace">
@@ -1277,6 +1362,9 @@ function DashboardShell(): React.JSX.Element {
         loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
         onClose={closeAuthExpired}
       />
+      {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关） */}
+      <ToastStack />
+      <ConfirmModalRoot />
     </>
   );
 }
@@ -1326,6 +1414,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    // Management reads are intentionally outside an H5/platform Workbench
+    // identity's capability map. The server marks that expected narrow denial;
+    // an unmarked 401 still means the identity expired and opens the login UI.
+    if (res.headers.get('x-botmux-auth-scope') === 'workbench') return res;
     const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
@@ -1335,19 +1427,57 @@ window.fetch = async function patchedFetch(
   return res;
 };
 
-async function loadAuthState(): Promise<void> {
+/**
+ * P1-4：拉取服务端投影的最小操作能力集。走 origFetch 绕过全局 401 包装——匿名
+ * （含 publicReadOnly 访客）在这里 401 是预期的能力探测结果，不是登录过期事件。
+ * 任何失败（401、网络错误、响应不合形）严格回落全 false：操作入口宁可少画，
+ * 不给无权身份画出会 401/403 的按钮。
+ */
+async function loadWorkbenchCapabilities(): Promise<void> {
   try {
-    const r = await fetch('/api/settings');
+    const r = await origFetch('/api/workbench/capabilities', { cache: 'no-store' });
+    ui.workbenchCapabilities = r.ok
+      ? parseWorkbenchCapabilities(await r.json())
+      : NO_WORKBENCH_CAPABILITIES;
+  } catch {
+    ui.workbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
+  }
+}
+
+async function loadAuthState(): Promise<void> {
+  // 能力探测与 /api/settings 并行：两者互不依赖，也都在首次 route() 之前完成。
+  const capabilitiesProbe = loadWorkbenchCapabilities();
+  try {
+    // Use the unwrapped request: a valid narrow Workbench identity is supposed
+    // to get a scoped 401 here, and that is auth-state data rather than an
+    // expiry event for the global fetch wrapper.
+    const r = await origFetch('/api/settings');
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
+      ui.workbenchAuthed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
+    } else if (r.status === 401 && r.headers.get('x-botmux-auth-scope') === 'workbench') {
+      // H5/platform identities can use Workbench control leases but must never
+      // become Dashboard owners merely because the shell probed /api/settings.
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = true;
+      publicReadOnly = false;
+      ui.publicReadOnly = false;
+    } else if (r.status === 401) {
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = false;
+      const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
+      showAuthExpiredOverlay(loginUrl);
     }
   } catch { /* keep defaults */ }
+  await capabilitiesProbe;
 }
 
 async function loadPinnedPluginNavItems(): Promise<void> {
@@ -1542,7 +1672,14 @@ void (async () => {
   }, 30 * 60_000);
   initOwnerAvatar();
   try {
-    await bootstrap();
+    await bootstrap({
+      // P1-14：排程只对「本机管理身份」和「publicReadOnly 匿名访客」开放。
+      // Workbench-only 身份（飞书 H5 / 平台 teammate|guest，loadAuthState 里把
+      // authed 置 false、workbenchAuthed 置 true）对 /api/schedules 是既定的
+      // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
+      // 依赖它对不对。
+      canReadSchedules: () => ui.authed || ui.publicReadOnly,
+    });
   } catch (err) {
     console.error('botmux dashboard bootstrap failed', err);
     store.setOnline(false);

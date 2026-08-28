@@ -22,7 +22,7 @@ CLI 进入 botmux 会话时，自动获得 `~/.botmux/bin` 在 PATH 中，以及
 
 ## wrapper 机制
 
-会话内命令依赖 `~/.botmux/bin/botmux` 这个 wrapper 脚本——**daemon 启动时自动写入**并加入 worker 的 PATH。wrapper 是个极薄的 `exec node <本 daemon 的 dist/cli.js>` shim，所以**版本永远跟 daemon 一致**，不需要单独 `npm i -g`。（`pnpm use:here` 之类是开发期手动改指向，与启动写入同内容、幂等。）
+会话内命令依赖 `~/.botmux/bin/botmux` 这个 wrapper 脚本——**daemon 启动时自动写入**并加入 worker 的 PATH。wrapper 是个极薄的 `exec node <本 daemon 的 dist/cli.js>` shim，所以**版本永远跟 daemon 一致**，不需要单独 `npm i -g`。（`bun run use:here` 之类是开发期手动改指向，与启动写入同内容、幂等。）
 
 session 信息通过**祖先进程标记**自动推断：worker 启动 CLI 时按子进程 PID 写一份标记（含 sessionId / turnId），agent 侧的命令沿进程树向上找到最近的标记即知道自己属于哪个会话——所以 agent 无需手动传 session id。进程树被打断（detached / `setsid` / 深层嵌套）时回落到 `BOTMUX_SESSION_ID` 环境变量兜底。
 

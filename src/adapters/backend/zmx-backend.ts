@@ -1159,7 +1159,9 @@ export class ZmxBackend implements SessionBackend {
         // fake terminal leader and never controls the backing PTY dimensions.
         stdio: ['ignore', 'ignore', 'pipe'],
         timeout: ZMX_COMMAND_TIMEOUT_MS,
-        env: zmxControlEnv(opts),
+        // The session PTY inherits THIS env — zmxFreshSessionEnv pins TERM,
+        // which the pm2-boundary scrub removed from the daemon/worker env.
+        env: zmxFreshSessionEnv(opts),
       });
 
       const ready = this.waitForFreshReady(launch);
@@ -2515,6 +2517,20 @@ function createZmxLaunchPayload(bin: string, args: string[], opts: SpawnOpts): Z
     cleanup();
     throw err;
   }
+}
+
+/**
+ * Env for the one-shot client that CREATES a fresh session. Unlike the
+ * node-pty backends (which force TERM via `name: 'xterm-256color'`), zmx sets
+ * no TERM of its own: the forkpty child inherits the create client's env
+ * verbatim, and the daemon/worker env arrives here with TERM scrubbed at the
+ * pm2 boundary (INVOKER_TERMINAL_ENV_KEYS). Left absent, every CLI in the
+ * session fails supports-color detection and renders colorless — pin the same
+ * constant every other backend PTY already forces. Control clients (get/set/
+ * list/kill) and a user's own `zmx attach` from a real terminal are untouched.
+ */
+export function zmxFreshSessionEnv(opts: SpawnOpts): NodeJS.ProcessEnv {
+  return { ...zmxControlEnv(opts), TERM: 'xterm-256color' };
 }
 
 /** Strip every payload-delivered key from ZMX control subprocesses. */

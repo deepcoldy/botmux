@@ -11,9 +11,17 @@ export interface ListenWebTerminalOpts {
 }
 
 /**
- * Bind the per-session web-terminal HTTP server, recovering from a busy
+ * Bind the per-session web-terminal HTTP server, recovering from an unbindable
  * `preferredPort` (e.g. a persisted webPort reused on worker re-fork that some
- * other process now holds) by retrying on an OS-assigned random port.
+ * other process now holds, or one that fell into a Windows winnat/Hyper-V
+ * reserved TCP range) by retrying on an OS-assigned random port.
+ *
+ * Both EADDRINUSE (port busy) and EACCES (port administratively reserved) are
+ * treated the same way: "can't bind THIS port, try another". On Windows the
+ * winnat reserved ranges re-randomize on every reboot, so a persisted webPort
+ * that bound fine yesterday can start failing with EACCES after a reboot; the
+ * OS never hands a reserved port back from listen(0), so the random-port retry
+ * always succeeds. Only genuinely non-recoverable errors reject.
  *
  * CRITICAL — why the `wss.on('error')` below is load-bearing, not cosmetic:
  * `new WebSocketServer({ server })` makes the ws library proxy the HTTP server's
@@ -76,10 +84,10 @@ export function listenWebTerminalWithFallback(opts: ListenWebTerminalOpts): Prom
       // on an already-listening server (ERR_SERVER_ALREADY_LISTEN, thrown
       // synchronously from the emit → unhandled → crash). Defense in depth.
       if (settled) return;
-      if (err.code === 'EADDRINUSE' && !fallbackAttempted) {
+      if ((err.code === 'EADDRINUSE' || err.code === 'EACCES') && !fallbackAttempted) {
         fallbackAttempted = true;
         if (preferredPort) {
-          log(`Preferred port ${preferredPort} in use (${err.code}), falling back to random`);
+          log(`Preferred port ${preferredPort} unavailable (${err.code}), falling back to random`);
         } else {
           log(`Port ${listenPort} bind failed (${err.code}), retrying with random port`);
         }

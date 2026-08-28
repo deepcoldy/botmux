@@ -13,6 +13,38 @@
 
 Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
+## Codex 的 per-bot 登录态
+
+`codexAuthSync` 控制 Codex 使用全局登录态还是该 bot 的独立登录态：
+
+```json
+{
+  "cliId": "codex",
+  "sandbox": true,
+  "codexAuthSync": "isolated"
+}
+```
+
+- 缺省或 `shared`：保持旧版行为。非沙箱直接使用全局 `~/.codex`；沙箱把
+  `CODEX_HOME` 指向 per-bot 目录，并在每次冷启动用全局 `~/.codex/auth.json`
+  刷新其中的 auth 副本。全局重新登录后，下次冷启动自动同步。
+- `isolated`：无论是否启用沙箱，都把 `CODEX_HOME` 指向
+  `<BOTMUX_HOME>/bots/<larkAppId>/codex`，且从不读取或复制全局 auth。首次启动前执行
+  `CODEX_HOME=<BOTMUX_HOME>/bots/<larkAppId>/codex codex login --with-api-key`。
+  缺少凭证时 worker 只记录路径、策略和明确登录指引，不记录 key/token/auth 内容。
+
+`isolated` 是显式迁移项，不会自动启用；升级后未配置的 bot 继续使用 `shared`。
+私有 `auth.json` 在 daemon 重启、会话休眠/恢复和其它冷启动中保持不变。凭证文件
+始终为 `0600`，符号链接或逃出 BOT_HOME 的 Codex 目录会被拒绝。
+
+注意：`sandbox: false` 只表示不启用 OS 文件访问隔离。缺省的 `shared` 仍使用
+全局 `~/.codex`；显式设置 `codexAuthSync: "isolated"` 则仍会使用独立
+`CODEX_HOME`，但不会阻止该 CLI 读取其它宿主文件。
+
+`bots.json` 的 per-bot `env` 在 Linux bwrap 中会随该 pane 的进程环境传入 CLI
+（PTY 与 tmux 均覆盖），不会写进共享 tmux server 环境。它可以为自定义 provider
+提供 endpoint/key，但不能替代 `requires_openai_auth = true` 时 Codex 选择的登录凭证。
+
 ## 工作原理
 
 ```
@@ -52,6 +84,14 @@ worker spawnCli
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
 → **所有飞书密钥全程不进沙盒**。
+
+## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
+
+no-transport 会话（core-only `apiOnly` bot、或 `http_async_*`/`http_wait_*` HTTP virtual 会话）**不被自动强制文件隔离**。它们的磁盘可读写范围和普通聊天会话一样，只由 bot 自己的 `sandbox`/`readIsolation` 配置决定：没配 → 不隔离（以同一 OS 用户身份对宿主文件有完整**读写**权，能读宿主 `bots.json`、也能改写宿主配置）；配了 → 照常隔离。
+
+> 早先版本曾把「会话没有飞书 transport 通道」当作强制隔离条件（no-transport ⇒ 一律关进沙盒）。现已去掉这条写死的强制，改为跟随 owner 自己的配置——单 bot 部署 / 载荷可信时不再被无谓束缚。**多 bot 同机**、且担心某个半受信任的 no-transport 会话横向读到**兄弟 bot 的凭证**（`bots.json` 里各 bot 的 app secret）时，需 owner **显式**给该 bot 开 `sandbox`（或 `readIsolation` / 全局 `BOTMUX_SANDBOX=1`）。不开沙盒时 agent 拿到的是同一 OS 用户的宿主读写能力：不仅能读出各 bot secret，还能据此直接调 Lark API、或改写宿主上的任意配置——这正是「载荷可信」这一前提要承担的信任面。
+
+两条与文件沙盒正交、不受此放宽影响的边界仍在：① **本 bot 自己的 transport secret 不进 CLI 进程 env**（gated on transport 能力）——这只关闭 **Botmux 内建的 transport 调用链**（本 bot 的 send 路径），**不构成恶意代码下的凭证隔离**：不开沙盒时 agent 仍能从磁盘 `bots.json` 读出 secret 自行调 Lark；② enrolled 设备上的 **device-credential 强制隔离**独立生效，与本开关无关。
 
 ## 落盘（改动去向）
 

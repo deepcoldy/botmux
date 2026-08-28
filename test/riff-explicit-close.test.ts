@@ -54,6 +54,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { readPersistedSessionRows } from './helpers/session-store-disk.js';
 
 let dataDir: string;
 let previousDataDir: string;
@@ -301,7 +302,7 @@ describe('Riff explicit close', () => {
     await new Promise(resolve => setImmediate(resolve));
 
     expect(fixture.session.riffParentTaskId).toBe('task-riff-child');
-    const durable = JSON.parse(readFileSync(join(dataDir, 'sessions-app.json'), 'utf8'));
+    const durable = readPersistedSessionRows(dataDir, 'app');
     expect(durable[fixture.session.sessionId].riffParentTaskId).toBe('task-riff-123');
   });
 
@@ -318,7 +319,7 @@ describe('Riff explicit close', () => {
     await new Promise(resolve => setImmediate(resolve));
 
     expect(fixture.session.riffParentTaskId).toBe('task-riff-123');
-    const durable = JSON.parse(readFileSync(join(dataDir, 'sessions-app.json'), 'utf8'));
+    const durable = readPersistedSessionRows(dataDir, 'app');
     expect(durable[fixture.session.sessionId].riffParentTaskId).toBe('task-riff-123');
   });
 });

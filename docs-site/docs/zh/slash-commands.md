@@ -19,6 +19,7 @@
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
 | `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
 | `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照） |
+| `/cot` | 思考过程消息开关：`/cot off` 关闭本群的思考气泡，`/cot on` 恢复，`/cot show` 在开关关闭时临时召唤一次当前回合的思考气泡，`/cot status` 查看状态（bot 级总开关 `thinkingCard` 默认 on；仅 claude-code / codex 支持） |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |

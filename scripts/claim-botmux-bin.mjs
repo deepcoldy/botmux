@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 认领全局 `botmux`：把 ~/.botmux/bin/botmux 的瘦 wrapper 重写为指向「本 checkout」
-// 的 dist/cli.js。供 `pnpm use:here` / `pnpm switch:here` 显式调用 —— 故意不挂进
+// 的 dist/cli.js。供 `bun run use:here` / `bun run switch:here` 显式调用 —— 故意不挂进
 // `build`，避免 review/验证别人 PR 时一次纯编译就悄悄抢走全局 botmux 的指向。
 //
 // 写入内容与 daemon 启动时写的 wrapper 完全一致（见 src/daemon.ts），所以两者幂等：

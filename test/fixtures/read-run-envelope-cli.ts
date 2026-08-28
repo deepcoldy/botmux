@@ -1,7 +1,9 @@
 /**
  * Subprocess driver for the v3 run-envelope FIFO regression tests.
  *
- * Usage: node --import tsx read-run-envelope-cli.ts <envelope|load> <runDir>
+ * Usage (spawned via test/helpers/ts-runner.ts, which picks the right runtime
+ * prefix): `node --import tsx read-run-envelope-cli.ts <envelope|load> <runDir>`
+ * under Node, `bun read-run-envelope-cli.ts <envelope|load> <runDir>` under Bun.
  *
  * Runs the reader in an isolated child so a regression that re-introduces a
  * blocking open hangs THIS process instead of the vitest worker; the parent

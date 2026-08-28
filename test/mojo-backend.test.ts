@@ -671,3 +671,66 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-nonce","war
     }
   }, 30_000);
 });
+
+describe('pipe-holding grandchild (auto-spawned execution daemon)', () => {
+  it('does not wedge the next turn when a grandchild keeps stdio open', async () => {
+    // Host execution auto-spawns the per-workspace mojo-daemon as the CLIENT's
+    // child and then BABYSITS it: the client process (and its stdio) can stay
+    // alive for hours after the turn's result event (observed live, twice).
+    // runTurn used to resolve only on process end — turn 1 settled fine
+    // (result event) but its promise stayed pending and every later write
+    // queued forever. `exec sleep 30` reproduces the worst shape: the client
+    // itself NEVER exits within the test window, so neither 'exit' nor
+    // 'close' can save us — only settling on the result event does.
+    const bin = fakeMojo(`echo '{"type":"system","subtype":"init","session_id":"sid-pipes"}'
+echo '{"type":"result","status":"ok","result":"turn done","session_id":"sid-pipes","warnings":[]}'
+exec sleep 30`);
+    const backend = new MojoBackend({ bin }, 'sid-pipe-hold');
+    let done = 0;
+    backend.onTaskDone(() => { done += 1; });
+    backend.spawn('', [], {} as never);
+    backend.write('turn one');
+    await vi.waitFor(() => expect(done).toBe(1), { timeout: 10_000 });
+    backend.write('turn two');
+    await vi.waitFor(() => expect(done).toBe(2), { timeout: 15_000 });
+  });
+});
+
+describe('cross-turn stream fencing (late output from an unawaited client)', () => {
+  it('a lingering turn-1 client cannot pollute turn 2 or settle it early', async () => {
+    // settleTurn-resolves means the turn-1 client is deliberately not awaited.
+    // Its pipe stays open (it babysits the daemon) and can emit MORE lines
+    // later — including a late `result`. Without the child fence on the stdout
+    // handler those bytes were consumed as the CURRENT turn's output:
+    // reproduced as turn 2 answering with turn 1's stale text while turn 2's
+    // real answer was dropped (turnSettled already true).
+    const bin = fakeMojo(`ans=TURN1-ANSWER
+for a in "$@"; do [ "$a" = "-r" ] && ans=TURN2-ANSWER; done
+echo '{"type":"system","subtype":"init","session_id":"sid-fence"}'
+if [ "$ans" = "TURN1-ANSWER" ]; then
+  echo '{"type":"result","status":"ok","result":"TURN1-ANSWER","session_id":"sid-fence","warnings":[]}'
+  ( sleep 1
+    echo '{"type":"result","status":"ok","result":"STALE-FROM-TURN-1","session_id":"sid-fence","warnings":[]}'
+  ) &
+  exec sleep 30
+fi
+sleep 2
+echo '{"type":"result","status":"ok","result":"TURN2-ANSWER","session_id":"sid-fence","warnings":[]}'`);
+    const backend = new MojoBackend({ bin }, 'sid-stream-fence');
+    let out = '';
+    let done = 0;
+    backend.onData((d) => { out += d; });
+    backend.onTaskDone(() => { done += 1; });
+    backend.spawn('', [], {} as never);
+    backend.write('turn one');
+    await vi.waitFor(() => expect(done).toBe(1), { timeout: 10_000 });
+    // Turn 2 takes ~2s; the stale line lands at ~1s — squarely mid-turn.
+    backend.write('turn two');
+    await vi.waitFor(() => expect(done).toBe(2), { timeout: 15_000 });
+    expect(out).toContain('TURN2-ANSWER');
+    // The stale line from the fenced-out old pipe must never surface —
+    // neither as streamed output nor as a premature turn boundary.
+    expect(out).not.toContain('STALE-FROM-TURN-1');
+    expect(done).toBe(2);
+  });
+});

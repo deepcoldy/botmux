@@ -109,6 +109,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/utils/process-identity.ts',
     'src/workflows/shared/idempotency-key.ts',
     'src/workflows/v3/artifact-contract.ts',
+    'src/workflows/v3/artifact-contract-declarations.ts',
     'src/workflows/v3/attempt-ledger.ts',
     'src/workflows/v3/contract.ts',
     'src/workflows/v3/core-control.ts',
@@ -204,6 +205,7 @@ async function assertTypeBoundary() {
   const typeRoot = join(distDir, 'types');
   const allowedSourceDeclarations = new Set([
     'src/workflows/v3/artifact-contract.d.ts',
+    'src/workflows/v3/artifact-contract-declarations.d.ts',
     'src/workflows/v3/core-control.d.ts',
     'src/workflows/v3/dag.d.ts',
     'src/workflows/v3/event-contract.d.ts',

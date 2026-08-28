@@ -18,6 +18,13 @@
  *   • privateCard               — `/card` sends a private ephemeral snapshot
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
+ *   • thinkingCard              — stream the model's thinking process into a
+ *                                  native Feishu CoT message during turns
+ *                                  (bot-level master switch; per-chat opt-out
+ *                                  via /cot off)
+ *   • senderTag                 — inject the per-turn `<sender>` tag naming who
+ *                                  spoke (default on; off drops per-message
+ *                                  identity from the prompt)
  *   • regularGroupReplyMode     — per-bot DEFAULT session mode for regular
  *                                  groups: chat | chat-topic | new-topic | shared
  *                                  (see chat-reply-mode-store). Default 'chat'.
@@ -45,6 +52,15 @@ export interface BotCardPrefs {
   codexAppCleanInput: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
+  /** Bot-level master switch for the native CoT (thinking process) message.
+   *  Default TRUE (absent = on; only explicit false persists). Per-chat
+   *  opt-out lives in noCotChats (`/cot off`), not here. */
+  thinkingCard: boolean;
+  /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
+   *  Default TRUE (absent = on; only an explicit false persists), same
+   *  convention as thinkingCard. Off also drops the cursor anti-echo note (it is
+   *  gated on the tag) and costs two observability signals — see BotConfig.senderTag. */
+  senderTag: boolean;
   /** When true, this bot's daemon watches host load/mem and DMs the owner on
    *  overload enter/recover edges. Machine-wide signal, so designate one bot;
    *  a shared episode lock de-dups if several have it on. Default false. */
@@ -83,6 +99,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexAppCleanInput: c.codexAppCleanInput === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
+      thinkingCard: c.thinkingCard !== false,
+      senderTag: c.senderTag !== false,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
@@ -103,6 +121,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexAppCleanInput: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
+      thinkingCard: true,
+      senderTag: true,
       overloadAlert: false,
       botToBotSameDir: true,
       autoStartOnGroupJoin: false,
@@ -183,6 +203,8 @@ export async function updateBotCardPrefs(
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    applyDefaultTrue(entry, 'thinkingCard', patch.thinkingCard);
+    applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
@@ -202,6 +224,8 @@ export async function updateBotCardPrefs(
         codexAppCleanInput: entry.codexAppCleanInput === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
+        thinkingCard: entry.thinkingCard !== false,
+        senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
@@ -242,6 +266,14 @@ export async function updateBotCardPrefs(
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
+  }
+  if (patch.thinkingCard !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.thinkingCard = patch.thinkingCard === false ? false : undefined;
+  }
+  if (patch.senderTag !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.senderTag = patch.senderTag === false ? false : undefined;
   }
   if (patch.overloadAlert !== undefined) {
     bot.config.overloadAlert = patch.overloadAlert || undefined;
@@ -284,6 +316,8 @@ export async function updateBotCardPrefs(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
+    `thinkingCard=${r.result.thinkingCard} ` +
+    `senderTag=${r.result.senderTag} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +

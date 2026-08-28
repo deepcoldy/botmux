@@ -9,6 +9,14 @@ mkdirSync(dataDir);
 
 process.env.SESSION_DATA_DIR = dataDir;
 
+// Same fencing for mojo's per-session isolated workspaces: without this, any
+// test that drives a real MojoBackend turn mints directories under the
+// developer's real ~/.botmux/mojo-workspaces (observed live). Tests that care
+// about the path pass an explicit home instead.
+const mojoWorkspaceRoot = join(fileRoot, 'mojo-workspaces');
+mkdirSync(mojoWorkspaceRoot);
+process.env.BOTMUX_MOJO_WORKSPACE_ROOT = mojoWorkspaceRoot;
+
 // setupFiles runs before the test module. Capture a file-wide temp override made
 // at module scope or in beforeAll once, then repair per-test mutations back to it.
 let fileDataDir = '';

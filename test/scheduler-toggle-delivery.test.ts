@@ -45,7 +45,9 @@ beforeEach(() => {
 });
 
 describe('scheduler.toggleDelivery', () => {
-  it('switches a topic task to group top-level while retaining its root', async () => {
+  it('switches a topic task to group top level and clears its retained root', async () => {
+    // Parking at top level clears the root bookmark so no later toggle or
+    // stale cache can re-enter the originating (e.g. adopted) topic.
     const { toggleDelivery } = await import('../src/core/scheduler.js');
     const id = seed('origin', { scope: 'thread', rootMessageId: 'om_root' });
     expect(toggleDelivery(id)).toEqual({
@@ -53,10 +55,10 @@ describe('scheduler.toggleDelivery', () => {
       deliver: 'origin',
       executionPosition: 'top-level',
     });
-    expect(store.get(id)).toMatchObject({ scope: 'chat', rootMessageId: 'om_root' });
+    expect(store.get(id)).toMatchObject({ scope: 'chat', rootMessageId: undefined });
     expect(publish).toHaveBeenCalledWith({
       type: 'schedule.updated',
-      body: { id, patch: { scope: 'chat', executionPosition: 'top-level' } },
+      body: { id, patch: { scope: 'chat', executionPosition: 'top-level', rootMessageId: null } },
     });
   });
 
@@ -79,11 +81,13 @@ describe('scheduler.toggleDelivery', () => {
     expect(publish).toHaveBeenCalledTimes(1);
   });
 
-  it('switches a fresh-topic task back to its retained topic root', async () => {
+  it('parks a fresh-topic task at top level instead of re-entering its retained root', async () => {
+    // The retained root may belong to the adopted topic the task was born in;
+    // cycling back into it would deliver results to the wrong topic.
     const { toggleDelivery } = await import('../src/core/scheduler.js');
     const id = seed('origin', { scope: 'chat', executionPosition: 'new-topic', rootMessageId: 'om_root' });
-    expect(toggleDelivery(id)).toEqual({ ok: true, deliver: 'origin', executionPosition: 'topic' });
-    expect(store.get(id)).toMatchObject({ scope: 'thread', executionPosition: 'topic', rootMessageId: 'om_root' });
+    expect(toggleDelivery(id)).toEqual({ ok: true, deliver: 'origin', executionPosition: 'top-level' });
+    expect(store.get(id)).toMatchObject({ scope: 'chat', executionPosition: 'top-level', rootMessageId: undefined });
   });
 
   it('switches a rootless fresh-topic task back to group top-level', async () => {

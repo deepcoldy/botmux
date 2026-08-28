@@ -7,7 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -20,7 +20,8 @@ import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCar
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
-import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
+import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
+import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -36,6 +37,7 @@ import {
   buildNewTopicCliInput,
   ensureSessionWhiteboard,
   getAvailableBots,
+  resumeSession,
 } from './session-manager.js';
 import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
@@ -71,6 +73,8 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { setCotMode } from '../services/cot-mode-store.js';
+import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
@@ -87,9 +91,9 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget } from '../types.js';
+import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1 } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
@@ -98,11 +102,14 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { rehomeReplyTargetState } from './reply-target.js';
+import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
+import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -152,6 +159,34 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
+
+function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
+  const runtime = snapshotCliRuntime(resolveCliRuntime({
+    cliId,
+    context: `CLI selection ${cliId}`,
+  }));
+  return {
+    version: 1,
+    state: 'pending',
+    entryId: cliId,
+    cliId,
+    cliRuntime: runtime ?? null,
+    cliPathOverride: runtime?.source === 'configured' || runtime?.source === 'legacy-path' ? runtime.executable : null,
+    wrapperCli: null,
+    model: null,
+    reasoningEffort: null,
+    launchShell: null,
+    startupCommands: [],
+  };
+}
+
+function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string): string | undefined {
+  if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
+  if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';
+  if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
+  if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(cliId)) return 'selected CLI cannot use codexRpcInput';
+  return undefined;
+}
 
 /**
  * Adapter-scoped default passthrough commands (e.g. Codex's `/goal`).
@@ -794,6 +829,7 @@ async function handleScheduleCommand(
   chatId: string,
   deps: CommandHandlerDeps,
   larkAppId?: string,
+  senderOpenId?: string,
 ): Promise<void> {
   const { activeSessions } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
@@ -881,8 +917,11 @@ async function handleScheduleCommand(
     const capturedScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     const capturedRootMessageId = capturedScope === 'thread' ? rootId : undefined;
     const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
-    const executionPosition = requestedPosition
-      ?? (capturedScope === 'thread' ? 'topic' : 'top-level');
+    // Default to group top-level: a schedule created inside a topic (including
+    // an adopted one) must not pin its results to that topic. NL 路径的
+    // extractScheduleModifiers 只有 top-level/new-topic 关键词，没有 topic
+    // 修饰符；topic 执行只能经 CLI --topic 或 Dashboard 表单显式指定。
+    const executionPosition = (requestedPosition ?? 'top-level') as ScheduleExecutionPosition;
     const taskScope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
@@ -894,13 +933,20 @@ async function handleScheduleCommand(
       prompt: schedPrompt,
       workingDir,
       chatId,
-      // Retain the captured root even when top-level is selected so the task
-      // can later switch back to topic execution without losing its anchor.
-      rootMessageId: capturedRootMessageId,
+      // Only a topic-executing task keeps the captured root. At top-level the
+      // root is dropped so a later delivery toggle can never silently pull
+      // execution back into the originating (e.g. adopted) topic.
+      rootMessageId: executionPosition === 'topic' ? capturedRootMessageId : undefined,
       scope: taskScope,
       executionPosition,
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
+      // Stamp the creator so the task's scheduled turns can authenticate
+      // workflow commands as them (scheduled-turn-provenance). On the
+      // sandboxed relay path the daemon re-checks the creator is still
+      // allowed at every run mutation; the default non-sandbox route does
+      // not re-check membership.
+      ownerOpenId: senderOpenId,
       deliver: 'origin',
       silent,
     });
@@ -1235,11 +1281,100 @@ export async function handleCardCommand(
     }
     ds.streamingCardForced = true;
     const posted = await postFreshStreamingCard(ds, deps.sessionReply);
-    if (!posted) await reply(t('cmd.card.not_ready', undefined, loc));
+    if (!posted) {
+      await reply(t('cmd.card.not_ready', undefined, loc));
+    }
     return;
   }
 
   await reply(t('cmd.card.usage', undefined, loc));
+}
+
+/**
+ * Handle `/cot` (operator-only). The CoT (thinking process) message twin of
+ * `/card`. No private variant — the CoT bubble is a chat-level native message
+ * with no ephemeral form. off/on/status work without a live session (they
+ * only touch per-chat config); show needs one.
+ *
+ * off    -> suppress the thinking bubble for this chat (add to noCotChats).
+ * on     -> restore it for this chat (remove from noCotChats); hints when the
+ *           bot-level master switch (`thinkingCard`) is off, since the bubble
+ *           won't appear until that is enabled too.
+ * show   -> one-shot peek while the switches are off: force the bubble for the
+ *           current turn (rendered immediately with everything accumulated so
+ *           far, via the daemon-side thinking cache) or, when idle, the next
+ *           turn. Auto-reverts when that turn settles — unlike `/card show`
+ *           this is a single peek, not a sticky per-session override, because
+ *           the bubble is ephemeral per turn anyway.
+ * ''/status -> report the effective state (master switch + this chat).
+ */
+export async function handleCotCommand(
+  rootId: string,
+  larkAppId: string,
+  chatId: string,
+  senderOpenId: string | undefined,
+  content: string,
+  deps: CommandHandlerDeps,
+): Promise<void> {
+  const loc = localeForBot(larkAppId);
+  const reply = (c: string) => deps.sessionReply(rootId, c, undefined, larkAppId);
+
+  if (!canOperate(larkAppId, chatId, senderOpenId)) {
+    await reply(t('cmd.cot.operator_only', undefined, loc));
+    return;
+  }
+
+  const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
+  // Master switch defaults ON — only an explicit false means disabled.
+  const masterOn = (() => {
+    try { return getBot(larkAppId).config.thinkingCard !== false; } catch { return false; }
+  })();
+
+  if (sub === 'off') {
+    const r = await setCotMode(larkAppId, chatId, true);
+    await reply(r.ok ? t('cmd.cot.off_ok', undefined, loc) : t('cmd.cot.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'on') {
+    const r = await setCotMode(larkAppId, chatId, false);
+    if (!r.ok) {
+      await reply(t('cmd.cot.fail', { reason: r.reason }, loc));
+      return;
+    }
+    await reply(masterOn ? t('cmd.cot.on_ok', undefined, loc) : t('cmd.cot.on_master_off', undefined, loc));
+    return;
+  }
+  if (sub === 'show') {
+    const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+    if (!ds) {
+      await reply(t('cmd.no_active_session', undefined, loc));
+      return;
+    }
+    ds.cotForced = true;
+    if (ds.lastThinkingUpdate) {
+      // Turn in flight with thinking already accumulated — render right away
+      // (the worker only emits on NEW entries, so waiting could miss a turn
+      // whose thinking phase is over).
+      handleCotThinkingUpdate(ds, { type: 'thinking_update', ...ds.lastThinkingUpdate });
+      await reply(t('cmd.cot.show_now', undefined, loc));
+    } else {
+      await reply(t('cmd.cot.show_armed', undefined, loc));
+    }
+    return;
+  }
+  if (sub === '' || sub === 'status') {
+    const chatOff = (() => {
+      try { return !!getBot(larkAppId).config.noCotChats?.includes(chatId); } catch { return false; }
+    })();
+    await reply(!masterOn
+      ? t('cmd.cot.status_master_off', undefined, loc)
+      : chatOff
+        ? t('cmd.cot.status_chat_off', undefined, loc)
+        : t('cmd.cot.status_on', undefined, loc));
+    return;
+  }
+
+  await reply(t('cmd.cot.usage', undefined, loc));
 }
 
 /**
@@ -1343,8 +1478,102 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/cli': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const botCfg = getBot(ds.larkAppId).config;
+        const rawArgs = message.content.replace(/^\/cli\s*/i, '').trim();
+        const args = rawArgs.split(/\s+/u);
+        const requestedId = args[0];
+        let selectedCliId: CliId | undefined;
+        if (args.length === 1) {
+          try {
+            selectedCliId = createCliAdapterSync(requestedId as CliId).id as CliId;
+          } catch {
+            // Keep the normal invalid-CLI response below.
+          }
+        }
+        if (!selectedCliId) {
+          await sessionReply(rootId, 'Usage: /cli <cliId>\nUnknown or invalid CLI.');
+          break;
+        }
+        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
+          break;
+        }
+        const securityError = cliSelectionSecurityError(botCfg, selectedCliId);
+        if (securityError) {
+          await sessionReply(rootId, `CLI selection rejected: ${securityError}`);
+          break;
+        }
+        const targetSessionId = ds.session.sessionId;
+        const result = await withBotTurnMutation(ds.larkAppId, async () => {
+          const current = [...activeSessions.values()].find(candidate => candidate.session.sessionId === targetSessionId);
+          if (!current || current !== ds || current.session.status !== 'active') return 'no_active_session' as const;
+          if (current.session.adoptedFrom) return 'adopt' as const;
+          if (current.session.queued || current.session.queuedActivationPending) return 'queued' as const;
+          if (current.hasHistory || current.session.lastCliInput || current.session.lastUserPrompt || current.session.cliSessionId) return 'history' as const;
+          if (current.session.agentFrozen || current.session.cliLaunchSnapshot?.state === 'resolved' || current.worker && !current.worker.killed) return 'frozen' as const;
+          current.session.cliLaunchSnapshot = cliSelectionSnapshot(selectedCliId);
+          sessionStore.updateSession(current.session);
+          return 'selected' as const;
+        });
+        if (result === 'selected') {
+          await sessionReply(rootId, `CLI selected: ${selectedCliId}`);
+        } else if (result === 'no_active_session') {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+        } else {
+          await sessionReply(rootId, 'CLI selection rejected: the session has already started or is not selectable.');
+        }
+        break;
+      }
       case '/close': {
         if (ds) {
+          // Shared adopts never own the source conversation. Keep /close
+          // backwards-compatible as the quick "leave this BotMux share" action,
+          // but never present it as terminating the source App Server / tmux CLI.
+          if (isSharedAdoptSession(ds)) {
+            const targetSessionId = ds.session.sessionId;
+            const detached = await withBotTurnMutation(ds.larkAppId, async () => {
+              const current = [...activeSessions.values()].find(
+                candidate => candidate.session.sessionId === targetSessionId,
+              );
+              if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+              try {
+                const result = await closeWorkerPoolSession(targetSessionId);
+                if (!result.ok) return 'refused' as const;
+                return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+              } catch {
+                return 'refused' as const;
+              }
+            });
+            if (detached === 'missing') {
+              await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+              break;
+            }
+            if (detached === 'refused') {
+              await sessionReply(rootId, t('cmd.detach.failed', undefined, loc));
+              break;
+            }
+            if (detached === 'residual') {
+              await sessionReply(rootId, t('cmd.detach.residual', undefined, loc));
+              break;
+            }
+            await sessionReply(
+              rootId,
+              t(
+                ds.session.existingAppServerEndpoint
+                  ? 'cmd.detach.existing_app_server_success'
+                  : 'cmd.detach.success',
+                undefined,
+                loc,
+              ),
+            );
+            logger.info(`[${logTag}] /close treated as shared-adopt disconnect`);
+            break;
+          }
           const targetSessionId = ds.session.sessionId;
           const closed = await withBotTurnMutation(ds.larkAppId, async () => {
             // Re-resolve the exact session after all peer admissions drain. A
@@ -1483,14 +1712,17 @@ export async function handleCommand(
 
       case '/detach':
       case '/disconnect': {
-        // 文字版的"⏏ 断开"按钮：仅 adopt 会话适用——botmux 只是观察用户原本在
-        // 跑的 CLI，断开只清掉 botmux 这一侧的 worker / polling，绝不结束 CLI
-        // 进程本身。等价于 card-handler 里 `actionType === 'disconnect'` 那段。
+        // 文字版的"⏏ 断开"按钮：共享接入会话适用。
+        //   - tmux adopt：BotMux 停止观察外部终端，不结束原 CLI；
+        //   - existing App Server adopt：BotMux 停止自己的 `codex --remote`
+        //     第二客户端，不结束 Codex App 或开发机上的 App Server。
+        // 两种模式都只移除 BotMux 这一侧，不接管来源会话。
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        if (!ds.adoptedFrom) {
+        const existingAppServerAdopt = !!ds.session.existingAppServerEndpoint;
+        if (!isSharedAdoptSession(ds)) {
           await sessionReply(rootId, t('cmd.detach.not_adopted', undefined, loc));
           break;
         }
@@ -1499,22 +1731,46 @@ export async function handleCommand(
           const current = [...activeSessions.values()].find(
             candidate => candidate.session.sessionId === closedSessionId,
           );
-          if (!current || !current.adoptedFrom) return false;
-          await closeWorkerPoolSession(closedSessionId);
-          return true;
+          if (!current || !isSharedAdoptSession(current)) return 'missing' as const;
+          try {
+            const result = await closeWorkerPoolSession(closedSessionId);
+            if (!result.ok) return 'refused' as const;
+            return result.outcome === 'closed' ? 'closed' as const : 'residual' as const;
+          } catch {
+            return 'refused' as const;
+          }
         });
-        if (!detached) {
+        if (detached === 'missing') {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
         }
-        await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
-        logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);
+        if (detached === 'refused') {
+          await sessionReply(rootId, t('cmd.detach.failed', undefined, loc));
+          break;
+        }
+        if (detached === 'residual') {
+          await sessionReply(rootId, t('cmd.detach.residual', undefined, loc));
+          break;
+        }
+        await sessionReply(
+          rootId,
+          t(
+            existingAppServerAdopt
+              ? 'cmd.detach.existing_app_server_success'
+              : 'cmd.detach.success',
+            undefined,
+            loc,
+          ),
+        );
+        logger.info(
+          `[${logTag}] Detached ${existingAppServerAdopt ? 'existing App Server' : 'terminal'} adopt by ${cmd} command`,
+        );
         break;
       }
 
       case '/restart': {
         if (ds) {
-          if (ds.adoptedFrom) {
+          if (isSharedAdoptSession(ds)) {
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
             break;
           }
@@ -1711,6 +1967,7 @@ export async function handleCommand(
             }
             const selfBot = getBot(current.larkAppId);
             const botCfg = selfBot.config;
+            const effectiveCliId = current.session.cliLaunchSnapshot?.cliId ?? current.session.cliId ?? botCfg.cliId;
             const pendingPrompt = current.pendingPrompt ?? '';
             const pendingRawInput = current.pendingRawInput;
             const hasBufferedInput = pendingPrompt.trim().length > 0
@@ -1731,7 +1988,7 @@ export async function handleCommand(
               wrappedInput = buildInput(
                 pendingPrompt,
                 current.session.sessionId,
-                current.session.cliId ?? botCfg.cliId,
+                effectiveCliId,
                 current.session.cliPathOverride ?? botCfg.cliPathOverride,
                 current.pendingAttachments,
                 current.pendingMentions,
@@ -1763,7 +2020,7 @@ export async function handleCommand(
                 ...((current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId)
                   ? { turnId: current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId }
                   : {}),
-                ...((current.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+                ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
                   ? { codexAppInput: wrappedInput.codexAppInput }
                   : {}),
                 codexAppInputGateFrozen: true,
@@ -1955,6 +2212,7 @@ export async function handleCommand(
                 session.ownerOpenId = oldSession.ownerOpenId;
                 session.creatorOpenId = oldSession.creatorOpenId;
                 session.lastCallerOpenId = oldSession.lastCallerOpenId;
+                rehomeReplyTargetState(current);
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
                 activeSessions.set(key, current);
@@ -2302,7 +2560,7 @@ export async function handleCommand(
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
-        await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId);
+        await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId);
         logger.info(`[${logTag}] Schedule command handled`);
         break;
       }
@@ -2809,6 +3067,10 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
+        if (ds?.session.existingAppServerEndpoint) {
+          await sessionReply(rootId, t('cmd.codex_existing_app_server_adopt.already_attached', undefined, loc));
+          break;
+        }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
           const cliName = sessionCliDisplayName(ds);
@@ -2818,7 +3080,7 @@ export async function handleCommand(
           break;
         }
         const botCfgForAdopt = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : undefined);
-        if (botCfgForAdopt?.cliId === 'codex-app') {
+        if (botCfgForAdopt?.cliId === 'codex-app' || botCfgForAdopt?.existingAppServer) {
           if (!ds) {
             await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
             break;
@@ -2830,6 +3092,50 @@ export async function handleCommand(
         const botCliId = botCfgForAdopt?.cliId;
         const adoptSession = ds?.session;
         const adoptAnchor = ds ? sessionAnchorId(ds) : undefined;
+        const directTarget = adoptArgs;
+
+        // The picker deliberately hides Botmux-managed history, but an exact
+        // id is explicit user intent. Resume the original closed record here;
+        // importing its CLI transcript into this command scratch would create
+        // two Botmux owners for one underlying history session.
+        if (directTarget) {
+          const managedTarget = sessionStore.getOwnedSession(directTarget)
+            ?? sessionStore.listSessions().find(s => s.cliSessionId === directTarget);
+          if (managedTarget) {
+            const managedAnchor = storedSessionAnchorId(managedTarget);
+            if (!ds || !adoptAnchor || managedAnchor !== adoptAnchor) {
+              await sessionReply(rootId, t('cmd.adopt.managed_other_topic', {
+                id: managedTarget.sessionId,
+              }, loc));
+              break;
+            }
+
+            const result = await resumeSession(managedTarget.sessionId, activeSessions);
+            if (result.ok) {
+              const cliName = sessionCliDisplayName(result.ds);
+              const resumeMsg = resumeStartsFresh(result.ds.session)
+                ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+                : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+              await sessionReply(rootId, resumeMsg);
+            } else if (result.error === 'not_closed') {
+              await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
+            } else if (result.error === 'anchor_occupied') {
+              const detail = result.activeSessionId
+                ? t('card.action.resume_anchor_holder', { short: result.activeSessionId.substring(0, 8) }, loc)
+                : '';
+              await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, loc));
+            } else if (result.error === 'adopt_unsupported') {
+              await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, loc));
+            } else if (result.error === 'deferred_unmaterialized') {
+              await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
+            } else if (result.error === 'resume_cancelled') {
+              await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, loc));
+            }
+            break;
+          }
+        }
 
         // Discover every supported backend, but only offer live sessions for
         // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
@@ -2868,7 +3174,6 @@ export async function handleCommand(
           break;
         }
 
-        const directTarget = adoptArgs;
         if (directTarget) {
           // Match a tmux address ("session:window.pane") OR a zellij target
           // ("session:paneId" / "session/paneId") against the merged list.
@@ -3416,7 +3721,7 @@ export async function handleCommand(
         // pendingRepo too, but only after createGroupWithBots has already
         // built a new chat. Failing here keeps relay clean and avoids
         // orphan-chat garbage when the operation can't possibly succeed.
-        if (ds.session.adoptedFrom) {
+        if (isSharedAdoptSession(ds)) {
           await sessionReply(rootId, t('cmd.relay.adopt_not_relayable', undefined, loc));
           break;
         }
@@ -3775,7 +4080,7 @@ export async function handleCommand(
 
         // Front guards (fork needs a clean, real, idle source — same as relay).
         // These MUST run before creating either a topic root or a new group.
-        if (ds.session.adoptedFrom) {
+        if (isSharedAdoptSession(ds)) {
           await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
           break;
         }
@@ -4036,6 +4341,20 @@ export async function handleCommand(
         break;
       }
 
+      case '/cot': {
+        // Existing-session path. New topics route /cot via handleCotCommand at
+        // the router (so no phantom session is created). All subcommands work
+        // without a live worker — they only touch per-chat config.
+        const appId = ds?.larkAppId ?? larkAppId;
+        const cotChatId = ds?.chatId;
+        if (!appId || !cotChatId) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        await handleCotCommand(rootId, appId, cotChatId, message.senderId, message.content, deps);
+        break;
+      }
+
       case '/term': {
         // Existing-session path. New topics route /term via handleTermLinkCommand
         // at the router (daemon.ts) so no phantom worker=null session is created.
@@ -4063,7 +4382,7 @@ export async function handleCommand(
         const botCfg = ds
           ? getBot(ds.larkAppId).config
           : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
-        const effectiveCliId = (ds?.session.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId;
+        const effectiveCliId = (ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId;
         const cliName = ds
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
@@ -4118,7 +4437,7 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
-        const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliId)];
+        const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
@@ -4132,6 +4451,7 @@ export async function handleCommand(
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
+          t('help.cot', undefined, loc),
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.issue', undefined, loc),
@@ -4170,10 +4490,16 @@ export async function handleCommand(
           t('help.login', undefined, loc),
           t('help.login_status', undefined, loc),
           t('help.pair', undefined, loc),
-          '',
-          t('help.heading_workflow', undefined, loc),
-          t('help.workflow_run', undefined, loc),
-          t('help.workflow_cancel', undefined, loc),
+          // Workflow help section — omitted when the machine-wide workflow
+          // switch is off, so `/help` never advertises a disabled feature.
+          ...(isWorkflowFeatureEnabled()
+            ? [
+              '',
+              t('help.heading_workflow', undefined, loc),
+              t('help.workflow_run', undefined, loc),
+              t('help.workflow_cancel', undefined, loc),
+            ]
+            : []),
           '',
           t('help.heading_role', undefined, loc),
           t('help.role_show', undefined, loc),
@@ -4337,6 +4663,8 @@ export async function startCodexAppThreadSession(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const botCfg = getBot(ds.larkAppId).config;
+  const existingAppServerEndpoint = botCfg.existingAppServer?.endpoint;
   const title = codexAppThreadTitle(thread);
   if (isSessionTransferring(ds)) {
     await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
@@ -4364,8 +4692,24 @@ export async function startCodexAppThreadSession(
     current.lastScreenStatus = undefined;
     current.session.workingDir = thread.cwd;
     current.session.title = `Codex App: ${title}`;
-    current.session.cliId = 'codex-app';
+    current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
+    if (existingAppServerEndpoint) {
+      // Do not reuse a possibly frozen runner/wrapper from the temporary
+      // BotMux shell this topic started with. The next fork freezes the current
+      // `cliId: codex` bot configuration and starts ONLY the official remote
+      // TUI. The endpoint itself is copied onto the session so later edits to
+      // bots.json cannot redirect an already-bound conversation.
+      current.session.existingAppServerEndpoint = existingAppServerEndpoint;
+      delete current.session.cliRuntime;
+      delete current.session.cliPathOverride;
+      delete current.session.wrapperCli;
+      delete current.session.model;
+      delete current.session.reasoningEffort;
+      delete current.session.agentFrozen;
+    } else {
+      delete current.session.existingAppServerEndpoint;
+    }
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
@@ -4382,7 +4726,16 @@ export async function startCodexAppThreadSession(
     );
     return;
   }
-  await sessionReply(switched.anchor, t('cmd.codex_app_adopt.success', { title }, loc));
+  await sessionReply(
+    switched.anchor,
+    t(
+      existingAppServerEndpoint
+        ? 'cmd.codex_existing_app_server_adopt.success'
+        : 'cmd.codex_app_adopt.success',
+      { title },
+      loc,
+    ),
+  );
 }
 
 export async function startAdoptSession(
@@ -4684,7 +5037,7 @@ export async function startForkSubtopicSession(
       parentRootId: parentSession.rootMessageId,
     }, loc);
     const availableBots = await getAvailableBots(appId, chatId);
-    const childCliId = parentSession.cliId ?? botCfg.cliId;
+    const childCliId = parentSession.cliLaunchSnapshot?.cliId ?? parentSession.cliId ?? botCfg.cliId;
     const { forkSession } = await import('./worker-pool.js');
     const forkResult = await forkSession(
       parentSession.sessionId,
@@ -4703,7 +5056,7 @@ export async function startForkSubtopicSession(
           `${childIntro}\n\n${taskText}`,
           childSessionId,
           childCliId,
-          botCfg.cliPathOverride,
+          parentSession.cliLaunchSnapshot?.cliPathOverride ?? parentSession.cliPathOverride ?? botCfg.cliPathOverride,
           undefined,
           undefined,
           availableBots,

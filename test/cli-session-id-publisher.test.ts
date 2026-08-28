@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { fork, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const children = new Set<ChildProcess>();
 
@@ -39,8 +40,9 @@ describe('CLI session id persistence ownership', () => {
       [sessionId]: { sessionId, riffParentTaskId: 'task-parent' },
     }));
 
-    const child = fork(join(process.cwd(), 'test/fixtures/cli-session-id-publisher-child.ts'), [], {
-      execArgv: ['--import', 'tsx'],
+    // fork(…, { execArgv: ['--import','tsx'] }) is Node-only; the runtime-aware
+    // spawn keeps the same IPC channel via the explicit 'ipc' stdio slot.
+    const child = spawnTsScript(join(process.cwd(), 'test/fixtures/cli-session-id-publisher-child.ts'), [], {
       stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
     });
     children.add(child);

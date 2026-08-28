@@ -36,11 +36,17 @@ import {
   getSessionGroup,
   touchSessionGroup,
   markSessionGroupTitled,
+  markSessionGroupTitleFailed,
   removeSessionGroup,
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
-import { resolveTagMode } from '../src/services/feed-group-tagger.js';
+import {
+  resolveTagMode,
+  resolveSessionTagName,
+  clampSessionTagName,
+  MAX_SESSION_TAG_NAME_CODEPOINTS,
+} from '../src/services/feed-group-tagger.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-groups-store-test-'));
@@ -82,6 +88,47 @@ describe('session-groups-store', () => {
     const entry = getSessionGroup('oc_a')!;
     expect(entry.lastSessionId).toBe('sess-1');
     expect(entry.titled).toBe(true);
+  });
+
+  it('persists bounded title retry metadata and clears the retry deadline on success', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-1' });
+    const failed = markSessionGroupTitleFailed('oc_a', 1_000)!;
+    expect(failed.titleAttempts).toBe(1);
+    expect(failed.titleRetryAt).toBe(31_000);
+    initSessionGroups('cli_testapp');
+    expect(getSessionGroup('oc_a')).toMatchObject({ titleAttempts: 1, titleRetryAt: 31_000 });
+    markSessionGroupTitled('oc_a');
+    expect(getSessionGroup('oc_a')).toMatchObject({ titled: true, titleAttempts: 1 });
+    expect(getSessionGroup('oc_a')!.titleRetryAt).toBeUndefined();
+  });
+
+  it('persists the birth authorization provenance (origin quota key / reason / chat)', () => {
+    // 会话群的额度与权限身份来自「出生时那条授权」，不是新群自己。这三个字段就是
+    // dispatcher 后续每条消息据以沿用原计数器/原 reason/原到期的依据，必须活过重启。
+    registerSessionGroup('oc_born', {
+      ownerOpenId: 'ou_grantee',
+      lastSessionId: '',
+      originReason: 'chatGrant',
+      originQuotaKey: 'chat:oc_dm:ou_grantee',
+      originChatId: 'oc_dm',
+    });
+    initSessionGroups('cli_testapp'); // simulate restart: reload from disk
+    expect(getSessionGroup('oc_born')).toMatchObject({
+      ownerOpenId: 'ou_grantee',
+      originReason: 'chatGrant',
+      originQuotaKey: 'chat:oc_dm:ou_grantee',
+      originChatId: 'oc_dm',
+    });
+  });
+
+  it('keeps legacy entries readable: provenance is optional (pre-upgrade groups)', () => {
+    registerSessionGroup('oc_legacy', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    initSessionGroups('cli_testapp');
+    const entry = getSessionGroup('oc_legacy')!;
+    expect(entry.ownerOpenId).toBe('ou_owner');
+    expect(entry.originReason).toBeUndefined();
+    expect(entry.originQuotaKey).toBeUndefined();
+    expect(entry.originChatId).toBeUndefined();
   });
 
   it('is per-appId: another app does not see the entries', () => {
@@ -241,5 +288,47 @@ describe('resolveTagMode', () => {
     expect(resolveTagMode({ mode: 'chat-tag' })).toBe('chat-tag');
     expect(resolveTagMode({ mode: 'feed-group' })).toBe('feed-group');
     expect(resolveTagMode({ mode: 'off' })).toBe('off');
+  });
+});
+
+describe('resolveSessionTagName（标签名回落链）', () => {
+  it('配置名优先，且原样保留（只 trim）', () => {
+    expect(resolveSessionTagName({ configuredName: '  我的工作台  ', botDisplayName: 'CodeXonAst' }))
+      .toBe('我的工作台');
+  });
+
+  it('没配名字 → 「<bot 显示名>会话」（多 bot 靠 bot 名区分，这是本次改动的重点）', () => {
+    expect(resolveSessionTagName({ botDisplayName: 'CodeXonAst' })).toBe('CodeXonAst会话');
+    expect(resolveSessionTagName({ configuredName: '   ', botDisplayName: 'CodeXonAst' }))
+      .toBe('CodeXonAst会话');
+  });
+
+  it('英文 locale 用 "<bot> chats"', () => {
+    expect(resolveSessionTagName({ botDisplayName: 'CodeXonAst', locale: 'en' }))
+      .toBe('CodeXonAst chats');
+  });
+
+  it('配置名与 bot 显示名都没有 → 旧默认名兜底', () => {
+    expect(resolveSessionTagName({})).toBe('Botmux群会话');
+    expect(resolveSessionTagName({ configuredName: '', botDisplayName: '   ' })).toBe('Botmux群会话');
+  });
+
+  it('bot 名过长按码点截到 12（侧边栏只显示前几个字）', () => {
+    // 20 个中文字 → 取前 12 个再拼「会话」。
+    expect(resolveSessionTagName({ botDisplayName: '机'.repeat(20) })).toBe(`${'机'.repeat(12)}会话`);
+    // emoji 是单个码点，不能被 slice 成半个代理对。
+    expect(resolveSessionTagName({ botDisplayName: '🤖'.repeat(20) })).toBe(`${'🤖'.repeat(12)}会话`);
+  });
+
+  it('自定义名超长按码点保守截断（飞书分组名有长度限制）', () => {
+    const long = 'a'.repeat(200);
+    const out = resolveSessionTagName({ configuredName: long });
+    expect(Array.from(out)).toHaveLength(MAX_SESSION_TAG_NAME_CODEPOINTS);
+    expect(clampSessionTagName(long)).toBe(out);
+  });
+
+  it('clampSessionTagName 对全空白返回空串（= 清除配置回默认）', () => {
+    expect(clampSessionTagName('   ')).toBe('');
+    expect(clampSessionTagName(' 工作 ')).toBe('工作');
   });
 });

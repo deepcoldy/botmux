@@ -157,4 +157,29 @@ describe('VC meeting receiver boot-recovery lifecycle', () => {
     expect(catchBlock).toContain('escalateVcMeetingBootRecovery(recoveryKey, ref.receiverSessionId)');
     expect(catchBlock).not.toContain('clearVcMeetingReceiverRecoveryPending(recoveryKey)');
   });
+
+  it('Plan B: boot-recovery eligibility is ledger-derived (ambiguous delivery receipts), not a session-marker scan', () => {
+    // Under Plan B the meeting agent is an ordinary chat-scope session, so the
+    // vcMeetingReceiver marker can no longer be the recovery predicate — a plain
+    // user turn carries the marker too. The recovery loop must iterate the
+    // reconciled delivery ledger (ambiguousOnBoot), which only ever contains
+    // stale durable delivery receipts, so a session that only ever ran plain user
+    // turns (no ledger receipt) is never fenced at boot.
+    const bootIdx = daemonSource.indexOf('const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(');
+    expect(bootIdx).toBeGreaterThanOrEqual(0);
+    const loopIdx = daemonSource.indexOf('for (const ref of ambiguousOnBoot) {');
+    expect(loopIdx).toBeGreaterThan(bootIdx);
+    // The loop resolves the live session by sessionId (works regardless of the
+    // now-ordinary activeSessions key) and verifies the meeting identity — it does
+    // NOT scan sessions by the vcMeetingReceiver marker to decide eligibility.
+    const loopBlock = daemonSource.slice(loopIdx, loopIdx + 400);
+    expect(loopBlock).toContain('findActiveBySessionId(ref.receiverSessionId)');
+  });
+
+  it('Plan B: a session with no durable delivery receipt is not boot-recovery blocked', () => {
+    // A plain user turn's session never gets a delivery ledger entry, so the boot
+    // gate must not block it. No recovery started for this sessionId → not blocked.
+    recovery.finishScheduling();
+    expect(recovery.isBlocked(delivery('sess_plain_user_turn', 'member_none'))).toBe(false);
+  });
 });

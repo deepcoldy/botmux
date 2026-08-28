@@ -53,6 +53,12 @@ export type CodexAppLifecycleCategory =
   | 'protocol'
   | 'runtime';
 
+/**
+ * The requested thread is still owned by another Codex app-server writer. This
+ * is an expected handoff conflict, not a generic runner crash.
+ */
+export const CODEX_APP_ACTIVE_WRITER_EXIT_CODE = 75;
+
 export type CodexAppLifecycleEvent =
   | (CodexAppLifecycleBase & {
     kind: 'input_queued' | 'turn_start_attempt';

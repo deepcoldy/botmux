@@ -5,13 +5,14 @@
  * stdout, stderr, and the process exit code are covered together. Using the
  * source entry through tsx keeps this unit test independent of a prior build.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const tempDirs: string[] = [];
@@ -27,9 +28,9 @@ function runAsk(
   args = ['ask', 'buttons', '--options', 'yes,no', '请作答'],
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', CLI_PATH, ...args],
+    const child = spawnTsScript(
+      CLI_PATH,
+      args,
       {
         env: {
           ...process.env,
@@ -41,7 +42,7 @@ function runAsk(
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       },
-    );
+    ) as ChildProcessWithoutNullStreams;
 
     let stdout = '';
     let stderr = '';

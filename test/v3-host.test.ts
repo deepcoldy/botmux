@@ -24,6 +24,7 @@ import { SPEC_SCHEMA_VERSION, type BotSnapshot } from '../src/workflows/v3/contr
 import { DagValidationError } from '../src/workflows/v3/dag.js';
 import { loadAuthorizedV3Run, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 function base(): string {
   return mkdtempSync(join(tmpdir(), 'v3-host-'));
@@ -41,7 +42,10 @@ function runTsChild(script: string): {
   exited: () => boolean;
   result: Promise<{ created: boolean; authorizedAt: string }>;
 } {
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+  // 不能用 spawnTsEval：内联脚本要 import 仓库内的 .ts 模块（.js specifier），
+  // Node 下丢掉 --import tsx 子进程会 ERR_MODULE_NOT_FOUND，所以拼 runner 前缀 + eval 参数。
+  const { command, prefixArgs } = tsRunnerPrefix();
+  const child = spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -150,7 +154,7 @@ function okArchitectDeps(): ArchitectDeps {
       notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
       manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
     }),
-    loadDag: () => ({ runId: 'r', nodes: [] }),
+    loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }),
     botSnapshot: DUMMY_BOT,
     resolveLarkAppSecret: () => undefined,
   };
@@ -238,7 +242,7 @@ describe('host — architect（codex 3 断言）', () => {
       const { runDir } = hostNew({ goal: 'g', baseDir: b, runId: 'r' });
       const deps: ArchitectDeps = {
         runArchitect: async () => { throw new Error('不该被调用'); },
-        loadDag: () => ({}),
+        loadDag: () => ({ schemaVersion: 2 }),
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -259,7 +263,7 @@ describe('host — architect（codex 3 断言）', () => {
           notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
           manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
         }),
-        loadDag: () => ({ runId: 'r', nodes: [] }), // 校验通过（不抛）
+        loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }), // 校验通过（不抛）
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -359,6 +363,30 @@ describe('host — architect（codex 3 断言）', () => {
     }
   });
 
+  it('Architect 生成 legacy DAG 时拒绝进入 dag_ready', async () => {
+    const b = base();
+    try {
+      const { runDir } = toApprovedSpec(b);
+      const deps: ArchitectDeps = {
+        runArchitect: async (input) => ({
+          status: 'ok',
+          dagPath: join(input.runDir, 'dag.json'),
+          notesPath: join(input.runDir, 'notes.md'),
+          manifestPath: join(input.runDir, 'manifest.json'),
+        }),
+        loadDag: () => ({ runId: 'legacy', nodes: [] }),
+        botSnapshot: DUMMY_BOT,
+        resolveLarkAppSecret: () => undefined,
+      };
+
+      const out = await hostArchitect(runDir, deps);
+      expect(out).toMatchObject({ ok: false, state: { status: 'spec_approved' } });
+      expect(out.problems).toContain('architect dag.json must use schemaVersion 2');
+    } finally {
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+
   it('并发 architect 共享 run 级 async transaction：attempt001 只启动一个 worker，竞争调用明确 busy', async () => {
     const b = base();
     let releaseWorker: () => void = () => {};
@@ -417,7 +445,7 @@ describe('host — approve-dag（gate-2）', () => {
           notesPath: join(input.runDir, 'notes.md'),
           manifestPath: join(input.runDir, 'manifest.json'),
         }),
-        loadDag: () => ({}),
+        loadDag: () => ({ schemaVersion: 2 }),
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };

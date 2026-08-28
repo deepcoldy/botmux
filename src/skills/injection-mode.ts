@@ -30,11 +30,27 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
+import { isWorkflowFeatureEnabled } from '../global-config.js';
 import {
   BUILTIN_SKILLS,
+  WORKFLOW_FEATURE_SKILLS,
   ASK_SKILL, ASK_SKILL_NAME,
   WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME,
 } from './definitions.js';
+import { effectiveBuiltinSkills, effectiveBuiltinSkillContent } from './effective-builtins.js';
+
+/** The unconditional built-ins with the v3 Workflow family spliced back in at
+ *  their historical position (right after `botmux-handoff`) when the machine-wide
+ *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
+ *  catalog byte-for-byte identical to before the family was factored out; when
+ *  the switch is OFF the family is simply absent. `botmux-orchestrate` is part of
+ *  BUILTIN_SKILLS and is never gated here. */
+function baseBuiltinSkills(workflowEnabled: boolean): typeof BUILTIN_SKILLS {
+  if (!workflowEnabled) return [...BUILTIN_SKILLS];
+  const anchor = BUILTIN_SKILLS.findIndex((s) => s.name === 'botmux-handoff');
+  const at = anchor >= 0 ? anchor + 1 : BUILTIN_SKILLS.length;
+  return [...BUILTIN_SKILLS.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...BUILTIN_SKILLS.slice(at)];
+}
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
 
@@ -135,7 +151,7 @@ function promptCatalogDescription(entry: BuiltinSkillEntry, locale?: Locale): st
 }
 
 /** First `description:` value from a SKILL.md YAML frontmatter (single line). */
-function frontmatterDescription(content: string): string {
+export function frontmatterDescription(content: string): string {
   const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
   const line = fm.split('\n').find((l) => l.startsWith('description:'));
   return line ? line.slice('description:'.length).trim() : '';
@@ -154,20 +170,37 @@ export function builtinSkillEntries(opts: {
    *  Send remains as an on-demand complex-delivery skill. Set for the prompt-mode
    *  catalog; leave off for `botmux skill list`, which surfaces everything. */
   excludeRoutingCovered?: boolean;
+  /** Machine-wide v3 Workflow switch. Defaults to the live accessor
+   *  (`isWorkflowFeatureEnabled`); when off, the botmux-workflow family is not
+   *  advertised. Explicit for tests. */
+  workflowEnabled?: boolean;
 }): BuiltinSkillEntry[] {
-  let defs = [...BUILTIN_SKILLS];
+  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
+  let defs = baseBuiltinSkills(workflowEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.excludeRoutingCovered) defs = defs.filter((d) => !FULLY_ROUTING_COVERED_SKILLS.has(d.name));
+  // Apply user overrides last: replaces bodies + drops user-disabled skills.
+  // Byte-identical to the pre-feature list when nothing is customized.
+  defs = effectiveBuiltinSkills(defs);
   return defs.map((d) => ({ name: d.name, description: frontmatterDescription(d.content), content: d.content }));
 }
 
 /** Full SKILL.md body for a built-in skill name — backs `botmux skill show`
  *  on-demand reads in `prompt` mode (independent of the per-CLI toggles above,
- *  so a name that made it into the catalog always resolves). */
+ *  so a name that made it into the catalog always resolves). The v3 Workflow
+ *  family resolves only while the feature is enabled, so a disabled host can't
+ *  pull a skill it never advertised. Honors a user override body; returns
+ *  undefined for a user-disabled skill. */
 export function builtinSkillContent(name: string): string | undefined {
-  const all = [...BUILTIN_SKILLS, { name: ASK_SKILL_NAME, content: ASK_SKILL }, { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL }];
-  return all.find((d) => d.name === name)?.content;
+  const all = [
+    ...baseBuiltinSkills(isWorkflowFeatureEnabled()),
+    { name: ASK_SKILL_NAME, content: ASK_SKILL },
+    { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
+  ];
+  const shipped = all.find((d) => d.name === name)?.content;
+  if (shipped === undefined) return undefined;
+  return effectiveBuiltinSkillContent(name, shipped);
 }
 
 /**
@@ -210,17 +243,21 @@ export function buildBuiltinSkillCatalogBlock(
  *  inner help line follows the same text-only contract as the catalog body. */
 export function builtinSkillHelpPointer(
   locale?: Locale,
-  opts: { hasRoutingBlock?: boolean } = {},
+  opts: { hasRoutingBlock?: boolean; workflowEnabled?: boolean } = {},
 ): string {
   const en = locale === 'en';
   const hasRouting = opts.hasRoutingBlock !== false;
+  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
+  // Only list `workflow` among the discoverable capabilities when the feature is
+  // on — a disabled host must not point the model at a subcommand that refuses.
+  const wf = (zh: string, enText: string) => (workflowEnabled ? (en ? enText : zh) : '');
   const inner = hasRouting
     ? (en
-      ? 'Beyond the commands in <botmux_routing>, more botmux capabilities (ask / schedule / workflow / …) are shell subcommands — run `botmux --help`, and `botmux <cmd> --help` for a specific one, to discover them.'
-      : '除了 <botmux_routing> 里的命令，botmux 还有更多能力（ask / schedule / workflow 等），都是 shell 子命令——用 `botmux --help` 查全部，`botmux <子命令> --help` 查单个用法。')
+      ? `Beyond the commands in <botmux_routing>, more botmux capabilities (ask / schedule${wf(' / workflow', ' / workflow')} / …) are shell subcommands — run \`botmux --help\`, and \`botmux <cmd> --help\` for a specific one, to discover them.`
+      : `除了 <botmux_routing> 里的命令，botmux 还有更多能力（ask / schedule${wf(' / workflow', '')} 等），都是 shell 子命令——用 \`botmux --help\` 查全部，\`botmux <子命令> --help\` 查单个用法。`)
     : (en
-      ? 'botmux capabilities (send / history / quoted / bots / ask / schedule / workflow / …) are shell subcommands — run `botmux --help`, and `botmux <cmd> --help` for a specific one, to discover them.'
-      : 'botmux 的能力（send / history / quoted / bots / ask / schedule / workflow 等）都是 shell 子命令——用 `botmux --help` 查全部，`botmux <子命令> --help` 查单个用法。');
+      ? `botmux capabilities (send / history / quoted / bots / ask / schedule${wf(' / workflow', ' / workflow')} / …) are shell subcommands — run \`botmux --help\`, and \`botmux <cmd> --help\` for a specific one, to discover them.`
+      : `botmux 的能力（send / history / quoted / bots / ask / schedule${wf(' / workflow', '')} 等）都是 shell 子命令——用 \`botmux --help\` 查全部，\`botmux <子命令> --help\` 查单个用法。`);
   return `<botmux_builtin_skills>\n${escapeXmlText(inner)}\n</botmux_builtin_skills>`;
 }
 

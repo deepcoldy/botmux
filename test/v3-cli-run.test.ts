@@ -14,6 +14,7 @@ import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { authorizeManualCliRun } from '../src/workflows/v3/cli-run.js';
 import type { BotConfig } from '../src/bot-registry.js';
 import type { V3Dag } from '../src/workflows/v3/dag.js';
@@ -45,7 +46,10 @@ function runTsChild(script: string): {
   exited: () => boolean;
   result: Promise<{ created: boolean; goal: string; authorizedAt: string }>;
 } {
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+  // 不能用 spawnTsEval：内联脚本要 import 仓库内的 .ts 模块（.js specifier），
+  // Node 下丢掉 --import tsx 子进程会 ERR_MODULE_NOT_FOUND，所以拼 runner 前缀 + eval 参数。
+  const { command, prefixArgs } = tsRunnerPrefix();
+  const child = spawn(command, [...prefixArgs, ...tsEvalArgs(script).args], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });

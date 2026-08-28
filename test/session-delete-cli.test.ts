@@ -6,7 +6,7 @@
  * locally while a live owner daemon is authoritative, carries the current
  * session capability, and retains an offline fallback.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -20,6 +20,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import {
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -41,6 +42,8 @@ interface StoredSession {
   closedAt?: string;
   larkAppId?: string;
   adoptedFrom?: { source: 'tmux'; tmuxTarget: string; cwd: string };
+  /** Live preview loopback registered by the worker generation being closed. */
+  previewTarget?: { host: string; port: number; registeredAt: string };
 }
 
 afterEach(() => {
@@ -123,11 +126,11 @@ function runDelete(
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) delete env[key];
     }
-    const child = spawn(
-      process.execPath,
-      ['--import', 'tsx', CLI_PATH, 'delete', ...args],
+    const child = spawnTsScript(
+      CLI_PATH,
+      ['delete', ...args],
       { env, stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    ) as ChildProcessWithoutNullStreams;
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -293,6 +296,10 @@ describe('botmux delete — daemon-first close', () => {
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-offline', {
       adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' },
+      // A retained target would let a later reader proxy into whatever local
+      // server re-acquires the port; offline close must drop it exactly like
+      // the daemon-side closeSession() does.
+      previewTarget: { host: '127.0.0.1', port: 43111, registeredAt: '2026-07-22T00:00:00.000Z' },
     });
     const sessionsPath = writeSessions(dataDir, [session]);
 
@@ -308,6 +315,7 @@ describe('botmux delete — daemon-first close', () => {
     const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
     expect(stored[session.sessionId].status).toBe('closed');
     expect(stored[session.sessionId].closedAt).toBeTruthy();
+    expect(stored[session.sessionId]).not.toHaveProperty('previewTarget');
   });
 
   it('orders the current session last for delete all', async () => {

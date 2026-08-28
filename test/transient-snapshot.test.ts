@@ -36,9 +36,10 @@ vi.mock('node:fs', async () => {
 });
 
 // captureToPng would try to use the canvas — stub it for tests so we can
-// verify the wiring without actually rendering a PNG.
+// verify the wiring without actually rendering a PNG. Async to match the real
+// signature (encode('png') returns Promise<Buffer>); snapshotToPng awaits it.
 vi.mock('../src/utils/screenshot-renderer.js', () => ({
-  captureToPng: vi.fn(() => Buffer.from('FAKE_PNG_BYTES')),
+  captureToPng: vi.fn(async () => Buffer.from('FAKE_PNG_BYTES')),
 }));
 
 import { execSync, spawnSync } from 'node:child_process';

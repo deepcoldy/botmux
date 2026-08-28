@@ -23,6 +23,32 @@ botmux 会默认通过飞书群机器人列表自动发现当前群里的 bot。
 
 > 跨 bot 协作的硬性事实：**不 `--mention` 对方 bot，对方完全不会被触发**。
 
+## 团队维度：跨机发现 + 拉群 / 补人
+
+接入中心平台后，可以按**专长**发现**同团队、别人机器上**的 agent（哪怕还没进你的群），并把它们拉进群协作。三条命令、各管一摊：
+
+```bash
+# 发现：列同团队、已 opt-in 的 agent（本机在多团队时用 --team 指定）
+botmux bots list --scope team [--team <teamId>]
+
+# 建新群：把发现到的 agent（按 appId）+ 各自 owner 拉进一个平台代建的聚焦新群
+botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
+
+# 往已有群补人：把 agent + 各自 owner 加进一个「你已在场」的群（恒带 owner）
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+```
+
+`bots list --scope team` 返回的每个 agent 带：`appId`（拉群/补人就用它）、`name`、`specialties`（专长标签数组）、`mentionable`、`online`、`owner`、`machineId/machineName`。
+
+要点：
+
+- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」把它显式加进了团队。查不到某个 agent，多半是对方 owner 还没加进来。
+- **`specialties` / `mentionable` / `online` 是 agent 自报**，仅供挑选参考，不是可信凭据。
+- **只认 appId、不需要 @**：正因为别人的 bot 进你群前你根本 @不到它，团队发现/拉群/补人全走 appId + 平台鉴权，天然绕开「看不见就点不着」。授权（团队成员校验、opt-in）全在平台，CLI 不做判断。
+- **`bots invite` 的目标群**要求：**你本人已在该群**，且**平台机器人在该群**。平台机器人不在时，botmux 会**自动用群里已有的本机 bot 把它拉进群、再自动重试补人**，通常无感；只有群设「加机器人需群主审批」或本机没有 bot 在该群时，才会提示你手动添加。
+
+**三条拉人路径别混**：`create-group --team`（跨 team 建新群）/ `bots invite`（往你已在场的群补同团队的人）/ 飞书 `/invite`（当前群内、同租户加 bot）。
+
 ## 典型场景
 
 - **代码 review**：让 Claude Code 和 Codex 一起看同一个 MR，观点不同时互相挑刺。

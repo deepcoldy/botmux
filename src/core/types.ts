@@ -3,6 +3,7 @@ import type {
   CodexAppTurnInput,
   CliTurnPayload,
   ChatContext,
+  CotEntry,
   Session,
   DaemonToWorker,
   LarkAttachment,
@@ -17,6 +18,10 @@ import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
   messageId: string;      // Lark message_id for PATCHing
+  /** Stable visible destination of this card (`plain:oc_*`, `thread:om_*`, or
+   *  `quote:om_*`). Chat-scope sessions can move between multiple Lark topics;
+   *  cleanup must only withdraw predecessors from the same destination. */
+  replyTargetKey?: string;
   content: string;        // frozen text snapshot — kept so "导出文字" still works on historical cards
   title: string;          // turn title at freeze time
   /** Legacy boolean expand/collapse — kept for migrating old persisted cards. */
@@ -29,6 +34,9 @@ export interface FrozenCard {
    *  recalled Codex card keeps its per-turn tier instead of being re-decorated
    *  with the session's current tier. Absent = no badge. */
   codexServiceTierBadge?: string;
+  /** Whether this historical turn deliberately completed with no reply. The
+   *  value belongs to this frozen card, not to the session's latest turn. */
+  silentIdle?: boolean;
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -124,6 +132,32 @@ export interface DaemonSession {
   /** Per-session snapshot of the final-answer feedback policy. New config takes
    * effect on the next new/restarted session, matching sandbox send-cred state. */
   feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
+  /** Explicit per-trigger model override (trigger API `options.model`, codex
+   *  family only). Outranks the bot's configured model at spawn; everything
+   *  else resolves the model from the LIVE bot config on every spawn (see
+   *  sessionAgentConfig), so a dashboard edit reaches long sessions.
+   *
+   *  **In-memory only, deliberately.** The public contract is per-trigger /
+   *  fresh-spawn ("ignored when folding into an existing worker"), so it must
+   *  not outlive this daemon's view of the session: persisting it — which is
+   *  what the old `session.model` freeze did — turned a one-shot caller choice
+   *  into a permanent override that a later dashboard change could not undo.
+   *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
+   *  re-fork of the same session launches identically. */
+  spawnModelOverride?: string;
+  /** True while this session's worker sits in the crash-loop park state: its CLI
+   *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
+   *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
+   *  no restart IPC to refresh it. While set, message IPCs carry the freshly
+   *  resolved launch model so that recovery does not relaunch on a stale one.
+   *  Cleared when a worker generation reports ready. In-memory only. */
+  crashDiagnosticParked?: boolean;
+  /** Daemon-side bounded auto-retry state for TRANSIENT worker startup
+   *  failures (e.g. "spawnSync tmux ETIMEDOUT" during a post-outage restart
+   *  storm — see worker-startup-retry.ts). `attempts` counts the current
+   *  failing streak; `timer` is the pending blank re-fork. Reset (timer
+   *  cleared) when a worker generation reaches `ready`. In-memory only. */
+  startupAutoRetry?: { attempts: number; timer?: NodeJS.Timeout };
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
@@ -216,7 +250,7 @@ export interface DaemonSession {
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
   pendingSubstituteTrigger?: import('../types.js').SubstituteTrigger;
-  /** Sender (open_id + type + resolved name) of the initial message — stashed
+  /** Sender (open_id + type + resolved name/email) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
@@ -253,7 +287,16 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
+  /** Visible Lark destination of the live streaming card. Unlike
+   * currentReplyTarget this remains bound to the card after a newer turn is
+   * accepted, so parking cannot attribute the predecessor to the new topic. */
+  streamCardReplyTargetKey?: string;
   streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
+  /** Incremented for every worker status observation, including same-value
+   *  edges. A screen update can land while the Feishu starting-card POST is
+   *  in flight; the revision lets the POST completion distinguish that from
+   *  the pre-turn cached idle state and immediately reconcile the new card. */
+  streamCardStatusRevision?: number;
   /** Monotonic in-memory generation for accepted user turns. Card POST
    * completions use it to avoid clearing a newer turn's pending state. */
   streamCardTurnGeneration?: number;
@@ -284,6 +327,19 @@ export interface DaemonSession {
    *  command so a user can manually summon a live card in an otherwise-quiet
    *  session. In-memory only (resets on daemon restart). */
   streamingCardForced?: boolean;
+  /** One-shot override for the native CoT (thinking process) message: when
+   *  true, the bubble renders for the current/next turn even if the chat is
+   *  in `noCotChats` or the bot-level `thinkingCard` switch is off. Flipped on
+   *  by `/cot show`; auto-cleared when that turn settles (turn_terminal), so
+   *  it is a single peek, not a toggle. In-memory only. */
+  cotForced?: boolean;
+  /** Latest `thinking_update` of the RUNNING turn, cached regardless of the
+   *  CoT switches so `/cot show` can summon the bubble mid-turn with all
+   *  thinking accumulated so far (the worker only emits on NEW entries — a
+   *  bare force flag could otherwise miss a turn whose thinking already
+   *  ended). Cleared on turn_terminal: a bubble created after its turn
+   *  settled would never receive RUN_FINISHED and spin forever. */
+  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -297,6 +353,34 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
+   *  Only positives are stored (absent === not mentioned), so the bounded FIFO
+   *  (see recordTurnExplicitMention) is spent entirely on turns that can still
+   *  owe a receipt — a long queue of un-@'d turns cannot evict a live one.
+   *  Read at turn_terminal to decide whether a deliberately-silent turn owes an
+   *  auto receipt. In-memory only: a daemon restart mid-turn skips the receipt. */
+  turnExplicitMentions?: Set<string>;
+  /** Set when the LAST completed turn ended as deliberate silence (worker
+   *  terminal outputDisposition 'nothing_to_send'). Drives the idle-card label
+   *  「已处理 · 判定无需回复」 instead of 「等待输入」 so users can tell "chose
+   *  silence" from "stuck". Cleared by every new-turn entry point
+   *  (beginNewTurn and both worker-exited re-fork branches). In-memory only. */
+  silentIdleTurnId?: string;
+  /** turnId of the most recently STARTED turn (beginNewTurn and both
+   *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
+   *  turn_terminal that lands after a NEWER turn already opened — the normal
+   *  type-ahead ordering, since the follow-up is admitted while the previous
+   *  turn is still running — belongs to the PREVIOUS turn and must not relabel
+   *  the live card. Left undefined for sessions driven only by HTTP/async
+   *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
+  currentTurnId?: string;
+  /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
+   *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
+   *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
+   *  one-slot guard would let A₂ re-post. An entry is claimed BEFORE the reply
+   *  is sent and released if that send fails, so a later replay can compensate
+   *  instead of losing the closure permanently. */
+  silentReceiptTurnIds?: Set<string>;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
@@ -351,6 +435,12 @@ export interface DaemonSession {
   };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Latch for the proactive rate/usage-limit owner notification: the
+   *  usageLimitStateKey of the limit episode we already posted about. Exactly
+   *  one owner notification per episode; reset to undefined by
+   *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
+   *  notify again. In-memory only. */
+  rateLimitNotifiedKey?: string;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
@@ -378,10 +468,13 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed';
+    status: 'pending' | 'completed' | 'failed';
     createdAt: number;
     completedAt?: number;
+    failedAt?: number;
     content?: string;
+    errorCode?: 'trigger_failed';
+    terminalErrorCode?: string;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
@@ -431,6 +524,13 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Current human caller, carried over private worker IPC from the
+     * daemon-authenticated input envelope. Never sourced from CLI env/files. */
+    callerOpenId?: string;
+    /** Linux pid:starttime identities already present in the CLI subtree when
+     * this turn authority was published. Actor callers may not traverse one of
+     * these old descendants; the long-lived CLI root itself is the exception. */
+    preexistingProcessIdentities?: string[];
   };
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
@@ -615,15 +715,13 @@ export function storedSessionAnchorId(
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
-/** Storage key for the daemon-owned activeSessions map. A VC receiver is a
- * dedicated conversation even though its visible output route is a chat, so
- * key it by its immutable session id instead of collapsing it into the normal
- * `(chatId, appId)` chat-scope slot. */
+/** Storage key for the daemon-owned activeSessions map. A VC meeting agent is
+ * now an ordinary chat-scope session in its listener group (Plan B): it is keyed
+ * by the normal `(chatId, appId)` slot so plain IM and meeting transcripts both
+ * fold into the one session. The `vcMeetingReceiver` marker is retained as pure
+ * delivery/meeting-output metadata and no longer affects routing. */
 export function activeSessionKey(ds: DaemonSession): string {
-  const anchor = ds.session.vcMeetingReceiver
-    ? `vc-receiver:${ds.session.sessionId}`
-    : sessionAnchorId(ds);
-  return sessionKey(anchor, ds.larkAppId);
+  return sessionKey(sessionAnchorId(ds), ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

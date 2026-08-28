@@ -154,7 +154,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { killWorker, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { closeSession, killWorker, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { deleteMessage, getMessageDetail } from '../src/im/lark/client.js';
 import { getBot } from '../src/bot-registry.js';
@@ -307,6 +307,33 @@ describe('Adopt card actions', () => {
 
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    });
+
+    it('does not report disconnect success when the close result carries a residual', async () => {
+      const ds = makeDaemonSession({
+        adoptedFrom: {
+          tmuxTarget: '0:1.0',
+          originalCliPid: 12345,
+          cwd: '/home/user/project',
+        },
+      });
+      const sessions = new Map<string, DaemonSession>([
+        [sessionKey(ROOT_ID, APP_ID), ds],
+      ]);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('未能确认完全断开');
+      expect(reply).not.toContain('已断开');
     });
   });
 

@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-verify-permissions.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 
 // 占位 mock — 单测里不真实调 Lark.Client. checkRequiredScopes / applyScopesUnverified
 // 单测都需要 mock 这个.
@@ -37,6 +37,7 @@ import {
   buildScopeDeepLink,
   buildEventSubDeepLink,
   buildRemainingSteps,
+  registerBotmuxRedirectUrlCollector,
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
   DOC_WATCH_SCOPES,
@@ -277,6 +278,41 @@ describe('deep-link builders', () => {
     // 主线收敛到 2 步: 权限申请 + 重定向 URL (PersonalAgent 默认配好事件/bot 不再列)
     expect(steps.length).toBe(2);
     for (const s of steps) expect(s.url).toContain('open.larksuite.com');
+  });
+
+  describe('重定向 URL 提示按实际配置生成', () => {
+    // collector 是模块级单例，用完必须还原成「与未注册时等价」的行为（本文件不 import
+    // open-platform-automation，所以未注册状态就等于只有 loopback 那一条），
+    // 否则会泄漏到同文件后续用例。
+    let restore: (() => void) | undefined;
+    afterEach(() => { restore?.(); restore = undefined; });
+
+    it('列出 collectBotmuxRedirectUrls 给的每一条，而不是写死 127.0.0.1', () => {
+      registerBotmuxRedirectUrlCollector(() => [
+        'http://127.0.0.1:9768/callback',
+        'https://m-abc.example.com/oauth/callback',
+      ]);
+      restore = () => registerBotmuxRedirectUrlCollector(() => ['http://127.0.0.1:9768/callback']);
+
+      const redirectStep = buildRemainingSteps('cli_x')[1];
+      // 配了 oauthRedirectBase / 平台绑定 / 反代的机器，真正发起授权用的是
+      // <base>/oauth/callback；只提示 loopback 那条，用户照做完照样 20029。
+      expect(redirectStep.title).toContain('http://127.0.0.1:9768/callback');
+      expect(redirectStep.title).toContain('https://m-abc.example.com/oauth/callback');
+    });
+
+    it('collector 抛错 / 给空数组时回落到 loopback 单条，绝不炸', () => {
+      // buildRemainingSteps 会在「读不到 global-config」的上下文里被调到
+      //（onboarding 落终态），提示生成失败不能反过来把整条链路带崩。
+      registerBotmuxRedirectUrlCollector(() => { throw new Error('config unavailable'); });
+      restore = () => registerBotmuxRedirectUrlCollector(() => ['http://127.0.0.1:9768/callback']);
+
+      expect(() => buildRemainingSteps('cli_x')).not.toThrow();
+      expect(buildRemainingSteps('cli_x')[1].title).toContain('http://127.0.0.1:9768/callback');
+
+      registerBotmuxRedirectUrlCollector(() => []);
+      expect(buildRemainingSteps('cli_x')[1].title).toContain('http://127.0.0.1:9768/callback');
+    });
   });
 });
 

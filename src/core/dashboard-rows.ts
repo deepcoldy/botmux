@@ -11,15 +11,17 @@ import type { CliId } from '../adapters/cli/types.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
-import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
+import { type Brand, chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 import { readSessionOpenTodos } from '../services/todo-state.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
+import { safeSessionPreviewTarget, type SessionPreviewTarget } from './session-preview.js';
 import {
   buildSessionMessagePreview,
   type SessionMessagePreview,
 } from './session-message-preview.js';
 import { isSuspendableBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
   sessionId: string;
@@ -72,9 +74,15 @@ export interface SessionRow extends SessionMessagePreview {
    *  up). When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}.
    *  Mirrors the port buildTerminalUrl puts in card links so both agree. */
   proxyPort?: number;
+  /** Internal daemon→dashboard routing data. The central browser projection
+   * removes it and emits only `preview: { path, registeredAt }`. */
+  previewTarget?: SessionPreviewTarget;
   cliVersion?: string;
   hasHistory?: boolean;
   feishuChatLink: string;
+  /** Direct AppLink to the session topic. It exists only when the native
+   *  `omt_...` id is known; the `om_...` routing root is not interchangeable. */
+  feishuThreadLink?: string;
   /** Repo-selection card is waiting for a click — the CLI has not spawned yet.
    *  Feeds the board view's needs-you column. */
   pendingRepo?: boolean;
@@ -120,6 +128,14 @@ export interface SessionRow extends SessionMessagePreview {
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
   return chatAppLink(chatId, brand);
+}
+
+function sessionThreadLink(
+  session: Pick<Session, 'chatId' | 'scope' | 'larkThreadId'>,
+  brand: Brand,
+): string | undefined {
+  if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
+  return threadAppLink(session.chatId, session.larkThreadId, brand);
 }
 
 let cachedBotName = '';
@@ -197,6 +213,8 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
 }
 
 export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean }): SessionRow {
+  const brand = getBotBrand(ds.larkAppId);
+  const topicLink = sessionThreadLink(ds.session, brand);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -208,9 +226,15 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     // For every other session, process residency is authoritative: suspension
     // clears ds.worker but intentionally preserves the logical active session.
     // Never let a stale pre-suspend status make it look resident after hydrate.
+    // No screen status yet + worker init complete = the CLI is executing its
+    // first turn (screen updates are suppressed until the first idle prompt).
+    // Long first turns — e.g. meeting agents fed a transcript delivery right at
+    // spawn — previously sat in「启动中」for minutes; project them as working.
     status: ds.session.queued
       ? 'idle'
-      : (!ds.worker || ds.worker.killed ? 'dormant' : (ds.lastScreenStatus ?? 'starting')),
+      : (!ds.worker || ds.worker.killed
+          ? 'dormant'
+          : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'))),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
@@ -237,10 +261,12 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
     proxyPort: getTerminalAdvertisedPort() || undefined,
+    previewTarget: safeSessionPreviewTarget(ds.session.previewTarget),
     riffAccessUrl: ds.riffAccessUrl,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId, getBotBrand(ds.larkAppId)),
+    feishuChatLink: feishuChatLink(ds.chatId, brand),
+    ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
     tuiPromptActive: !!ds.tuiPromptCardId,
@@ -256,6 +282,8 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
 }
 
 export function composeRowFromClosed(s: Session): SessionRow {
+  const brand = getBotBrand(s.larkAppId ?? '');
+  const topicLink = sessionThreadLink(s, brand);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
@@ -284,7 +312,9 @@ export function composeRowFromClosed(s: Session): SessionRow {
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
-    feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
+    previewTarget: safeSessionPreviewTarget(s.previewTarget),
+    feishuChatLink: feishuChatLink(s.chatId, brand),
+    ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     tokenUsage: sessionTokenUsage(s),
     ...buildSessionMessagePreview(s),
   };
@@ -299,6 +329,8 @@ export function composeRowFromClosed(s: Session): SessionRow {
  * see and explicitly retry closing it without an unsafe resume affordance.
  */
 export function composeRowFromPersistedActive(s: Session): SessionRow {
+  const brand = getBotBrand(s.larkAppId ?? '');
+  const topicLink = sessionThreadLink(s, brand);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
@@ -326,7 +358,8 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: null,
-    feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
+    feishuChatLink: feishuChatLink(s.chatId, brand),
+    ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,

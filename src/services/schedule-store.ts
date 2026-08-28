@@ -470,6 +470,7 @@ export function createTask(params: {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  ownerOpenId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -523,6 +524,7 @@ export function createTask(params: {
       creatorChatId: params.creatorChatId,
       creatorRootMessageId: params.creatorRootMessageId,
       creatorLarkAppId: params.creatorLarkAppId,
+      ownerOpenId: params.ownerOpenId,
       enabled: true,
       createdAt: new Date().toISOString(),
       nextRunAt: params.nextRunAt,

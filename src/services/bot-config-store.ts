@@ -28,6 +28,11 @@ import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import {
+  cliModelSupportsReasoningEffort,
+  isCodexReasoningEffort,
+  isConfigurableReasoningCliId,
+} from './codex-reasoning-effort.js';
 
 /**
  * 生效时机：
@@ -48,6 +53,9 @@ export interface ConfigFieldSpec {
   effect: ConfigEffect;
   /** 是否支持 `/config unset <field>`（清回默认）。boolean 字段用 `set off` 即可，无需 unset。 */
   clearable: boolean;
+  /** kind==='boolean' 且默认值为 ON 的字段：持久化取反（只写显式 false，true
+   *  删 key），展示时缺省渲染为 on。缺省（undefined）保持默认 OFF 语义。 */
+  defaultOn?: boolean;
   /** kind==='enum' 时的合法取值（已小写）。 */
   enumValues?: readonly string[];
   /** kind==='string' 的最大长度（trim 后计），超出 coerce 报 too_long。缺省不限。 */
@@ -68,6 +76,7 @@ export interface ConfigFieldSpec {
 export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
+  { key: 'reasoningEffort', configKey: 'reasoningEffort', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], hint: '支持的 CLI 上新会话默认思考强度 low|medium|high|xhigh|max|ultra；unset 回 CLI 默认' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
   { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|fish|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；fish 用户把 PATH/nvm 放进 ~/.config/fish/config.fish，无需回填 bash/zsh；unset 回 $SHELL' },
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
@@ -80,6 +89,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
+  { key: 'thinkingCard', configKey: 'thinkingCard', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；当前支持 claude-code / codex）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -91,6 +101,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
+  { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'p2pOpen', configKey: 'p2pOpen', kind: 'boolean', effect: 'immediate', clearable: false, hint: '私聊对话全开 on|off：任何能看到本 bot 的人都可私聊（只放行对话；管理操作默认仍只认 allowedUsers，被 canTalkDaemonCommands 显式降级的命令除外）；不影响群聊' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat', 'group'], hint: '私聊单聊模式 thread|chat|group；默认 chat=扁平连续会话，thread=每条 DM 独立会话，group=每条 DM 自动建专属会话群（chat/unset 回默认）' },
@@ -99,6 +110,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
+  { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）；选 riff 时需配置 riff 字段，mojo 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
@@ -125,7 +137,7 @@ export function parseBooleanValue(raw: string): boolean | undefined {
 
 /** 展示某字段当前值的人类可读文本。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
-  if (spec.kind === 'boolean') return value === true ? 'on' : 'off';
+  if (spec.kind === 'boolean') return (spec.defaultOn ? value !== false : value === true) ? 'on' : 'off';
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
@@ -224,31 +236,76 @@ export async function applyConfigField(
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
 
-  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+  const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
+    const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
+      ? entry.cliId.trim()
+      : bot.config.cliId;
+    const nextCliId = spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
+      ? effective.trim()
+      : currentCliId;
+    const currentModel = typeof entry.model === 'string' && entry.model.trim()
+      ? entry.model.trim()
+      : undefined;
+    const nextModel = spec.configKey === 'model'
+      ? typeof effective === 'string' && effective.trim()
+        ? effective.trim()
+        : undefined
+      : currentModel;
+    const currentReasoningEffort = isCodexReasoningEffort(entry.reasoningEffort)
+      ? entry.reasoningEffort
+      : undefined;
+    const nextReasoningEffort = spec.configKey === 'reasoningEffort'
+      ? effective === null
+        ? undefined
+        : isCodexReasoningEffort(effective)
+          ? effective
+          : undefined
+      : currentReasoningEffort;
+    if (spec.configKey === 'reasoningEffort' && effective !== null
+        && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
+      return { write: false, result: 'reasoning_effort_not_supported' };
+    }
+    if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
+        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+      return { write: false, result: 'reasoning_effort_not_supported_by_model' };
+    }
     if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
-      // 与 parseBotConfigsFromText 一致：true 才写，false → 删 key（bots.json 保持干净）。
-      if (effective === true) entry[spec.configKey] = true;
+      // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
+      // false 删 key；默认 ON（defaultOn）的字段 false 才写、true 删 key。
+      if (spec.defaultOn) {
+        if (effective === false) entry[spec.configKey] = false;
+        else delete entry[spec.configKey];
+      } else if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
     } else if (spec.kind === 'json') {
       entry[spec.configKey] = effective as any;
     } else {
       entry[spec.configKey] = effective;
     }
+    if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(nextCliId)) {
+      delete entry.reasoningEffort;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
+  if (r.result) return { ok: false, reason: r.result };
 
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
   if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
-    (bot.config as any)[spec.configKey] = effective || undefined;
+    (bot.config as any)[spec.configKey] = spec.defaultOn
+      ? (effective === false ? false : undefined)
+      : (effective || undefined);
   } else if (spec.kind === 'json') {
     (bot.config as any)[spec.configKey] = effective;
   } else {
     (bot.config as any)[spec.configKey] = effective;
+  }
+  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(String(effective ?? bot.config.cliId))) {
+    bot.config.reasoningEffort = undefined;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
   if (spec.configKey === 'feedback') {

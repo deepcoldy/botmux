@@ -1,4 +1,6 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
@@ -18,6 +20,10 @@ import {
   CODEX_CONNECTION_ERROR_CODE,
   CODEX_RATE_LIMIT_ERROR_CODE,
 } from '../src/services/codex-transcript.js';
+import {
+  settleDeferredSubmitConfirmation,
+  type SubmitActivityEvidence,
+} from '../src/services/submit-confirmation.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -99,6 +105,100 @@ describe('stripTrailingOaiMemoryCitation', () => {
     const malformed = `<oai-mem-citation><citation_entries>${repeatedCandidates}`
       + '<rollout_ids>missing final envelope';
     expect(stripTrailingOaiMemoryCitation(malformed)).toBe(malformed);
+  });
+});
+
+function workerFunctionSlice(name: string, nextName: string): string {
+  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+  const start = source.indexOf(`function ${name}`);
+  const end = source.indexOf(`function ${nextName}`, start + 1);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
+}
+
+describe('worker submit-failure retry wiring', () => {
+  it('reschedules ordinary IM turns after active evidence and keeps structured-target state', () => {
+    const schedule = workerFunctionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
+    const activeStart = schedule.indexOf("case 'suppress-active':");
+    const activeEnd = schedule.indexOf("case 'notify-hard-failure':", activeStart);
+    expect(activeStart).toBeGreaterThanOrEqual(0);
+    expect(activeEnd).toBeGreaterThan(activeStart);
+
+    const active = schedule.slice(activeStart, activeEnd);
+    const recursiveCall = active.indexOf('scheduleSubmitFailureNotify(');
+    expect(recursiveCall).toBeGreaterThanOrEqual(0);
+    expect(active.slice(0, recursiveCall)).not.toContain('dispatchAttempt !== undefined');
+    expect(active.slice(recursiveCall, active.indexOf(');', recursiveCall) + 2)).toContain('structuredTarget');
+
+    const notifyStuck = schedule.slice(schedule.indexOf("case 'notify-stuck':"));
+    expect(notifyStuck).toContain('if (turnIdentity?.dispatchAttempt === undefined)');
+    expect(notifyStuck).toContain("type: 'user_notify'");
+    expect(notifyStuck).toContain('worker.submit_unconfirmed');
+  });
+});
+
+describe('deferred submit confirmation behavior', () => {
+  it('keeps ordinary IM unconfirmed while active evidence continues, then notifies after a quiet window', async () => {
+    const queue = new CodexBridgeQueue();
+    const evidence: Array<SubmitActivityEvidence | undefined> = [
+      'pty-output',
+      'botmux-send',
+      undefined,
+    ];
+
+    const actions = [];
+    for (const activityEvidence of evidence) {
+      const settlement = await settleDeferredSubmitConfirmation(queue, {
+        turnId: 'ordinary-im-turn',
+        recheck: async () => false,
+        usageLimitDetected: () => false,
+        activityEvidence: () => activityEvidence,
+        isCurrent: () => true,
+      });
+      expect(settlement.stale).toBe(false);
+      if (!settlement.stale) actions.push(settlement.action);
+    }
+
+    expect(actions).toEqual([
+      { kind: 'suppress-active', evidence: 'pty-output' },
+      { kind: 'suppress-active', evidence: 'botmux-send' },
+      { kind: 'notify-stuck' },
+    ]);
+  });
+
+  it('confirms an ordinary IM retry once the deferred history recheck sees the prompt', async () => {
+    const queue = new CodexBridgeQueue();
+    let recheckCalls = 0;
+    const actions = [];
+
+    for (let round = 0; round < 3; round += 1) {
+      const settlement = await settleDeferredSubmitConfirmation(queue, {
+        turnId: 'ordinary-im-turn',
+        recheck: async () => {
+          recheckCalls += 1;
+          return recheckCalls === 3
+            ? { submitted: true, cliSessionId: 'grok-session-id' }
+            : false;
+        },
+        usageLimitDetected: () => false,
+        activityEvidence: () => 'structured-transcript',
+        isCurrent: () => true,
+      });
+      expect(settlement.stale).toBe(false);
+      if (!settlement.stale) actions.push(settlement.action);
+      if (!settlement.stale && settlement.action.kind === 'suppress-confirmed') {
+        expect(settlement.cliSessionId).toBe('grok-session-id');
+        expect(settlement.lifecycle).toBe('unchanged');
+        break;
+      }
+    }
+
+    expect(actions).toEqual([
+      { kind: 'suppress-active', evidence: 'structured-transcript' },
+      { kind: 'suppress-active', evidence: 'structured-transcript' },
+      { kind: 'suppress-confirmed' },
+    ]);
   });
 });
 

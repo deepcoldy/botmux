@@ -175,4 +175,25 @@ describe('codex writeInput history ownership filter', () => {
     const result = await adapter.writeInput!(fakePty(undefined, onEnter), 'noping');
     expect((result as any)?.cliSessionId).toBe(SID_A);
   });
+
+  it('external App Server viewer accepts only its explicitly selected remote thread', async () => {
+    const historyPath = join(home, 'history.jsonl');
+    const adapter = createCodexAdapter();
+    let appended = false;
+    const onEnter = () => {
+      if (appended) return;
+      appended = true;
+      // An unrelated same-text submit may land first in the global history.
+      appendFileSync(historyPath, historyLine(SID_B, 'remote submit'));
+      appendFileSync(historyPath, historyLine(SID_A, 'remote submit'));
+    };
+    const pty = fakePty(ownerChild.pid!, onEnter);
+    // The remote TUI owns no rollout fd—the existing App Server owns SID_A.
+    // Its explicit binding therefore wins over the local viewer PID.
+    pty.expectedCodexSessionId = SID_A;
+
+    const result = await adapter.writeInput!(pty, 'remote submit');
+    expect((result as any)?.submitted).toBe(true);
+    expect((result as any)?.cliSessionId).toBe(SID_A);
+  });
 });

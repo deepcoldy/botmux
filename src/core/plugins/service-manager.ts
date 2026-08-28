@@ -57,7 +57,7 @@ export class PluginServiceDeleteError extends Error {
   }
 }
 
-interface Pm2AppInfo {
+export interface Pm2AppInfo {
   name: string;
   pid?: number;
   status?: string;
@@ -71,6 +71,13 @@ function serviceLockTarget(): string {
   return `${pluginsHome()}/service-manager`;
 }
 
+/**
+ * Serializes every plugin service lifecycle mutation on one file lock so a
+ * concurrent plugin start/stop/delete can't interleave. (Pre-migration this
+ * also nested under the shared PM2_HOME fleet-mutation lock to order against an
+ * `include-pm2` core restart's `pm2 kill`; the core fleet is now supervisor-
+ * managed with no shared PM2_HOME, so only the plugin service lock remains.)
+ */
 export function withPluginServiceLockSync<T>(fn: () => T): T {
   return withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 });
 }
@@ -304,6 +311,32 @@ function selectedRecords(pluginIds?: readonly string[], autoOnly = false): Insta
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/** Capture manual services that must be restored after the shared PM2 God rotates. */
+export async function snapshotRunningManualPluginServiceIds(): Promise<string[]> {
+  return withPluginServiceLock(async () => {
+    return selectRunningManualPluginServiceIds(selectedRecords(), readPm2Apps());
+  });
+}
+
+export function selectRunningManualPluginServiceIds(
+  records: readonly InstalledPluginRecord[],
+  pm2Apps: readonly Pm2AppInfo[],
+): string[] {
+  const apps = new Map(pm2Apps.map(app => [app.name, app]));
+  return records
+    .filter(record => record.manifest.service?.mode === 'manual')
+    .filter(record => {
+      const app = apps.get(pluginPm2AppName(record.id));
+      return !!app
+        && app.status !== 'stopped'
+        && app.status !== 'errored'
+        && ((typeof app.pid === 'number' && app.pid > 1)
+          || app.status === 'online'
+          || app.status === 'launching');
+    })
+    .map(record => record.id);
+}
+
 function reportFromState(
   record: InstalledPluginRecord,
   action: PluginServiceReport['action'],
@@ -446,17 +479,24 @@ export async function deletePluginServices(pluginIds?: readonly string[]): Promi
 }
 
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {
-  const reports: PluginServiceReport[] = [];
-  for (const record of selectedRecords()) {
-    try {
-      const definition = await loadPluginServiceDefinition(record);
-      if (!definition) continue;
-      const app = findPm2App(pluginPm2AppName(record.id));
-      const state = writeServiceState(record, definition, app);
-      reports.push(reportFromState(record, 'status', state));
-    } catch (err: any) {
-      reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+  // Also serialized: a "read-only" status probe runs pm2 jlist, and a pm2
+  // client with no live God lazily births one from THIS process's env — which
+  // could insert a replacement God mid-mutation. Holding the plugin service
+  // lock parks the probe until any concurrent plugin start/stop/delete
+  // completes.
+  return withPluginServiceLock(async () => {
+    const reports: PluginServiceReport[] = [];
+    for (const record of selectedRecords()) {
+      try {
+        const definition = await loadPluginServiceDefinition(record);
+        if (!definition) continue;
+        const app = findPm2App(pluginPm2AppName(record.id));
+        const state = writeServiceState(record, definition, app);
+        reports.push(reportFromState(record, 'status', state));
+      } catch (err: any) {
+        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+      }
     }
-  }
-  return reports;
+    return reports;
+  });
 }

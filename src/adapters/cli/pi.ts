@@ -47,10 +47,12 @@ import { delay } from '../../utils/timing.js';
  *       terminal stopReason), and `terminate` is not persisted — so that turn
  *       has no on-disk end marker.
  *  Setting `reliableTurnTerminal` would (a) claim VC-meeting delivery eligibility
- *  Pi can't honor, (b) suppress the busy-marker idle probe Pi actually relies on,
- *  and (c) make `structuredRateLimitAuthoritative` suppress Pi's screen `rate`
- *  verdict with no structured replacement (real 429s vanish). Leaving it unset
- *  keeps Pi on its proven quiescence + `Working...` busy-marker idle path.
+ *  Pi can't honor and (b) suppress the busy-marker idle probe Pi actually relies
+ *  on, so it stays unset — keeping Pi on its proven quiescence + `Working...`
+ *  busy-marker idle path. (Pi's screen `rate` verdict is NOT at risk here:
+ *  `structuredRateLimitAuthoritative` gates on `claudeDataDir` /
+ *  `emitsStructuredRateLimit`, neither of which Pi sets — Pi has no structured
+ *  rate-limit emit, so it correctly keeps screen-scanning real 429s.)
  *
  *  ## Idle detection
  *  Pi is a pure-quiescence adapter (no `readyPattern`, no `injectsReadyHook`).

@@ -41,8 +41,90 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      - run: npm install -g pnpm@9.5.0
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - run: pnpm test
-      - run: pnpm workflow-core:test
+      # Bun is the package manager (packageManager: bun@1.4.0). node-pty's native
+      # build runs only because it is in `trustedDependencies` — bun skips
+      # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
+      # need a real build/Release/pty.node.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run test
+      - run: bun run workflow-core:test
+
+  # The Bun single-file executable is a SHIPPED artifact (attached to every
+  # GitHub Release), but until this job existed nothing built or ran it before a
+  # tag push — so `bun build --compile` breakage was only discovered at release
+  # time, after npm had already published. Two real defects reached that far:
+  #   • the compiled dashboard crashlooped on a deep `require()` the bundler
+  #     never embedded (qrcode-terminal/vendor), and
+  #   • the dashboard had no supervisor launcher at all.
+  # Neither is visible to `bun run test` (vitest runs the Node path) nor to a
+  # `capabilities --json` canary. This job compiles the host-arch binary and runs
+  # scripts/smoke-bun-binary.mjs, which exercises the layers that actually carry
+  # Bun-migration risk: the hidden self-spawn entries, the supervised dashboard
+  # member booting with its embedded modules, and its HTTP listener.
+  #
+  # Kept a separate job (not steps appended to `build`) so a Bun-only failure is
+  # legible at a glance and does not mask unit-test results.
+  bun-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Bun is the package manager as well as the runtime here (packageManager:
+      # bun@1.4.0), so this pin governs BOTH `bun install` and the compiled
+      # artifact. CI must exercise the exact Bun that builds what ships.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      # The platform's own install compiles node-pty's build/Release/pty.node for
+      # this OS/arch, which the embed plugin bundles into the binary. That only
+      # happens because node-pty is in `trustedDependencies` — bun does NOT run a
+      # dependency's lifecycle scripts otherwise, and without pty.node there is no
+      # PTY and no working compiled binary.
+      - run: bun install --frozen-lockfile
+
+      - name: Stamp a synthetic version (mirrors the release job)
+        # WHY THIS EXISTS: the compiled binary has no package.json on disk, so the
+        # build BAKES the version in at compile time by reading package.json —
+        # and in the repo that file carries the unbuilt `0.0.0` placeholder, which
+        # the runtime deliberately treats as "nothing baked" (a locally-compiled
+        # dev binary must not report 0.0.0 as authoritative). Compiling straight
+        # from the placeholder therefore yields `--version: unknown`, which is the
+        # exact regression the smoke gate below exists to catch.
+        #
+        # release.yml stamps the real version from the git tag BEFORE compiling
+        # ("Sync version from git tag"). CI has no tag, so stamp a synthetic one
+        # here — same ORDER as release, so this job exercises the same shape the
+        # shipped artifact is built with instead of a placeholder-only path that
+        # can never satisfy the gate.
+        #
+        # Runs after `bun install --frozen-lockfile` on purpose: `npm version`
+        # rewrites package.json, and bun's frozen-lockfile check must see the
+        # committed file. The workspace is ephemeral, so nothing is committed back.
+        run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
+
+      - run: bun run build
+
+      - name: Compile the host-arch Bun binary
+        run: bun scripts/build-bun-binary.mjs --target bun-linux-x64 --out dist-bin/botmux-linux-x64
+
+      - name: Smoke-test the compiled binary
+        # Runs from a scratch HOME with an empty bots.json — no Feishu
+        # credentials, no live fleet, no interference with anything on the runner.
+        #
+        # The empty bots.json is why checks 1-4 cannot reach the daemon: it refuses
+        # to start with 0 bots ("Invalid BOTMUX_BOT_INDEX=0"), so writePidFile —
+        # and the wrapper write that once overwrote the binary itself — is
+        # structurally unreachable. Check 5 in the script covers that path directly
+        # instead of booting a credentialed bot.
+        run: node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64
+
