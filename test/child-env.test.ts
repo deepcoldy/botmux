@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   applySessionOwnerEnv,
+  scrubExternalMemberEnv,
   BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
@@ -680,5 +681,48 @@ describe('pm2CallerEnv()', () => {
     const base: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret' };
     pm2CallerEnv(base, '/tmp/pm2-home');
     expect(base.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('h5-secret');
+  });
+});
+
+describe('scrubExternalMemberEnv (external fleet members)', () => {
+  // Parity with the pm2 path is the whole contract: this replaces
+  // scrubPm2CallerEnv for plugin services, and a migration must not quietly
+  // reduce protection. Asserting the RESULT against the real scrubPm2CallerEnv
+  // (rather than re-listing keys here) means the two cannot drift: adding a
+  // family to one without the other fails this spec.
+  it('strips exactly what the pm2 caller scrub stripped', async () => {
+    const { scrubPm2CallerEnv } = await import('../src/cli/pm2-env.js');
+    const poisoned = (): NodeJS.ProcessEnv => ({
+      CODEX_HOME: '/bot/a/codex',
+      CLAUDE_CONFIG_DIR: '/bot/a/claude',
+      CLAUDECODE: '1',
+      CLAUDE_CODE_SESSION_ID: 'sess',
+      BOTMUX_WORKFLOW: '1',
+      BOTMUX_GOAL_PATH: '/tmp/goal',
+      BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'secret',
+      NO_COLOR: '1',
+      FORCE_COLOR: '3',
+      BOTMUX_SESSION_ID: 'sess-1',
+      BOTMUX_TURN_ID: 'turn-1',
+      PATH: '/usr/bin',
+      HOME: '/root',
+      UNRELATED: 'keep',
+    });
+    const viaExternal = poisoned();
+    const viaPm2 = poisoned();
+    scrubExternalMemberEnv(viaExternal);
+    scrubPm2CallerEnv(viaPm2);
+    expect(viaExternal).toEqual(viaPm2);
+  });
+
+  it('keeps unrelated env and re-pins TERM rather than deleting it', () => {
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin', UNRELATED: 'keep', TERM: 'dumb', NO_COLOR: '1' };
+    scrubExternalMemberEnv(env);
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.UNRELATED).toBe('keep');
+    // Deleting TERM would make the child render colorless — the same end state
+    // the invoker-terminal scrub exists to prevent — so it is pinned, not removed.
+    expect(env.TERM).toBe('xterm-256color');
+    expect(env.NO_COLOR).toBeUndefined();
   });
 });

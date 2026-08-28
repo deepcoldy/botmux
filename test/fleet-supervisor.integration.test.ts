@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -418,6 +418,172 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(after.status).toBe('stopped'); // did NOT come back online
     expect(pidAlive(after.pid)).toBe(false);
 
+    await sup.stopAll();
+  });
+
+  // ── External members (plugin services) ──────────────────────────────────────
+  // A plugin service is not one of botmux's entry modules, so it cannot be
+  // spawned via resolveEntrySpawn. It still needs everything else the supervisor
+  // already does for the dashboard (which is also not a bot): crash-restart,
+  // graceful stop, state, per-member logs. These specs pin the two things that
+  // differ — the command and the env — and, critically, that our OWN members are
+  // untouched by the new branch.
+
+  it('runs an external member command and reports it online', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const marker = join(root, 'ran.txt');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-demo', appId: '', botIndex: -1,
+      logBaseName: 'plugin-demo',
+      external: {
+        command: process.execPath,
+        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, String(process.pid));`
+          + `process.on('SIGTERM',()=>process.exit(90)); setInterval(()=>{},1000);`],
+      },
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {},
+    });
+    sup.start([svc]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    const proc = readFleetState(statePath)!.procs[0];
+    expect(proc.name).toBe('botmux-plugin-demo');
+    expect(pidAlive(proc.pid)).toBe(true);
+    killLater(proc.pid);
+    // It really executed OUR command (not a botmux entry module).
+    expect(await waitFor(() => existsSync(marker))).toBe(true);
+    expect(readFileSync(marker, 'utf-8').trim()).toBe(String(proc.pid));
+    await sup.stopAll();
+  });
+
+  it('scrubs session-scoped env before handing it to an external member', async () => {
+    // The load-bearing security spec. An external command inherits whatever we
+    // give it and never scrubs itself, so these keys must be gone BEFORE exec.
+    // Each one has a measured fleet-wide failure mode (a sibling bot's CLI home,
+    // the dashboard app secret, one turn's identity) — see scrubExternalMemberEnv.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const dump = join(root, 'env.json');
+    const poisoned: NodeJS.ProcessEnv = {
+      CODEX_HOME: '/some/bot/home',                       // sibling CLI home
+      CLAUDE_CONFIG_DIR: '/some/bot/claude',
+      CLAUDECODE: '1',                                    // claude session marker
+      BOTMUX_WORKFLOW: '1',                               // workflow marker
+      BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'top-secret', // app secret
+      NO_COLOR: '1',                                      // invoker terminal
+      BOTMUX_SESSION_ID: 'sess-1',                        // turn identity
+      KEEP_ME: 'yes',                                     // unrelated: must survive
+    };
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-env', appId: '', botIndex: -1, logBaseName: 'plugin-env',
+      external: {
+        command: process.execPath,
+        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.env));`
+          + `process.on('SIGTERM',()=>process.exit(90)); setInterval(()=>{},1000);`],
+        env: { PLUGIN_OWN: 'set-by-manifest' },
+      },
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: poisoned, cwd: root, log: () => {},
+    });
+    sup.start([svc]);
+    await waitFor(() => existsSync(dump));
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    const seen = JSON.parse(readFileSync(dump, 'utf-8')) as Record<string, string>;
+
+    for (const key of [
+      'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDECODE', 'BOTMUX_WORKFLOW',
+      'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET', 'NO_COLOR', 'BOTMUX_SESSION_ID',
+    ]) {
+      expect(seen[key], `${key} must be scrubbed`).toBeUndefined();
+    }
+    // Unrelated env still passes through, and the manifest's own env is applied
+    // AFTER the scrub (so a service can deliberately set what it needs).
+    expect(seen.KEEP_ME).toBe('yes');
+    expect(seen.PLUGIN_OWN).toBe('set-by-manifest');
+    expect(seen.TERM).toBe('xterm-256color');   // re-pinned, not deleted
+    await sup.stopAll();
+  });
+
+  it('leaves bot and dashboard env UNCHANGED (the new branch must not leak)', async () => {
+    // The regression guard for this whole change: adding the external branch must
+    // not alter what our own members receive. A bot daemon still gets its index
+    // and the base env verbatim — including keys the external scrub strips, which
+    // bot daemons legitimately still see because they scrub in their own boot.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const dump = join(root, 'bot-env.json');
+    const DUMPER = `
+      require('fs').writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.env));
+      process.on('SIGTERM', () => process.exit(90));
+      setInterval(() => {}, 1000);
+    `;
+    const base: NodeJS.ProcessEnv = { CODEX_HOME: '/bot/home', NO_COLOR: '1', KEEP_ME: 'yes' };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, DUMPER), daemonEnv: base, cwd: root, log: () => {},
+    });
+    sup.start([{ name: 'botmux-0', appId: 'cli_a', botIndex: 0 }]);
+    await waitFor(() => existsSync(dump));
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    const seen = JSON.parse(readFileSync(dump, 'utf-8')) as Record<string, string>;
+    // Passed through untouched — NOT scrubbed. If this ever starts failing, the
+    // external scrub has leaked onto our own members.
+    expect(seen.CODEX_HOME).toBe('/bot/home');
+    expect(seen.NO_COLOR).toBe('1');
+    expect(seen.KEEP_ME).toBe('yes');
+    expect(seen.BOTMUX_BOT_INDEX).toBe('0');    // bots still get their index
+    await sup.stopAll();
+  });
+
+  it('gives an external member the same crash-restart machinery as a bot', async () => {
+    // The reason to reuse the supervisor at all: a plugin service must be
+    // restarted on crash exactly like a bot daemon, with the same restart tally.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-crash', appId: '', botIndex: -1, logBaseName: 'plugin-crash',
+      external: { command: process.execPath, args: ['-e', 'setInterval(()=>{},1000);'] },
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 50 }, log: () => {},
+    });
+    sup.start([svc]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    const oldPid = readFleetState(statePath)!.procs[0].pid;
+    process.kill(oldPid, 'SIGKILL');
+    const restarted = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid !== oldPid && p.pid > 1 && p.restarts >= 1;
+    });
+    expect(restarted).toBe(true);
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    await sup.stopAll();
+  });
+
+  it('honours an external member cwd', async () => {
+    const root = tmp();
+    const workdir = join(root, 'svc-cwd');
+    mkdirSync(workdir, { recursive: true });
+    const statePath = join(root, 'fleet.json');
+    const dump = join(root, 'cwd.txt');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-cwd', appId: '', botIndex: -1, logBaseName: 'plugin-cwd',
+      external: {
+        command: process.execPath,
+        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(dump)}, process.cwd());`
+          + `process.on('SIGTERM',()=>process.exit(90)); setInterval(()=>{},1000);`],
+        cwd: workdir,
+      },
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {},
+    });
+    sup.start([svc]);
+    await waitFor(() => existsSync(dump));
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    expect(readFileSync(dump, 'utf-8').trim()).toBe(realpathSync(workdir));
     await sup.stopAll();
   });
 });

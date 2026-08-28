@@ -589,3 +589,42 @@ export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   stripDashboardH5Env(env);
   return env;
 }
+
+/**
+ * Scrub the env handed to an EXTERNAL long-lived child — a process that is not
+ * botmux's own code and therefore will not scrub itself.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM THE BOOT SCRUBS: a bot daemon and the
+ * dashboard strip these families in their OWN entrypoints (index-daemon.ts /
+ * index-dashboard.ts). That works because they are our code. A plugin service is
+ * an arbitrary third-party program: it inherits whatever we hand it and will
+ * never delete a key on our behalf, so the strip has to happen on OUR side,
+ * before the spawn.
+ *
+ * The set is deliberately IDENTICAL to what the pm2 path scrubbed
+ * (`scrubPm2CallerEnv`), because this replaces that path — a migration must not
+ * quietly reduce protection. Every family below has a measured fleet-wide
+ * failure mode; see each key list for the specifics:
+ *
+ *   • SESSION_CLI_HOME_ENV_KEYS      one bot reading/writing a sibling's CLI home
+ *   • CLAUDE_SESSION_MARKER_ENV_KEYS transcript saving flipped off fleet-wide
+ *   • WORKFLOW_WORKER_ENV_KEYS       ordinary chats running in workflow mode
+ *   • dashboard H5 family            the app secret persisted into child state
+ *   • INVOKER_TERMINAL_ENV_KEYS      every PTY on the machine turned colorless
+ *   • SESSION_TURN_MARKER_ENV_KEYS   a long-lived proc carrying one turn's identity
+ *
+ * TERM is re-pinned rather than deleted, matching the pm2 path: deleting it
+ * makes a child's supports-color detection fail and render colorless, which is
+ * the same end state the invoker-terminal scrub exists to prevent.
+ *
+ * Mutates `env` in place.
+ */
+export function scrubExternalMemberEnv(env: NodeJS.ProcessEnv): void {
+  scrubSessionCliHomeEnv(env);
+  scrubClaudeSessionMarkerEnv(env);
+  scrubWorkflowWorkerEnv(env);
+  stripDashboardH5Env(env);
+  scrubInvokerTerminalEnv(env);
+  scrubSessionTurnMarkerEnv(env);
+  env.TERM = 'xterm-256color';
+}

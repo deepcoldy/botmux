@@ -15,6 +15,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { openSync, closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
+import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import {
   decideOnExit,
   freshProc,
@@ -44,6 +45,39 @@ export interface FleetBotSpec {
    *  write `dashboard-out.log` / `dashboard-err.log` instead of a bot-indexed
    *  name. */
   logBaseName?: string;
+  /**
+   * A member that is NOT one of botmux's own entry modules — an arbitrary
+   * long-lived command (today: a plugin service). Set this INSTEAD of `entry`.
+   *
+   * WHY THE SUPERVISOR AND NOT pm2: plugin services used to run under a pm2 God
+   * at `PLUGIN_PM2_HOME`, which does not work in the shipped build at all —
+   * MEASURED in a real compiled binary, `require.resolve('pm2/bin/pm2')` throws
+   * (the module graph lives in the virtual `/$bunfs/`), so `pm2Bin()` fell back
+   * to a bare `'pm2'` that is not on a user's PATH. The supervisor already gives
+   * the dashboard — also not a bot — the same crash-restart / graceful-exit /
+   * stop machinery a plugin service needs, and it re-execs `process.execPath`,
+   * so it works in the compiled binary by construction.
+   *
+   * ENV IS SCRUBBED HARDER THAN FOR OUR OWN MEMBERS, deliberately. A bot daemon
+   * and the dashboard scrub the full set of session-scoped keys in their OWN
+   * boot (index-daemon.ts / index-dashboard.ts) — they are our code, so they can
+   * be asked to. An external command will NOT do that for us, and the keys it
+   * would inherit are exactly the ones that turn one session's private state
+   * into fleet-wide state (a sibling bot's CLI home, the dashboard's H5 app
+   * secret, one turn's session identity). So `spawnBot` runs the same scrub the
+   * pm2 path used to run (`scrubExternalMemberEnv`) before handing env over.
+   */
+  external?: {
+    /** Executable to run. Resolved by the OS (PATH) unless absolute. */
+    command: string;
+    args?: string[];
+    /** Working directory for the child. Defaults to the supervisor's own cwd. */
+    cwd?: string;
+    /** Extra env merged over the (scrubbed) base env. Applied AFTER the scrub,
+     *  so a service can set a key the scrub would otherwise strip — that is the
+     *  plugin manifest's prerogative, mirroring the old pm2 `--update-env`. */
+    env?: Record<string, string>;
+  };
 }
 
 export interface FleetSupervisorOptions {
@@ -231,12 +265,21 @@ export class FleetSupervisor {
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
     const entry = spec.entry ?? 'daemon';
-    const { command, args } = resolveEntrySpawn(entry, this.opts.distDir);
+    // An external member (a plugin service) runs an arbitrary command instead of
+    // one of our entry modules. Everything BELOW this point — logs, state,
+    // restart budget, graceful stop — is shared verbatim; only the command and
+    // the env differ, which is the whole reason this is a spec variant rather
+    // than a second spawn path.
+    const { command, args } = spec.external
+      ? { command: spec.external.command, args: spec.external.args ?? [] }
+      : resolveEntrySpawn(entry, this.opts.distDir);
     // node_args (heap/diag) apply only to the Node path; a compiled binary has
     // no separate interpreter args. resolveEntrySpawn already picks the shape;
     // we prepend node_args only when the command is a node/JS invocation.
+    // An external command is neither: its argv is the plugin's own, so our
+    // interpreter flags would be nonsense (or worse, consumed as its args).
     const isStandalone = args.length > 0 && args[0].startsWith('__');
-    const nodeArgs = isStandalone ? [] : (this.opts.daemonNodeArgs ?? []);
+    const nodeArgs = (spec.external || isStandalone) ? [] : (this.opts.daemonNodeArgs ?? []);
     // Per-member log files (mirrors pm2 out_file/error_file → `botmux logs`).
     // Bot daemons write daemon-<index>-{out,err}.log; the dashboard writes
     // dashboard-{out,err}.log (spec.logBaseName). Opened in append mode so a
@@ -264,11 +307,25 @@ export class FleetSupervisor {
     // ~/.botmux/.env H5 family in index-dashboard.ts). Injecting a bot index
     // into the dashboard would be meaningless and misleading, so gate it on the
     // 'daemon' entry.
-    const childEnv: NodeJS.ProcessEnv = entry === 'daemon'
-      ? { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) }
-      : { ...this.opts.daemonEnv };
+    //
+    // An EXTERNAL member takes neither: it is not a bot (no index) and it is not
+    // our code, so it gets the base env with the session-scoped families removed
+    // first. See scrubExternalMemberEnv for why our own members do not need this
+    // (they scrub in their own boot) and why an external command does. The
+    // spec's own `env` is merged AFTER the scrub so a plugin manifest can still
+    // set a key deliberately — the same order the pm2 path used.
+    let childEnv: NodeJS.ProcessEnv;
+    if (spec.external) {
+      childEnv = { ...this.opts.daemonEnv };
+      scrubExternalMemberEnv(childEnv);
+      if (spec.external.env) Object.assign(childEnv, spec.external.env);
+    } else if (entry === 'daemon') {
+      childEnv = { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) };
+    } else {
+      childEnv = { ...this.opts.daemonEnv };
+    }
     const child = spawn(command, [...nodeArgs, ...args], {
-      cwd: this.opts.cwd,
+      cwd: spec.external?.cwd ?? this.opts.cwd,
       stdio,
       env: childEnv,
       windowsHide: true,
