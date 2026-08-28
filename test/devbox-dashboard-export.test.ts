@@ -4,11 +4,21 @@ import { join } from 'node:path';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Counting settings-file reads is the only way to pin the gate ORDER: on an
+// ordinary host the verdict is null either way, so only the syscall is
+// observable. Wraps the real implementation — nothing is stubbed out.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
+});
+
 import {
   devboxDashboardBaseUrl,
   ensureDevboxDashboardExport,
   resetDevboxDashboardExportCaches,
 } from '../src/platform/devbox-dashboard-export.js';
+
+const readSpy = vi.mocked(readFileSync);
 
 function tmpDir() {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-devbox-export-'));
@@ -180,6 +190,57 @@ describe('ensureDevboxDashboardExport', () => {
     await expect(call()).resolves.toBeNull();
     await expect(call()).resolves.toBeNull();
     expect(runExport).toHaveBeenCalledTimes(1);
+  });
+
+  // The negative cache has TWO write sites: the runner rejecting (above) and the
+  // runner resolving with output that cannot be parsed. Only the first was
+  // covered, so removing the second's write left the suite green.
+  it('does not re-spawn after an unparseable exit-0 export inside the window', async () => {
+    const cachePath = fixture();
+    const runExport = vi.fn(async () => 'merlin-cli: unexpected output');
+    const call = () => ensureDevboxDashboardExport({
+      port: 9001,
+      remoteBaseConfigured: false,
+      env: devboxEnv,
+      cachePath,
+      merlinCliPath: '/fake/merlin-cli',
+      runExport,
+    });
+    await expect(call()).resolves.toBeNull();
+    await expect(call()).resolves.toBeNull();
+    expect(runExport).toHaveBeenCalledTimes(1);
+  });
+
+  // An ordinary host has no ARNOLD_WORKSPACE_ID, so the read side is reached
+  // constantly from the CSRF hot path and must not touch the filesystem there:
+  // the Devbox gates are checked before the switch, which may read ~/.botmux/.env.
+  it('does not read the settings file on a non-Devbox host', () => {
+    const envFilePath = join(tmpDir(), '.env');
+    // The file EXISTS and disables the feature, so a regression cannot pass by
+    // swallowing ENOENT — reading it would be observable below.
+    writeFileSync(envFilePath, 'BOTMUX_DEVBOX_AUTO_EXPORT=0\n');
+    const cachePath = fixture();
+    const reads = () => readSpy.mock.calls.filter(([p]) => p === envFilePath).length;
+
+    for (const env of [{}, { ARNOLD_WORKSPACE_ID: 'ws' }, { PORT_LIST: '9001' }]) {
+      resetDevboxDashboardExportCaches();
+      readSpy.mockClear();
+      expect(devboxDashboardBaseUrl({ cachePath, env, envFilePath, port: 9001 })).toBeNull();
+      expect(reads()).toBe(0);
+    }
+
+    // On a real Devbox the switch IS consulted, which is what pins the ordering
+    // as an optimization rather than a behaviour change: same null verdict, but
+    // this time the file was actually read.
+    resetDevboxDashboardExportCaches();
+    readSpy.mockClear();
+    expect(devboxDashboardBaseUrl({
+      cachePath,
+      env: devboxEnv,
+      envFilePath,
+      port: 9001,
+    })).toBeNull();
+    expect(reads()).toBe(1);
   });
 
   it('reads the disable switch from ~/.botmux/.env when the CLI never dotenv-loads it', async () => {

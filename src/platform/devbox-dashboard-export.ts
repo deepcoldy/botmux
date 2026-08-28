@@ -161,7 +161,13 @@ function readCache(path = CACHE_PATH): DevboxDashboardExportCache | null {
 function computeDevboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions): string | null {
   const env = opts.env ?? process.env;
   const workspaceId = env.ARNOLD_WORKSPACE_ID?.trim();
-  if (!enabled(env, opts.envFilePath) || !workspaceId || !env.PORT_LIST) return null;
+  // Devbox gates FIRST, switch second. `enabled()` may read ~/.botmux/.env (the
+  // CLI has no dotenv step of its own), while these two only read env vars — and
+  // on an ordinary host ARNOLD_WORKSPACE_ID is never set, so this function is
+  // reached constantly from the CSRF hot path and must cost zero syscalls there.
+  // All three are side-effect-free reads, so the AND is commutative.
+  if (!workspaceId || !env.PORT_LIST) return null;
+  if (!enabled(env, opts.envFilePath)) return null;
   const port = opts.port ?? resolveDashboardPort(env, opts.portFilePath);
   if (port === null) return null;
   const cached = readCache(opts.cachePath ?? CACHE_PATH);
