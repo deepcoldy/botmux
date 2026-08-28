@@ -702,7 +702,7 @@ export const messages: Record<string, string> = {
   'slashlist.col_desc': '说明',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
-  'ai.routing.intro': '你在飞书话题群中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
+  'ai.routing.intro': '你在飞书（Lark）会话中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',
@@ -724,7 +724,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI hints（非注入式 CLI 的 BOTMUX_SHELL_HINTS；multiline_heredoc /
   // heredoc_example 同时被 system-prompt 路径复用——两个 locale 保持一致）──
-  'ai.shell.intro': '你运行在飞书（Lark）话题群中。用户在飞书阅读回复，看不到你的终端输出。',
+  'ai.shell.intro': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出。',
   'ai.shell.commands_are_shell': '重要：botmux send / botmux history / botmux quoted / botmux bots 都是 shell 命令（CLI 程序，已安装在 $PATH），不是 MCP 工具。必须通过 Bash 工具执行，不要到 MCP 工具列表里找。',
   'ai.shell.how_to_send': '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`，附带视频预览用 `--videos /path.mp4 --video-covers /cover.png`。',
   'ai.shell.multiline_heredoc': '多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
@@ -741,7 +741,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
   'ai.followup.reminder': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND',
-  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书话题;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书会话;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
