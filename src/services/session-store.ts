@@ -521,7 +521,10 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   const tmp = openDatabaseSyncOrThrow(tmpFp);
   try {
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    tmp.exec('PRAGMA journal_mode = WAL;');
+    // The temporary file is renamed after close. WAL sidecars keep the old
+    // `.tmp` basename, so publishing only the main file strands the schema
+    // and rows on Bun. The live store switches to WAL when it is opened.
+    tmp.exec('PRAGMA journal_mode = DELETE;');
     tmp.exec('PRAGMA synchronous = NORMAL;');
     tmp.exec(SESSIONS_SCHEMA_SQL);
     tmp.exec('BEGIN');
@@ -531,6 +534,11 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     }
     tmp.exec('COMMIT');
     tmp.close();
+    for (const suffix of ['-wal', '-shm']) {
+      if (existsSync(`${tmpFp}${suffix}`)) {
+        throw new Error(`temporary SQLite import left ${tmpFp}${suffix}`);
+      }
+    }
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {

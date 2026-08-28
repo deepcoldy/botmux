@@ -106,8 +106,13 @@ describe('first-start JSON import', () => {
     expect(imported.legacyCard).not.toHaveProperty('pendingResponseCardState');
     // repairMissingChatScope 发生在导入期
     expect(imported.broken.scope).toBe('chat');
-    // .db 落位，JSON 原地冻结（一个字节都不动）
-    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
+    // .db 落位后可由另一连接重新读取；导入临时库不能留下 basename
+    // 仍为 `.tmp` 的 WAL sidecar，否则 Bun 会把已提交内容留在孤儿 WAL 中。
+    const storeDir = join(tempDir, 'session-stores', 'appA');
+    expect(existsSync(join(storeDir, 'sessions.db'))).toBe(true);
+    expect(existsSync(join(storeDir, 'sessions.db.tmp-wal'))).toBe(false);
+    expect(existsSync(join(storeDir, 'sessions.db.tmp-shm'))).toBe(false);
+    expect(imported.live.title).toBe('live');
     expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonBefore);
   });
 
