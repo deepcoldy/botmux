@@ -1782,6 +1782,21 @@ describe('probeVcMeetingEventSubscription — read-only VC event check', () => {
   });
 });
 
+describe('readDefaultScopeManifest', () => {
+  it('loads the bundled manifest and returns an independent copy', () => {
+    const first = readDefaultScopeManifest();
+    const second = readDefaultScopeManifest();
+
+    expect(first.scopes?.tenant?.length).toBeGreaterThan(0);
+    expect(first.scopes?.user?.length).toBeGreaterThan(0);
+    expect(first).not.toBe(second);
+    expect(first.scopes?.tenant).not.toBe(second.scopes?.tenant);
+
+    first.scopes?.tenant?.pop();
+    expect(second.scopes?.tenant?.length).toBeGreaterThan(0);
+  });
+});
+
 describe('automateOpenPlatformSetup', () => {
   it('forwards forceQrLogin so configure --switch-account ignores a valid cache', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-auto-force-'));

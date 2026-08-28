@@ -69,8 +69,8 @@ describe('scripts/ 纳入类型检查', () => {
     const options = parsedScriptsConfig().options;
     expect(options.noEmit).toBe(true);
     expect(options.strict).toBe(true);
-    expect(options.module).toBe(ts.ModuleKind.Node16);
-    expect(options.moduleResolution).toBe(ts.ModuleResolutionKind.Node16);
+    expect(options.module).toBe(ts.ModuleKind.NodeNext);
+    expect(options.moduleResolution).toBe(ts.ModuleResolutionKind.NodeNext);
     expect(options.jsx).toBe(ts.JsxEmit.ReactJSX);
   });
 

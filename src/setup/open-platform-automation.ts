@@ -12,6 +12,7 @@ import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
+import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
@@ -2331,17 +2332,14 @@ async function pollFeishuQrLogin(
 }
 
 export function readDefaultScopeManifest(): ScopeManifest {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    join(here, 'lark-scopes.json'),
-    join(here, 'setup', 'lark-scopes.json'),
-    join(here, '..', 'src', 'setup', 'lark-scopes.json'),
-  ];
-  for (const candidate of candidates) {
-    if (!existsSync(candidate)) continue;
-    return JSON.parse(readFileSync(candidate, 'utf-8')) as ScopeManifest;
-  }
-  throw new Error('找不到 botmux lark-scopes.json');
+  // Static JSON import (bundledScopeManifest) rather than readFileSync of a
+  // module-relative path: Bun's `--compile` inlines the import into the binary,
+  // whereas readFileSync(join(__dirname, ...)) resolves against the read-only
+  // virtual /$bunfs at runtime and always missed — the first `setup --create-app`
+  // from a curl install died with "找不到 botmux lark-scopes.json". structuredClone
+  // so callers (e.g. filterScopeManifest) can mutate without corrupting the shared
+  // bundled object.
+  return structuredClone(bundledScopeManifest) as ScopeManifest;
 }
 
 // 宿主机到飞书的偶发网络抖动（DNS EAI_AGAIN、连接被重置、路由瞬断等）会让

@@ -92,6 +92,7 @@ import {
 } from './setup/owner-identity.js';
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
+import bundledScopeManifest from './setup/lark-scopes.json' with { type: 'json' };
 import type { CliId } from './adapters/cli/types.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
@@ -509,20 +510,8 @@ function botBrand(b: any): Brand {
  * Returns: 写出的 JSON 文件绝对路径.
  */
 function writeScopesJsonToConfigDir(): string {
-  // build script 会把 src/setup/lark-scopes.json copy 到 dist/setup/.
-  // dist 模式下 __dirname 是 dist/, 找 ./setup/lark-scopes.json; dev (tsx)
-  // 模式找 src/setup/lark-scopes.json 在源码同目录也成立.
-  const here = dirname(fileURLToPath(import.meta.url));
-  const srcCandidates = [
-    join(here, 'setup', 'lark-scopes.json'),
-    join(here, '..', 'src', 'setup', 'lark-scopes.json'),
-  ];
-  let scopesPath = srcCandidates[0];
-  for (const p of srcCandidates) {
-    if (existsSync(p)) { scopesPath = p; break; }
-  }
   const destPath = join(CONFIG_DIR, 'lark-scopes.json');
-  copyFileSync(scopesPath, destPath);
+  writeFileSync(destPath, `${JSON.stringify(bundledScopeManifest, null, 2)}\n`);
   return destPath;
 }
 
@@ -12868,6 +12857,36 @@ switch (command) {
   case 'list':
   case 'ls':      await cmdList(); break;
   case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;
+  // Hidden self-check for the compiled single-file binary: exercise the two
+  // setup-time code paths that load lark-scopes.json off a module-relative path —
+  // readDefaultScopeManifest() (real Open Platform setup) and
+  // writeScopesJsonToConfigDir() (writes ~/.botmux/lark-scopes.json). In compiled
+  // mode the module graph lives in the read-only virtual /$bunfs, so the old
+  // readFileSync/copyFileSync of a __dirname-derived path threw
+  // "找不到 botmux lark-scopes.json". The npm/Node unit tests can't catch that —
+  // dist/ physically exists there — so smoke-bun-binary.mjs drives THIS against
+  // the actual binary. Prints a one-line JSON summary and exits 0; any throw
+  // (missing/empty manifest, unwritable path) exits non-zero and fails the smoke.
+  case '__selfcheck': {
+    const { readDefaultScopeManifest } = await import('./setup/open-platform-automation.js');
+    const manifest = readDefaultScopeManifest();
+    const tenant = manifest.scopes?.tenant?.length ?? 0;
+    const user = manifest.scopes?.user?.length ?? 0;
+    if (tenant <= 0 || user <= 0) {
+      console.error(`__selfcheck: lark-scopes manifest empty (tenant=${tenant}, user=${user})`);
+      process.exit(1);
+    }
+    const written = writeScopesJsonToConfigDir();
+    const onDisk = JSON.parse(readFileSync(written, 'utf-8'));
+    const wroteTenant = onDisk?.scopes?.tenant?.length ?? 0;
+    const wroteUser = onDisk?.scopes?.user?.length ?? 0;
+    if (wroteTenant !== tenant || wroteUser !== user) {
+      console.error(`__selfcheck: written manifest mismatch (${wroteTenant}/${wroteUser} vs ${tenant}/${user})`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ ok: true, tenant, user, written }));
+    process.exit(0);
+  }
   case 'delete':
   case 'del':
   case 'rm':      await cmdDelete(); break;
