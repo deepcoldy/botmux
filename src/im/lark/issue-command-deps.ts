@@ -5,7 +5,7 @@
  * bot 注册表都在这里装配。card-handler 与 command-handler 都从这里取。
  */
 import { config } from '../../config.js';
-import { effectiveBotDisplayName, getBot, type BotConfig } from '../../bot-registry.js';
+import { effectiveBotDisplayName, effectiveDefaultWorkingDir, getBot } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
 import { configuredWorkingDirs } from '../../utils/working-dir.js';
 import { readPlatformBinding } from '../../platform/binding.js';
@@ -87,25 +87,6 @@ export function setIssueActivate(fn: ActivateSession): void {
   registeredActivate = fn;
 }
 
-/**
- * Issue 领取必须选一个本地仓库，但固定目录模式的 Bot 只配置
- * `defaultWorkingDir`，没有仓库卡片使用的 `workingDir/workingDirs`。
- *
- * 显式扫描根始终优先；只有完全没配置扫描根时，才把固定默认目录作为
- * Issue 领取的兜底扫描入口。这样不会把 default 混进已有的多仓库候选，
- * 也不改变普通新会话“直接进入 defaultWorkingDir”的行为。
- */
-export function issueWorkingDirs(
-  cfg: Pick<BotConfig, 'workingDir' | 'workingDirs' | 'defaultWorkingDir'>,
-): string[] {
-  const explicit = configuredWorkingDirs({
-    workingDir: cfg.workingDir,
-    workingDirs: cfg.workingDirs,
-  });
-  if (explicit.length > 0) return explicit;
-  return configuredWorkingDirs({ workingDir: cfg.defaultWorkingDir });
-}
-
 export function buildIssueCommandDeps(activate: ActivateSession | undefined = registeredActivate): IssueCommandDeps {
   return {
     fetchTeams: () => fetchTeams() as any,
@@ -123,9 +104,20 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
     workingDirs: (larkAppId: string) => {
       try {
         const cfg = getBot(larkAppId).config;
-        return issueWorkingDirs(cfg);
+        return configuredWorkingDirs({
+          workingDir: cfg.workingDir,
+          workingDirs: cfg.workingDirs,
+        });
       } catch {
         return [];
+      }
+    },
+
+    defaultWorkingDir: (larkAppId: string) => {
+      try {
+        return effectiveDefaultWorkingDir(getBot(larkAppId).config);
+      } catch {
+        return undefined;
       }
     },
 

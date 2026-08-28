@@ -8,7 +8,7 @@ import {
   reposFor,
   type IssueCommandDeps,
 } from '../src/im/lark/issue-command.js';
-import { scanMultipleProjects } from '../src/services/project-scanner.js';
+import { describeProjectDir, scanMultipleProjects } from '../src/services/project-scanner.js';
 import {
   ISSUE_ACTION_CLAIM_CANCEL,
   ISSUE_ACTION_CLAIM_CONFIRM,
@@ -19,6 +19,7 @@ import {
 } from '../src/im/lark/issue-card.js';
 
 vi.mock('../src/services/project-scanner.js', () => ({
+  describeProjectDir: vi.fn(() => null),
   scanMultipleProjects: vi.fn(() => []),
 }));
 
@@ -48,6 +49,7 @@ function deps(over: Partial<IssueCommandDeps> = {}) {
     runClaim,
     allowedUsers: () => [ME],
     workingDirs: () => [],
+    defaultWorkingDir: () => undefined,
     ...over,
   };
   return {
@@ -172,7 +174,10 @@ describe('领取', () => {
       branch: 'main',
     }]);
 
-    const choices = reposFor(APP, deps({ workingDirs: () => ['/w/card-mode'] }).d);
+    const choices = reposFor(APP, deps({
+      workingDirs: () => ['/w/card-mode'],
+      defaultWorkingDir: () => '/w/fixed-repo',
+    }).d);
 
     expect(scanMultipleProjects).toHaveBeenCalledWith(
       ['/w/card-mode'],
@@ -184,13 +189,36 @@ describe('领取', () => {
       path: '/w/card-mode-repo',
       branch: 'main',
     }]);
+    expect(describeProjectDir).not.toHaveBeenCalled();
   });
 
-  it('依赖没有提供仓库目录时不调用扫描器', () => {
+  it('fixed/oncall 默认目录本身是仓库时直接生成唯一候选', () => {
     vi.clearAllMocks();
-    const choices = reposFor(APP, deps({ workingDirs: () => [] }).d);
+    vi.mocked(describeProjectDir).mockReturnValueOnce({ name: 'fixed-repo', branch: 'main' });
+
+    const choices = reposFor(APP, deps({
+      workingDirs: () => [],
+      defaultWorkingDir: () => '/w/fixed-repo',
+    }).d);
+
+    expect(choices).toEqual([{
+      name: 'fixed-repo',
+      path: '/w/fixed-repo',
+      branch: 'main',
+    }]);
+    expect(describeProjectDir).toHaveBeenCalledWith('/w/fixed-repo');
+    expect(scanMultipleProjects).not.toHaveBeenCalled();
+  });
+
+  it('fixed/oncall 默认目录不是仓库时不递归扫描', () => {
+    vi.clearAllMocks();
+    const choices = reposFor(APP, deps({
+      workingDirs: () => [],
+      defaultWorkingDir: () => '/w/large-root',
+    }).d);
 
     expect(choices).toEqual([]);
+    expect(describeProjectDir).toHaveBeenCalledWith('/w/large-root');
     expect(scanMultipleProjects).not.toHaveBeenCalled();
   });
 
