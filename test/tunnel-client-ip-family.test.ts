@@ -10,6 +10,12 @@ const { FakeWebSocket, createWebSocketStream, netConnect } = vi.hoisted(() => {
       pipe: vi.fn(),
       destroy: vi.fn(),
       setNoDelay: vi.fn(),
+      // The bridge writes to the TCP socket directly and manages backpressure
+      // itself (no createWebSocketStream / pipe — it throws on Bun). `write`
+      // returns true = "kernel buffer took it", so no pause is needed by default.
+      write: vi.fn(() => true),
+      pause: vi.fn(),
+      resume: vi.fn(),
     };
     stream.on.mockReturnValue(stream);
     stream.pipe.mockReturnValue(stream);
@@ -42,12 +48,22 @@ const { FakeWebSocket, createWebSocketStream, netConnect } = vi.hoisted(() => {
       for (const fn of [...(this.listeners.get(ev) || [])]) fn(...args);
     }
 
-    send(): void {}
+    send = vi.fn();
     close(): void {}
     terminate = vi.fn();
+    // The bridge manages backpressure itself (it no longer uses
+    // createWebSocketStream, which throws on Bun), so the fake has to answer the
+    // flow-control surface the real ws exposes.
+    pause = vi.fn();
+    resume = vi.fn();
+    bufferedAmount = 0;
   }
   return {
     FakeWebSocket,
+    // Still exported by the mock because the real `ws` exports it — but the
+    // bridge must never CALL it (throws "Not supported yet in Bun"). Left here
+    // so a regression that reintroduces the call is visible as a call on this spy
+    // rather than an undefined-import crash that obscures the cause.
     createWebSocketStream: vi.fn(() => fakeStream()),
     netConnect: vi.fn(() => fakeStream()),
   };
@@ -138,8 +154,16 @@ describe('tunnel-client 不强制协议族', () => {
     dataDials[0]!.readyState = FakeWebSocket.OPEN;
     dataDials[0]!.emit('open');
     expect(dataDials[0]!.terminate).not.toHaveBeenCalled();
-    expect(createWebSocketStream).toHaveBeenCalledWith(dataDials[0]);
+    // The winning dial is bridged to the local dashboard. The bridge is now
+    // hand-written event piping rather than createWebSocketStream() — that API
+    // throws "Not supported yet in Bun", and the compiled binary runs on Bun, so
+    // reaching for it made the platform-side Dashboard unreachable on every
+    // binary install. Assert the observable outcome instead: a TCP connection to
+    // the dashboard, and the winner wired for both directions.
     expect(netConnect).toHaveBeenCalledWith(7891, '127.0.0.1');
+    expect(netConnect.mock.results[0]!.value.on).toHaveBeenCalledWith('data', expect.any(Function));
+    // ...and the API that throws on Bun must NOT have been reached.
+    expect(createWebSocketStream).not.toHaveBeenCalled();
     // 桥接到本机 dashboard 的裸 socket 必须关 Nagle：交互式终端分帧小包否则被
     // delayed-ACK 扣住(~40ms)→ Web 终端经隧道中转周期卡顿。锁住这条行为，删源码那行会红。
     expect(netConnect.mock.results[0]!.value.setNoDelay).toHaveBeenCalledWith(true);

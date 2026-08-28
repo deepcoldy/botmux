@@ -43,7 +43,7 @@ function activeSession(): any {
 }
 
 describe('POST /api/current-actor', () => {
-  it('returns only the daemon-resolved actor for a live CLI descendant', async () => {
+  it.skipIf(process.platform !== 'linux')('returns only the daemon-resolved actor for a live CLI descendant', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(activeSession());
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {

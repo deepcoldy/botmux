@@ -23,3 +23,25 @@ To stop or correct it mid-turn, **don't wait for it to finish**: in screenshot m
 The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display, `--card-file` / `--card-json` can send raw interactive card JSON.
 
 > ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
+
+## Updating a card after sending (card patch)
+
+A successful `botmux send --card-file/--card-json` prints `{"success":true,"messageId":"om_...",...}`. `botmux card patch` updates that same card **in place** by its messageId — no new message, same chat/topic — which makes it ideal for progress cards:
+
+```bash
+# 1. Send an "in progress" card and grab its messageId from the JSON output
+botmux send --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"Deploy progress"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"Progress: 0%"}]}}' --no-mention
+# → {"success":true,"messageId":"om_xxx","sessionId":"..."}
+
+# 2. Extract the messageId with jq, then patch it to 50%
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"Deploy progress"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"Progress: 50%"}]}}'
+
+# 3. Patch once more when done
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"green","title":{"tag":"plain_text","content":"Deploy done"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"✅ Shipped"}]}}'
+```
+
+- The replacement card JSON goes through the **same safety validation** as sending (display-only + open_url; callback controls are rejected).
+- The `send` examples pass `--no-mention`: a progress card doesn't need to @ anyone, and explicitly opting out avoids the mention-policy gate (exit 2).
+- Bot identity is resolved from the session context (same as `send`); errors such as a withdrawn message, missing permission, or a non-card target are surfaced as-is (exit 1).
+- Success prints `{"success":true,"messageId":"om_xxx","sessionId":"..."}` (JSON only on stdout); usage errors exit 2.

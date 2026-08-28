@@ -153,14 +153,26 @@ export type BackendGateDecision =
  * abandoning it would spawn a duplicate CLI and orphan the real conversation.
  * tmux/zellij capability probes use disposable sessions; ZMX checks its
  * version and full-list control plane; Herdr uses `herdr --version`.
+ *
+ * `existingSessionUnknown` is the third state of that existence check: the
+ * probe itself got no answer (a timeout under host load), which a
+ * `hasSession()`-style boolean reports as "no session". Gating on that turns a
+ * false negative on the CHEAP check into a hard refusal for a session whose
+ * pane is alive. So an indeterminate existence answer spawns rather than gates
+ * — the reverse asymmetry from a kill-verification, where an unanswered probe
+ * must NOT be read as success. Callers that deliberately gate on an
+ * indeterminate result (ZMX ownership / protocol version, where adopting
+ * someone else's session is the worse outcome) simply leave this unset.
  */
 export function decideBackendGate(opts: {
   requested: BackendType;
   available: boolean;
   hasExistingSession: boolean;
+  existingSessionUnknown?: boolean;
 }): BackendGateDecision {
   if (opts.requested === 'pty') return { action: 'spawn' };
   if (opts.hasExistingSession) return { action: 'spawn' };
+  if (opts.existingSessionUnknown) return { action: 'spawn' };
   if (opts.available) return { action: 'spawn' };
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
 }
@@ -329,9 +341,22 @@ export function selectSessionBackend(opts: {
 
   if (opts.backendType === 'zellij') {
     const sessionName = ZellijBackend.sessionName(opts.sessionId);
-    const reattach = ZellijBackend.hasSession(sessionName);
+    // Prefer the caller's frozen existence decision when supplied: the worker
+    // resolves a tri-state probe once (biasing an indeterminate answer toward
+    // "reattach", since a live pane is more authoritative than a load-timed-out
+    // probe — the same asymmetry decideBackendGate uses) and refreshes it to
+    // "gone" after any teardown, so a post-kill re-selection cold-spawns rather
+    // than reattaching to what it just removed. A bare live `hasSession()`
+    // cannot tell those two call sites apart, so only fall back to it when no
+    // decision was threaded in (default callers / unit tests).
+    const reattach = opts.hasExistingSession ?? ZellijBackend.hasSession(sessionName);
+    // A threaded-in decision is authoritative — tell the backend to honour it
+    // verbatim and skip spawn()'s `|| hasSession()` self-heal, which would
+    // otherwise re-probe and could reattach to a pane a teardown gate just
+    // removed. Default callers (no decision) keep the self-heal via 'auto'.
+    const reattachDecision = opts.hasExistingSession === undefined ? 'auto' : 'frozen';
     return {
-      backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach }),
+      backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach, reattachDecision }),
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: true,

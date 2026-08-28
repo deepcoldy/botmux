@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -102,7 +103,7 @@ describe('OMP legacy session migration', () => {
 
     expect(result).toMatchObject({
       status: 'migrated',
-      sourcePath: source,
+      sourcePath: realpathSync(source),
       targetPath: join(exactDir, basename(source)),
       artifactDirectoryPreserved: true,
     });

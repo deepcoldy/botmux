@@ -33,6 +33,25 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete/);
   });
 
+  it('每条 inbound 路径都把「消息是否来自话题内」如实记进 per-turn 记录', () => {
+    // chatSessionAnsweredRootAtTopLevel 靠 inThread 区分「顶层 @ 之后才被开成
+    // 话题」与「用户真正开的原生话题」——两者的 target 都是 mode='plain'，只有
+    // 这一位能分开。任何一条路径把它写死成常量（而不是照实读 parsed.threadId），
+    // 判据就会在那条路径上重新退化成只看 mode，真话题里的回复又会被平铺出去。
+    // 所以逐条钉住「值来自 inbound 本身」，而不是只钉「字段存在」。
+    const inThreadFromInbound = /inThread: !!parsed\.threadId/g;
+    // initial passthrough / new-topic / existing-session / auto-create 四条
+    // beginReplyTargetTurn 直连路径，外加 passthrough 经 turn 结构体的透传。
+    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(5);
+    expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete, inThread: !!parsed\.threadId/);
+    expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete, inThread: !!parsed\.threadId/);
+    expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete, inThread: !!parsed\.threadId/);
+    expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete, inThread: !!parsed\.threadId/);
+    // passthrough 走 turn 结构体：调用方读 inbound，helper 原样转交。
+    expect(daemonSource).toMatch(/substitute: !!substituteTrigger,\s*inThread: !!parsed\.threadId,/);
+    expect(daemonSource).toMatch(/participantsIncomplete: passthroughWindow\.incomplete,\s*inThread: turn\.inThread,/);
+  });
+
   it('BOTH registration-race loser handoffs preserve the pre-extracted seed+follow-up post @s', () => {
     // Two CAS-loser handoffs (new-topic loser and the auto-create loser) must EACH
     // preserve the complete seed's post inline @s, or a double-race drops them.

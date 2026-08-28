@@ -3,7 +3,7 @@
  * Keeps the single-source helpers honest without pulling the worker.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -22,6 +22,7 @@ describe('structured-bridge-clis', () => {
   it('always-on includes OMP without widening adopt forwarding', () => {
     expect(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS).toContain('grok');
     expect(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS).toContain('oh-my-pi');
+    expect(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS).toContain('ebsd');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain('grok');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain('cursor');
     // hermes is bridge-ALWAYS but must NOT be adopt-forwarded: it has no
@@ -32,10 +33,11 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('hermes');
     expect(isStructuredBridgeAdoptCli('hermes')).toBe(false);
     for (const id of STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) {
-      if (id === 'hermes' || id === 'oh-my-pi') continue;
+      if (id === 'hermes' || id === 'oh-my-pi' || id === 'ebsd') continue;
       expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain(id);
     }
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('oh-my-pi');
+    expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });
 
   it('fallback treats cursor as adopt-only', () => {
@@ -59,10 +61,11 @@ describe('structured-bridge-clis', () => {
     // started Pi turn may suppress the screen-ready heuristic (the custom-tool
     // terminate:true gap is accepted — next user turn HOL-drops the head).
     // grok: user_message_chunk → turn_completed with normalized stop reasons.
-    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'pi', 'oh-my-pi', 'grok']);
+    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'pi', 'oh-my-pi', 'ebsd', 'grok']);
     expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('pi')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('oh-my-pi')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('ebsd')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('grok')).toBe(true);
     for (const id of ['traex', 'coco', 'hermes', 'mtr', 'cursor']) {
       expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
@@ -97,13 +100,16 @@ describe('resolveFileBridgePath (grok)', () => {
 });
 
 describe('resolveFileBridgePath (oh-my-pi)', () => {
-  const ROOT = join(tmpdir(), `botmux-fbp-omp-${process.pid}`);
+  let ROOT = join(tmpdir(), `botmux-fbp-omp-${process.pid}`);
   const ORIGINAL_HOME = process.env.HOME;
 
   beforeEach(() => {
-    process.env.HOME = ROOT;
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(ROOT, { recursive: true });
+    // The resolvers canonicalize $HOME (macOS /var → /private/var), so both
+    // the fixture layout and the expectations must live in that namespace.
+    ROOT = realpathSync(ROOT);
+    process.env.HOME = ROOT;
   });
   afterEach(() => {
     rmSync(ROOT, { recursive: true, force: true });
@@ -123,5 +129,17 @@ describe('resolveFileBridgePath (oh-my-pi)', () => {
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).toBe(path);
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).not.toBe(legacyPath);
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sibling' })).toBeUndefined();
+  });
+
+  it('resolves ebsd only inside its exact managed session directory', () => {
+    const dir = join(ROOT, '.ebsd', 'agent', 'sessions', 'botmux', 'sid-ebsd');
+    const sibling = join(ROOT, '.ebsd', 'agent', 'sessions', 'botmux', 'other');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(sibling, { recursive: true });
+    const path = join(dir, 'session.jsonl');
+    writeFileSync(path, '');
+    writeFileSync(join(sibling, 'secret.jsonl'), 'sibling');
+    expect(resolveFileBridgePath('ebsd', { sessionId: 'sid-ebsd' })).toBe(path);
+    expect(resolveFileBridgePath('ebsd', { sessionId: 'missing' })).toBeUndefined();
   });
 });

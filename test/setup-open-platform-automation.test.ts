@@ -14,18 +14,25 @@ import {
   BOTMUX_REDIRECT_URL,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
+  buildPrivilegeAppAvailabilityContent,
+  buildPrivilegeUpdatePayload,
   buildSafeSettingPayload,
   buildScopeUpdatePayload,
+  canFillPrivilegeWithAppAvailability,
   collectBotmuxRedirectUrls,
   createFeishuOpenPlatformApp,
   createOpenPlatformApiClient,
   extractOpenPlatformCsrfToken,
+  extractOpenPlatformPrivileges,
   extractOpenPlatformRedirectUrls,
   extractOpenPlatformSessionIdentity,
   extractOpenPlatformScopeEntries,
+  filterScopeManifest,
   getCookieHeader,
+  isPrivilegeRangeNarrowed,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
+  readDefaultScopeManifest,
   missingRedirectUrls,
   OpenPlatformApiError,
   parseSetupOpenPlatformAutoFlag,
@@ -33,6 +40,7 @@ import {
   probeVcMeetingEventSubscription,
   readStoredCookiesFromSessionFile,
   safeErrorMessage,
+  selectPrivilegesNeedingAppAvailability,
   type StoredCookie,
   vcListenerEventGateError,
   writeRedirectWhitelist,
@@ -244,6 +252,477 @@ describe('Open Platform payload helpers', () => {
     expect(buildSafeSettingPayload('cli_x').redirectURL).toEqual(['http://127.0.0.1:9768/callback']);
   });
 });
+
+describe('filterScopeManifest — 只申请缺失项，避免全量 manifest 过度申请', () => {
+  const manifest = {
+    scopes: {
+      tenant: [
+        'im:message',
+        'im:resource',
+        'calendar:calendar:read',
+        'application:application:self_manage',
+      ],
+      user: [
+        'im:message',
+        'im:feed_group_v1:read',
+        'im:feed_group_v1:write',
+        'docs:document:readonly',
+      ],
+    },
+  };
+
+  it('保留点名的权限并沿用 manifest 的 tenant/user 分桶归属', () => {
+    // im:feed_group_v1:* 只在 user 桶；im:resource 只在 tenant 桶——分桶必须来自
+    // manifest，不能自己猜。
+    const filtered = filterScopeManifest(manifest, [
+      'im:feed_group_v1:read',
+      'im:feed_group_v1:write',
+      'im:resource',
+    ]);
+    expect(filtered).toEqual({
+      scopes: {
+        tenant: ['im:resource'],
+        user: ['im:feed_group_v1:read', 'im:feed_group_v1:write'],
+      },
+    });
+  });
+
+  it('同名权限同时落两桶时两桶都保留', () => {
+    const filtered = filterScopeManifest(manifest, ['im:message']);
+    expect(filtered).toEqual({ scopes: { tenant: ['im:message'], user: ['im:message'] } });
+  });
+
+  it('不点名的权限一律不申请（日历/文档等不再被连带带上）', () => {
+    const filtered = filterScopeManifest(manifest, ['application:application:self_manage']);
+    expect(filtered.scopes?.tenant).toEqual(['application:application:self_manage']);
+    expect(filtered.scopes?.user).toEqual([]);
+    // 关键回归点：manifest 里的 calendar/docs 权限不会被带进申请集合。
+    expect(filtered.scopes?.tenant).not.toContain('calendar:calendar:read');
+    expect(filtered.scopes?.user).not.toContain('docs:document:readonly');
+  });
+
+  it('manifest 里不存在的名字直接落空（交给 catalog 映射记 skipped）', () => {
+    const filtered = filterScopeManifest(manifest, ['im:nonexistent:scope']);
+    expect(filtered).toEqual({ scopes: { tenant: [], user: [] } });
+  });
+
+  it('空缺失列表 → 空申请集合', () => {
+    expect(filterScopeManifest(manifest, [])).toEqual({ scopes: { tenant: [], user: [] } });
+  });
+
+  /**
+   * 裁剪之后 `scopeCount` 的语义变了：从「整份清单导入了多少」变成「**缺失的那几项
+   * 里成功了多少**」。所以 `0` 不再等于「本来就齐」，反而最常见的成因是「一项都没
+   * 补上」——调用方（event-dispatcher.tryAutoFixScopes）据此措辞，说反了就会在全部
+   * 失败时谎报「所有必需权限已在应用清单中」，而这句话同时进管理员 DM。
+   *
+   * 这里跑真实的 automation 拿到真实的 `scopeCount / skippedScopeCount /
+   * scopeWarning` 三元组，验证三种成因**确实可区分**——否则调用方无论怎么写文案都
+   * 只能靠猜。
+   */
+  it('三种 scopeCount===0 成因在结果里可区分（调用方措辞的依据）', async () => {
+    const FEED = ['im:feed_group_v1:read', 'im:feed_group_v1:write'];
+    const narrowed = filterScopeManifest(readDefaultScopeManifest(), FEED);
+
+    const run = async (label: string, opts: {
+      catalog: { appScopeList: any[]; userScopeList: any[] };
+      rejectScopeUpdate?: boolean;
+      manifest?: any;
+    }) => {
+      const dir = mkdtempSync(join(tmpdir(), `scope0-${label}-`));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = openPlatformSubscriptionMock('cli_s');
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/app/cli_s/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+        if (href.includes('/scope/all/')) return Response.json({ code: 0, data: opts.catalog });
+        if (href.includes('/scope/update/')) {
+          return opts.rejectScopeUpdate
+            ? Response.json({ code: 1, msg: 'scope not grantable for tenant' })
+            : Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/list/')) return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0' }] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+      const r = await automateOpenPlatformSetup({
+        appId: 'cli_s', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+        scopeManifest: opts.manifest ?? narrowed,
+      });
+      expect(r.ok, `${label}: ok=false reason=${(r as any).reason}`).toBe(true);
+      if (!r.ok) throw new Error('unreachable');
+      return { scopeCount: r.scopeCount, skipped: r.skippedScopeCount, warned: Boolean(r.scopeWarning) };
+    };
+
+    const catalogWithFeed = {
+      appScopeList: [{ id: 't1', name: 'im:message' }],
+      userScopeList: [{ id: 'u1', name: 'im:feed_group_v1:read' }, { id: 'u2', name: 'im:feed_group_v1:write' }],
+    };
+    const catalogWithoutFeed = {
+      appScopeList: [{ id: 't1', name: 'im:message' }, { id: 't2', name: 'im:resource' }],
+      userScopeList: [{ id: 'u1', name: 'im:message' }],
+    };
+
+    // ① 成功落地：scopeCount>0 —— 调用方说「N 项权限已导入」
+    expect(await run('applied', { catalog: catalogWithFeed }))
+      .toEqual({ scopeCount: 2, skipped: 0, warned: false });
+
+    // ② 租户目录里根本没有这两项 → 一个 id 都映射不出来，scope/update 都不会发。
+    //    scopeCount=0 但 skipped>0 —— 必须说「不在租户目录、需手动开通」。
+    expect(await run('not-in-catalog', { catalog: catalogWithoutFeed }))
+      .toEqual({ scopeCount: 0, skipped: 2, warned: false });
+
+    // ③ 目录里有、但开放平台整批拒了 → scopeCount 被归零且带 scopeWarning。
+    //    必须说「开放平台拒绝了申请」，不能说「已齐全」。
+    expect(await run('rejected', { catalog: catalogWithFeed, rejectScopeUpdate: true }))
+      .toEqual({ scopeCount: 0, skipped: 0, warned: true });
+
+    // ④ 真的无事可做（申请集合为空）才是「所有必需权限已在应用清单中」：
+    //    三个信号全为零/假，与 ②③ 明确可区分。
+    expect(await run('nothing-missing', {
+      catalog: catalogWithFeed, manifest: { scopes: { tenant: [], user: [] } },
+    })).toEqual({ scopeCount: 0, skipped: 0, warned: false });
+  });
+});
+
+/**
+ * 「权限可访问的数据范围」自动填成「与应用的可用范围一致」。
+ *
+ * 这是**独立于 scope/update 的第二条链路**：权限点进了清单，其中一部分还各带一份
+ * 「这个权限能看到哪些数据」的表单。botmux 历史上完全没碰它，于是每次自动发版都
+ * 带着「未配置」提审——而这些权限都是「需审核」档，租户审批规则明写申请全员数据
+ * 范围要「视情况加签至 CEO-2」。
+ *
+ * 下面的 fixture 是从**线上真实响应**（`privilege/all`）里摘出来的原样结构，不是
+ * 手写的理想形状：
+ *   • `vc/meeting.meetingid` —— 单个 select_staff 字段，isRequired，真实待配对象
+ *   • `security_and_compliance/dlp_execute_log` —— 同为 SelectionExpression + 内部
+ *     组织，但字段里混了一个 `data_source.type==='url'` 的「工作地点」。这正是
+ *     `availability_of_app`（成员范围语义）塞不进去的形态，必须整条跳过。
+ */
+describe('privilege 数据范围 —— 自动填「与应用的可用范围一致」', () => {
+  /** 线上 `privilege/all` 的真实条目（结构原样，只裁掉与判定无关的字段）。 */
+  const VC_PRIVILEGE = {
+    bizId: 'vc',
+    resource: 'meeting.meetingid',
+    name: '会议号查询会议信息',
+    isRequired: true,
+    content: '',
+    privilegeStatus: 3,
+    schemaType: 1,
+    organizationType: 1,
+    schemaContent: {
+      selectionExpressionSchemaContent: {
+        fields: [{
+          id: 'owner_scope',
+          name: '会议的归属者',
+          type: 'object',
+          multi: false,
+          operators: ['in'],
+          data_source: { type: 'select_staff', val: '' },
+        }],
+        select_mode_options: ['all', 'part', 'null'],
+        fallback_value: { mode: 'all' },
+      },
+    },
+  };
+  /** 同样 needsDataRange，但含一个非选人字段（工作地点）——不可自动填。 */
+  const DLP_PRIVILEGE = {
+    bizId: 'security_and_compliance',
+    resource: 'dlp_execute_log',
+    name: 'DLP执行日志',
+    isRequired: true,
+    content: '',
+    schemaType: 1,
+    organizationType: 1,
+    schemaContent: {
+      selectionExpressionSchemaContent: {
+        fields: [
+          { id: 'member_range', name: '用户范围', operators: ['in', 'notIn'], data_source: { type: 'select_staff', val: '' } },
+          { id: 'place', name: '工作地点', operators: ['in', 'notIn'], data_source: { type: 'url', val: '/oapi/…/places/query' } },
+        ],
+        select_mode_options: ['all', 'part', 'null'],
+        fallback_value: { mode: 'all' },
+      },
+    },
+  };
+  const payloadOf = (privileges: any[], scopeBiz: any[] = [{ bizId: 'vc', bizName: '视频会议' }]) =>
+    ({ code: 0, data: { privileges, scopeBiz } });
+
+  it('解析出条目、业务分类名与字段定义', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([VC_PRIVILEGE]));
+    expect(state.privileges).toHaveLength(1);
+    const [p] = state.privileges;
+    expect(p).toMatchObject({
+      bizId: 'vc', resource: 'meeting.meetingid', name: '会议号查询会议信息',
+      bizName: '视频会议', isRequired: true, content: '', schemaType: 1, organizationType: 1,
+    });
+    expect(p.fields).toEqual([{ id: 'owner_scope', name: '会议的归属者', selectStaff: true, supportsIn: true }]);
+  });
+
+  it('字段定义缺结构化那份时回退解析原始 schema 字符串', () => {
+    // 线上响应同时给 schemaContent（已解析）和 schema（JSON 字符串，内层 key 首字母
+    // 大写）。前者不保证一直在，回退路径必须真能解析出字段——否则会静默降级成
+    // 「没有字段」→ 整条跳过 → 又变回从不配置。
+    const { schemaContent, ...withoutStructured } = VC_PRIVILEGE as any;
+    const state = extractOpenPlatformPrivileges(payloadOf([{
+      ...withoutStructured,
+      schema: JSON.stringify({
+        biz_id: 'vc',
+        schema_content: {
+          SelectionExpressionSchemaContent: schemaContent.selectionExpressionSchemaContent,
+        },
+      }),
+    }]));
+    expect(state.privileges[0].fields)
+      .toEqual([{ id: 'owner_scope', name: '会议的归属者', selectStaff: true, supportsIn: true }]);
+    expect(canFillPrivilegeWithAppAvailability(state.privileges[0])).toBe(true);
+  });
+
+  it('只对「SelectionExpression + 内部组织 + 全字段可选人」放行', () => {
+    const fill = (p: any) =>
+      canFillPrivilegeWithAppAvailability(extractOpenPlatformPrivileges(payloadOf([p])).privileges[0]);
+    expect(fill(VC_PRIVILEGE)).toBe(true);
+    // 混了非选人字段（工作地点）——availability_of_app 是成员范围语义，塞不进去。
+    expect(fill(DLP_PRIVILEGE)).toBe(false);
+    // console 的两个判据各自都是必要条件。
+    expect(fill({ ...VC_PRIVILEGE, schemaType: 3 })).toBe(false);
+    expect(fill({ ...VC_PRIVILEGE, organizationType: 2 })).toBe(false);
+    // 没有字段定义 → 不猜。
+    expect(fill({ ...VC_PRIVILEGE, schemaContent: { selectionExpressionSchemaContent: { fields: [] } } })).toBe(false);
+    // 字段不支持「包含」(in) → 不猜。
+    expect(fill({
+      ...VC_PRIVILEGE,
+      schemaContent: {
+        selectionExpressionSchemaContent: {
+          fields: [{ id: 'owner_scope', name: 'x', operators: ['notIn'], data_source: { type: 'select_staff' } }],
+        },
+      },
+    })).toBe(false);
+  });
+
+  it('content 与 console 手工配置的结果逐字节相同', () => {
+    // 基准串取自**线上一个由人在 console 上手点「与应用的可用范围一致」的应用**，
+    // 原样粘过来。自己写的 builder 与它逐字节一致，才说明我们没在猜格式。
+    const CONSOLE_WRITTEN = '{"biz_id":"vc","mode":"part","resource":"meeting.meetingid","filters":[{"field":"owner_scope","value":"[{\\"mode\\":\\"availability_of_app\\",\\"members\\":[],\\"departments\\":[],\\"groups\\":[]}]","operator":"in"}],"expression":"1","description":"视频会议 - 会议号查询会议信息\\n\\t会议的归属者 包含 与应用的可用范围一致 \\n"}';
+    const [p] = extractOpenPlatformPrivileges(payloadOf([VC_PRIVILEGE])).privileges;
+    expect(buildPrivilegeAppAvailabilityContent(p)).toBe(CONSOLE_WRITTEN);
+  });
+
+  it('多字段时逐字段生成 filter，expression 用 1-based 序号 and 连接', () => {
+    const [p] = extractOpenPlatformPrivileges(payloadOf([{
+      ...VC_PRIVILEGE,
+      schemaContent: {
+        selectionExpressionSchemaContent: {
+          fields: [
+            { id: 'a', name: '甲', operators: ['in'], data_source: { type: 'select_staff' } },
+            { id: 'b', name: '乙', operators: ['in'], data_source: { type: 'select_staff' } },
+          ],
+        },
+      },
+    }])).privileges;
+    const parsed = JSON.parse(buildPrivilegeAppAvailabilityContent(p));
+    expect(parsed.filters.map((f: any) => f.field)).toEqual(['a', 'b']);
+    expect(parsed.expression).toBe('1 and 2');
+    // filter value 是**再套一层 JSON 字符串**的数组，不是对象——写错这层服务端不报错，
+    // 但 console 上会显示成未配置。
+    expect(JSON.parse(parsed.filters[0].value)).toEqual([
+      { mode: 'availability_of_app', members: [], departments: [], groups: [] },
+    ]);
+  });
+
+  it('只挑「isRequired 且还没收敛」的，已收敛到具体范围的一律不覆盖', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([
+      VC_PRIVILEGE,
+      // 非必填 → console 自己的 gate 也不强制，不碰。
+      { ...VC_PRIVILEGE, resource: 'meeting.participant', isRequired: false },
+      // 已经收敛到具体范围 → 可能是人手精心配的，覆盖它比不配更糟。
+      { ...VC_PRIVILEGE, resource: 'vc.record', content: '{"mode":"part","filters":[{"field":"owner_scope","value":"[]","operator":"in"}]}' },
+      // 必填但不可自动填 → 留给人手配。
+      DLP_PRIVILEGE,
+    ]));
+    expect(selectPrivilegesNeedingAppAvailability(state).map(p => p.resource))
+      .toEqual(['meeting.meetingid']);
+  });
+
+  /**
+   * 🔴 生产回归（live 实测发现）：「一键创建智能体」模板建出来的应用，这两条数据
+   * 范围**出生就带 `{"mode":"all"}`**（console 上显示选中「全部」）——正是审批规则里
+   * 要补充理由、视情况加签至 CEO-2 的那一档。
+   *
+   * 第一版守卫写的是「有 content 就算配过、不覆盖」（本意是别覆盖人手配的范围），
+   * 而模板塞的默认值刚好满足「有 content」⟹ 被当成用户的选择跳过，
+   * `privilegeRangeCount` 恒为 0，整个改动空转。下面两个 fixture 是**线上抓下来的
+   * 原文**，不是构造的。
+   */
+  const TEMPLATE_DEFAULT_ALL_VC = {
+    ...VC_PRIVILEGE,
+    privilegeStatus: 2,
+    // 线上原文。`\n` 必须是 JSON 里的转义序列（`\\n` 在 JS 源码里），不是真换行——
+    // 真换行会让这串不是合法 JSON，从而走进「读不懂 → 保守视为已配置」的分支，
+    // 把这个测试变成假绿。
+    content: '{"biz_id":"vc","resource":"meeting.meetingid","mode":"all","description":"视频会议 - 会议号查询会议信息\\n\\t全部\\n"}',
+  };
+
+  it('模板默认的 mode:"all" 视为待收窄（不是"已配置"）', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([TEMPLATE_DEFAULT_ALL_VC]));
+    expect(isPrivilegeRangeNarrowed(state.privileges[0])).toBe(false);
+    // 这一条是整个改动的成败所在：漏了它，新建 bot 永远带「全部」提审。
+    expect(selectPrivilegesNeedingAppAvailability(state).map(p => p.resource))
+      .toEqual(['meeting.meetingid']);
+    // 收窄后的目标形态：按条件筛选 + 与应用的可用范围一致。
+    const rewritten = JSON.parse(buildPrivilegeAppAvailabilityContent(state.privileges[0]));
+    expect(rewritten.mode).toBe('part');
+    expect(JSON.parse(rewritten.filters[0].value)[0].mode).toBe('availability_of_app');
+  });
+
+  it('已收敛的判据是「mode 不是 all」，不是「content 非空」', () => {
+    const narrowed = (content: string) =>
+      isPrivilegeRangeNarrowed(extractOpenPlatformPrivileges(payloadOf([{ ...VC_PRIVILEGE, content }])).privileges[0]);
+    expect(narrowed('')).toBe(false);                                  // 未配置
+    expect(narrowed('{"mode":"all"}')).toBe(false);                    // 模板默认「全部」
+    expect(narrowed('{"mode":""}')).toBe(false);                       // 空 mode 同样不算收敛
+    expect(narrowed('{"resource":"x"}')).toBe(false);                  // mode 整个缺失
+    expect(narrowed('{"mode":"null"}')).toBe(false);                   // console 的「无」
+    expect(narrowed('{"mode":"part","filters":[{"field":"owner_scope","value":"[]","operator":"in"}]}')).toBe(true);
+    // 我们自己写过的也算收敛 —— 重复跑权限自愈不该反复重写同一条。
+    expect(narrowed(buildPrivilegeAppAvailabilityContent(
+      extractOpenPlatformPrivileges(payloadOf([VC_PRIVILEGE])).privileges[0]))).toBe(true);
+    // content 存在但读不懂 → 保守视为已配置：覆盖一个读不懂的值风险更大。
+    expect(narrowed('{oops')).toBe(true);
+  });
+
+  /**
+   * 与 console 自己的「是否配置好」谓词 `XC()` 对齐：它要求
+   * `mode === 'all' || (Array.isArray(filters) && filters.length > 0)`。
+   * 也就是说 `mode:'part'` 但 filters 为空，在 console 眼里**不算配置好**（UI 上显示
+   * 「暂未配置筛选条件」）。这是又一个「看着配过、其实是空的」中间态——放过它就是
+   * 重犯 `mode:"all"` 那个空转 bug 的同类错误。
+   */
+  it('mode:part 但 filters 为空同样视为未收敛（对齐 console 的 XC()）', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([{
+      ...VC_PRIVILEGE,
+      content: '{"biz_id":"vc","mode":"part","resource":"meeting.meetingid","filters":[],"expression":""}',
+    }]));
+    expect(isPrivilegeRangeNarrowed(state.privileges[0])).toBe(false);
+    expect(selectPrivilegesNeedingAppAvailability(state).map(p => p.resource)).toEqual(['meeting.meetingid']);
+  });
+
+  it('写入 payload 只带本次要填的条目，并保留原始字段', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([VC_PRIVILEGE, DLP_PRIVILEGE]));
+    const payload = buildPrivilegeUpdatePayload('cli_x', selectPrivilegesNeedingAppAvailability(state));
+    expect(payload.clientId).toBe('cli_x');
+    // 增量合并语义（实测：服务端按 (bizId,resource) 合并）——不必回传全部条目。
+    expect(payload.privileges).toHaveLength(1);
+    const [entry] = payload.privileges as any[];
+    expect(entry.content).toBe(buildPrivilegeAppAvailabilityContent(state.privileges[0]));
+    // 原始字段原样回传：服务端还会读 schema / privilegeStatus 等，丢了它们就等于
+    // 拿一个残缺条目去覆盖。
+    expect(entry).toMatchObject({
+      bizId: 'vc', resource: 'meeting.meetingid', isRequired: true, privilegeStatus: 3,
+      schemaType: 1, organizationType: 1,
+    });
+    expect(entry.schemaContent).toEqual(VC_PRIVILEGE.schemaContent);
+  });
+
+  it('没有待填的条目时一个写请求都不发', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([DLP_PRIVILEGE]));
+    expect(selectPrivilegesNeedingAppAvailability(state)).toEqual([]);
+  });
+
+  it('响应结构异常/为空时安全降级为「没有条目」', () => {
+    expect(extractOpenPlatformPrivileges(null).privileges).toEqual([]);
+    expect(extractOpenPlatformPrivileges({ code: 0 }).privileges).toEqual([]);
+    expect(extractOpenPlatformPrivileges({ data: { privileges: 'nope' } }).privileges).toEqual([]);
+    // 缺 bizId 就拼不出合并键，写回去也定位不到条目 → 丢弃而不是硬塞。
+    expect(extractOpenPlatformPrivileges(payloadOf([{ resource: 'x', isRequired: true }])).privileges).toEqual([]);
+    // schema 不是合法 JSON → 当作没有字段，由 canFill… 跳过，不抛。
+    const bad = extractOpenPlatformPrivileges(payloadOf([{ ...VC_PRIVILEGE, schemaContent: undefined, schema: '{oops' }]));
+    expect(bad.privileges[0].fields).toEqual([]);
+    expect(canFillPrivilegeWithAppAvailability(bad.privileges[0])).toBe(false);
+  });
+
+  /**
+   * 上面全是纯函数。这里跑**真实的 automation**，验证接线本身：请求真的发出去了、
+   * 落在 `app_version/create` 之前（否则本次发版仍带「未配置」提审，等于没修）、
+   * 失败时不阻塞建 bot。纯函数全绿但没接上线，是这类改动最典型的空转。
+   */
+  it('automation 真的发出 privilege/update，且在发版之前', async () => {
+    const run = async (label: string, opts: { privilegeAll?: unknown; failRead?: boolean; failWrite?: boolean }) => {
+      const dir = mkdtempSync(join(tmpdir(), `privrange-${label}-`));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = openPlatformSubscriptionMock('cli_p');
+      const calls: string[] = [];
+      const writes: any[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/app/cli_p/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+        const path = href.replace(/^https:\/\/[^/]+/, '');
+        if (path.startsWith('/developers/')) calls.push(path);
+        if (path.includes('/scope/all/')) {
+          return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+        }
+        if (path.includes('/privilege/all/')) {
+          if (opts.failRead) return Response.json({ code: 1, msg: 'privilege read denied' });
+          return Response.json(opts.privilegeAll ?? payloadOf([VC_PRIVILEGE]));
+        }
+        if (path.includes('/privilege/update/')) {
+          if (opts.failWrite) return Response.json({ code: 1, msg: 'privilege write rejected' });
+          writes.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (path.includes('/app_version/list/')) return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0' }] } });
+        if (path.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+      const r = await automateOpenPlatformSetup({
+        appId: 'cli_p', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      });
+      expect(r.ok, `${label}: ok=false reason=${(r as any).reason}`).toBe(true);
+      if (!r.ok) throw new Error('unreachable');
+      return { calls, writes, count: r.privilegeRangeCount, warning: r.privilegeRangeWarning };
+    };
+
+    // ① 有待配的 → 写请求发出，内容是「与应用的可用范围一致」
+    const applied = await run('applied', {});
+    expect(applied.count).toBe(1);
+    expect(applied.warning).toBeUndefined();
+    expect(applied.writes).toHaveLength(1);
+    expect(applied.writes[0].clientId).toBe('cli_p');
+    expect(JSON.parse(applied.writes[0].privileges[0].content).filters[0].value)
+      .toContain('availability_of_app');
+    // 顺序判据：数据范围必须在**本次发版之前**写完，否则这一版仍带「未配置」提审。
+    const writeAt = applied.calls.findIndex(p => p.includes('/privilege/update/'));
+    const versionAt = applied.calls.findIndex(p => p.includes('/app_version/create/'));
+    expect(writeAt).toBeGreaterThanOrEqual(0);
+    expect(versionAt).toBeGreaterThanOrEqual(0);
+    expect(writeAt).toBeLessThan(versionAt);
+    // 也必须在 scope/update 之后：权限点还没进清单时，它带的数据范围条目也还不在。
+    expect(applied.calls.findIndex(p => p.includes('/scope/update/'))).toBeLessThan(writeAt);
+
+    // ② 没有待配的 → 一个写请求都不发，且 count=0 不带 warning（调用方据此区分成因）
+    const noop = await run('noop', { privilegeAll: payloadOf([DLP_PRIVILEGE]) });
+    expect(noop.writes).toEqual([]);
+    expect(noop.calls.some(p => p.includes('/privilege/update/'))).toBe(false);
+    expect({ count: noop.count, warned: Boolean(noop.warning) }).toEqual({ count: 0, warned: false });
+
+    // ③ 读失败 / ④ 写失败 → 非致命：ok:true 照常发版建 bot，但 count=0 且**带
+    //    warning**，与②明确可区分（不带 warning 会被读成「本来就没有待配的」）。
+    for (const [label, opts] of [['read-fail', { failRead: true }], ['write-fail', { failWrite: true }]] as const) {
+      const failed = await run(label, opts);
+      expect({ label, count: failed.count, warned: Boolean(failed.warning) })
+        .toEqual({ label, count: 0, warned: true });
+      expect(failed.calls.some(p => p.includes('/app_version/create/')), `${label}: 仍应发版`).toBe(true);
+    }
+  });
+});
+
+
 
 describe('redirect 白名单读→合并→写', () => {
   /** postJson 桩：读接口返回 `read`（或抛错），写接口按 `writeResults` 顺序成功/失败。 */
@@ -854,6 +1333,9 @@ describe('createFeishuOpenPlatformApp', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_created',
       '/developers/v1/event/switch/cli_created',
+      // 模板建出来的应用数据范围默认是 mode:'all'(「全部」),必须在**这一版发布之前**
+      // 收窄——这个 mock 的 privilege/all 返回空,所以只有读、没有 privilege/update。
+      '/developers/v1/privilege/all/cli_created',
       '/developers/v1/app_version/create/cli_created',
       '/developers/v1/publish/commit/cli_created/v-enable',
       '/developers/v1/secret/cli_created',
@@ -907,10 +1389,122 @@ describe('createFeishuOpenPlatformApp', () => {
       '/developers/v1/app/create',
       '/developers/v1/robot/switch/cli_fallback',
       '/developers/v1/event/switch/cli_fallback',
+      // 回退路径（裸自建应用）同样在发版前收窄数据范围。
+      '/developers/v1/privilege/all/cli_fallback',
       '/developers/v1/app_version/create/cli_fallback',
       '/developers/v1/publish/commit/cli_fallback/v-enable',
       '/developers/v1/secret/cli_fallback',
     ]);
+  });
+
+  /**
+   * 🔴 生产回归（live 建 bot 实测发现）：模板建出来的应用，数据范围出生就是
+   * `mode:'all'`（「全部」），而**紧接着就发第一个版本**。只在
+   * `automateOpenPlatformSetup` 里收窄救不回这一版（它发的是下一版），所以创建
+   * 路径必须自己做一次。上面的顺序断言只证明「读了」，这里证明「**真写了**、且
+   * 写在发版之前、内容是与应用的可用范围一致」。
+   */
+  it('模板默认的「全部」在第一个版本发布前就被收窄', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-narrow-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    let written: any;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      calls.push(path);
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 0, data: { clientID: 'cli_narrow' } });
+      }
+      if (path === '/developers/v1/privilege/all/cli_narrow') {
+        // 线上模板建出来的真实形态：isRequired 且 mode:'all'。
+        return Response.json({
+          code: 0,
+          data: {
+            scopeBiz: [{ bizId: 'vc', bizName: '视频会议' }],
+            privileges: [{
+              bizId: 'vc', resource: 'meeting.meetingid', name: '会议号查询会议信息',
+              isRequired: true, privilegeStatus: 2, schemaType: 1, organizationType: 1,
+              content: '{"biz_id":"vc","resource":"meeting.meetingid","mode":"all","description":"视频会议 - 会议号查询会议信息\\n\\t全部\\n"}',
+              schemaContent: {
+                selectionExpressionSchemaContent: {
+                  fields: [{ id: 'owner_scope', name: '会议的归属者', operators: ['in'], data_source: { type: 'select_staff', val: '' } }],
+                  select_mode_options: ['all', 'part', 'null'],
+                },
+              },
+            }],
+          },
+        });
+      }
+      if (path === '/developers/v1/privilege/update/cli_narrow') {
+        written = JSON.parse(String(init?.body));
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/app_version/create/cli_narrow') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
+      if (path === '/developers/v1/secret/cli_narrow') {
+        return Response.json({ code: 0, data: { secret: 'narrow-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-narrow', sessionFilePath: sessionFile, disableBytedcliFallback: true, fetchImpl,
+    });
+    expect(result).toMatchObject({ ok: true, appId: 'cli_narrow' });
+
+    // 真的发出了写请求，且内容是「按条件筛选 + 与应用的可用范围一致」
+    expect(written?.clientId).toBe('cli_narrow');
+    const content = JSON.parse(written.privileges[0].content);
+    expect(content.mode).toBe('part');
+    expect(JSON.parse(content.filters[0].value)[0].mode).toBe('availability_of_app');
+
+    // 顺序：收窄必须在**这一版**发布之前，否则第一版仍带「全部」进审批。
+    const narrowAt = calls.indexOf('/developers/v1/privilege/update/cli_narrow');
+    const versionAt = calls.indexOf('/developers/v1/app_version/create/cli_narrow');
+    expect(narrowAt).toBeGreaterThanOrEqual(0);
+    expect(versionAt).toBeGreaterThan(narrowAt);
+  });
+
+  it('数据范围收窄失败不影响建 bot（非致命）', async () => {
+    // 这里正处在「应用已建成、还没发版」的窗口：为一个只影响审批快慢的步骤把整条
+    // 创建链路判死，会把用户丢进手动读 Secret 的恢复路径，代价明显更大。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-narrowfail-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 0, data: { clientID: 'cli_nf' } });
+      }
+      if (path === '/developers/v1/privilege/all/cli_nf') {
+        return Response.json({ code: 1, msg: 'privilege read denied' });
+      }
+      if (path === '/developers/v1/app_version/create/cli_nf') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
+      if (path === '/developers/v1/secret/cli_nf') {
+        return Response.json({ code: 0, data: { secret: 'nf-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    await expect(createFeishuOpenPlatformApp({
+      name: 'botmux-nf', sessionFilePath: sessionFile, disableBytedcliFallback: true, fetchImpl,
+    })).resolves.toMatchObject({ ok: true, appId: 'cli_nf', appSecret: 'nf-secret' });
   });
 
   function outcomeUnknownFetchImpl(calls: string[], templateResponse: () => Response | Promise<Response>) {
@@ -1343,6 +1937,9 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
+      // 权限点进清单后紧接着读它带的「数据范围」条目（这个 mock 没有待配条目，
+      // 所以只有读、没有 privilege/update）。
+      '/developers/v1/privilege/all/cli_x',
       '/developers/v1/robot/switch/cli_x',
       '/developers/v1/event/switch/cli_x',
       '/developers/v1/event/cli_x',
@@ -1420,6 +2017,9 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/safe_setting/update/cli_x',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
+      // 权限点进清单后紧接着读它带的「数据范围」条目（这个 mock 没有待配条目，
+      // 所以只有读、没有 privilege/update）。
+      '/developers/v1/privilege/all/cli_x',
       '/developers/v1/robot/switch/cli_x',
       '/developers/v1/event/switch/cli_x',
       '/developers/v1/event/cli_x',

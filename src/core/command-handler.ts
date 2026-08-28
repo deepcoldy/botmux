@@ -229,11 +229,11 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
  * App Server rather than an interactive TUI; slash-looking text must use the
  * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
-/** Runner adapters speak a framed stdin protocol, not an interactive TUI:
- * raw slash passthrough would bypass the turn ledger and the runner rejects
- * non-frame input. Both the routing and the /list-slash-command display must
- * agree on this set. */
-const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh']);
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
+ * requires every user message to pass through its service-user envelope and
+ * structured turn ledger. Both the routing and /list-slash-command display must
+ * agree on CLIs with no raw passthrough surface. */
+const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
 
 export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
   return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
@@ -263,7 +263,9 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // Runner adapters (codex-app/mira/mir/dsh) speak a framed stdin protocol,
   // not an interactive TUI: a slash command through raw_input bypasses the
   // turn ledger and the runner rejects non-frame input, wedging the session.
-  // Keep these messages on the normal structured turn path.
+  // ebsd is interactive but still has no raw surface: service mode requires the
+  // service-user envelope and its own writer/terminal-marker ledger for every
+  // external message. Keep all of these on the normal structured turn path.
   if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
@@ -4693,11 +4695,10 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
         const workingDir = getSessionWorkingDir(ds);
-        // Runner adapters route everything through the structured turn lane,
-        // so they have NO passthrough surface at all — mirror
-        // resolvePassthroughCommands's early empty return here and skip
-        // filesystem discovery (their PTY is the runner, not an interactive
-        // TUI that would honor those).
+        // CLIs without a raw input surface route everything through their
+        // structured/service turn lane, so mirror resolvePassthroughCommands's
+        // early empty return here and skip filesystem discovery (the runner
+        // protocols reject raw input; ebsd requires its service-user envelope).
         const noPassthrough = cliHasNoRawPassthroughSurface(effectiveCliId);
         const builtin = noPassthrough ? [] : [...PASSTHROUGH_COMMANDS];
         const adapterDefaults = noPassthrough ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);

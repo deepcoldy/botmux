@@ -1349,6 +1349,7 @@ describe('runCliRuntimeUpdateAudit with FNM rotating launcher symlinks', () => {
     mkdirSync(join(dir, 'install', 'bin'), { recursive: true });
     realInstall = join(dir, 'install', 'bin', 'codex.js');
     writeFileSync(realInstall, '#!/usr/bin/env node\n');
+    realInstall = realpathSync(realInstall);
   });
 
   afterEach(() => {
@@ -1464,6 +1465,7 @@ describe('runCliRuntimeUpdateAudit with FNM rotating launcher symlinks', () => {
     mkdirSync(join(dir, 'install-v2', 'bin'), { recursive: true });
     const realInstallV2 = join(dir, 'install-v2', 'bin', 'codex.js');
     writeFileSync(realInstallV2, '#!/usr/bin/env node\n');
+    const canonicalInstallV2 = realpathSync(realInstallV2);
     const shellBin = join(dir, 'multishells', '402_bbb', 'bin');
     mkdirSync(shellBin, { recursive: true });
     const link = join(shellBin, 'codex');
@@ -1473,9 +1475,9 @@ describe('runCliRuntimeUpdateAudit with FNM rotating launcher symlinks', () => {
     await runCliRuntimeUpdateAudit(deps(link));
     expect(probe).toHaveBeenCalledTimes(2);
     expect(notified).toEqual(['0.147.0', '0.147.0']);
-    const secondKey = `codex:${realInstallV2}`;
+    const secondKey = `codex:${canonicalInstallV2}`;
     expect(secondKey).not.toBe(firstKey);
-    expect(store.entries[secondKey].installationPath).toBe(realInstallV2);
+    expect(store.entries[secondKey].installationPath).toBe(canonicalInstallV2);
   });
 
   it('migrates a legacy raw-path entry onto the stable key without re-notifying (criteria = safe upgrade)', async () => {
@@ -1545,6 +1547,8 @@ describe('runCliRuntimeUpdateAudit with FNM rotating launcher symlinks', () => {
     const installC = join(dir, 'install-c', 'bin', 'codex.js');
     writeFileSync(installB, '#!/usr/bin/env node\n');
     writeFileSync(installC, '#!/usr/bin/env node\n');
+    const canonicalInstallB = realpathSync(installB);
+    const canonicalInstallC = realpathSync(installC);
     const binB = join(dir, 'multishells', 'B_live', 'bin');
     const binC = join(dir, 'multishells', 'C_live', 'bin');
     mkdirSync(binB, { recursive: true });
@@ -1593,13 +1597,13 @@ describe('runCliRuntimeUpdateAudit with FNM rotating launcher symlinks', () => {
 
     // Ambiguous group: no migration. Each live install probes and notifies
     // under its own canonical identity; the dead orphan is pruned.
-    const keyB = `codex:${installB}`;
-    const keyC = `codex:${installC}`;
+    const keyB = `codex:${canonicalInstallB}`;
+    const keyC = `codex:${canonicalInstallC}`;
     expect(probe).toHaveBeenCalledTimes(2);
     expect(notified).toEqual(['0.147.0', '0.147.0']);
     expect(Object.keys(store.entries).sort()).toEqual([keyB, keyC].sort());
-    expect(store.entries[keyB]?.installationPath).toBe(installB);
-    expect(store.entries[keyC]?.installationPath).toBe(installC);
+    expect(store.entries[keyB]?.installationPath).toBe(canonicalInstallB);
+    expect(store.entries[keyC]?.installationPath).toBe(canonicalInstallC);
   });
 
   it('reindexes a pre-fix entry whose rotating symlink is still alive, keeping its watermark (criteria 1/4 boundary)', async () => {

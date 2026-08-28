@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
+vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
+  devboxDashboardBaseUrl: vi.fn(() => null),
+}));
 import {
   issueTerminalControlGrant,
   verifyTerminalControlGrant,
@@ -17,6 +20,7 @@ import {
   type TerminalDashboardActor,
 } from '../src/dashboard/terminal-control.js';
 import { logger } from '../src/utils/logger.js';
+import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
 
 const SECRET = 'host-only-dashboard-secret-for-tests';
 
@@ -550,6 +554,17 @@ describe('P1-11 same-origin behind a reverse proxy / platform tunnel', () => {
       'x-forwarded-host': 'm-abc.platform.example',
       origin: 'https://m-victim.platform.example',
     })).toEqual({ ok: false, error: 'upgrade_origin_forbidden' });
+  });
+
+  it('accepts the cached private Merlin Devbox origin for management and terminal WebSocket', () => {
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue('https://devbox.example.com');
+    const headers = {
+      host: '127.0.0.1:9001',
+      origin: 'https://devbox.example.com',
+    };
+    expect(controlRequestOriginState(headers)).toBe('same-origin');
+    expect(managementUpgradeOrigin(headers)).toEqual({ ok: true });
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
   });
 });
 

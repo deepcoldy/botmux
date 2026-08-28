@@ -508,7 +508,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
@@ -1305,7 +1305,7 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     }
   });
 
-  it('keeps raw passthrough off Codex App while honoring a frozen session CLI override', () => {
+  it('keeps raw passthrough off structured/service CLIs while honoring a frozen interactive override', () => {
     mockCodexAppBot();
 
     // App Server turns must use the structured message lane; raw_input has no
@@ -1323,6 +1323,10 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    // ebsd is interactive, but every external message must pass through the
+    // service-user envelope and structured terminal-marker ledger.
+    expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'ebsd').size).toBe(0);
   });
 
   it('threads the frozen CLI through the ADAPTER-SCOPED layer, not just the builtin set', () => {

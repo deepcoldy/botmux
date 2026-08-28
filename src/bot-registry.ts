@@ -168,6 +168,8 @@ export function larkUploadHttpInstance(): unknown {
 }
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+/** 普通群 @ 策略：always=必须 @｜topic=话题内免 @｜never=免 @｜ambient=免 @ 但 @ 别人时安静。 */
+export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
 /** Where a bot shows native Context / Token usage on its Session cards. */
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
 /** Default when a bot sets nothing: usage rides the live streaming card. */
@@ -305,6 +307,13 @@ function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (v === 'chat-topic' || v === 'chattopic' || v === 'chat_topic') return 'chat-topic';
   if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
   if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  return undefined;
+}
+
+function normalizeGroupMentionModeConfig(raw: unknown): GroupMentionMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'always' || v === 'topic' || v === 'never' || v === 'ambient') return v;
   return undefined;
 }
 
@@ -1603,6 +1612,8 @@ export interface BotConfig {
   defaultOncallAutoboundChats?: string[];
   /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
+  /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
+  chatMentionModes?: { [chatId: string]: GroupMentionMode };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -2918,6 +2929,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
 
+    // chatMentionModes：只保留每群显式设置，非法值丢弃。四态 always｜topic｜
+    // never｜ambient 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
+    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatMentionMode）。
+    let chatMentionModes: { [chatId: string]: GroupMentionMode } | undefined;
+    if (entry.chatMentionModes && typeof entry.chatMentionModes === 'object' && !Array.isArray(entry.chatMentionModes)) {
+      const out: { [chatId: string]: GroupMentionMode } = {};
+      for (const [cid, mode] of Object.entries(entry.chatMentionModes)) {
+        if (typeof cid !== 'string' || !cid.trim()) continue;
+        const normalizedMode = normalizeGroupMentionModeConfig(mode);
+        if (normalizedMode) out[cid] = normalizedMode;
+      }
+      if (Object.keys(out).length > 0) chatMentionModes = out;
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -3174,6 +3199,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // true is persisted (undefined = off) so bots.json stays clean.
       defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
+      chatMentionModes,
       chatGrants,
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。

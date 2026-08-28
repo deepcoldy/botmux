@@ -30,12 +30,28 @@ describe('fleet-supervisor-policy — graceful exit (invariant 1)', () => {
     // Defensive: a signal alongside a 90 code still counts as a crash.
     expect(isGracefulExit({ code: FLEET_GRACEFUL_EXIT_CODE, signal: 'SIGKILL' })).toBe(false);
   });
+
+  // 90 is a PRIVATE handshake between our own two managed cores and this policy.
+  // A plugin service is third-party code that may use 90 as an ordinary failure
+  // code; taking it at its word retires the service instead of restarting it.
+  // Under pm2 this could not happen — plugin apps never got stop_exit_codes.
+  it('a member that does NOT honour the sentinel treats 90 as a crash', () => {
+    expect(isGracefulExit({ code: FLEET_GRACEFUL_EXIT_CODE, signal: null }, false)).toBe(false);
+    // …and the default is still to honour it, so our own members are unchanged.
+    expect(isGracefulExit({ code: FLEET_GRACEFUL_EXIT_CODE, signal: null })).toBe(true);
+  });
 });
 
 describe('fleet-supervisor-policy — decideOnExit (invariants 1 + 2)', () => {
   it('graceful → stop, never restart', () => {
     expect(decideOnExit(proc({ restarts: 3 }), { code: 90, signal: null }))
       .toEqual({ action: 'stop', reason: 'graceful' });
+  });
+  it('an external member exiting 90 is a CRASH and restarts', () => {
+    // The whole point of supervising a plugin service is crash-restart. If 90 were
+    // honoured here the service would silently vanish, showing a bland 'stopped'.
+    expect(decideOnExit(proc({ restarts: 0 }), { code: 90, signal: null }, undefined, false))
+      .toEqual({ action: 'restart', nextRestarts: 1 });
   });
   it('crash under the cap → restart with incremented count', () => {
     expect(decideOnExit(proc({ restarts: 0 }), { code: 1, signal: null }))

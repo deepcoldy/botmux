@@ -38,7 +38,27 @@ const require = createRequire(import.meta.url);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 // Compile targets for the botmux fleet. Kept in sync with release.yml.
-const RELEASE_TARGETS = ['bun-linux-x64', 'bun-linux-arm64', 'bun-darwin-x64', 'bun-darwin-arm64'];
+//
+// The `-musl` variants exist because Alpine (and most slim Docker images) link
+// against musl libc, where a glibc-linked binary does not run at all — it dies in
+// the loader with an error that names no cause. npm selects the right one on its
+// own: each platform subpackage declares `libc: ["musl"] | ["glibc"]` (undocumented
+// in `npm help package-json` but live in the wild, e.g. @napi-rs/canvas ships both).
+//
+// ⚠️ A musl binary MUST be compiled on musl: `pty.node` is embedded at build time,
+// and node-pty has no linux prebuild, so the builder compiles it against whatever
+// libc it is running on (verified: glibc box → `NEEDED libc.so.6`, Alpine container
+// → `NEEDED libc.musl-x86_64.so.1`). release.yml therefore runs the musl legs inside
+// an Alpine container — cross-compiling them from a glibc runner would embed the
+// wrong native and fail at PTY spawn, not at build time.
+const RELEASE_TARGETS = [
+  'bun-linux-x64',
+  'bun-linux-arm64',
+  'bun-linux-x64-musl',
+  'bun-linux-arm64-musl',
+  'bun-darwin-x64',
+  'bun-darwin-arm64',
+];
 
 function parseArgs(argv) {
   const args = { target: undefined, out: undefined, all: false };

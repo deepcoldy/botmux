@@ -33,6 +33,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import { platformBrowserAuthorities, type PlatformBrowserSurface } from '../platform/binding.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 /** 提交控制类请求时携带 CSRF 票据的头名。`<form>` 设不了自定义头，这是关键。 */
 export const CONTROL_CSRF_HEADER = 'x-botmux-csrf';
@@ -166,6 +167,20 @@ function publicUrlAuthority(): string | undefined {
   return authority;
 }
 
+/**
+ * Merlin Devbox 私有短链的 authority。同 {@link publicUrlAuthority}，只参与
+ * Origin 的精确 host+port 比对，值只来自本机 0600 缓存。
+ *
+ * `devboxDashboardBaseUrl()` 自带短 TTL 的进程内 memo，所以这条控制类请求热路径
+ * （每次控制请求 / WS 升级，被判跨站时还会再走一次 warnForeignOrigin）不会每次都
+ * 付一遍 secure-file 读——与紧邻的 `publicAuthorityCache` 保持同样的缓存姿势。
+ */
+function devboxUrlAuthority(): string | undefined {
+  const raw = devboxDashboardBaseUrl();
+  if (!raw) return undefined;
+  try { return new URL(raw).host || undefined; } catch { return undefined; }
+}
+
 /** 本请求可能的自身 authority：直连是 `Host`，反代/平台隧道下还有转发头，外加
  *  运维显式声明的对外基址；绑定中心平台时再加本机可信的平台浏览器子域
  *  (`m-`/`t-<machineId>.<平台域名>`)——平台隧道反代不透传 `X-Forwarded-Host`，
@@ -184,6 +199,7 @@ function requestAuthorities(
     // 逗号分隔时第一个才是最初的客户端所见 host。
     forwarded ? forwarded.split(',')[0] : undefined,
     publicUrlAuthority(),
+    devboxUrlAuthority(),
     ...platformBrowserAuthorities(surface),
   ];
 }

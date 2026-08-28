@@ -1542,6 +1542,10 @@ export class BotOnboardingManager {
       // 这份 ACK 是从权限台账重建的，本次并没有碰 redirect 白名单。宁可报「没配」
       // 让人去核一眼，也不能凭空报「配好了」——那正是 20029 静默失败的来源。
       redirectConfigured: false,
+      // 同上：本次没有读/写「权限可访问的数据范围」。0 + warning 才是诚实的
+      // 「没碰过」，报 0 而不带 warning 会被下游读成「本来就没有待配的」。
+      privilegeRangeCount: 0,
+      privilegeRangeWarning: '本次从权限台账重建，未读写权限数据范围',
       eventMode: managedPermission.eventMode,
       verifiedEventCount: managedPermission.verifiedEventCount,
       versionId: managedPermission.versionId,

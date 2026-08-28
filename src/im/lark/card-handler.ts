@@ -2716,9 +2716,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
             : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
-          // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST (old closed card
-          // recalled, fresh card posted at the thread bottom), AND send the
-          // "✅ 会话已恢复…" text follow-up — both are wanted.
+          // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
+          // cards are enabled. Card-off bots only withdraw the stale closed card
+          // and send the "✅ 会话已恢复…" text follow-up.
           // Ordering is load-bearing for two reasons:
           //   1) ACK the callback FIRST (bare `return` → empty ACK), THEN
           //      post/delete in the background — deleting the just-clicked card
@@ -2728,20 +2728,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           //      never briefly shows zero cards (same invariant as park→recall).
           // Skip in private-card mode (clicked card may be an ephemeral snapshot).
           const botCfgResume = getBot(result.ds.larkAppId).config;
+          const shouldRepostStreamingCard = botCfgResume.disableStreamingCard !== true
+            && !botCfgResume.noCardChats?.includes(result.ds.chatId);
           if (cardMessageId && value?.visibility !== 'private' && !botCfgResume.privateCard) {
             const staleCardId = cardMessageId;
             const resumedDs = result.ds;
             void (async () => {
               try {
-                const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
-                resumedDs.streamCardId = freshCardId;
+                if (shouldRepostStreamingCard) {
+                  const freshCardId = await sessionReply(rootId, buildStreamingCardJson(resumedDs), 'interactive');
+                  resumedDs.streamCardId = freshCardId;
+                } else {
+                  resumedDs.streamCardId = undefined;
+                  resumedDs.streamCardNonce = undefined;
+                  resumedDs.streamCardReplyTargetKey = undefined;
+                }
                 persistStreamCardState(resumedDs);
                 await deleteMessage(resumedDs.larkAppId, staleCardId).catch(() => { /* already withdrawn/expired */ });
-                // Also send the "✅ 会话已恢复…" text follow-up (the original resume
-                // behavior). Both are wanted: the live streaming card AND the text
-                // prompt telling the user to send a message to continue.
+                // Also send the "✅ 会话已恢复…" text follow-up (the original
+                // resume behavior) telling the user to send a message to continue.
                 await deliverEphemeralOrReply(resumedDs, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
-                logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button (withdraw + repost streaming card + text)`);
+                logger.info(
+                  `[${targetSessionId.substring(0, 8)}] Resumed via card button `
+                  + (shouldRepostStreamingCard
+                    ? '(withdraw + repost streaming card + text)'
+                    : '(withdraw card + text; streaming card disabled)'),
+                );
               } catch (err) {
                 logger.warn(`[${targetSessionId.substring(0, 8)}] resume card repost failed: ${err instanceof Error ? err.message : String(err)}`);
               }

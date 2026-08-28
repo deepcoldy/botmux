@@ -166,6 +166,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_new' } },                  // upsert_by_template
       { code: 0 },                                                 // robot/switch
       { code: 0 },                                                 // event/switch
+      { code: 0, data: { privileges: [], scopeBiz: [] } },         // privilege/all（数据范围收窄，无待收窄项）
       { code: 0, data: { versionId: 'v-init' } },                  // app_version/create（启用发布）
       { code: 0 },                                                 // publish/commit
       { code: 0, data: { secret: 'new-secret' } },                 // secret
@@ -181,6 +182,9 @@ describe('createOpenPlatformAppWithClient', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_new',
       '/developers/v1/event/switch/cli_new',
+      // 模板建出的应用数据范围默认是 mode:'all'（「全部」），必须在**这一版发布之前**
+      // 收窄，否则第一个版本仍带「全部」进审批。
+      '/developers/v1/privilege/all/cli_new',
       '/developers/v1/app_version/create/cli_new',
       '/developers/v1/publish/commit/cli_new/v-init',
       '/developers/v1/secret/cli_new',
@@ -199,15 +203,18 @@ describe('createOpenPlatformAppWithClient', () => {
     });
     expect(client.calls[2].body).toEqual({ clientId: 'cli_new', enable: true });
     expect(client.calls[3].body).toEqual({ clientId: 'cli_new', eventMode: 4 });
-    // 启用发布用极简版本 payload,可见成员含创建者(否则发布后不自动上架启用)
-    expect(client.calls[4].body).toMatchObject({
+    // 启用发布用极简版本 payload,可见成员含创建者(否则发布后不自动上架启用)。
+    // ⚠️ 按**路径**取而不是按下标：这条链路中间插过步骤（数据范围收窄），写死下标会让
+    // 任何后续插入都变成一堆看不出所以然的失败。
+    const bodyOf = (needle: string) => client.calls.find(call => call.path.includes(needle))?.body as any;
+    expect(bodyOf('/app_version/create/')).toMatchObject({
       appVersion: '1.0.0',
       visibleSuggest: { members: ['u_creator'], isAll: 0 },
       pcDefaultAbility: 'bot',
       mobileDefaultAbility: 'bot',
     });
-    expect(client.calls[4].body).not.toHaveProperty('applyReasonConfig');
-    expect(client.calls[5].body).toEqual({ clientId: 'cli_new' });
+    expect(bodyOf('/app_version/create/')).not.toHaveProperty('applyReasonConfig');
+    expect(bodyOf('/publish/commit/')).toEqual({ clientId: 'cli_new' });
   });
 
   it('fails closed (with appId) when the enabling publish commit fails — no silent orphan', async () => {
@@ -216,6 +223,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_commit_fail' } },
       { code: 0 },
       { code: 0 },
+      { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: { versionId: 'v-init' } }, // 版本创建成功
       { code: 1, msg: 'publish commit rejected' }, // commit 失败 → 抛
     ]);
@@ -227,6 +235,7 @@ describe('createOpenPlatformAppWithClient', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_commit_fail',
       '/developers/v1/event/switch/cli_commit_fail',
+      '/developers/v1/privilege/all/cli_commit_fail',
       '/developers/v1/app_version/create/cli_commit_fail',
       '/developers/v1/publish/commit/cli_commit_fail/v-init',
     ]);
@@ -238,6 +247,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_noverid' } },
       { code: 0 },
       { code: 0 },
+      { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: {} }, // code=0 但没 versionId → 可能留下未发布草稿
     ]);
     await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-nv', creatorUserId: 'u_creator' }))
@@ -253,6 +263,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_orphan_guard' } },
       { code: 0 },
       { code: 0 },
+      { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: { versionId: 'v-init' } },
       { code: 0 },
       { code: 0, data: {} }, // secret 缺失

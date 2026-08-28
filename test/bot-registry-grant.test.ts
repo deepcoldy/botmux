@@ -16,6 +16,29 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
   });
 
+  it('parseBotConfigsFromText preserves & filters chatMentionModes (four-state)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'mm1', larkAppSecret: 's',
+      chatMentionModes: {
+        oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient',
+        // Case/padding are normalized; unknown values and blank chat ids are dropped.
+        oc_5: '  NEVER  ', oc_6: 'bogus', oc_7: 42, '': 'never', '   ': 'always',
+      },
+    }]));
+    expect(cfgs[0].chatMentionModes).toEqual({
+      oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient', oc_5: 'never',
+    });
+  });
+
+  it('parseBotConfigsFromText leaves chatMentionModes undefined when absent/all-invalid/not-an-object', () => {
+    const at = (entry: Record<string, unknown>) =>
+      parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mm2', larkAppSecret: 's', ...entry }]))[0].chatMentionModes;
+    expect(at({})).toBeUndefined();
+    expect(at({ chatMentionModes: { oc_1: 'nope' } })).toBeUndefined();
+    // An array is an object in JS — the parser must still reject it.
+    expect(at({ chatMentionModes: ['always'] })).toBeUndefined();
+  });
+
   it('parseBotConfigsFromText preserves & filters chatGrants', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'a1', larkAppSecret: 's',

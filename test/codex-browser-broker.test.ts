@@ -5,7 +5,7 @@ import {
   resolveCodexBrowserPluginRoot,
   type DynamicToolCallParams,
 } from '../src/services/codex-browser-broker.js';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -182,7 +182,7 @@ describe('resolveCodexBrowserPluginRoot', () => {
         writeFileSync(join(scripts, 'browser-service.mjs'), 'export {}');
       }
       expect(resolveCodexBrowserPluginRoot()).toBe(
-        join(root, 'plugins', 'cache', 'openai-bundled', 'chrome', '26.10.1'),
+        realpathSync(join(root, 'plugins', 'cache', 'openai-bundled', 'chrome', '26.10.1')),
       );
     } finally {
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;

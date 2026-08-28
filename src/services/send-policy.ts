@@ -35,6 +35,55 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+export interface AfterTheFactTopicQuoteArgs {
+  /** The message id this send would quote (null ⇒ nothing to decide). */
+  quoteTargetId: string | null;
+  /**
+   * The frozen per-turn record's `inThread` for the turn that produced
+   * `quoteTargetId`: did the inbound message arrive from INSIDE a topic?
+   * `undefined` = unknown (pre-`inThread` session row).
+   */
+  quotedTurnInThread?: boolean;
+  /**
+   * `thread_id` the quote target carries RIGHT NOW, freshly probed from Lark.
+   * `null` = confirmed no topic. `undefined` = probe failed / not attempted.
+   */
+  currentThreadId?: string | null;
+  /** An explicit `--quote <id>` is the operator's own choice; never override it. */
+  explicitQuote?: string;
+}
+
+/**
+ * Whether a chat-scope send must DROP its quote and post flat instead.
+ *
+ * Lark's reply API makes a reply inherit the **current** topic membership of the
+ * message it quotes — `reply_in_thread: false` only declines to OPEN a new
+ * topic, it cannot escape an existing one. So when the user @s the bot at group
+ * top level and only AFTERWARDS opens a 话题 on that very message, quoting it
+ * drops the answer into a topic the user never @'d the bot in (the same
+ * user-reported bug the regular-group fold fixes on the dispatcher side — this
+ * is its `botmux send` half, which owns the visible prose reply).
+ *
+ * Requires BOTH halves, so it can only ever fire on the exact reported case:
+ *   • the quoted turn arrived at top level (`inThread === false`), and
+ *   • that message NOW carries a `thread_id` — i.e. the topic appeared later.
+ *
+ * Fails toward the pre-existing behavior (keep quoting) whenever either half is
+ * unknown: an old session row has no `inThread`, and a failed/skipped probe
+ * leaves `currentThreadId` undefined. Quoting is the long-standing default, so
+ * uncertainty must never silently change where every normal reply lands.
+ */
+export function shouldDropAfterTheFactTopicQuote(args: AfterTheFactTopicQuoteArgs): boolean {
+  if (!args.quoteTargetId) return false;
+  // `--quote <id>` is an explicit operator instruction; honor it verbatim.
+  if (args.explicitQuote) return false;
+  // Only a turn PROVEN to have arrived at top level can be a victim here.
+  // `undefined` (legacy row) must keep the old behavior, never guess.
+  if (args.quotedTurnInThread !== false) return false;
+  // The topic must actually exist now. `undefined` = we don't know ⇒ keep quoting.
+  return typeof args.currentThreadId === 'string' && args.currentThreadId.trim().length > 0;
+}
+
 export interface ManagedVcQuoteArgs {
   managed: boolean;
   durableDelivery: boolean;

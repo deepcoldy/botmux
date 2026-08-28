@@ -11,6 +11,9 @@ vi.mock('../src/platform/binding.js', () => ({
   publicReverseProxyBaseUrl: vi.fn(() => null),
   readPlatformBinding: vi.fn(() => null),
 }));
+vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
+  devboxDashboardBaseUrl: vi.fn(() => null),
+}));
 
 import {
   buildDashboardUrl,
@@ -27,6 +30,7 @@ import {
   publicReverseProxyBaseUrl,
   readPlatformBinding,
 } from '../src/platform/binding.js';
+import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
@@ -34,6 +38,7 @@ const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).
 const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
   vi.mocked(readPlatformBinding).mockReturnValue(binding)
 );
+const setDevbox = (base: string | null) => vi.mocked(devboxDashboardBaseUrl).mockReturnValue(base);
 
 describe('buildDashboardUrl', () => {
   beforeEach(() => {
@@ -41,6 +46,7 @@ describe('buildDashboardUrl', () => {
     setPlatform(null);
     setPublic(null);
     setBinding(null);
+    setDevbox(null);
   });
 
   it('builds a local host:port URL with token when remote access is off', () => {
@@ -100,6 +106,33 @@ describe('buildDashboardUrl', () => {
       'https://m-deadbeef.botmux.example/?t=abc',
     );
   });
+
+  it('routes through a cached Merlin Devbox export when no explicit remote base exists', () => {
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 9001, token: 'abc' })).toBe(
+      'https://devbox.example.com/?t=abc',
+    );
+  });
+
+  // The Devbox lookup validates the cache against the port the dashboard
+  // actually bound (`.dashboard-port`), not against the port this link is for:
+  // v3 card callers pass config.dashboard.port, which goes stale after an
+  // EADDRINUSE probe, and would otherwise demote a working tunnel link.
+  it('asks the Devbox lookup about the bound port, not the caller port', () => {
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 7891, token: 'abc' })).toBe(
+      'https://devbox.example.com/?t=abc',
+    );
+    expect(devboxDashboardBaseUrl).toHaveBeenLastCalledWith();
+  });
+
+  it('lets BOTMUX_PUBLIC_URL win over a cached Merlin Devbox export', () => {
+    setPublic('https://botmux.example.com');
+    setDevbox('https://devbox.example.com');
+    expect(buildDashboardUrl({ host: '1.2.3.4', port: 9001, token: 'abc' })).toBe(
+      'https://botmux.example.com/?t=abc',
+    );
+  });
 });
 
 describe('buildDashboardUrls', () => {
@@ -107,6 +140,7 @@ describe('buildDashboardUrls', () => {
     setRemote(false);
     setPlatform(null);
     setPublic(null);
+    setDevbox(null);
   });
 
   it('local-only: no localUrl fallback when the primary is already local', () => {

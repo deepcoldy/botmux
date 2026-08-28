@@ -586,6 +586,7 @@ describe('dashboard secret persistence', () => {
     if (process.platform === 'win32') return;
     mkdirSync(join(dir, 'nested'));
     writeFileSync(secretPath, 'x'.repeat(43), { mode: 0o644 });
+    chmodSync(secretPath, 0o644);
     expect(() => loadDashboardSecret(secretPath)).toThrow(/0600/);
   });
 

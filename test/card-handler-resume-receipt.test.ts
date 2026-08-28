@@ -37,6 +37,20 @@ const ROOT_ID = 'om_root_resume';
 const CHAT_ID = 'oc_1';
 const OWNER = 'ou_owner';
 
+function configureBot(overrides: Record<string, unknown> = {}): void {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-resume-receipt-'));
+  const cfg = join(dir, 'bots.json');
+  writeFileSync(cfg, JSON.stringify([{
+    larkAppId: APP_ID,
+    larkAppSecret: 's',
+    cliId: 'copilot',
+    lang: 'zh',
+    allowedUsers: [OWNER],
+    ...overrides,
+  }], null, 2));
+  process.env.BOTS_CONFIG = cfg;
+}
+
 function makeDs(cliId: string, cliSessionId?: string): DaemonSession {
   return {
     larkAppId: APP_ID,
@@ -85,16 +99,7 @@ async function fresh() {
 }
 
 beforeEach(() => {
-  const dir = mkdtempSync(join(tmpdir(), 'botmux-resume-receipt-'));
-  const cfg = join(dir, 'bots.json');
-  writeFileSync(cfg, JSON.stringify([{
-    larkAppId: APP_ID,
-    larkAppSecret: 's',
-    cliId: 'copilot',
-    lang: 'zh',
-    allowedUsers: [OWNER],
-  }], null, 2));
-  process.env.BOTS_CONFIG = cfg;
+  configureBot();
 });
 
 afterEach(() => {
@@ -103,7 +108,7 @@ afterEach(() => {
 });
 
 describe('card-handler resume receipt', () => {
-  // The resume flow reposts the live streaming card FIRST (sessionReply with an
+  // With streaming cards enabled, the resume flow reposts the live card FIRST (sessionReply with an
   // interactive card body) and then sends the "会话已恢复 / 新起干净会话" text
   // receipt from a background task. So the receipt is no longer sessionReply
   // call[0] — it is the TEXT call among the sessionReply calls. Extract it by
@@ -166,5 +171,33 @@ describe('card-handler resume receipt', () => {
     const receipt = textReceipt(sessionReply);
     expect(receipt).toContain('会话已恢复');
     expect(receipt).not.toContain('新起干净会话');
+  });
+
+  it('does not repost a live card when streaming cards are disabled for the bot', async () => {
+    configureBot({ disableStreamingCard: true });
+    const { handler, resumeSession: mockedResume } = await fresh();
+    mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot', 'cli-sess-9') });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await flushBackground();
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('会话已恢复');
+  });
+
+  it('does not repost a live card when streaming cards are disabled for the chat', async () => {
+    configureBot({ noCardChats: [CHAT_ID] });
+    const { handler, resumeSession: mockedResume } = await fresh();
+    mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot', 'cli-sess-9') });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await flushBackground();
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('会话已恢复');
   });
 });

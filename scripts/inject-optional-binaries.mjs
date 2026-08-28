@@ -48,12 +48,23 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
   throw new Error(`invalid version ${JSON.stringify(version)} (expected X.Y.Z or X.Y.Z-tag.N, no leading "v")`);
 }
 
-/** The four platform subpackages, matching packages/binary-<platform>-<arch>/. */
+/**
+ * The platform subpackages, matching packages/binary-<platform>-<arch>[-musl]/.
+ *
+ * The two `-musl` entries are load-bearing for Alpine: npm chooses among optional
+ * platform deps by `os`/`cpu`/`libc`, and `libc` is the ONLY field that separates a
+ * musl host from a glibc one (both report linux/x64). Publishing the musl
+ * subpackages without listing them here leaves them on the registry with nothing
+ * referencing them — npm never even considers them, and Alpine falls back to the
+ * glibc package, which cannot exec.
+ */
 export const PLATFORM_PACKAGES = [
   'botmux-darwin-arm64',
   'botmux-darwin-x64',
   'botmux-linux-arm64',
+  'botmux-linux-arm64-musl',
   'botmux-linux-x64',
+  'botmux-linux-x64-musl',
 ];
 
 const manifestPath = join(repoRoot, 'package.json');

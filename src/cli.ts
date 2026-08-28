@@ -100,7 +100,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
-import { reapLegacyPm2 } from './core/legacy-pm2-reaper.js';
+import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
@@ -131,10 +131,14 @@ import {
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
+import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   executeDashboardCommand,
@@ -2452,12 +2456,22 @@ function sleepSyncMs(ms: number): void {
  * double-run alongside the supervisor. This detects that stale God and stops it
  * (delegated to the self-contained `reapLegacyPm2`), so the operator never has
  * to `pm2 kill` by hand. Fail-safe + no-op on fresh installs / when pm2 is
- * absent (always the case for the compiled single binary). The `_op` parameter
- * is retained for call-site compatibility but no longer changes behavior — the
- * reaper is a single idempotent operation.
+ * absent. The `_op` parameter is retained for call-site compatibility but no
+ * longer changes behavior — the reaper is a single idempotent operation.
+ *
+ * A reap that finds a God but cannot confirm it is down is reported on STDERR,
+ * not just through `logger`: CLI mode runs with `logger.setSilent(true)`, so the
+ * reaper's own notes are invisible without DEBUG. That silence is how a
+ * double-run started unnoticed — both fleets live, two processes consuming the
+ * same Feishu events and the same session sqlite. The operator needs to see it.
  */
 function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
   const r = reapLegacyPm2(CONFIG_DIR, PKG_ROOT, (m) => logger.info(`[legacy-pm2] ${m}`));
+  if (r.unresolved) {
+    console.warn(`⚠️  检测到迁移前的 pm2 守护进程,但未能确认其已停止:${r.note}`);
+    console.warn('   旧 fleet 可能仍在消费同一批飞书事件(消息重复、会话存储争用)。');
+    console.warn('   请手动确认:ps -ef | grep index-daemon   然后停掉旧进程后重试。');
+  }
   return r.found;
 }
 
@@ -2849,14 +2863,18 @@ async function ensureSystemDependencies(): Promise<void> {
  * supervisor view while old pm2-managed daemons keep running. Self-contained:
  * no pm2 CLI call. `botmux start`/`restart` will reap it (reapLegacyPm2).
  *
- * TWO SIGNALS, deliberately different per home — this must agree with
- * reapLegacyPm2's detection or the warning lies in one direction or the other:
+ * TWO SIGNALS, deliberately different per home. Both go through the reaper's own
+ * `liveGodAt` so the warning and the reaper cannot disagree — this used to be a
+ * second, hand-kept copy of that logic, and it drifted: it trusted a bare
+ * `kill(pid, 0)` (true for the ZOMBIE a fresh reap leaves behind) and a bare
+ * `existsSync(rpc.sock)` (which outlives `pm2 kill`), so the warning survived a
+ * SUCCESSFUL migration and no amount of re-running `restart` could clear it.
  *
  *  • The botmux-dedicated home (~/.botmux/pm2) is exclusively ours, so ANY live
- *    God there is a migration leftover. Detect it by pm2.pid OR rpc.sock: a real
- *    God was observed supervising 50 daemons with NO pm2.pid at all, and a
- *    pid-file-only probe stayed silent through exactly the situation this warning
- *    exists for.
+ *    God there is a migration leftover. `liveGodAt` detects it by pm2.pid OR a
+ *    held rpc.sock: a real God was observed supervising 50 daemons with NO
+ *    pm2.pid at all, and a pid-file-only probe stayed silent through exactly the
+ *    situation this warning exists for.
  *
  *  • The shared default (~/.pm2) may be the user's own pm2 running unrelated
  *    apps. A live God there means nothing by itself — MEASURED on this box: the
@@ -2867,23 +2885,9 @@ async function ensureSystemDependencies(): Promise<void> {
  */
 function legacyBotmuxGodAlive(): boolean {
   const dedicated = join(CONFIG_DIR, 'pm2');
-  if (pm2GodAlive(dedicated)) return true;
+  if (liveGodAt(dedicated) !== null) return true;
   const shared = join(homedir(), '.pm2');
-  return pm2GodAlive(shared) && sharedHomeHasBotmuxRows(shared);
-}
-
-/** A God is alive at `home` if its pid file points at a live process, or (when
- *  the file is missing/stale) its RPC socket is still there. */
-function pm2GodAlive(home: string): boolean {
-  const pidFile = join(home, 'pm2.pid');
-  if (existsSync(pidFile)) {
-    let pid = 0;
-    try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
-    if (Number.isSafeInteger(pid) && pid > 1) {
-      try { process.kill(pid, 0); return true; } catch { /* stale — try the socket */ }
-    }
-  }
-  return existsSync(join(home, 'rpc.sock'));
+  return liveGodAt(shared) !== null && sharedHomeHasBotmuxRows(shared);
 }
 
 /** Does the SHARED pm2 home actually hold botmux apps? pm2 writes one pid file
@@ -3119,6 +3123,25 @@ async function callDashboardEndpoint(path: DashboardEndpoint): Promise<Dashboard
 }
 
 /**
+ * Merlin Devbox 上为当前 dashboard 端口创建（或复用）私有短链。
+ *
+ * 端口取 dashboard 落盘的 `.dashboard-port`（端口探测可能落在 7891 之外），与
+ * `devboxDashboardBaseUrl()` 读侧用的是同一份判据，避免写 9002、读 9001。
+ * 非 Devbox / 已配置中心平台或自建反代 / `merlin-cli` 不可用时全部静默 no-op。
+ */
+async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
+  const portFile = join(CONFIG_DIR, '.dashboard-port');
+  const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || process.env.BOTMUX_DASHBOARD_PORT || '7891');
+  await ensureDevboxDashboardExport({
+    port,
+    remoteBaseConfigured: Boolean(
+      (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
+    ),
+  });
+}
+
+/**
  * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
  * via /__cli/current (non-rotating) so an already-shared URL is preserved.
  * Retries for a few seconds since the dashboard process boots after the daemon;
@@ -3129,6 +3152,10 @@ async function printDashboardHintWithRetry(): Promise<void> {
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
+  // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
+  // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
+  // 才 6s，实测会把 start/restart 的这段拖到近两倍。
+  await ensureDevboxDashboardExportForCurrentPort();
   while (Date.now() - started < maxWaitMs) {
     last = await callDashboardEndpoint('/__cli/current');
     if (last.ok) {
@@ -3160,6 +3187,11 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
+  const rawAction = args[0]?.toLowerCase();
+  const resolvesEndpoint = args.length <= 1
+    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
+    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
+  if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
   const execution = await executeDashboardCommand(args, callDashboardEndpoint);
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
@@ -3252,6 +3284,13 @@ interface SessionData {
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
+   *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
+   *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
+  turnReplyContexts?: Record<string, {
+    target?: { mode?: string; chatId?: string; rootMessageId?: string };
+    inThread?: boolean;
+  }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
   queued?: boolean;
@@ -5930,6 +5969,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
     Bot→Bot 默认进入 Queue；要显式调整对方活跃的 Codex App turn，把 @steer 写成
     正文首个语义行（可放在收件人 @ 行之后）。接收端会消费该指令，不交给模型。
     （可设 BOTMUX_REQUIRE_MENTION_DECISION=false 关闭硬门）
+  card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
+                       原地更新之前用 send --card-file/--card-json 发出的自定义卡片
+                       （不发新消息、不换群/话题）；messageId 取自 send 成功输出的 .messageId，
+                       卡片安全校验与 send 相同；[--session-id <sid>] 可手动指定会话
   bots list                            列出当前群聊中的机器人（含 open_id）
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
@@ -6770,6 +6813,25 @@ async function cmdHistory(rest: string[]): Promise<void> {
         ...(cardJson !== undefined ? { cardJson } : {}),
       };
     }));
+    // Range guidance, emitted at the moment the model is actually reading
+    // history. The decisive fact is `sessionScope` (this session's own scope),
+    // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
+    // chat_mode='group' while its session is thread-scope, so reasoning from the
+    // group type would wrongly conclude "I may search the whole chat". Both
+    // `--scope` gates above key on isChatScope for exactly that reason.
+    //
+    // Wording note: describe only what the model can OBSERVE. Daemon-side
+    // invocations (`/t` and friends) are stripped before the prompt is built, so
+    // the model never sees them — naming them here would be an instruction it
+    // cannot act on. Describe the symptom instead: the topic starts mid-discussion
+    // and its own history looks too short to explain the task.
+    const rangeHint = isChatScope
+      ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
+      : effectiveScope === 'thread'
+        ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+        : effectiveScope === 'ambient'
+          ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
+          : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
     console.log(JSON.stringify({
       sessionId: sid,
       chatId: s.chatId,
@@ -6785,6 +6847,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
       } : {}),
       messages,
       total: messages.length,
+      rangeHint,
       // Discoverability: agents reading history often need the actual image
       // bytes (alert charts) or the raw card JSON — both live one command away.
       ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
@@ -6962,6 +7025,7 @@ import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
+  shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
@@ -8478,7 +8542,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -8734,6 +8798,31 @@ async function cmdSend(rest: string[]): Promise<void> {
         ?? frozenTurnDispatch?.quoteTargetId
         ?? s.quoteTargetId,
   });
+  // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边。飞书的 reply 接口让回复继承
+  // 被引用消息**此刻**的话题归属（`reply_in_thread:false` 只是不新开话题，逃不出
+  // 已有话题），所以引用一条事后被开成话题的顶层消息，会把回复带进用户根本没在
+  // 其中 @ 过 bot 的话题里 —— dispatcher 侧的 fold 只管住了卡片，正文由这里决定。
+  //
+  // 只在「该轮确证从顶层进来（inThread === false）且本次真要 quote」时才探测一次
+  // 飞书；话题内轮次、`--top-level`、`--no-quote`、`--quote`、thread-scope 全部在
+  // 上面或 `shouldDropAfterTheFactTopicQuote` 里短路，普通热路径不多付这次调用。
+  // 探测失败一律保持 quote（既有默认行为），绝不因为不确定就改变所有正常回复的落点。
+  const quotedTurnInThread = quoteTargetId
+    ? (s.turnReplyContexts?.[currentTurnId ?? '']?.inThread
+      ?? s.turnReplyContexts?.[quoteTargetId]?.inThread)
+    : undefined;
+  let effectiveQuoteTargetId = quoteTargetId;
+  if (quoteTargetId && !explicitQuote && quotedTurnInThread === false) {
+    const probedThreadId = await getMessageThreadId(appId, quoteTargetId).catch(() => undefined);
+    if (shouldDropAfterTheFactTopicQuote({
+      quoteTargetId,
+      quotedTurnInThread,
+      currentThreadId: probedThreadId,
+      explicitQuote,
+    })) {
+      effectiveQuoteTargetId = undefined;
+    }
+  }
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
   const dispatchPrimary = async (
@@ -8746,7 +8835,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     revalidateVcMeetingManagedSend();
     const proposedOutput = {
       targetChatId,
-      ...(quoteTargetId ? { quoteTargetId } : {}),
+      ...(effectiveQuoteTargetId ? { quoteTargetId: effectiveQuoteTargetId } : {}),
       msgType,
       content,
     };
@@ -9348,6 +9437,67 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error(`发送失败: ${err.message}`);
     process.exit(1);
   }
+}
+
+// ─── Card subcommand (patch a previously-sent custom card in place) ───
+
+async function cmdCard(rest: string[]): Promise<void> {
+  const sub = rest[0] ?? '';
+  if (sub === '' || sub === '--help' || sub === '-h') {
+    console.log(CARD_COMMAND_USAGE);
+    return;
+  }
+  if (sub !== 'patch') {
+    console.error(
+      `未知 card 子命令: ${sub}\n` +
+      `用法: botmux card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>) [--session-id <sid>]`,
+    );
+    process.exit(2);
+  }
+  const args = rest.slice(1);
+  // Help wins over the missing-arg validation and the transport gates below.
+  if (cardPatchArgsWantHelp(args)) {
+    console.log(CARD_PATCH_USAGE);
+    return;
+  }
+  // Same two transport doors as `botmux send`: a no-transport turn (apiOnly bot
+  // or HTTP virtual session) may not originate ANY Feishu write — including a
+  // card patch.
+  assertTurnTransportOrExit('card patch');
+  // Read isolation: register this bot from its own worker-written cred file so
+  // the Lark client resolves without reading the denied bots.json (same as
+  // cmdSend/cmdHistory).
+  await registerSelfFromCredFile();
+
+  const parsed = parseCardPatchArgs(args);
+  if (!parsed.ok) {
+    console.error(`botmux card patch: ${parsed.error}`);
+    process.exit(2);
+  }
+  const input = readCardPatchInput(parsed.cardFile, parsed.cardJson);
+  if (!input.ok) {
+    console.error(`botmux card patch: ${input.error}`);
+    process.exit(input.exitCode);
+  }
+  // Bot identity comes from the session context only (same as send): no
+  // --bot-style explicit selector. Resolves --session-id / ancestor pid marker
+  // / BOTMUX_SESSION_ID / riff sandbox, and registers the bot so getBotClient
+  // works. Exits 1 on failure (session not found / no larkAppId), same as send.
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  // Target-aware door: a --session-id pointing at a virtual/apiOnly session is
+  // refused even from a transport-capable turn.
+  assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
+
+  const { updateMessage } = await import('./im/lark/client.js');
+  const outcome = await executeCardPatch(
+    { updateMessage },
+    { larkAppId, messageId: parsed.messageId, rawCard: input.rawCard },
+  );
+  if (!outcome.ok) {
+    console.error(`botmux card patch: ${outcome.error}`);
+    process.exit(outcome.exitCode);
+  }
+  console.log(buildCardPatchSuccessOutput(outcome.messageId, sid));
 }
 
 // ─── Dispatch subcommand (Phase 0: open a sub-project thread + assign bots) ───
@@ -12690,7 +12840,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
   'vc-agent', 'report', 'actor',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
@@ -12969,6 +13119,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;

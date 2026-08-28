@@ -981,6 +981,22 @@ export interface FrozenSessionReplyContext {
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
   replyTargetSenderIsBot?: boolean;
+  /**
+   * The inbound message that opened this turn already carried a Lark
+   * `thread_id` — i.e. it arrived from INSIDE a topic, not from the group's
+   * flat top level.
+   *
+   * `target.mode` alone cannot express this: a chat-scope turn records
+   * `mode:'plain'` both for a genuine top-level @ AND for a native-topic seed
+   * (whose opening message carries thread_id but no root_id, so neither the
+   * regular-group fold nor the shared-topic seeder supplies a replyRootId).
+   * Only the pair (`mode==='plain'` && `inThread !== true`) means "this session
+   * answered that message flat, AT TOP LEVEL".
+   *
+   * Written for chat-scope turns only; absent on older persisted rows, where it
+   * reads as "unknown" and callers must fail toward the pre-existing behavior.
+   */
+  inThread?: boolean;
 }
 
 /** Host-side destination frozen when a Codex App turn crosses daemon

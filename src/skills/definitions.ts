@@ -270,7 +270,7 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 按 messageId 原地更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -426,6 +426,28 @@ botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention 
 botmux send --card-file /tmp/card.json --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
+
+#### 发出后原地更新：\`botmux card patch\`
+
+自定义卡片发出后可以**原地改内容**——不发新消息、不换群/话题，用户看到的还是那张卡。适合进度卡片（开始时发「进行中」，每到节点刷新，结束改「完成」，不刷屏）和状态卡片（构建/审批结果过期后原地更正）。只想再发一条消息就用 \`send\`；daemon 自己维护的流式卡片/会话管理卡不要 patch；消息已撤回只能重新 send。
+
+流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
+
+\`\`\`bash
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
+\`\`\`
+
+| 参数 | 说明 |
+|---|---|
+| \`--message-id <om_xxx>\` | 必填。目标卡片的 messageId，取自 \`botmux send\` 成功输出的 \`.messageId\` |
+| \`--card-file <path>\` / \`--card-json <json>\` | 新卡片 JSON，二选一 |
+| \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
+
+安全边界与上面的 \`send --card-file/--card-json\` **完全相同**：只允许纯展示元素 + open_url 按钮，任何回调控件都会被拒绝。Bot 身份从会话上下文解析，不提供 \`--bot\` 类显式指定；飞书本身也禁止跨应用 patch 别人的卡片。
+
+成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
 
 ### @mention 其他机器人协作
 
@@ -1618,4 +1640,8 @@ export const RETIRED_SKILL_NAMES: string[] = [
   // (Groups & Bots → bot card). The CLI subcommand was removed too, so the
   // skill has nothing to drive — prune it from every CLI's skills dir on upgrade.
   'botmux-worker-budget',
+  // Folded into botmux-send as the "发出后原地更新" section (the `botmux card
+  // patch` subcommand stays). Only pre-release builds of this branch ever wrote
+  // it, but those installs must not linger as a duplicate skill.
+  'botmux-card-patch',
 ];

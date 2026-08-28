@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
+import { isStandaloneBinary } from './core/self-spawn.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -159,7 +160,7 @@ import { parseCloseResidual, type ParsedCloseResidual } from './core/close-resid
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -1859,6 +1860,92 @@ const WEB_DIR = join(__dirname, 'dashboard-web');
 const DEV_RELOAD_MARKER = join(WEB_DIR, '.botmux-dashboard-dev');
 const DEV_RELOAD_VERSION = join(WEB_DIR, '.botmux-dashboard-reload');
 
+/**
+ * Request-relative asset path → on-disk path to read, or null when we have no
+ * such asset. The ONE place that knows whether the frontend lives on disk
+ * (source/npm) or inside the compiled binary's virtual filesystem.
+ *
+ * WHY: `WEB_DIR` is derived from `__dirname`, which in the compiled single binary
+ * is the virtual `/$bunfs/root` — a path that does not exist on disk (the
+ * documented CLAUDE.md `__dirname` hazard). Every asset request therefore missed
+ * and fell through to the catch-all 404: the login redirect landed on `/` and
+ * returned `{"error":"not_found_yet","path":"/"}`, so the Dashboard was entirely
+ * unreachable from a compiled binary while working fine from npm/source.
+ *
+ * In compiled mode the assets are embedded instead (see
+ * scripts/generate-dashboard-embed.mjs) and Bun renames each one with a content
+ * hash, so the request path cannot address them directly — the generated manifest
+ * supplies the mapping. Extensions are preserved, so MIME lookup is unaffected.
+ *
+ * Path traversal is handled differently per mode, and both are closed:
+ *  • Embedded: the manifest is a build-time allowlist, so a traversal string
+ *    simply misses. The lookup still goes through `hasOwnProperty` and a string
+ *    check — a plain `map[rel]` answers `__proto__`/`constructor`/`toString` with
+ *    inherited objects and functions (MEASURED), and handing one of those onward
+ *    would only be stopped by a downstream throw. A security property should not
+ *    rest on that.
+ *  • On disk: the resolved path must stay inside WEB_DIR.
+ *
+ * Returns null (→ caller 404s) rather than throwing: an asset genuinely absent
+ * from the bundle must stay a 404, exactly as a missing file on disk does.
+ */
+function resolveWebAsset(rel: string): string | null {
+  const embedded = embeddedDashboardAssets();
+  if (embedded) {
+    if (!Object.prototype.hasOwnProperty.call(embedded, rel)) return null;
+    const fp = embedded[rel];
+    return typeof fp === 'string' && fp.length > 0 ? fp : null;
+  }
+  // Source / npm install: real directory on disk. Keep the path-traversal guard
+  // here — `rel` is derived from the request.
+  const fp = resolve(WEB_DIR, rel);
+  const relToRoot = relative(resolve(WEB_DIR), fp);
+  if (relToRoot === '..' || relToRoot.startsWith('..\\') || relToRoot.startsWith('../') || isAbsolute(relToRoot)) return null;
+  return fp;
+}
+
+/**
+ * The compiled binary's embedded-asset manifest, or null when running from
+ * source/npm (where the frontend is a real directory on disk). Resolved once and
+ * cached — including the null.
+ *
+ * HOW IT GETS HERE: the compiled build's plugin (scripts/bun-native-embed-plugin.mjs)
+ * prepends a generated block of `import … with { type: 'file' }` statements to
+ * this module and assigns the map to `globalThis.__BOTMUX_DASHBOARD_ASSETS__`.
+ *
+ * It has to arrive by build-time injection rather than an ordinary import:
+ *  • A static `import './dashboard-web-embedded.js'` would make `tsc` (and a
+ *    plain source checkout) demand a generated artifact that only exists after
+ *    `bun run dashboard:bundle`.
+ *  • A runtime `require()` of it does NOT work: Bun only embeds what it can trace
+ *    statically, and MEASURED, a `createRequire` require of the manifest bundled
+ *    1 module and embedded zero assets — the binary would still 404 everything.
+ */
+let embeddedAssetsCache: Record<string, string> | null | undefined;
+function embeddedDashboardAssets(): Record<string, string> | null {
+  if (embeddedAssetsCache !== undefined) return embeddedAssetsCache;
+  const injected = (globalThis as Record<string, unknown>).__BOTMUX_DASHBOARD_ASSETS__;
+  if (injected && typeof injected === 'object') {
+    embeddedAssetsCache = injected as Record<string, string>;
+  } else {
+    embeddedAssetsCache = null;
+    // A compiled binary with no injected manifest is a BUILD regression, not a
+    // runtime condition to paper over. Say it loudly: the symptom is a 404 on
+    // every page, which otherwise reads as a routing or auth bug.
+    if (isStandaloneBinary()) {
+      logger.error('[dashboard] compiled binary has no embedded frontend — every asset will 404');
+    }
+  }
+  return embeddedAssetsCache;
+}
+
+/** Cache-busting stamp for embedded assets, whose `mtimeMs` is 0 (MEASURED).
+ *  The baked release version changes with every binary, so it invalidates a
+ *  browser's cached copy exactly when the binary changes. */
+function embeddedAssetStamp(): string {
+  return (bakedBinaryVersion() ?? 'embedded').replace(/[^\w.-]/g, '');
+}
+
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript',
@@ -1926,11 +2013,14 @@ function serveStatic(
   options: { injectHtml?: (html: string) => string } = {},
 ): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const fp = resolve(WEB_DIR, rel);
-  const webRoot = resolve(WEB_DIR);
-  const relToRoot = relative(webRoot, fp);
-  // Path-traversal guard: resolved path must stay inside WEB_DIR.
-  if (relToRoot === '..' || relToRoot.startsWith('..\\') || relToRoot.startsWith('../') || isAbsolute(relToRoot)) return false;
+  const fp = resolveWebAsset(rel);
+  if (!fp) return false;
+  // Asset-identity decisions below key off the REQUEST path, not `fp`: in the
+  // compiled binary `fp` is a content-hash-renamed file in the virtual fs
+  // (`chunks/x.js` → `/$bunfs/root/x-<hash>.js`), so `relative(WEB_DIR, fp)`
+  // would classify every embedded asset wrongly — no chunk would be immutable
+  // and index.html would never get its CSRF shell injected.
+  const relToRoot = rel;
   try {
     const st = statSync(fp);
     if (!st.isFile()) return false;
@@ -1938,7 +2028,11 @@ function serveStatic(
     // a deploy never serves new JS with old CSS. Lazy chunks are content-hashed
     // and can be cached immutably once the current app.js points at them.
     const immutableChunk = relToRoot.startsWith('chunks/') || relToRoot.startsWith('chunks\\');
-    const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+    // `mtimeMs` is 0 for an embedded file (MEASURED), so the ETag would collapse
+    // to size alone across a whole compiled release. Fold in the baked build
+    // identity so a new binary always invalidates the browser's cache.
+    const etagStamp = st.mtimeMs > 0 ? Math.floor(st.mtimeMs).toString(16) : embeddedAssetStamp();
+    const etag = `W/"${st.size.toString(16)}-${etagStamp}"`;
     const isIndex = relToRoot === 'index.html';
     const devIndex = isIndex && dashboardDevReloadEnabled();
     // 注入 CSRF 票据的壳是每次请求现生成的：ETag 只反映磁盘文件，走 304 会让浏览

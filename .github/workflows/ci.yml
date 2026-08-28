@@ -128,3 +128,133 @@ jobs:
         # instead of booting a credentialed bot.
         run: node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64
 
+  # The musl (Alpine) binary, gated on PRs — not only at release time.
+  #
+  # WHY THIS JOB EXISTS SEPARATELY FROM `bun-binary`: the musl binary is a shipped
+  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time and
+  # node-pty ships no linux prebuild, so it is compiled against whatever libc the
+  # builder runs on (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine →
+  # `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
+  # cleanly and fails only when the native is dlopen'd, on the user's machine.
+  #
+  # This job previously lived ONLY in release.yml, which runs on tag push. That
+  # meant a PR could change the build script, the embed plugin, or node-pty's
+  # version and the musl leg was first exercised during a release — after npm had
+  # published. This mirrors the release leg so the PR gate is not weaker.
+  #
+  # Only linux-x64-musl is built: GitHub offers no Alpine runner, so musl requires
+  # a container, and arm64 would need the (slower, separately-queued) arm64 runner.
+  # The release workflow still builds BOTH musl arches; this is the PR canary.
+  #
+  # ⚠️ THE COST OF THAT x64-ONLY CHOICE, MEASURED: it was made for runner time, and
+  # arm64-musl turned out to be the one cell with a PLATFORM-level obstacle — a
+  # job-level `container: node:22-alpine` cannot run JS actions (actions/checkout)
+  # on an arm64 runner at all. So this gate was green while the release failed. The
+  # structure below (JS actions on the host, build inside `docker run`) is the fix,
+  # and it is used here too so both workflows stay on ONE shape: if this leg ever
+  # gains an arch, it will not re-learn the same lesson.
+  bun-binary-musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      # Runs on the HOST (glibc), which is what keeps this arch-portable.
+      - uses: actions/checkout@v6
+
+      - name: Build and smoke the musl binary inside Alpine
+        # Every musl-side step in one container invocation. `--platform` is
+        # deliberately NOT passed: the image must resolve to the runner's own
+        # architecture, since the native has to be built for the arch it ships on.
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e CI_RUN_NUMBER="${{ github.run_number }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:22-alpine sh -euc '
+              # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty has no linux
+              # prebuild and must compile here. binutils supplies readelf.
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
+
+              npm i -g bun@1.4.0 --loglevel=error
+              echo "bun $(bun --version) on $(uname -m)"
+
+              # Compiles node-pty against MUSL — the entire point of this job.
+              bun install --frozen-lockfile
+
+              # Fail closed rather than compiling a musl binary around a glibc
+              # native: that mistake survives the build and surfaces only when the
+              # native is loaded.
+              f=node_modules/node-pty/build/Release/pty.node
+              test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
+              if ! readelf -d "$f" | grep -q "libc\.musl"; then
+                echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
+              fi
+              echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s " ")"
+
+              # Same reason and same ORDER as the glibc job above: the compiled
+              # binary has no package.json on disk, so the version is baked at
+              # compile time, and the repo'"'"'s 0.0.0 placeholder is deliberately
+              # treated as "nothing baked" — compiling from it yields
+              # `--version: unknown`, which the smoke gate fails. Must also come
+              # AFTER install, so --frozen-lockfile sees the committed manifest.
+              npm version "0.0.0-ci.${CI_RUN_NUMBER}" --no-git-tag-version --allow-same-version
+
+              bun run build
+              bun scripts/build-bun-binary.mjs --target bun-linux-x64-musl \
+                --out dist-bin/botmux-linux-x64-musl
+
+              # Same shared script as the glibc leg, so this gate can never be the
+              # weaker one. This is also where an unloadable native is caught:
+              # dist/cli.js statically imports node-pty (via the backends), and
+              # node-pty dlopens the native at MODULE scope — verified by mutation,
+              # corrupting the embedded pty.node makes check 1 die with
+              # ERR_DLOPEN_FAILED. So running the binary at all proves the musl
+              # native loads; no separate PTY step is needed.
+              node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64-musl
+
+              # The legacy-pm2 reaper identifies processes and sockets before it
+              # signals or deletes anything, and BusyBox answers those questions
+              # DIFFERENTLY than procps/lsof: `ps -p` is rejected outright, and
+              # `lsof <path>` ignores the path and exits 0. Both differences
+              # silently DISABLED a guard — the reap found nothing to stop, and an
+              # orphaned rpc.sock read as a live God so the "legacy pm2 still
+              # running" warning could never clear.
+              #
+              # `bun run test` cannot see any of this: vitest runs on the glibc
+              # host, where reverting either probe leaves the suite fully green
+              # (MEASURED). This is the only gate that exercises the BusyBox shapes,
+              # which is why it runs here rather than as a unit test. Verified to
+              # have teeth: reverting either probe makes it exit 1 (1 and 8 failed
+              # checks respectively).
+              node scripts/smoke-musl-reaper-probes.mjs dist/core/legacy-pm2-reaper.js
+
+              # Hand dist-bin back to the HOST user, exactly as the release leg does.
+              #
+              # This job needs it less (nothing after this step touches dist-bin), and
+              # that asymmetry is precisely how the bug shipped: the release leg has a
+              # `Checksums` step that WRITES into dist-bin, and root-owned files made
+              # it fail with `Permission denied` after both musl builds had succeeded.
+              # Keeping the two legs isomorphic means the PR gate exercises the same
+              # ownership handoff the release depends on.
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
+            '
+
+      - name: Prove the host can WRITE into dist-bin (canary.5's actual failure)
+        # Not cosmetic — this is the only place CI can catch the ownership bug.
+        #
+        # v3.18.0-canary.5 failed AFTER both musl builds and all smoke checks passed:
+        # the release leg's `Checksums` step writes .sha256 files INTO dist-bin, and
+        # the container had left it owned by root, so the runner's non-root user got
+        # `Permission denied`. This PR job has no such step, so without the check
+        # below it would stay green while the release breaks — exactly the asymmetry
+        # that let the bug ship.
+        #
+        # Deliberately mirrors what `Checksums` does (create a file in the directory)
+        # rather than merely reading a file: read access was never the problem.
+        run: |
+          echo "dist-bin owner: $(stat -c '%u:%g' dist-bin) (runner is $(id -u):$(id -g))"
+          cd dist-bin
+          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+          echo "✅ host user wrote checksums into a container-produced directory"
+

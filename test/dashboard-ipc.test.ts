@@ -1,7 +1,7 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -329,6 +329,7 @@ describe('IPC auth reads the on-disk dashboard secret through the secure primiti
   it('fails closed (401) when the secret file has loose (0644) permissions', async () => {
     if (process.platform === 'win32') return;
     writeFileSync(secretPath, REAL_SECRET, { mode: 0o644 });
+    chmodSync(secretPath, 0o644);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     const base = `http://127.0.0.1:${handle.port}`;
 

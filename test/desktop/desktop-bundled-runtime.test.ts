@@ -105,4 +105,29 @@ describe('bundled desktop runtime', () => {
     expect(script).toContain("for (const arch of ['arm64', 'x64'])");
     expect(script).toContain('Bundled runtime is missing @napi-rs/canvas-darwin-${arch}');
   });
+
+  it('stages node-pty by copy, without the builder‑platform build/ dir', () => {
+    const script = readFileSync(resolve(import.meta.dirname, '../../scripts/prepare-desktop-runtime.mjs'), 'utf8');
+
+    // node-pty is a devDependency on purpose (its install script would drag node-gyp
+    // into every `npm i -g`), so `bun install --production` cannot supply it — the
+    // runtime tree gets it by copy instead. If this call disappears, the desktop app
+    // ships with no terminal support and nothing else notices.
+    expect(script).toContain('await stageNodePty();');
+    // Copying build/ would be actively WRONG, not merely wasteful: node-pty's loader
+    // tries build/Release BEFORE prebuilds/<platform>-<arch>, so a compiled artifact
+    // in the builder's own tree shadows the prebuild we want. The release runner
+    // (macOS, prebuilds present) normally has none, but a Linux dev box does, and
+    // `npm_config_build_from_source=true` forces one — and in a Universal app a
+    // single-arch Mach-O would shadow the OTHER arch's prebuild silently.
+    //
+    // Assert the filter is WIRED INTO the copy, not merely that the helper exists:
+    // a first version of this test only checked for the identifier, and deleting the
+    // `filter:` line left it green (verified by mutation).
+    expect(script).toMatch(/filter:\s*src\s*=>\s*!isUnderBuildDir\(source,\s*src\)/);
+    // Both fail-closed assertions must stay: the darwin prebuild must exist, and the
+    // builder's own binary must NOT have ridden along.
+    expect(script).toContain('Staged node-pty is missing its darwin-${arch} prebuild');
+    expect(script).toContain("carries the builder's build/Release/pty.node");
+  });
 });

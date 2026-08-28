@@ -1,4 +1,5 @@
-// Bun build plugin: make botmux's native addons survive `bun build --compile`.
+// Bun build plugin: make botmux's native addons AND the Dashboard frontend
+// survive `bun build --compile`.
 //
 // `bun --compile` embeds a `.node` only when it is *statically* `require()`d in
 // the bundle. botmux's native deps load theirs through dynamic/relative paths
@@ -7,6 +8,11 @@
 // (the source tree's node_modules is gone; paths resolve inside /$bunfs/). This
 // plugin replaces those loaders at build time with ones that statically require
 // the exact embedded `.node` we hand it, so Bun bundles + serves it.
+//
+// The Dashboard's static frontend has the same shape of problem — it is reached
+// via a `__dirname`-derived directory that does not exist in a compiled binary —
+// and is fixed the same way, by injecting static embedded-file imports. See the
+// `dist/dashboard.js` hook at the bottom.
 //
 // Exported as a factory so both build-bun-binary.mjs and any programmatic caller
 // pass the resolved native paths explicitly (no env/global coupling).
@@ -18,6 +24,7 @@
 
 import { readFileSync } from 'node:fs';
 import { dirname as nodeDirname } from 'node:path';
+import { buildDashboardEmbedPreamble } from './generate-dashboard-embed.mjs';
 
 /**
  * @param {{ ptyNode: string, spawnHelper: string|null, skiaNode?: string|null }} opts
@@ -84,6 +91,19 @@ export function makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode = null })
           return { contents: preamble + '\n' + original, loader: 'js' };
         });
       }
+
+      // ── Dashboard frontend ────────────────────────────────────────────────
+      // Same class of problem as the natives above, for static assets: the
+      // Dashboard resolves its frontend as `join(__dirname, 'dashboard-web')`,
+      // which in a compiled binary points into the virtual /$bunfs/ and does not
+      // exist — so every asset request fell through to the catch-all 404 and the
+      // Dashboard was completely unreachable from a binary (npm/source were
+      // fine). Prepend static `type: 'file'` imports for the whole bundle plus
+      // the request-path → embedded-path map the server reads.
+      build.onLoad({ filter: /[\\/]dist[\\/]dashboard\.js$/ }, (args) => {
+        const original = readFileSync(args.path, 'utf8');
+        return { contents: buildDashboardEmbedPreamble() + '\n' + original, loader: 'js' };
+      });
     },
   };
 }

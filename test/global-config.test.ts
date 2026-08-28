@@ -23,6 +23,7 @@ describe('global dashboard config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 

@@ -125,6 +125,41 @@ export interface MappedScopeIds {
   missingUserScopes: string[];
 }
 
+/** console 的 `schemaType` 枚举：只有 SelectionExpression 这档有「数据范围」表单。 */
+export const PRIVILEGE_SCHEMA_TYPE_SELECTION_EXPRESSION = 1;
+/** console 的 `organizationType` 枚举：跨组织(B2B/B2C)那两档不在本机制内。 */
+export const PRIVILEGE_ORG_TYPE_INTERNAL = 1;
+
+/** 数据范围表单里的一个字段（只保留判定与拼 content 需要的部分）。 */
+export interface OpenPlatformPrivilegeField {
+  id: string;
+  name: string;
+  /** `data_source.type === 'select_staff'`，即「选人」控件。 */
+  selectStaff: boolean;
+  /** 支持 `in`（「包含」）操作符。 */
+  supportsIn: boolean;
+}
+
+/** `privilege/all` 里的一条「权限可访问的数据范围」。 */
+export interface OpenPlatformPrivilege {
+  /** 原始条目，写回时浅拷贝改 content 用（服务端还会读其它字段）。 */
+  raw: Record<string, unknown>;
+  bizId: string;
+  resource: string;
+  name: string;
+  /** 所属业务分类的显示名（来自同一响应的 `scopeBiz`），只用于 description。 */
+  bizName: string;
+  isRequired: boolean;
+  content: string;
+  schemaType?: number;
+  organizationType?: number;
+  fields: OpenPlatformPrivilegeField[];
+}
+
+export interface OpenPlatformPrivilegeState {
+  privileges: OpenPlatformPrivilege[];
+}
+
 export type OpenPlatformAutomationResult =
   | {
       ok: true;
@@ -134,6 +169,14 @@ export type OpenPlatformAutomationResult =
       scopeCount: number;
       skippedScopeCount: number;
       scopeWarning?: string;
+      /**
+       * 自动填好的「权限可访问的数据范围」条数（填成「与应用的可用范围一致」）。
+       * 0 有两种成因：本来就没有待填的（常态），或写入失败（看
+       * {@link privilegeRangeWarning}）——两者必须靠 warning 区分，别照 count 报「已配齐」。
+       */
+      privilegeRangeCount: number;
+      /** 数据范围读取/写入失败的原因（非致命，仅影响后续审批快慢）。 */
+      privilegeRangeWarning?: string;
       subscribedEventCount: number;
       eventWarning?: string;
       /** 回读后仍缺失的 VC 会议事件。普通建 bot 不阻断,VC listener 保存前必须为空。 */
@@ -417,6 +460,232 @@ export function mapManifestScopesToOpenPlatformIds(
     missingTenantScopes: mapScopeIds(tenant, catalog, 'tenant').missing,
     missingUserScopes: mapScopeIds(user, catalog, 'user').missing,
   };
+}
+
+/**
+ * 把整份 scope 清单裁到「只保留 `wantedNames` 里点名的权限」，tenant / user 分桶
+ * **原样沿用 manifest 的归属**。
+ *
+ * 权限自愈只缺某几项时，历史实现把整份 {@link readDefaultScopeManifest}（300+ 项）
+ * 全量 `operation:'add'` 追加进去——「用缺失项当触发器，却拿完整清单当申请集合」，
+ * 于是补一个 `im:feed_group_v1:read` 会连带申请日历/文档/表格等一大批 botmux 自己
+ * 都不校验的权限。调用方先用本函数把 manifest 裁成缺失项，再传给
+ * {@link automateOpenPlatformSetup} 的 `scopeManifest`，申请集合就与缺失集合一致。
+ *
+ * ⚠️ 故意**不**自己猜 bucket：`im:feed_group_v1:*` 只在 user 桶、`im:resource` 只在
+ * tenant 桶，同名权限也可能同时落两个桶（manifest 里有 121 项 tenant∩user 重叠）。
+ * 以 manifest 的分桶为准，能落哪个桶就保留哪个桶，避免把 user 权限误当 tenant 申请。
+ * 不在 manifest 里的名字直接落空（automation 侧的 catalog 映射也会把它算进
+ * skippedScopeCount），不硬塞。
+ */
+export function filterScopeManifest(manifest: ScopeManifest, wantedNames: string[]): ScopeManifest {
+  const wanted = new Set(uniqueStrings(wantedNames));
+  return {
+    scopes: {
+      tenant: uniqueStrings(manifest.scopes?.tenant ?? []).filter(name => wanted.has(name)),
+      user: uniqueStrings(manifest.scopes?.user ?? []).filter(name => wanted.has(name)),
+    },
+  };
+}
+
+/**
+ * 从 `POST /developers/v1/privilege/all/<appId>` 的返回里解析「权限可访问的数据
+ * 范围」条目。
+ *
+ * ⚠️ 这是**独立于 scope/update 的第二条链路**：`scope/update` 只把权限点加进
+ * 应用清单，而每个权限点还可能带一份「这个权限能看到哪些数据」的配置（console
+ * 上是权限详情里的「权限可访问的数据范围」单选：全部 / 与应用的可用范围一致 /
+ * 按条件筛选）。两者的 appId 相同但接口、payload、生效时机全不一样。
+ *
+ * 第三条相关链路是 `contact_range`（通讯录权限范围），又是另一个概念，不在这里。
+ */
+export function extractOpenPlatformPrivileges(payload: unknown): OpenPlatformPrivilegeState {
+  const data = asRecord(asRecord(payload).data);
+  const rawPrivileges = Array.isArray(data.privileges) ? data.privileges : [];
+  const rawBizNames = Array.isArray(data.scopeBiz) ? data.scopeBiz : [];
+  const bizNames = new Map<string, string>();
+  for (const biz of rawBizNames) {
+    const record = asRecord(biz);
+    const bizId = pickString(record, ['bizId', 'biz_id']);
+    const bizName = pickString(record, ['bizName', 'biz_name']);
+    if (bizId && bizName) bizNames.set(bizId, bizName);
+  }
+  const privileges: OpenPlatformPrivilege[] = [];
+  for (const entry of rawPrivileges) {
+    const record = asRecord(entry);
+    const bizId = pickString(record, ['bizId', 'biz_id']);
+    // resource 允许为空串（contact 这类整 biz 一条的形态），但 bizId 必须有：
+    // 缺了它连合并键都拼不出来，写回去也定位不到条目。
+    if (!bizId) continue;
+    privileges.push({
+      raw: record,
+      bizId,
+      resource: pickString(record, ['resource']) ?? '',
+      name: pickString(record, ['name']) ?? '',
+      bizName: bizNames.get(bizId) ?? '',
+      isRequired: record.isRequired === true,
+      content: pickString(record, ['content']) ?? '',
+      schemaType: typeof record.schemaType === 'number' ? record.schemaType : undefined,
+      organizationType: typeof record.organizationType === 'number' ? record.organizationType : undefined,
+      fields: extractPrivilegeStaffFields(record),
+    });
+  }
+  return { privileges };
+}
+
+/**
+ * 「与应用的可用范围一致」在飞书 console 里的内部取值。console 前端把这三个
+ * mode 定义在同一个 enum 上（`availability_of_app` / `part` / `all`），选中第
+ * 二项时写进 filter value 的就是这个字符串。
+ */
+export const PRIVILEGE_RANGE_SAME_AS_APP_AVAILABILITY = 'availability_of_app';
+
+/**
+ * 判断某条数据范围**能不能**用「与应用的可用范围一致」自动填。
+ *
+ * console 的判据（`em()` / `om()`，CDP 读前端 bundle 确认）是
+ * `schemaType === SelectionExpression(1) && organizationType === InternalOrganization(1)`；
+ * 在此之上本函数额外要求每个字段都是「选人」类型且支持 `in` 操作符，因为
+ * `availability_of_app` 是**成员范围**语义——把它塞进「工作地点」这类字符串
+ * 字段是无意义的（DLP 那条 privilege 就同时有 `member_range` 和 `place` 两个
+ * 字段）。字段里只要有一个不满足就整条跳过，宁可留给人手配，也不猜一个可能
+ * 被审核驳回的组合。
+ */
+export function canFillPrivilegeWithAppAvailability(privilege: OpenPlatformPrivilege): boolean {
+  if (privilege.schemaType !== PRIVILEGE_SCHEMA_TYPE_SELECTION_EXPRESSION) return false;
+  if (privilege.organizationType !== PRIVILEGE_ORG_TYPE_INTERNAL) return false;
+  if (!privilege.fields.length) return false;
+  return privilege.fields.every(field => field.selectStaff && field.supportsIn);
+}
+
+/**
+ * 构造一条数据范围的 `content`——即 console 上选「与应用的可用范围一致」后保存
+ * 的那个字符串。
+ *
+ * 形态是**逐字节复刻 console** 的（拿 6 个已由人手在 console 配好的线上应用
+ * 对照，5 个完全相同，第 6 个只有 `description` 里的权限显示名是飞书改名前的
+ * 旧文案 —— 说明 description 纯展示、不参与语义）：
+ *   • `mode: 'part'` + 每个字段一条 `in` filter，filter value 是**再套一层
+ *     JSON 字符串**的 `[{mode:'availability_of_app',members:[],…}]`
+ *   • `expression` 是 filter 的 1-based 序号用 ` and ` 连起来
+ *   • `description` 是给人看的摘要（console 的 `GC()` 拼的同款）
+ */
+export function buildPrivilegeAppAvailabilityContent(privilege: OpenPlatformPrivilege): string {
+  const filters = privilege.fields.map(field => ({
+    field: field.id,
+    value: JSON.stringify([{
+      mode: PRIVILEGE_RANGE_SAME_AS_APP_AVAILABILITY,
+      members: [] as string[],
+      departments: [] as string[],
+      groups: [] as string[],
+    }]),
+    operator: 'in',
+  }));
+  const description =
+    `${privilege.bizName} - ${privilege.name}\n`
+    + privilege.fields.map(field => `\t${field.name} 包含 与应用的可用范围一致 `).join('')
+    + '\n';
+  return JSON.stringify({
+    biz_id: privilege.bizId,
+    mode: 'part',
+    resource: privilege.resource,
+    filters,
+    expression: filters.map((_, index) => index + 1).join(' and '),
+    description,
+  });
+}
+
+/**
+ * 这条数据范围是否已经被**收敛过**（即不需要我们再动它）。
+ *
+ * ⚠️ 不能简单判 `content` 非空。实测「一键创建智能体」模板建出来的应用，出生就
+ * 带着 `{"mode":"all"}`（console 上显示为选中「全部」）——正是审批规则里要额外
+ * 说明理由、视情况加签至 CEO-2 的那一档。按「有 content 就算配过」会把这个默认
+ * 值当成用户的选择而跳过，于是新建 bot 永远带着「全部」提审，改动完全空转。
+ *
+ * 所以判据是「**已收敛到 all 以外**」：
+ *   • `mode:'all'`（全部）→ 需要我们收窄，视为未配置
+ *   • `mode:'part'` 但 `filters` 为空 → console 自己的 `XC()` 也不认这算配置好
+ *     （它要求 `mode==='all' || filters.length>0`），是个「看着配过、其实空」的
+ *     中间态，同样视为未配置
+ *   • `mode:'part'` 且有 filters / 其它 → 人为或我们之前配过的具体范围，绝不覆盖
+ *   • 空 / `mode` 缺失 / `mode:'null'`（console 的「无」）→ 未配置
+ */
+export function isPrivilegeRangeNarrowed(privilege: OpenPlatformPrivilege): boolean {
+  if (!privilege.content) return false;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = asRecord(JSON.parse(privilege.content));
+  } catch {
+    // content 存在但不是合法 JSON:不敢当成"配过了",也不敢覆盖——保守视为已配置,
+    // 交给人处理(覆盖一个读不懂的值风险更大)。
+    return true;
+  }
+  const mode = parsed.mode;
+  if (typeof mode !== 'string' || mode === '' || mode === 'all' || mode === 'null') return false;
+  // 与 console 的 XC() 对齐：非 all 的 mode 必须真的带上筛选条件才算配置好。
+  return Array.isArray(parsed.filters) && parsed.filters.length > 0;
+}
+
+/**
+ * 挑出「必须配、但还没收敛」且能安全自动填的数据范围条目。
+ *
+ * 只取 `isRequired`：console 自己的 gate（`jC()`）也只强制这一档，实测线上租户
+ * 84 条 privilege 条目里 required 的只有 2 条（会议号查询会议信息 / 创建更新
+ * 任务时可指定的人员范围）。已经收敛到具体范围的一律不碰——那可能是人手精心配
+ * 过的，覆盖它比不配更糟；但模板默认的 `mode:'all'` **要**收窄（见
+ * {@link isPrivilegeRangeNarrowed}）。
+ */
+export function selectPrivilegesNeedingAppAvailability(
+  state: OpenPlatformPrivilegeState,
+): OpenPlatformPrivilege[] {
+  return state.privileges.filter(privilege =>
+    privilege.isRequired
+    && !isPrivilegeRangeNarrowed(privilege)
+    && canFillPrivilegeWithAppAvailability(privilege));
+}
+
+/**
+ * 构造 `POST /developers/v1/privilege/update/<appId>` 的 payload。
+ *
+ * ⚠️ 与 {@link buildSafeSettingPayload}（全量覆盖）**语义相反**：实测服务端按
+ * `(bizId, resource)` **增量合并**——只传 1 条、改动它，同一应用里另一条已配好
+ * 的数据范围逐字节不变。所以这里只传「本次要填的那几条」，不必像 console 前端
+ * 那样把 84 条整包读回来再写。
+ *
+ * 每条都在原始条目上浅拷贝改 `content`，其余字段（schema / privilegeStatus /
+ * isRequired…）原样回传，避免把服务端还会读的字段丢掉。
+ */
+export function buildPrivilegeUpdatePayload(appId: string, privileges: OpenPlatformPrivilege[]) {
+  return {
+    clientId: appId,
+    privileges: privileges.map(privilege => ({
+      ...privilege.raw,
+      content: buildPrivilegeAppAvailabilityContent(privilege),
+    })),
+  };
+}
+
+/**
+ * 读 `privilege/all` → 把「必须配但还没收敛」的数据范围写成「与应用的可用范围
+ * 一致」。返回实际写了几条（0 = 没有待收窄的）。
+ *
+ * 抽成共享函数是因为**两条路径都必须做**，且各自发的是不同的版本：
+ *   • {@link createOpenPlatformAppWithClient} —— 模板建完立刻发第一版
+ *   • {@link automateOpenPlatformSetup} —— 权限自愈 / 补配时发下一版
+ * 只做前者，存量 bot 永远不收窄；只做后者，新建 bot 的第一版仍带「全部」提审。
+ *
+ * 调用方决定失败怎么处理（两处都是非致命，但一处 warn 一处进 result.warning）。
+ */
+async function narrowRequiredPrivilegeRanges(
+  api: { postJson(path: string, body?: unknown): Promise<unknown> },
+  appId: string,
+): Promise<number> {
+  const state = extractOpenPlatformPrivileges(await api.postJson(`/developers/v1/privilege/all/${appId}`, {}));
+  const needFill = selectPrivilegesNeedingAppAvailability(state);
+  if (needFill.length === 0) return 0;
+  await api.postJson(`/developers/v1/privilege/update/${appId}`, buildPrivilegeUpdatePayload(appId, needFill));
+  return needFill.length;
 }
 
 export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>) {
@@ -1116,6 +1385,25 @@ export async function automateOpenPlatformSetup(
     }
   }
 
+  // 权限点加进清单后，其中一部分还带一份「权限可访问的数据范围」要填（console
+  // 上是权限详情里的单选：全部 / 与应用的可用范围一致 / 按条件筛选）。这些权限
+  // 的 scope level 是「需审核」，而字节租户的审批规则明写「非必要不申请全员数据，
+  // 如申请全员范围请提供充分的理由说明，视情况加签至 CEO-2」——留空提审时这一格
+  // 是空的（privilegeStatus=Unset），且 schema 的 fallback_value 是 mode:'all'，
+  // 等于把范围往「全部」那侧靠。所以这里主动收敛成「与应用的可用范围一致」：
+  // 语义上正是 botmux 需要的（bot 只对能看到它的人干活），也是审批规则鼓励的方向。
+  //
+  // 非致命，与 scope 注册同档：数据范围没配好不该阻塞建 bot（它只影响后续审批
+  // 快慢，不影响 bot 收发消息）。写入按 (bizId,resource) 增量合并，且只碰
+  // 「isRequired 且当前为空」的条目——人手配过的范围一律不覆盖。
+  let privilegeRangeCount = 0;
+  let privilegeRangeWarning: string | undefined;
+  try {
+    privilegeRangeCount = await narrowRequiredPrivilegeRanges({ postJson }, options.appId);
+  } catch (err: any) {
+    privilegeRangeWarning = safeErrorMessage(err);
+  }
+
   // Web 创建的是普通企业自建应用（不是 SDK PersonalAgent），需要显式开启
   // 机器人能力并把事件接收方式切到长连接。对已启用的 SDK/已有应用重复调用
   // 是幂等的；这里设为致命步骤，因为缺任一项 daemon 都无法正常收消息。
@@ -1339,6 +1627,8 @@ export async function automateOpenPlatformSetup(
       scopeCount: importedScopeCount,
       skippedScopeCount,
       scopeWarning,
+      privilegeRangeCount,
+      privilegeRangeWarning,
       subscribedEventCount,
       eventWarning,
       missingVcEvents,
@@ -1704,6 +1994,19 @@ export async function createOpenPlatformAppWithClient(
     await retryIdempotentOnTransientNetworkError(() =>
       client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
 
+    // 模板建出来的应用，「权限可访问的数据范围」出生就是 `mode:'all'`（console 上
+    // 显示「全部」）——而这里紧接着就要发**第一个版本**。不先收窄，这一版就带着
+    // 「全部」进审批：正是租户规则里要补充理由、视情况加签至 CEO-2 的那一档。
+    // 后续 automateOpenPlatformSetup 也会做同一件事，但它发的是**下一个**版本，
+    // 救不回这一版，所以两处都必须做。
+    //
+    // 非致命：数据范围只影响审批快慢，不影响应用能不能收发消息。这里正处在
+    // 「应用已建成、还没发版」的窗口里，为它把整条创建链路判死（用户被丢进手动读
+    // Secret 的恢复路径）代价明显更大。
+    await narrowRequiredPrivilegeRanges(client, appId).catch((err: unknown) => {
+      console.warn(`权限数据范围自动收窄失败（不影响建 bot，可到开放平台手动选「与应用的可用范围一致」）: ${safeErrorMessage(err)}`);
+    });
+
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
     // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
@@ -2027,7 +2330,7 @@ async function pollFeishuQrLogin(
   };
 }
 
-function readDefaultScopeManifest(): ScopeManifest {
+export function readDefaultScopeManifest(): ScopeManifest {
   const here = dirname(fileURLToPath(import.meta.url));
   const candidates = [
     join(here, 'lark-scopes.json'),
@@ -2256,6 +2559,46 @@ function collectScopeEntries(value: unknown, bucket: 'tenant' | 'user' | undefin
         : bucket;
     if (child && typeof child === 'object') collectScopeEntries(child, nextBucket, out);
   }
+}
+
+/**
+ * 从一条 privilege 里取出数据范围表单的字段定义。
+ *
+ * 字段在响应里出现**两处**：解析好的 `schemaContent.selectionExpressionSchemaContent`
+ * 和原始 JSON 字符串 `schema`（内层 key 是首字母大写的
+ * `SelectionExpressionSchemaContent`）。优先用前者，缺失时回退解析后者——两者
+ * 在实测数据里内容一致，但结构化那份不保证一直在。
+ */
+function extractPrivilegeStaffFields(record: Record<string, unknown>): OpenPlatformPrivilegeField[] {
+  const structured = asRecord(asRecord(record.schemaContent).selectionExpressionSchemaContent);
+  let rawFields = Array.isArray(structured.fields) ? structured.fields : undefined;
+  if (!rawFields) {
+    const schemaText = pickString(record, ['schema']);
+    if (schemaText) {
+      try {
+        const parsed = asRecord(asRecord(JSON.parse(schemaText)).schema_content);
+        const inner = asRecord(parsed.SelectionExpressionSchemaContent);
+        if (Array.isArray(inner.fields)) rawFields = inner.fields;
+      } catch {
+        // schema 不是合法 JSON:当作没有字段,上层 canFill… 会因此跳过这条
+      }
+    }
+  }
+  if (!rawFields) return [];
+  const fields: OpenPlatformPrivilegeField[] = [];
+  for (const entry of rawFields) {
+    const field = asRecord(entry);
+    const id = pickString(field, ['id']);
+    if (!id) continue;
+    const operators = Array.isArray(field.operators) ? field.operators : [];
+    fields.push({
+      id,
+      name: pickString(field, ['name']) ?? '',
+      selectStaff: pickString(asRecord(field.data_source), ['type']) === 'select_staff',
+      supportsIn: operators.includes('in'),
+    });
+  }
+  return fields;
 }
 
 function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bucket: 'tenant' | 'user') {

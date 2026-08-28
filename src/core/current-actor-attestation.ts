@@ -91,10 +91,10 @@ export function resolveLoopbackPeerProcesses(input: {
   procRoot?: string;
 }): LoopbackPeerResolution {
   const procRoot = input.procRoot ?? '/proc';
+  if (!isLoopbackAddress(input.remoteAddress)) return { ok: false, reason: 'not_loopback' };
   if (procRoot === '/proc' && process.platform !== 'linux') {
     return { ok: false, reason: 'platform_unsupported' };
   }
-  if (!isLoopbackAddress(input.remoteAddress)) return { ok: false, reason: 'not_loopback' };
   if (!Number.isSafeInteger(input.remotePort) || !input.remotePort
     || !Number.isSafeInteger(input.localPort) || !input.localPort) {
     return { ok: false, reason: 'socket_unavailable' };

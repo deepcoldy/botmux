@@ -37,6 +37,37 @@ case "$arch" in
 esac
 asset="botmux-${os_tag}-${arch_tag}"
 
+# On Linux, pick the musl build when the C library is musl (Alpine and most slim
+# Docker images). A glibc-linked binary does not run there at all — it dies in the
+# loader with a message that names no cause — so guessing wrong is worse than not
+# installing. `uname` cannot tell us this, so probe the libc.
+#
+# `ldd` IS AUTHORITATIVE IN BOTH DIRECTIONS when present: glibc and musl both ship
+# one, so if it answers "musl" we are on musl, and if it answers anything else we are
+# NOT — do not let a later probe overturn it. That matters because a glibc distro can
+# legitimately have musl INSTALLED (Debian/Ubuntu `musl` / `musl-tools`, common for
+# Rust/Go musl cross-compiling) which drops /lib/ld-musl-x86_64.so.1 at top level.
+# Measured: debian:bookworm-slim + musl-tools was selecting the musl asset — an
+# install that "succeeds" and then fails in the loader on first run.
+#
+# The filesystem probes are therefore the fallback for images with NO ldd at all
+# (distroless-style). Deliberately conservative: only claim musl when positively
+# observed, so a glibc box is never pushed onto the musl asset.
+if [ "$os_tag" = linux ]; then
+  is_musl=0
+  if command -v ldd >/dev/null 2>&1; then
+    # musl's ldd exits non-zero for --version, so read the output, not the status.
+    if (ldd --version 2>&1 || true) | grep -qi musl; then
+      is_musl=1
+    fi
+  elif ls /lib/ld-musl-* >/dev/null 2>&1 || ls /usr/lib/ld-musl-* >/dev/null 2>&1; then
+    is_musl=1
+  elif [ -f /etc/alpine-release ]; then
+    is_musl=1
+  fi
+  [ "$is_musl" -eq 1 ] && asset="${asset}-musl"
+fi
+
 # ── Resolve the download URLs (binary + checksum) ─────────────────────────────
 if [ "${BOTMUX_VERSION:-latest}" = "latest" ]; then
   base="https://github.com/${REPO}/releases/latest/download"

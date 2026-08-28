@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
+  shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
@@ -359,5 +360,59 @@ describe('attentionUsageError', () => {
   });
   it('rejects no-text (dashboard needs a reason)', () => {
     expect(attentionUsageError({ ...ok, hasText: false })).toMatch(/reason/);
+  });
+});
+
+describe('shouldDropAfterTheFactTopicQuote', () => {
+  // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边：quote 会继承被引用消息
+  // **此刻**的话题归属，所以必须在这种情况下放弃 quote、改平铺。
+  const base = { quoteTargetId: 'om_top_at' };
+
+  it('顶层进来的轮次 + 该消息现在已属于话题 → 放弃 quote(改平铺)', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: 'omt_after_fact',
+    })).toBe(true);
+  });
+
+  it('顶层进来但该消息现在确认没有话题 → 照旧 quote', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: null,
+    })).toBe(false);
+  });
+
+  it('本轮就是从话题里进来的(inThread=true) → 照旧 quote,不碰真话题的锚定', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: true, currentThreadId: 'omt_genuine',
+    })).toBe(false);
+  });
+
+  it('老会话行没有 inThread(undefined) → 按未知保持旧行为,绝不猜', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: undefined, currentThreadId: 'omt_x',
+    })).toBe(false);
+  });
+
+  it('探测失败/未探测(currentThreadId undefined) → 保持 quote,不确定不改行为', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: undefined,
+    })).toBe(false);
+  });
+
+  it('--quote 是操作者显式指定 → 一律照办,不覆盖', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: 'omt_after_fact', explicitQuote: 'om_top_at',
+    })).toBe(false);
+  });
+
+  it('本来就不 quote → 无需判断', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      quoteTargetId: null, quotedTurnInThread: false, currentThreadId: 'omt_x',
+    })).toBe(false);
+  });
+
+  it('空白 thread_id 不算话题(防把 "" / 空格当命中)', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: '   ',
+    })).toBe(false);
   });
 });

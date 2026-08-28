@@ -936,7 +936,10 @@ describe('worker capability carve-out ordering', () => {
     // and BOTH of those tests would stay green (goal-mode traex would wedge again
     // on the migration prompt). Assert the worker actually threads the method
     // output into readonlyRoots.
-    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.() ?? [])].map(expandTildeLexical),');
+    // The call site passes the merged child/per-bot env so env-driven adapters
+    // (e.g. ebsd's repository root) resolve against bot config, not daemon env.
+    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.({')
+    expect(source).toContain('}) ?? [])].map(expandTildeLexical),');
   });
 
   it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {

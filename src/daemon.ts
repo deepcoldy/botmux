@@ -278,7 +278,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -647,6 +647,7 @@ import {
   type VcMeetingImRoutingCandidate,
   type VcMeetingSealedReceiverSessionBinding,
 } from './services/vc-meeting-im-routing.js';
+import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -17246,6 +17247,9 @@ function deliverPassthroughToExistingSession(
     senderOpenId?: string;
     senderIsBot: boolean;
     substitute: boolean;
+    /** The inbound message carried a Lark thread_id (see
+     *  FrozenSessionReplyContext.inThread). */
+    inThread?: boolean;
     /** raw input 已写入 worker 后回调（worker 不在线的拒绝分支不触发），供 ingress
      *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
      *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
@@ -17270,6 +17274,7 @@ function deliverPassthroughToExistingSession(
       senderOpenId: turn.senderOpenId,
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
+      inThread: turn.inThread,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -17434,7 +17439,7 @@ async function startInitialPassthroughSession(args: {
     sessionStore.updateSession(ds.session);
   }
   const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -17523,7 +17528,10 @@ async function startInitialPassthroughSession(args: {
 
 
 function vcMeetingApplicationContext(ctx: RoutingContext): string {
-  return (ctx.vcMeetingContextLifecycle === 'sealed'
+  return (ctx.vcMeetingImTurnOrigin
+    ? VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT
+    : '')
+    + (ctx.vcMeetingContextLifecycle === 'sealed'
     ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
     : '')
     + (ctx.vcMeetingContextMayLag
@@ -18421,7 +18429,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -19513,6 +19521,7 @@ async function handleThreadReplyAdmitted(
           senderOpenId: threadSenderOpenId,
           senderIsBot: isForeignBot,
           substitute: !!substituteTrigger,
+          inThread: !!parsed.threadId,
           onDelivered: () => markIngressAdmitted(ctx),
         });
       }
@@ -19784,7 +19793,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -20218,7 +20227,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {
@@ -22425,6 +22434,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      chatSessionAnsweredRootAtTopLevel: (rootId, chatId, appId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.larkAppId !== appId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
+          if (chatSessionAnsweredRootAtTopLevel(ds.session, rootId)) return true;
+        }
+        return sessionStore.listSessions().some(s =>
+          s.status === 'active'
+          && s.larkAppId === appId
+          && s.chatId === chatId
+          && chatSessionAnsweredRootAtTopLevel(s, rootId));
+      },
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Idle legacy owners are evicted so subsequent inbound messages land on
       // fresh thread-scope sessions. Owners with accepted/pending work remain

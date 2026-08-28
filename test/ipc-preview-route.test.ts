@@ -12,6 +12,7 @@ import * as sessionStore from '../src/services/session-store.js';
 
 const CAPABILITY = 'ac'.repeat(32);
 const HOST_SECRET = 'preview-route-host-secret';
+const itWithRealProcfs = it.skipIf(process.platform !== 'linux');
 let ipc: IpcServerHandle | null = null;
 let targetServer: Server | null = null;
 
@@ -87,7 +88,7 @@ async function postPreview(
 }
 
 describe('POST /api/sessions/:sessionId/preview', () => {
-  it('validates, persists, publishes, and returns only a safe same-origin descriptor', async () => {
+  itWithRealProcfs('validates, persists, publishes, and returns only a safe same-origin descriptor', async () => {
     const port = await reachablePort();
     const ds = activeSession();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
@@ -194,7 +195,7 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('P1-13: discards a registration whose worker generation advanced during the probe', async () => {
+  itWithRealProcfs('P1-13: discards a registration whose worker generation advanced during the probe', async () => {
     const port = await reachablePort();
     const ds = activeSession();
     let lookups = 0;
@@ -223,7 +224,7 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it('P1-13: discards a registration whose session was closed during the probe', async () => {
+  itWithRealProcfs('P1-13: discards a registration whose session was closed during the probe', async () => {
     const port = await reachablePort();
     const ds = activeSession();
     let lookups = 0;
@@ -257,7 +258,7 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('本机后端矩阵: pty/tmux/zellij still register normally', async () => {
+  itWithRealProcfs('本机后端矩阵: pty/tmux/zellij still register normally', async () => {
     for (const backendType of ['pty', 'tmux', 'zellij']) {
       const port = await reachablePort();
       const ds = activeSession(`s-${backendType}`);
@@ -282,7 +283,7 @@ describe('POST /api/sessions/:sessionId/preview', () => {
   // 鉴权，**没有 previewTarget 自己**，于是谁先 settle 谁先写、后 settle 的无条件覆盖
   // ——胜负由 probe 耗时决定，不是由请求先后决定（单 host 超时 750ms，不带 host 时
   // 127.0.0.1 与 ::1 串行试，「A 慢一秒、B 快一毫秒」是常规而非极端）。
-  it('P1-3: 慢请求不再覆盖 await 期间落地的新注册', async () => {
+  itWithRealProcfs('P1-3: 慢请求不再覆盖 await 期间落地的新注册', async () => {
     const port = await reachablePort();
     const ds = activeSession();
     const winner = {
@@ -310,7 +311,7 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it('P1-3: 没有并发写入时，覆盖旧目标照常成功', async () => {
+  itWithRealProcfs('P1-3: 没有并发写入时，覆盖旧目标照常成功', async () => {
     const port = await reachablePort();
     const ds = activeSession();
     ds.session.previewTarget = {
@@ -326,7 +327,7 @@ describe('POST /api/sessions/:sessionId/preview', () => {
     expect(ds.session.previewTarget).toMatchObject({ port });
   });
 
-  it('restores in-memory state when durable persistence fails', async () => {
+  itWithRealProcfs('restores in-memory state when durable persistence fails', async () => {
     const port = await reachablePort();
     const previous = {
       host: '127.0.0.1', port: 1111, registeredAt: '2026-08-10T00:00:00.000Z',

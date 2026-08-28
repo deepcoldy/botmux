@@ -45,6 +45,8 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 ```
 
 > npm 包内已经带了对应平台的**自包含二进制**（按 os/arch 只装匹配的那一个），安装时会把 `~/.botmux/bin/botmux` 指向它。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。把 `~/.botmux/bin` 放进 PATH 即可（安装日志会提示命令）。
+>
+> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：要跑的 PTY 已经嵌在那个二进制里，npm 只是把它放到位。支持 linux / macOS × x64 / arm64；**Windows 请在 WSL2 里安装**（WSL 报告为 linux，是完整支持的一等环境）。不在支持列表里的平台会在安装时**明确报错**，而不是装上一个跑不起来的命令。
 
 <details>
 <summary>不想装 Node？直接下单文件可执行（连装包都不需要 Node）</summary>
@@ -57,7 +59,7 @@ botmux setup
 botmux start
 ```
 
-装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），自动按 OS/arch 拉对应二进制并校验 SHA-256。命令用法与 npm 版完全一致。Windows 仍走 `npm i -g botmux`（daemon 是 Unix-only）。
+装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），自动按 OS/arch 拉对应二进制并校验 SHA-256。命令用法与 npm 版完全一致。**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，完整支持）。
 
 </details>
 
@@ -79,7 +81,29 @@ botmux start
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
+
+`ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
+
+`bots.json` 里只放非敏感元数据和密钥文件路径，例如：
+
+```json
+{
+  "cliId": "ebsd",
+  "workingDir": "/var/lib/botmux/ebsd-work",
+  "sandbox": true,
+  "env": {
+    "EBSD_BOTMUX_DIAG_ENDPOINT": "https://ebsbot.example",
+    "EBSD_BOTMUX_DIAG_TOKEN_FILE": "/run/secrets/ebsd-botmux/diag-token",
+    "EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-ak",
+    "EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-sk",
+    "EBSD_BOTMUX_SUBJECT": "botmux-ebsd@prod",
+    "EBSD_BOTMUX_REPOSITORY_ROOT": "/srv/repos"
+  }
+}
+```
+
+三个密钥文件必须是运行 BotMux 的账号持有的 `0600` 普通文件，不能是符号链接；文件内容、AK/SK 和 Gateway token 都不得写进 `bots.json`。`workingDir` 应是专用空目录，仓库通过只读的 `EBSD_BOTMUX_REPOSITORY_ROOT` 暴露。Linux 开启 `sandbox` 前需安装 bubblewrap，隔离建立失败时会拒绝启动。当前/上一把 Gateway key 可以在服务端并存完成轮换，subject 保持不变。
 
 当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 

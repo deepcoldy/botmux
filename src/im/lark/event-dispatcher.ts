@@ -35,12 +35,13 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, probeVcMeetingEventSubscription } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
+import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
@@ -260,11 +261,18 @@ async function tryAutoFixScopes(
   try {
     const totalMissing = missingCritical.length + missingOptional.length;
     logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
+    // 只申请「实际缺失」的那几项：把默认清单裁成缺失集合再传进去，避免
+    // 「用缺失项当触发器、却拿完整 manifest（300+ 项）当申请集合」——那会让补一个
+    // im:feed_group_v1:read 连带申请日历/文档/表格等一大批 botmux 不校验的权限。
+    // 分桶归属仍以默认 manifest 为准（见 filterScopeManifest）。
+    const wantedScopeNames = [...missingCritical, ...missingOptional].map(s => s.name);
+    const scopeManifest = filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames);
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
+      scopeManifest,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -276,14 +284,39 @@ async function tryAutoFixScopes(
     });
 
     if (result.ok) {
+      // ⚠️ `scopeCount === 0` 有三种**互相矛盾**的成因，不能共用一句话。自从申请集合
+      // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
+      // 多少」变成「**缺失的那几项里成功了多少**」，于是 0 不再等于「本来就齐」，
+      // 反而最可能是「一项都没补上」——照旧说「所有必需权限已在应用清单中」就成了
+      // 恰在全部失败时谎报齐全。三种成因按可诊断性分开：
+      //   ① scopeWarning 有值 → scope/update 被租户整批拒了（开放平台明确报错）
+      //   ② skippedScopeCount > 0 → 这些名字不在该租户的开放平台目录里，不可授予
+      //      （automation 自己 warn 过「not present in the Open Platform catalog」）
+      //   ③ 都没有 → 申请集合本就是空的（缺失项已在清单中），才是真的「已齐全」
+      // 这句同时进 daemon 日志**和**下面的管理员 DM，DM 开头写着「✅ 已自动修复了
+      // 缺失的权限」，一旦这里说反就自相矛盾，管理员会以为不用管。
       const scopeDetail = result.scopeCount > 0
         ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
-        : '所有必需权限已在应用清单中';
-      logger.info(
-        `[${larkAppId}] auto-fix succeeded: ${scopeDetail}, ` +
+        : result.scopeWarning
+          ? `0 项权限已导入——开放平台拒绝了本次权限申请（${result.scopeWarning}），需到「权限管理」手动开通`
+          : result.skippedScopeCount > 0
+            ? `0 项权限已导入——这 ${result.skippedScopeCount} 项不在当前租户的开放平台权限目录中，无法自动申请，需到「权限管理」手动开通`
+            : '所有必需权限已在应用清单中';
+      // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
+      const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
+      // 数据范围只在**真做了事**或**真出错**时才进日志：常态是「没有待配的」，
+      // 那句话对读日志的人零信息量，还会淹没上面真正的 scope 结论。
+      const privilegeRangeDetail = result.privilegeRangeCount > 0
+        ? `, ${result.privilegeRangeCount} 项权限数据范围已设为「与应用的可用范围一致」`
+        : result.privilegeRangeWarning
+          ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
+          : '';
+      const summary =
+        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
         `version ${result.versionId ?? 'n/a'} published, ` +
-        `${result.subscribedEventCount} events subscribed`,
-      );
+        `${result.subscribedEventCount} events subscribed`;
+      if (autoFixEffective) logger.info(summary);
+      else logger.warn(summary);
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
       // never enabled the feature must not be pinged just because a non-critical
       // scope was topped up in the background). The log line above is the record.
@@ -294,13 +327,18 @@ async function tryAutoFixScopes(
       if (adminOpenId) {
         const fixedList = [...missingCritical, ...missingOptional];
         const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
+        // 标题跟着实际结果走：一项都没落地时说「已自动修复」是谎报，管理员会以为
+        // 不用管，而这条路径的下游（缺 critical scope）恰恰是最需要人工介入的。
         await dmAdmin(
           larkAppId,
           adminOpenId,
-          `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
+          (autoFixEffective
+            ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
+            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能申请成功，需要你手动开通：\n\n`) +
+          `${missingList}\n\n` +
           `${scopeDetail}，新版本已发布。\n` +
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
-          `auto-fixed ${fixedList.length} scopes`,
+          autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
         );
       }
       return true;
@@ -360,11 +398,13 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // self_manage 后下次重启就能自检了。
     if (infoData.code === 99991672) {
       // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
-      // are missing. Try the Open Platform web-session auto-fix to add ALL
-      // required scopes (including self_manage) in one shot.
+      // are missing. Try the Open Platform web-session auto-fix to add every
+      // botmux-required scope (including self_manage) in one shot — passing the
+      // full BOTMUX_REQUIRED_SCOPES so the next restart's self-check finds them
+      // all present, without over-applying the whole 300+ scope manifest.
       if (brand === 'feishu') {
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand,
-          [{ name: SELF_MANAGE_SCOPE, desc: '应用自查 (免审批)' }], []);
+        const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
+        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
         if (fixed) return;
       }
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
@@ -2053,6 +2093,12 @@ export interface RoutingContext {
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
+  /** Set when the turn folded into the group chat-scope session from a Lark
+   *  thread whose root was deliberately NOT used as `replyRootId` (an
+   *  after-the-fact topic). The reply stays flat, but the session must still be
+   *  registered under this root so a later NON-@ message inside that topic
+   *  folds back here instead of forking a new thread-scope session. */
+  foldedRootId?: string;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
   /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
@@ -2362,6 +2408,13 @@ export interface EventHandlers {
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
+  /** True when this chat's chat-scope session already answered `rootId` as a FLAT
+   *  top-level turn. Identifies the "user @'d at top level, then opened a 话题 on
+   *  that same message" case, where the regular-group fold must keep the turn in
+   *  the group session (as it already does) but must NOT anchor the visible reply
+   *  into the after-the-fact topic. Genuine "@ inside an existing topic" turns
+   *  never match. Best-effort: absent handler ⇒ legacy behavior. */
+  chatSessionAnsweredRootAtTopLevel?: (rootId: string, chatId: string, larkAppId: string) => boolean;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
    *  session has been converted to topic mode (chat_mode 'group' → 'topic'
    *  via Lark group settings). Daemon should evict the stale chat-scope
@@ -2517,7 +2570,7 @@ async function maybeApplySharedTopicSeed(input: {
   // (unconditional) or 'ambient' — but for 'ambient' NOT when the message
   // @mentions another specific member (person/bot) without @ing us: that is a
   // redirect to someone else, so we back off (mentionsAnotherMember).
-  const seedMentionMode = resolveGroupMentionMode(larkAppId);
+  const seedMentionMode = resolveGroupMentionMode(larkAppId, chatId);
   if (!isBotMentioned(larkAppId, message, senderOpenId)
       && !(seedMentionMode === 'never'
         || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message)))) return undefined;
@@ -2536,12 +2589,14 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   chatId: string;
   chatType: 'group' | 'p2p';
   message: any;
-  routing: { scope: 'thread' | 'chat'; anchor: string };
+  routing: { scope: 'thread' | 'chat'; anchor: string; foldedRootId?: string };
   forceTopicApplied?: boolean;
   mentionedThisBot: boolean;
   ownsThreadSession?: boolean;
+  /** See EventHandlers.chatSessionAnsweredRootAtTopLevel. */
+  answeredRootAtTopLevel?: (rootId: string) => boolean;
 }): Promise<string | undefined> {
-  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession } = input;
+  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession, answeredRootAtTopLevel } = input;
   if (forceTopicApplied || ownsThreadSession) return undefined;
   if (!mentionedThisBot) return undefined;
   if (chatType !== 'group') return undefined;
@@ -2578,6 +2633,27 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (freshMode !== 'group') return undefined;
   routing.scope = 'chat';
   routing.anchor = chatId;
+  // 用户先在顶层 @ 了 bot（bot 已按 mode='plain' 平铺答过这条消息），之后才在
+  // **同一条消息上手动开启话题**：飞书把话题内的后续消息投递成
+  // root_id=<那条原顶层消息> + thread_id=<新建 omt_>。会话折叠回群是对的（上面
+  // 已完成），但此时不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层
+  // @ 得到的回复会跑进一个他并未在其中 @ 过 bot 的话题里。
+  //
+  // 判据要求 `inThread === false`（答那轮的 inbound 不带 thread_id），所以
+  // 「@ 在既有话题里」不会命中：原生话题的开场消息虽然同样记 mode='plain'，但它
+  // 带 thread_id ⇒ inThread=true。既有的话题锚定契约（chat/shared fold 用例）
+  // 因此保持不变。
+  //
+  // 只抑制**显示锚点**，不抑制**路由归属**：仍把 rootId 作为 foldedRootId 交出去
+  // 登记 alias，否则该话题内后续的非 @ 消息会查不到本会话而另起 thread 会话。
+  if (answeredRootAtTopLevel?.(rootId)) {
+    logger.info(
+      `[reply-mode] thread root=${rootId.substring(0, 12)} was answered flat at top level; ` +
+      `folding into chat=${chatId.substring(0, 12)} WITHOUT anchoring the reply into the after-the-fact topic`,
+    );
+    routing.foldedRootId = rootId;
+    return undefined;
+  }
   logger.info(`[reply-mode] mentioned thread root=${rootId.substring(0, 12)} folds into chat=${chatId.substring(0, 12)}`);
   return rootId;
 }
@@ -3010,7 +3086,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       dispatchPersistedForwardFollowup(record.messageId, payload);
     const remainingMs = record.dueAt - Date.now();
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
-    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
       chatId,
@@ -3316,6 +3392,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
+          answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
         });
         if (!replyRootId) {
           replyRootId = await maybeApplySharedTopicSeed({
@@ -3397,6 +3474,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
 
       if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
+      if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return;
       }
 
@@ -3561,7 +3642,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // that @mentions another specific member (person/bot) is a redirect to
       // someone else → back off, don't fold it in (mentionsAnotherMember).
       // 'never' stays unconditional by design.
-      const mentionModeForAlias = resolveGroupMentionMode(larkAppId);
+      const mentionModeForAlias = resolveGroupMentionMode(larkAppId, chatId);
       if (!explicitlyMentionedThisBot
           && mentionModeForAlias !== 'always'
           && !((mentionModeForAlias === 'topic' || mentionModeForAlias === 'ambient') && mentionsAnotherMember(larkAppId, message))
@@ -3633,6 +3714,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         : false;
       const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
         larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
+        answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
       });
       if (foldedReplyRootId) {
         replyRootId = foldedReplyRootId;
@@ -3710,7 +3792,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           senderOpenId,
           rootId: message.root_id,
         };
-        const pairingMentionMode = resolveGroupMentionMode(larkAppId);
+        const pairingMentionMode = resolveGroupMentionMode(larkAppId, chatId);
         const ambientRedirect = pairingMentionMode === 'ambient'
           && !explicitlyMentionedThisBot
           && mentionsAnotherMember(larkAppId, message);
@@ -3767,7 +3849,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
       if (chatType === 'group') {
-        const mentionMode = resolveGroupMentionMode(larkAppId);
+        const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
         // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
         // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
         // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
@@ -3890,7 +3972,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
-      const groupMentionMode = resolveGroupMentionMode(larkAppId);
+      const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
       const shouldDelayTopicSeed = usesForwardFollowupDelay(groupMentionMode)
         && !pairedForwardSeed
         && !isControlCommand

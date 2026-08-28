@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   applySessionOwnerEnv,
+  scrubExternalMemberEnv,
   BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
@@ -680,5 +681,66 @@ describe('pm2CallerEnv()', () => {
     const base: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret' };
     pm2CallerEnv(base, '/tmp/pm2-home');
     expect(base.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('h5-secret');
+  });
+});
+
+describe('scrubExternalMemberEnv (external fleet members)', () => {
+  // Parity with the pm2 path is the whole contract: this replaces the plugin pm2
+  // boundary, and a migration must not quietly reduce protection. Asserting the
+  // RESULT against that boundary's real composition (rather than re-listing keys
+  // here) means the two cannot drift.
+  //
+  // The reference MUST be the whole old boundary, not scrubPm2CallerEnv alone:
+  // pm2Env() ran stripPm2GracefulExitMarker FIRST and then scrubbed. Comparing
+  // against the scrub in isolation is what let the graceful-exit sentinel leak
+  // into external members unnoticed — the fixture carries it now so this spec
+  // fails if that strip is ever dropped again.
+  it('strips exactly what the whole pm2 plugin boundary stripped', async () => {
+    const { scrubPm2CallerEnv } = await import('../src/cli/pm2-env.js');
+    const { stripPm2GracefulExitMarker } = await import('../src/pm2-graceful-exit.js');
+    const poisoned = (): NodeJS.ProcessEnv => ({
+      CODEX_HOME: '/bot/a/codex',
+      CLAUDE_CONFIG_DIR: '/bot/a/claude',
+      CLAUDECODE: '1',
+      CLAUDE_CODE_SESSION_ID: 'sess',
+      BOTMUX_WORKFLOW: '1',
+      BOTMUX_GOAL_PATH: '/tmp/goal',
+      BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'secret',
+      NO_COLOR: '1',
+      FORCE_COLOR: '3',
+      BOTMUX_SESSION_ID: 'sess-1',
+      BOTMUX_TURN_ID: 'turn-1',
+      // resolveFleetDaemonEnv pins this for EVERY supervised member, so an
+      // external member really does arrive here carrying it.
+      [PM2_GRACEFUL_EXIT_CODE_ENV]: '90',
+      PATH: '/usr/bin',
+      HOME: '/root',
+      UNRELATED: 'keep',
+    });
+    const viaExternal = poisoned();
+    // pm2Env(): stripPm2GracefulExitMarker(...) then scrubPm2CallerEnv(...).
+    const viaPm2 = stripPm2GracefulExitMarker(poisoned());
+    scrubExternalMemberEnv(viaExternal);
+    scrubPm2CallerEnv(viaPm2);
+    expect(viaExternal).toEqual(viaPm2);
+  });
+
+  it('strips the graceful-exit sentinel (drift guard on the key name)', () => {
+    // Spelled as a literal in child-env.ts (that module is dependency-free), so
+    // pin it to the constant here the way REDACTED_CHILD_ENV_KEYS is pinned.
+    const env: NodeJS.ProcessEnv = { [PM2_GRACEFUL_EXIT_CODE_ENV]: '90', PATH: '/usr/bin' };
+    scrubExternalMemberEnv(env);
+    expect(env[PM2_GRACEFUL_EXIT_CODE_ENV]).toBeUndefined();
+  });
+
+  it('keeps unrelated env and re-pins TERM rather than deleting it', () => {
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin', UNRELATED: 'keep', TERM: 'dumb', NO_COLOR: '1' };
+    scrubExternalMemberEnv(env);
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.UNRELATED).toBe('keep');
+    // Deleting TERM would make the child render colorless — the same end state
+    // the invoker-terminal scrub exists to prevent — so it is pinned, not removed.
+    expect(env.TERM).toBe('xterm-256color');
+    expect(env.NO_COLOR).toBeUndefined();
   });
 });

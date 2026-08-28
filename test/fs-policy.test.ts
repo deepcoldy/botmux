@@ -25,6 +25,7 @@ import {
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -150,6 +151,27 @@ describe('buildFsPolicy', () => {
     expect(args[carve - 1]).toBe('--bind');
     expect(args.lastIndexOf(sessionsRoot)).toBeGreaterThan(carve);
     expect(args[args.lastIndexOf(sessionsRoot) - 1]).toBe('--remount-ro');
+  });
+
+  it('isolates ebsd sibling transcripts while retaining service state', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const sessionsRoot = '/home/u/.ebsd/agent/sessions';
+    const ownSessionDir = `${sessionsRoot}/botmux/self`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+      mandatoryDenyPaths: [sessionsRoot],
+      extraWritePaths: [ownSessionDir],
+    }));
+    expect(accessForPath(p.rules, '/home/u/.ebsd/agent/agent.db').access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${ownSessionDir}/turn.jsonl`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sessionsRoot}/botmux/sibling/secret.jsonl`).access).toBe('deny');
   });
 
   it('reasonix state root is read-write so identity, sessions, leases and skills persist in sandbox', () => {
@@ -658,17 +680,31 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).not.toMatch(/isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
   });
 
+  it('WIRING GUARD: worker routes exact service credentials through their dedicated policy channel', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toContain("import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';");
+    expect(src).toMatch(/const serviceCredentialReadOnlyPaths\s*=\s*resolveServiceSecretReadonlyFiles\([\s\S]*?cliAdapter\.sandboxSecretReadonlyPaths/);
+    expect(src).toMatch(/const fsPolicyCtx[\s\S]*?serviceCredentialReadOnlyPaths,/);
+    expect(src).not.toContain('mandatoryReadOnlyPaths.push(...keepSecretReadonlyFiles');
+    expect(src).toContain("if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);");
+  });
+
   it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
     expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");
     expect(src).toMatch(/ompCurrentSessionDir\s*=\s*cliAdapter\.id === 'oh-my-pi'[\s\S]*?ompSessionDir\(effectiveAdapterSessionId\)/);
-    const precreate = src.indexOf('if (ompCurrentSessionDir) mkdirSync(ompCurrentSessionDir');
+    // ebsd shares the same exact-session carve-out shape through its own
+    // adapter-owned session dir; both feed the generalized managed dir.
+    expect(src).toMatch(/import \{[^}]*ebsdBotmuxSessionDir[^}]*\} from '\.\/adapters\/cli\/ebsd\.js';/);
+    expect(src).toMatch(/ebsdCurrentSessionDir\s*=\s*cliAdapter\.id === 'ebsd'[\s\S]*?ebsdBotmuxSessionDir\(effectiveAdapterSessionId\)/);
+    expect(src).toContain('const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;');
+    const precreate = src.indexOf('if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir');
     const policyAssembly = src.indexOf('const fsPolicyCtx =', precreate);
     expect(precreate).toBeGreaterThan(-1);
     expect(policyAssembly).toBeGreaterThan(precreate);
-    expect(src).toContain("relative(canonicalOmpSessionsRoot, canonicalOmpSessionDir) !== join('botmux', effectiveAdapterSessionId)");
-    expect(src).toContain('mandatoryDenyPaths.push(canonicalOmpSessionsRoot)');
-    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalOmpSessionDir])');
+    expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
+    expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
+    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {
@@ -1051,6 +1087,51 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/sibling/send-cred.json').access).toBe('deny');
+  });
+
+  it('suppresses service credentials inside authority roots without filtering other mandatory read-only grants', () => {
+    const serviceSecret = '/Users/u/.botmux/.dashboard-secret';
+    const capability = '/Users/u/.botmux/data/origin-capability';
+    const p = noTransport({
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+      mandatoryReadOnlyPaths: [capability],
+    });
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths).toContain(serviceSecret);
+    expect(accessForPath(p.rules, capability).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(capability);
+  });
+
+  it('suppresses service credentials inside Linux authority roots too', () => {
+    const serviceSecret = '/home/u/.botmux/.dashboard-secret';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      larkTransportEnabled: false,
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+    }));
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths).toContain(serviceSecret);
+  });
+
+  it('keeps external service credentials mandatory read-only under no-transport', () => {
+    const serviceSecret = '/run/secrets/ebsd-diag-token';
+    const p = noTransport({
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+      userPaths: { readWrite: [serviceSecret] },
+    });
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths ?? []).not.toContain(serviceSecret);
   });
 
   it('LINUX no-transport: the lark-cli keystore is frozen with NO own-key carve-out (unlike transport-enabled)', () => {

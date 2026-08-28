@@ -278,7 +278,7 @@ jobs:
   # `if: github.event_name == 'push'`. If you ever add an `if:` here you MUST
   # also re-assert `needs.<each>.result == 'success'` for every entry in `needs`.
   release:
-    needs: [preflight, bun-binaries, binary-subpackages]
+    needs: [preflight, bun-binaries, bun-binaries-musl, binary-subpackages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -508,21 +508,30 @@ jobs:
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release (desktop assets attached asynchronously)
-        # npm-first: the Release is created right after npm publish, WITHOUT the
-        # macOS assets — those are uploaded later by `attach-desktop-assets` once
-        # signing/notarization finishes. So the Release exists with npm already
-        # live but no .dmg/.zip yet. Normally the desktop bundle lands within the
-        # same run (a few minutes) once macOS signing completes — but signing is
-        # behind a human approval gate that can wait up to 30 days, or be
-        # rejected / fail / be cancelled; in those cases the Release stays
-        # npm-only until the manual recovery re-run (see attach-desktop-assets).
-        # softprops keeps the release editable so the later --clobber upload just
-        # adds the files.
+      - name: Create GitHub Release as a DRAFT (published once binaries are attached)
+        # WHY A DRAFT (this was a real user-facing 404): `releases/latest/download/…`
+        # starts resolving to a release the moment it is PUBLISHED, but the binaries
+        # are uploaded by the separate `attach-bun-binaries` job which cannot run
+        # until the release exists. On v3.18.0 that gap was 72 seconds (published
+        # 09:11:58, assets attached 09:13:10) and a user running install.sh inside it
+        # got:
+        #   curl: (56) The requested URL returned error: 404
+        #   botmux install: download failed: …/releases/latest/download/botmux-darwin-arm64
+        #
+        # A draft is invisible to `latest` and to anonymous downloads, so the window
+        # closes: `publish-github-release` below flips it public only after the
+        # binaries are in place. Verified against the real API: uploading to a draft
+        # BY TAG NAME works, publishing preserves the assets, and the asset is then
+        # anonymously downloadable (HTTP 200).
+        #
+        # Desktop (.dmg/.zip) is deliberately NOT part of this gate — signing sits
+        # behind a human approval that can wait up to 30 days, so it still attaches
+        # asynchronously to the already-published release, exactly as before.
         uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+          draft: true
 
       - name: Comment "Released in" on included PRs
         # squash 兼容的「已发布」标记:GitHub 原生侧栏 released 徽标只认 PR 分支的原始
@@ -731,6 +740,149 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  bun-binaries-musl:
+    # The musl (Alpine) legs. The build runs inside Alpine via `docker run`; the
+    # job itself runs on the plain glibc runner.
+    #
+    # WHY A SEPARATE JOB: `pty.node` is embedded into the binary at build time, and
+    # node-pty ships NO linux prebuild — so the builder compiles it against whatever
+    # libc it runs on. Measured: on a glibc host the result is
+    # `NEEDED libc.so.6`; inside node:22-alpine it is `NEEDED libc.musl-x86_64.so.1`.
+    # Cross-compiling a musl target from the glibc runner would therefore embed a
+    # glibc native and fail at PTY spawn on Alpine — at RUNTIME, silently, not at
+    # build time. So the musl targets must be compiled on musl.
+    #
+    # WHY `docker run` AND NOT A JOB-LEVEL `container:` (this cost a failed release):
+    # with `container: node:22-alpine`, the arm64 leg died before running anything:
+    #   JavaScript Actions in Alpine containers are only supported on x64 Linux
+    #   runners. Detected Linux Arm64
+    # actions/checkout is a JS action, and GitHub cannot inject its Node runtime
+    # into a musl container on arm64. The x64 leg was unaffected, which is why the
+    # PR gate (x64-only) stayed green while the release failed. Running JS actions
+    # on the HOST and only the build inside `docker run` sidesteps the limitation
+    # entirely and keeps both arches on one code path.
+    #
+    # Verified end-to-end: inside node:22-alpine, building with
+    # scripts/build-bun-binary.mjs --target bun-linux-x64-musl and then running the
+    # result spawned a real PTY (`PTY_OK_FROM_MUSL`). That check matters because a
+    # binary that merely STARTS proves nothing — a libc mismatch fails at the moment
+    # the native module loads. The bind-mount writeback (artifact readable back on
+    # the host for upload-artifact) was verified with the same shape.
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: bun-linux-x64-musl
+            artifact: linux-x64-musl
+          - os: ubuntu-24.04-arm
+            targets: bun-linux-arm64-musl
+            artifact: linux-arm64-musl
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      # Runs on the HOST (glibc), so the JS action works on both arches.
+      - uses: actions/checkout@v6
+
+      - name: Build the musl binary inside Alpine
+        # Every musl-side step in one container invocation: toolchain, bun, install
+        # (this is what compiles pty.node against musl), the fail-closed linkage
+        # check, version stamp, build, compile, and the shared smoke script.
+        #
+        # `--platform` is deliberately NOT passed: the image resolves to the
+        # runner's own architecture, which is the whole point — the native must be
+        # built for the arch it will ship on, not emulated.
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e RELEASE_TAG \
+            -e MATRIX_TARGETS="${{ matrix.targets }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:22-alpine sh -euc '
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
+
+              # setup-bun does not support musl, and npm ships musl builds of bun
+              # (@oven/bun-linux-{x64,aarch64}-musl), so npm is the way in.
+              npm i -g bun@1.4.0 --loglevel=error
+              echo "bun $(bun --version) on $(uname -m)"
+
+              # Compiles node-pty against MUSL — the whole point of this job.
+              bun install --frozen-lockfile
+
+              # Fail closed rather than shipping a glibc native inside a musl
+              # binary: that mistake survives the build and only surfaces when the
+              # native is loaded, on a user machine.
+              f=node_modules/node-pty/build/Release/pty.node
+              test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
+              if ! readelf -d "$f" | grep -q "libc\.musl"; then
+                echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
+              fi
+              echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s " ")"
+
+              npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+              bun run build
+
+              mkdir -p dist-bin
+              for t in $MATRIX_TARGETS; do
+                bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+              done
+
+              # Run the binary this container just built, on musl — the only place
+              # it can be executed. Same shared script as the glibc legs and the PR
+              # gate, so no leg is gated more weakly than another.
+              HOST_ARCH="$(node -e "process.stdout.write(process.arch)")"
+              BIN="dist-bin/botmux-linux-${HOST_ARCH}-musl"
+              if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
+              node scripts/smoke-bun-binary.mjs "$BIN"
+
+              # The process/socket probes in the legacy-pm2 reaper, exercised against
+              # BusyBox. Mirrors the PR gate deliberately: `bun run test` runs on
+              # glibc, where reverting either probe to `ps -p`/`lsof` leaves the
+              # unit suite green while the musl binary we ship stops reaping at all
+              # (and can never clear its own stale warning). Keeping this in BOTH
+              # workflows is the same "no leg gated more weakly" rule as above —
+              # last time the legs diverged, the PR gate was green while the release
+              # failed.
+              node scripts/smoke-musl-reaper-probes.mjs dist/core/legacy-pm2-reaper.js
+
+              # Hand dist-bin back to the HOST user before exiting.
+              #
+              # WHY (this broke v3.18.0-canary.5, after the container work itself had
+              # fully succeeded): the container runs as root, so everything it writes
+              # through the bind mount is uid 0. The runner host user is `runner`
+              # (uid 1001) and CANNOT create files inside a root-owned directory:
+              #   dist-bin/botmux-linux-arm64-musl.sha256: Permission denied
+              # Both musl legs built, smoke-passed, and then died in `Checksums`.
+              #
+              # `-v` bind mounts share the host inode, so ownership is not remapped
+              # for us (a `container:` job did not have this problem because GitHub
+              # ran the whole job as the same user). Reproduced and fixed as a
+              # non-root user before committing — my original verification ran as
+              # root, which can write anywhere and therefore could not see it.
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
+            '
+
+      - name: Checksums
+        # Runs on the host, writing .sha256 files INTO dist-bin — which is why the
+        # container hands ownership back above. Readable is not enough; this step
+        # needs write permission on the directory.
+        run: |
+          cd dist-bin
+          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload binaries as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-binaries-${{ matrix.artifact }}
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+          retention-days: 7
+
   binary-subpackages:
     # Publish the four platform subpackages — `botmux-linux-x64`,
     # `botmux-linux-arm64`, `botmux-darwin-x64`, `botmux-darwin-arm64` — each
@@ -745,7 +897,7 @@ jobs:
     #
     # Single runner, not a matrix: publishing is pure npm I/O with no native
     # build, so both OSes' binaries are packed here from the artifacts.
-    needs: [preflight, bun-binaries]
+    needs: [preflight, bun-binaries, bun-binaries-musl]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -788,7 +940,7 @@ jobs:
         # one carry the tag's version.
         run: |
           VERSION="${RELEASE_TAG#v}"
-          for plat in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+          for plat in linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64; do
             src="dist-bin/botmux-${plat}"
             dir="packages/binary-${plat}"
             if [ ! -f "$src" ]; then echo "missing compiled binary $src"; exit 1; fi
@@ -818,8 +970,8 @@ jobs:
     # the binaries can be re-attached by hand. The npm channel already carries the
     # same binaries inside the platform subpackages, so a missing Release asset
     # only affects the curl/install.sh path.
-    if: github.event_name == 'push' && needs.bun-binaries.result == 'success' && needs.release.result == 'success'
-    needs: [bun-binaries, release]
+    if: github.event_name == 'push' && needs.bun-binaries.result == 'success' && needs.bun-binaries-musl.result == 'success' && needs.release.result == 'success'
+    needs: [bun-binaries, bun-binaries-musl, release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -839,6 +991,76 @@ jobs:
         run: |
           ls -la dist-bin
           gh release upload "$RELEASE_TAG" dist-bin/botmux-* --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish-github-release:
+    # Flip the draft release public — the LAST step of the release, on purpose.
+    #
+    # WHY THIS JOB EXISTS: `releases/latest/download/…` resolves as soon as a release
+    # is published, but the binaries are attached by `attach-bun-binaries`, which
+    # cannot run before the release exists. Publishing immediately therefore opened a
+    # window where install.sh 404s — 72 seconds on v3.18.0, and a real user hit it.
+    # Creating the release as a draft and publishing HERE means `latest` never points
+    # at a release without binaries.
+    #
+    # WHY IT IS NOT PART OF `attach-bun-binaries`: keeping "upload" and "publish"
+    # separate means a partial upload cannot publish. If attach fails, this job is
+    # skipped and the release stays a DRAFT — invisible to `latest`, so users keep
+    # getting the previous version instead of a 404. That is the fail-closed
+    # direction: npm is already live either way.
+    #
+    # RECOVERY FROM A STUCK DRAFT (verified, because the obvious assumption is wrong):
+    # `workflow_dispatch` does NOT re-run this job — it carries
+    # `github.event_name == 'push'`, and the dispatch path only reaches
+    # `refresh-desktop-assets`. Re-running the failed RUN works only while the
+    # compiled-binary artifacts still exist (`retention-days: 7`). So:
+    #   • within 7 days → re-run the failed jobs of that run; or
+    #   • any time      → attach the assets and publish by hand:
+    #       gh release upload vX.Y.Z <binaries+sha256> --clobber
+    #       gh release edit   vX.Y.Z --draft=false
+    # A draft blocks only the curl/install.sh path; npm already serves the same
+    # binaries inside the platform subpackages, so this is never a total outage.
+    #
+    # `--draft=false` is idempotent: publishing an already-public release is a no-op.
+    if: github.event_name == 'push' && needs.attach-bun-binaries.result == 'success'
+    needs: [attach-bun-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify every install.sh asset is present BEFORE publishing
+        # The gate this whole change exists for. install.sh derives asset names from
+        # `uname -s`/`uname -m` (+ a `-musl` suffix when the libc is musl), so a
+        # missing or misnamed asset is a 404 for exactly the platforms it covers —
+        # and nothing else in the pipeline checks the NAMES at all. Refusing to
+        # publish leaves the release a draft, which is strictly better than a public
+        # release that 404s.
+        run: |
+          missing=""
+          for a in botmux-linux-x64 botmux-linux-arm64 botmux-linux-x64-musl \
+                   botmux-linux-arm64-musl botmux-darwin-x64 botmux-darwin-arm64; do
+            for f in "$a" "$a.sha256"; do
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '[.assets[].name]|index("'"$f"'")' | grep -q '^[0-9]' \
+                || missing="$missing $f"
+            done
+          done
+          if [ -n "$missing" ]; then
+            echo "REFUSING to publish: missing release assets:$missing"
+            echo "The release stays a DRAFT, so releases/latest/download keeps serving the"
+            echo "previous version instead of 404ing. Fix the assets, then re-run."
+            exit 1
+          fi
+          echo "ok: all 12 install.sh assets present"
+
+      - name: Publish the release
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq '"published: isDraft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
 
   attach-desktop-assets:
     # npm-first tail: once the parallel `desktop` job has signed+notarized the

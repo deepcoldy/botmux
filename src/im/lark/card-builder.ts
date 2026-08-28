@@ -285,6 +285,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'pi': 'Pi',
   'copilot': 'Copilot',
   'oh-my-pi': 'Oh My Pi',
+  'ebsd': 'ebsd',
   'kimi': 'Kimi',
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',

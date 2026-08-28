@@ -93,8 +93,14 @@ describe('plugin PM2 environment', () => {
     vi.resetModules();
     const { runPluginPm2 } = await import('../src/core/plugins/pm2.js');
 
-    expect(() => runPluginPm2(['start', 'fixture'], { inherit: false }))
-      .toThrow(/exactly one.*123, 456/);
+    const hostPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    try {
+      expect(() => runPluginPm2(['start', 'fixture'], { inherit: false }))
+        .toThrow(/exactly one.*123, 456/);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: hostPlatform });
+    }
     expect(childProcess.spawnSync).not.toHaveBeenCalled();
   });
   it('does not leak the Dashboard Feishu H5 login family into plugin PM2 apps', async () => {

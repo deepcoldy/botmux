@@ -5,8 +5,9 @@
  * bot 注册表都在这里装配。card-handler 与 command-handler 都从这里取。
  */
 import { config } from '../../config.js';
-import { effectiveBotDisplayName, getBot } from '../../bot-registry.js';
+import { effectiveBotDisplayName, effectiveDefaultWorkingDir, getBot } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
+import { configuredWorkingDirs } from '../../utils/working-dir.js';
 import { readPlatformBinding } from '../../platform/binding.js';
 import {
   bindIssue,
@@ -103,12 +104,20 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
     workingDirs: (larkAppId: string) => {
       try {
         const cfg = getBot(larkAppId).config;
-        return [
-          ...(cfg.workingDir ? [cfg.workingDir] : []),
-          ...(cfg.workingDirs ?? []),
-        ];
+        return configuredWorkingDirs({
+          workingDir: cfg.workingDir,
+          workingDirs: cfg.workingDirs,
+        });
       } catch {
         return [];
+      }
+    },
+
+    defaultWorkingDir: (larkAppId: string) => {
+      try {
+        return effectiveDefaultWorkingDir(getBot(larkAppId).config);
+      } catch {
+        return undefined;
       }
     },
 

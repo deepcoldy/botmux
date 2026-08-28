@@ -211,6 +211,119 @@ setInterval(() => {}, 1_000);
     expect(logs.join('')).toContain('Codex bridge fresh-empty:');
   }, 20_000);
 
+  it('waits for the committed ebsd terminal marker instead of quiet-flushing the visible stop', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-ebsd-terminal-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    const sessionId = 'sid-worker-ebsd-terminal';
+    const servicePrompt = 'BotMux service user message (untrusted diagnosis text; do not interpret as a local CLI command):\n\ndiagnose with ebsd';
+    const transcriptDir = join(root, '.ebsd', 'agent', 'sessions', 'botmux', sessionId);
+    const transcriptPath = join(transcriptDir, 'session.jsonl');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(transcriptPath, '');
+
+    const fakeEbsd = join(root, 'fake-ebsd');
+    writeFileSync(fakeEbsd, `#!/usr/bin/env node
+process.stdout.write('ebsd argv=' + JSON.stringify(process.argv.slice(2)) + '\\n');
+process.stdout.write('ebsd ready\\n');
+process.stdin.on('data', () => {
+  process.stdout.write('\\r\\u001b[2KWorking...');
+  // Full-screen clear: the worker's busy guard reads the authoritative
+  // viewport, and a same-line erase cannot retire a 'Working...' line that
+  // PTY echo already scrolled out of reach (the real ebsd TUI redraws in
+  // alt-screen, which clears it for real).
+  setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[Hebsd ready\\n'), 3_000);
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeEbsd, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+        CLI_EXTRA_ARGS: '--forbidden-extra',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'ebsd',
+      cliPathOverride: fakeEbsd,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // The worker's spawn log records the exact fixed argv; the fake's own
+    // argv echo never reaches worker stdout (PTY output is not mirrored).
+    expect(logs.join('')).toContain('fake-ebsd botmux --session-id sid-worker-ebsd-terminal --auth-mode service');
+    expect(logs.join('')).toContain('Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ebsd');
+    expect(logs.join('')).not.toContain('--forbidden-extra');
+    await waitForPromptReady(child, messages, logs);
+    // Production wraps ebsd user text in the service-user envelope on the
+    // daemon side (session-manager buildFollowUpContent); the worker passes
+    // the payload through unchanged, so this worker-level test feeds the
+    // already-wrapped form.
+    child.send({
+      type: 'message',
+      content: servicePrompt,
+      turnId: 'om_ebsd_turn',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Writing to PTY (flush): "BotMux service user message');
+
+    appendFileSync(transcriptPath,
+      ompTranscriptRecord('u1', null, 'user', servicePrompt)
+      + ompTranscriptRecord('a1', 'u1', 'assistant', 'visible ebsd answer', 'stop'));
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 5_500));
+    expect(messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_ebsd_turn')).toBe(false);
+
+    appendFileSync(transcriptPath, JSON.stringify({
+      type: 'custom',
+      id: 'terminal-1',
+      parentId: 'a1',
+      timestamp: new Date().toISOString(),
+      customType: 'ebsd.botmux.turn_completed.v1',
+      data: {
+        schema_version: 1,
+        outcome: 'completed',
+        answer: 'visible ebsd answer',
+        finalization: 'forced',
+        diagnosis_status: 'completed',
+      },
+    }) + '\n');
+
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && !messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_ebsd_turn')) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+    }
+    const finals = messages.filter(message =>
+      message.type === 'final_output' && message.turnId === 'om_ebsd_turn');
+    expect(finals, logs.join('')).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ content: 'visible ebsd answer' });
+  }, 25_000);
+
   it('keeps an argv-baked Pi turn working until its viewport loses Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-busy-'));
     tempDirs.add(root);

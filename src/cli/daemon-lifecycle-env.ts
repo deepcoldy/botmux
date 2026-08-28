@@ -42,6 +42,12 @@ export const DAEMON_ENV_KEYS = [
   // keeps them on the deterministic resolveDaemonEnv snapshot semantics.
   'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
   'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
+  // Merlin Devbox auto-export switch (platform/devbox-dashboard-export.ts).
+  // The dashboard resolves it (dashboard-url / control-csrf run there), so it
+  // has to survive the allowlist copy — same reason BOTMUX_PUBLIC_URL is here.
+  // The CLI, which is the side that spawns merlin-cli, has no dotenv step at
+  // all and reads the key straight from ~/.botmux/.env instead.
+  'BOTMUX_DEVBOX_AUTO_EXPORT',
 ] as const;
 
 export type DaemonEnvKey = (typeof DAEMON_ENV_KEYS)[number];

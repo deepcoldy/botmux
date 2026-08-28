@@ -286,6 +286,12 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.dm_updated': '✅ DM session mode updated to: {mode}',
   'cmd.reply_mode.dm_usage': 'Usage (DM): /reply-mode chat | topic | group\nchat = the whole DM shares one continuous session (default); topic = each message starts its own session; group = each message births a dedicated session group and the conversation continues there.',
   'cmd.reply_mode.dm_shared_unsupported': '⚠️ shared / chat-topic only make sense in regular groups; DMs support chat | topic only.',
+  'cmd.mention_mode.status': 'Current group @-mention policy: {mode}\nCommands: /mention-mode always | topic | never | ambient',
+  'cmd.mention_mode.updated': '✅ Group @-mention policy updated to: {mode}',
+  'cmd.mention_mode.unsupported': '⚠️ /mention-mode only works in regular groups; DMs and topic groups need no setting.',
+  'cmd.mention_mode.owner_only': '⚠️ Only owner/allowedUsers can change the @-mention policy.',
+  'cmd.mention_mode.usage': 'Usage: /mention-mode always | topic | never | ambient\nalways = @ required to reply (default); topic = @ required at top level, non-@ continues inside topics; never = no @ required, answers all group messages; ambient = like never, but stays quiet when the message @mentions someone else.',
+  'cmd.mention_mode.failed': '⚠️ Failed to update @-mention policy: {reason}',
   'cmd.substitute.status_on': 'Current substitute mode for this group: ON (default). When a configured substitute target is @mentioned, I will answer on their behalf.',
   'cmd.substitute.status_off': 'Current substitute mode for this group: OFF. Use @me /substitute on to enable it again.',
   'cmd.substitute.updated_on': '✅ Substitute mode enabled for this group.',
@@ -728,7 +734,7 @@ export const messages: Record<string, string> = {
   'slashlist.col_desc': 'Description',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
-  'ai.routing.intro': 'You are in a Lark (Feishu) topic group. The user cannot see terminal output — you MUST reply via `botmux send`.',
+  'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
@@ -750,7 +756,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI hints (BOTMUX_SHELL_HINTS for non-injecting CLIs; multiline_heredoc /
   // heredoc_example are also reused by the system-prompt path — keep both locales aligned) ──
-  'ai.shell.intro': 'You are running inside a Lark (Feishu) topic group. The user reads on Lark and cannot see your terminal output.',
+  'ai.shell.intro': 'You are running inside a Lark (Feishu) conversation. The user reads on Lark and cannot see your terminal output.',
   'ai.shell.commands_are_shell': 'IMPORTANT: `botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are SHELL commands (CLI programs installed in $PATH), NOT MCP tools. Run them via the Bash tool — don\'t look for them in the MCP tool list.',
   'ai.shell.how_to_send': 'To send a message to the user (the only way): run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`, video previews with `--videos /path.mp4 --video-covers /cover.png`.',
   'ai.shell.multiline_heredoc': 'Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
@@ -767,7 +773,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
   'ai.followup.reminder': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
-  'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark topic via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
+  'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',

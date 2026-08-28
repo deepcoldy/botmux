@@ -1668,6 +1668,71 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(providerUuid).toBeTruthy();
   });
 
+  it('unwraps a stale automatic meeting envelope before replying to a human listener-chat question', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_direct_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im-envelope',
+      memberId: 'member-im-envelope', memberEpoch: 1,
+    };
+    const origin = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-im-envelope', memberId: 'member-im-envelope',
+      memberEpoch: 1, agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_envelope',
+    };
+    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+      memberId: origin.memberId,
+      memberEpoch: origin.memberEpoch,
+      agentAppId: origin.agentAppId,
+      ownerBootId: origin.ownerBootId,
+      ownerEpoch: origin.ownerEpoch,
+      role: 'minutes',
+      membershipGeneration: origin.membershipGeneration,
+      status: 'active',
+      responseMode: 'silent',
+      capabilities: ['meeting.read'],
+      ownedSinks: [],
+      sinkOwnerGeneration: origin.sinkOwnerGeneration,
+      joinedAtIngestSeq: 0,
+      receiverSessionId: origin.receiverSessionId,
+      outputChatId: ds.chatId,
+    })).toMatchObject({ ok: true });
+    ds.session.vcMeetingImTurnOrigins = { om_human_envelope: origin };
+    const msg = {
+      ...finalOutputMsg(),
+      content: JSON.stringify({
+        decision: 'publish',
+        content: '请根据当前已启用的能力处理会议相关请求。',
+      }),
+      turnId: 'om_human_envelope',
+      lastUuid: 'bridge-human-envelope',
+    };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('请根据当前已启用的能力处理会议相关请求。');
+    expect(cardJson).not.toContain('&quot;decision&quot;');
+    expect(cardJson).not.toContain('publish');
+    expect(sessionReply.mock.calls[0][5]).toMatchObject({
+      quoteMessageId: 'om_human_envelope',
+    });
+  });
+
   it('blocks the plain fallback when VC IM authority expires during a withdrawn quote request', async () => {
     let plainFallbackCalls = 0;
     const sessionReply = vi.fn(async (...args: any[]) => {
