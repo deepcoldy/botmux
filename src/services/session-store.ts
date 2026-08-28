@@ -514,7 +514,9 @@ function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
 function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   requireSqliteEngine(`会话存储 ${basename(dbFp)} 首次导入`);
   const tmpFp = `${dbFp}.tmp`;
-  for (const suffix of ['', '-wal', '-shm']) {
+  // `-journal` is DELETE mode's sidecar (the mode this import uses below);
+  // `-wal`/`-shm` cover a crash under an older WAL-based import.
+  for (const suffix of ['', '-journal', '-wal', '-shm']) {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
@@ -534,7 +536,7 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     }
     tmp.exec('COMMIT');
     tmp.close();
-    for (const suffix of ['-wal', '-shm']) {
+    for (const suffix of ['-journal', '-wal', '-shm']) {
       if (existsSync(`${tmpFp}${suffix}`)) {
         throw new Error(`temporary SQLite import left ${tmpFp}${suffix}`);
       }
@@ -543,7 +545,7 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     return entries.length;
   } catch (err) {
     try { tmp.close(); } catch { /* already closed */ }
-    for (const suffix of ['', '-wal', '-shm']) {
+    for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
