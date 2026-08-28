@@ -6775,6 +6775,25 @@ async function cmdHistory(rest: string[]): Promise<void> {
         ...(cardJson !== undefined ? { cardJson } : {}),
       };
     }));
+    // Range guidance, emitted at the moment the model is actually reading
+    // history. The decisive fact is `sessionScope` (this session's own scope),
+    // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
+    // chat_mode='group' while its session is thread-scope, so reasoning from the
+    // group type would wrongly conclude "I may search the whole chat". Both
+    // `--scope` gates above key on isChatScope for exactly that reason.
+    //
+    // Wording note: describe only what the model can OBSERVE. Daemon-side
+    // invocations (`/t` and friends) are stripped before the prompt is built, so
+    // the model never sees them — naming them here would be an instruction it
+    // cannot act on. Describe the symptom instead: the topic starts mid-discussion
+    // and its own history looks too short to explain the task.
+    const rangeHint = isChatScope
+      ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
+      : effectiveScope === 'thread'
+        ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+        : effectiveScope === 'ambient'
+          ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
+          : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
     console.log(JSON.stringify({
       sessionId: sid,
       chatId: s.chatId,
@@ -6790,6 +6809,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
       } : {}),
       messages,
       total: messages.length,
+      rangeHint,
       // Discoverability: agents reading history often need the actual image
       // bytes (alert charts) or the raw card JSON — both live one command away.
       ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
