@@ -395,12 +395,17 @@ describe('ensureDevboxDashboardExport', () => {
   // covered, so removing the second's write left the suite green.
   it('does not re-spawn after an unparseable exit-0 export inside the window', async () => {
     const cachePath = fixture();
-    const runExport = vi.fn(async () => 'merlin-cli: unexpected output');
+    // Must be the {stdout, stderr} shape: returning a bare string made this land
+    // in the runner-threw branch (reading .stdout off a string yields undefined,
+    // and the scan throws), so it exercised the OTHER negative-cache write site
+    // and stayed green when this one was deleted.
+    const runExport = vi.fn(async () => ({ stdout: 'merlin-cli: unexpected output', stderr: '' }));
     const call = () => ensureDevboxDashboardExport({
       port: 9001,
       remoteBaseConfigured: false,
       env: devboxEnv,
       cachePath,
+      envFileMode: 'ignore' as const,
       merlinCliPath: '/fake/merlin-cli',
       runExport,
     });
