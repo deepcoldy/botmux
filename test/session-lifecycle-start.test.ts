@@ -737,7 +737,176 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('suppresses ordinary delivery failure when suspendWorker retires the worker', async () => {
+  it('reports an honest unconfirmed notice when suspendWorker retires the worker before commit', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ initConfig: { backendType: 'tmux' } as any });
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // The daemon never observes a commit ACK for this turn: suspend detaches
+    // the worker and destroys the CLI, and nothing redelivers the message. A
+    // deliberate retirement must not misreport an ambiguous crash, but it must
+    // not stay silent either — the user gets one honest unconfirmed notice
+    // that asks them to check the session before resending.
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    expect(suspendWorker(ds, 'test_retirement')).toBe(true);
+    worker.emit('exit', 0, null);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('主动休眠或更换');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('若未执行，再重新发送');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_business');
+  });
+
+  it('stays silent when the commit ACK arrives after suspendWorker detached the worker', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ initConfig: { backendType: 'tmux' } as any });
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // The worker committed the turn, but its fire-and-forget ACK drains only
+    // AFTER suspendWorker nulled ds.worker. The stale-worker gate must still
+    // let the old worker settle its own delivery record, or the exit
+    // settlement would misreport a committed turn as unconfirmed.
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    expect(suspendWorker(ds, 'test_retirement')).toBe(true);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
+    worker.emit('exit', 0, null);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('stays silent when the commit ACK arrives after a replacement fork advanced the generation', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const oldWorker = forkMock.mock.results.at(-1)!.value;
+    oldWorker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(oldWorker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    // Replacement fork: reserveWorkerGeneration advances the generation and
+    // the double-fork guard retires the old worker before its ACKs drain.
+    forkWorker(ds, '', true);
+    oldWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
+    oldWorker.emit('exit', 0, null);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('stays silent when suspendWorker retires the worker after the turn committed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ initConfig: { backendType: 'tmux' } as any });
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
+    expect(suspendWorker(ds, 'test_retirement')).toBe(true);
+    worker.emit('exit', 0, null);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('reports the retirement notice instead of the pre-ready exit notice when suspendWorker retires a cold-starting worker', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ initConfig: { backendType: 'tmux' } as any });
+    const worker = makeFakeWorker();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    forkMock.mockImplementationOnce(() => worker);
+
+    // Cold start with a tracked prompt; suspend lands BEFORE the worker ever
+    // reports ready (reachable in production: a re-forked session can carry the
+    // previous generation's lastScreenStatus='idle' into the pre-ready window,
+    // where the idle sweeper may suspend it under live_worker_cap).
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    // The IPC preload ACKs the receipt before the full worker module loads,
+    // so a real pre-ready record is received-but-uncommitted, not blank.
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_kickoff' });
+    expect(suspendWorker(ds, 'pre_ready_retirement')).toBe(true);
+    worker.emit('exit', 0, null);
+    await Promise.resolve();
+
+    // A deliberate suspend exits with code 0 and killed=false. It must not be
+    // misreported as "exited before becoming ready" or as an ambiguous crash
+    // — but the opening prompt never produced a commit ACK, so the user still
+    // gets exactly one honest unconfirmed notice.
+    expect(worker.killed).toBe(false);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('主动休眠或更换');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('就绪前退出');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_kickoff');
+  });
+
+  it('renders the retirement unconfirmed notice in the bot English locale', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ lang: 'en' }));
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -761,7 +930,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     worker.emit('exit', 0, null);
     await Promise.resolve();
 
-    expect(sessionReply).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('deliberately suspended or replaced');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('resend the message only if it did not run');
   });
 
   it('renders transport, commit, and failure notices in the bot English locale', async () => {

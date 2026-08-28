@@ -6335,7 +6335,12 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
   record.timer = undefined;
 }
 
-function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+function failOrdinaryImDelivery(
+  record: OrdinaryImDelivery,
+  reason: string,
+  messageKey: 'worker.input_delivery_failed' | 'worker.input_retired_unconfirmed'
+    = 'worker.input_delivery_failed',
+): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   clearOrdinaryImDelivery(record);
   logger.error(
@@ -6362,7 +6367,7 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
-    tr('worker.input_delivery_failed', { turnId: record.turnId.substring(0, 16) }, loc),
+    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
     'text',
     record.ds.larkAppId,
     record.turnId,
@@ -6557,6 +6562,21 @@ function completeOrdinaryImDelivery(
   if (record) clearOrdinaryImDelivery(record);
 }
 
+/** A retiring worker's late COMMIT ACK settles only the deliveries tracked
+ * against that exact worker object. The record's own worker identity is the
+ * authority here — deliberately NOT ds.worker/ds.workerGeneration, which have
+ * already moved on (suspend nulls the worker; a replacement fork advances the
+ * generation) by the time the ACK drains from the old child. Receipt ACKs are
+ * deliberately excluded: a stale receipt is not settlement-grade — the turn
+ * can still die unexecuted with the old worker, and swallowing the pending
+ * timers on it would silence the original generation's visible failure. */
+function completeStaleWorkerOrdinaryImDelivery(worker: ChildProcess, turnId: string): void {
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.worker !== worker || record.turnId !== turnId) continue;
+    clearOrdinaryImDelivery(record);
+  }
+}
+
 function rejectOrdinaryImDelivery(
   ds: DaemonSession,
   turnId: string,
@@ -6571,11 +6591,27 @@ function rejectOrdinaryImDelivery(
 
 function settleOrdinaryImDeliveriesForWorker(
   worker: ChildProcess,
-  options: { suppressAllFailures: boolean; startupOwnedTurnId?: string },
+  options: {
+    suppressAllFailures: boolean;
+    startupOwnedTurnId?: string;
+    retiredBeforeCommit?: boolean;
+  },
 ): void {
   for (const record of pendingOrdinaryImDeliveries.values()) {
     if (record.worker !== worker) continue;
     if (options.suppressAllFailures || record.turnId === options.startupOwnedTurnId) {
+      // A record still pending here means the daemon never observed the
+      // commit ACK — but a fire-and-forget ACK can also be lost when the old
+      // child exits right after sending it, so this does NOT prove the turn
+      // never entered the CLI. A deliberate lifecycle retirement (suspend /
+      // worker replacement) must not turn that into silence, and must not
+      // claim certainty either: report an honest unconfirmed outcome that
+      // asks the user to check the session before resending. Transfer, close
+      // and plain kill keep silent settling.
+      if (options.retiredBeforeCommit) {
+        failOrdinaryImDelivery(record, 'worker_retired_before_commit', 'worker.input_retired_unconfirmed');
+        continue;
+      }
       clearOrdinaryImDelivery(record);
       continue;
     }
@@ -10314,6 +10350,17 @@ function setupWorkerHandlers(
     // installed; never let those stale events mutate the replacement's cards,
     // tokens, readiness, transcript metadata, or durable turn state.
     if (ds.worker !== worker) {
+      // A retiring worker's own COMMIT ACK still settles the ordinary
+      // deliveries tracked against THAT worker object: suspend detaches
+      // ds.worker and a replacement advances the generation BEFORE the old
+      // child's fire-and-forget ACKs drain, so without this the exit
+      // settlement would report an already-committed turn as unconfirmed.
+      // Only the commit ACK is settlement-grade; a stale receipt proves
+      // nothing about execution and must keep the visible-failure timers
+      // running. Stale workers gain no other authority.
+      if (msg.type === 'turn_input_committed') {
+        completeStaleWorkerOrdinaryImDelivery(worker, msg.turnId);
+      }
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
       return;
     }
@@ -12831,6 +12878,12 @@ function setupWorkerHandlers(
       startupOwnedTurnId: !suppressDeliveryFailure && preReadyExit
         ? startupState.initTurnId
         : undefined,
+      // A deliberate retirement suppresses the misleading crash/ambiguity
+      // notices, but a tracked turn that never committed still owes the user
+      // a terminal outcome: it will never run and nothing redelivers it.
+      retiredBeforeCommit: lifecycleRetirement
+        && !transferRetirement
+        && ds.session.status !== 'closed',
     });
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);
