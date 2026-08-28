@@ -270,7 +270,7 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 按 messageId 原地更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -427,6 +427,28 @@ botmux send --card-file /tmp/card.json --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
 
+#### 发出后原地更新：\`botmux card patch\`
+
+自定义卡片发出后可以**原地改内容**——不发新消息、不换群/话题，用户看到的还是那张卡。适合进度卡片（开始时发「进行中」，每到节点刷新，结束改「完成」，不刷屏）和状态卡片（构建/审批结果过期后原地更正）。只想再发一条消息就用 \`send\`；daemon 自己维护的流式卡片/会话管理卡不要 patch；消息已撤回只能重新 send。
+
+流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
+
+\`\`\`bash
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
+\`\`\`
+
+| 参数 | 说明 |
+|---|---|
+| \`--message-id <om_xxx>\` | 必填。目标卡片的 messageId，取自 \`botmux send\` 成功输出的 \`.messageId\` |
+| \`--card-file <path>\` / \`--card-json <json>\` | 新卡片 JSON，二选一 |
+| \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
+
+安全边界与上面的 \`send --card-file/--card-json\` **完全相同**：只允许纯展示元素 + open_url 按钮，任何回调控件都会被拒绝。Bot 身份从会话上下文解析，不提供 \`--bot\` 类显式指定；飞书本身也禁止跨应用 patch 别人的卡片。
+
+成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -524,70 +546,6 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"...","quotedMessageId":"om_yyy 或 null","mentioned":[{"open_id":"ou_x","name":"Codex"}]}\`
 其中 \`quotedMessageId\` 是实际引用的消息（纯发为 null），\`mentioned\` 是实际 @ 的对象。stderr 另给一行人类可读摘要。
 失败 exit 1；**未做 @ 决策 exit 2**（按提示补 \`--mention\`/\`--mention-back\`/\`--no-mention\`）。
-`;
-
-const CARD_PATCH_SKILL = `---
-name: botmux-card-patch
-description: 原地更新之前用 botmux send --card-file/--card-json 发出的飞书自定义卡片（按 messageId patch，不发新消息、不换群/话题）。做进度卡片、状态卡片时用：先 send 发出卡片拿到 messageId，后续每次 card patch 原地刷新内容。
----
-
-# botmux-card-patch — 原地更新已发送的自定义卡片
-
-\`botmux send --card-file/--card-json\` 成功后输出 \`{"success":true,"messageId":"om_...",...}\`。\`botmux card patch\` 按这个 messageId **原地更新**同一张卡片——不发新消息、不换群/话题，用户看到的还是那张卡，只是内容变了。
-
-## 什么时候用
-
-- **进度卡片**：长任务开始时 send 一张「进行中」卡片，每到关键节点 patch 刷新进度，结束时 patch 成「完成」。比反复 send 新消息干净，不刷屏。
-- **状态卡片**：之前发出的卡片内容过期了（构建状态、审批结果等），原地更正。
-
-## 什么时候不用
-
-- 只是想再发一条消息 → 用 \`botmux send\`。patch 只改已有卡片，不能发新内容。
-- 更新会话的流式卡片 / 会话管理卡 → 那是 daemon 自己维护的，不要 patch。
-- 消息已被撤回 → patch 会报错（见下），只能重新 send。
-
-## 用法
-
-\`\`\`bash
-# 1. 发一张「进行中」卡片，从输出 JSON 里拿 messageId
-botmux send --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"部署进度"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 0%"}]}}' --no-mention
-# → {"success":true,"messageId":"om_xxx","sessionId":"..."}
-
-# 2. 原地更新到 50%
-botmux card patch --message-id om_xxx --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"部署进度"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 50%"}]}}'
-
-# 3. 完成时再更新一次（也可以用 --card-file）
-botmux card patch --message-id om_xxx --card-file /tmp/done.json
-\`\`\`
-
-脚本里用 \`jq\` 提取 messageId：
-
-\`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
-botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
-\`\`\`
-
-## 参数
-
-| 参数 | 说明 |
-|---|---|
-| \`--message-id <om_xxx>\` | 必填。目标卡片的 messageId，取自 \`botmux send\` 成功输出的 \`.messageId\` |
-| \`--card-file <path>\` | 新卡片 JSON 文件，与 \`--card-json\` 二选一 |
-| \`--card-json <json>\` | 新卡片 JSON 字符串，与 \`--card-file\` 二选一 |
-| \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
-
-## 安全边界（与 send 相同）
-
-更新用的卡片 JSON 走与 \`botmux send --card-file/--card-json\` **完全相同**的归一化和安全校验：只允许**纯展示元素 + open_url 跳转按钮**，任何会触发回调的控件（回调按钮、下拉 select、日期/时间选择、input、表单提交等）都会被拒绝（exit 2）。Bot 身份从会话上下文解析（与 send 相同），不提供 --bot 类显式指定；飞书本身也禁止跨应用 patch 别人的卡片。
-
-## 输出
-
-成功 stdout 只输出一行 JSON：\`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`，可直接 \`jq\`。
-
-| 失败情况 | exit | 说明 |
-|---|---|---|
-| 参数错误（缺 \`--message-id\`、卡片输入二选一、messageId 非 \`om_\` 开头、卡片含回调控件、JSON 非法） | 2 | stderr 有明确提示 |
-| \`--card-file\` 不存在、消息已撤回、飞书 API 报错（无权限、目标不是卡片消息等） | 1 | stderr 透出原因，如「消息已撤回，无法更新」「更新失败: ...」 |
 `;
 
 const BOTS_SKILL = `---
@@ -1582,7 +1540,6 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },
   { name: 'botmux-send', content: SEND_SKILL },
-  { name: 'botmux-card-patch', content: CARD_PATCH_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
@@ -1603,4 +1560,8 @@ export const RETIRED_SKILL_NAMES: string[] = [
   // (Groups & Bots → bot card). The CLI subcommand was removed too, so the
   // skill has nothing to drive — prune it from every CLI's skills dir on upgrade.
   'botmux-worker-budget',
+  // Folded into botmux-send as the "发出后原地更新" section (the `botmux card
+  // patch` subcommand stays). Only pre-release builds of this branch ever wrote
+  // it, but those installs must not linger as a duplicate skill.
+  'botmux-card-patch',
 ];
