@@ -1900,12 +1900,19 @@ export interface BotConfig {
   regularGroupReplyMode?: ChatReplyMode;
   /**
    * Per-bot (bot-global) policy for when an @mention is required to get a reply
-   * in regular Lark groups — a 4-tier ladder:
-   *   • 'always' (or undefined) — @ required everywhere, including inside the
-   *                               bot's own shared topics (the safe default).
+   * in Lark groups. Storable values are the 4 explicit tiers; undefined means
+   * the default, which resolves to 'topic-group' (see resolveGroupMentionMode):
+   *   • undefined → 'topic-group' (default) — @ required at top level and in
+   *                               普通群 owned topics; a non-@ reply inside a
+   *                               话题群 (chat_mode=topic) thread the bot owns
+   *                               continues without @. 新建话题的 agent 在话题内
+   *                               免 @ 续话。
+   *   • 'always'                — @ required everywhere, including inside the
+   *                               bot's own topics. Explicit opt-out of the
+   *                               topic-group default.
    *   • 'topic'                 — @ required to start / at top level, but NOT
-   *                               inside the bot's shared topics (non-@ replies
-   *                               there continue the session).
+   *                               inside the bot's owned topics in ANY group
+   *                               (non-@ replies there continue the session).
    *   • 'never'                 — @ never required: every non-@ message in groups
    *                               where the bot has talk access is answered too,
    *                               unconditionally. For dedicated / on-call groups.
@@ -3255,10 +3262,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
         return mode === 'chat' || mode === 'new-topic' || mode === 'shared' ? mode : undefined;
       })(),
-      // 4-tier @ policy. Only 'topic' | 'never' | 'ambient' are meaningful;
-      // 'always' (the default) and anything else normalize to undefined so
-      // bots.json stays clean.
-      regularGroupMentionMode: entry.regularGroupMentionMode === 'topic'
+      // 4-tier @ policy. All four explicit tiers are storable; undefined means
+      // the default ('topic-group' — see resolveGroupMentionMode). 'always' is
+      // kept (not normalized away) so it can explicitly opt out of the
+      // topic-group default; anything else drops to undefined.
+      regularGroupMentionMode: entry.regularGroupMentionMode === 'always'
+        || entry.regularGroupMentionMode === 'topic'
         || entry.regularGroupMentionMode === 'never'
         || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode

@@ -116,9 +116,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     regularGroupReplyMode: (j?.regularGroupReplyMode === 'chat' || j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared')
       ? j.regularGroupReplyMode
       : 'chat-topic',
-    regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never' || j?.regularGroupMentionMode === 'ambient')
+    regularGroupMentionMode: (j?.regularGroupMentionMode === 'always' || j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never' || j?.regularGroupMentionMode === 'ambient')
       ? j.regularGroupMentionMode
-      : 'always',
+      : 'topic-group',
     docSubscribeDefaultMode: j?.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,

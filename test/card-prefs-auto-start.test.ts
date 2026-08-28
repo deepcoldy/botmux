@@ -64,7 +64,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.codexAppCleanInput).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
     expect(prefs.regularGroupReplyMode).toBe('chat-topic');
-    expect(prefs.regularGroupMentionMode).toBe('always');
+    expect(prefs.regularGroupMentionMode).toBe('topic-group');
   });
 
   it('persists toggles + prompt to bots.json and syncs in-memory config (FR-9)', async () => {

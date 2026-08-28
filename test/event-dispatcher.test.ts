@@ -4576,6 +4576,57 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('default mention mode (topic-group): a non-@ reply inside an owned thread in a 话题群 is answered', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default = topic-group
+    mockGetChatMode.mockResolvedValue('topic');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 }); // multi-person → no 1v1 relax
+    handlers.resolveReplyThreadAlias.mockReturnValue(null); // not a shared alias — a real owned thread
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up inside the topic, no @' }),
+      rootId: 'owned-topic-root',
+      threadId: 'owned-topic-root',
+      messageId: 'msg-in-owned-topic-tg',
+      chatId: 'chat-topic-group',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'owned-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('default mention mode (topic-group): a non-@ reply inside an owned thread in a 普通群 is still ignored (@ required)', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default = topic-group
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 }); // multi-person → no 1v1 relax
+    handlers.resolveReplyThreadAlias.mockReturnValue(null);
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-topic-root');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up inside the topic, no @' }),
+      rootId: 'owned-topic-root',
+      threadId: 'owned-topic-root',
+      messageId: 'msg-in-owned-topic-regular',
+      chatId: 'chat-regular-group',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // topic-group only relaxes in 话题群; a 普通群 owned thread still requires @.
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('mention mode topic: a reply inside an owned thread that @mentions ANOTHER bot is ignored — yields the turn', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
     mockGetChatMode.mockResolvedValue('group');
@@ -4623,10 +4674,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic group default (always): a non-@ reply inside an owned topic is ignored in a multi-person group', async () => {
-    // #336 曾无条件放行「owned-topic 免@续话」，导致多人话题群里旁人不 @ 也触发
-    // bot。现在话题群与普通群共用「群聊 @ 策略」：默认 always 必须 @。
-    setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default always
+  it('explicit always: a non-@ reply inside an owned topic is ignored in a multi-person group', async () => {
+    // 默认已是 topic-group（话题群内免 @ 续话）；这里显式配 'always' 验证 opt-out
+    // 档仍要求 @（#336 的多人群守卫对 always 档依然成立）。
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'always' });
     mockGetChatMode.mockResolvedValue('topic');
     mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
     handlers.resolveReplyThreadAlias.mockReturnValue(null);
@@ -4703,11 +4754,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('topic group default, MULTI-bot: a non-@ reply inside an owned topic is ignored (@ required)', async () => {
+  it('explicit always, MULTI-bot: a non-@ reply inside an owned topic is ignored (@ required)', async () => {
     // Regression for the #336 relax leaking into multi-bot topics: with 2+ bots
     // in the group, every co-resident bot owns a session on the same thread
-    // anchor, so a non-@ (or @-someone-else) reply must NOT be answered.
-    setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default always
+    // anchor, so a non-@ (or @-someone-else) reply must NOT be answered —
+    // under the explicit 'always' opt-out. (The default 'topic-group' now
+    // answers non-@ replies in 话题群 owned topics; set 'always' to keep @ required.)
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'always' });
     mockGetChatMode.mockResolvedValue('topic');
     mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 2 });
     handlers.resolveReplyThreadAlias.mockReturnValue(null);
