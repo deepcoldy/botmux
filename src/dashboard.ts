@@ -3919,6 +3919,19 @@ const server = createServer(async (req, res) => {
         : { ok: true, settings: result.settings });
     }
 
+    // Hand a currently-authenticated admin the active-token editable link so
+    // they can pass write access to a teammate without shelling into
+    // `botmux dashboard`. `localUrl` (the LAN-direct form) is the one a teammate
+    // can actually open — the platform subdomain in `url` gates non-owners — so
+    // the SPA copies `localUrl` when present. Admin-only: the URL carries the
+    // active token (full write capability), so a read-only visitor must not read
+    // it back out of the settings surface.
+    if (req.method === 'GET' && url.pathname === '/api/dashboard/edit-link') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (!activeToken) return jsonRes(res, 404, { ok: false, error: 'no_active_token' });
+      return jsonRes(res, 200, { ok: true, ...dashboardUrlsFor(activeToken) });
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/autostart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       res.setHeader('cache-control', 'no-store');

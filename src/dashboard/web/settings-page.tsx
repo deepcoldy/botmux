@@ -1,6 +1,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { copyText } from './clipboard.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -790,6 +791,7 @@ function SettingsBody(props: {
               s => ({ ...s, oauthRedirectBase: value }),
             )}
           />
+          {canWrite ? <ShareEditLinkRow /> : null}
         </SettingsBlock>
         <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
           <ToggleRow
@@ -1499,6 +1501,46 @@ function ToggleRow(props: {
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+function ShareEditLinkRow() {
+  const tr = useT();
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<StatusMessage>(null);
+
+  const copyLink = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const r = await fetch('/api/dashboard/edit-link');
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false) {
+        throw new Error(body?.error ?? `HTTP ${r.status}`);
+      }
+      const link = typeof body.localUrl === 'string' && body.localUrl ? body.localUrl : body.url;
+      if (typeof link !== 'string' || !link) throw new Error('no_link');
+      const ok = await copyText(link, tr('settings.shareEditLinkLabel'));
+      setMsg({ text: ok ? tr('settings.shareEditLinkCopied') : tr('settings.shareEditLinkCopyManual'), cls: 'hint-ok' });
+    } catch (e) {
+      setMsg({ text: `${tr('settings.shareEditLinkFail')}: ${e instanceof Error ? e.message : String(e)}`, cls: 'hint-warn-inline' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="settings-subfield">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.shareEditLinkHelp')}>{tr('settings.shareEditLink')}</FieldTitle>
+      </div>
+      <div className="actions">
+        <button type="button" disabled={busy} onClick={() => void copyLink()}>
+          {tr('settings.shareEditLinkBtn')}
+        </button>
+      </div>
+      {msg ? <p className={`settings-subfield-hint ${msg.cls ?? ''}`}>{msg.text}</p> : null}
+    </div>
+  );
+}
 
 export function GroupNamePrefixRow(props: {
   value: string;
