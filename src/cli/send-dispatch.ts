@@ -1,4 +1,5 @@
 import { extname } from 'node:path';
+import { formatLarkError } from '../bot-registry.js';
 import type { ManagedHookOrigin } from '../services/hook-runner.js';
 
 export type SendMessageFn = (
@@ -113,7 +114,7 @@ export async function sendFileAttachments(
       await deps.beforeEffect?.();
       sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
     } catch (err: any) {
-      failed.push({ path: fp, error: err?.message ?? String(err) });
+      failed.push({ path: fp, error: formatLarkError(err) ?? err?.message ?? String(err) });
     }
   }
   return { sent, failed };
@@ -406,7 +407,7 @@ export async function sendVideoAttachments(
       failed.push({
         path: video.videoPath,
         coverPath: video.coverPath,
-        error: err?.message ?? String(err),
+        error: formatLarkError(err) ?? err?.message ?? String(err),
       });
     }
   }
