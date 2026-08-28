@@ -17,6 +17,29 @@ import { describe, expect, it } from 'vitest';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliSource = readFileSync(join(__dirname, '..', 'src', 'cli.ts'), 'utf8');
 
+/** 判据收敛块，按真实大括号配对取，不用固定行宽。固定宽度窗口两个方向都不安全：
+ *  窄了 → 块里新增几行就把目标推出窗口，干净代码也变红；宽了 → 越过闭合括号，
+ *  于是「赋值必须落在判据 if 块内」这类断言即便赋值被移到块外也照样通过。
+ *  剔除注释行，避免把代码注释掉后、注释里残留的同样字符仍能满足断言。 */
+function convergenceBlock(): string {
+  const lines = cliSource.split('\n');
+  const start = lines.findIndex(
+    l => l.includes('if (quoteTargetId && !explicitQuote && quotedTurnInThread === false)'),
+  );
+  if (start < 0) throw new Error('convergence block guard not found');
+  let depth = 0;
+  const out: string[] = [];
+  for (let i = start; i < lines.length; i++) {
+    out.push(lines[i]);
+    for (const ch of lines[i]) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+    }
+    if (i > start && depth <= 0) break;
+  }
+  return out.filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+}
+
 describe('botmux send: 事后开的话题不再被 quote 带进去（接线）', () => {
   it('判据从 send-policy 导入,不在 cli 里手抄一份', () => {
     // 手抄副本会让判据本体的变异测不到 —— 同一个 PR 的 dispatcher 侧已经踩过一次。
@@ -49,10 +72,7 @@ describe('botmux send: 事后开的话题不再被 quote 带进去（接线）',
     const live = assignLines.filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l));
     expect(live.length).toBeGreaterThan(0);
     // 且它落在判据的 if 块里。
-    const idx = lines.findIndex(l => l.includes('shouldDropAfterTheFactTopicQuote({'));
-    expect(idx).toBeGreaterThan(-1);
-    const block = lines.slice(idx, idx + 14).filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
-    expect(block).toMatch(/effectiveQuoteTargetId = undefined;/);
+    expect(convergenceBlock()).toMatch(/effectiveQuoteTargetId = undefined;/);
   });
 
   it('送进发送链的是**收敛后**的值,不是原始 quoteTargetId', () => {

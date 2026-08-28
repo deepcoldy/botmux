@@ -8820,11 +8820,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       currentThreadId: probedThreadId,
       explicitQuote,
     })) {
-      logger.info(
-        `[send] quote target ${quoteTargetId.substring(0, 12)} was answered flat at top level but now `
-        + `belongs to topic ${String(probedThreadId).substring(0, 12)}; posting flat instead of quoting `
-        + 'so the reply does not land in an after-the-fact topic',
-      );
       effectiveQuoteTargetId = undefined;
     }
   }
