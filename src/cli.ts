@@ -135,6 +135,9 @@ import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredSche
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
+import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   executeDashboardCommand,
@@ -3130,6 +3133,15 @@ async function printDashboardHintWithRetry(): Promise<void> {
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
   while (Date.now() - started < maxWaitMs) {
+    const portFile = join(CONFIG_DIR, '.dashboard-port');
+    const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+      || process.env.BOTMUX_DASHBOARD_PORT || '7891');
+    await ensureDevboxDashboardExport({
+      port,
+      remoteBaseConfigured: Boolean(
+        (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
+      ),
+    });
     last = await callDashboardEndpoint('/__cli/current');
     if (last.ok) {
       console.log(`   面板: botmux dashboard (${last.url})`);
@@ -3160,6 +3172,21 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
+  const rawAction = args[0]?.toLowerCase();
+  const resolvesEndpoint = args.length <= 1
+    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
+    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
+  if (resolvesEndpoint) {
+    const exportPortFile = join(CONFIG_DIR, '.dashboard-port');
+    const port = Number((existsSync(exportPortFile) ? readFileSync(exportPortFile, 'utf8').trim() : '')
+      || process.env.BOTMUX_DASHBOARD_PORT || '7891');
+    await ensureDevboxDashboardExport({
+      port,
+      remoteBaseConfigured: Boolean(
+        (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
+      ),
+    });
+  }
   const execution = await executeDashboardCommand(args, callDashboardEndpoint);
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);

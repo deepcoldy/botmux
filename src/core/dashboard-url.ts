@@ -4,6 +4,7 @@ import {
   readPlatformBinding,
 } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 export interface DashboardUrls {
   /**
@@ -148,7 +149,7 @@ function parseHttpUrl(raw: string): URL | null {
  */
 function remotePublicBase(): string | null {
   const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
-  return platformBase ?? publicReverseProxyBaseUrl();
+  return platformBase ?? publicReverseProxyBaseUrl() ?? devboxDashboardBaseUrl();
 }
 
 /**

@@ -33,6 +33,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import { platformBrowserAuthorities, type PlatformBrowserSurface } from '../platform/binding.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 /** 提交控制类请求时携带 CSRF 票据的头名。`<form>` 设不了自定义头，这是关键。 */
 export const CONTROL_CSRF_HEADER = 'x-botmux-csrf';
@@ -166,6 +167,12 @@ function publicUrlAuthority(): string | undefined {
   return authority;
 }
 
+function devboxUrlAuthority(): string | undefined {
+  const raw = devboxDashboardBaseUrl();
+  if (!raw) return undefined;
+  try { return new URL(raw).host || undefined; } catch { return undefined; }
+}
+
 /** 本请求可能的自身 authority：直连是 `Host`，反代/平台隧道下还有转发头，外加
  *  运维显式声明的对外基址；绑定中心平台时再加本机可信的平台浏览器子域
  *  (`m-`/`t-<machineId>.<平台域名>`)——平台隧道反代不透传 `X-Forwarded-Host`，
@@ -184,6 +191,7 @@ function requestAuthorities(
     // 逗号分隔时第一个才是最初的客户端所见 host。
     forwarded ? forwarded.split(',')[0] : undefined,
     publicUrlAuthority(),
+    devboxUrlAuthority(),
     ...platformBrowserAuthorities(surface),
   ];
 }

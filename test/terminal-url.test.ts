@@ -5,6 +5,9 @@ import { config } from '../src/config.js';
 vi.mock('../src/global-config.js', () => ({
   isRemoteAccessEnabled: vi.fn(() => false),
 }));
+vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
+  devboxDashboardBaseUrl: vi.fn(() => null),
+}));
 
 // Partial mock: platformMachineBaseUrl is stubbed (no real platform.json on the
 // test box should leak in), but publicReverseProxyBaseUrl stays REAL — the
@@ -19,6 +22,7 @@ vi.mock('../src/platform/binding.js', async (importOriginal) => {
 
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import { platformMachineBaseUrl } from '../src/platform/binding.js';
+import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
 
 import {
   setTerminalProxyPort,
@@ -52,6 +56,7 @@ describe('buildTerminalUrl', () => {
   beforeEach(() => {
     vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
     vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
     setTerminalProxyPort(8801);
   });
 
@@ -189,6 +194,21 @@ describe('buildTerminalUrl — BOTMUX_PUBLIC_URL (self-hosted reverse proxy)', (
 
   it('falls back to the local proxy port when unset', () => {
     expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=vtok`);
+  });
+});
+
+describe('buildTerminalUrl — Merlin Devbox export', () => {
+  beforeEach(() => setTerminalProxyPort(8801));
+  afterEach(() => {
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
+    resetTerminalProxy();
+  });
+
+  it('routes terminal links through the cached Devbox front door', () => {
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue('https://devbox.example.com');
+    expect(buildTerminalUrl(ds)).toBe(
+      'https://devbox.example.com/s/sess-123?viewToken=vtok',
+    );
   });
 });
 

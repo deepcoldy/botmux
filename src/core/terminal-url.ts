@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { formatUrlHost } from './dashboard-url.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -105,6 +106,13 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
     const publicBase = publicReverseProxyBaseUrl();
     if (publicBase) {
       const url = `${publicBase}/s/${ds.session.sessionId}`;
+      return opts.write
+        ? withCapability(url, 'token', ds.workerToken)
+        : withCapability(url, 'viewToken', ds.workerViewToken);
+    }
+    const devboxBase = devboxDashboardBaseUrl();
+    if (devboxBase) {
+      const url = `${devboxBase}/s/${ds.session.sessionId}`;
       return opts.write
         ? withCapability(url, 'token', ds.workerToken)
         : withCapability(url, 'viewToken', ds.workerViewToken);
