@@ -15,6 +15,17 @@ export type DashboardCommandExecution =
 const LEGACY_ENSURE_TOKEN_GATE_PREFIX =
   '401 <h1>Token expired</h1><p>Run <code>botmux dashboard</code>';
 
+const MIN_DASHBOARD_EXPORT_BUDGET_MS = 500;
+const MAX_DASHBOARD_EXPORT_TIMEOUT_MS = 5_000;
+
+/** Bound the best-effort export to the caller's remaining startup budget.
+ * Returning null below 500ms avoids a predictably doomed spawn and its
+ * process-local failure cache. */
+export function dashboardExportTimeoutForBudget(remainingMs: number): number | null {
+  if (!Number.isFinite(remainingMs) || remainingMs < MIN_DASHBOARD_EXPORT_BUDGET_MS) return null;
+  return Math.min(MAX_DASHBOARD_EXPORT_TIMEOUT_MS, Math.floor(remainingMs));
+}
+
 function legacyEnsureRouteMissing(result: DashboardResult): boolean {
   if (result.ok) return false;
   if (result.reason === 'wrong-service') return true;
@@ -48,6 +59,52 @@ export function formatDashboardFallbackFailure(
 ): string {
   const operation = action === 'current' ? 'Dashboard lookup' : 'Rotation';
   return `${operation} failed: ${failure.detail ?? failure.reason}`;
+}
+
+/**
+ * Refresh a successful dashboard response after the CLI has created/reused a
+ * Devbox export. The first endpoint call is deliberately outside this helper:
+ * it proves the dashboard is live and lets callDashboard() repair a stale
+ * `.dashboard-port` before merlin-cli is allowed to export anything. A second
+ * non-mutating current read is needed because the first response was rendered
+ * before the export cache existed. If export/refresh fails, retain the already
+ * usable local response rather than turning a best-effort enhancement fatal.
+ */
+export async function refreshDashboardResultAfterExport(
+  result: Extract<DashboardResult, { ok: true }>,
+  ensureExport: () => Promise<string | null>,
+  callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
+): Promise<Extract<DashboardResult, { ok: true }>> {
+  let exported: string | null;
+  try {
+    exported = await ensureExport();
+  } catch {
+    return result;
+  }
+  if (!exported) return result;
+  try {
+    const refreshed = await callEndpoint('/__cli/current');
+    return refreshed.ok ? refreshed : result;
+  } catch {
+    return result;
+  }
+}
+
+/** Execute the user-facing command first, then add the Devbox export as a
+ * post-success enhancement. Keeping that order in one tested helper prevents a
+ * future refactor from exporting the configured/stale port before endpoint
+ * discovery has identified the live dashboard. */
+export async function executeDashboardCommandWithExportRefresh(
+  args: readonly string[],
+  callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
+  ensureExport: () => Promise<string | null>,
+): Promise<DashboardCommandExecution> {
+  const execution = await executeDashboardCommand(args, callEndpoint);
+  if (execution.kind !== 'endpoint' || !execution.result.ok) return execution;
+  return {
+    ...execution,
+    result: await refreshDashboardResultAfterExport(execution.result, ensureExport, callEndpoint),
+  };
 }
 
 /**

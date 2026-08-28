@@ -171,9 +171,10 @@ function publicUrlAuthority(): string | undefined {
  * Merlin Devbox 私有短链的 authority。同 {@link publicUrlAuthority}，只参与
  * Origin 的精确 host+port 比对，值只来自本机 0600 缓存。
  *
- * `devboxDashboardBaseUrl()` 自带短 TTL 的进程内 memo，所以这条控制类请求热路径
- * （每次控制请求 / WS 升级，被判跨站时还会再走一次 warnForeignOrigin）不会每次都
- * 付一遍 secure-file 读——与紧邻的 `publicAuthorityCache` 保持同样的缓存姿势。
+ * `devboxDashboardBaseUrl()` 用 cache / 实际端口 / 设置文件的元数据指纹校验进程内
+ * memo，所以这条控制类请求热路径（每次控制请求 / WS 升级，被判跨站时还会再走一次
+ * warnForeignOrigin）只付较轻的 stat，不会每次重读并解析 secure-file；文件一变，
+ * 下一次请求立即重算，不把旧隧道留在可信 authority 里。
  */
 function devboxUrlAuthority(): string | undefined {
   const raw = devboxDashboardBaseUrl();
