@@ -275,6 +275,38 @@ for (;;) {
 }
 console.log(`smoke: ✅ http — dashboard is serving (status ${served})`);
 
+// ── 4b. the embedded frontend must actually be there ─────────────────────────
+// REGRESSION GUARD for a shipped bug this smoke test walked straight past.
+//
+// Check 4 accepts ANY status, on the reasoning that an unauthenticated `/`
+// legitimately 404s. True — but it made the check blind to a 404 with a
+// completely different cause: the Dashboard resolves its frontend as
+// `join(__dirname, 'dashboard-web')`, which in a compiled binary points inside
+// the virtual /$bunfs/ and does not exist, and `bun --compile` embeds nothing it
+// cannot trace statically. So EVERY asset 404'd, the post-login redirect to `/`
+// answered `{"error":"not_found_yet","path":"/"}`, and the Dashboard was
+// unreachable from any compiled binary — while npm/source installs were fine, and
+// while this smoke test reported ✅.
+//
+// Distinguish the two 404s by CAUSE rather than status: `not_found_yet` is the
+// server's catch-all miss (no asset), whereas an auth rejection carries the token
+// gate's own shape. Asserting on the body is what makes an empty-frontend binary
+// fail the build instead of shipping.
+const assetProbe = await fetch(`http://127.0.0.1:${PORTS.dashboard}/`, {
+  signal: AbortSignal.timeout(5_000),
+});
+const assetBody = await assetProbe.text();
+if (assetBody.includes('not_found_yet')) {
+  fail(
+    'frontend',
+    `dashboard answered its catch-all miss for \`/\` (${assetProbe.status}: ${assetBody.slice(0, 120)}).\n`
+    + 'The compiled binary has no embedded Dashboard frontend, so every page and asset 404s.\n'
+    + 'Expected the build plugin to inject dist/dashboard-web (scripts/generate-dashboard-embed.mjs) — '
+    + 'run `bun run build` before compiling, and check that hook still matches dist/dashboard.js.',
+  );
+}
+console.log(`smoke: ✅ frontend — embedded Dashboard assets resolve (no catch-all miss on /)`);
+
 // ── 5. the wrapper write must NOT destroy an install.sh-style binary ─────────
 // REGRESSION GUARD for a shipped bug this smoke test used to walk straight past.
 //
