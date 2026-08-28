@@ -279,6 +279,8 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     // Dashboard control-audit destination + terminal takeover lease TTL.
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
     'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
+    // Merlin Devbox auto-export switch.
+    'BOTMUX_DEVBOX_AUTO_EXPORT',
   ]) delete env[key];
   return env;
 }

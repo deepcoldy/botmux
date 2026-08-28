@@ -110,6 +110,9 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
         ? withCapability(url, 'token', ds.workerToken)
         : withCapability(url, 'viewToken', ds.workerViewToken);
     }
+    // Merlin Devbox 私有短链：同样走 dashboard 前门 `/s/<id>`，所以隧道对应的是
+    // dashboard 端口——不传 port，由 devboxDashboardBaseUrl() 按 `.dashboard-port`
+    // 解析当前实际端口并与缓存比对（端口漂移后回退本机，不指向旧隧道）。
     const devboxBase = devboxDashboardBaseUrl();
     if (devboxBase) {
       const url = `${devboxBase}/s/${ds.session.sessionId}`;

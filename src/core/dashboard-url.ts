@@ -149,6 +149,13 @@ function parseHttpUrl(raw: string): URL | null {
  */
 function remotePublicBase(): string | null {
   const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
+  // The Devbox candidate validates itself against `~/.botmux/.dashboard-port`
+  // rather than against `opts.port`: the tunnel belongs to whichever port the
+  // dashboard actually bound, and several callers here pass the CONFIGURED port
+  // (v3 cards use config.dashboard.port), which goes stale the moment the
+  // dashboard probes upward on EADDRINUSE. Checking the caller's port would
+  // demote those links to an equally-stale local URL; checking the bound port
+  // answers the real question — is this cache still for the port we serve?
   return platformBase ?? publicReverseProxyBaseUrl() ?? devboxDashboardBaseUrl();
 }
 
