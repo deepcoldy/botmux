@@ -2074,6 +2074,16 @@ function shortLarkPath(url: unknown): string {
  * access token can't leak.
  */
 export function formatLarkError(v: any): string | null {
+  // The SDK logger calls logger.error(formatErrors(error)), so its first
+  // argument is an array containing the already-sanitized Axios shape. Accept
+  // that wrapper here as well as the raw error received by CLI callers.
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const formatted = formatLarkError(item);
+      if (formatted) return formatted;
+    }
+    return null;
+  }
   if (!v || typeof v !== 'object') return null;
   const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
   if (!isAxios) return null;

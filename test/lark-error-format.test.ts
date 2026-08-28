@@ -65,6 +65,16 @@ describe('formatLarkError', () => {
     expect(formatLarkError(err)).toBe('POST im/v1/messages → 403 code=230002 "bot not in chat"');
   });
 
+  it('unwraps the nested array passed by the Lark SDK logger', () => {
+    const sdkLoggerArg = [[{
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230022, msg: 'content contains sensitive information', log_id: 'LOG456' } },
+    }]];
+    expect(formatLarkError(sdkLoggerArg)).toBe(
+      'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOG456',
+    );
+  });
+
   it('returns null for non-axios values so callers fall back', () => {
     expect(formatLarkError('plain string')).toBeNull();
     expect(formatLarkError({ hello: 'world' })).toBeNull();

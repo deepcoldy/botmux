@@ -7021,7 +7021,7 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, formatLarkError, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -7038,6 +7038,12 @@ import {
   managedVcSendPayloadError,
   containsLarkAtTag,
 } from './services/send-policy.js';
+
+/** Keep provider details visible to the agent without leaking Axios config. */
+function describeSendFailure(err: unknown): string {
+  return formatLarkError(err)
+    ?? (err instanceof Error && err.message ? err.message : String(err));
+}
 
 /**
  * Sandbox relay mode for `botmux send`. Inside a file-sandbox the CLI cannot
@@ -8365,7 +8371,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           : {}),
       }));
     } catch (e: any) {
-      console.error(`语音发送失败：${e?.message ?? e}`);
+      console.error(`语音发送失败：${describeSendFailure(e)}`);
       if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
       process.exit(1);
     }
@@ -8433,7 +8439,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
       console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
-      console.error(`文档评论发送失败：${e?.message ?? e}`);
+      console.error(`文档评论发送失败：${describeSendFailure(e)}`);
       process.exit(1);
     }
     return;
@@ -9435,7 +9441,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         : {}),
     }));
   } catch (err: any) {
-    console.error(`发送失败: ${err.message}`);
+    console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }
 }
