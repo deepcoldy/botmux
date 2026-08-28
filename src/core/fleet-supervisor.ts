@@ -73,9 +73,11 @@ export interface FleetBotSpec {
     args?: string[];
     /** Working directory for the child. Defaults to the supervisor's own cwd. */
     cwd?: string;
-    /** Extra env merged over the (scrubbed) base env. Applied AFTER the scrub,
-     *  so a service can set a key the scrub would otherwise strip — that is the
-     *  plugin manifest's prerogative, mirroring the old pm2 `--update-env`. */
+    /** Extra env merged UNDER the scrub: it is applied first and the scrub runs
+     *  after it, so a manifest cannot revive a key we deliberately strip. Same
+     *  order (and same reason) as the pm2 path it replaces — a service needing
+     *  its own data root must resolve it internally, not via CLAUDE_CONFIG_DIR /
+     *  CODEX_HOME. Anything outside the scrubbed families passes through. */
     env?: Record<string, string>;
     /** Hash of the definition this member is being started from; persisted into
      *  fleet-state so a later reconcile can detect "running from a stale config"
@@ -321,16 +323,22 @@ export class FleetSupervisor {
     // 'daemon' entry.
     //
     // An EXTERNAL member takes neither: it is not a bot (no index) and it is not
-    // our code, so it gets the base env with the session-scoped families removed
-    // first. See scrubExternalMemberEnv for why our own members do not need this
-    // (they scrub in their own boot) and why an external command does. The
-    // spec's own `env` is merged AFTER the scrub so a plugin manifest can still
-    // set a key deliberately — the same order the pm2 path used.
+    // our code, so it gets the base env with the session-scoped families removed.
+    // See scrubExternalMemberEnv for why our own members do not need this (they
+    // scrub in their own boot) and why an external command does.
+    //
+    // ORDER IS LOAD-BEARING: the spec's own `env` is merged BEFORE the scrub, so
+    // the scrub has the last word and a plugin manifest cannot revive a key we
+    // deliberately strip. This is the order the pm2 path used and stated outright
+    // ("applies it AFTER the manifest env merge, so a plugin manifest cannot
+    // revive a scrubbed key" — plugins/pm2.ts), with a test pinning it. Merging
+    // after the scrub would silently undo it for exactly the keys that matter
+    // (a sibling's CLI home, the dashboard app secret, the graceful sentinel).
+    // A service needing its own data root must resolve it internally.
     let childEnv: NodeJS.ProcessEnv;
     if (spec.external) {
-      childEnv = { ...this.opts.daemonEnv };
+      childEnv = { ...this.opts.daemonEnv, ...(spec.external.env ?? {}) };
       scrubExternalMemberEnv(childEnv);
-      if (spec.external.env) Object.assign(childEnv, spec.external.env);
     } else if (entry === 'daemon') {
       childEnv = { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) };
     } else {
@@ -403,7 +411,12 @@ export class FleetSupervisor {
     }
 
     const current = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
-    const decision = decideOnExit({ restarts: current?.restarts ?? 0 }, exit, this.policy);
+    // An external member does not get the 90-is-graceful sentinel: it is not our
+    // code and may use 90 as an ordinary failure code, in which case honouring it
+    // would silently retire the service instead of restarting it (see
+    // isGracefulExit). Operator stops are already handled above via explicitStop,
+    // which does not depend on the exit code at all.
+    const decision = decideOnExit({ restarts: current?.restarts ?? 0 }, exit, this.policy, !spec.external);
 
     if (decision.action === 'stop') {
       this.log(`${spec.name} exited cleanly (graceful); not restarting`);

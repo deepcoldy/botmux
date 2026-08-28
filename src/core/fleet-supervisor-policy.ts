@@ -85,11 +85,25 @@ export interface ChildExit {
   signal: NodeJS.Signals | null;
 }
 
-/** True when this exit is a clean, operator-intended shutdown (do NOT restart).
- *  ONLY a code === 90 qualifies; a signal death (code null) is always a crash,
- *  matching pm2's rule that signal-only death is never a graceful sentinel. */
-export function isGracefulExit(exit: ChildExit): boolean {
-  return exit.signal === null && exit.code === FLEET_GRACEFUL_EXIT_CODE;
+/**
+ * True when this exit is a clean, operator-intended shutdown (do NOT restart).
+ * ONLY a code === 90 qualifies; a signal death (code null) is always a crash,
+ * matching pm2's rule that signal-only death is never a graceful sentinel.
+ *
+ * `honoursSentinel` is false for a member whose code is NOT ours (an external
+ * command / plugin service). 90 is a PRIVATE handshake between botmux's own two
+ * managed cores and this policy — a third-party program has never heard of it and
+ * may use 90 as an ordinary failure code. Honouring it there means a plugin that
+ * dies with 90 is read as "it asked not to be restarted" and silently vanishes,
+ * with state showing a bland 'stopped' — defeating the crash-restart machinery
+ * that is the whole reason such a service is supervised at all. Under pm2 this
+ * could not happen: plugin apps were never given stop_exit_codes, so 90 was just
+ * a crash and restarted. Operator-intended stops do NOT rely on the exit code
+ * (the live layer marks them via explicitStop/stopping before the exit arrives),
+ * so external members lose nothing by refusing the sentinel.
+ */
+export function isGracefulExit(exit: ChildExit, honoursSentinel = true): boolean {
+  return honoursSentinel && exit.signal === null && exit.code === FLEET_GRACEFUL_EXIT_CODE;
 }
 
 export type ExitDecision =
@@ -103,13 +117,18 @@ export type ExitDecision =
  *   • graceful (code 90)            → stop, never restart
  *   • crash & under the cap         → restart (restarts+1)
  *   • crash & at/over the cap       → park errored, stop restarting
+ *
+ * `honoursSentinel: false` (an external/plugin member) makes 90 an ordinary crash
+ * code — see isGracefulExit for why a third-party program must not be taken at
+ * its word about our private sentinel.
  */
 export function decideOnExit(
   proc: Pick<FleetProcState, 'restarts'>,
   exit: ChildExit,
   policy: RestartPolicy = DEFAULT_RESTART_POLICY,
+  honoursSentinel = true,
 ): ExitDecision {
-  if (isGracefulExit(exit)) return { action: 'stop', reason: 'graceful' };
+  if (isGracefulExit(exit, honoursSentinel)) return { action: 'stop', reason: 'graceful' };
   const nextRestarts = proc.restarts + 1;
   if (nextRestarts > policy.maxRestarts) {
     return { action: 'park', reason: 'max_restarts', atRestarts: proc.restarts };

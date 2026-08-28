@@ -473,6 +473,10 @@ describe('FleetSupervisor (live, integration)', () => {
       BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'top-secret', // app secret
       NO_COLOR: '1',                                      // invoker terminal
       BOTMUX_SESSION_ID: 'sess-1',                        // turn identity
+      // resolveFleetDaemonEnv pins this for EVERY supervised member, so a real
+      // external member always arrives carrying it. Telling a third-party service
+      // that 90 means "clean exit" is exactly what the old pm2 path refused to do.
+      BOTMUX_PM2_GRACEFUL_EXIT_CODE: '90',
       KEEP_ME: 'yes',                                     // unrelated: must survive
     };
     const svc: FleetBotSpec = {
@@ -481,7 +485,16 @@ describe('FleetSupervisor (live, integration)', () => {
         command: process.execPath,
         args: ['-e', `require('fs').writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.env));`
           + `process.on('SIGTERM',()=>process.exit(90)); setInterval(()=>{},1000);`],
-        env: { PLUGIN_OWN: 'set-by-manifest' },
+        // A manifest that TRIES to revive scrubbed keys. The scrub runs after this
+        // merge, so it must win: otherwise a plugin could point itself at a
+        // sibling bot's CLI home just by naming it here.
+        env: {
+          PLUGIN_OWN: 'set-by-manifest',
+          CLAUDE_CONFIG_DIR: '/manifest/claude',
+          BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'manifest-secret',
+          BOTMUX_PM2_GRACEFUL_EXIT_CODE: '90',
+          NO_COLOR: '1',
+        },
       },
     };
     const sup = new FleetSupervisor({
@@ -495,14 +508,70 @@ describe('FleetSupervisor (live, integration)', () => {
     for (const key of [
       'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDECODE', 'BOTMUX_WORKFLOW',
       'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET', 'NO_COLOR', 'BOTMUX_SESSION_ID',
+      // The graceful-exit sentinel: our own private handshake, never handed to a
+      // third-party program (the pm2 path stripped it too).
+      'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
     ]) {
       expect(seen[key], `${key} must be scrubbed`).toBeUndefined();
     }
-    // Unrelated env still passes through, and the manifest's own env is applied
-    // AFTER the scrub (so a service can deliberately set what it needs).
+    // Unrelated env still passes through. The manifest's own env is merged BEFORE
+    // the scrub, so a key outside the scrubbed families survives while the four it
+    // tried to revive above are still gone — asserted by the loop.
     expect(seen.KEEP_ME).toBe('yes');
     expect(seen.PLUGIN_OWN).toBe('set-by-manifest');
     expect(seen.TERM).toBe('xterm-256color');   // re-pinned, not deleted
+    await sup.stopAll();
+  });
+
+  it('restarts an external member that exits 90 instead of retiring it', async () => {
+    // 90 is OUR private "clean shutdown" sentinel, honoured for the bot daemons
+    // and the dashboard. A plugin service has never heard of it and may use 90 as
+    // an ordinary failure code, so honouring it there would silently retire the
+    // service — with state showing a bland 'stopped' — defeating the crash-restart
+    // machinery that is the whole reason it is supervised. Under pm2 this could
+    // not happen: plugin apps were never given stop_exit_codes.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const beats = join(root, 'beats');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-90', appId: '', botIndex: -1, logBaseName: 'plugin-90',
+      external: {
+        command: process.execPath,
+        // Appends one byte per launch, then exits with OUR sentinel code.
+        args: ['-e', `require('fs').appendFileSync(${JSON.stringify(beats)}, 'x'); process.exit(90);`],
+      },
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 3, restartDelayMs: 40 }, log: () => {},
+    });
+    sup.start([svc]);
+    // It must be relaunched: two separate launches prove 90 was read as a crash.
+    const relaunched = await waitFor(() =>
+      existsSync(beats) && readFileSync(beats, 'utf-8').length >= 2);
+    expect(relaunched).toBe(true);
+    // And the restart tally really moved (not just a coincidental double spawn).
+    expect(await waitFor(() => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 1)).toBe(true);
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    await sup.stopAll();
+  });
+
+  it('still honours exit 90 as graceful for our OWN members (no leak)', async () => {
+    // The mirror of the spec above: refusing the sentinel must apply ONLY to
+    // external members. A bot daemon exiting 90 is still a clean shutdown and
+    // must NOT be restarted.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, 'process.exit(90);'), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 3, restartDelayMs: 40 }, log: () => {},
+    });
+    sup.start([{ name: 'botmux-0', appId: 'cli_a', botIndex: 0 }]);
+    expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped')).toBe(true);
+    await delay(300);   // give a (wrong) restart time to show up
+    const p = readFleetState(statePath)!.procs[0];
+    expect(p.status).toBe('stopped');
+    expect(p.restarts).toBe(0);
     await sup.stopAll();
   });
 
@@ -519,7 +588,13 @@ describe('FleetSupervisor (live, integration)', () => {
       process.on('SIGTERM', () => process.exit(90));
       setInterval(() => {}, 1000);
     `;
-    const base: NodeJS.ProcessEnv = { CODEX_HOME: '/bot/home', NO_COLOR: '1', KEEP_ME: 'yes' };
+    const base: NodeJS.ProcessEnv = {
+      CODEX_HOME: '/bot/home', NO_COLOR: '1', KEEP_ME: 'yes',
+      // A bot daemon MUST keep the sentinel: it is how it reports a clean shutdown
+      // as 90 instead of 0. Only external members are denied it, so this key is
+      // the sharpest probe for the external scrub leaking onto our own members.
+      BOTMUX_PM2_GRACEFUL_EXIT_CODE: '90',
+    };
     const sup = new FleetSupervisor({
       statePath, distDir: fakeDist(root, DUMPER), daemonEnv: base, cwd: root, log: () => {},
     });
@@ -532,6 +607,7 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(seen.CODEX_HOME).toBe('/bot/home');
     expect(seen.NO_COLOR).toBe('1');
     expect(seen.KEEP_ME).toBe('yes');
+    expect(seen.BOTMUX_PM2_GRACEFUL_EXIT_CODE).toBe('90');
     expect(seen.BOTMUX_BOT_INDEX).toBe('0');    // bots still get their index
     await sup.stopAll();
   });
