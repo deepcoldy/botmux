@@ -6309,6 +6309,7 @@ type OrdinaryImDelivery = {
   attempt: number;
   received: boolean;
   transportConfirmed: boolean;
+  delayNotified: boolean;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -6373,7 +6374,13 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
 
 function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
-  clearOrdinaryImDelivery(record);
+  // A delayed notice is only an intermediate status. Keep the delivery record
+  // so a later explicit rejection or worker exit can still produce the real
+  // terminal outcome instead of silently dropping the turn after telling the
+  // user not to resend it.
+  clearOrdinaryImDeliveryTimer(record);
+  if (record.delayNotified) return;
+  record.delayNotified = true;
   logger.warn(
     `[${tag(record.ds)}] Ordinary IM input is still waiting for the worker after IPC enqueue `
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
@@ -6492,6 +6499,7 @@ function sendOrdinaryImDeliveryTracked(
     attempt: 0,
     received: false,
     transportConfirmed: false,
+    delayNotified: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   return sendOrdinaryImDeliveryAttempt(record);
