@@ -106,6 +106,12 @@ export interface FsPolicyContext {
   extraWritePaths?: readonly string[];
   /** Per-bot user config (bots.json sandboxPaths) — highest precedence. */
   userPaths?: FsPolicyUserPaths;
+  /** Per-adapter exact service-credential files. They are mandatory read-only
+   *  for normal turns, but no-transport turns suppress entries inside Feishu
+   *  authority roots before merge. Kept separate from mandatoryReadOnlyPaths:
+   *  capability/attestation/MCP grants in that channel may legitimately live
+   *  under botmux authority roots and must not be filtered wholesale. */
+  serviceCredentialReadOnlyPaths?: readonly string[];
   /** Host-owned boundaries that user policy may not override. */
   mandatoryDenyPaths?: readonly string[];
   mandatoryDenyRegexes?: readonly string[];
@@ -653,6 +659,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       if (insideAuthority(n)) { suppressedAuthorityPaths.push(n); return false; }
       return true;
     });
+  const serviceCredentialReadOnlyPaths = dropAuthority(ctx.serviceCredentialReadOnlyPaths);
 
   // workingDir is the CLI's cwd — it MUST be granted, so we cannot silently drop
   // it. A workingDir that IS (or is inside) a Feishu-authority root — own BOT_HOME
@@ -879,6 +886,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(dropAuthority(ctx.userPaths?.readOnly), 'readOnly', 'user');
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
+  push(serviceCredentialReadOnlyPaths, 'readOnly', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
 
   // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
@@ -952,7 +960,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     net: ctx.net !== false,
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    finalReadOnlyPaths: [...(ctx.mandatoryReadOnlyPaths ?? [])],
+    finalReadOnlyPaths: [
+      ...serviceCredentialReadOnlyPaths,
+      ...(ctx.mandatoryReadOnlyPaths ?? []),
+    ],
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
       : undefined,

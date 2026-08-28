@@ -578,9 +578,11 @@ export interface CliAdapter {
 
   /** Credential files a trusted service CLI must read inside the sandbox.
    *  This is deliberately separate from ordinary readonlyRoots so adapters
-   *  cannot expose secrets accidentally. Use only when the CLI's model-facing
-   *  tool surface has no general file/shell escape, and return exact files
-   *  rather than parent directories. */
+   *  cannot expose secrets accidentally. The worker validates exact regular
+   *  files and fs-policy emits them mandatory read-only, except that a
+   *  no-transport turn suppresses entries inside Feishu authority roots. Use
+   *  only when the CLI's model-facing tool surface has no general file/shell
+   *  escape, and return exact files rather than parent directories. */
   sandboxSecretReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
 
   /** Extra env merged into the spawned child's environment. Used by Claude-family

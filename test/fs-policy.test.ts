@@ -675,14 +675,13 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).not.toMatch(/isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
   });
 
-  it('WIRING GUARD: service credential files use mandatory read-only policy rules', () => {
+  it('WIRING GUARD: worker routes exact service credentials through their dedicated policy channel', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
-    expect(src).toMatch(/mandatoryReadOnlyPaths\.push\(\.\.\.keepSecretReadonlyFiles\([\s\S]*?cliAdapter\.sandboxSecretReadonlyPaths/);
-    const readonlyStart = src.indexOf('readonlyRoots: keepExisting([');
-    const readonlyEnd = src.indexOf('botmuxInstallRoot,', readonlyStart);
-    expect(readonlyStart).toBeGreaterThan(-1);
-    expect(readonlyEnd).toBeGreaterThan(readonlyStart);
-    expect(src.slice(readonlyStart, readonlyEnd)).not.toContain('sandboxSecretReadonlyPaths');
+    expect(src).toContain("import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';");
+    expect(src).toMatch(/const serviceCredentialReadOnlyPaths\s*=\s*resolveServiceSecretReadonlyFiles\([\s\S]*?cliAdapter\.sandboxSecretReadonlyPaths/);
+    expect(src).toMatch(/const fsPolicyCtx[\s\S]*?serviceCredentialReadOnlyPaths,/);
+    expect(src).not.toContain('mandatoryReadOnlyPaths.push(...keepSecretReadonlyFiles');
+    expect(src).toContain("if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);");
   });
 
   it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
@@ -691,7 +690,7 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).toMatch(/ompCurrentSessionDir\s*=\s*cliAdapter\.id === 'oh-my-pi'[\s\S]*?ompSessionDir\(effectiveAdapterSessionId\)/);
     // ebsd shares the same exact-session carve-out shape through its own
     // adapter-owned session dir; both feed the generalized managed dir.
-    expect(src).toContain("import { ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';");
+    expect(src).toMatch(/import \{[^}]*ebsdBotmuxSessionDir[^}]*\} from '\.\/adapters\/cli\/ebsd\.js';/);
     expect(src).toMatch(/ebsdCurrentSessionDir\s*=\s*cliAdapter\.id === 'ebsd'[\s\S]*?ebsdBotmuxSessionDir\(effectiveAdapterSessionId\)/);
     expect(src).toContain('const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;');
     const precreate = src.indexOf('if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir');
@@ -1083,6 +1082,51 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/sibling/send-cred.json').access).toBe('deny');
+  });
+
+  it('suppresses service credentials inside authority roots without filtering other mandatory read-only grants', () => {
+    const serviceSecret = '/Users/u/.botmux/.dashboard-secret';
+    const capability = '/Users/u/.botmux/data/origin-capability';
+    const p = noTransport({
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+      mandatoryReadOnlyPaths: [capability],
+    });
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths).toContain(serviceSecret);
+    expect(accessForPath(p.rules, capability).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(capability);
+  });
+
+  it('suppresses service credentials inside Linux authority roots too', () => {
+    const serviceSecret = '/home/u/.botmux/.dashboard-secret';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      larkTransportEnabled: false,
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+    }));
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths).toContain(serviceSecret);
+  });
+
+  it('keeps external service credentials mandatory read-only under no-transport', () => {
+    const serviceSecret = '/run/secrets/ebsd-diag-token';
+    const p = noTransport({
+      serviceCredentialReadOnlyPaths: [serviceSecret],
+      userPaths: { readWrite: [serviceSecret] },
+    });
+
+    expect(accessForPath(p.rules, serviceSecret).access).toBe('readOnly');
+    expect(p.finalReadOnlyPaths).toContain(serviceSecret);
+    expect(p.suppressedAuthorityPaths ?? []).not.toContain(serviceSecret);
   });
 
   it('LINUX no-transport: the lark-cli keystore is frozen with NO own-key carve-out (unlike transport-enabled)', () => {

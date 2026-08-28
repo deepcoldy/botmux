@@ -19,6 +19,13 @@ function validateSessionId(sessionId: string): string {
   return sessionId;
 }
 
+/** ebsd service sessions and BotMux must resolve one fixed ~/.ebsd tree. */
+export function assertEbsdPerBotEnv(env: Readonly<Record<string, string>>): void {
+  if (Object.prototype.hasOwnProperty.call(env, 'HOME')) {
+    throw new Error('ebsd does not allow a per-bot HOME override');
+  }
+}
+
 export function ebsdBotmuxSessionDir(sessionId: string): string {
   const lexicalHome = homedir();
   let canonicalHome = lexicalHome;

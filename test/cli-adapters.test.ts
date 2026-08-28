@@ -45,7 +45,7 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
-import { createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
+import { assertEbsdPerBotEnv, createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
@@ -1575,6 +1575,13 @@ describe('ebsd buildArgs', () => {
     expect(() => adapter.buildArgs({ sessionId: 'x'.repeat(256), resume: false })).toThrow(
       'Invalid BotMux session id for ebsd',
     );
+  });
+
+  it('rejects per-bot HOME overrides that would split worker and child session roots', () => {
+    expect(() => assertEbsdPerBotEnv({ HOME: '/tmp/other-home' })).toThrow(
+      'ebsd does not allow a per-bot HOME override',
+    );
+    expect(() => assertEbsdPerBotEnv({ HTTPS_PROXY: 'http://proxy.invalid' })).not.toThrow();
   });
 
   it('does not retry or cancel an unconfirmed Enter', async () => {

@@ -269,7 +269,8 @@ import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionId
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
-import { ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
+import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
+import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -14058,6 +14059,7 @@ async function spawnCli(
   // `/usr/bin/env` prefix and never into the shared backing-server global env,
   // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -14127,23 +14129,6 @@ async function spawnCli(
         if (!raw || typeof raw !== 'string') continue;
         const p = expandTilde(raw);
         try { if (existsSync(p)) out.push(canonical(p)); } catch { /* */ }
-      }
-      return out;
-    };
-    const keepSecretReadonlyFiles = (paths: readonly string[]) => {
-      const out: string[] = [];
-      for (const raw of paths) {
-        const path = expandTilde(raw);
-        let info: ReturnType<typeof lstatSync>;
-        try {
-          info = lstatSync(path);
-        } catch {
-          throw new Error('[sandbox] a required service credential file is unavailable');
-        }
-        if (info.isSymbolicLink() || !info.isFile()) {
-          throw new Error('[sandbox] every service credential path must be an exact regular file');
-        }
-        out.push(canonical(path));
       }
       return out;
     };
@@ -14280,18 +14265,19 @@ async function spawnCli(
     // (Schedules moved into each bot's BOT_HOME — the whole dir is already
     // bound readWrite for the owner, so no per-file pre-create is needed.)
 
-    const mandatoryDenyPaths: string[] = [];
-    const mandatoryDenyRegexes: string[] = [];
-    const mandatoryReadOnlyPaths: string[] = [];
-    // Fixed service-adapter credentials are an invariant, not an owner-tunable
-    // convenience. Keep them in the mandatory tier so an equal-path user
-    // readWrite rule cannot turn a host-managed token/key file writable.
-    mandatoryReadOnlyPaths.push(...keepSecretReadonlyFiles(
+    // Fixed service-adapter credentials remain mandatory read-only, but travel
+    // through a dedicated policy channel so no-transport authority filtering
+    // applies only to them—not to capability/attestation/MCP mandatory grants.
+    const serviceCredentialReadOnlyPaths = resolveServiceSecretReadonlyFiles(
       cliAdapter.sandboxSecretReadonlyPaths?.({
         ...childEnv,
         ...perBotInjectEnv,
       }) ?? [],
-    ));
+      sandboxHome,
+    );
+    const mandatoryDenyPaths: string[] = [];
+    const mandatoryDenyRegexes: string[] = [];
+    const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
     // cleanup manifest + the mode-000 empty ro-bind SOURCES. If SESSION_DATA_DIR
     // is configured INSIDE the working dir (a custom data dir under a RW-bound
@@ -14544,6 +14530,7 @@ async function spawnCli(
       outbox,
       extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),
       userPaths,
+      serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
