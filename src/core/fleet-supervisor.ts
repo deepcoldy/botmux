@@ -77,6 +77,10 @@ export interface FleetBotSpec {
      *  so a service can set a key the scrub would otherwise strip — that is the
      *  plugin manifest's prerogative, mirroring the old pm2 `--update-env`. */
     env?: Record<string, string>;
+    /** Hash of the definition this member is being started from; persisted into
+     *  fleet-state so a later reconcile can detect "running from a stale config"
+     *  and restart it. See FleetProcState.configHash. */
+    configHash?: string;
   };
 }
 
@@ -253,7 +257,15 @@ export class FleetSupervisor {
    *  is required) and applied via startOneBot/stopOneBot. */
   async drainCommands(commands: readonly FleetCommand[]): Promise<void> {
     for (const cmd of commands) {
-      const spec: FleetBotSpec = { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
+      // PREFER THE KNOWN SPEC over the command payload. The queue carries only
+      // (name, appId, botIndex) — enough to respawn a bot daemon, but it cannot
+      // describe an EXTERNAL member, whose command/args/cwd/env live in the spec.
+      // Rebuilding from the payload alone would spawn a plugin service as if it
+      // were a bot daemon (resolveEntrySpawn + no scrub). start() records every
+      // member in knownSpecs, so use that and fall back to the payload only for
+      // a name we have never seen.
+      const known = this.knownSpecs.get(cmd.name);
+      const spec: FleetBotSpec = known ?? { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
       if (cmd.op === 'start-bot') {
         this.startOneBot(spec);
       } else {
@@ -351,8 +363,13 @@ export class FleetSupervisor {
         // crashlooped in a previous supervisor generation would carry its stale
         // count and be parked one crash later instead of getting a full budget.
         if (!isRestart) existing.restarts = 0;
+        // Record which config this generation was actually started from, so the
+        // caller can later tell "running, but from a stale definition" apart from
+        // "running and current". Only external members have one.
+        if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
+        else delete existing.configHash;
       } else {
-        cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now) });
+        cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;

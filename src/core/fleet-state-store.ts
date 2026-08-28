@@ -35,6 +35,12 @@ function coerceState(raw: unknown): FleetState | null {
       restarts: Number.isSafeInteger(q.restarts) ? (q.restarts as number) : 0,
       lastExitCode: typeof q.lastExitCode === 'number' ? q.lastExitCode : null,
       startedAt: typeof q.startedAt === 'string' ? q.startedAt : null,
+      // Optional, external members only. This normalizer is a WHITELIST — any
+      // field not copied here is silently dropped on the next read, so a new
+      // FleetProcState field has to be added in both places or it never
+      // round-trips. Kept absent (rather than `undefined`) when missing so bot
+      // and dashboard entries serialize byte-identically to before.
+      ...(typeof q.configHash === 'string' ? { configHash: q.configHash } : {}),
     });
   }
   return {

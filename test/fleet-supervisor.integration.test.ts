@@ -586,4 +586,93 @@ describe('FleetSupervisor (live, integration)', () => {
     expect(readFileSync(dump, 'utf-8').trim()).toBe(realpathSync(workdir));
     await sup.stopAll();
   });
+
+  it('drainCommands restarts an external member from its SPEC, not the queue payload', async () => {
+    // The queue only carries (name, appId, botIndex) — enough to respawn a bot
+    // daemon, but it cannot describe an external member's command. Rebuilding the
+    // spec from the payload alone would spawn a plugin service through
+    // resolveEntrySpawn (i.e. as a bot daemon) AND skip the env scrub, so a queued
+    // start-bot must resolve through knownSpecs, which start() populates.
+    //
+    // NOTE: one supervisor per spec here. `stopAll()` sets `stopping` permanently
+    // (by design — it is the shutdown path), so a supervisor that has stopped can
+    // never spawn again; reusing one would make this pass for the wrong reason.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const marker = join(root, 'external-ran.txt');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-drain', appId: '', botIndex: -1, logBaseName: 'plugin-drain',
+      external: {
+        command: process.execPath,
+        // NOTE: build the newline with String.fromCharCode(10), not a `\n` escape.
+        // This is a TEMPLATE literal, so `\n` here becomes a REAL newline inside
+        // the child's `-e` source — which puts a line break in the middle of a JS
+        // string and makes the child die with a parse error (exit 1). That looked
+        // exactly like "the supervisor spawned the wrong thing", so it is worth
+        // spelling out.
+        args: ['-e', `require('fs').appendFileSync(${JSON.stringify(marker)}, 'ran' + String.fromCharCode(10));`
+          + `process.on('SIGTERM',()=>process.exit(90)); setInterval(()=>{},1000);`],
+      },
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {},
+    });
+    sup.start([svc]);
+    await waitFor(() => existsSync(marker));
+    const runsAfterStart = readFileSync(marker, 'utf-8').trim().split('\n').length;
+
+    // stop-bot then start-bot through the QUEUE (the SIGHUP path). No stopAll(),
+    // so this supervisor is still live and the restart really goes through
+    // drainCommands → knownSpecs.
+    await sup.drainCommands([
+      { id: 'c1', op: 'stop-bot', name: svc.name, appId: '', botIndex: -1, at: new Date().toISOString() },
+    ]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped');
+    await sup.drainCommands([
+      { id: 'c2', op: 'start-bot', name: svc.name, appId: '', botIndex: -1, at: new Date().toISOString() },
+    ]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    killLater(readFileSync(marker, 'utf-8') ? readFleetState(statePath)?.procs[0]?.pid : undefined);
+
+    // The marker grew → the EXTERNAL command ran again. Had the spec been rebuilt
+    // from the payload, the supervisor would have run fakeDist's STAY script
+    // instead and never touched the marker.
+    const runsAfterRestart = await waitFor(
+      () => readFileSync(marker, 'utf-8').trim().split('\n').length > runsAfterStart,
+    );
+    expect(runsAfterRestart).toBe(true);
+    await sup.stopAll();
+  });
+
+  it('persists configHash for an external member and clears it for a bot', async () => {
+    // The "running from a stale config" signal. pm2 kept it in its own app
+    // metadata; fleet-state has to carry it instead, or a definition change can
+    // never be detected after the spawn.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {},
+    });
+    sup.start([{
+      name: 'botmux-plugin-hash', appId: '', botIndex: -1, logBaseName: 'plugin-hash',
+      external: { command: process.execPath, args: ['-e', 'setInterval(()=>{},1000);'], configHash: 'h1' },
+    }]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    killLater(readFleetState(statePath)?.procs[0]?.pid);
+    expect(readFleetState(statePath)!.procs[0].configHash).toBe('h1');
+    await sup.stopAll();
+
+    // A bot daemon must NOT carry one — the key stays absent so existing state
+    // files (and their assertions) are byte-identical.
+    const root2 = tmp();
+    const statePath2 = join(root2, 'fleet.json');
+    const sup2 = new FleetSupervisor({
+      statePath: statePath2, distDir: fakeDist(root2, STAY), daemonEnv: {}, cwd: root2, log: () => {},
+    });
+    sup2.start([{ name: 'botmux-0', appId: 'cli_a', botIndex: 0 }]);
+    await waitFor(() => readFleetState(statePath2)?.procs[0]?.status === 'online');
+    killLater(readFleetState(statePath2)?.procs[0]?.pid);
+    expect(readFleetState(statePath2)!.procs[0]).not.toHaveProperty('configHash');
+    await sup2.stopAll();
+  });
 });

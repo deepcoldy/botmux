@@ -49,6 +49,20 @@ export interface FleetProcState {
   lastExitCode: number | null;
   /** ISO timestamp of the last (re)spawn. */
   startedAt: string | null;
+  /**
+   * For an EXTERNAL member (a plugin service): a hash of the configuration this
+   * process was actually started from. Absent for bot daemons and the dashboard,
+   * whose configuration is not per-member.
+   *
+   * WHY IT IS PERSISTED HERE: the caller compares it against the hash of the
+   * CURRENT definition to decide "was this started from a stale config, and does
+   * it therefore need a restart to pick up the change?". That question can only
+   * be answered by something that outlives the spawn, so it has to live in
+   * fleet-state next to the pid. pm2 answered it by stashing the hash in its own
+   * app metadata (`pm2_env`); fleet-state has no such bag, hence this field —
+   * same semantics, different storage.
+   */
+  configHash?: string;
 }
 
 export interface FleetState {
@@ -148,6 +162,10 @@ export function planStart(
 }
 
 /** Fresh state entry for a newly-spawned proc (generation 1, online). */
-export function freshProc(name: string, appId: string, pid: number, now: string): FleetProcState {
-  return { name, appId, pid, generation: 1, status: 'online', restarts: 0, lastExitCode: null, startedAt: now };
+export function freshProc(name: string, appId: string, pid: number, now: string, configHash?: string): FleetProcState {
+  const proc: FleetProcState = { name, appId, pid, generation: 1, status: 'online', restarts: 0, lastExitCode: null, startedAt: now };
+  // Only external members carry one; keep the key absent otherwise so existing
+  // state files and their assertions stay byte-identical.
+  if (configHash !== undefined) proc.configHash = configHash;
+  return proc;
 }
