@@ -18720,6 +18720,9 @@ async function handleBotAdded(
     }
     const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
+    // 入群 seed 消息文案：bot 配置了 autoStartOnGroupJoinSeed 用之，否则回退内置 i18n。
+    const joinSeedText = botCfg.autoStartOnGroupJoinSeed?.trim()
+      || tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
     // D8 deliberately keeps the legacy prompt empty when no join prompt is
     // configured, so the agent can inspect group context without receiving a
     // synthetic instruction. Codex App still needs a non-blank visible
@@ -18736,8 +18739,7 @@ async function handleBotAdded(
     let scope: 'thread' | 'chat';
     let anchor: string;
     if (opensOwnTopic) {
-      const seedText = tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
-      anchor = await sendMessage(larkAppId, chatId, seedText, 'text');
+      anchor = await sendMessage(larkAppId, chatId, joinSeedText, 'text');
       scope = 'thread';
     } else {
       anchor = chatId;
@@ -18894,7 +18896,7 @@ async function handleBotAdded(
         sharedReplyRootId = await sendMessage(
           larkAppId,
           chatId,
-          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          joinSeedText,
           'text',
         );
       } catch (err: any) {

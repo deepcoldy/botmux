@@ -127,6 +127,9 @@ export type BotDefaultsRow = {
   riff?: Record<string, unknown> | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
+  autoStartOnGroupJoinSeed?: string;
+  /** 内置默认 seed 文案（按 bot locale），供留空时 placeholder 展示。 */
+  autoStartOnGroupJoinSeedDefault?: string;
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;

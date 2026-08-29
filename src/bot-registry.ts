@@ -1876,6 +1876,12 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
+   * 主动开工 — 场景①自定义入群 seed 消息文案（群里那条"已加入本群"锚点消息）。
+   * 缺省/空白 → 用内置 i18n 文案（daemon.auto_start_join_seed）。仅 bots.json
+   * 文件配置，dashboard 不感知。Moot when {@link autoStartOnGroupJoin} is off.
+   */
+  autoStartOnGroupJoinSeed?: string;
+  /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
@@ -3317,6 +3323,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()
         ? entry.autoStartOnGroupJoinPrompt
+        : undefined,
+      // Preserve the configured seed verbatim; trim-to-undefined when blank
+      // so an empty string doesn't linger in bots.json.
+      autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' && entry.autoStartOnGroupJoinSeed.trim()
+        ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       messageListeners,
