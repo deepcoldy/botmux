@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
 import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
+import { isStandaloneBinary } from '../../core/self-spawn.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -235,13 +236,71 @@ function canonical(p: string): string {
 }
 
 /** Absolute path to this build's compiled cli.js (dist/cli.js), derived from
- *  this module's own location (dist/adapters/backend/sandbox.js → ../../cli.js). */
+ *  this module's own location (dist/adapters/backend/sandbox.js → ../../cli.js).
+ *
+ *  ⚠️ NOT VALID IN A COMPILED BINARY. There is no cli.js on disk there: the module
+ *  graph lives in the virtual, process-private `/$bunfs/`, so both candidates
+ *  below resolve against `/$bunfs/root` and collapse onto the real filesystem
+ *  root — MEASURED inside a real compiled binary: `/cli.js` and `/dist/cli.js`,
+ *  neither existing. Callers must therefore go through `botmuxCliInvocation()` (a
+ *  child spawn) or `botmuxShimExecLine()` (a shim handed to another process)
+ *  rather than calling this directly. */
 function distCliJs(): string {
   const colocated = fileURLToPath(new URL('../../cli.js', import.meta.url));
   if (existsSync(colocated)) return colocated;
-  // `pnpm daemon` loads this module from src/ through tsx, while the trusted
+  // `bun run daemon` loads this module from src/ through tsx, while the trusted
   // sandbox shim must still execute the built CLI entrypoint.
   return fileURLToPath(new URL('../../../dist/cli.js', import.meta.url));
+}
+
+/**
+ * `#!/bin/sh` body for the in-sandbox `botmux` shim.
+ *
+ * WHY THIS CANNOT BE ONE FORM FOR BOTH RUNTIMES: the shim is written to the host
+ * disk, ro-bound into the sandbox at `/run/sbxbin`, and then executed by a
+ * DIFFERENT process inside that sandbox. Two things follow, both MEASURED:
+ *
+ *   • `/$bunfs/` is process-private — a child sees nothing there, so a compiled
+ *     binary emitting `exec node "/dist/cli.js"` produces a shim whose target does
+ *     not exist for the only process that will ever run it; and
+ *   • `sh` expands the unescaped `$bunfs` inside double quotes to the empty
+ *     string, so even the literal path is lost (`"/$bunfs/cli.js"` → `//cli.js`).
+ *
+ * Verified against a real binary: running the compiled form of this line prints
+ * the botmux HELP BANNER and exits 0, so an in-sandbox `botmux send` silently
+ * does nothing.
+ *
+ * The two runtimes genuinely need DIFFERENT values — the source form must name
+ * `dist/cli.js` (a compiled binary has no such file) and the compiled form must
+ * name the executable itself (`process.execPath`, a real on-disk path even under
+ * --compile). Collapsing them is not possible; the guard here is that each branch
+ * is exercised by a test, since a wrong shim fails silently.
+ *
+ * Also note the compiled form drops `node` entirely: re-introducing an
+ * interpreter dependency would defeat the point of the self-contained binary, and
+ * the sandbox policy does not expose a node.
+ */
+export function botmuxShimExecLine(): string {
+  if (isStandaloneBinary()) {
+    return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`;
+  }
+  return `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`;
+}
+
+/**
+ * Command + leading args to run this build's CLI as a CHILD of the current
+ * process (used by the relay watcher to re-exec `botmux send` on the host).
+ *
+ * Same split as `src/core/self-spawn.ts`: under Node the script path is required
+ * (`node <dist/cli.js> send …`), while the compiled binary dispatches ordinary
+ * subcommands itself (`<binary> send …`) and must NOT be handed a script path —
+ * verified on a real binary that `<binary> "/dist/cli.js" send …` prints help and
+ * exits 0 instead of sending anything.
+ */
+export function botmuxCliInvocation(cliPathOverride?: string): { command: string; args: string[] } {
+  if (cliPathOverride) return { command: process.execPath, args: [cliPathOverride] };
+  if (isStandaloneBinary()) return { command: process.execPath, args: [] };
+  return { command: process.execPath, args: [distCliJs()] };
 }
 
 /** Is the file sandbox globally forced for this daemon? The real per-bot
@@ -624,7 +683,7 @@ export function prepareDirectSandbox(opts: {
   // `botmux` shim → THIS build's cli.js so in-sandbox `botmux send` hits relay
   // mode (and never needs bots.json, which the policy doesn't expose).
   const shim = join(shimBin, 'botmux');
-  writeFileSync(shim, `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`);
+  writeFileSync(shim, botmuxShimExecLine());
   chmodSync(shim, 0o755);
 
   // usrmerge symlinks to replicate; deny rules that are FILES on the host need
@@ -1108,7 +1167,7 @@ export function startOutboxWatcher(
     cliPath?: string;
   } = {},
 ): () => void {
-  const cli = opts.cliPath ?? distCliJs();
+  const cliInvocation = botmuxCliInvocation(opts.cliPath);
   const authorize = opts.authorize;
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
@@ -1232,7 +1291,7 @@ export function startOutboxWatcher(
       } else {
         delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
       }
-      const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
+      const child = spawn(cliInvocation.command, [...cliInvocation.args, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });
