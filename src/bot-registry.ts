@@ -2103,6 +2103,12 @@ export function formatLarkError(v: any): string | null {
   if (typeof code === 'number') parts.push(`code=${code}`);
   if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
   if (logId) parts.push(`log_id=${logId}`);
+  // Without an HTTP response, the transport code/message is the only useful
+  // signal. Keep it while still excluding config, headers, and stack.
+  if (httpStatus == null && typeof code !== 'number') {
+    if (typeof v.code === 'string' && v.code) parts.push(v.code);
+    if (typeof v.message === 'string' && v.message) parts.push(`"${v.message}"`);
+  }
   if (!parts.length) return null;
   return parts.join(' ');
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  describeSendFailure,
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
   normalizeInteractiveCardInput,
@@ -11,6 +12,32 @@ import {
 } from '../src/cli/send-dispatch.js';
 
 class MessageWithdrawnError extends Error {}
+
+describe('describeSendFailure', () => {
+  it('preserves Lark business details instead of falling back to the HTTP message', () => {
+    const err = {
+      isAxiosError: true,
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: {
+        status: 400,
+        data: {
+          code: 230022,
+          msg: 'content contains sensitive information',
+          log_id: 'LOGREAL123',
+        },
+      },
+    };
+
+    expect(describeSendFailure(err)).toBe(
+      'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOGREAL123',
+    );
+  });
+
+  it('falls back to a plain Error message for non-Lark failures', () => {
+    expect(describeSendFailure(new Error('upload boom'))).toBe('upload boom');
+  });
+});
 
 describe('dispatchPrimaryMessage hook context wiring', () => {
   const baseOptions = {

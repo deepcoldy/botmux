@@ -28,6 +28,12 @@ export type DispatchPrimaryDeps = {
   replyMessage: ReplyMessageFn;
 };
 
+/** Keep provider details visible without leaking Axios config or headers. */
+export function describeSendFailure(err: unknown): string {
+  return formatLarkError(err)
+    ?? (err instanceof Error && err.message ? err.message : String(err));
+}
+
 /**
  * Paths that resolve to the process's own stdin. `botmux send` reads stdin for
  * the message body (the documented `echo "msg" | botmux send` form), so passing
@@ -113,8 +119,8 @@ export async function sendFileAttachments(
       const fileKey = await deps.uploadFile(appId, fp);
       await deps.beforeEffect?.();
       sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
-    } catch (err: any) {
-      failed.push({ path: fp, error: formatLarkError(err) ?? err?.message ?? String(err) });
+    } catch (err: unknown) {
+      failed.push({ path: fp, error: describeSendFailure(err) });
     }
   }
   return { sent, failed };
@@ -403,11 +409,11 @@ export async function sendVideoAttachments(
       const messageId = await send(content, 'media');
       primaryUsed = true;
       sent.push(messageId);
-    } catch (err: any) {
+    } catch (err: unknown) {
       failed.push({
         path: video.videoPath,
         coverPath: video.coverPath,
-        error: formatLarkError(err) ?? err?.message ?? String(err),
+        error: describeSendFailure(err),
       });
     }
   }
