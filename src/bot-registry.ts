@@ -1876,9 +1876,12 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
-   * 主动开工 — 场景①自定义入群 seed 消息文案（群里那条"已加入本群"锚点消息）。
-   * 缺省/空白 → 用内置 i18n 文案（daemon.auto_start_join_seed）。仅 bots.json
-   * 文件配置，dashboard 不感知。Moot when {@link autoStartOnGroupJoin} is off.
+   * 主动开工 — 场景①自定义入群 seed 消息文案（该消息同时是话题根/共享会话锚点，
+   * 只在话题群 / 普通群 new-topic / shared 模式下发送；普通群顶层平铺入群静默）。
+   * 缺省/空白 → 按 bot locale 回退内置 i18n 文案（daemon.auto_start_join_seed）。
+   * bots.json 手配 + dashboard「Bot 默认设置」可编辑（card-prefs 链路，清空保存即
+   * 恢复默认）。注意 forcePrompt（Issue Board 领取）路径会跳过
+   * {@link autoStartOnGroupJoin} 开关检查，开关关闭时 seed 仍可能发出。
    */
   autoStartOnGroupJoinSeed?: string;
   /**
