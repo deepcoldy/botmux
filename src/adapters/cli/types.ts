@@ -365,6 +365,13 @@ export interface CliAdapter {
    *  the worker may safely let quiescence mark the session idle. */
   readonly busyPattern?: RegExp;
 
+  /**
+   * Optional runtime session busy check against the CLI's native state store
+   * (e.g. OpenCode SQLite db). When true, suppresses premature idle detection
+   * even if PTY output has quiesced.
+   */
+  readonly isSessionBusy?: (opts: { sessionId: string; cliSessionId?: string }) => boolean;
+
   /** Opt-in positive marker for an idle→working edge observed in PTY output.
    *  Kept separate from busyPattern because transcript/full-screen redraws may
    *  contain old busy text; existing adapters remain opt-out by default. */

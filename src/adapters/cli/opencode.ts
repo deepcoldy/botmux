@@ -202,6 +202,70 @@ export function sessionRowExists(cliSessionId: string, kind: OpenCodeDbKind = 'v
   });
 }
 
+/**
+ * 探测 OpenCode 会话当前是否处于执行中（工具调用中、模型推理中等）。
+ *
+ * 判 busy 准则（满足任一即为 busy）：
+ *  1. 存在属于该 session、状态为 `status: "running"` 的 tool part；
+ *  2. 该 session 最新的一条 assistant message 处于未完成状态（没有 completed 时间戳，
+ *     或 finish 仍为 "tool-calls" 且后续 step 尚未终态）。
+ */
+export function isOpenCodeSessionBusy(cliSessionId: string, kind: OpenCodeDbKind = 'v1'): boolean {
+  if (kind === 'v2') {
+    return withDb((db) => {
+      // 1. 检查是否存在 running 状态的 tool part
+      const runningTool = db.prepare(
+        "SELECT 1 AS busy FROM session_message " +
+        "WHERE session_id = ? " +
+        "  AND json_extract(data, '$.state.status') = 'running' " +
+        "LIMIT 1"
+      ).get(cliSessionId) as { busy?: number } | undefined;
+      if (runningTool?.busy) return true;
+
+      // 2. 检查最新 assistant message 是否处于未完成状态
+      const lastMsg = db.prepare(
+        "SELECT json_extract(data, '$.finish') AS finish, " +
+        "       json_extract(data, '$.time.completed') AS completed " +
+        "FROM session_message " +
+        "WHERE session_id = ? AND type = 'assistant' " +
+        "ORDER BY time_created DESC LIMIT 1"
+      ).get(cliSessionId) as { finish?: string; completed?: number } | undefined;
+
+      if (!lastMsg) return false;
+      if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
+      if (lastMsg.finish === 'tool-calls') return true;
+      return false;
+    }) ?? false;
+  }
+
+  return withDb((db) => {
+    // 1. 检查是否存在 running 状态的 tool part
+    const runningTool = db.prepare(
+      "SELECT 1 AS busy FROM part " +
+      "WHERE session_id = ? " +
+      "  AND json_extract(data, '$.type') = 'tool' " +
+      "  AND json_extract(data, '$.state.status') = 'running' " +
+      "LIMIT 1"
+    ).get(cliSessionId) as { busy?: number } | undefined;
+    if (runningTool?.busy) return true;
+
+    // 2. 检查最新 assistant message 是否处于未完成状态
+    const lastMsg = db.prepare(
+      "SELECT json_extract(data, '$.finish') AS finish, " +
+      "       json_extract(data, '$.time.completed') AS completed " +
+      "FROM message " +
+      "WHERE session_id = ? " +
+      "  AND json_extract(data, '$.role') = 'assistant' " +
+      "ORDER BY time_created DESC LIMIT 1"
+    ).get(cliSessionId) as { finish?: string; completed?: number } | undefined;
+
+    if (!lastMsg) return false;
+    if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
+    if (lastMsg.finish === 'tool-calls') return true;
+    return false;
+  }) ?? false;
+}
+
 /** Import path（/adopt 第二过滤器）共用实现：从当前存储层的会话表列出可续接的
  *  顶层会话（parent_id 非空的是子代理会话，跳过）。opencode2 与 opencode 共用
  *  同一库文件，kind 区分表空间。 */
@@ -344,6 +408,14 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
+    busyPattern: /ctrl\+c to interrupt|esc to interrupt/i,
+    isSessionBusy({ sessionId, cliSessionId }) {
+      const sid = isOpenCodeSessionId(cliSessionId)
+        ? cliSessionId
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1');
+      if (!sid) return false;
+      return isOpenCodeSessionBusy(sid, 'v1');
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Bubble Tea renders in alternate screen buffer
     readOnlyRemoteScroll: true,
