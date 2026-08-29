@@ -141,9 +141,11 @@ import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/bi
 import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
-  executeDashboardCommand,
+  dashboardExportTimeoutForBudget,
+  executeDashboardCommandWithExportRefresh,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
+  refreshDashboardResultAfterExport,
 } from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -3129,15 +3131,16 @@ async function callDashboardEndpoint(path: DashboardEndpoint): Promise<Dashboard
  * `devboxDashboardBaseUrl()` 读侧用的是同一份判据，避免写 9002、读 9001。
  * 非 Devbox / 已配置中心平台或自建反代 / `merlin-cli` 不可用时全部静默 no-op。
  */
-async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
+async function ensureDevboxDashboardExportForCurrentPort(timeoutMs?: number): Promise<string | null> {
   const portFile = join(CONFIG_DIR, '.dashboard-port');
   const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT || '7891');
-  await ensureDevboxDashboardExport({
+  return ensureDevboxDashboardExport({
     port,
     remoteBaseConfigured: Boolean(
       (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
     ),
+    timeoutMs,
   });
 }
 
@@ -3152,13 +3155,22 @@ async function printDashboardHintWithRetry(): Promise<void> {
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
-  // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
-  // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
-  // 才 6s，实测会把 start/restart 的这段拖到近两倍。
-  await ensureDevboxDashboardExportForCurrentPort();
   while (Date.now() - started < maxWaitMs) {
     last = await callDashboardEndpoint('/__cli/current');
     if (last.ok) {
+      // Only export after the endpoint proves which port the dashboard actually
+      // owns (callDashboard may self-heal `.dashboard-port`). Do it once, then
+      // re-read the non-mutating current URL so this very hint sees the export.
+      const exportTimeoutMs = dashboardExportTimeoutForBudget(
+        maxWaitMs - (Date.now() - started),
+      );
+      if (exportTimeoutMs !== null) {
+        last = await refreshDashboardResultAfterExport(
+          last,
+          () => ensureDevboxDashboardExportForCurrentPort(exportTimeoutMs),
+          callDashboardEndpoint,
+        );
+      }
       console.log(`   面板: botmux dashboard (${last.url})`);
       // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
       if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
@@ -3187,12 +3199,11 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const rawAction = args[0]?.toLowerCase();
-  const resolvesEndpoint = args.length <= 1
-    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
-    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
-  if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
-  const execution = await executeDashboardCommand(args, callDashboardEndpoint);
+  const execution = await executeDashboardCommandWithExportRefresh(
+    args,
+    callDashboardEndpoint,
+    () => ensureDevboxDashboardExportForCurrentPort(),
+  );
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
     return;

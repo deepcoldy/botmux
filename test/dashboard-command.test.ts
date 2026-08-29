@@ -1,10 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  dashboardExportTimeoutForBudget,
   executeDashboardCommand,
+  executeDashboardCommandWithExportRefresh,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
+  refreshDashboardResultAfterExport,
 } from '../src/cli/dashboard-command.js';
 import type { DashboardEndpoint } from '../src/cli/dashboard-endpoint.js';
+
+describe('dashboardExportTimeoutForBudget', () => {
+  it('skips doomed sub-500ms exports and caps a healthy budget at five seconds', () => {
+    expect(dashboardExportTimeoutForBudget(499)).toBeNull();
+    expect(dashboardExportTimeoutForBudget(500)).toBe(500);
+    expect(dashboardExportTimeoutForBudget(1_234.9)).toBe(1_234);
+    expect(dashboardExportTimeoutForBudget(6_000)).toBe(5_000);
+  });
+});
 
 describe('executeDashboardCommand', () => {
   it.each([['--help'], ['-h'], ['help']])('%s is non-mutating', async (...args) => {
@@ -217,6 +229,109 @@ describe('executeDashboardCommand', () => {
       argument: 'wat',
     });
     expect(callEndpoint).not.toHaveBeenCalled();
+  });
+});
+
+describe('refreshDashboardResultAfterExport', () => {
+  it('exports only after a live result, then re-reads current without rotating', async () => {
+    const events: string[] = [];
+    const ensureExport = vi.fn(async () => {
+      events.push('export');
+      return 'https://devbox.example.com';
+    });
+    const callEndpoint = vi.fn(async (path: DashboardEndpoint) => {
+      events.push(path);
+      return { ok: true as const, url: 'https://devbox.example.com/?t=token' };
+    });
+
+    await expect(refreshDashboardResultAfterExport(
+      { ok: true, url: 'http://127.0.0.1:9002/?t=token' },
+      ensureExport,
+      callEndpoint,
+    )).resolves.toEqual({ ok: true, url: 'https://devbox.example.com/?t=token' });
+    expect(events).toEqual(['export', '/__cli/current']);
+    expect(callEndpoint).not.toHaveBeenCalledWith('/__cli/rotate');
+  });
+
+  it('keeps the usable local response when export is unavailable', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    const callEndpoint = vi.fn();
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => null,
+      callEndpoint,
+    )).resolves.toBe(original);
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('keeps the first live response when the post-export refresh fails', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => 'https://devbox.example.com',
+      async () => ({ ok: false, reason: 'unreachable' }),
+    )).resolves.toBe(original);
+  });
+
+  it('keeps the first live response when export rejects', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    const callEndpoint = vi.fn();
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => { throw new Error('cache raced with another process'); },
+      callEndpoint,
+    )).resolves.toBe(original);
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('keeps the first live response when the post-export refresh rejects', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => 'https://devbox.example.com',
+      async () => { throw new Error('dashboard stopped'); },
+    )).resolves.toBe(original);
+  });
+});
+
+describe('executeDashboardCommandWithExportRefresh', () => {
+  it('discovers the dashboard before export and refreshes only with current', async () => {
+    const events: string[] = [];
+    let currentCalls = 0;
+    const callEndpoint = vi.fn(async (path: DashboardEndpoint) => {
+      events.push(path);
+      currentCalls += path === '/__cli/current' ? 1 : 0;
+      return {
+        ok: true as const,
+        url: currentCalls > 1
+          ? 'https://devbox.example.com/?t=token'
+          : 'http://127.0.0.1:9002/?t=token',
+      };
+    });
+    const ensureExport = vi.fn(async () => {
+      events.push('export');
+      return 'https://devbox.example.com';
+    });
+
+    await expect(executeDashboardCommandWithExportRefresh(
+      ['current'],
+      callEndpoint,
+      ensureExport,
+    )).resolves.toMatchObject({
+      kind: 'endpoint',
+      result: { ok: true, url: 'https://devbox.example.com/?t=token' },
+    });
+    expect(events).toEqual(['/__cli/current', 'export', '/__cli/current']);
+    expect(callEndpoint).not.toHaveBeenCalledWith('/__cli/rotate');
+  });
+
+  it('does not export for help, invalid argv, or a failed first endpoint', async () => {
+    const ensureExport = vi.fn();
+    const failedEndpoint = vi.fn(async () => ({ ok: false as const, reason: 'unreachable' as const }));
+    await executeDashboardCommandWithExportRefresh(['help'], failedEndpoint, ensureExport);
+    await executeDashboardCommandWithExportRefresh(['wat'], failedEndpoint, ensureExport);
+    await executeDashboardCommandWithExportRefresh(['current'], failedEndpoint, ensureExport);
+    expect(ensureExport).not.toHaveBeenCalled();
   });
 });
 
