@@ -37,10 +37,10 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { botmuxShimExecLine, botmuxCliInvocation } from '../src/adapters/backend/sandbox.js';
+import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 
 const REAL_ARGV1 = process.argv[1];
 function asCompiledBinary() { process.argv[1] = '/$bunfs/root/cli.js'; }
@@ -153,5 +153,73 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
     expect(src).toContain('botmuxCliInvocation(opts.cliPath)');
     // And the shim writer must go through the helper too.
     expect(src).toContain('writeFileSync(shim, botmuxShimExecLine())');
+  });
+});
+
+/**
+ * INSTALL.SH LAYOUT — the shim must NOT be overlaid onto this executable.
+ *
+ * install.sh moves the compiled binary to `~/.botmux/bin/botmux` (install.sh:106)
+ * and the daemon runs from there, while `trustedBotmuxCommandPaths` defaults to
+ * exactly that path (gateway-installer.ts; `BOTMUX_BIN_PATH` has no writer
+ * anywhere in the repo, so the default IS the production value). Binding the shim
+ * over it makes the shim's own `exec "<process.execPath>"` resolve back to the
+ * shim.
+ *
+ * MEASURED with bwrap and a real compiled binary:
+ *   baseline (no shim overlay)      → `3.18.6-21-g…`     ✅
+ *   shim overlaid on the same path  → no output, exit 0  ❌
+ *
+ * Silent exit 0, because the kernel caps shebang recursion and simply gives up —
+ * so an in-sandbox `botmux send` looks like it worked and sent nothing. That is
+ * the same failure class this file exists to prevent, which is why it gets a
+ * dedicated case rather than a comment.
+ *
+ * WHY THE EARLIER CASES MISSED IT: the "shim actually runs" test above puts the
+ * stand-in binary at a DIFFERENT path — i.e. it only ever exercised the npm
+ * layout, where the launcher and the platform binary are separate files.
+ */
+describe('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
+  function overlayTargets(trusted: string): string[] {
+    const root = mkdtempSync(join(tmpdir(), 'sbx-overlay-'));
+    const proj = join(root, 'proj');
+    const home = join(root, 'home');
+    mkdirSync(proj, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    const spawn = prepareDirectSandbox({
+      sessionId: `s${Math.random().toString(16).slice(2, 8)}`,
+      dataDir: join(root, 'data'),
+      policy: { rules: [{ path: proj, access: 'readWrite' }], execPaths: [], denyDefault: true } as never,
+      chdir: proj,
+      home,
+      cliBin: '/bin/sh',
+      cliArgs: ['-c', 'true'],
+      trustedBotmuxCommandPaths: [trusted],
+    });
+    if (!spawn) return [];
+    const out: string[] = [];
+    for (let i = 0; i < spawn.args.length - 2; i++) {
+      if (spawn.args[i] === '--ro-bind' && String(spawn.args[i + 1]).endsWith('/shimbin/botmux')) {
+        out.push(String(spawn.args[i + 2]));
+      }
+    }
+    spawn.cleanup();
+    return out;
+  }
+
+  it('skips the overlay when the trusted path IS this executable (no self-recursion)', () => {
+    // The real binary stays reachable regardless: execPaths always contains
+    // dirname(canonical(process.execPath)) (worker.ts), so an absolute-path call
+    // lands on it directly, and PATH-shaped `botmux` still goes through
+    // /run/sbxbin.
+    expect(overlayTargets(process.execPath)).toEqual([]);
+  });
+
+  it('still overlays a DIFFERENT launcher path (npm layout unaffected)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-npmlayout-'));
+    const launcher = join(dir, 'botmux');
+    writeFileSync(launcher, '#!/bin/sh\nexec /somewhere/botmux "$@"\n', { mode: 0o755 });
+    chmodSync(launcher, 0o755);
+    expect(overlayTargets(launcher)).toEqual([launcher]);
   });
 });

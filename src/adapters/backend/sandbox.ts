@@ -751,11 +751,36 @@ export function prepareDirectSandbox(opts: {
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
+  // Overlay the shim onto every configured absolute `botmux` command path so an
+  // in-sandbox call by absolute path also reaches relay mode.
+  //
+  // ⚠️ EXCEPT when that path IS this executable. install.sh moves the compiled
+  // binary to `~/.botmux/bin/botmux` (install.sh:106) and the daemon runs from
+  // there, while `trustedBotmuxCommandPaths` defaults to exactly that path
+  // (gateway-installer.ts — `BOTMUX_BIN_PATH` has no writer anywhere, so the
+  // default is what production uses). Binding the shim over it makes the shim's
+  // own `exec "<process.execPath>"` resolve back to the shim: MEASURED with bwrap,
+  // the real binary never runs and the process ends in SILENT exit 0 (the kernel
+  // caps shebang recursion and gives up), i.e. an in-sandbox `botmux send` looks
+  // like it worked and sent nothing — the exact failure class this whole change
+  // exists to remove.
+  //
+  // Skipping the overlay is safe: `execPaths` always contains
+  // `dirname(canonical(process.execPath))` (worker.ts), so the real binary is
+  // already reachable inside the sandbox, and an absolute-path call lands on it
+  // directly. The PATH-shaped `botmux` still goes through `/run/sbxbin`, and relay
+  // mode is driven by env (BOTMUX_SANDBOX_OUTBOX etc.), not by which file answers
+  // the call. The npm layout — where the launcher and the platform binary are
+  // different files — still gets the overlay.
+  let selfExec: string | undefined;
+  try { selfExec = realpathSync(process.execPath); } catch { selfExec = undefined; }
   for (const rawTarget of [...new Set(opts.trustedBotmuxCommandPaths ?? [])]) {
     if (typeof rawTarget !== 'string' || !isAbsolute(rawTarget)) continue;
     const target = resolve(rawTarget);
     try {
       if (!lstatSync(target).isFile()) continue;
+      // Compare resolved paths: either side may be reached through a symlink.
+      if (selfExec !== undefined && realpathSync(target) === selfExec) continue;
       args.push('--ro-bind', shim, target);
     } catch { /* missing/stale config target — PATH shim remains available */ }
   }
