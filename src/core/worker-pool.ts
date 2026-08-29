@@ -13992,6 +13992,20 @@ export function listProcesses(): ProcSnapshot[] {
 }
 
 /**
+ * This executable's absolute, symlink-resolved path.
+ *
+ * `process.execPath` is already absolute and kernel-resolved, so this is normally
+ * a no-op; realpath is applied anyway so a comparison against a `/proc` argv[0]
+ * cannot be defeated by the daemon having been started through a symlink (a
+ * released install commonly sits behind `~/.botmux/bin/botmux`). Falls back to the
+ * raw value when the path cannot be resolved — a failed realpath must not turn the
+ * reaper into a no-op.
+ */
+function canonicalExecPath(): string {
+  try { return realpathSync(process.execPath); } catch { return process.execPath; }
+}
+
+/**
  * Reap worker processes orphaned by a previous daemon that died WITHOUT running
  * its graceful shutdown — SIGKILL, OOM, or an uncaught crash. The shutdown()
  * path in daemon.ts already SIGKILLs stragglers on SIGTERM, but a hard kill
@@ -14034,22 +14048,40 @@ export function reapOrphanWorkers(opts: {
   // this function exists to prevent: each orphan leaks ~0.5 GB and they accumulate
   // across restarts (daemon.ts records an 841-orphan / ~65 GB incident).
   //
-  // The compiled predicate keeps the same conservatism — it must still identify
-  // THIS install and not another botmux — by requiring the running executable's
-  // path AND the `__worker` token. Both are matched as substrings because
-  // /proc/<pid>/cmdline preserves argv[0] exactly as given, which may be relative
-  // (MEASURED: launching via a relative path yields a relative argv[0]), so the
-  // basename is the portion that reliably appears.
+  // The compiled predicate must keep the SAME conservatism the worker.js path had:
+  // it identified this install by an ABSOLUTE path, so another botmux install's
+  // orphans could never match. A basename-only check loses that — every released
+  // install names its binary `botmux`, so install A would reap install B's
+  // orphans (verified: with a same-named binary at a different absolute path, a
+  // basename check reaps it).
+  //
+  // So match on the absolute path when the command line carries one. That is the
+  // normal case for OUR workers: spawnWorker launches them via
+  // `resolveEntrySpawn` → `process.execPath`, which the kernel has already
+  // resolved to an absolute path (MEASURED in /proc/<pid>/cmdline:
+  // `/…/botmux-linux-x64 __worker`). Only a RELATIVE argv[0] — a binary started
+  // by a bare PATH lookup, which our own spawns never produce — falls back to the
+  // basename, where cross-install ambiguity is unavoidable but the process was
+  // also not started the way we start ours.
   const standalone = isStandaloneBinary();
   const workerPath = opts.workerPath ?? (standalone ? undefined : join(__dirname, '..', 'worker.js'));
-  const binaryName = standalone ? basename(process.execPath) : '';
+  const selfBinary = standalone ? canonicalExecPath() : '';
+  const selfBinaryName = standalone ? basename(selfBinary) : '';
 
   /** Does this command line belong to a worker of THIS install? */
   const isOurWorker = (cmd: string): boolean => {
     if (workerPath !== undefined) return cmd.includes(workerPath);
-    // Compiled form: `<binary> __worker`. Require both parts so a stray process
-    // that merely mentions `__worker` (or a different botmux binary) is spared.
-    return cmd.includes(binaryName) && cmd.includes(WORKER_ENTRY_SUBCOMMAND);
+    // Compiled form: `<binary> __worker`. The token alone is not enough — a
+    // process merely mentioning `__worker` (a grep, another install) must be
+    // spared.
+    if (!cmd.includes(WORKER_ENTRY_SUBCOMMAND)) return false;
+    const argv0 = cmd.split(/\s+/, 1)[0] ?? '';
+    // Absolute argv[0] → require the exact executable, so a same-named binary
+    // from a different install is not ours.
+    if (argv0.startsWith('/')) return argv0 === selfBinary;
+    // Relative argv[0] (never produced by our own spawns) → basename is all
+    // there is to compare.
+    return basename(argv0) === selfBinaryName;
   };
 
   let reaped = 0;

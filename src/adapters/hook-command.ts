@@ -43,8 +43,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * 单一出口：三个导出全部经由它，避免「同一个判据三份实现各自漂移」——
  * 本文件此前正是三处各拼一遍 `join(__dirname,'..','cli.js')`。
  */
-function botmuxInvocation(subcommand: string[]): { cmd: string; args: string[] } {
-  if (isStandaloneBinary()) {
+function botmuxInvocation(
+  subcommand: string[],
+  standalone: boolean = isStandaloneBinary(),
+): { cmd: string; args: string[] } {
+  if (standalone) {
     // process.execPath 是**真实磁盘路径**（编译态下也是），所以对别的进程有效。
     return { cmd: process.execPath, args: [...subcommand] };
   }
@@ -59,8 +62,12 @@ function botmuxInvocation(subcommand: string[]): { cmd: string; args: string[] }
  * 需要 argv 的场景请用 `hookCommandParts`，切勿对本字符串再 `.split(' ')`。
  */
 function renderShellCommand(cliId?: string, ...subcommand: string[]): string {
-  const { cmd, args } = botmuxInvocation(cliId === undefined ? subcommand : [...subcommand, cliId]);
-  if (isStandaloneBinary()) {
+  // 判一次形态两处用：`botmuxInvocation` 决定 argv 里有没有脚本路径，这里决定给不给
+  // 它加引号——两者必须看到同一个答案，各调一次 `isStandaloneBinary()` 只是让同一个
+  // 判据有两个求值点。
+  const standalone = isStandaloneBinary();
+  const { cmd, args } = botmuxInvocation(cliId === undefined ? subcommand : [...subcommand, cliId], standalone);
+  if (standalone) {
     // 只有可执行路径需要引号；子命令是字面量 token。
     return `"${cmd}" ${args.join(' ')}`;
   }

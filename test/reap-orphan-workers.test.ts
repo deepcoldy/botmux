@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { basename } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { reapOrphanWorkers, type ProcSnapshot } from '../src/core/worker-pool.js';
 
 // Absolute path of THIS install's worker script, as it appears in a worker's
@@ -94,14 +96,58 @@ describe('reapOrphanWorkers — compiled binary form', () => {
   it('still spares other installs and non-workers (conservatism is preserved)', () => {
     const killed: number[] = [];
     const procs: ProcSnapshot[] = [
-      { pid: 300, ppid: 1, cmd: '/opt/other-botmux/botmux __worker' }, // different install ✗
-      { pid: 301, ppid: 1, cmd: `${BIN} __supervisor` },              // another entry, not a worker ✗
-      { pid: 302, ppid: 1, cmd: `${BIN} start` },                     // ordinary CLI ✗
-      { pid: 303, ppid: 1, cmd: 'grep -r __worker src/' },            // merely mentions the token ✗
+      { pid: 301, ppid: 1, cmd: `${BIN} __supervisor` },   // another entry, not a worker ✗
+      { pid: 302, ppid: 1, cmd: `${BIN} start` },          // ordinary CLI ✗
+      { pid: 303, ppid: 1, cmd: 'grep -r __worker src/' }, // merely mentions the token ✗
     ];
 
     expect(reapOrphanWorkers({ procs, kill: (p) => killed.push(p) })).toBe(0);
     expect(killed).toEqual([]);
+  });
+
+  /**
+   * CROSS-INSTALL PRECISION.
+   *
+   * The worker.js predicate identified this install by an ABSOLUTE path, so another
+   * botmux install's orphans could never match it. A basename-only compiled
+   * predicate silently loses that: every released install names its binary
+   * `botmux`, so install A would reap install B's orphans — each leaking ~0.5 GB
+   * and, worse, killing live-looking processes that belong to somebody else's
+   * daemon.
+   *
+   * The earlier version of this file appeared to cover the case with a literal
+   * `/opt/other-botmux/botmux __worker`, but that only passed BY ACCIDENT: under
+   * vitest `basename(process.execPath)` is `node`, which that string does not
+   * contain. Deriving the name from `process.execPath` is what gives the case
+   * teeth — VERIFIED that the basename-only predicate reaps pid 400 here.
+   */
+  it('spares a SAME-NAMED binary from a different install (absolute argv[0] must match exactly)', () => {
+    const killed: number[] = [];
+    const sameName = basename(BIN);
+    const procs: ProcSnapshot[] = [
+      { pid: 400, ppid: 1, cmd: `/opt/other-install/${sameName} __worker` },        // ✗ not ours
+      { pid: 401, ppid: 1, cmd: `/usr/local/lib/botmux/${sameName} __worker` },     // ✗ not ours
+      { pid: 402, ppid: 1, cmd: `${realpathSync(BIN)} __worker` },                  // ✓ ours
+    ];
+
+    const n = reapOrphanWorkers({ procs, kill: (p) => killed.push(p) });
+
+    expect(killed).toEqual([402]);
+    expect(n).toBe(1);
+  });
+
+  it('a relative argv[0] still matches by basename (our spawns never produce one)', () => {
+    // spawnWorker goes through process.execPath, which the kernel resolves to an
+    // absolute path, so this branch only sees processes started by a bare PATH
+    // lookup. Cross-install ambiguity is unavoidable there — but such a process
+    // was also not started the way we start ours, so matching by name is the most
+    // that can be said, and dropping the branch would leave those orphans forever.
+    const killed: number[] = [];
+    const procs: ProcSnapshot[] = [
+      { pid: 500, ppid: 1, cmd: `${basename(BIN)} __worker` },
+    ];
+    expect(reapOrphanWorkers({ procs, kill: (p) => killed.push(p) })).toBe(1);
+    expect(killed).toEqual([500]);
   });
 
   it('never matches a /$bunfs/ path (nothing on the system carries one)', () => {

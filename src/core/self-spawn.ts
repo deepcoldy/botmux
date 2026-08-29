@@ -95,8 +95,10 @@ export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
  *
  * `scriptPath` is supplied by the caller because each adapter owns its own
  * resolution order (a test-scoped env override, a compiled sibling, a source-tree
- * dist/) and this module stays location-agnostic. It is not even evaluated in the
- * compiled branch, so an adapter may pass a path it knows does not exist there.
+ * dist/) and this module stays location-agnostic. Its VALUE is unused in the
+ * compiled branch — the argument is still evaluated, as JS is strict about that,
+ * so an adapter may pass a path it knows does not exist there but must not put a
+ * side effect in the expression that produces it.
  */
 export function runnerArgv0(entry: BotmuxEntry, scriptPath: string): string {
   return isStandaloneBinary() ? ENTRY_SUBCOMMAND[entry] : scriptPath;
