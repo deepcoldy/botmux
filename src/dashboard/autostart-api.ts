@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   inspectAutostart,
+  launchProgram,
   type AutostartOpts,
   type AutostartState,
 } from '../autostart.js';
@@ -38,12 +38,26 @@ function isTimeoutError(error: unknown): boolean {
   return value.code === 'ETIMEDOUT' || value.killed === true;
 }
 
+/**
+ * Run `botmux autostart enable|disable` as a child process.
+ *
+ * GOES THROUGH `launchProgram`, which is the same helper the unit/plist writers
+ * use, because this had the identical `__dirname` bug: a hardcoded
+ * `[process.execPath, join(pkgRoot,'dist','cli.js'), 'autostart', …]`. Inside the
+ * compiled binary `process.execPath` IS the botmux binary and there is no
+ * `dist/cli.js` on disk (pkgRoot resolves into the virtual `/$bunfs/`), so the
+ * bogus path was parsed as an unknown subcommand: the binary printed help and
+ * exited 0. The controller then re-read an unchanged state and reported
+ * `command_failed`, leaving the Dashboard's autostart toggle permanently dead in
+ * the shipped build. Node still runs `node <pkgRoot>/dist/cli.js autostart …`.
+ */
 function defaultRunner(opts: AutostartOpts): RunAutostart {
   return async enabled => {
+    const [command, ...programArgs] = launchProgram(opts);
     try {
       await execFileAsync(
-        process.execPath,
-        [join(opts.pkgRoot, 'dist', 'cli.js'), 'autostart', enabled ? 'enable' : 'disable'],
+        command,
+        [...programArgs, 'autostart', enabled ? 'enable' : 'disable'],
         {
           cwd: homedir(),
           encoding: 'utf8',

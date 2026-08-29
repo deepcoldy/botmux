@@ -796,6 +796,39 @@ function resumeStaleBreakSync(
   }
 }
 
+/**
+ * Thrown ONLY when the lock could not be acquired within `maxWaitMs` — i.e.
+ * somebody else holds it. Every other failure (EACCES/ENOSPC from `open`, a
+ * failed holder write, an unreadable holder file, a stale-claim `link` error)
+ * propagates as its original error.
+ *
+ * ⚠️ WHY A TYPE AND NOT A MESSAGE MATCH. Callers need to tell "busy, retry later"
+ * apart from "the disk is full", and `acquired === false` cannot: it only proves
+ * the callback never ran, which is equally true for all the pre-callback failures
+ * above. `botmux update` was reporting every one of them as "another update is
+ * already running" — hiding a real fault behind a benign message.
+ *
+ * The message text is DELIBERATELY UNCHANGED: several call sites still match it as
+ * a string (`workflows/v3/host.ts`, `daemon.ts`, `services/session-store.ts`, …),
+ * so altering it would silently break their handling. New code should test
+ * `instanceof FileLockTimeoutError` (or `code === 'FILE_LOCK_TIMEOUT'`), which the
+ * async and sync variants raise identically.
+ */
+export class FileLockTimeoutError extends Error {
+  readonly code = 'FILE_LOCK_TIMEOUT';
+  constructor(
+    readonly lockPath: string,
+    readonly holderPid: number | undefined,
+    readonly lockAgeMs: number,
+  ) {
+    super(
+      `file-lock timeout waiting for ${lockPath} ` +
+      `(held by pid ${holderPid || '?'}, age ${Math.round(lockAgeMs)}ms)`,
+    );
+    this.name = 'FileLockTimeoutError';
+  }
+}
+
 export interface FileLockOptions {
   /** Max time to wait for the lock before throwing (default MAX_WAIT_MS). */
   maxWaitMs?: number;
@@ -899,10 +932,7 @@ export async function withFileLock<T>(
     }
 
     if (Date.now() - start > maxWaitMs) {
-      throw new Error(
-        `file-lock timeout waiting for ${lockPath} ` +
-        `(held by pid ${holder?.pid || '?'}, age ${Math.round(lockAgeMs)}ms)`,
-      );
+      throw new FileLockTimeoutError(lockPath, holder?.pid, lockAgeMs);
     }
     await new Promise(r => setTimeout(r, RETRY_BASE_MS + Math.random() * RETRY_BASE_MS));
   }
@@ -994,10 +1024,7 @@ export function withFileLockSync<T>(
     }
 
     if (Date.now() - start > maxWaitMs) {
-      throw new Error(
-        `file-lock timeout waiting for ${lockPath} ` +
-        `(held by pid ${holder?.pid || '?'}, age ${Math.round(lockAgeMs)}ms)`,
-      );
+      throw new FileLockTimeoutError(lockPath, holder?.pid, lockAgeMs);
     }
     sleepSync(RETRY_BASE_MS + Math.random() * RETRY_BASE_MS);
   }

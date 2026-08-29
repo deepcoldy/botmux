@@ -7,6 +7,7 @@ import { logger } from '../utils/logger.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 import { resolveSessionContext } from '../core/session-marker.js';
 import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
+import { loopbackFetch } from '../core/loopback-fetch.js';
 
 export const HOOK_EVENTS = [
   'topic.new',
@@ -513,7 +514,7 @@ export async function forwardEmitToDaemon(
       try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
       const res = secret
         ? await fetchDaemonIpc(ipcPort, '/api/hooks/emit', request, secret)
-        : await fetch(`http://127.0.0.1:${ipcPort}/api/hooks/emit`, request);
+        : await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/hooks/emit`, request);
       if (!res.ok) {
         logger.warn(`[hooks] CLI forward ${event} → daemon: HTTP ${res.status}`);
       }

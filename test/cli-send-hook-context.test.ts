@@ -42,6 +42,16 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
 }
 
 describe('cmdSend hook context wiring', () => {
+  it('passes Lark business error details through every cmdSend failure exit', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cliSource).toContain('describeSendFailure');
+    expect(cmdSend).toContain('语音发送失败：${describeSendFailure(e)}');
+    expect(cmdSend).toContain('文档评论发送失败：${describeSendFailure(e)}');
+    expect(cmdSend).toContain('发送失败: ${describeSendFailure(err)}');
+  });
+
   it('strips trailing memory citations before relay and direct-send rendering', () => {
     const relayStart = cliSource.indexOf('async function relaySend(');
     const relayEnd = cliSource.indexOf('\nfunction currentBotIsApiOnly', relayStart);

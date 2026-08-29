@@ -153,6 +153,16 @@ export interface TriggerResponse {
   /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
    *  (follow-up async turn on an existing session). */
   turnIdempotencyKey?: string;
+  /** Inbound-webhook duplicate-delivery suppression outcome (webhook edge only;
+   *  unrelated to the daemon-side `idempotencyKey` lease above).
+   *  - `accepted`  — first delivery under this key; it was dispatched.
+   *  - `duplicate` — same key + same body as an earlier delivery; NOT dispatched,
+   *                  `firstTriggerId` names the turn that actually ran. */
+  idempotency?: {
+    key: string;
+    action: 'accepted' | 'duplicate';
+    firstTriggerId?: string;
+  };
   /** True when this response reused an EXISTING session for the idempotency key
    *  (no new session created, no re-dispatch) instead of creating a fresh one.
    *  Absent/false on the first (creating) call and on non-idempotent triggers. */

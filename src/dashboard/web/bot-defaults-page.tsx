@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { openBotOnboarding } from './bot-onboarding.js';
+import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -840,6 +840,29 @@ export function BotDefaultsPage() {
         </div>
         <div className="page-heading-actions">
           <RefreshIconButton id="bd-refresh" label={tr('botDefaults.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void reload()} />
+          {ui.authed && bots.length > 0 ? (
+            <DropdownMenu<string>
+              className="clone-bot-menu"
+              ariaLabel={tr('botOnboarding.clone')}
+              disabled={onboardingBusy}
+              label={tr('botOnboarding.clone')}
+              value=""
+              options={bots.map(bot => ({
+                value: bot.larkAppId,
+                label: `${bot.botName ?? bot.larkAppId} · ${displayCliId(bot, cliIdOf(bot.larkAppId))}`,
+              }))}
+              onChange={sourceAppId => {
+                setOnboardingBusy(true);
+                // 把源 Bot 的 CLI / 目录 / model 一并带进弹窗预填：克隆时后端会用
+                // 源 Bot 覆盖这几项，表单必须显示真正会生效的值，否则用户白填。
+                // 映射规则（含目录两种互斥形态）见 cloneSourceDefaultsFrom。
+                const sourceDefaults = cloneSourceDefaultsFrom(
+                  bots.find(bot => bot.larkAppId === sourceAppId),
+                );
+                void openBotOnboarding(sourceAppId, sourceDefaults).finally(() => setOnboardingBusy(false));
+              }}
+            />
+          ) : null}
           {ui.authed ? (
             <CreateActionButton
               className="page-primary-action add-bot-btn"

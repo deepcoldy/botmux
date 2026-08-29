@@ -40,6 +40,19 @@ describe('classifySetupOpenPlatformOutcome', () => {
       .toBe('ready_with_warnings');
   });
 
+  it('无变更短路（publishSkipped）不算 warning：versionId 空、scopeCount 0 都是预期结果', () => {
+    // 一次「配置本就齐全、无变更 → 有意跳过发版」的健康自检：versionId 必空、
+    // importedScopeCount 必为 0。若把这两者仍计入 warning，会把纯健康结果误报成
+    // ready_with_warnings（PR #1044 复审提到的次要问题）。
+    expect(classifySetupOpenPlatformOutcome(
+      success({ versionId: undefined, scopeCount: 0, publishSkipped: true }),
+    ).status).toBe('ready');
+    // publishSkipped 不豁免真正的 warning：白名单没写上仍要报 warning。
+    expect(classifySetupOpenPlatformOutcome(
+      success({ versionId: undefined, scopeCount: 0, publishSkipped: true, redirectConfigured: false }),
+    ).status).toBe('ready_with_warnings');
+  });
+
   it('redirect 白名单没写上时不许报成纯 ready', () => {
     // 权限、事件、发版全绿也没用：白名单缺条目 = authorize 硬失败 20029
     //（群聊模式 p2pMode=group / 会话群标签 / `/login` 全都授权不了）。

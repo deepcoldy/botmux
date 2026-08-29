@@ -615,8 +615,8 @@ jobs:
     # `pty.node` (and macOS `spawn-helper`) must match the target OS. Bun can
     # cross-compile the JS + runtime, but the embedded `.node` has to be the one
     # `bun install` compiled ON that OS. So we build each OS's binaries on its
-    # own native runner (linux -> ubuntu, darwin -> macos-14), where build/Release
-    # is correct; each runner emits both of its architectures.
+    # own native architecture. Linux compiles inside manylinux_2_28 so the embedded
+    # native stays compatible with Node 22's glibc floor; darwin uses macos-14.
     needs: [preflight]
     # WHY a per-OS **and per-arch** matrix: node-pty's native `pty.node` (and
     # macOS `spawn-helper`) must match the target. Bun can cross-compile the JS +
@@ -634,7 +634,7 @@ jobs:
     # same leg — and with the release order inverted, `binary-subpackages` and
     # `release` both `needs` this job, so the whole publish chain stalled.
     # Hence linux-arm64 gets its own native arm64 runner (`ubuntu-24.04-arm`,
-    # GA and free for public repos).
+    # GA and free for public repos), which runs the aarch64 manylinux container.
     strategy:
       fail-fast: false
       matrix:
@@ -642,12 +642,15 @@ jobs:
           - os: ubuntu-latest
             targets: bun-linux-x64
             artifact: linux-x64
+            glibc_baseline: '2.28'
           - os: ubuntu-24.04-arm
             targets: bun-linux-arm64
             artifact: linux-arm64
+            glibc_baseline: '2.28'
           - os: macos-14
             targets: bun-darwin-x64 bun-darwin-arm64
             artifact: darwin
+            glibc_baseline: ''
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -657,21 +660,35 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
+        if: matrix.glibc_baseline == ''
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@v2
+        if: matrix.glibc_baseline == ''
         with:
           bun-version: 1.4.0
       # --frozen-lockfile + the platform's own install compiles node-pty's
       # build/Release/pty.node for THIS OS/arch, which the embed plugin bundles.
-      - run: bun install --frozen-lockfile
+      - if: matrix.glibc_baseline == ''
+        run: bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
+        if: matrix.glibc_baseline == ''
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
 
-      - run: bun run build
+      - if: matrix.glibc_baseline == ''
+        run: bun run build
+
+      - name: Build Linux binary on the glibc 2.28 floor
+        if: matrix.glibc_baseline != ''
+        run: |
+          target="${{ matrix.targets }}"
+          scripts/build-linux-glibc-baseline.sh \
+            "$target" "dist-bin/botmux-${target#bun-}" \
+            "${RELEASE_TAG#v}"
 
       - name: Compile Bun single-file executables
+        if: matrix.glibc_baseline == ''
         # Build each target this runner is responsible for. The script fails
         # closed if a target's native (pty.node) is absent rather than shipping a
         # broken binary.
@@ -682,6 +699,7 @@ jobs:
           done
 
       - name: Smoke-test the host-arch binary
+        if: matrix.glibc_baseline == ''
         # Each leg executes the binary it just built for its OWN arch, so with the
         # per-arch matrix every linux target is now genuinely run (linux-x64 on the
         # x64 runner, linux-arm64 on the arm64 runner). Only darwin still has one

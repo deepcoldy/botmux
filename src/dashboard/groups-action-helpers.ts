@@ -8,6 +8,8 @@
  * response. Behaviour is byte-equivalent to the original inline implementation;
  * all IO flows through `deps`.
  */
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
+
 
 export interface DaemonHandle {
   larkAppId: string;
@@ -68,7 +70,7 @@ export async function addBotsToGroup(
   } catch {
     return err('bad_json', 400);
   }
-  const fetchFn = deps.fetch ?? fetch;
+  const fetchFn = deps.fetch ?? loopbackFetchImpl;
   let proxy: DaemonHandle | undefined;
   for (const d of deps.registryList()) {
     try {
@@ -140,7 +142,7 @@ export async function leaveGroup(
     : [];
   if (ids.length === 0) return err('larkAppIds_required', 400);
 
-  const fetchFn = deps.fetch ?? fetch;
+  const fetchFn = deps.fetch ?? loopbackFetchImpl;
   const result = await Promise.all(ids.map(async appId => {
     const d = deps.registryGetByAppId(appId);
     // Pre-proxy failure shapes do NOT carry `closedSessions` — matches the

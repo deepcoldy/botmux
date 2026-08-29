@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isStandaloneBinary } from '../core/self-spawn.js';
 
 /** Pure check: is `rootDir` a source working copy rather than an npm install? */
 export function isLocalDevInstallAt(rootDir: string): boolean {
@@ -19,10 +20,32 @@ export function isLocalDevInstallAt(rootDir: string): boolean {
 
 let cached: boolean | undefined;
 
-/** Classify this running install. Cached — it cannot change at runtime. */
+/**
+ * Classify this running install. Cached — it cannot change at runtime.
+ *
+ * ⚠️ A COMPILED BINARY IS NEVER A SOURCE CHECKOUT, and the naive check cannot
+ * see that. `packageRoot()` walks up looking for package.json; inside a
+ * single-file executable there is none on disk (the module graph lives in the
+ * virtual `/$bunfs/`), so it returns `/` — and the test then becomes "does the
+ * FILESYSTEM ROOT have .git or src?". On this box neither exists so the answer is
+ * accidentally correct, but plenty of container images do have `/src`, and there
+ * the compiled binary would be misclassified as a dev checkout and sent down the
+ * `git pull --ff-only` update path.
+ *
+ * The standalone check is therefore an explicit early return, not a refinement of
+ * the filesystem probe. Node behaviour is bit-for-bit unchanged.
+ */
 export function isLocalDevInstall(): boolean {
-  if (cached === undefined) cached = isLocalDevInstallAt(packageRoot());
+  if (cached === undefined) {
+    cached = isStandaloneBinary() ? false : isLocalDevInstallAt(packageRoot());
+  }
   return cached;
+}
+
+/** Test seam: drop the cached classification. Production never calls this — the
+ *  answer genuinely cannot change within one process. */
+export function __resetLocalDevInstallCacheForTests(): void {
+  cached = undefined;
 }
 
 /**
@@ -61,6 +84,28 @@ export function botmuxVersionAt(rootDir: string): string {
   // The compiled binary has no package.json to read (see bakedBinaryVersion).
   const baked = bakedBinaryVersion();
   if (baked) return baked;
+  return diskVersionAt(rootDir);
+}
+
+/**
+ * The version recorded in `rootDir`'s package.json, IGNORING the baked value.
+ *
+ * ⚠️ WHY THIS EXISTS — THE BAKED VERSION SHADOWS A COMPLETED UPDATE. `baked` is
+ * compiled into the running executable, so `botmuxVersionAt` returns it no matter
+ * which directory you ask about. That is right for "what am I running", and WRONG
+ * for "what is now installed on disk": after a package-manager update replaces the
+ * install tree, a compiled binary asking `botmuxVersionAt(root)` still gets its OWN
+ * old version (measured: package.json says 3.19.0, the call returns 3.18.4).
+ *
+ * The maintenance tick gates its restart on `after !== before`, so that shadowing
+ * makes a successful update look like "already on the latest version" — it never
+ * restarts onto what it just installed. Post-update reads must therefore use this
+ * function, not `botmuxVersionAt`.
+ *
+ * (Under Node `bakedBinaryVersion()` is undefined, so the two are identical there
+ * — which is why this defect only surfaces for the compiled binary.)
+ */
+export function diskVersionAt(rootDir: string): string {
   try {
     const pkg = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf-8'));
     return typeof pkg.version === 'string' ? pkg.version : '0.0.0';

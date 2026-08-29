@@ -1,4 +1,5 @@
 import { cliAuthBind, signCliAuth } from '../dashboard/auth.js';
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 export interface ExactChatGrantDaemon {
   ipcPort: number;
@@ -35,7 +36,7 @@ export class ExactChatGrantClientError extends Error {
  */
 export async function requestExactChatGrant(
   input: ExactChatGrantClientInput,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: typeof fetch = loopbackFetchImpl,
 ): Promise<Record<string, any>> {
   if (input.daemon.larkAppId !== input.receiverLarkAppId) {
     throw new ExactChatGrantClientError('receiver daemon mismatch');

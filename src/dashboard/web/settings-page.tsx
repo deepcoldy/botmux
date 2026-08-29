@@ -118,7 +118,9 @@ interface UpdateStatus {
   /** Local-dev checkout is a git worktree → self-update via git pull + build. */
   localDevUpdatable?: boolean;
   updateSupported: boolean;
-  updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'unknown';
+  // 'binary' = 编译版独立二进制（install.sh 形态），不归任何包管理器所有，
+  // 自己下载 release 资产替换自身。
+  updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'binary' | 'unknown';
   updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };

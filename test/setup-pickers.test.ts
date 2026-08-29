@@ -94,6 +94,12 @@ function stubClient(responses: unknown[] | ((path: string, body: unknown) => unk
       calls.push({ path, body });
       return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));
     },
+    // 语义幂等的 POST（robot/event switch、读 Secret）走这条；stub 里与 postJson
+    // 同构记账，好让「调用了哪些 path」的既有断言不受实现分流影响。
+    async postJsonIdempotent(path: string, body?: unknown) {
+      calls.push({ path, body });
+      return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));
+    },
     async postForm(path: string, body: FormData) {
       calls.push({ path, body });
       return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));

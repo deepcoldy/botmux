@@ -150,6 +150,29 @@ export interface RiffBackendConfig {
    * after the mandatory botmux install commands.
    */
   setupCommands?: string[];
+  /**
+   * Extra HTTP headers added to EVERY riff outbound request (task-execute,
+   * task-follow-up, task-stream, the reconcile tasks query, task-cancel,
+   * task-detail). Intended for PPE/lane routing — e.g. { 'x-tt-env':
+   * 'ppe_shenhan_sh', 'x-use-ppe': '1' } to hit a PPE deployment instead of
+   * production. Empty/unset → no extra headers (production, current behavior).
+   * MUST cover all requests uniformly: routing only task-execute to PPE while
+   * task-stream hits production would split a session across environments.
+   * Also mergeable from the BOTMUX_RIFF_EXTRA_HEADERS env var (JSON object);
+   * config wins on key conflicts.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Override the follow-up fetch timeout budgets (ms). Both optional; when unset
+   * the built-in defaults apply (hot 30s / cold 60s). Cold covers a follow-up
+   * that must synchronously wake a reclaimed sandbox (idle gap / daemon-restart
+   * resume); hot covers a follow-up right after the previous turn. Exposed so the
+   * values can be tuned against riff's measured P50/P99 without a code change,
+   * and so tests/live-repro can force a timeout by shrinking them. Non-positive
+   * or non-finite values are ignored.
+   */
+  followUpHotTimeoutMs?: number;
+  followUpColdTimeoutMs?: number;
 }
 
 /** Valid riff service base URL: non-empty http(s). Shared by the worker's
@@ -270,13 +293,20 @@ export function deriveRiffReposFromDirs(
  * retry; failures are logged, never thrown.
  */
 export async function cancelRiffTaskById(
-  cfg: { baseUrl: string; jwt?: string; jwtEnv?: string },
+  cfg: { baseUrl: string; jwt?: string; jwtEnv?: string; extraHeaders?: Record<string, string> },
   taskId: string,
 ): Promise<boolean> {
   const attempt = async (): Promise<void> => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const jwt = await new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel')['resolveJwt']({ allowRefresh: false });
+    // Reuse a throwaway instance for BOTH resolveJwt and applyExtraHeaders so the
+    // orphan-cancel path routes to the same env/lane as the live session (else a
+    // PPE session's orphan cancel would hit production). allowRefresh:false is
+    // kept from the daemon-side contract — orphan-cancel must never trigger a
+    // host-identity JWT refresh.
+    const inst = new RiffBackend(cfg as RiffBackendConfig, 'orphan-cancel');
+    const jwt = await inst['resolveJwt']({ allowRefresh: false });
     if (jwt) headers['x-jwt-token'] = jwt;
+    inst['applyExtraHeaders'](headers);
     const resp = await fetch(`${cfg.baseUrl}/api/task-cancel`, {
       method: 'POST', headers, body: JSON.stringify({ id: taskId }), signal: AbortSignal.timeout(4000),
     });
@@ -750,6 +780,27 @@ interface RiffTaskResponse {
   };
 }
 
+/** One node from `GET /api/tasks?threadId=&view=summary` (summary projection).
+ *  NOTE the primary-key field is `id` (the DB `taskId` is serialized out as
+ *  `id`) — never read `.taskId` here. `followUpParentTaskId` is absent on the
+ *  root task. `interaction.status` is a retired V1 field (not written by new
+ *  tasks) — status comes from the top-level `status` only.
+ *  Fields verified against riff's TASK_THREAD_SUMMARY_PROJECTION: the summary
+ *  view really does project `followUpParentTaskId`/`followUpRootTaskId`, so the
+ *  reconcile below can match on them. */
+interface RiffThreadNode {
+  id: string;
+  threadId?: string;
+  status?: string;
+  origin?: string;
+  useRunner?: boolean;
+  followUpParentTaskId?: string;
+  followUpRootTaskId?: string;
+  /** ISO timestamp of task creation. In riff's summary projection; used as the
+   *  reconcile floor so a task stranded by an earlier turn is never adopted. */
+  createdAt?: string;
+}
+
 /** Terminal riff task statuses (riff openApiDocs task contract). Once a task
  *  reaches one of these it will emit no further progress — an `init` replay or
  *  a `done` event carrying one of these IS the task's completion. Non-terminal:
@@ -817,7 +868,42 @@ export class RiffBackend implements SessionBackend {
   private connectionStartedAtMs: number | null = null;
   /** 预算层级（单调覆盖，见 destroySession 注释）；字段化以便测试注入边界。 */
   private cancelTimeoutMs = 4_000;
-  private createTimeoutMs = 10_000;
+  /** task-execute（首建）的 fetch 预算。create 只是服务端入队，快，保持较小。 */
+  private createTimeoutMs = 15_000;
+  /** task-follow-up 的 fetch 预算，冷/热两档。follow-up 返回前的同步预检（JWT 刷新
+   *  + 读沙箱状态 + lark/meego/agentBuddy 授权检查）本就比 create 重；沙箱变冷时
+   *  （空闲被回收 / daemon 重启后 resume 血缘）还会叠加 archive+snapshot+IDE-proxy
+   *  探测——正是当初顶穿共用 10s 预算的慢路径（实测 spawn→timeout 恰好 10.01s）。
+   *  故 follow-up 给更大预算并按冷/热分档。30/60s 为暂定值，待 riff 侧 P50/P99
+   *  回填；字段化以便测试注入。 */
+  private followUpHotTimeoutMs = 30_000;
+  private followUpColdTimeoutMs = 60_000;
+  /** follow-up 距上次任务活动超过此阈值（或本进程尚无任何活动，见 followUpTimeoutMs）
+   *  即判为冷沙箱，走 followUpColdTimeoutMs。 */
+  private coldFollowUpThresholdMs = 90_000;
+  /** follow-up 超时后对 thread 的对账查询预算 / 最多尝试次数 / 重试间隔。查询是只读的，
+   *  刚在超时瞬间建好的子任务可能要一小会才可查到，故允许一次短重试。字段化以便测试注入。 */
+  private reconcileTimeoutMs = 8_000;
+  private reconcileMaxAttempts = 2;
+  private reconcileRetryDelayMs = 1_500;
+  /** 对账「发送时刻下限」的容差，分两档（见 pickReconciledChild）：
+   *  - 已从 `Date` 头实测到服务端偏差 → 只需覆盖测量误差本身（`Date` 头整秒精度
+   *    ~0.5s + 一个往返 + 期间的小漂移），取 5s。
+   *  - 尚未观测到 `Date` 头（首次对账、代理剥掉了该头等） → 偏差完全未知，退回
+   *    30s 盲兜底：宁可窗口宽一些，也不要因本机时钟快而永远认领不到子任务。
+   *  容差直接就是误接窗口宽度（创建于本轮发送前该时长内的遗留任务会被误判为本轮
+   *  的），所以能测到偏差时必须收窄。字段化以便测试注入。 */
+  private reconcileClockSkewMs = 5_000;
+  private reconcileBlindClockSkewMs = 30_000;
+  /** riff 服务端时钟减本机时钟（ms），由 tasks 响应的 `Date` 头实测得出；`null`
+   *  表示尚未观测到（此时按偏差未知处理，走盲兜底容差）。用于把「发送时刻」换算到
+   *  服务端时间轴，再与服务端写入的 `createdAt` 比较。 */
+  private serverClockOffsetMs: number | null = null;
+  /** 最近一次「任务活动」的 wall-clock ms（成功建任务/续任务，或收到任意 SSE 事件），
+   *  本进程尚无活动时为 null。驱动 follow-up 冷/热判据：长时间空闲或全新进程
+   *  （daemon 重启 resume）意味着 riff 沙箱大概率已被回收，下一次 follow-up 需同步
+   *  唤醒它——正是需要更大预算的慢路径。 */
+  private lastTaskActivityMs: number | null = null;
   private destroyDeadlineMs = 20_000;
   /** SSE 重连退避基数（指数退避的第一档）；字段化以便测试把重连间隔压到 0。 */
   private reconnectBaseDelayMs = 1_000;
@@ -859,6 +945,11 @@ export class RiffBackend implements SessionBackend {
     // follow-up lineage — the first write after restart continues the riff
     // conversation instead of cold-booting a context-less fresh task.
     if (config.resumeParentTaskId) this.currentTaskId = config.resumeParentTaskId;
+    // Optional follow-up timeout overrides (P50/P99 tuning without a code change,
+    // or forcing a timeout in live repro). Only positive finite values apply.
+    const pos = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0;
+    if (pos(config.followUpHotTimeoutMs)) this.followUpHotTimeoutMs = config.followUpHotTimeoutMs;
+    if (pos(config.followUpColdTimeoutMs)) this.followUpColdTimeoutMs = config.followUpColdTimeoutMs;
   }
 
   /** Called when the riff sandbox accessUrl becomes available or changes. */
@@ -888,6 +979,42 @@ export class RiffBackend implements SessionBackend {
    *  window (an actual server 401 proved the token bad). */
   private getJwt(opts: { allowRefresh?: boolean; forceRefresh?: boolean } = {}): Promise<string | null> {
     return this.resolveJwt(opts);
+  }
+
+  /** Merge the configured extra headers (PPE/lane routing, see config.extraHeaders)
+   *  into an outbound request's header map, in place. Precedence: existing headers
+   *  already set (JWT, Content-Type) are never overwritten; config.extraHeaders
+   *  wins over the BOTMUX_RIFF_EXTRA_HEADERS env var on key conflicts. Applied to
+   *  EVERY riff request so a session never splits across environments. No-op when
+   *  nothing is configured (production, current behavior). */
+  private applyExtraHeaders(headers: Record<string, string>): void {
+    const merged = this.resolveExtraHeaders();
+    for (const [k, v] of Object.entries(merged)) {
+      if (!(k in headers)) headers[k] = v;
+    }
+  }
+
+  /** Extra headers from the env var (JSON object) overlaid by config.extraHeaders.
+   *  Malformed env JSON is ignored with a warning rather than throwing. */
+  private resolveExtraHeaders(): Record<string, string> {
+    const out: Record<string, string> = {};
+    const raw = process.env.BOTMUX_RIFF_EXTRA_HEADERS?.trim();
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v != null && v !== '') out[k] = String(v);
+        }
+      } catch (err) {
+        logger.warn(`[riff] ignoring malformed BOTMUX_RIFF_EXTRA_HEADERS: ${err}`);
+      }
+    }
+    if (this.config.extraHeaders) {
+      for (const [k, v] of Object.entries(this.config.extraHeaders)) {
+        if (v != null && v !== '') out[k] = String(v);
+      }
+    }
+    return out;
   }
 
   private async resolveJwt(
@@ -1485,8 +1612,9 @@ export class RiffBackend implements SessionBackend {
     if (this.config.templateId) payload.templateId = this.config.templateId;
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs);
       if (!(await this.adoptLateTask(taskId))) return;
+      this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
@@ -1494,22 +1622,75 @@ export class RiffBackend implements SessionBackend {
     }
   }
 
+  /** Record a "task activity" tick — drives the follow-up cold/hot decision.
+   *  Called on every SSE event and on each successful create/adopt so a long
+   *  idle gap (sandbox likely reclaimed) or a fresh process is detectable. */
+  private markActivity(): void {
+    this.lastTaskActivityMs = Date.now();
+  }
+
+  /** Pick the follow-up fetch budget. Cold (larger budget) when the riff sandbox
+   *  has likely gone cold and this follow-up must synchronously wake it:
+   *    • this process has seen NO task activity yet — the daemon-restart resume
+   *      case (currentTaskId came from resumeParentTaskId, sandbox long idle);
+   *      this is exactly the logged 10.01s timeout.
+   *    • the last activity was longer ago than coldFollowUpThresholdMs.
+   *  Hot budget otherwise (a follow-up right after the previous turn). */
+  private followUpTimeoutMs(): number {
+    const last = this.lastTaskActivityMs;
+    const cold = last === null || (Date.now() - last) >= this.coldFollowUpThresholdMs;
+    return cold ? this.followUpColdTimeoutMs : this.followUpHotTimeoutMs;
+  }
+
   private async followUp(prompt: string, attachments: RiffAttachment[]): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-follow-up`;
+
+    // Capture the parent BEFORE the request: reconcile-on-timeout below needs the
+    // exact parent this follow-up hung off, independent of any later mutation.
+    const parentTaskId = this.currentTaskId;
 
     // riff task-follow-up body: parentTaskId + origin + prompt at top level
     const payload: Record<string, unknown> = {
       origin: 'botmux',
-      parentTaskId: this.currentTaskId,
+      parentTaskId,
       prompt: this.injectSystemPrompt(prompt),
     };
 
+    // Send-time floor for reconcile-on-timeout: only a task created at/after this
+    // instant can be THIS follow-up's child (see reconcileAfterFollowUpTimeout).
+    // Read before the request so a slow pre-flight cannot push it past the child's
+    // own createdAt.
+    const sentAtMs = Date.now();
+
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs());
       if (!(await this.adoptLateTask(taskId))) return;
+      this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
+      // A client-side fetch timeout does NOT mean the server did nothing. riff
+      // task-follow-up is "accept → return taskId", but returns only AFTER a
+      // synchronous pre-flight (auth refresh + sandbox-status read + lark/meego/
+      // agentBuddy checks, plus archive/snapshot/IDE-proxy probes when the sandbox
+      // is cold). That pre-flight can outlast our fetch budget while the child task
+      // is ALREADY being created server-side. Clearing the lineage here (old
+      // behavior) would cold-boot a fresh context-less task on the next message AND
+      // strand that in-flight child. Instead: reconcile against the thread — if the
+      // child already exists, adopt it (no lost context, no duplicate); only a true
+      // broken lineage resets to a fresh task.
+      if (this.isTimeoutError(err) && parentTaskId) {
+        if (await this.reconcileAfterFollowUpTimeout(parentTaskId, sentAtMs)) return;
+        // Reconcile found no child. Deliberately NO auto-resend: riff has no
+        // request-dedup (no X-Idempotency-Key / clientRequestId server-side), and
+        // its follow-up redirects the parent to the thread's latest node — so a
+        // blind resend can genuinely build a SECOND task for one user message.
+        // Keep the lineage instead: the parent is still valid, so the next message
+        // continues the conversation rather than cold-booting a fresh sandbox.
+        // THIS turn's prompt is dropped; say so plainly so the user can resend.
+        this.emitError(`riff follow-up 超时，本次未送达（血缘保留，请重发本条消息）: ${err}`);
+        return;
+      }
       // Broken lineage (parent expired/GC'd etc.) — fall back to a fresh task
       // on the next message instead of failing every follow-up forever. Also
       // clear the DAEMON-side persisted lineage: without the null broadcast a
@@ -1518,6 +1699,174 @@ export class RiffBackend implements SessionBackend {
       this.taskIdCb?.(null);
       this.emitError(`riff follow-up 失败: ${err}（下一条消息将新建任务）`);
     }
+  }
+
+  /** Node's AbortSignal.timeout() rejects with a DOMException/Error named
+   *  "TimeoutError" ("The operation was aborted due to timeout"). Match by name
+   *  (message wording is locale/runtime-dependent). AbortError (manual abort) is
+   *  deliberately NOT treated as a timeout — that is teardown, handled elsewhere. */
+  private isTimeoutError(err: unknown): boolean {
+    return err instanceof Error && err.name === 'TimeoutError';
+  }
+
+  /**
+   * After a follow-up fetch times out, ask the thread whether the child task was
+   * in fact created (the pre-flight simply outran our budget). botmux sends its
+   * own sessionId as the riff threadId (task-execute threadId: this.sessionId),
+   * and riff stores it verbatim (no rewrite/mapping) — so we query by sessionId
+   * directly, no task-detail hop needed.
+   *
+   * IDENTITY INVARIANT (locked by design with the riff side): riff's
+   * `GET /api/tasks` is owner-scoped. This reconcile MUST reuse the CURRENT
+   * backend instance's getJwt() — the same identity that created the task — or it
+   * would query as a different owner and get an empty list. Never introduce a
+   * different credential here.
+   *
+   * Returns true iff this follow-up's child task was found and adopted (streaming
+   * resumed / terminal result fetched). False means "no child yet" → caller keeps
+   * the lineage without adopting.
+   *
+   * MATCHING ANCHOR — `followUpParentTaskId` PLUS a send-time floor:
+   *   riff has no per-request id we could echo back (no clientRequestId in the
+   *   task document, no X-Idempotency-Key handling), so the parent link is the
+   *   only server-side signal tying a task to this follow-up.
+   *   It is not unique on its own: riff redirects a follow-up's parent to the
+   *   thread's LATEST node (api/lambda/task-follow-up.ts — "普通追问必须从 thread
+   *   最新节点发起"), so several siblings can share one parent — including a task
+   *   stranded by an EARLIER timed-out turn. Adopting that one would replay a
+   *   previous turn's output and silently drop this turn's prompt.
+   *   Hence `sentAtMs`: only a child created at/after the moment we issued THIS
+   *   follow-up can be its child. `createdAt` is in riff's
+   *   TASK_THREAD_SUMMARY_PROJECTION, so the summary view really carries it.
+   *   A node with an absent/unparsable createdAt is NOT adopted — fail closed,
+   *   because a wrong adopt is worse than a missed one (the caller keeps the
+   *   lineage and the user just resends).
+   *   Ties are broken by the OLDEST qualifying child: the first task created
+   *   after we sent is the one our request produced.
+   */
+  private async reconcileAfterFollowUpTimeout(parentTaskId: string, sentAtMs: number): Promise<boolean> {
+    for (let attempt = 1; attempt <= this.reconcileMaxAttempts; attempt++) {
+      if (this.killed || this.closing || this.shutdownDetaching) return false;
+      let nodes: RiffThreadNode[];
+      try {
+        nodes = await this.fetchThreadNodes(this.sessionId);
+      } catch (err) {
+        logger.warn(`[riff] reconcile thread query failed (attempt ${attempt}): ${err}`);
+        nodes = [];
+      }
+      // Diagnostic: what did the thread query return, and what are we matching on?
+      // ids/times only — surfaces missing (timing/scope) vs present-but-unmatched.
+      // Print the EFFECTIVE floor (offset + tolerance applied), not the raw send
+      // instant: a log that names a different threshold than the code applies
+      // would send whoever debugs this down the wrong path.
+      logger.info(`[riff] reconcile attempt ${attempt}: match by parent=${parentTaskId.slice(0, 8)} createdAt>=${new Date(this.reconcileFloorMs(sentAtMs)).toISOString()} (sent=${new Date(sentAtMs).toISOString()}, serverOffset=${this.serverClockOffsetMs ?? 'unmeasured'}), thread has ${nodes.length} node(s): ${nodes.map(n => `${n.id?.slice(0, 8)}(par=${n.followUpParentTaskId?.slice(0, 8) ?? 'none'},created=${n.createdAt ?? 'none'},${n.status})`).join(' ')}`);
+      const child = this.pickReconciledChild(nodes, parentTaskId, sentAtMs);
+      if (child) {
+        const childId = child.id;
+        // Re-check we can still adopt (a concurrent close/kill may have landed).
+        if (!(await this.adoptLateTask(childId))) return true;
+        this.markActivity();
+        this.reconnectAttempts = 0;
+        this.emitLine(`[riff] follow-up 超时，但服务端已建任务，自动续接（未丢上下文）`, 'warn');
+        if (this.isTerminalStatus(child.status)) {
+          // Already finished while we were blind — fire the turn boundary + fetch
+          // its final report instead of streaming a stream that will never speak.
+          this.completeTask(childId, child.status, undefined);
+        } else {
+          this.streamTask(childId);
+        }
+        return true;
+      }
+      if (attempt < this.reconcileMaxAttempts) {
+        await new Promise((r) => setTimeout(r, this.reconcileRetryDelayMs));
+      }
+    }
+    return false;
+  }
+
+  /** The effective reconcile floor in riff's time frame: our send instant,
+   *  translated by the measured server clock offset, minus the tolerance.
+   *  `createdAt` is stamped by riff's clock (TaskService: `new Date()`), while
+   *  sentAtMs is ours — two different machines. The tolerance IS the mis-adopt
+   *  window (a leftover task created within it, just before we sent, still
+   *  passes), so it is kept tight once the offset is known and only stays wide
+   *  while it is unknown.
+   *  CAVEAT: an intermediary (proxy/gateway) may rewrite `Date`, in which case
+   *  the measured offset is that hop's clock, not riff's — harmless while the two
+   *  agree to within the tolerance. A server-side NTP jump between stamping
+   *  `createdAt` and sending the response is absorbed the same way.
+   *  Single-sourced so the diagnostic log can never name a different threshold
+   *  than the filter actually applies. */
+  private reconcileFloorMs(sentAtMs: number): number {
+    const measured = this.serverClockOffsetMs;
+    const tolerance = measured === null ? this.reconcileBlindClockSkewMs : this.reconcileClockSkewMs;
+    return sentAtMs + (measured ?? 0) - tolerance;
+  }
+
+  /** The thread node this follow-up created, or undefined. Requires BOTH the
+   *  parent link AND creation at/after the effective floor (see
+   *  reconcileFloorMs + the anchor notes on reconcileAfterFollowUpTimeout — the
+   *  parent alone can match a task stranded by an earlier timed-out turn).
+   *  Unparsable/absent createdAt → not a candidate. Oldest qualifying node wins. */
+  private pickReconciledChild(
+    nodes: RiffThreadNode[],
+    parentTaskId: string,
+    sentAtMs: number,
+  ): RiffThreadNode | undefined {
+    const floorMs = this.reconcileFloorMs(sentAtMs);
+    let best: RiffThreadNode | undefined;
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (const n of nodes) {
+      if (!n.id || n.followUpParentTaskId !== parentTaskId) continue;
+      const createdMs = n.createdAt ? Date.parse(n.createdAt) : NaN;
+      if (!Number.isFinite(createdMs) || createdMs < floorMs) continue;
+      if (createdMs < bestMs) {
+        best = n;
+        bestMs = createdMs;
+      }
+    }
+    return best;
+  }
+
+  /** riff terminal task statuses — whitelist so future intermediate states are
+   *  never mis-classified as "done" (they default to "still running"). Mirrors
+   *  TERMINAL_RIFF_STATUSES. */
+  private isTerminalStatus(status: string | undefined): boolean {
+    return status != null && TERMINAL_RIFF_STATUSES.has(status);
+  }
+
+  /** GET /api/tasks?threadId=&view=summary → { success, data: RiffThreadNode[] }.
+   *  Owner-scoped (see reconcileAfterFollowUpTimeout). view=summary is the
+   *  lightweight projection (no logs/results) suited to this hot-path probe. */
+  private async fetchThreadNodes(threadId: string): Promise<RiffThreadNode[]> {
+    const url = `${this.config.baseUrl}/api/tasks?threadId=${encodeURIComponent(threadId)}&view=summary`;
+    const headers: Record<string, string> = {};
+    const jwt = await this.getJwt();
+    if (jwt) headers['x-jwt-token'] = jwt;
+    this.applyExtraHeaders(headers);
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(this.reconcileTimeoutMs) });
+    if (!resp.ok) throw new Error(`tasks query HTTP ${resp.status}`);
+    // Measure the server↔client clock offset off this very response, so the
+    // reconcile floor compares like with like (see observeServerClock).
+    this.observeServerClock(resp.headers.get('date'));
+    const result = (await resp.json()) as { success?: boolean; data?: RiffThreadNode[] };
+    // Envelope is { success, data: [...] } — data is the array directly (NOT
+    // data.tasks). Empty/no-permission → [].
+    return Array.isArray(result.data) ? result.data : [];
+  }
+
+  /** Record how far riff's clock sits from ours, read from an HTTP `Date`
+   *  response header (RFC 9110 requires it, and it is generated by the same
+   *  machine that stamps `createdAt`). Lets the reconcile floor correct for a
+   *  real measured offset instead of assuming the two clocks agree.
+   *  Whole-second resolution, and the value is one round-trip old, so callers
+   *  still add a small tolerance on top. Unparsable/missing header → leave the
+   *  previous observation (or none) in place. */
+  private observeServerClock(dateHeader: string | null): void {
+    if (!dateHeader) return;
+    const serverMs = Date.parse(dateHeader);
+    if (!Number.isFinite(serverMs)) return;
+    this.serverClockOffsetMs = serverMs - Date.now();
   }
 
   /**
@@ -1560,6 +1909,7 @@ export class RiffBackend implements SessionBackend {
     url: string,
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
+    timeoutMs: number,
   ): Promise<string> {
     // Assemble the request body FIRST (attachment reads can be slow on large
     // files / slow disks), THEN resolve the JWT immediately before fetch. The
@@ -1590,10 +1940,20 @@ export class RiffBackend implements SessionBackend {
     // freshness check reflects the token that actually goes on the wire. `body`
     // (string or FormData) is re-extractable per fetch, so the retry below can
     // reuse it.
+    this.applyExtraHeaders(headers);
+    // Observability: record the outbound target + which routing headers were
+    // attached (names only — never the JWT value). Makes "did this request carry
+    // the PPE/lane headers?" answerable from logs instead of guesswork.
+    const routingHeaderKeys = Object.keys(headers).filter(k => k.toLowerCase() !== 'x-jwt-token' && k.toLowerCase() !== 'content-type');
+    logger.info(`[riff] → POST ${url} headers=[${routingHeaderKeys.join(',') || 'none'}]`);
+    // The routing headers live in `headers`, which `post` spreads — so the
+    // 401/403 retry below carries them too (a retry that dropped them would land
+    // in the wrong environment). The timeout is the caller's per-endpoint budget
+    // (create vs follow-up cold/hot), not a fixed constant.
     const post = (jwt: string | null): Promise<Response> => {
       const h = { ...headers };
       if (jwt) h['x-jwt-token'] = jwt;
-      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(this.createTimeoutMs) });
+      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(timeoutMs) });
     };
 
     const firstJwt = await this.getJwt();
@@ -1682,6 +2042,7 @@ export class RiffBackend implements SessionBackend {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
+    this.applyExtraHeaders(headers);
     const resp = await fetch(url, {
       method: 'POST',
       headers,
@@ -1723,6 +2084,7 @@ export class RiffBackend implements SessionBackend {
     const headers: Record<string, string> = {};
     const jwt = await this.getJwt();
     if (jwt) headers['x-jwt-token'] = jwt;
+    this.applyExtraHeaders(headers);
 
     this.abortController = new AbortController();
     // Per-connection lifetime clock (see field doc): null until this connection
@@ -1871,6 +2233,10 @@ export class RiffBackend implements SessionBackend {
     // stale stream must never write into the new task's log or replace its
     // sandbox URL.
     if (taskId !== this.currentTaskId) return;
+    // Any event from the current task's live stream is proof the sandbox is warm
+    // and talking — refresh the cold/hot clock so a follow-up right after gets the
+    // hot budget.
+    this.markActivity();
     // Standard SSE parsing: event type from `event:` line, data from `data:` lines
     // Also handle SSE comments (lines starting with `:`) — ignore them (heartbeats)
     let eventType = 'message';
@@ -2034,6 +2400,7 @@ export class RiffBackend implements SessionBackend {
       const headers: Record<string, string> = {};
       const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
+      this.applyExtraHeaders(headers);
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) return;
       const result = (await resp.json()) as {
@@ -2066,6 +2433,7 @@ export class RiffBackend implements SessionBackend {
       const headers: Record<string, string> = {};
       const jwt = await this.getJwt();
       if (jwt) headers['x-jwt-token'] = jwt;
+      this.applyExtraHeaders(headers);
 
       const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
       if (!resp.ok) {

@@ -68,6 +68,8 @@ export type BotDefaultsRow = {
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
+  /** 「仓库选择卡片」形态的工作目录，与 defaultWorkingDir 互斥。 */
+  workingDir?: string | null;
   defaultWorkingDirAutoWorktree?: boolean;
   autoboundChatCount?: number;
   brandLabel?: string | null;

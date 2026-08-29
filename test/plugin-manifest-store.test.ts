@@ -31,6 +31,10 @@ describe('plugin manifest and registry basics', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it('keeps plugin state inside the stubbed test home', () => {
+    expect(pluginRegistryPath()).toBe(join(home, '.botmux', 'plugins-registry.json'));
+  });
+
   it('normalizes plugin id lists by filtering invalid ids and deduping', () => {
     expect(normalizePluginIdList(['agent-chrome', 'bad/id', 'agent-chrome', '', 'gitlab'])).toEqual(['agent-chrome', 'gitlab']);
     expect(normalizePluginIdList(['bad/id', 1, ''])).toBeUndefined();

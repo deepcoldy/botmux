@@ -191,6 +191,33 @@ try {
   fail('version', err instanceof Error ? err.message : String(err));
 }
 
+// ── 1c. selfcheck: setup-time lark-scopes.json load works in the binary ──────
+// The compiled binary keeps its module graph in the read-only virtual /$bunfs,
+// so setup code that loaded lark-scopes.json via readFileSync/copyFileSync of a
+// __dirname-relative path threw "找不到 botmux lark-scopes.json" — the first
+// `botmux setup ... --create-app` from a fresh curl install died right here.
+// npm/Node unit tests can't see it (dist/ physically exists there). The hidden
+// `__selfcheck` entry runs readDefaultScopeManifest() + writeScopesJsonToConfigDir()
+// and prints `{"ok":true,...}`; a non-zero exit or missing ok flag = the /$bunfs
+// regression is back. Runs in the scratch HOME, no credentials needed.
+try {
+  const out = execFileSync(binary, ['__selfcheck'], {
+    cwd: home, env: childEnv, encoding: 'utf-8', timeout: 60_000,
+  });
+  let parsed;
+  try { parsed = JSON.parse(out.trim().split('\n').pop()); }
+  catch { parsed = null; }
+  if (!parsed?.ok || !(parsed.tenant > 0) || !(parsed.user > 0)) {
+    fail('selfcheck', `__selfcheck did not confirm the manifest loaded: ${out.slice(0, 300)}`);
+  }
+  if (!existsSync(join(home, '.botmux', 'lark-scopes.json'))) {
+    fail('selfcheck', 'writeScopesJsonToConfigDir did not produce ~/.botmux/lark-scopes.json');
+  }
+  console.log(`smoke: ✅ selfcheck — lark-scopes manifest loads + writes in the binary (tenant=${parsed.tenant}, user=${parsed.user})`);
+} catch (err) {
+  fail('selfcheck', err instanceof Error ? err.message : String(err));
+}
+
 // ── 2/3. self-spawn + dashboard boots and reaches online ─────────────────────
 // `__supervisor` is the hidden self-re-exec entry: under a compiled binary this
 // takes the /$bunfs argv[1] detection path, so a broken isStandaloneBinary() or

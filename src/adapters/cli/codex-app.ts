@@ -7,6 +7,7 @@ import { resolveCommandReal } from './registry.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
 
 function runnerPath(): string {
   // Source-level worker integration tests execute through tsx and need the
@@ -63,7 +64,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort, codexBrowser }) {
       const args = [
-        runnerPath(),
+        runnerArgv0('codex-app-runner', runnerPath()),
         '--session-id', sessionId,
         // Canonical for the same reason as sandboxExtraExecPaths above — the runner
         // hands this straight to spawn().

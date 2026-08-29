@@ -70,63 +70,20 @@ jobs:
   # legible at a glance and does not mask unit-test results.
   bun-binary:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      # Bun is the package manager as well as the runtime here (packageManager:
-      # bun@1.4.0), so this pin governs BOTH `bun install` and the compiled
-      # artifact. CI must exercise the exact Bun that builds what ships.
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.0
-
-      # The platform's own install compiles node-pty's build/Release/pty.node for
-      # this OS/arch, which the embed plugin bundles into the binary. That only
-      # happens because node-pty is in `trustedDependencies` — bun does NOT run a
-      # dependency's lifecycle scripts otherwise, and without pty.node there is no
-      # PTY and no working compiled binary.
-      - run: bun install --frozen-lockfile
-
-      - name: Stamp a synthetic version (mirrors the release job)
-        # WHY THIS EXISTS: the compiled binary has no package.json on disk, so the
-        # build BAKES the version in at compile time by reading package.json —
-        # and in the repo that file carries the unbuilt `0.0.0` placeholder, which
-        # the runtime deliberately treats as "nothing baked" (a locally-compiled
-        # dev binary must not report 0.0.0 as authoritative). Compiling straight
-        # from the placeholder therefore yields `--version: unknown`, which is the
-        # exact regression the smoke gate below exists to catch.
-        #
-        # release.yml stamps the real version from the git tag BEFORE compiling
-        # ("Sync version from git tag"). CI has no tag, so stamp a synthetic one
-        # here — same ORDER as release, so this job exercises the same shape the
-        # shipped artifact is built with instead of a placeholder-only path that
-        # can never satisfy the gate.
-        #
-        # Runs after `bun install --frozen-lockfile` on purpose: `npm version`
-        # rewrites package.json, and bun's frozen-lockfile check must see the
-        # committed file. The workspace is ephemeral, so nothing is committed back.
-        run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
-
-      - run: bun run build
-
-      - name: Compile the host-arch Bun binary
-        run: bun scripts/build-bun-binary.mjs --target bun-linux-x64 --out dist-bin/botmux-linux-x64
-
-      - name: Smoke-test the compiled binary
-        # Runs from a scratch HOME with an empty bots.json — no Feishu
-        # credentials, no live fleet, no interference with anything on the runner.
-        #
-        # The empty bots.json is why checks 1-4 cannot reach the daemon: it refuses
-        # to start with 0 bots ("Invalid BOTMUX_BOT_INDEX=0"), so writePidFile —
-        # and the wrapper write that once overwrote the binary itself — is
-        # structurally unreachable. Check 5 in the script covers that path directly
-        # instead of booting a credentialed bot.
-        run: node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64
+      - name: Build and smoke on the supported glibc 2.28 floor
+        # node-pty is compiled on the build host. ubuntu-latest raised the embedded
+        # native to GLIBC_2.34, even though Node 22 and Bun still run on 2.28.
+        # Build inside manylinux_2_28 and execute the full smoke there so the PR
+        # gate is byte-for-byte the same compatibility boundary as release.
+        run: |
+          scripts/build-linux-glibc-baseline.sh \
+            bun-linux-x64 dist-bin/botmux-linux-x64 \
+            "0.0.0-ci.${{ github.run_number }}"
 
   # The musl (Alpine) binary, gated on PRs — not only at release time.
   #
@@ -257,4 +214,3 @@ jobs:
           for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
           ls -la
           echo "✅ host user wrote checksums into a container-produced directory"
-

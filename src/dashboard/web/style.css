@@ -540,6 +540,46 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
   }
 }
 
+/* Bot 配置桌面：整页吃满 main，名册和详情各占一列。名册若只靠
+   sticky + 100dvh 估算限高，往往会比 main 可视区高出一截——钉住之后
+   仍会被含块底边往上挤，搜索框就从视口顶被切掉。窄屏仍走整页滚动。 */
+@media (min-width: 981px) {
+  main:has(.bot-defaults-page) {
+    padding-bottom: 0;
+    overflow: hidden;
+  }
+
+  main:has(.bot-defaults-page) .bot-defaults-page {
+    height: 100%;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  main:has(.bot-defaults-page) .bd-layout {
+    height: 100%;
+    min-height: 0;
+    align-items: stretch;
+  }
+
+  main:has(.bot-defaults-page) .bd-roster {
+    position: static;
+    top: auto;
+    height: 100%;
+    max-height: none;
+    min-height: 0;
+  }
+
+  main:has(.bot-defaults-page) .bd-detail {
+    height: 100%;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}
+
 @keyframes dashboard-page-enter {
   from {
     opacity: 0;
@@ -23090,6 +23130,19 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 /* ─── Bot 配置：平台化表单控件 ───────────────────────────────────────────── */
+.bot-defaults-page .clone-bot-menu[open] {
+  z-index: 1000;
+}
+
+.bot-defaults-page .clone-bot-menu > .sect-sort-pop {
+  right: 0;
+  left: auto;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(340px, calc(100vw - 48px));
+  transform: none;
+}
+
 .bot-defaults-page .bd-detail,
 .bot-defaults-page .bd-card.bd-profile {
   background: transparent;
@@ -23418,7 +23471,11 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 .bot-defaults-page .bd-roster {
+  /* Search/count stay put; the list row is the scrollport. Desktop height
+     comes from the fill-height shell (main:has); mobile caps it below. */
   top: 0;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .bot-defaults-page #bd-filters {
@@ -23474,6 +23531,9 @@ dialog select[multiple]:hover:not(:disabled) {
   display: grid;
   gap: 3px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 @media (max-width: 980px) {

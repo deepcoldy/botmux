@@ -28,7 +28,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -92,7 +92,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1 } from '../types.js';
+import type { LarkMessage, DaemonToWorker, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1, CliTurnPayload } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -112,6 +112,7 @@ import {
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -2808,6 +2809,54 @@ export async function handleCommand(
         break;
       }
 
+      case '/retry': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.retry.no_session', undefined, loc));
+          break;
+        }
+        const failedTurn = ds.session.lastFailedTurn;
+        if (!failedTurn) {
+          await sessionReply(rootId, t('cmd.retry.no_failed_turn', undefined, loc));
+          break;
+        }
+        const cooldownMs = retryCooldownRemaining(failedTurn);
+        if (cooldownMs > 0) {
+          await sessionReply(rootId, t('cmd.retry.cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, loc));
+          break;
+        }
+        // Strip clientUserMessageId to avoid dedup conflicts (same as retry_last_task)
+        const retryCodexAppInput = failedTurn.codexAppInput
+          ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
+          : undefined;
+        const retryInput: CliTurnPayload = {
+          content: failedTurn.cliInput,
+          ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+        };
+        let accepted = false;
+        try {
+          if (ds.worker && !ds.worker.killed) {
+            accepted = sendWorkerInput(ds, retryInput);
+          } else {
+            forkWorker(ds, retryInput, ds.hasHistory);
+            accepted = true;
+          }
+        } catch (err) {
+          logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (!accepted) {
+          await sessionReply(rootId, t('cmd.retry.submit_failed', undefined, loc));
+          break;
+        }
+        // Update retry state + record the input as the session's last CLI turn
+        // (same post-acceptance pattern as the daemon's live-worker path).
+        markRetryAttempt(ds.session);
+        rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+        sessionStore.updateSession(ds.session);
+        logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
+        await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
       case '/status': {
         if (ds) {
           const alive = ds.worker && !ds.worker.killed;
@@ -4757,6 +4806,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.retry', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),

@@ -15,6 +15,7 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import { executeWithLarkGate } from './api-gate.js';
 import type { ChatContext } from '../../types.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
@@ -289,47 +290,49 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
-  const c = getBotClient(larkAppId);
-  const body = msgType === 'text'
-    ? JSON.stringify({ text: content })
-    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
+  return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
+    const c = getBotClient(larkAppId);
+    const body = msgType === 'text'
+      ? JSON.stringify({ text: content })
+      : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
-  let res: any;
-  try {
-    res = await c.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: msgType as any,
-        content: body,
-        ...(uuid ? { uuid } : {}),
-      },
-    });
-  } catch (err: any) {
-    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-      throw new MessageWithdrawnError(chatId);
+    let res: any;
+    try {
+      res = await c.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: msgType as any,
+          content: body,
+          ...(uuid ? { uuid } : {}),
+        },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(chatId);
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  if (res.code !== 0) {
-    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
-    throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
-  }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
+      throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
+    }
 
-  const messageId = res.data?.message_id;
-  if (!messageId) throw new Error('No message_id in response');
-  logger.info(`Sent message ${messageId} to chat ${chatId}`);
-  await emitOutboundHookIfAllowed(options, 'outbound.send', {
-      ...hookContext,
-      larkAppId,
-      chatId,
-      messageId,
-      msgType,
-      uuid,
-      content,
-    });
-  return messageId;
+    const messageId = res.data?.message_id;
+    if (!messageId) throw new Error('No message_id in response');
+    logger.info(`Sent message ${messageId} to chat ${chatId}`);
+    await emitOutboundHookIfAllowed(options, 'outbound.send', {
+        ...hookContext,
+        larkAppId,
+        chatId,
+        messageId,
+        msgType,
+        uuid,
+        content,
+      });
+    return messageId;
+  });
 }
 
 /**
@@ -350,75 +353,81 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
-  const c = getBotClient(larkAppId);
-  const body = msgType === 'text'
-    ? JSON.stringify({ text: content })
-    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
+  return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    const c = getBotClient(larkAppId);
+    const body = msgType === 'text'
+      ? JSON.stringify({ text: content })
+      : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
-  let res: any;
-  try {
-    res = await c.im.v1.message.reply({
-      path: { message_id: messageId },
-      data: {
-        msg_type: msgType as any,
-        content: body,
-        ...(replyInThread ? { reply_in_thread: true } : {}),
-        ...(uuid ? { uuid } : {}),
-      },
-    });
-  } catch (err: any) {
-    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-      throw new MessageWithdrawnError(messageId);
+    let res: any;
+    try {
+      res = await c.im.v1.message.reply({
+        path: { message_id: messageId },
+        data: {
+          msg_type: msgType as any,
+          content: body,
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+          ...(uuid ? { uuid } : {}),
+        },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  if (res.code !== 0) {
-    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
-    throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
-  }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
+    }
 
-  const replyId = res.data?.message_id;
-  if (!replyId) throw new Error('No message_id in reply response');
-  logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
-  await emitOutboundHookIfAllowed(options, 'outbound.reply', {
-      ...hookContext,
-      larkAppId,
-      messageId,
-      replyId,
-      msgType,
-      replyInThread,
-      uuid,
-      content,
-    });
-  return replyId;
+    const replyId = res.data?.message_id;
+    if (!replyId) throw new Error('No message_id in reply response');
+    logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+    await emitOutboundHookIfAllowed(options, 'outbound.reply', {
+        ...hookContext,
+        larkAppId,
+        messageId,
+        replyId,
+        msgType,
+        replyInThread,
+        uuid,
+        content,
+      });
+    return replyId;
+  });
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
   assertLarkTransport(larkAppId, 'addReaction');
-  const c = getBotClient(larkAppId);
-  const res = await (c as any).im.v1.messageReaction.create({
-    path: { message_id: messageId },
-    data: { reaction_type: { emoji_type: emojiType } },
+  return executeWithLarkGate(larkAppId, 'addReaction', async () => {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).im.v1.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: emojiType } },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to add reaction: ${res.msg} (code: ${res.code})`);
+    }
+    const reactionId = res.data?.reaction_id;
+    logger.info(`Added reaction ${emojiType} (${reactionId}) to message ${messageId}`);
+    return reactionId ?? '';
   });
-  if (res.code !== 0) {
-    throw new Error(`Failed to add reaction: ${res.msg} (code: ${res.code})`);
-  }
-  const reactionId = res.data?.reaction_id;
-  logger.info(`Added reaction ${emojiType} (${reactionId}) to message ${messageId}`);
-  return reactionId ?? '';
 }
 
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
   assertLarkTransport(larkAppId, 'removeReaction');
-  const c = getBotClient(larkAppId);
-  const res = await (c as any).im.v1.messageReaction.delete({
-    path: { message_id: messageId, reaction_id: reactionId },
+  return executeWithLarkGate(larkAppId, 'removeReaction', async () => {
+    const c = getBotClient(larkAppId);
+    const res = await (c as any).im.v1.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to remove reaction: ${res.msg} (code: ${res.code})`);
+    }
+    logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
   });
-  if (res.code !== 0) {
-    throw new Error(`Failed to remove reaction: ${res.msg} (code: ${res.code})`);
-  }
-  logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
 }
 
 /**
@@ -581,46 +590,53 @@ export async function sendUserMessage(
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
-  const c = getBotClient(larkAppId);
-  // Stamp callback-button ownership markers on interactive DMs too: this is the
-  // FIFTH card egress surface (config / write-link / substitute / overload / …
-  // cards all DM their callback buttons through here). Without it a peer bot
-  // reading such a DM via history flattens the buttons into its prompt, and —
-  // worse — a future botmux DM button with a new action would leak past the
-  // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
-  // create + deadline request), so one stamp covers both. Same total-function
-  // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
-  const body = msgType === 'text'
-    ? JSON.stringify({ text: content })
-    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
-  const data = {
-    receive_id: openId,
-    msg_type: msgType as any,
-    content: body,
-    ...(uuid ? { uuid } : {}),
-  };
+  return executeWithLarkGate(
+    larkAppId,
+    'sendUserMessage',
+    async () => {
+      const c = getBotClient(larkAppId);
+      // Stamp callback-button ownership markers on interactive DMs too: this is the
+      // FIFTH card egress surface (config / write-link / substitute / overload / …
+      // cards all DM their callback buttons through here). Without it a peer bot
+      // reading such a DM via history flattens the buttons into its prompt, and —
+      // worse — a future botmux DM button with a new action would leak past the
+      // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
+      // create + deadline request), so one stamp covers both. Same total-function
+      // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
+      const body = msgType === 'text'
+        ? JSON.stringify({ text: content })
+        : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
+      const data = {
+        receive_id: openId,
+        msg_type: msgType as any,
+        content: body,
+        ...(uuid ? { uuid } : {}),
+      };
 
-  const res = requestOptions
-    ? await c.request({
-      method: 'POST',
-      url: '/open-apis/im/v1/messages',
-      params: { receive_id_type: 'open_id' },
-      data,
-      ...larkRequestDeadline(requestOptions),
-    })
-    : await c.im.v1.message.create({
-      params: { receive_id_type: 'open_id' },
-      data,
-    });
+      const res = requestOptions
+        ? await c.request({
+          method: 'POST',
+          url: '/open-apis/im/v1/messages',
+          params: { receive_id_type: 'open_id' },
+          data,
+          ...larkRequestDeadline(requestOptions),
+        })
+        : await c.im.v1.message.create({
+          params: { receive_id_type: 'open_id' },
+          data,
+        });
 
-  if (res.code !== 0) {
-    throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
-  }
+      if (res.code !== 0) {
+        throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
+      }
 
-  const messageId = res.data?.message_id;
-  if (!messageId) throw new Error('No message_id in response');
-  logger.info(`Sent DM ${messageId} to user ${openId}`);
-  return messageId;
+      const messageId = res.data?.message_id;
+      if (!messageId) throw new Error('No message_id in response');
+      logger.info(`Sent DM ${messageId} to user ${openId}`);
+      return messageId;
+    },
+    requestOptions?.signal ? { signal: requestOptions.signal } : undefined,
+  );
 }
 
 export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
@@ -900,18 +916,20 @@ export async function getChatMode(
  */
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
-  const c = getBotClient(larkAppId);
-  try {
-    const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
-    if (res && typeof res.code === 'number' && res.code !== 0) {
-      logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+  return executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
+    const c = getBotClient(larkAppId);
+    try {
+      const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
+      if (res && typeof res.code === 'number' && res.code !== 0) {
+        logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.debug(`Failed to delete message ${messageId}: ${err}`);
       return false;
     }
-    return true;
-  } catch (err) {
-    logger.debug(`Failed to delete message ${messageId}: ${err}`);
-    return false;
-  }
+  });
 }
 
 /** Error code Feishu returns from `ephemeral/v1/send` when the target chat is a
@@ -930,24 +948,26 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
-  const c = getBotClient(larkAppId);
-  let card: unknown;
-  try {
-    card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
-  } catch (err) {
-    throw new Error(`Invalid ephemeral card JSON: ${err}`);
-  }
-  const res: any = await (c as any).request({
-    method: 'POST',
-    url: '/open-apis/ephemeral/v1/send',
-    data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
+  return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
+    const c = getBotClient(larkAppId);
+    let card: unknown;
+    try {
+      card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
+    } catch (err) {
+      throw new Error(`Invalid ephemeral card JSON: ${err}`);
+    }
+    const res: any = await (c as any).request({
+      method: 'POST',
+      url: '/open-apis/ephemeral/v1/send',
+      data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
+    });
+    if (res.code !== 0) {
+      throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
+    }
+    const messageId = res.data?.message_id;
+    logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
+    return messageId ?? '';
   });
-  if (res.code !== 0) {
-    throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
-  }
-  const messageId = res.data?.message_id;
-  logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
-  return messageId ?? '';
 }
 
 /**
@@ -961,43 +981,47 @@ export async function sendEphemeralCard(
  */
 export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteEphemeralCard');
-  const c = getBotClient(larkAppId);
-  try {
-    const res: any = await (c as any).request({
-      method: 'POST',
-      url: '/open-apis/ephemeral/v1/delete',
-      data: { message_id: messageId },
-    });
-    if (res && typeof res.code === 'number' && res.code !== 0) {
-      logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+  return executeWithLarkGate(larkAppId, 'deleteEphemeralCard', async () => {
+    const c = getBotClient(larkAppId);
+    try {
+      const res: any = await (c as any).request({
+        method: 'POST',
+        url: '/open-apis/ephemeral/v1/delete',
+        data: { message_id: messageId },
+      });
+      if (res && typeof res.code === 'number' && res.code !== 0) {
+        logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
       return false;
     }
-    return true;
-  } catch (err) {
-    logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
-    return false;
-  }
+  });
 }
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
   assertLarkTransport(larkAppId, 'updateMessage');
-  const c = getBotClient(larkAppId);
-  let res: any;
-  try {
-    res = await c.im.v1.message.patch({
-      path: { message_id: messageId },
-      data: { content: stampBotmuxCallbackMarkers(cardJson) },
-    });
-  } catch (err: any) {
-    if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
-      throw new MessageWithdrawnError(messageId);
+  return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
+    const c = getBotClient(larkAppId);
+    let res: any;
+    try {
+      res = await c.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: { content: stampBotmuxCallbackMarkers(cardJson) },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
     }
-    throw err;
-  }
-  if (res.code !== 0) {
-    if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
-    throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
-  }
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
+    }
+  });
 }
 
 export async function getMessageDetail(
@@ -1185,38 +1209,42 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
 
 export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadImage');
-  const c = getBotUploadClient(larkAppId);
-  const buf = readFileSync(imagePath);
-  // SDK returns { image_key } directly (not wrapped in { code, data })
-  const res = await c.im.v1.image.create({
-    data: { image_type: 'message', image: buf },
+  return executeWithLarkGate(larkAppId, 'uploadImage', async () => {
+    const c = getBotUploadClient(larkAppId);
+    const buf = readFileSync(imagePath);
+    // SDK returns { image_key } directly (not wrapped in { code, data })
+    const res = await c.im.v1.image.create({
+      data: { image_type: 'message', image: buf },
+    });
+    const imageKey = res?.image_key;
+    if (!imageKey) throw new Error(`Failed to upload image: no image_key in response (${JSON.stringify(res)})`);
+    logger.info(`Uploaded image ${imagePath} → ${imageKey}`);
+    return imageKey;
   });
-  const imageKey = res?.image_key;
-  if (!imageKey) throw new Error(`Failed to upload image: no image_key in response (${JSON.stringify(res)})`);
-  logger.info(`Uploaded image ${imagePath} → ${imageKey}`);
-  return imageKey;
 }
 
 export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
-  const c = getBotUploadClient(larkAppId);
-  const buf = readFileSync(filePath);
-  const ext = extname(filePath).toLowerCase();
-  const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-  const fileName = basename(filePath);
-  // `duration` (ms) only applies to opus voice uploads — it sets the length
-  // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
-  const duration = fileType === 'opus' && opts?.duration
-    ? Math.max(1000, Math.round(opts.duration))
-    : undefined;
-  // SDK returns { file_key } directly (not wrapped in { code, data })
-  const res = await c.im.v1.file.create({
-    data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
+  return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
+    const c = getBotUploadClient(larkAppId);
+    const buf = readFileSync(filePath);
+    const ext = extname(filePath).toLowerCase();
+    const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
+    const fileName = basename(filePath);
+    // `duration` (ms) only applies to opus voice uploads — it sets the length
+    // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
+    const duration = fileType === 'opus' && opts?.duration
+      ? Math.max(1000, Math.round(opts.duration))
+      : undefined;
+    // SDK returns { file_key } directly (not wrapped in { code, data })
+    const res = await c.im.v1.file.create({
+      data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
+    });
+    const fileKey = res?.file_key;
+    if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+    logger.info(`Uploaded file ${filePath} → ${fileKey}`);
+    return fileKey;
   });
-  const fileKey = res?.file_key;
-  if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-  logger.info(`Uploaded file ${filePath} → ${fileKey}`);
-  return fileKey;
 }
 
 /**

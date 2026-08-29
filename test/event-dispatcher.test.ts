@@ -158,6 +158,8 @@ import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../s
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
+import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
+import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -5544,6 +5546,97 @@ describe('globalGrants — global talk-only authorization (canTalk / canOperate)
     setupBotState({ globalGrants: ['ou_talk_only'], allowedUsers: ['ou_admin'] });
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_admin')).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_talk_only')).toBe(false);
+  });
+});
+
+describe('managed Agent clone owner boundary', () => {
+  beforeEach(() => {
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('{}');
+  });
+
+  it('pins the excluded-key list so a field cannot be silently dropped', () => {
+    // 下面那条用例用 CLONE_EXCLUDED_KEYS 驱动断言，好处是新增字段自动覆盖，
+    // 但代价是「从清单里删一个字段」会连带把它的断言一起删掉（自指盲区，
+    // 实测反向变异确认过）。所以这里额外用**字面量**钉死清单内容：删字段
+    // 必须在这条上红。新增字段时同步更新这份字面量即可。
+    expect([...CLONE_EXCLUDED_KEYS]).toEqual([
+      'apiOnly',
+      'name',
+      'displayName',
+      'messageListeners',
+      'oncallChats',
+      'defaultOncallAutoboundChats',
+      'allowedChatGroups',
+      'chatGrants',
+      'globalGrants',
+      'quotaState',
+      'grantExpiryState',
+      'sessionGroup',
+      'chatReplyModes',
+      'chatFeedbackPolicies',
+      'noCardChats',
+      'activationPending',
+      'activationDeactivating',
+      'activationStarting',
+      'activationCommitted',
+    ]);
+  });
+
+  it('keeps the human owner operable without cloning source instance state', async () => {
+    // 用实现导出的清单驱动：新增实例态字段时这条用例自动覆盖到。清单本身
+    // 被上一条字面量用例钉死，两条合起来堵住「加了不测」与「删了不红」。
+    // name 是 pm2 进程名（string），单独构造；其余用可辨识的对象值填充。
+    const instanceKeys = CLONE_EXCLUDED_KEYS.filter(key => key !== 'name');
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      cliId: 'codex',
+      allowedUsers: ['ou_source_owner', 'ou_stale_coowner'],
+      name: 'source-proc',
+      ...Object.fromEntries(instanceKeys.map(key => [key, { source: key }])),
+    };
+    const owners = cloneOwnerEntries(source, 'cli_source', 'ou_source_owner');
+    expect(owners).toEqual(['ou_source_owner']);
+
+    const normalized = await normalizeManagedOwnerEntries(
+      owners.join(','),
+      { sourceAppId: 'cli_source', sourceOwnerOpenId: 'ou_source_owner', creatingApp: true },
+      async () => 'on_human_owner',
+    );
+    const target = cloneBotConfig(source, {
+      larkAppId: MY_APP_ID,
+      larkAppSecret: 'target-secret',
+      allowedUsers: normalized?.split(','),
+    });
+    expect(target.allowedUsers).toEqual(['on_human_owner']);
+    for (const key of CLONE_EXCLUDED_KEYS) expect(target).not.toHaveProperty(key);
+    // 行为配置仍照常克隆（否则「全删掉」也能让上面那条断言通过）。
+    expect(target.cliId).toBe('codex');
+
+    // 目标 app 启动时会把 union_id 解析成自己视角下的 open_id。
+    setupBotState({ configAllowedUsers: target.allowedUsers, allowedUsers: [USER_OPEN_ID] });
+    expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
+    expect(canOperate(MY_APP_ID, 'chat-A', 'ou_source_owner')).toBe(false);
+  });
+
+  it('never carries a source-app identity into the cloned bot', () => {
+    // ou_ open_id 与 app secret 都是 app-scoped：target 没有该字段时必须删除，
+    // 而不是把 source 的值留下来（那会把真人 owner 锁在新 Bot 外面）。
+    const source = {
+      larkAppId: 'cli_source',
+      larkAppSecret: 'source-secret',
+      brand: 'lark',
+      allowedUsers: ['ou_source_owner'],
+      ownerOpenId: 'ou_source_owner',
+      cliId: 'codex',
+    };
+    const target = cloneBotConfig(source, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+    expect(target.larkAppId).toBe('cli_target');
+    expect(target.larkAppSecret).toBe('target-secret');
+    for (const key of ['brand', 'allowedUsers', 'ownerOpenId']) {
+      expect(target).not.toHaveProperty(key);
+    }
   });
 });
 

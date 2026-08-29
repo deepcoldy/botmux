@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -160,7 +161,7 @@ import { parseCloseResidual, type ParsedCloseResidual } from './core/close-resid
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -188,6 +189,7 @@ import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
   tryResolveGlobalInstallPlan,
+  isAutoUpdateSupportedInstall,
   withGlobalInstallRegistry,
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
@@ -242,6 +244,7 @@ import {
 } from './services/skill-registry-store.js';
 import { readSkillPackRegistry } from './services/skill-pack-store.js';
 import { dashboardSessionActionTimeoutMs, type DashboardSessionAction } from './dashboard/session-action-timeout.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 import {
   cloneSkillPack,
   createSkillPack,
@@ -1483,7 +1486,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     repoPickerMode: global.repoPickerMode ?? 'all',
     maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
-    autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
+    // Same predicate the save-time validation uses (resolveAutoUpdateSupport), so
+    // the UI can never render the toggle disabled while the backend would accept
+    // it — or the reverse. A plain `tryResolveGlobalInstallPlan()` here reported
+    // false for every compiled binary, because its package root is "/".
+    autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
     remoteAccess: global.remoteAccess === true,
@@ -2445,7 +2452,7 @@ async function proxyToDaemon(
   for (const [key, value] of Object.entries(authHeaders)) {
     headers.set(key, value);
   }
-  const upstream = await fetch(
+  const upstream = await loopbackFetch(
     `http://127.0.0.1:${d.ipcPort}${daemonPath}`,
     { ...init, headers },
   );
@@ -4051,9 +4058,24 @@ const server = createServer(async (req, res) => {
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = currentInstalledVersion();
-      const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
-      const installManager = detectGlobalInstallManager(packageRoot);
-      const installPlan = tryResolveGlobalInstallPlan(packageRoot);
+      // Display/classification only — deliberately NOT a plan root. It feeds
+      // `currentUpdateStrategy` (which handles the compiled binary's "/" correctly)
+      // and the manager label shown when nothing else resolves. Named distinctly from
+      // the `packageRoot` variables that DO reach resolveGlobalInstallPlan, so the two
+      // uses cannot be confused (and so the source guard in
+      // test/binary-self-update.test.ts can tell them apart).
+      const classifyRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+      const installManager = detectGlobalInstallManager(classifyRoot);
+      // A compiled binary has no package.json, so `classifyRoot` is "/" and the
+      // plan resolution always fails — which used to grey out the update button
+      // and tell an npm user their install method is unsupported. Resolve the
+      // strategy by BINARY LOCATION first; only fall back to the package-root
+      // classification for the Node path (unchanged there).
+      const updateStrategy = currentUpdateStrategy(classifyRoot);
+      const installPlan = updateStrategy.kind === 'package-manager'
+        ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
+        : null;
+      const selfReplace = updateStrategy.kind === 'self-replace';
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -4100,9 +4122,19 @@ const server = createServer(async (req, res) => {
         // the wrapper points at is a real git worktree; otherwise the button
         // stays disabled (there is nothing to pull).
         localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
-        updateSupported: installPlan !== null,
-        updateManager: installPlan?.manager ?? installManager,
-        updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
+        updateSupported: installPlan !== null || selfReplace,
+        // Rollback is a SEPARATE capability from update. The web UI used to derive
+        // it from `updateSupported`, which now includes the self-replacing binary —
+        // but /api/update/rollback only knows how to drive a package manager, so a
+        // curl-installed binary would be offered a button that always fails.
+        // Report it explicitly instead of letting the UI infer it.
+        rollbackSupported: installPlan !== null,
+        // The standalone binary is not owned by a package manager; report it as
+        // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
+        updateManager: selfReplace ? 'binary' : (installPlan?.manager ?? installManager),
+        updateCommand: selfReplace
+          ? `botmux update（下载并替换 ${updateStrategy.target}）`
+          : installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
       });
@@ -4182,9 +4214,58 @@ const server = createServer(async (req, res) => {
           localDev: true,
         });
       }
+      // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
+      // 对应平台的 release 资产、校验 SHA-256 后原子替换自身。npm 子包形态不走
+      // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
+      const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (runStrategy.kind === 'self-replace') {
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let oldVersion = '';
+        let newVersion = '';
+        try {
+          const latest = await cachedLatestVersion(false);
+          if (!latest.value) {
+            return jsonRes(res, 503, { ok: false, error: 'version_lookup_failed' });
+          }
+          oldVersion = currentInstalledVersion();
+          newVersion = latest.value;
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            await replaceStandaloneBinary(newVersion, runStrategy.target);
+          }, { maxWaitMs: 2_000 });
+        } catch (e) {
+          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+        } finally {
+          updateInFlight = false;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        return jsonRes(res, 200, {
+          ok: true,
+          oldVersion,
+          newVersion,
+          // The swapped binary is on disk but THIS process still runs (and reports)
+          // the old baked version, so `changed` cannot be derived by re-reading —
+          // it is the version comparison that decided to update at all.
+          changed: newVersion !== oldVersion,
+          restartRequired: true,
+          manager: 'binary',
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
-        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        // ⚠️ NOT `botmuxInstallRoot()`: for a compiled binary that is "/" and the
+        // resolve below throws, which is the very defect this PR fixes. The
+        // strategy resolved above already carries the right root (the sibling main
+        // package for an npm/pnpm/Bun subpackage; the running install root under
+        // Node). `lastSuccessfulUpdatePlan` still wins so a pnpm update keeps using
+        // the stable symlink it resolved last time.
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot
+          ?? (runStrategy.kind === 'package-manager' ? runStrategy.packageRoot : botmuxInstallRoot());
         installPlan = resolveGlobalInstallPlan(packageRoot);
       } catch (error) {
         if (error instanceof UnsupportedGlobalInstallError) {
@@ -4225,7 +4306,11 @@ const server = createServer(async (req, res) => {
         updateInFlight = false;
       }
       if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
-      const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+      // Read the DISK, not `botmuxVersionAt`: for a compiled binary the baked
+      // version takes priority and would report this process's OLD version even
+      // though npm just rewrote package.json (measured) — making `changed` always
+      // false and the "restart to apply" prompt never appear.
+      const newVersion = diskVersionAt(installPlan.activePackageRoot);
       lastSuccessfulUpdatePlan = installPlan;
       return jsonRes(res, 200, {
         ok: true,
@@ -4261,9 +4346,22 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'not_rollback_target' });
       }
 
+      // Rollback only knows how to drive a package manager. Resolve the strategy
+      // first so a compiled binary uses its MAPPED root: on a fresh process there
+      // is no `lastSuccessfulUpdatePlan` yet and `botmuxInstallRoot()` is "/", which
+      // made the very first rollback throw `unsupported_install_method` even though
+      // /api/update/status had just reported `rollbackSupported: true`.
+      const rollbackStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (rollbackStrategy.kind !== 'package-manager') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'unsupported_install_method',
+          manager: rollbackStrategy.kind === 'self-replace' ? 'binary' : 'unknown',
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
-        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? rollbackStrategy.packageRoot;
         installPlan = withGlobalInstallRegistry(
           resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
         );
@@ -4305,7 +4403,10 @@ const server = createServer(async (req, res) => {
           }
 
           await runGlobalInstall(installPlan);
-          const newVersion = botmuxVersionAt(installPlan.activePackageRoot);
+          // diskVersionAt, not botmuxVersionAt: the baked version of a compiled
+          // binary would never equal the rollback target, so this verification
+          // would report a spurious `installed_version_mismatch` on every rollback.
+          const newVersion = diskVersionAt(installPlan.activePackageRoot);
           lastSuccessfulUpdatePlan = installPlan;
           if (newVersion !== targetVersion) {
             installedVersionMismatch = newVersion;
@@ -4864,6 +4965,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
       let parsed: {
         appName?: unknown;
+        cloneSourceAppId?: unknown;
         registrationMode?: unknown;
         sessionMode?: unknown;
         expectedIdentity?: unknown;
@@ -4955,6 +5057,9 @@ const server = createServer(async (req, res) => {
       }
       const job = botOnboarding.start({
         appName,
+        ...(typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()
+          ? { cloneSourceAppId: parsed.cloneSourceAppId.trim() }
+          : {}),
         registrationMode,
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
         cliId,

@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
+import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
 const sentMessages = vi.hoisted(() => [] as Array<{ receiveId: string; msgType: string; content: string; uuid?: string }>);
 const patchedMessages = vi.hoisted(() => [] as Array<{ messageId: string; content: string }>);
@@ -49,6 +51,21 @@ const preparationRecords = vi.hoisted(() => [] as Array<{
 }>);
 const onlineDaemons = vi.hoisted(() => new Map<string, { larkAppId: string; ipcPort: number; pid?: number; lastHeartbeat?: number }>());
 const remoteFetchCalls = vi.hoisted(() => [] as Array<{ url: string; init?: RequestInit; body?: any }>);
+/**
+ * Install one mock for BOTH transports.
+ *
+ * Loopback callers were moved off the global `fetch` onto node:http (Bun's fetch
+ * silently proxies 127.0.0.1 when `no_proxy` does not list that literal address),
+ * so `vi.stubGlobal('fetch', …)` alone stopped intercepting them: these tests
+ * began opening REAL connections to ports like 4310/39003 and `remoteFetchCalls`
+ * stayed empty. Keep using the same mock for both so the assertions still see
+ * every request, remote and local alike.
+ */
+function stubAllFetch(mock: unknown): void {
+  vi.stubGlobal('fetch', mock);
+  __setLoopbackTransportForTests(mock as never);
+}
+
 const addBotToChatCalls = vi.hoisted(() => [] as Array<{ proxyLarkAppId: string; chatId: string; targetLarkAppIds: string[] }>);
 const addBotToChatFailures = vi.hoisted(() => ({ count: 0 }));
 const addBotToChatHolds = vi.hoisted(() => ({
@@ -870,6 +887,7 @@ describe('VC meeting daemon session lifecycle', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    __testOnly_resetLarkGate();
     __vcMeetingAgentTest.reset();
     __testOnly_activeSessions.clear();
     sentMessages.length = 0;
@@ -912,6 +930,10 @@ describe('VC meeting daemon session lifecycle', () => {
     testDataDir = undefined;
     dataDirBeforeTest = undefined;
     vi.unstubAllGlobals();
+    // vi.unstubAllGlobals() knows nothing about the loopback transport seam, so it
+    // has to be cleared explicitly — otherwise a mock installed here leaks into
+    // every later test in the run.
+    __setLoopbackTransportForTests(undefined);
     delete process.env.BOTMUX_TIME_SCALE;
   });
 
@@ -3460,7 +3482,7 @@ describe('VC meeting daemon session lifecycle', () => {
       observeRemoteRegistration = resolve;
     });
     let remoteRegistrationBody: any;
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       let body: any;
       try {
@@ -8174,7 +8196,7 @@ describe('VC meeting daemon session lifecycle', () => {
     });
     __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(AGENT_APP_ID);
     __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(false);
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       remoteFetchCalls.push({ url, init, body });
@@ -8574,7 +8596,7 @@ describe('VC meeting daemon session lifecycle', () => {
       updatedAt: Date.now(),
       expiresAt: Date.now() + 60_000,
     });
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       let body: any;
       try {
@@ -8902,7 +8924,7 @@ describe('VC meeting daemon session lifecycle', () => {
       ipcPort: 39001,
       lastHeartbeat: Date.now(),
     });
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       let body: any;
       try {
@@ -9042,7 +9064,7 @@ describe('VC meeting daemon session lifecycle', () => {
       lastHeartbeat: Date.now(),
     });
     const deliveryBodies: any[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    stubAllFetch(vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       remoteFetchCalls.push({ url, init, body });

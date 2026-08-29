@@ -3,7 +3,7 @@
  * a single triage line (status + code/msg/log_id) without leaking the bearer
  * token or dumping the stack/config blob.
  *
- * Run:  pnpm vitest run test/lark-error-format.test.ts
+ * Run:  bun run test -- test/lark-error-format.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
 
@@ -57,12 +57,44 @@ describe('formatLarkError', () => {
     expect(formatLarkError(err)).toBe('GET contact/v3/users/ou_x → 400');
   });
 
+  it('preserves the transport code and message when no HTTP response exists', () => {
+    const err = {
+      name: 'AxiosError',
+      code: 'ECONNREFUSED',
+      message: 'connect ECONNREFUSED 127.0.0.1:1',
+      config: {
+        method: 'post',
+        url: 'https://open.feishu.cn/open-apis/im/v1/messages',
+        headers: { Authorization: 'Bearer t-secretToken' },
+      },
+    };
+    expect(formatLarkError(err)).toBe(
+      'POST im/v1/messages → ? ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:1"',
+    );
+
+    expect(formatLarkError({
+      name: 'AxiosError',
+      message: 'timeout of 15000ms exceeded',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+    })).toBe('POST im/v1/messages → ? "timeout of 15000ms exceeded"');
+  });
+
   it('detects axios shape via config+response even without name', () => {
     const err = {
       config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
       response: { status: 403, data: { code: 230002, msg: 'bot not in chat' } },
     };
     expect(formatLarkError(err)).toBe('POST im/v1/messages → 403 code=230002 "bot not in chat"');
+  });
+
+  it('unwraps the nested array passed by the Lark SDK logger', () => {
+    const sdkLoggerArg = [[{
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230022, msg: 'content contains sensitive information', log_id: 'LOG456' } },
+    }]];
+    expect(formatLarkError(sdkLoggerArg)).toBe(
+      'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOG456',
+    );
   });
 
   it('returns null for non-axios values so callers fall back', () => {

@@ -179,6 +179,79 @@ describe('runMaintenanceTick', () => {
   });
 });
 
+describe('runMaintenanceTick — a binary self-replace still triggers the restart', () => {
+  /**
+   * THE SUBTLE BUG THIS PINS. For a package-manager update the new version lands
+   * in the install's package.json, so re-reading it afterwards observes the
+   * change, and `after !== before` is what gates the restart.
+   *
+   * A compiled binary has NO package.json: its version is BAKED IN at compile time
+   * and read from the RUNNING process's own env. MEASURED: after swapping the file
+   * on disk, `currentVersion()` still returns the OLD version. So the naive tick
+   * computes `after === before`, logs "already on the latest version", and never
+   * restarts onto the binary it just installed — the update silently does not
+   * take effect until something else restarts the fleet.
+   *
+   * `installedVersion()` is therefore authoritative when set.
+   */
+  function selfReplaceDeps(reported: string, running = '3.18.4') {
+    const calls = { update: 0, restart: 0, intents: [] as RestartIntent[], logs: [] as string[] };
+    const deps: MaintenanceDeps = {
+      now: () => NOON,
+      readConfig: () => ({ autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } }),
+      readState: () => ({}),
+      writeState: () => {},
+      anyBusy: () => false,
+      isLocalDev: () => false,
+      withUpdateLock: (fn) => fn(),
+      // Deliberately CONSTANT: a self-replace cannot change what this process reports.
+      currentVersion: () => running,
+      runUpdate: () => { calls.update++; },
+      installedVersion: () => reported,
+      writeIntent: (i) => { calls.intents.push(i); },
+      triggerRestart: () => { calls.restart++; },
+      log: (m) => { calls.logs.push(m); },
+    };
+    return { deps, calls };
+  }
+
+  it('restarts using the version the self-replace reported, not the re-read one', () => {
+    const { deps, calls } = selfReplaceDeps('3.19.0', '3.18.4');
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(1);
+    // MUTATION CHECK: dropping `installedVersion` from the tick (i.e. going back
+    // to `after = deps.currentVersion()`) makes both of these fail — restart 0 and
+    // no intent — which is exactly the silent no-op described above.
+    expect(calls.restart).toBe(1);
+    expect(calls.intents).toEqual([
+      { kind: 'update', oldVersion: '3.18.4', newVersion: '3.19.0', at: new Date(NOON).toISOString() },
+    ]);
+    expect(calls.logs.join('\n')).not.toMatch(/already on the latest/);
+  });
+
+  it('an unchanged version still means "already latest" (no spurious restart)', () => {
+    // The guard must not fire merely because installedVersion is populated.
+    const { deps, calls } = selfReplaceDeps('3.18.4', '3.18.4');
+    runMaintenanceTick(deps);
+    expect(calls.restart).toBe(0);
+    expect(calls.intents).toEqual([]);
+    expect(calls.logs.join('\n')).toMatch(/already on the latest/);
+  });
+
+  it('the package-manager path is unaffected: an empty report falls back to re-reading', () => {
+    // Regression guard for the currently-working npm path — it reports '' and must
+    // keep using the before/after comparison.
+    const { deps, calls } = makeDeps(
+      { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } },
+      { startVer: '2.64.0', installTo: '2.65.0' },
+    );
+    (deps as MaintenanceDeps).installedVersion = () => '';
+    runMaintenanceTick(deps);
+    expect(calls.restart).toBe(1);
+    expect(calls.intents[0]).toMatchObject({ oldVersion: '2.64.0', newVersion: '2.65.0' });
+  });
+});
+
 describe('buildRestartLauncher', () => {
   const NODE = '/usr/bin/node';
   const CLI = '/opt/botmux/dist/cli.js';

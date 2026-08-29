@@ -93,12 +93,22 @@ function targetToPlatformArch(target) {
  * Compile time is the only place that knows the version for certain: release.yml
  * stamps package.json from the git tag BEFORE this script runs (the "Sync version
  * from git tag" step), so reading it here captures exactly what is being shipped.
+ *
+ * LOCAL VERIFICATION OVERRIDE: outside a release, package.json carries the
+ * placeholder `0.0.0`, which the runtime deliberately treats as "not baked" (so a
+ * local build cannot pass a placeholder off as authoritative). That makes the
+ * smoke's version check fail on `unknown` for anyone compiling by hand — measured.
+ * `scripts/verify-binary.mjs` therefore passes a `git describe` value through this
+ * variable. It is read ONLY as a fallback, never over a real package.json version,
+ * so it cannot influence a release build.
  */
 function versionToBake() {
   try {
     const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8'));
-    if (typeof pkg.version === 'string' && pkg.version.length > 0) return pkg.version;
+    if (typeof pkg.version === 'string' && pkg.version.length > 0 && pkg.version !== '0.0.0') return pkg.version;
   } catch { /* fall through */ }
+  const override = process.env.BOTMUX_VERIFY_BAKED_VERSION;
+  if (typeof override === 'string' && override.length > 0) return override;
   return '0.0.0';
 }
 

@@ -13,6 +13,10 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import type { PricingOverrides } from './services/model-pricing.js';
+import type { BudgetConfig } from './services/budget-tracker.js';
+import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
@@ -1973,6 +1977,16 @@ export interface BotConfig {
    * cards render the "🔊 语音总结" button. See services/voice/types.ts.
    */
   voice?: VoiceConfig;
+  /**
+   * Per-bot pricing overrides for cost estimation. Merged over the built-in
+   * model price table. See services/model-pricing.ts.
+   */
+  pricing?: PricingOverrides;
+  /**
+   * Per-bot monthly budget config. When set, the daemon tracks spend and
+   * alerts/blocks at thresholds. See services/budget-tracker.ts.
+   */
+  budget?: BudgetConfig;
 }
 
 export interface BotState {
@@ -2074,6 +2088,16 @@ function shortLarkPath(url: unknown): string {
  * access token can't leak.
  */
 export function formatLarkError(v: any): string | null {
+  // The SDK logger calls logger.error(formatErrors(error)), so its first
+  // argument is an array containing the already-sanitized Axios shape. Accept
+  // that wrapper here as well as the raw error received by CLI callers.
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const formatted = formatLarkError(item);
+      if (formatted) return formatted;
+    }
+    return null;
+  }
   if (!v || typeof v !== 'object') return null;
   const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
   if (!isAxios) return null;
@@ -2093,6 +2117,12 @@ export function formatLarkError(v: any): string | null {
   if (typeof code === 'number') parts.push(`code=${code}`);
   if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
   if (logId) parts.push(`log_id=${logId}`);
+  // Without an HTTP response, the transport code/message is the only useful
+  // signal. Keep it while still excluding config, headers, and stack.
+  if (httpStatus == null && typeof code !== 'number') {
+    if (typeof v.code === 'string' && v.code) parts.push(v.code);
+    if (typeof v.message === 'string' && v.message) parts.push(`"${v.message}"`);
+  }
   if (!parts.length) return null;
   return parts.join(' ');
 }
@@ -3082,8 +3112,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传）；非对象或 engine 非法 → undefined。深度校验
-    // （凭证是否可用）在 resolveVoiceConfig 做，这里只挡明显垃圾。
+    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
+    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
+    // resolveAsrConfig 做，这里只挡明显垃圾。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
@@ -3097,9 +3128,26 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
-        if (v.engine || v.sami || v.openai || v.speaker) voice = v;
+        const a = (rawVoice as any).asr;
+        if (a && typeof a === 'object') v.asr = {
+          enabled: a.enabled === true,
+          baseUrl: typeof a.baseUrl === 'string' ? a.baseUrl : undefined,
+          apiKey: typeof a.apiKey === 'string' ? a.apiKey : undefined,
+          model: typeof a.model === 'string' ? a.model : undefined,
+          ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
+          ...(typeof a.language === 'string' ? { language: a.language } : {}),
+        };
+        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
       }
     }
+
+    // pricing：per-bot 定价覆盖。normalizePricingOverrides 做宽松校验，
+    // 非法项丢弃，全空返回 undefined。
+    const pricing = normalizePricingOverrides(entry.pricing);
+
+    // budget：per-bot 月度预算。parseBudgetConfig 做宽松校验，
+    // 非法/缺字段返回 null。
+    const budget = parseBudgetConfig(entry.budget);
 
     configs.push({
       larkAppId: entry.larkAppId,
@@ -3306,6 +3354,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       summaryMemoryPath,
       contentTriggers,
       voice,
+      pricing,
+      budget: budget ?? undefined,
     });
   }
 

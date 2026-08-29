@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { slugFromWorktreeText } from './git-worktree.js';
+import { isLoopbackUrl, loopbackFetch } from '../core/loopback-fetch.js';
 
 const SYSTEM_PROMPT = `You generate short, stable git branch slugs for coding tasks.
 Return ONLY one lowercase ASCII slug, no markdown, no quotes.
@@ -48,7 +49,13 @@ export async function worktreeSlugFromContextAI(title?: string, firstPrompt?: st
   if (!c) return fallback;
   try {
     const url = `${c.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-    const resp = await fetch(url, {
+    // Same hazard as the self-hosted TTS endpoint: `baseUrl` is user-configured and
+    // may well be a local model, while this request carries `Authorization: Bearer`.
+    // Under Bun the global fetch proxies 127.0.0.1 unless `no_proxy` names that
+    // literal address — measured with a canary, the token reached the proxy and the
+    // call then fell back silently. Dispatch on the resolved URL; remote stays native.
+    const send = isLoopbackUrl(url) ? loopbackFetch : fetch;
+    const resp = await send(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

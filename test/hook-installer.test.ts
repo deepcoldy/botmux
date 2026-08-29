@@ -542,3 +542,104 @@ describe('cleanupTraexAskHooks', () => {
     expect(JSON.parse(readFileSync(configPath, 'utf-8'))).toEqual(existing);
   });
 });
+
+/**
+ * The generated plugins must not reach a loopback service through the global
+ * `fetch`, and — the part a `toContain` check cannot see — the helper they call
+ * has to actually EXIST in each generated file.
+ *
+ * WHY THIS IS EXECUTED, NOT GREPPED: the helper was first interpolated into the
+ * V2 template only, while BOTH templates had their call switched over. The V1
+ * plugin then died with `ReferenceError: loopbackSafeFetch is not defined` on its
+ * fallback path — and every source-contains assertion stayed green, because the
+ * call site is present in both. "Changed the call, forgot the definition" is the
+ * characteristic generated-template defect, so these tests import the emitted
+ * file and run the function.
+ *
+ * The plugins run inside OpenCode's Bun process, where `fetch` auto-uses
+ * `$http_proxy` and `no_proxy` is literal-match only. For the V2 reply path that
+ * also means the Basic password from the registration file would be handed to the
+ * corporate proxy, not just a failed reply.
+ */
+describe('generated OpenCode plugins — loopback requests bypass the proxy', () => {
+  const CASES = [
+    { label: 'V1 (opencode-plugin)', cliId: 'opencode', format: 'opencode-plugin' as const },
+    { label: 'V2 (opencode2-plugin)', cliId: 'opencode', format: 'opencode2-plugin' as const },
+  ];
+
+  for (const { label, cliId, format } of CASES) {
+    it(`${label}: defines loopbackSafeFetch wherever it is called`, () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+      // A call without a definition is the defect; assert on the PAIR.
+      const calls = (src.match(/loopbackSafeFetch\(/g) ?? []).length;
+      const defs = (src.match(/(?:async\s+)?function\s+loopbackSafeFetch\b/g) ?? []).length;
+      expect(calls).toBeGreaterThan(0);
+      expect(defs).toBe(1);
+      // And it must be built on node:http — that is the whole point.
+      expect(src).toContain("await import(\"node:http\")");
+      expect(src).toContain('isLiteralLoopback');
+    });
+
+    it(`${label}: the emitted helper RUNS and reaches a loopback server directly`, async () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+
+      // Pull just the two helper functions out of the generated file and evaluate
+      // them. Importing the whole plugin would start its OpenCode wiring; this
+      // still executes the REAL emitted text, which is what the guard is about.
+      const from = src.indexOf('function isLiteralLoopback');
+      expect(from).toBeGreaterThan(-1);
+      const to = src.indexOf('\n}', src.indexOf('function loopbackSafeFetch'));
+      expect(to).toBeGreaterThan(from);
+      const helperSrc = src.slice(from, to + 2);
+
+      const { createServer } = await import('node:http');
+      const servers: import('node:http').Server[] = [];
+      try {
+        let direct = 0;
+        const server = createServer((_q, r) => {
+          direct++;
+          r.writeHead(200, { 'content-type': 'application/json' });
+          r.end('{"ok":true}');
+        });
+        servers.push(server);
+        await new Promise<void>(res => server.listen(0, '127.0.0.1', () => res()));
+        const port = (server.address() as { port: number }).port;
+
+        // `new Function` has no dynamic-import callback, so the generated
+        // `await import("node:http")` cannot resolve inside it. Hand the module in
+        // through a local `import` binding instead of rewriting the emitted text —
+        // the body under test stays byte-for-byte what we ship.
+        const nodeHttp = await import('node:http');
+        // eslint-disable-next-line no-new-func
+        const make = new Function('__import', `const _i = __import; ${helperSrc.replace(/await import\("node:http"\)/g, '_i("node:http")')}\nreturn { isLiteralLoopback, loopbackSafeFetch };`);
+        const { isLiteralLoopback, loopbackSafeFetch } = make(
+          (spec: string) => (spec === 'node:http' ? nodeHttp : (() => { throw new Error(`unexpected import ${spec}`); })()),
+        ) as {
+          isLiteralLoopback: (u: string) => boolean;
+          loopbackSafeFetch: (u: string, i?: unknown) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+        };
+
+        // Classification: loopback vs remote (remote must keep the native fetch).
+        expect(isLiteralLoopback(`http://127.0.0.1:${port}/x`)).toBe(true);
+        expect(isLiteralLoopback('http://localhost:1/x')).toBe(true);
+        expect(isLiteralLoopback('https://api.example.com/x')).toBe(false);
+
+        const res = await loopbackSafeFetch(`http://127.0.0.1:${port}/api/x`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+        });
+        expect(res.ok).toBe(true);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe('{"ok":true}');
+        expect(direct).toBe(1);
+      } finally {
+        await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
+      }
+    });
+  }
+});

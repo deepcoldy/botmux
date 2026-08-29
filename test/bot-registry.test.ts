@@ -1126,6 +1126,92 @@ describe('parseBotConfigsFromText — apiOnly', () => {
   });
 });
 
+// ─── pricing / budget (cost governance wiring) ───────────────────────────────
+// 这两块是「成本金额化 + 月度预算」功能的入口：不在这里解析，daemon 的
+// pricingResolver / budget sink 就永远拿不到配置，金额与告警静默失效（且
+// 因为字段缺省是合法状态，不会有任何报错）。所以解析这一步必须有回归网。
+
+describe('parseBotConfigsFromText — pricing / budget', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('parses a pricing block (usdCny + per-model overrides) onto the config', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        pricing: { usdCny: 7.3, models: { 'claude-sonnet-4': { input: 3, output: 15 } } },
+      },
+    ]));
+    expect(cfg.pricing).toEqual({
+      usdCny: 7.3,
+      models: { 'claude-sonnet-4': { input: 3, output: 15 } },
+    });
+  });
+
+  it('parses a budget block and fills the threshold/hardStop defaults', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', budget: { monthlyCny: 200 } },
+    ]));
+    expect(cfg.budget).toEqual({
+      monthlyCny: 200,
+      alertThresholdPercent: [80],
+      hardStop: false,
+    });
+  });
+
+  it('keeps explicit budget thresholds and hardStop', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        budget: { monthlyCny: 500, alertThresholdPercent: [50, 90], hardStop: true },
+      },
+    ]));
+    expect(cfg.budget).toEqual({
+      monthlyCny: 500,
+      alertThresholdPercent: [50, 90],
+      hardStop: true,
+    });
+  });
+
+  it('leaves both undefined when unconfigured (cost estimation stays off)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.pricing).toBeUndefined();
+    expect(cfg.budget).toBeUndefined();
+  });
+
+  it('drops garbage blocks instead of throwing (feature off, never crash startup)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        // pricing 非对象 → undefined；budget 缺 monthlyCny → null → undefined
+        pricing: 'nope',
+        budget: { alertThresholdPercent: [80] },
+      },
+    ]));
+    expect(cfg.pricing).toBeUndefined();
+    expect(cfg.budget).toBeUndefined();
+  });
+
+  it('normalizes budget: undefined (not null) so the field is omitted downstream', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', budget: { monthlyCny: -5 } },
+    ]));
+    // parseBudgetConfig returns null for a non-positive budget; the registry
+    // must map that to undefined so `bot.config.budget` is falsy-and-absent
+    // rather than a null that a `?? {}` style read could mistake for config.
+    expect(cfg.budget).toBeUndefined();
+    expect('budget' in cfg ? cfg.budget : undefined).toBeUndefined();
+  });
+});
+
 // ─── core-only synthesis (BOTMUX_CORE_ONLY) ─────────────────────────────────
 
 describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {

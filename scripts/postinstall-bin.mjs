@@ -47,6 +47,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmodS
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 /** Abort the install with a reason. There is no Node fallback any more (see header). */
@@ -170,6 +171,30 @@ try {
   if ((mode & 0o111) === 0) chmodSync(binary, 0o755);
 } catch { /* best effort; the exec below will surface a real problem */ }
 
+// Do not activate a platform package merely because npm selected the right
+// os/cpu/libc tuple. That metadata cannot express a glibc symbol-version floor:
+// a binary built on Ubuntu 24.04 is still "linux-x64 + glibc", yet its embedded
+// node-pty native may require GLIBC_2.34 and die on Debian 10 (glibc 2.28).
+//
+// Probe the exact candidate before touching the shared launcher. `--version`
+// loads the complete compiled module graph (including node-pty), but starts no
+// daemon and writes no bot data. A failed global npm update can then roll back
+// while every already-running daemon and every shell keeps using the old launcher.
+const probe = spawnSync(binary, ['--version'], {
+  encoding: 'utf-8',
+  timeout: 30_000,
+  env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+});
+if (probe.error || probe.status !== 0) {
+  const raw = probe.error?.message || probe.stderr || probe.stdout || `exit ${probe.status ?? probe.signal ?? 'unknown'}`;
+  const detail = String(raw).trim().split('\n').slice(0, 8).join(' | ');
+  fail(
+    `${SUBPACKAGE} cannot run on this host; the existing botmux launcher was not changed.`,
+    `${detail || 'candidate probe failed'}. Install a compatible release or upgrade the host OS; `
+      + 'do not replace glibc in-place on a live machine.',
+  );
+}
+
 // ── Write the single launcher ──────────────────────────────────────────────────
 // Same path + same atomic-write discipline as the daemon and `pnpm use:here` use
 // (src/daemon.ts, scripts/claim-botmux-bin.mjs), because concurrent CLI sessions
@@ -219,11 +244,45 @@ try {
   );
 }
 
-// ── PATH hint ─────────────────────────────────────────────────────────────────
-// Mirrors install.sh. Without ~/.botmux/bin on PATH the launcher we just wrote is
-// never the `botmux` the user's shell resolves.
-const pathEntries = (process.env.PATH ?? '').split(':');
-if (!pathEntries.includes(binDir)) {
-  console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds:`);
-  console.log(`[botmux]   echo 'export PATH="${binDir}:$PATH"' >> ~/.profile && . ~/.profile`);
+// ── PATH: write it, don't just suggest it ─────────────────────────────────────
+// This used to only PRINT `echo 'export PATH=…' >> ~/.profile`. Two problems:
+// the user had to act on it, and for zsh users the suggested file is WRONG —
+// zsh never reads ~/.profile (measured), so following the hint verbatim left
+// `botmux` still not found. There is no `bin` field any more, so PATH is the
+// only way this launcher becomes a command; we now write the right startup file
+// for the user's actual shell (bash/zsh/fish/other) and tell them what we did.
+//
+// ⚠️ FAIL-SOFT, and never `fail()`: the launcher is already installed and working
+// at this point, so a PATH edit that cannot happen must degrade to the printed
+// hint — not abort a successful install. That includes the sibling module simply
+// not being there: it ships via package.json `files`, and if a future edit drops
+// it (or a mirror repacks the tarball without it) the import throws. Guarding it
+// keeps `npm i -g botmux` succeeding either way.
+if (!(process.env.PATH ?? '').split(':').includes(binDir)) {
+  let ensurePathEntry = null;
+  try {
+    ({ ensurePathEntry } = await import('./install-path-entry.mjs'));
+  } catch (err) {
+    console.error(`[botmux] PATH helper unavailable (${err && err.message ? err.message : String(err)})`);
+  }
+  let written = [], skipped = [];
+  if (ensurePathEntry) {
+    try {
+      const r = ensurePathEntry({ installDir: binDir });
+      ({ written, skipped } = r);
+      for (const f of written) console.log(`[botmux] added ${binDir} to PATH in ${f} (${r.shell})`);
+      for (const f of skipped) console.log(`[botmux] ${f} already puts ${binDir} on PATH`);
+      for (const { file, error } of r.failed) console.error(`[botmux] could not update ${file}: ${error}`);
+    } catch (err) {
+      console.error(`[botmux] could not update your shell startup file: ${err && err.message ? err.message : String(err)}`);
+    }
+  }
+  if (written.length > 0) {
+    console.log('[botmux] open a new terminal (or re-source that file) and `botmux` will be on PATH');
+  } else if (skipped.length === 0) {
+    // Nothing written and nothing already present — fall back to telling them.
+    // Deliberately not naming a specific file here: the correct one depends on
+    // the shell, and naming the wrong one is what caused the original bug.
+    console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds`);
+  }
 }

@@ -254,7 +254,7 @@ async function tryAutoFixScopes(
   brand: Brand,
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
-  opts?: { disableQrLogin?: boolean; silent?: boolean },
+  opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } },
 ): Promise<boolean> {
   if (brand !== 'feishu') return false;
 
@@ -273,6 +273,13 @@ async function tryAutoFixScopes(
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
       scopeManifest,
+      // 已授权集合（按 tenant/user 分桶）：automation 据此对上面这份 manifest 再按桶
+      // 各自做一次差集，并按「确有新增」而非「发过 scope/update」置 mutated——「配置本
+      // 就齐全」时才能命中无变更短路。分桶是为了不让 tenant 授权误伤 user 桶同名
+      // scope（#1044）。与 scopeManifest 叠加安全：缺失判定用的扁平集合是分桶集合的
+      // 超集，故本路径上二次差集恒为空操作；它真正兜住的是「裁剪后为空」那一轮。
+      // 拿不到 granted（self_manage 冷启动）时不传，退回保守近似。
+      grantedScopeNames: opts?.grantedScopeNames,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -311,9 +318,14 @@ async function tryAutoFixScopes(
         : result.privilegeRangeWarning
           ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
           : '';
+      // 「无变更→有意跳过发版」≠「发了版但没解析到 versionId」：后者要提示去开放平台
+      // 确认，前者根本没建版本，报 `version n/a published` 会误导（#1044）。
+      const versionDetail = result.publishSkipped
+        ? '无变更，已跳过发版'
+        : `version ${result.versionId ?? 'n/a'} published`;
       const summary =
         `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
-        `version ${result.versionId ?? 'n/a'} published, ` +
+        `${versionDetail}, ` +
         `${result.subscribedEventCount} events subscribed`;
       if (autoFixEffective) logger.info(summary);
       else logger.warn(summary);
@@ -448,6 +460,23 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
     );
 
+    // 按 token 类型分桶的已授权集合，专供 automation 的「无变更短路」按桶做差用。
+    // application/v6 每个 scope 条目自带 token_types:(tenant|user)[]（SDK 类型可查）。
+    // 之所以不能复用上面的扁平 grantedScopes：约 121 个名字同时在 tenant/user 两桶，
+    // tenant/user 是两份独立授权；扁平集合会让「tenant 已授权」误伤 user 桶同名 scope，
+    // 把真正缺的 user 权限静默吞掉（PR #1044 R2）。缺 token_types 的条目**两桶都不放**，
+    // 退回保守近似（该名字照发 scope/update），宁可多发一版也不少发。
+    const grantedScopeBuckets = { tenant: [] as string[], user: [] as string[] };
+    for (const s of scopesRaw) {
+      const name = typeof s === 'string' ? s : s?.scope;
+      if (!name) continue;
+      const tokenTypes: unknown = typeof s === 'string' ? undefined : s?.token_types;
+      if (Array.isArray(tokenTypes)) {
+        if (tokenTypes.includes('tenant')) grantedScopeBuckets.tenant.push(name);
+        if (tokenTypes.includes('user')) grantedScopeBuckets.user.push(name);
+      }
+    }
+
     // 文档评论入口就绪自检：仅对「已订阅过文档」的 bot 生效（opt-in，不打扰其他 bot）。
     // ① 校验文档 app 权限是否开通（可查 → 缺则 DM 深链）② 提醒去后台订阅评论事件
     // drive.notice.comment_add_v1（飞书无 API 可查是否已订阅，只能提醒）——让「订阅
@@ -554,7 +583,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       // before (no API call / no prompt / no nag).
       if (missingOptional.length > 0 && brand === 'feishu') {
         const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
-          { disableQrLogin: true, silent: true });
+          { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
         if (toppedUp) {
           logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
           return;
@@ -569,7 +598,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // If a cached Feishu web session exists (~/.botmux/feishu-session.json), we can
     // directly add missing scopes and publish a new version without user interaction.
     // Falls through to manual DM warning if session is missing/expired.
-    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional);
+    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional,
+      { grantedScopeNames: grantedScopeBuckets });
     if (autoFixed) return;
 
     // Log + DM consolidated message listing all missing critical scopes.

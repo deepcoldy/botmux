@@ -3,14 +3,19 @@
  *
  * Run: pnpm vitest run test/setup-open-platform-automation.test.ts
  */
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
   BOT_BASELINE_CALLBACKS,
+  BOT_OPTIONAL_APP_EVENTS,
+  LONG_CONNECTION_EVENT_MODE,
+  VC_MEETING_APP_EVENTS,
+  VC_MEETING_USER_EVENTS,
   BOTMUX_REDIRECT_URL,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
@@ -41,6 +46,7 @@ import {
   readStoredCookiesFromSessionFile,
   safeErrorMessage,
   selectPrivilegesNeedingAppAvailability,
+  type OpenPlatformApiClient,
   type StoredCookie,
   vcListenerEventGateError,
   writeRedirectWhitelist,
@@ -1782,6 +1788,21 @@ describe('probeVcMeetingEventSubscription — read-only VC event check', () => {
   });
 });
 
+describe('readDefaultScopeManifest', () => {
+  it('loads the bundled manifest and returns an independent copy', () => {
+    const first = readDefaultScopeManifest();
+    const second = readDefaultScopeManifest();
+
+    expect(first.scopes?.tenant?.length).toBeGreaterThan(0);
+    expect(first.scopes?.user?.length).toBeGreaterThan(0);
+    expect(first).not.toBe(second);
+    expect(first.scopes?.tenant).not.toBe(second.scopes?.tenant);
+
+    first.scopes?.tenant?.pop();
+    expect(second.scopes?.tenant?.length).toBeGreaterThan(0);
+  });
+});
+
 describe('automateOpenPlatformSetup', () => {
   it('forwards forceQrLogin so configure --switch-account ignores a valid cache', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-auto-force-'));
@@ -2558,6 +2579,447 @@ describe('automateOpenPlatformSetup', () => {
     // 走不到订阅阶段的早期失败(missingVcEvents/eventModeReady 均 undefined)保持原 best-effort 语义
     expect(vcListenerEventGateError({})).toBeNull();
   });
+
+  // 无变更短路：redirect / scope / 事件 / 回调 / 接收模式一路下来都没落地过写操作时，
+  // 不应再 create+publish 一个新版本（存量 bot 每次重启命中自检都凭空多一版的根因）。
+  describe('无变更时跳过发版', () => {
+    // 「什么都不缺」的 mock：所有 botmux 需要的事件/回调/长连接模式都已就位，
+    // redirect 白名单已含全部 wanted，scope 传空清单 → 全程零写请求。
+    function noopMock(appId: string) {
+      return openPlatformSubscriptionMock(appId, {
+        initial: {
+          appEvents: [...BOT_BASELINE_APP_EVENTS, ...BOT_OPTIONAL_APP_EVENTS, ...VC_MEETING_APP_EVENTS],
+          userEvents: [...VC_MEETING_USER_EVENTS],
+          eventMode: LONG_CONNECTION_EVENT_MODE,
+          callbacks: [...BOT_BASELINE_CALLBACKS],
+          callbackMode: LONG_CONNECTION_EVENT_MODE,
+          redirectUrls: collectBotmuxRedirectUrls(),
+        },
+      });
+    }
+
+    function noopFetch(appId: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+      return (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes(`/scope/all/${appId}`)) {
+          return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        }
+        // 命中发版端点直接抛：无变更时它们绝不该被调用。
+        if (href.includes('/app_version/create/') || href.includes('/publish/commit/')) {
+          throw new Error(`must not publish on no-op: ${href}`);
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+    }
+
+    it('权限/事件/回调全就位时不 create+publish，直接回成功且 versionId 为空', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl: noopFetch('cli_x', sub, calls),
+        // 空清单 → importedScopeCount=0 → 不发 scope/update
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBeUndefined();
+      // 一条发版请求都没有；也没有任何写请求（redirect/scope/event/callback update）。
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(false);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      expect(sub.updateBodies).toEqual([]);
+      expect(sub.redirectWrites).toEqual([]);
+    });
+
+    it('appJustCreated=true 时即便无变更也照常发版（新应用要靠首发上架）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-new-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+        appJustCreated: true,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBe('v1');
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('requireVerifiedEvents=true 时即便无变更也照常发版（受管激活靠精确 versionId ACK）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-managed-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+        requireVerifiedEvents: true,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.versionId).toBe('v1');
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    // 锁生产链路：走**真实默认 manifest**（不注入 scopeManifest）+ 已授权集合。
+    // 这是维护者复审揪出的空白——之前 3 例都注入空 manifest，恰好绕开了唯一有意义
+    // 的那条路径（默认 171+130 项、importedScopeCount 恒 >0 → mutated 恒真 → 短路
+    // 永不触发）。这里用「manifest 全部已授权」模拟「配置本就齐全」的重启自检。
+    const defaultManifest = JSON.parse(
+      readFileSync(join(fileURLToPath(new URL('../src/setup/lark-scopes.json', import.meta.url))), 'utf-8'),
+    ) as { scopes: { tenant: string[]; user: string[] } };
+    const allDefaultScopeNames = [...defaultManifest.scopes.tenant, ...defaultManifest.scopes.user];
+
+    // 用默认 manifest 里的名字构造一份「租户目录」——scope/all 返回它，automation 据此
+    // 把 name 映射成 ID。ID 只要唯一即可。
+    function defaultCatalogFetch(
+      appId: string,
+      sub: ReturnType<typeof openPlatformSubscriptionMock>,
+      calls: string[],
+      captured: { scopeUpdateBodies: Array<Record<string, unknown>> },
+    ) {
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      return (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes(`/scope/all/${appId}`)) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes(`/scope/update/${appId}`)) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/') || href.includes('/publish/commit/')) {
+          throw new Error(`must not publish on no-op: ${href}`);
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+    }
+
+    it('默认全量 manifest + grantedScopeNames 覆盖全部权限时，短路生效、零 scope/update、不发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-default-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl: defaultCatalogFetch('cli_x', sub, calls, captured),
+        // 关键：不传 scopeManifest（走真实默认清单），但告知「全部已授权」——
+        // 按桶传：tenant / user 两桶各自全授权。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: [...defaultManifest.scopes.user],
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.versionId).toBeUndefined();
+        expect(result.publishSkipped).toBe(true);
+      }
+      // 全部已授权 → 差集为空 → 一次 scope/update 都不发、也不发版。
+      expect(captured.scopeUpdateBodies).toEqual([]);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(false);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
+    });
+
+    // #1042 × #1044 合并回归：`narrowRequiredPrivilegeRanges` 会真发 `privilege/update`
+    // （返回值就是写进去的条目数）。它排在无变更短路之前，所以「scope/事件/回调全齐、
+    // 只有权限数据范围被收敛」的那一轮**确实改了线上配置**，必须照常发版——否则改动
+    // 留在草稿里不生效。反向变异（删掉 `privilegeRangeCount > 0` 那句置位）时本例转红。
+    it('只有权限数据范围被收敛时仍算一次变更、照常发版（不被无变更短路吞掉）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-privilege-only-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      // 线上 `privilege/all` 的真实条目形态：isRequired + content 为空 + 单个选人字段
+      // ⇒ 落进 selectPrivilegesNeedingAppAvailability，会触发一次 privilege/update。
+      const vcPrivilege = {
+        bizId: 'vc',
+        resource: 'meeting.meetingid',
+        name: '会议号查询会议信息',
+        isRequired: true,
+        content: '',
+        privilegeStatus: 3,
+        schemaType: 1,
+        organizationType: 1,
+        schemaContent: {
+          selectionExpressionSchemaContent: {
+            fields: [{
+              id: 'owner_scope', name: '会议的归属者', type: 'object', multi: false,
+              operators: ['in'], data_source: { type: 'select_staff', val: '' },
+            }],
+            select_mode_options: ['all', 'part', 'null'],
+            fallback_value: { mode: 'all' },
+          },
+        },
+      };
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/privilege/all/cli_x')) {
+          return Response.json({ code: 0, data: { scopeBiz: [{ bizId: 'vc', bizName: '视频会议' }], privileges: [vcPrivilege] } });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-priv' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        // scope 两桶全授权 ⇒ 差集为空、零 scope/update；唯一的变更来自数据范围收敛。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: [...defaultManifest.scopes.user],
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      // 真发过一次 privilege/update，且没有任何 scope/update。
+      expect(calls.some(u => u.includes('/privilege/update/'))).toBe(true);
+      expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
+      if (result.ok) {
+        expect(result.privilegeRangeCount).toBe(1);
+        // 关键断言：这一轮**不是**无变更，必须发版。
+        expect(result.publishSkipped).toBeUndefined();
+        expect(result.versionId).toBe('v-priv');
+      }
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(true);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    // PR #1044 R2 回归：dual-bucket 名字（tenant/user 两桶都有）的 user 侧独缺时，
+    // 必须仍对 user 侧发 scope/update——不能因为 tenant 侧已授权就把它从 user 桶误删。
+    // 用扁平集合做差会把这一项静默吞掉（0 次 scope/update + publishSkipped），本例锁死。
+    it('dual-bucket 名字仅 user 侧缺失时，按桶做差仍申请其 user 授权、不误报无变更', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-dual-user-missing-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      // 取一个同时出现在 tenant 与 user 两桶的名字。
+      const tenantSet = new Set(defaultManifest.scopes.tenant);
+      const dualName = defaultManifest.scopes.user.find(n => tenantSet.has(n))!;
+      expect(dualName, 'expected a dual-bucket scope name in the default manifest').toBeTruthy();
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        // tenant 侧全授权；user 侧独缺 dualName。扁平集合会因 tenant 有 dualName 而误删 user 桶。
+        grantedScopeNames: {
+          tenant: [...defaultManifest.scopes.tenant],
+          user: defaultManifest.scopes.user.filter(n => n !== dualName),
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // 确有新增（user 侧那一项）→ 必须发版、不是无变更。
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 恰好对「user 侧缺的那一项」发一次 scope/update：零 tenant id、一个 user id。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(captured.scopeUpdateBodies[0].appScopeIDs).toEqual([]);
+      expect(captured.scopeUpdateBodies[0].userScopeIDs).toEqual([nameToId.get(dualName)]);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('默认全量 manifest + grantedScopeNames 缺一项时，只对缺的那项发 scope/update 并发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-default-onemissing-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      // 缺一项**仅出现在 tenant 桶**的 scope（避免 dual 名字干扰，其余全部已授权）。
+      const userSet = new Set(defaultManifest.scopes.user);
+      const missingName = defaultManifest.scopes.tenant.find(n => !userSet.has(n))!;
+      expect(missingName, 'expected a tenant-only scope name').toBeTruthy();
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        grantedScopeNames: {
+          tenant: defaultManifest.scopes.tenant.filter(n => n !== missingName),
+          user: [...defaultManifest.scopes.user],
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.versionId).toBe('v-NEW');
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 只对「真正还缺的那一项」发 scope/update：payload 里恰好一个 tenant scope id、零 user scope。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(captured.scopeUpdateBodies[0].appScopeIDs).toEqual([nameToId.get(missingName)]);
+      expect(captured.scopeUpdateBodies[0].userScopeIDs).toEqual([]);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+
+    it('不传 grantedScopeNames（默认全量 manifest）时保持原保守行为：发 scope/update 且发版', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-default-nogrant-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_x');
+      const calls: string[] = [];
+      const captured = { scopeUpdateBodies: [] as Array<Record<string, unknown>> };
+      const nameToId = new Map<string, string>();
+      allDefaultScopeNames.forEach((name, i) => nameToId.set(name, `id_${i}`));
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+        if (href.includes('/scope/all/cli_x')) {
+          return Response.json({
+            code: 0,
+            data: {
+              appScopeList: defaultManifest.scopes.tenant.map(name => ({ name, id: nameToId.get(name) })),
+              userScopeList: defaultManifest.scopes.user.map(name => ({ name, id: nameToId.get(name) })),
+            },
+          });
+        }
+        if (href.includes('/scope/update/cli_x')) {
+          captured.scopeUpdateBodies.push(JSON.parse(String(init?.body)));
+          return Response.json({ code: 0 });
+        }
+        if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-NEW' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_x',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        // 不传 grantedScopeNames：拿不到已授权信号 → 保守近似 → 照发不误。
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.versionId).toBe('v-NEW');
+        expect(result.publishSkipped).toBeUndefined();
+      }
+      // 保守行为：整份 manifest 全量映射 → 发一次非空 scope/update → 发版。
+      expect(captured.scopeUpdateBodies).toHaveLength(1);
+      expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
+    });
+  });
 });
 
 /**
@@ -2737,6 +3199,263 @@ describe('console 页面读取的瞬态网络错误重试', () => {
     const result = await createOpenPlatformApiClient([cookie()], { fetchImpl });
     expect(result).toMatchObject({ ok: false, reason: 'network' });
     expect(attempts).toBe(1);
+  });
+});
+
+// 「TLS 握手完成之前就断连」是唯一可证明「请求一个字节都没发出去」的传输错误：
+// Node 内置 `_tls_wrap.js` 的 `onConnectEnd` 在建 socket 时挂上、在
+// `onConnectSecure` 里摘掉，所以它只会在握手完成前触发 ⟹ 没有加密通道 ⟹ 请求行/
+// 头/body 都没送出。因此连非幂等的 console 写操作也能安全重放；不重放的代价是
+// 用户的改名/改头像被一次网络毛刺整轮打挂（线上实测：改头像失败并把这句话原样
+// 抛给用户）。以下用例守住「该重试的重试、不该重试的绝不重试」两侧。
+describe('pre-TLS 断连：可证明未送达，写操作也重试', () => {
+  /** 与线上实测逐字一致的错误形态（外层 undici 包装 + cause 带 code）。 */
+  const preTlsDisconnect = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(
+        new Error('Client network socket disconnected before secure TLS connection was established'),
+        { code: 'ECONNRESET' },
+      ),
+    });
+  /** 对照：握手已完成、请求已送达后才断 —— 服务端可能已处理，绝不能重放。 */
+  const afterRequestSent = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    });
+
+  async function postWith(errFactory: () => Error, failTimes: number) {
+    let postAttempts = 0;
+    let failed = 0;
+    const bodies: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        postAttempts += 1;
+        bodies.push(String(init?.body ?? ''));
+        if (failed < failTimes) { failed += 1; throw errFactory(); }
+        return new Response(JSON.stringify({ code: 0, data: { ok: true } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) throw new Error('client construction failed');
+    return { client: clientResult.client, attempts: () => postAttempts, bodies };
+  }
+
+  it('POST 写操作遇 pre-TLS 断连会重试，并把 body 原样重发', async () => {
+    const h = await postWith(preTlsDisconnect, 1);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', { clientId: 'cli_x', name: '小助手' }))
+      .resolves.toMatchObject({ code: 0 });
+    expect(h.attempts()).toBe(2);
+    // 重发的必须是同一份 payload——否则会写出半截数据。
+    expect(h.bodies).toHaveLength(2);
+    expect(h.bodies[0]).toBe(h.bodies[1]);
+    expect(h.bodies[0]).toContain('"name":"小助手"');
+  });
+
+  it('POST 的 multipart 上传（改头像图片）同样重试且 FormData 可原样重发', async () => {
+    let postAttempts = 0;
+    const sizes: Array<number | string> = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        postAttempts += 1;
+        const body = init?.body as FormData;
+        sizes.push(body instanceof FormData ? ((body.get('file') as Blob | null)?.size ?? 'MISSING') : 'NOT_FORM');
+        if (postAttempts === 1) throw preTlsDisconnect();
+        return new Response(JSON.stringify({ code: 0, data: { url: 'https://cdn/a.png' } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) return;
+    const form = new FormData();
+    form.append('file', new Blob([new Uint8Array(64).fill(7)], { type: 'image/png' }), 'avatar.png');
+    await expect(clientResult.client.postForm('/developers/v1/app/upload/image', form))
+      .resolves.toMatchObject({ code: 0 });
+    expect(postAttempts).toBe(2);
+    // 两次都带着完整的 64 字节图片——重发不能退化成空 body。
+    expect(sizes).toEqual([64, 64]);
+  });
+
+  it('重试耗尽后仍失败，并把这句 pre-TLS 断连原样透出给用户', async () => {
+    const h = await postWith(preTlsDisconnect, Number.POSITIVE_INFINITY);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(3); // 首次 + 2 次退避重试
+  });
+
+  it('对照：握手后断连（UND_ERR_SOCKET）的写操作绝不重试——结果未知不可重放', async () => {
+    const h = await postWith(afterRequestSent, 1);
+    await expect(h.client.postJson('/developers/v1/app_version/create/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  it('对照：普通 ECONNRESET（非 pre-TLS 文案）的写操作也不重试——仅靠 code 判定不安全', async () => {
+    const genericReset = () => new TypeError('fetch failed', {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    const h = await postWith(genericReset, 1);
+    await expect(h.client.postJson('/developers/v1/publish/commit/cli_x/v1', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  // 判据必须是**整句精确匹配**，不能放宽成关键词包含。Node 内置的
+  // `ConnResetException` 有多条文案共用 code=ECONNRESET，其中 `socket hang up`
+  // （`_http_client.js`）是在请求**已发出之后**才抛的 —— 一旦用
+  // `includes('disconnected')` 之类的松匹配，或把别的 ConnResetException 文案
+  // 也算进来，写操作就会在「服务端可能已处理」的情况下被重放。
+  it.each([
+    ['socket hang up', 'ECONNRESET'],                                   // 请求已送达后
+    ['aborted', 'ECONNRESET'],                                          // 响应中途断
+    ['Client network socket disconnected', 'ECONNRESET'],               // 截断的近似文案
+    ['socket disconnected before secure TLS handshake', 'ECONNRESET'],  // 改写过的近似文案
+  ])('对照：ConnResetException 的其它文案 %j 不得被当成可重放', async (message, code) => {
+    const near = () => new TypeError('fetch failed', {
+      cause: Object.assign(new Error(message), { code }),
+    });
+    const h = await postWith(near, 1);
+    await expect(h.client.postJson('/developers/v1/app_version/create/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  it('调用方主动 abort 即使裹在 pre-TLS 文案里也不重试（不违背调用方意图）', async () => {
+    const aborted = () => {
+      const e = new Error('Client network socket disconnected before secure TLS connection was established');
+      e.name = 'AbortError';
+      (e as any).code = 'ECONNRESET';
+      return new TypeError('fetch failed', { cause: e });
+    };
+    const h = await postWith(aborted, 1);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', {})).rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  // AggregateError 一律不支持（有意收窄）：真实 Node pre-TLS 断连不是聚合体
+  // ——`net.internalConnectMultiple` 只在**所有** TCP connect 失败时构造
+  // NodeAggregateError，而这句文案由 `_tls_wrap.onConnectEnd` 在某条腿 connect
+  // **成功之后**才可能产出，两者互斥。支持聚合体就得对 `.errors` 与同样合法的
+  // `.cause` 都做全称量词检查，任一遗漏即 fail-open，证明责任配不上收益。
+  it.each([
+    ['全部成员都是 pre-TLS 文案', () => new AggregateError([
+      Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { code: 'ECONNRESET' }),
+    ], '')],
+    ['混合成员（一条已送达）', () => new AggregateError([
+      Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { code: 'ECONNRESET' }),
+      Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+    ], '')],
+    ['成员安全但 aggregate 自带不安全 cause', () => new AggregateError([
+      Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { code: 'ECONNRESET' }),
+    ], '', { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) })],
+    ['空 errors', () => new AggregateError([], '')],
+  ])('AggregateError（%s）的写操作一律不重试', async (_label, mk) => {
+    const h = await postWith(() => new TypeError('fetch failed', { cause: mk() }), 1);
+    await expect(h.client.postJson('/developers/v1/app_version/create/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  it('精确文案节点自带 cause 时 fail-closed（Node 构造 ConnResetException 不挂 cause）', async () => {
+    const tampered = () => {
+      const leaf = Object.assign(
+        new Error('Client network socket disconnected before secure TLS connection was established'),
+        { code: 'ECONNRESET' },
+      );
+      (leaf as any).cause = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+      return new TypeError('fetch failed', { cause: leaf });
+    };
+    const h = await postWith(tampered, 1);
+    await expect(h.client.postJson('/developers/v1/publish/commit/cli_x/v1', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  // 运行时边界：本特判绑定 Node/undici 的错误形态。Bun 原生 fetch 对同一真实
+  // 故障（accept 后立即断）抛的是顶层 `TypeError`、message
+  // `The socket connection was closed unexpectedly...`、code=ECONNRESET、**无
+  // cause**，不满足精确文案 ⟹ 不会命中。这是**已知的跨运行时缺口**而非安全
+  // 问题（不重试 = 保持旧行为）；要覆盖 Bun 必须先为它的文案建立同等级
+  // 「只可能握手前」证明，不能只凭 code=ECONNRESET。本用例把该边界钉住，
+  // 避免日后有人误以为 Bun 路径已被覆盖。
+  it('Bun 原生 pre-TLS 错误形态（无 cause）不命中特判 —— 已知跨运行时缺口', async () => {
+    const bunShaped = () => Object.assign(
+      new TypeError('The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()'),
+      { code: 'ECONNRESET' },
+    );
+    const h = await postWith(bunShaped, 1);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', {}))
+      .rejects.toThrow('socket connection was closed');
+    expect(h.attempts()).toBe(1);
+  });
+});
+
+// 语义幂等的 console POST（robot/event switch 设值、只读拉 Secret）与 GET/HEAD 同权
+// 认全部瞬态错误，但**预算只在 fetchRaw 这一层**。历史上这三处在外层另包了一轮
+// retry，与内层相乘成 3×3=9 次（实测 4.8s 退避）；更隐蔽的是**异构错误序列**——
+// 内层先遇 2 次 pre-TLS、第 3 次是普通 reset 时，外层看到的是普通 reset 于是又跑
+// 一轮，最坏仍能到 9。故断言各种序列下总尝试恒为 3。
+describe('语义幂等 POST 的统一重试预算（防乘法重试回归）', () => {
+  const PRE_TLS = 'Client network socket disconnected before secure TLS connection was established';
+  const preTls = () => new TypeError('fetch failed', {
+    cause: Object.assign(new Error(PRE_TLS), { code: 'ECONNRESET' }),
+  });
+  const genericReset = () => new TypeError('fetch failed', {
+    cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+  });
+
+  /** 按序列逐次抛错（用尽后继续抛最后一个），返回真实发出的 POST 次数。 */
+  async function attemptsFor(
+    sequence: Array<() => Error>,
+    call: (client: OpenPlatformApiClient) => Promise<unknown>,
+  ): Promise<number> {
+    let posts = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        const idx = posts;
+        posts += 1;
+        throw (sequence[idx] ?? sequence[sequence.length - 1])();
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) throw new Error('client construction failed');
+    await expect(call(clientResult.client)).rejects.toThrow();
+    return posts;
+  }
+
+  it.each([
+    ['全部 pre-TLS', [preTls]],
+    ['全部普通 reset', [genericReset]],
+    // 这一格是真实乘法 bug 的形态：外层只按「最终错误」短路时守不住 3。
+    ['异构：pre-TLS, pre-TLS, 普通 reset…', [preTls, preTls, genericReset]],
+    ['异构：普通 reset, pre-TLS…', [genericReset, preTls]],
+  ])('postJsonIdempotent 在「%s」下总尝试恒为 3', async (_label, seq) => {
+    const posts = await attemptsFor(
+      seq,
+      client => client.postJsonIdempotent('/developers/v1/robot/switch/cli_x', { clientId: 'cli_x', enable: true }),
+    );
+    expect(posts).toBe(3);
+  });
+
+  it('普通 postJson 不因此变宽：pre-TLS 仍 3 次，普通 reset 仍 1 次', async () => {
+    expect(await attemptsFor([preTls], c => c.postJson('/developers/v1/app_version/create/cli_x', {}))).toBe(3);
+    expect(await attemptsFor([genericReset], c => c.postJson('/developers/v1/app_version/create/cli_x', {}))).toBe(1);
   });
 });
 

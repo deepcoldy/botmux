@@ -100,18 +100,161 @@ else
   printf '%s\n' "⚠ no checksum published for $asset; skipping verification"
 fi
 
-# ── Install ───────────────────────────────────────────────────────────────────
+# ── Probe + atomically install ────────────────────────────────────────────────
+# os/arch/libc selection cannot express the minimum glibc symbol version. Run the
+# exact candidate before replacing a working installation: `--version` loads the
+# embedded node-pty native, so a GLIBC_x.y mismatch surfaces here without starting
+# a daemon or touching bot data. Stage on the destination filesystem so the final
+# rename is atomic even when /tmp and $INSTALL_DIR are different mounts.
 mkdir -p "$INSTALL_DIR"
 chmod +x "$tmp/$asset"
-mv "$tmp/$asset" "$INSTALL_DIR/botmux"
+candidate="$INSTALL_DIR/.botmux-install-$$"
+cp "$tmp/$asset" "$candidate"
+chmod +x "$candidate"
+trap 'rm -rf "$tmp"; rm -f "$candidate"' EXIT
+if ! probe_output="$("$candidate" --version 2>&1)"; then
+  err "downloaded $asset cannot run on this host; existing botmux was preserved: $probe_output"
+fi
+mv "$candidate" "$INSTALL_DIR/botmux"
 printf '%s\n' "✅ installed botmux → $INSTALL_DIR/botmux"
 
-# ── PATH hint ─────────────────────────────────────────────────────────────────
+# ── PATH: write it, don't just suggest it ─────────────────────────────────────
+# This used to only print `echo 'export PATH=…' >> ~/.profile`, which is WRONG for
+# zsh users: zsh never reads ~/.profile (measured), so following the hint verbatim
+# left `botmux` still not found. Mirrors scripts/install-path-entry.mjs — keep the
+# two in step. Startup files per shell, all measured:
+#   zsh  → ${ZDOTDIR:-$HOME}/.zshenv   (only file read by -c, -i and -li alike;
+#                                       zsh reads dotfiles from $ZDOTDIR when set)
+#   bash → .bashrc AND its login file  (interactive vs login are disjoint; the
+#                                       login file is the FIRST of .bash_profile →
+#                                       .bash_login → .profile that EXISTS)
+#   fish → ${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/botmux.fish
+#                                      (and fish is NOT POSIX: `set -gx`)
+#   else → .profile                    (sh/ksh/dash read it at login)
+MARKER='# added by botmux installer'
+
+# Quote INSTALL_DIR for LITERAL use inside the rc file we write.
+# ⚠️ SECURITY: INSTALL_DIR is caller-controlled (BOTMUX_INSTALL_DIR) and the line
+# we write is executed by the user's shell on every startup. Inside double quotes
+# a `$(…)`/backtick/`$VAR` in the path would RUN — measured: an install dir with
+# `$(touch /tmp/PWNED)` created that file on every new shell. Single quotes make
+# every byte literal; only `'` needs care, closed and reopened as '\''. Same form
+# works in POSIX shells and fish.
+sq=$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")
+QUOTED_DIR="'$sq'"
+
+path_line_present() {  # $1=file — already handled, by us or by the user's own line?
+  [ -f "$1" ] || return 1
+  # TWO SEPARATE CHECKS, mirroring fileAlreadyHasEntry() in
+  # scripts/install-path-entry.mjs. Do not try to fold them into one.
+  #
+  # (a) OUR OWN line, recognised by its known syntax: the marker plus the exact
+  #     quoted directory we would generate. Needed because the line written for a
+  #     dir containing a quote is  export PATH='/x/q'\''bin'":$PATH"  and ANY
+  #     tokenizer that treats `'` as a separator shreds it into /x/q, \, bin — so
+  #     the quoted spelling can never match a token (measured: a second line was
+  #     appended on every re-install).
+  #
+  # (b) A HAND-WRITTEN line: strip quote syntax, then compare whole PATH elements.
+  #     Substring matching produced three measured false positives that each left
+  #     the real dir unwritten: <INSTALL_DIR>-old (sibling), /backup<INSTALL_DIR>
+  #     (prefix) and <INSTALL_DIR>/other (child). Commented-out lines never count.
+  # NOTE the comment filter: without it, commenting OUT our own generated line
+  # (marker included) still counted as configured, so no working line was ever
+  # added back — measured, install.sh reported configured while the mjs half
+  # correctly said false.
+  if grep -F "$MARKER" "$1" 2>/dev/null \
+    | grep -Ev '^[[:space:]]*#' \
+    | grep -Fq "$QUOTED_DIR"; then
+    return 0
+  fi
+  BOTMUX_RAW_DIR="$INSTALL_DIR" awk '
+    BEGIN { raw = ENVIRON["BOTMUX_RAW_DIR"]; sub(/\/+$/, "", raw) }
+    /^[[:space:]]*#/ { next }
+    !/export[[:space:]]+PATH[[:space:]]*=|^[[:space:]]*PATH[[:space:]]*=|set[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*PATH|fish_add_path|path\+=|path=\(/ { next }
+    {
+      line = $0
+      gsub(/["'"'"']/, "", line)     # quotes are syntax around a plain path here
+      gsub(/[()=]/, " ", line)       # zsh path=(...) and assignments
+      n = split(line, tok, /[:[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        t = tok[i]
+        sub(/\/+$/, "", t)           # a trailing slash is the same directory
+        if (t != "" && t == raw) { found = 1; exit }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$1" 2>/dev/null
+}
+
+# bash's LOGIN file is the FIRST of .bash_profile → .bash_login → .profile that
+# EXISTS. Creating .bash_profile when the user's login config lives in .profile
+# (or .bash_login) silently stops that file from being read ever again — measured
+# with a sentinel: visible before, MISSING after. So append to whichever already
+# exists, and only create .bash_profile when none does (nothing to shadow then).
+bash_login_file() {
+  for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  printf '%s\n' "$HOME/.bash_profile"
+}
+
+append_path_line() {  # $1=file  $2=line
+  mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
+  # Leading newline only when the file exists and lacks a trailing one, so we
+  # never glue onto an unterminated last line.
+  if [ -f "$1" ] && [ -n "$(tail -c 1 "$1" 2>/dev/null)" ]; then
+    printf '\n%s\n' "$2" >> "$1" || return 1
+  else
+    printf '%s\n' "$2" >> "$1" || return 1
+  fi
+  printf '%s\n' "✓ added $INSTALL_DIR to PATH in $1"
+}
+
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) : ;;  # already on PATH
   *)
-    printf '\n%s\n' "Add $INSTALL_DIR to your PATH, e.g.:"
-    printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
+    # $PATH stays outside the quotes so it still expands; the dir cannot.
+    # The STATEMENT must be idempotent too, not just the file write: an
+    # unconditional prepend re-runs on every shell startup, so nested or
+    # re-sourced shells keep growing PATH (measured: the dir appeared twice at
+    # nesting depth 2). `case` is POSIX, needs no subshell, and the `:` padding
+    # makes it an exact ELEMENT test so `<dir>-old` never satisfies it.
+    posix_line="case \":\$PATH:\" in *:$QUOTED_DIR:*) ;; *) export PATH=$QUOTED_DIR\":\$PATH\" ;; esac  $MARKER"
+    wrote=0
+    case "$(basename "${SHELL:-}")" in
+      *zsh*)
+        # zsh reads its dotfiles from $ZDOTDIR when set, else $HOME. Writing
+        # $HOME/.zshenv on a ZDOTDIR machine produces a file zsh never reads.
+        f="${ZDOTDIR:-$HOME}/.zshenv"
+        if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+        ;;
+      *fish*)
+        # fish's config dir is $XDG_CONFIG_HOME/fish, default ~/.config/fish.
+        f="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/botmux.fish"
+        if path_line_present "$f"; then wrote=1
+        # fish: `contains` is its own exact list-element test.
+        else append_path_line "$f" "contains $QUOTED_DIR \$PATH; or set -gx PATH $QUOTED_DIR \$PATH  $MARKER" && wrote=1; fi
+        ;;
+      *bash*)
+        # .bashrc (interactive) and the login file are disjoint; write both, but
+        # never CREATE a login file that would shadow an existing one.
+        for f in "$HOME/.bashrc" "$(bash_login_file)"; do
+          if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+        done
+        ;;
+      *)
+        f="$HOME/.profile"
+        if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+        ;;
+    esac
+    if [ "$wrote" = 1 ]; then
+      printf '%s\n' "  open a new terminal (or re-source that file) and \`botmux\` will be on PATH"
+    else
+      printf '\n%s\n' "Add $INSTALL_DIR to your PATH, e.g.:"
+      printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
+    fi
     ;;
 esac
+
 printf '\n%s\n' "Next: botmux setup"

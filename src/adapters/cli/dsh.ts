@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
 
 function runnerPath(): string {
   // Source-level worker integration tests execute through tsx and need the
@@ -67,7 +68,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       mkdirSync(join(dshHome, 'botmux'), { recursive: true });
       mkdirSync(join(dshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
-        runnerPath(),
+        runnerArgv0('dsh-runner', runnerPath()),
         '--session-id', sessionId,
         '--dsh-bin', (cachedDshBin ??= resolveCommandReal(rawDshBin)),
       ];

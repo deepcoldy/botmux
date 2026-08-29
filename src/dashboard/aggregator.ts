@@ -1,6 +1,7 @@
 // src/dashboard/aggregator.ts
 import type { DaemonInfo } from './registry.js';
 import type { DashboardEvent } from '../core/dashboard-events.js';
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 type Row = { sessionId: string; larkAppId: string; [k: string]: unknown };
 type Sched = { id: string; [k: string]: unknown };
@@ -184,7 +185,7 @@ export function subscribeDaemon(
   d: DaemonInfo,
   agg: Aggregator,
   onError: (e: Error) => void,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: typeof fetch = loopbackFetchImpl,
   onConnected?: (signal: AbortSignal) => Promise<void> | void,
 ): () => void {
   const ctrl = new AbortController();

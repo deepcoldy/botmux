@@ -37,6 +37,32 @@ describe('bot defaults focused layout', () => {
     expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid > \.bd-tile-wide\s*\{[\s\S]*?grid-column:\s*1 \/ -1;/);
   });
 
+  it('fills the desktop main so the roster cannot be shoved under the search box', () => {
+    // A sticky roster sized with 100dvh is usually a few pixels taller than
+    // main's client box. Once pinned, the containing-block floor keeps
+    // sliding it up and clips #bd-filters. Desktop therefore uses the same
+    // fill-height shell as roles-page: main does not scroll, both columns
+    // stretch, the list and the detail pane are the scrollports.
+    const desktop = css.slice(css.indexOf('main:has(.bot-defaults-page)'), css.indexOf('main:has(.bot-defaults-page) .bd-detail') + 280);
+    expect(desktop).toMatch(/main:has\(\.bot-defaults-page\)\s*\{[\s\S]*?overflow:\s*hidden;/);
+    expect(desktop).toMatch(/\.bot-defaults-page\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
+    expect(desktop).toMatch(/\.bd-layout\s*\{[\s\S]*?align-items:\s*stretch;/);
+    expect(desktop).toMatch(/\.bd-roster\s*\{[\s\S]*?position:\s*static;[\s\S]*?height:\s*100%;/);
+    expect(desktop).toMatch(/\.bd-detail\s*\{[\s\S]*?overflow-y:\s*auto;/);
+
+    const rosterStart = css.indexOf('.bot-defaults-page .bd-roster {');
+    const roster = css.slice(rosterStart, css.indexOf('.bot-defaults-page #bd-filters', rosterStart));
+    expect(roster).toMatch(/grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
+    expect(roster).toMatch(/overflow:\s*hidden;/);
+    expect(roster).not.toMatch(/max-height:\s*calc\(100dvh/);
+
+    const listStart = css.indexOf('.bot-defaults-page .bd-roster-list {');
+    const list = css.slice(listStart, css.indexOf('@media (max-width: 980px)', listStart));
+    expect(list).toMatch(/min-height:\s*0;/);
+    expect(list).toMatch(/overflow-y:\s*auto;/);
+    expect(list).toMatch(/overscroll-behavior:\s*contain;/);
+  });
+
   it('keeps the mobile roster bounded with a real scrollport instead of clipping', () => {
     // Grid auto rows keep max-content height, so the list row must be
     // forced into the remaining space (minmax(0,1fr) + min-height:0) or

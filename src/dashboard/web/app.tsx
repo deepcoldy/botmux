@@ -61,6 +61,9 @@ type BotmuxUpdateStatus = {
   behind: boolean;
   localDevInstall: boolean;
   updateSupported: boolean;
+  /** Whether /api/update/rollback can actually drive this install. Absent on
+   *  older backends; see the fallback where it is consumed. */
+  rollbackSupported?: boolean;
   updateCommand: string | null;
   node: { version: string; required: number; ok: boolean };
   installs: { entries: Array<{ binPath: string }>; multiple: boolean };
@@ -764,7 +767,13 @@ function TopbarVersionControl(props: {
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
-  const rollbackSupported = status.updateSupported && !status.localDevInstall && status.node.ok;
+  // Rollback is its own capability, reported explicitly by the backend: the
+  // self-replacing binary CAN update but /api/update/rollback only drives a
+  // package manager, so deriving this from `updateSupported` would show a button
+  // that always fails. Older backends omit the field — fall back to the previous
+  // derivation so a stale dashboard/daemon pair behaves as before.
+  const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
+    && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';
   // Progress-ring geometry. R=20 → circumference C; the arc fills clockwise
   // from 12 o'clock for `progress`%.

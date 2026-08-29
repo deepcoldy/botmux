@@ -7,3 +7,14 @@ export function resolveSetupAppName(requestedName: string | undefined, nextBotIn
   const requested = requestedName?.trim();
   return requested || `botmux-${nextBotIndex}`;
 }
+
+export function resolveCloneAppName(
+  requestedName: string | undefined,
+  sourceName: string | undefined,
+  now = Date.now(),
+): string {
+  const requested = requestedName?.trim();
+  if (requested) return requested;
+  const suffix = `-copy-${now}`;
+  return `${(sourceName?.trim() || 'botmux').slice(0, 64 - suffix.length)}${suffix}`;
+}

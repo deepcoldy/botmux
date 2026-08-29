@@ -8,7 +8,7 @@
   // 腐烂（脚本里缺 owner/workerGeneration、location 缺 protocol/hostname，仍然 exit 0）。
   // 把 scripts/ 纳入同一套 strict 检查后，这类漂移在 `pnpm typecheck:scripts` 就被拦住。
   //
-  // 这里只改「不产出、允许 src 之外的根目录」，其余编译选项（strict、Node16 解析、
+  // 这里只改「不产出、允许 src 之外的根目录」，其余编译选项（strict、NodeNext 解析、
   // JSX）一律继承根配置——验的必须是生产同一套规则。
   "extends": "./tsconfig.json",
   "compilerOptions": {

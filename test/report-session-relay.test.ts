@@ -235,7 +235,11 @@ describe('report session relay wiring', () => {
   });
 
   it('falls back to the source daemon relay when the host secret is masked', () => {
-    expect(cliSource).toContain("fetch(`http://127.0.0.1:${port}${input.path}`");
+    // Must be the proxy-immune loopback client, not the global fetch: under Bun the
+    // latter routes 127.0.0.1 through $http_proxy whenever no_proxy does not name
+    // that literal address, and the corporate proxy answers an HTML 403.
+    expect(cliSource).toContain("loopbackFetch(`http://127.0.0.1:${port}${input.path}`");
+    expect(cliSource).not.toContain("await fetch(`http://127.0.0.1:${port}${input.path}`");
     expect(cliSource).toContain('originCapability: originClaim?.capability');
   });
 

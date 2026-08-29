@@ -429,6 +429,93 @@ export function parseBotSelection(
   return byProcessName >= 0 ? byProcessName : undefined;
 }
 
+/**
+ * 克隆时**不**复制的字段。分两类：
+ *  - 进程/激活态：`name` 是 pm2 进程名（启动期绑定），`apiOnly` 与四个
+ *    `activation*` 是上一次 onboarding 的中间态，复制过去会让新 Bot 以别人的
+ *    生命周期状态起步；`displayName` 复制会让名册里两个 Bot 同名难以区分。
+ *  - 实例态：按 **源应用的 chat_id / open_id** 建 key 的授权、绑定与账本。
+ *    chat_id 是租户级共享的，把它们带进新应用既无意义（多为死条目），又会
+ *    产生意外行为——例如 `oncallChats` 让新 Bot 在源绑定过的群里直接被
+ *    talk + 自动开工，`defaultOncallAutoboundChats` 则相反，会让该群的自动
+ *    绑定被误判成「已花掉」而不触发。
+ *
+ * 单一真源：回归测试直接 import 本常量，避免测试再抄一份清单后与实现漂移
+ * （新增实例态字段时两边都不报警）。新增此类字段请加在这里。
+ */
+export const CLONE_EXCLUDED_KEYS = [
+  'apiOnly',
+  'name',
+  'displayName',
+  'messageListeners',
+  'oncallChats',
+  'defaultOncallAutoboundChats',
+  'allowedChatGroups',
+  'chatGrants',
+  'globalGrants',
+  'quotaState',
+  'grantExpiryState',
+  'sessionGroup',
+  'chatReplyModes',
+  'chatFeedbackPolicies',
+  'noCardChats',
+  'activationPending',
+  'activationDeactivating',
+  'activationStarting',
+  'activationCommitted',
+] as const;
+
+/**
+ * 目标应用自己的身份字段：克隆后必须从 target 恢复。target 没有该字段时**删除**
+ * （而不是留下 source 的值）——`ou_` open_id 与 app secret 都是 app-scoped，
+ * 跨应用复制会把 owner 锁在门外。见 setup/owner-identity.ts。
+ */
+export const CLONE_IDENTITY_KEYS = [
+  'larkAppId',
+  'larkAppSecret',
+  'brand',
+  'allowedUsers',
+  'ownerOpenId',
+] as const;
+
+/**
+ * 把源 Bot 的行为配置覆盖到刚创建的目标 Bot，同时保留目标应用自己的身份。
+ * Dashboard 与 CLI clone 共用这里，避免两条入口各维护一份排除字段。
+ */
+export function cloneBotConfig(
+  source: Record<string, any>,
+  target: Record<string, any>,
+): Record<string, any> {
+  const cloned: Record<string, any> = { ...target, ...source };
+
+  for (const key of CLONE_EXCLUDED_KEYS) {
+    delete cloned[key];
+  }
+
+  for (const key of CLONE_IDENTITY_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(target, key) && target[key] !== undefined) {
+      cloned[key] = target[key];
+    } else {
+      delete cloned[key];
+    }
+  }
+
+  return cloned;
+}
+
+/** 只允许 daemon 已认证的 source open_id 进入共享的跨应用 owner 归一化。 */
+export function cloneOwnerEntries(
+  source: Record<string, any>,
+  sourceAppId?: string,
+  sourceOwnerOpenId?: string,
+): string[] {
+  const managedOwner = sourceAppId === source.larkAppId ? sourceOwnerOpenId : undefined;
+  if (!Array.isArray(source.allowedUsers)) return [];
+  return source.allowedUsers.filter((entry: unknown): entry is string => (
+    typeof entry === 'string' && (!entry.startsWith('ou_') || entry === managedOwner)
+  ));
+}
+
 export function removeBotConfig<T extends { larkAppId?: string; name?: unknown }>(
   bots: T[],
   selection: string,

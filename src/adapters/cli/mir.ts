@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveCommandReal } from './registry.js';
 
 /**
@@ -67,7 +68,7 @@ export function createMirAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildArgs({ sessionId, botName, botOpenId, locale }) {
-      const args = [runnerPath(), '--session-id', sessionId];
+      const args = [runnerArgv0('mir-runner', runnerPath()), '--session-id', sessionId];
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);

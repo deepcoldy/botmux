@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  describeSendFailure,
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
   normalizeInteractiveCardInput,
@@ -11,6 +12,32 @@ import {
 } from '../src/cli/send-dispatch.js';
 
 class MessageWithdrawnError extends Error {}
+
+describe('describeSendFailure', () => {
+  it('preserves Lark business details instead of falling back to the HTTP message', () => {
+    const err = {
+      isAxiosError: true,
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: {
+        status: 400,
+        data: {
+          code: 230022,
+          msg: 'content contains sensitive information',
+          log_id: 'LOGREAL123',
+        },
+      },
+    };
+
+    expect(describeSendFailure(err)).toBe(
+      'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOGREAL123',
+    );
+  });
+
+  it('falls back to a plain Error message for non-Lark failures', () => {
+    expect(describeSendFailure(new Error('upload boom'))).toBe('upload boom');
+  });
+});
 
 describe('dispatchPrimaryMessage hook context wiring', () => {
   const baseOptions = {
@@ -217,6 +244,28 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
       { path: '/x', error: 'dispatch down' },
       { path: '/y', error: 'dispatch down' },
     ]);
+  });
+
+  it('surfaces the Lark business error (code/log_id) instead of a bare HTTP message', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => {
+      if (p === '/bad') {
+        throw {
+          isAxiosError: true,
+          config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+          response: { status: 400, data: { code: 230022, msg: 'content contains sensitive information', log_id: 'LOG789' } },
+          message: 'Request failed with status code 400',
+        };
+      }
+      return `key:${p}`;
+    });
+    const dispatch = vi.fn(async (content: string) => `om:${content}`);
+
+    const res = await sendFileAttachments({ uploadFile, dispatch }, 'cli_app', ['/bad']);
+
+    expect(res.failed).toEqual([{
+      path: '/bad',
+      error: 'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOG789',
+    }]);
   });
 });
 

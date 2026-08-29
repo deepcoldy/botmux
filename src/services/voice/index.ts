@@ -11,11 +11,13 @@
 import { encodePcmToOpus, toSpoken, type OpusResult, type Pcm } from './audio.js';
 import { samiSynthesizePcm, type SamiCreds, type VoiceProviderEffectOptions } from './sami.js';
 import { openaiSynthesizePcm, type OpenAITtsConfig } from './openai.js';
+import type { ResolvedAsrConfig } from './asr.js';
 import { readGlobalConfig } from '../../global-config.js';
 import { loadBotConfigs } from '../../bot-registry.js';
-import type { VoiceConfig, VoiceEngine } from './types.js';
+import type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
 
-export type { VoiceConfig, VoiceEngine } from './types.js';
+export type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
+export type { ResolvedAsrConfig } from './asr.js';
 
 /** Default SAMI voice — 灿灿 (bigtts), the product-chosen default. */
 export const DEFAULT_SAMI_SPEAKER = 'zh_female_cancan_mars_bigtts';
@@ -73,6 +75,50 @@ export function resolveVoiceConfig(larkAppId?: string): VoiceConfig | null {
 /** Cheap predicate for conditionally rendering the voice button. */
 export function isVoiceConfigured(larkAppId?: string): boolean {
   return resolveVoiceConfig(larkAppId) !== null;
+}
+
+/** ASR 默认转写超时（毫秒）。飞书语音客户端录制上限 60s，whisper 转写
+ *  通常 5-15s；留足余量，转发/导入的长音频也可通过 timeoutMs 调大。 */
+export const DEFAULT_ASR_TIMEOUT_MS = 120000;
+
+/** Pure evaluation: per-bot `voice.asr` merged over global `voice.asr`
+ *  （浅合并——字段都是标量，per-bot 逐字段覆盖）。enabled !== true 或缺
+ *  baseUrl/model 返回 null。Exported for testing without disk. */
+export function evaluateAsrConfig(global?: VoiceAsrConfig, perBot?: VoiceAsrConfig): ResolvedAsrConfig | null {
+  const merged = { ...global, ...perBot };
+  if (merged.enabled !== true) return null;
+  if (!merged.baseUrl || !merged.model) return null;
+  return {
+    baseUrl: merged.baseUrl,
+    ...(merged.apiKey ? { apiKey: merged.apiKey } : {}),
+    model: merged.model,
+    timeoutMs: merged.timeoutMs ?? DEFAULT_ASR_TIMEOUT_MS,
+    ...(merged.language ? { language: merged.language } : {}),
+  };
+}
+
+/** Resolve effective ASR config for a bot: per-bot `voice.asr` merged over
+ *  the global `voice.asr` block. Returns null when ASR is not enabled or
+ *  incomplete for this bot. */
+export function resolveAsrConfig(larkAppId?: string): ResolvedAsrConfig | null {
+  let global: VoiceAsrConfig | undefined;
+  try {
+    global = readGlobalConfig().voice?.asr;
+  } catch { /* no global config */ }
+
+  let perBot: VoiceAsrConfig | undefined;
+  if (larkAppId) {
+    try {
+      const bot = loadBotConfigs().find((b) => b.larkAppId === larkAppId);
+      perBot = bot?.voice?.asr;
+    } catch { /* no bots.json */ }
+  }
+  return evaluateAsrConfig(global, perBot);
+}
+
+/** Cheap predicate for whether inbound voice messages should be transcribed. */
+export function isAsrConfigured(larkAppId?: string): boolean {
+  return resolveAsrConfig(larkAppId) !== null;
 }
 
 function effectiveSpeaker(v: VoiceConfig): string {

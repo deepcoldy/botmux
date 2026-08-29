@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -65,6 +65,18 @@ type SqliteDatabaseLike = DatabaseSyncLike;
 
 const SQLITE_BUSY_TIMEOUT_MS = 3000;
 const SQLITE_NODE_VERSION_HINT = 'Node ≥ 22.13.0（23.x 需 ≥ 23.4.0）';
+
+// Recovery receipts: written in the SAME transaction as the merge, so
+// "this orphan's rows are already in the main file" becomes a durable fact
+// instead of something re-derived from a replay whose observations are
+// timing-dependent. Keyed by the orphan WAL's content digest.
+const RECOVERY_RECEIPTS_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS import_recovery_receipts (
+  orphan_digest TEXT PRIMARY KEY,
+  merged_at TEXT NOT NULL,
+  merged_rows INTEGER NOT NULL
+);
+`;
 
 const SESSIONS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -479,23 +491,33 @@ function parseSessionsProjectionStrict(raw: string, fp: string): Record<string, 
   return value as Record<string, Session>;
 }
 
-/** The JSON rows today's load()/migration would have produced for this store:
- *  the per-bot file's entries when it exists, else the legacy `sessions.json`
- *  rows belonging to this bot; scope repair applied, legacy card fields
- *  stripped, closed rows included. Parse failures degrade to an empty store —
- *  exactly like the previous loader. */
-function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
+/** Which snapshot file a recovery/import read actually resolved. `none` means no
+ *  readable snapshot existed at all — distinct from "a readable snapshot that
+ *  legitimately holds zero rows for this bot", which IS evidence. */
+type FrozenSnapshotSource = 'per-bot' | 'legacy' | 'none';
+
+/** The JSON rows today's load()/migration would have produced for this store,
+ *  plus WHICH file they came from. The source matters to recovery: a legacy
+ *  `sessions.json` that parses fine but filters down to zero rows for this bot
+ *  proves the store held nothing, whereas a missing file proves nothing. */
+function readFrozenSnapshotForImport(jsonFp: string): {
+  entries: [string, Session][];
+  source: FrozenSnapshotSource;
+} {
   let entries: [string, Session][] = [];
+  let source: FrozenSnapshotSource = 'none';
   if (existsSync(jsonFp)) {
     const data = parseSessionsProjectionStrict(readFileSync(jsonFp, 'utf-8'), jsonFp);
     entries = Object.entries(data);
+    source = 'per-bot';
   } else if (currentAppId) {
     const legacyFp = join(config.session.dataDir, 'sessions.json');
-    if (!existsSync(legacyFp)) return [];
+    if (!existsSync(legacyFp)) return { entries: [], source: 'none' };
     const data = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
     entries = Object.entries(data).filter(([, v]) => v?.larkAppId === currentAppId);
+    source = 'legacy';
   } else {
-    return [];
+    return { entries: [], source: 'none' };
   }
   for (const [, value] of entries) {
     if (value && typeof value === 'object') {
@@ -503,7 +525,16 @@ function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
       stripLegacyPendingCardFields(value as unknown as Record<string, unknown>);
     }
   }
-  return entries;
+  return { entries, source };
+}
+
+/** The JSON rows today's load()/migration would have produced for this store:
+ *  the per-bot file's entries when it exists, else the legacy `sessions.json`
+ *  rows belonging to this bot; scope repair applied, legacy card fields
+ *  stripped, closed rows included. Parse failures degrade to an empty store —
+ *  exactly like the previous loader. */
+function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
+  return readFrozenSnapshotForImport(jsonFp).entries;
 }
 
 /** One-shot deterministic import: build the store at `<db>.tmp`, commit, then
@@ -514,14 +545,19 @@ function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
 function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   requireSqliteEngine(`会话存储 ${basename(dbFp)} 首次导入`);
   const tmpFp = `${dbFp}.tmp`;
-  for (const suffix of ['', '-wal', '-shm']) {
+  // `-journal` is DELETE mode's sidecar (the mode this import uses below);
+  // `-wal`/`-shm` cover a crash under an older WAL-based import.
+  for (const suffix of ['', '-journal', '-wal', '-shm']) {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
   const tmp = openDatabaseSyncOrThrow(tmpFp);
   try {
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    tmp.exec('PRAGMA journal_mode = WAL;');
+    // The temporary file is renamed after close. WAL sidecars keep the old
+    // `.tmp` basename, so publishing only the main file strands the schema
+    // and rows on Bun. The live store switches to WAL when it is opened.
+    tmp.exec('PRAGMA journal_mode = DELETE;');
     tmp.exec('PRAGMA synchronous = NORMAL;');
     tmp.exec(SESSIONS_SCHEMA_SQL);
     tmp.exec('BEGIN');
@@ -531,15 +567,421 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     }
     tmp.exec('COMMIT');
     tmp.close();
+    for (const suffix of ['-journal', '-wal', '-shm']) {
+      if (existsSync(`${tmpFp}${suffix}`)) {
+        throw new Error(`temporary SQLite import left ${tmpFp}${suffix}`);
+      }
+    }
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {
     try { tmp.close(); } catch { /* already closed */ }
-    for (const suffix of ['', '-wal', '-shm']) {
+    for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
   }
+}
+
+// ─── Orphaned import sidecar recovery ────────────────────────────────────────
+// A pre-fix import built `<db>.tmp` in WAL mode and published only the main
+// file with `renameSync`. Under Bun, `close()` skips the WAL checkpoint while a
+// prepared statement is still alive, so the schema and every row stayed in
+// `<db>.tmp-wal` while the published `.db` was a bare 4096-byte header. That
+// import path now uses DELETE mode (it cannot produce this shape any more), but
+// stores already poisoned by it stay broken forever: the import/cleanup branch
+// below is gated on `!existsSync(dbFp)` and the poisoned `.db` DOES exist, so
+// nothing ever looks at the orphans again.
+//
+// DETECTION uses the orphaned `<db>.tmp*` sidecars and nothing else. Verified
+// alternatives and why they are unusable:
+//   • `PRAGMA quick_check` / `integrity_check` return `ok` on a poisoned store
+//     (the file is structurally fine, its content simply never merged) — zero
+//     discriminating power against a legitimately empty store.
+//   • "the `sessions` table is missing" self-erases: `openDbForOwnStore` runs
+//     `CREATE TABLE IF NOT EXISTS`, so the very first open destroys the
+//     evidence. Measured going false→true across two opens while the `.tmp*`
+//     orphans persisted.
+// The orphan predicate cannot fire on a healthy store: the import builds on
+// `<db>.tmp` and only `renameSync`s it into place as the last step, under the
+// same lock, and its branch requires `.db` to be ABSENT. So ".db exists AND
+// .tmp* exists" is unreachable in a normal timeline — it is always crash
+// residue. A scan of 56 live production stores found zero `.tmp*` leftovers
+// (healthy stores carry only `-wal`/`-shm`), i.e. no false-positive surface.
+const IMPORT_TMP_SIDECAR_SUFFIXES = ['', '-journal', '-wal', '-shm'] as const;
+
+/** No source could attest what a poisoned store held, so recovery refused to
+ *  touch it. Distinct class so the fail-closed path reads as a deliberate
+ *  refusal rather than an I/O accident. */
+class SessionStoreRecoveryUnattestedError extends Error {
+  override readonly name = 'SessionStoreRecoveryUnattestedError';
+}
+
+/** Content digest of an orphaned WAL, used as its recovery-receipt key. The
+ *  bytes are what identify it: a different crash produces different frames, and
+ *  a WAL we already merged keeps the same digest until it is finally removed. */
+function orphanWalDigest(walFp: string): string | undefined {
+  try {
+    return createHash('sha256').update(readFileSync(walFp)).digest('hex');
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a previous recovery pass already committed THIS orphan's rows.
+ *
+ *  STRICTLY read-only: SELECT and nothing else. It must not create the receipts
+ *  table — a bare `CREATE TABLE IF NOT EXISTS` grows the main file (measured
+ *  12288 → 20480 bytes), and this runs BEFORE the archive is taken, so writing
+ *  here would leave the archived shell no longer paired with the WAL frames it
+ *  is meant to preserve. A missing table simply means "no proof". */
+function hasPriorReceipt(dbFp: string, walDigest: string | undefined): boolean {
+  if (!walDigest) return false;
+  try {
+    const db = openDatabaseSyncOrThrow(dbFp, { readOnly: true });
+    try {
+      return db.prepare('SELECT 1 FROM import_recovery_receipts WHERE orphan_digest = ?')
+        .get(walDigest) !== undefined;
+    } finally {
+      db.close();
+    }
+  } catch {
+    // No table yet, or an unreadable store: either way, nothing is proven.
+    return false;
+  }
+}
+
+/** Every orphaned `<db>.tmp*` path a crashed pre-fix import may have left: the
+ *  temporary shell itself plus any of its journals. */
+function orphanedImportSidecars(dbFp: string): string[] {
+  return IMPORT_TMP_SIDECAR_SUFFIXES
+    .map(suffix => `${dbFp}.tmp${suffix}`)
+    .filter(path => existsSync(path));
+}
+
+/**
+ * Rows stranded in an orphaned import WAL, read WITHOUT touching the originals.
+ *
+ * ⚠️ DO NOT "recover" by renaming `<db>.tmp-wal` onto `<db>-wal` in place. A
+ * `-wal` is REPLACE semantics, not merge: once anything has opened the poisoned
+ * store, `CREATE TABLE IF NOT EXISTS` gives it a usable empty table and new
+ * sessions accumulate in the store's OWN `-wal`. Measured on Bun 1.4.0 — the
+ * in-place rename overwrites that live WAL and ALSO fails to replay (the
+ * orphan's frames describe the original bare shell, which the live writes have
+ * since moved past): a store holding 3 fresh sessions went to 0 rows and the 40
+ * stranded ones did not come back either. Net data destruction.
+ *
+ * So replay happens on a private COPY, and the caller merges the result without
+ * overwriting anything live. A damaged orphan never yields half-parsed rows, but
+ * it does NOT reliably announce itself either: measured shapes include throwing
+ * `no such table` (no usable shell at all), replaying zero rows (frames accepted
+ * but the transaction never committed), and — the dangerous one — quietly echoing
+ * whatever the MAIN file already holds. Damage is therefore not detectable from
+ * the returned rows; see the composite warning below.
+ *
+ * ⚠️ THE SCRATCH VIEW IS A COMPOSITE, not a picture of the WAL. It is "current
+ * main file + orphan WAL", and SQLite silently IGNORES an orphan whose header is
+ * invalid. So rows coming back prove nothing about the orphan: a store whose old
+ * code wrote new sessions and checkpointed them into the main file replays those
+ * live rows even when the orphan is entirely unreadable. Counting rows (or
+ * checking they all parse) therefore cannot answer "did the WAL replay" — it
+ * measures the wrong file.
+ *
+ * `walReplayed` answers that question with `PRAGMA wal_checkpoint(PASSIVE)`,
+ * which reports how many WAL frames the engine actually ACCEPTED. Measured on
+ * Bun 1.4.0 and Node 22.21.1 alike, against a 40-row orphan beside 3 live rows
+ * already checkpointed into the main file:
+ *
+ *   intact orphan       → `{busy:0, log:17, checkpointed:17}`, SELECT sees 40
+ *   header zeroed       → `{busy:0, log:0,  checkpointed:0}`,  SELECT sees 3 (live only)
+ *   truncated to 20 KiB → `{busy:0, log:3,  checkpointed:3}`,  SELECT sees 0
+ *
+ * `log > 0` is what rules out the dangerous blind spot — the middle row, where
+ * the WAL contributed NOTHING and the rows on screen are pure live main. It is
+ * still not a completeness proof (the third row accepted 3 frames yet lost every
+ * row), so it is paired with "the replay produced parseable rows". Anything not
+ * proven replayed is archived rather than deleted.
+ *
+ * A differential replay of the shell WITHOUT the orphan is layered on top, so a
+ * future engine that reports frames it then discards still cannot pass. That
+ * comparison uses whole rows rather than ids: a valid orphan may UPDATE a row the
+ * shell already carries, which an id-only diff would miss.
+ */
+function readStrandedImportRows(dbFp: string): {
+  entries: [string, Session][];
+  walReplayed: boolean;
+} {
+  const walFp = `${dbFp}.tmp-wal`;
+  if (!existsSync(walFp)) return { entries: [], walReplayed: false };
+  const scratchFp = `${dbFp}.recover-${process.pid}-${randomUUID()}`;
+  const baseFp = `${dbFp}.recoverbase-${process.pid}-${randomUUID()}`;
+  const scratchPaths = ['', '-journal', '-wal', '-shm'].flatMap(suffix => [
+    `${scratchFp}${suffix}`,
+    `${baseFp}${suffix}`,
+  ]);
+  const dropScratch = (): void => {
+    for (const path of scratchPaths) {
+      try { unlinkSync(path); } catch { /* nothing to drop */ }
+    }
+  };
+  /** session_id → row the shell exposes on its own (no orphan attached). Full
+   *  rows, not just ids: a valid orphan may UPDATE an id the shell already has,
+   *  and comparing ids alone would score that as "the WAL contributed nothing". */
+  const readBaselineRows = (): Map<string, string> => {
+    copyFileSync(dbFp, baseFp);
+    try {
+      const db = openDatabaseSyncOrThrow(baseFp);
+      try {
+        db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
+        const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
+        return new Map(rows.map(r => [r.session_id, r.row]));
+      } finally {
+        db.close();
+      }
+    } catch {
+      // A bare shell with no table is the normal baseline for a poisoned store.
+      return new Map();
+    }
+  };
+  try {
+    const baselineRows = readBaselineRows();
+    // The published `.db` is the exact shell those WAL frames were written
+    // against, so it is the shell the replay must run on.
+    copyFileSync(dbFp, scratchFp);
+    copyFileSync(walFp, `${scratchFp}-wal`);
+    const db = openDatabaseSyncOrThrow(scratchFp);
+    try {
+      db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
+      // Must run BEFORE the SELECT: it reports the frames the engine accepted
+      // from this orphan, which is the only direct evidence the WAL was used.
+      let acceptedFrames = 0;
+      try {
+        const checkpoint = db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as { log?: number | bigint } | undefined;
+        acceptedFrames = Number(checkpoint?.log ?? 0);
+      } catch {
+        // Treat an unavailable pragma as "cannot prove the WAL replayed".
+        acceptedFrames = 0;
+      }
+      const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
+      const entries: [string, Session][] = [];
+      let unparseable = 0;
+      let beyondBaseline = 0;
+      for (const r of rows) {
+        if (baselineRows.get(r.session_id) !== r.row) beyondBaseline++;
+        try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { unparseable++; }
+      }
+      // "The orphan demonstrably replayed": SQLite accepted frames from it AND
+      // it contributed rows the shell did not already have, with nothing corrupt.
+      //
+      // Deliberately NOT extended to "the row sets happen to match, so a previous
+      // pass must have merged it". That inference is timing-dependent — a
+      // truncated orphan beside live rows can produce an identical-looking
+      // observation while its real rows are unaccounted for — so the retry path
+      // is answered by a durable RECEIPT instead (see recoverPoisonedSqliteStore).
+      const walReplayed = acceptedFrames > 0 && unparseable === 0 && beyondBaseline > 0;
+      return { entries, walReplayed };
+    } finally {
+      db.close();
+    }
+  } finally {
+    dropScratch();
+  }
+}
+
+/**
+ * Repair a store poisoned by a crashed pre-fix import, in place, and report how
+ * many rows were rescued. MUST be called with the store's JSON file lock held —
+ * the same lock the import, daemon saves and offline CLI mutations use.
+ *
+ * TWO sources are merged, because neither alone is sufficient:
+ *   • the orphaned WAL — the only copy of anything written after the JSON was
+ *     frozen, and the only source at all if the JSON has since been removed;
+ *   • the frozen JSON — the import read exclusively from it, so it is normally a
+ *     superset of the stranded rows, and the only source that survives a DAMAGED
+ *     orphan. "Normally": the file can later be trimmed or partially restored,
+ *     so it is not treated as authoritative on its own.
+ * A partially-written orphan is precisely why both are needed: truncating one
+ * replays as "schema, zero rows" without any error, so trusting the orphan alone
+ * would delete it and report a healthy EMPTY store — the very silent-loss bug
+ * this function exists to end.
+ *
+ * Two independent decisions come out of that, and conflating them is what makes
+ * this subtle:
+ *
+ * 1. MAY WE PROCEED AT ALL? Only with POSITIVE ATTESTATION of what the store
+ *    held. Three things can supply it:
+ *      • the orphan demonstrably replayed rows;
+ *      • a snapshot file was actually READ — about the source, not the row
+ *        count: a legacy `sessions.json` that parses and filters down to zero
+ *        rows for this bot proves the store held nothing, while a MISSING file
+ *        proves nothing at all;
+ *      • a RECEIPT for this exact orphan digest, written by an earlier pass in
+ *        the same transaction as its merge — the only proof that survives a
+ *        crash, and the one that lets an interrupted cleanup finish.
+ *    With none of them, "zero rows" is indistinguishable from "damaged, contents
+ *    unknown", so recovery refuses and keeps the orphans for manual rescue.
+ *
+ * 2. MAY WE DESTROY THE ORPHAN? Only when its contents are accounted for. Frame
+ *    counts cannot establish that: a WAL truncated mid-transaction still gets
+ *    frames ACCEPTED (its schema prefix) while contributing no data rows at all,
+ *    because the missing commit frame means SQLite exposes none of that
+ *    transaction. Equally, "we merged something" is not proof nothing was lost —
+ *    with a trimmed snapshot beside a damaged orphan, both sources can be missing
+ *    the same session and the merge silently converges on an incomplete store.
+ *    When completeness cannot be proven, the
+ *    pair is ARCHIVED rather than deleted — `<db>.unrecovered-<ts>.db` plus its
+ *    `-wal`: the ORIGINAL bytes, kept beside the shell they belong to, for
+ *    forensics or a manual salvage attempt.
+ *
+ *    It is deliberately NOT a promise that the couple replays. Measured: a WAL
+ *    truncated mid-transaction hands back zero rows, because the missing commit
+ *    frame means SQLite exposes no partial transaction at all — the damage lost
+ *    those rows, not the archiving. What archiving guarantees is that nothing is
+ *    thrown away: whatever a human can still extract remains extractable.
+ *
+ *    Archiving, rather than leaving the file in place, is also what makes the
+ *    store usable again. The orphan path IS the poison predicate, so keeping
+ *    `<db>.tmp-wal` there would re-enter recovery on every single start and leave
+ *    every `owner:false` worker permanently fail-closed. And the shell is copied
+ *    BEFORE the merge, since the merge advances the live database — a shell
+ *    copied afterwards would no longer be the one those frames were written
+ *    against.
+ *
+ * Merge policy is `INSERT OR IGNORE`: rows that exist live always win. Both
+ * sources predate every live write by construction, so preferring live rows
+ * cannot lose newer state. Verified: 40 stranded + 3 live → 43, both kept.
+ *
+ * Orphans are removed only after the merge commits, so a crash mid-recovery
+ * leaves the store exactly as recoverable as it was before. The `.tmp-wal` is
+ * deleted LAST, so a crash mid-cleanup always leaves the still-authoritative
+ * file behind rather than a stray sidecar with the evidence already gone.
+ */
+function recoverPoisonedSqliteStore(dbFp: string, jsonFp: string): {
+  merged: number;
+  archivedEvidence?: string;
+} {
+  const walFp = `${dbFp}.tmp-wal`;
+  const walPresent = existsSync(walFp);
+  const walDigest = walPresent ? orphanWalDigest(walFp) : undefined;
+  let stranded: [string, Session][] = [];
+  let walReplayed = false;
+  try {
+    const replay = readStrandedImportRows(dbFp);
+    stranded = replay.entries;
+    walReplayed = replay.walReplayed;
+  } catch (err) {
+    logger.error(`Could not replay the orphaned import WAL for ${dbFp}: ${err}`);
+  }
+
+  let frozen: [string, Session][] = [];
+  let frozenAttests = false;
+  try {
+    const snapshot = readFrozenSnapshotForImport(jsonFp);
+    frozen = snapshot.entries;
+    // A snapshot that was actually READ attests, even when it resolves to zero
+    // rows for this bot — that is a positive statement about the store. Only
+    // `none` (no readable file anywhere) fails to attest.
+    frozenAttests = snapshot.source !== 'none';
+  } catch (err) {
+    logger.error(`Could not read the frozen JSON snapshot for ${dbFp}: ${err}`);
+  }
+
+  // The composite view can echo rows that live only in the MAIN file, so
+  // `stranded.length` is not evidence about the orphan. Proceeding requires the
+  // orphan to have demonstrably replayed, or a snapshot to have been read.
+  const priorReceipt = hasPriorReceipt(dbFp, walDigest);
+  if (!walReplayed && !frozenAttests && !priorReceipt) {
+    throw new SessionStoreRecoveryUnattestedError(
+      `cannot recover ${dbFp}: the orphaned import WAL could not be proven to have replayed and no frozen `
+      + 'JSON snapshot could attest the store contents',
+    );
+  }
+
+  // Archive BEFORE the merge: the shell must be the one those WAL frames were
+  // written against, and the merge is about to change it. A receipt (checked in
+  // the transaction below) can still spare an archive on the retry path, so this
+  // decision is revisited there rather than being final here.
+  let archivedEvidence: string | undefined;
+  if (walPresent && !walReplayed && !priorReceipt) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archiveFp = `${dbFp}.unrecovered-${stamp}.db`;
+    try {
+      copyFileSync(dbFp, archiveFp);
+      copyFileSync(walFp, `${archiveFp}-wal`);
+      archivedEvidence = archiveFp;
+    } catch (err) {
+      // Could not preserve the couple — do NOT delete the original below.
+      logger.error(`Could not archive the unrecovered import WAL for ${dbFp}: ${err}`);
+      throw err;
+    }
+  }
+
+  const db = openDbForOwnStore(dbFp);
+  let merged = 0;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // Inside the transaction, so the schema write cannot advance the shell
+      // before the archive above was taken.
+      db.exec(RECOVERY_RECEIPTS_SCHEMA_SQL);
+      const insert = db.prepare('INSERT OR IGNORE INTO sessions (session_id, status, row) VALUES (?, ?, ?)');
+      for (const [key, value] of [...stranded, ...frozen]) {
+        const result = insert.run(key, sessionStatusText(value), JSON.stringify(value));
+        if (Number(result.changes) > 0) merged++;
+      }
+      // Record the receipt in the SAME transaction as the rows: either both land
+      // or neither does, so a receipt can never claim a merge that did not commit.
+      if (walDigest && walReplayed) {
+        db.prepare('INSERT OR IGNORE INTO import_recovery_receipts (orphan_digest, merged_at, merged_rows) VALUES (?, ?, ?)')
+          .run(walDigest, new Date().toISOString(), merged);
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* txn already gone */ }
+      throw err;
+    }
+  } finally {
+    db.close();
+  }
+  // Committed, and anything unproven is archived under a name the poison
+  // predicate ignores, so the originals can go.
+  //
+  // ORDER IS A CORRECTNESS PROPERTY, not tidiness. `<db>.tmp-wal` is the only
+  // sidecar that carries rows, so it is deleted LAST and only once every other
+  // sidecar is provably gone. That makes "just a lone `.tmp-shm`" unreachable —
+  // neither a successful recovery nor a crash midway through cleanup can produce
+  // it — which is what lets a lone `-shm` keep counting as a poisoned store
+  // instead of being waved through as a healthy empty one. If any earlier unlink
+  // fails, the WAL stays: the store still tests as poisoned and the next start
+  // re-runs an idempotent merge.
+  let sidecarsCleared = true;
+  for (const path of orphanedImportSidecars(dbFp)) {
+    if (path === walFp) continue;
+    try {
+      unlinkSync(path);
+    } catch (err) {
+      sidecarsCleared = false;
+      logger.error(`Could not remove orphaned import sidecar ${path}: ${err}`);
+    }
+  }
+  // The WAL may go once its contents are accounted for, which happens three ways:
+  //   • this pass replayed it (its rows are now merged);
+  //   • a receipt proves an earlier pass committed them (interrupted-cleanup retry);
+  //   • it was ARCHIVED — the original bytes are preserved elsewhere, which is
+  //     the whole point of archiving. (A failed copy throws above, so reaching
+  //     here with `archivedEvidence` set means the copy succeeded.)
+  const walAccountedFor = walReplayed || priorReceipt || archivedEvidence !== undefined;
+  if (walPresent && sidecarsCleared && walAccountedFor) {
+    try { unlinkSync(walFp); } catch (err) {
+      logger.error(`Could not remove the orphaned import WAL ${walFp}: ${err}`);
+    }
+  } else if (walPresent && !archivedEvidence) {
+    // Neither replayed nor receipted, and not archived either: leave it exactly
+    // where it is. The store keeps testing as poisoned, which is the honest
+    // state — its contents are unaccounted for.
+    logger.warn(`Leaving ${walFp} in place: its rows are not accounted for.`);
+  }
+  return { merged, archivedEvidence };
 }
 
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
@@ -548,6 +990,56 @@ function load(): void {
   ensureDir();
   const dbFp = getDbPath();
   const jsonFp = getFilePath();
+
+  // A poisoned store must never be mistaken for an empty one. Recover it before
+  // anything reads it, or fail closed so listSessionsStrict() throws instead of
+  // answering "there are no durable sessions".
+  if (existsSync(dbFp) && orphanedImportSidecars(dbFp).length > 0) {
+    if (!sqliteBootstrapAllowed) {
+      // A worker must not repair a store its still-running daemon owns. Report
+      // unavailable rather than serve the truncated view.
+      loadFailure = new Error(
+        `session store ${dbFp} has orphaned import sidecars (${orphanedImportSidecars(dbFp).join(', ')}); `
+        + 'a non-owning process may not recover it',
+      );
+      logger.error(`Refusing to load poisoned session store as a non-owner: ${loadFailure.message}`);
+      sessions = new Map();
+      loaded = true;
+      return;
+    }
+    try {
+      withFileLockSync(jsonFp, () => {
+        // Re-check under the lock: another owning process may have just fixed it.
+        if (orphanedImportSidecars(dbFp).length === 0) return;
+        const { merged, archivedEvidence } = recoverPoisonedSqliteStore(dbFp, jsonFp);
+        if (archivedEvidence) {
+          // The merge committed, but the orphan could not be proven to have
+          // replayed, so a matched shell+WAL couple was archived under a name
+          // the poison predicate ignores. Say so loudly: the store is usable,
+          // yet a human may still want to replay that couple by hand.
+          logger.warn(
+            `Recovered ${merged} session row(s) stranded by a crashed SQLite import into ${dbFp}, but the `
+            + `orphaned WAL could not be proven to have replayed — archived the matching shell+WAL couple to `
+            + `${archivedEvidence}(-wal) for manual inspection. Delete it once you are satisfied nothing is missing.`,
+          );
+        } else {
+          logger.warn(
+            `Recovered ${merged} session row(s) stranded by a crashed SQLite import into ${dbFp}; `
+            + 'removed the orphaned .tmp sidecars',
+          );
+        }
+      });
+    } catch (err) {
+      if (isTransientStoreContentionError(err)) throw err;
+      // Fail closed: the rows are still on disk, but this process cannot prove
+      // what the store holds, so it must not report an empty projection.
+      logger.error(`Failed to recover poisoned session store ${dbFp}: ${err}`);
+      loadFailure = err instanceof Error ? err : new Error(String(err));
+      sessions = new Map();
+      loaded = true;
+      return;
+    }
+  }
 
   if (!existsSync(dbFp) && sqliteBootstrapAllowed) {
     // First start on the SQLite engine: import this store's JSON rows (or

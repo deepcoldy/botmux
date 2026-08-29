@@ -147,6 +147,20 @@ export interface CardHandlerDeps {
   codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
+  /** 把 passthrough 命令（如 /compact）透传到仍存活的会话。由 daemon 接线到
+   *  deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 绑定/卡片冻结/
+   *  turn-starting 逻辑）。未接线时 compact_session 走 unsupported toast 兜底。 */
+  deliverPassthroughCommand?: (
+    ds: DaemonSession,
+    cmd: string,
+    opts: {
+      anchor: string;
+      senderOpenId?: string;
+      senderIsBot: boolean;
+      messageId: string;
+      replyRootId?: string;
+    },
+  ) => void;
 }
 
 /**
@@ -2002,7 +2016,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -3468,6 +3482,96 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
       return;
+    }
+
+    // 「⏹ 停止」：中断当前 turn 但保留会话（不是 /close——turn 跑飞时折叠态用户此前
+    // 唯一手段是杀整个会话丢上下文）。走已有的 term_action ctrlc IPC 链路
+    // （sendWorkerSessionInput → worker.handleTermAction → sendCriticalControlKey
+    // 带重试注入 ^C），与展开态 ^C 快捷键完全同款。中断后把卡片重渲染为 transient
+    // 'interrupted' 状态（橙色 header + 已中断文案），~2s 后被下一次 screen_update
+    // patch 覆盖为真实 idle 态。
+    if (actionType === 'stop_turn') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (isSessionTransferring(ds)) {
+        return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
+      }
+      // RPC 输入模式下 ^C 到不了 app-server（pane 只是 viewer）；codex-app（App Runner）
+      // 无 PTY 输入通道。两者都降级为明确拒绝，提示用 /close。
+      if (ds.initConfig?.codexRpcInput === true || sessionCliId(ds) === 'codex-app') {
+        return { toast: { type: 'warning', content: t('card.action.stop_unsupported', undefined, locDs) } };
+      }
+      if (!ds.worker || ds.worker.killed) {
+        return { toast: { type: 'warning', content: t('card.action.stop_no_worker', undefined, locDs) } };
+      }
+      sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
+      logger.info(`[${tag(ds)}] stop_turn: ^C sent (session kept alive)`);
+      // 重渲染为 'interrupted' transient 状态——与 term_action 重渲染完全同款模式，
+      // 唯一差异是 status 参数传 'interrupted' 而非 ds.lastScreenStatus。
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
+        const effectiveCliId = sessionCliId(ds);
+        const readUrl = readableTerminalUrlFor(ds);
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          sessionAnchorId(ds),
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          'interrupted',
+          effectiveCliId,
+          ds.displayMode ?? 'screenshot',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+          !!ds.adoptedFrom,
+          false,
+          localeForBot(ds.larkAppId),
+          cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
+          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          silentIdleCardFlag(ds),
+        );
+        return {
+          toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
+          card: { type: 'raw' as const, data: JSON.parse(cardJson) },
+        };
+      }
+      return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
+    }
+
+    // 「🗜️ 压缩」：等价于用户在话题里发 /compact——通过 deps.deliverPassthroughCommand
+    // 复用 daemon 的 deliverPassthroughToExistingSession（raw_input 透传，含完整 turn
+    // 绑定/卡片冻结/turn-starting 逻辑），不新造压缩逻辑。daemon 未接线时走 unsupported
+    // toast 兜底。与 daemon passthrough 路径一致，不用 withBotTurnMutation
+    // （deliverPassthroughToExistingSession 内部自己管 turn 绑定）。
+    if (actionType === 'compact_session') {
+      const locDs = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
+      }
+      if (isSessionTransferring(ds)) {
+        return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
+      }
+      if (!ds.worker || ds.worker.killed) {
+        return { toast: { type: 'warning', content: t('card.action.compact_no_worker', undefined, locDs) } };
+      }
+      if (!deps.deliverPassthroughCommand) {
+        return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
+      }
+      deps.deliverPassthroughCommand(ds, '/compact', {
+        anchor: sessionAnchorId(ds),
+        senderOpenId: operatorOpenId,
+        senderIsBot: false,
+        messageId: cardMessageId ?? `compact-${Date.now()}`,
+        replyRootId: rootId,
+      });
+      logger.info(`[${tag(ds)}] compact_session: /compact passthrough sent`);
+      return { toast: { type: 'success', content: t('card.action.compact_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
     }
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.

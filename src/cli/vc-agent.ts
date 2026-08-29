@@ -24,6 +24,7 @@ import { resolveSessionContext } from '../core/session-marker.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
 import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
 import type { NormalizedVcMeetingItem } from '../vc-agent/types.js';
+import { loopbackFetch } from '../core/loopback-fetch.js';
 
 const VC_AGENT_SPEAK_MAX_TEXT_LENGTH = 200;
 
@@ -322,7 +323,7 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
     ? receiverPortRaw
     : discoveredReceiver?.ipcPort;
   if (receiverSessionId && receiverAppId && receiverPort) {
-    const managedResponse = await fetch(`http://127.0.0.1:${receiverPort}/api/vc-meetings/action-request`, {
+    const managedResponse = await loopbackFetch(`http://127.0.0.1:${receiverPort}/api/vc-meetings/action-request`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({

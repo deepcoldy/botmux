@@ -3,7 +3,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, type ChildProcess } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -26,7 +26,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { spawnWorker } from './self-spawn.js';
+import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
@@ -100,6 +100,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -112,6 +113,12 @@ const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+
+/** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
+function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefined {
+  if (!larkAppId) return undefined;
+  return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
+}
 
 /** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
 function workerForkExecArgv(): string[] {
@@ -280,6 +287,8 @@ export function getDaemonSessionUsageSnapshot(
       // card refreshes on every status tick and rides the reader's reparse
       // throttle instead (fresh:false) to stay off the disk.
       fresh: opts?.fresh ?? true,
+      // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
+      pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
     });
   } catch (error) {
     logger.warn(
@@ -13992,6 +14001,20 @@ export function listProcesses(): ProcSnapshot[] {
 }
 
 /**
+ * This executable's absolute, symlink-resolved path.
+ *
+ * `process.execPath` is already absolute and kernel-resolved, so this is normally
+ * a no-op; realpath is applied anyway so a comparison against a `/proc` argv[0]
+ * cannot be defeated by the daemon having been started through a symlink (a
+ * released install commonly sits behind `~/.botmux/bin/botmux`). Falls back to the
+ * raw value when the path cannot be resolved — a failed realpath must not turn the
+ * reaper into a no-op.
+ */
+function canonicalExecPath(): string {
+  try { return realpathSync(process.execPath); } catch { return process.execPath; }
+}
+
+/**
  * Reap worker processes orphaned by a previous daemon that died WITHOUT running
  * its graceful shutdown — SIGKILL, OOM, or an uncaught crash. The shutdown()
  * path in daemon.ts already SIGKILLs stragglers on SIGTERM, but a hard kill
@@ -14021,12 +14044,59 @@ export function reapOrphanWorkers(opts: {
   if (process.platform === 'win32') return 0;
   const procs = opts.procs ?? listProcesses();
   const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
-  const workerPath = opts.workerPath ?? join(__dirname, '..', 'worker.js');
+  // How THIS install's workers appear in a command line.
+  //
+  // Node: `<node> <dist>/worker.js` — the script path identifies the install.
+  //
+  // ⚠️ Compiled single-file binary: there IS no worker.js on disk. spawnWorker()
+  // launches `<binary> __worker` (see src/core/self-spawn.ts), while
+  // `join(__dirname,'..','worker.js')` evaluates to `/$bunfs/worker.js` — a
+  // process-private virtual path that appears in NO command line. MEASURED: a real
+  // compiled worker's cmdline is `<binary> __worker`, so the old predicate matched
+  // nothing and orphans were NEVER reaped in the compiled form. That is the failure
+  // this function exists to prevent: each orphan leaks ~0.5 GB and they accumulate
+  // across restarts (daemon.ts records an 841-orphan / ~65 GB incident).
+  //
+  // The compiled predicate must keep the SAME conservatism the worker.js path had:
+  // it identified this install by an ABSOLUTE path, so another botmux install's
+  // orphans could never match. A basename-only check loses that — every released
+  // install names its binary `botmux`, so install A would reap install B's
+  // orphans (verified: with a same-named binary at a different absolute path, a
+  // basename check reaps it).
+  //
+  // So match on the absolute path when the command line carries one. That is the
+  // normal case for OUR workers: spawnWorker launches them via
+  // `resolveEntrySpawn` → `process.execPath`, which the kernel has already
+  // resolved to an absolute path (MEASURED in /proc/<pid>/cmdline:
+  // `/…/botmux-linux-x64 __worker`). Only a RELATIVE argv[0] — a binary started
+  // by a bare PATH lookup, which our own spawns never produce — falls back to the
+  // basename, where cross-install ambiguity is unavoidable but the process was
+  // also not started the way we start ours.
+  const standalone = isStandaloneBinary();
+  const workerPath = opts.workerPath ?? (standalone ? undefined : join(__dirname, '..', 'worker.js'));
+  const selfBinary = standalone ? canonicalExecPath() : '';
+  const selfBinaryName = standalone ? basename(selfBinary) : '';
+
+  /** Does this command line belong to a worker of THIS install? */
+  const isOurWorker = (cmd: string): boolean => {
+    if (workerPath !== undefined) return cmd.includes(workerPath);
+    // Compiled form: `<binary> __worker`. The token alone is not enough — a
+    // process merely mentioning `__worker` (a grep, another install) must be
+    // spared.
+    if (!cmd.includes(WORKER_ENTRY_SUBCOMMAND)) return false;
+    const argv0 = cmd.split(/\s+/, 1)[0] ?? '';
+    // Absolute argv[0] → require the exact executable, so a same-named binary
+    // from a different install is not ours.
+    if (argv0.startsWith('/')) return argv0 === selfBinary;
+    // Relative argv[0] (never produced by our own spawns) → basename is all
+    // there is to compare.
+    return basename(argv0) === selfBinaryName;
+  };
 
   let reaped = 0;
   for (const p of procs) {
-    if (p.ppid !== 1) continue;                 // parent still alive → not an orphan
-    if (!p.cmd.includes(workerPath)) continue;  // not OUR worker script
+    if (p.ppid !== 1) continue;         // parent still alive → not an orphan
+    if (!isOurWorker(p.cmd)) continue;  // not OUR worker
     try {
       // SIGKILL, not SIGTERM: an orphan can be wedged in a sync code path (the
       // very failure mode that produced it) where SIGTERM is lost. It holds no

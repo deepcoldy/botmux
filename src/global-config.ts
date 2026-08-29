@@ -303,17 +303,21 @@ export interface DashboardGlobalConfig {
    *  model; harmless but unnecessary otherwise. Read live — see config.ts
    *  `noVisibleOutputHint`. */
   noVisibleOutputHint?: boolean;
+  /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
+   *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
+  contextCompactThreshold?: number;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
- *  recognizable engine or engine-specific creds. Deep validation (usable
- *  creds) happens in resolveVoiceConfig; here we just gate obvious garbage. */
+ *  recognizable engine or engine-specific creds (TTS) / an asr block. Deep
+ *  validation (usable creds / enabled) happens in resolveVoiceConfig /
+ *  resolveAsrConfig; here we just gate obvious garbage. */
 function readVoice(raw: unknown): VoiceConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === undefined;
   if (!engineOk) return undefined;
-  if (!v.sami && !v.openai && !v.engine) return undefined;
+  if (!v.sami && !v.openai && !v.engine && !v.asr) return undefined;
   return v as VoiceConfig;
 }
 
@@ -434,6 +438,12 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // preserve a stored `false` to let an operator disable it.
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
+  // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
+  if (typeof d.contextCompactThreshold === 'number'
+    && Number.isFinite(d.contextCompactThreshold)
+    && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
+    out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

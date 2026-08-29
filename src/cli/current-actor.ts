@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 export const CURRENT_ACTOR_SCHEMA = 'botmux.current-actor.v2' as const;
 export const CURRENT_ACTOR_ROUTE = '/api/current-actor';
@@ -151,7 +152,7 @@ export async function resolveCurrentActor(
   }
   let response: Response;
   try {
-    response = await (options.fetchImpl ?? fetch)(
+    response = await (options.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${options.ipcPort}${CURRENT_ACTOR_ROUTE}`,
       {
         method: 'POST',

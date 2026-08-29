@@ -27,12 +27,18 @@ export function classifySetupOpenPlatformOutcome(
   // redirect 白名单没写成功也算 warning：它不阻断建 bot，但缺了它 authorize 直接
   // 20029（群聊模式 p2pMode=group / 会话群标签 / `/login` 全都授权不了）。历史实现
   // 把这种「建好了但一授权就失败」的 bot 报成纯 ready，用户只能等踩坑才发现。
+  //
+  // 例外：`publishSkipped` 说明本次「配置本就齐全、无变更 → 有意跳过发版」。这条
+  // 短路分支里 versionId 必为空、importedScopeCount 必为 0（真发了 scope/update 就
+  // 会置 mutated 而不走短路），两者都是**预期结果**而非缺陷——不排除的话，一次完全
+  // 健康的重启自检会被恒判成 ready_with_warnings。
+  const publishSkipped = result.publishSkipped === true;
   const hasWarnings = Boolean(
     result.scopeWarning
     || result.eventWarning
-    || result.scopeCount === 0
+    || (result.scopeCount === 0 && !publishSkipped)
     || result.skippedScopeCount > 0
-    || !result.versionId
+    || (!result.versionId && !publishSkipped)
     || !result.redirectConfigured
     || result.redirectWarning
   );

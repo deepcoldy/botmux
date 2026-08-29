@@ -417,6 +417,78 @@ function installClaudeSettings(
  *   - stdout 为空（passthrough：daemon 不可达 / 超时 / 非 botmux 会话）→ 不 reply，把问题
  *     留给 OpenCode 原生 picker（botmux web 终端里仍可人工作答）。
  */
+/**
+ * Injected into BOTH generated plugin templates (V1 and V2).
+ *
+ * ⚠️ Emit this wherever `loopbackSafeFetch` is CALLED. It was first added to the
+ * V2 template only, while the V1 fallback call was switched over too — the V1
+ * plugin then died with `ReferenceError: loopbackSafeFetch is not defined` the
+ * moment it took that path. "Changed the call, forgot the definition" is the
+ * classic generated-template defect, so the definition lives in one constant and
+ * is interpolated into every template that uses it.
+ *
+ * Why it exists at all: these plugins run inside OpenCode's **Bun** process, and
+ * Bun's `fetch` auto-uses `$http_proxy` while `no_proxy` is literal-match only
+ * (no CIDR, and `localhost` does not cover `127.0.0.1`). On a corporate dev box a
+ * request to the LOCAL serve is handed to the proxy — the ask reply fails AND the
+ * Basic password from the registration file is sent to the proxy. A generated file
+ * cannot import repo helpers, so this is a minimal inline version; remote,
+ * user-configurable URLs still use the native fetch.
+ */
+const LOOPBACK_SAFE_FETCH_SNIPPET = `
+// 本机 loopback 请求绝不能走全局 fetch。这段代码跑在 OpenCode 的 **Bun** 进程里，
+// 而 Bun 的 fetch 会自动使用 $http_proxy，且 no_proxy 只做字面量匹配（不解析 CIDR，
+// 也不把 localhost 当作覆盖 127.0.0.1）。公司内网开发机普遍 export 这种组合，于是
+// 打本机 serve 的请求被交给公司代理：不只是回答 ask 失败，注册文件里的 Basic 口令
+// 也会随请求发给代理。这里不能 import 仓库里的 helper（本文件是**生成**到插件目录的
+// 独立脚本），所以内联一份最小实现；远端可配置 URL 仍走原生 fetch，只有字面量
+// loopback 才切到 node:http（它完全无视代理 env）。
+function isLiteralLoopback(u) {
+  try {
+    const p = new URL(u);
+    // http: only — this helper is node:http, so claiming an https: URL is
+    // loopback-safe would pick a transport that cannot serve it.
+    if (p.protocol !== "http:") return false;
+    // URL.hostname keeps IPv6 bracketed; node:http wants the bare address.
+    const h = p.hostname.startsWith("[") && p.hostname.endsWith("]")
+      ? p.hostname.slice(1, -1) : p.hostname;
+    return h === "127.0.0.1" || h === "localhost" || h === "::1";
+  } catch { return false; }
+}
+async function loopbackSafeFetch(url, init) {
+  if (!isLiteralLoopback(url)) return fetch(url, init);
+  const http = await import("node:http");
+  const t = new URL(url);
+  return await new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: (() => {
+          const h = t.hostname.startsWith("[") && t.hostname.endsWith("]")
+            ? t.hostname.slice(1, -1) : t.hostname;
+          return h === "localhost" ? "127.0.0.1" : h;
+        })(),
+        port: t.port || 80, path: t.pathname + t.search,
+        method: (init && init.method) || "GET", headers: (init && init.headers) || {} },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(Buffer.from(c)));
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            text: async () => buf.toString("utf8"),
+            json: async () => JSON.parse(buf.toString("utf8")),
+          });
+        });
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    if (init && init.body) req.end(init.body); else req.end();
+  });
+}
+`;
+
 function buildOpenCodePlugin(parts: { cmd: string; args: string[] }): string {
   // 用 argv 形式嵌入（不拼 shell 字符串、不 split）：含空格/引号的路径也不会被拆坏。
   const cmdLit = JSON.stringify(parts.cmd);
@@ -473,6 +545,7 @@ function safeStr(x) {
   try { return String(JSON.stringify(x)).slice(0, 120); } catch { return String(x); }
 }
 
+${LOOPBACK_SAFE_FETCH_SNIPPET}
 async function postReply(client, serverUrl, id, answers) {
   const body = { answers };
   // 1) 经 client._client（带 directory 头 + 正确传输）。这是 daemon 多实例下唯一可达的路径：
@@ -502,7 +575,7 @@ async function postReply(client, serverUrl, id, answers) {
     } catch {}
     const url = base + "/question/" + id + "/reply";
     dbg("FETCH_POST url=" + url + " headers=" + Object.keys(headers).join(","));
-    const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+    const r = await loopbackSafeFetch(url, { method: "POST", headers, body: JSON.stringify(body) });
     let txt = ""; try { txt = await r.text(); } catch {}
     dbg("FETCH_POST_RESULT id=" + id + " status=" + r.status + " body=" + txt.slice(0, 150));
     return r.ok;
@@ -644,6 +717,7 @@ function readRegistration() {
 
 // 把答案回传给 OpenCode 2.0 解阻塞。必须带 x-opencode-directory 头（多 worktree
 // 路由），带注册文件里的 Basic auth。
+${LOOPBACK_SAFE_FETCH_SNIPPET}
 async function postReply(directory, sessionID, requestID, answers) {
   const reg = readRegistration();
   if (!reg) { dbg("NO_REGISTRATION id=" + requestID); return; }
@@ -656,7 +730,7 @@ async function postReply(directory, sessionID, requestID, answers) {
   const url = base + "/api/session/" + encodeURIComponent(sessionID) + "/question/" + encodeURIComponent(requestID) + "/reply";
   dbg("POST_REPLY id=" + requestID + " url=" + url);
   try {
-    const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ answers }) });
+    const r = await loopbackSafeFetch(url, { method: "POST", headers, body: JSON.stringify({ answers }) });
     let txt = ""; try { txt = await r.text(); } catch {}
     dbg("REPLY_DONE id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
     if (!r.ok) dbg("REPLY_NON_OK id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));

@@ -27,7 +27,13 @@ import { join, dirname } from 'node:path';
  * talks over IPC is unchanged.
  */
 
-export type BotmuxEntry = 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard';
+export type BotmuxEntry =
+  | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
+  // CLI-adapter runners. Unlike the entries above these are not fleet processes:
+  // an adapter spawns one as the CLI session itself (`resolvedBin` is
+  // process.execPath and the runner is argv[0]). They need the same treatment for
+  // the same reason — see RUNNER_ENTRIES below.
+  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -36,6 +42,10 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'worker': '__worker',
   'supervisor': '__supervisor',
   'dashboard': '__dashboard',
+  'codex-app-runner': '__codex-app-runner',
+  'dsh-runner': '__dsh-runner',
+  'mira-runner': '__mira-runner',
+  'mir-runner': '__mir-runner',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -45,7 +55,54 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'worker': 'worker.js',
   'supervisor': 'index-supervisor.js',
   'dashboard': 'index-dashboard.js',
+  'codex-app-runner': 'codex-app-runner.js',
+  'dsh-runner': 'dsh-runner.js',
+  'mira-runner': 'mira-runner.js',
+  'mir-runner': 'mir-runner.js',
 };
+
+/**
+ * The CLI-adapter runners, i.e. the entries a `createXAdapter()` launches as the
+ * session process rather than as part of the fleet.
+ *
+ * WHY THEY BELONG HERE: each adapter used to locate its runner by walking up from
+ * its own module path (`resolve(here,'..','..','<name>-runner.js')`, plus a
+ * dist/ fallback). In the compiled binary `here` is `/$bunfs/root`, so both
+ * candidates collapse onto the real filesystem root — MEASURED: `/codex-app-runner.js`
+ * and `/dist/codex-app-runner.js`, both `existsSync === false`. `runnerPath()` has
+ * no fail-closed branch: it returns the non-existent sibling anyway, the binary
+ * re-execs ITSELF with that path as argv[0], normal CLI dispatch does not recognise
+ * it, and the process PRINTS HELP AND EXITS 0. The user gets a help dump instead of
+ * a session, with nothing logged as an error.
+ *
+ * Exported so a test can assert every runner is wired end to end (token → dispatch
+ * → dist filename) rather than checking one and assuming the rest.
+ */
+export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
+  'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner',
+] as const;
+
+/**
+ * The FIRST argv entry an adapter must pass so `resolvedBin` (= process.execPath)
+ * becomes the given runner.
+ *
+ * Compiled binary: the hidden token — `<binary> __mira-runner …`.
+ * Node: the script path as the caller resolved it — `<node> …/mira-runner.js …`.
+ *
+ * A single function instead of four inline ternaries: the adapters are otherwise
+ * identical here, and four copies of one predicate is exactly how the three
+ * hook-command call sites drifted apart.
+ *
+ * `scriptPath` is supplied by the caller because each adapter owns its own
+ * resolution order (a test-scoped env override, a compiled sibling, a source-tree
+ * dist/) and this module stays location-agnostic. Its VALUE is unused in the
+ * compiled branch — the argument is still evaluated, as JS is strict about that,
+ * so an adapter may pass a path it knows does not exist there but must not put a
+ * side effect in the expression that produces it.
+ */
+export function runnerArgv0(entry: BotmuxEntry, scriptPath: string): string {
+  return isStandaloneBinary() ? ENTRY_SUBCOMMAND[entry] : scriptPath;
+}
 
 /** True only when running as a `bun build --compile` single-file executable.
  *
@@ -82,6 +139,15 @@ export function resolveEntrySpawn(entry: BotmuxEntry, distDir: string): { comman
 
 /** The set of hidden subcommand tokens, so the CLI dispatcher can recognize them. */
 export const ENTRY_SUBCOMMANDS: ReadonlySet<string> = new Set(Object.values(ENTRY_SUBCOMMAND));
+
+/**
+ * The hidden token a compiled binary is launched with to become a worker, i.e.
+ * `<binary> __worker`. Exported because the orphan reaper has to RECOGNIZE that
+ * command line in `ps` output: in the compiled form there is no `worker.js` path
+ * to match on, and a hardcoded `'__worker'` literal at the matching site would
+ * drift away from this map the moment the token changed.
+ */
+export const WORKER_ENTRY_SUBCOMMAND: string = ENTRY_SUBCOMMAND.worker;
 
 /** Map a hidden subcommand token back to its entry (null if not one). */
 export function entryForSubcommand(token: string): BotmuxEntry | null {

@@ -16,11 +16,14 @@ import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { request as httpsRequest } from 'node:https';
-import { request as httpRequest, type IncomingMessage } from 'node:http';
-import { connect as tlsConnect } from 'node:tls';
 import { logger } from '../utils/logger.js';
-import { readGlobalConfig } from '../global-config.js';
+import { getReleaseStream, resolveHttpProxy } from '../core/release-download.js';
+
+// The proxy-aware release download lives in core/release-download.ts so the
+// binary self-update reuses this exact transport (redirect teardown, CONNECT
+// tunnelling) rather than growing a second copy. Re-exported because callers
+// and tests already import it from here.
+export { resolveHttpProxy };
 
 export const HD2D_ASSETS_TAG = 'hd2d-assets-v2';
 const RELEASE_BASE_URL = `https://github.com/deepcoldy/botmux/releases/download/${HD2D_ASSETS_TAG}`;
@@ -69,103 +72,14 @@ async function sha256File(fp: string): Promise<string> {
   return hash.digest('hex');
 }
 
-/** Resolve an outbound proxy: explicit config wins, then the standard env vars
- *  (which Node's global fetch ignores — the whole reason we hand-roll this). */
-export function resolveHttpProxy(): string | undefined {
-  return readGlobalConfig().httpProxy
-    || process.env.HTTPS_PROXY || process.env.https_proxy
-    || process.env.HTTP_PROXY || process.env.http_proxy
-    || undefined;
-}
-
 const DOWNLOAD_UA = 'botmux-hd2d';
-
-/** GET a URL and resolve with the 200 response stream, following redirects and
- *  optionally tunnelling through an HTTP proxy. Uses node:http/https directly
- *  (not fetch) so a configured proxy is actually honored — undici ignores the
- *  proxy env vars. */
-function getStream(rawUrl: string, proxy: string | undefined, redirectsLeft = 5): Promise<IncomingMessage> {
-  return new Promise((resolve, reject) => {
-    let target: URL;
-    try { target = new URL(rawUrl); } catch { reject(new Error(`URL 非法: ${rawUrl}`)); return; }
-    const isHttps = target.protocol === 'https:';
-
-    const handle = (res: IncomingMessage) => {
-      const sc = res.statusCode ?? 0;
-      if (sc >= 300 && sc < 400 && res.headers.location) {
-        // Tear down this hop's connection before following the redirect: a
-        // lingering TLS socket layered over a proxy CONNECT tunnel stalls the
-        // NEXT hop's handshake (observed: github.com → release-assets… drops
-        // with "socket disconnected before secure TLS" unless hop 1 is closed).
-        res.destroy();
-        res.socket?.destroy();
-        if (redirectsLeft <= 0) { reject(new Error('重定向次数过多')); return; }
-        resolve(getStream(new URL(res.headers.location, rawUrl).toString(), proxy, redirectsLeft - 1));
-        return;
-      }
-      if (sc !== 200) { res.resume(); reject(new Error(`HTTP ${sc}`)); return; }
-      resolve(res);
-    };
-
-    let p: URL | undefined;
-    if (proxy) {
-      try { p = new URL(proxy); } catch { reject(new Error(`代理地址非法: ${proxy}`)); return; }
-    }
-    const proxyAuth = (): Record<string, string> => p?.username
-      ? { 'proxy-authorization': `Basic ${Buffer.from(`${decodeURIComponent(p.username)}:${decodeURIComponent(p.password)}`).toString('base64')}` }
-      : {};
-
-    if (p && isHttps) {
-      // HTTPS via HTTP proxy: open a CONNECT tunnel, then TLS over the socket.
-      const port = target.port || '443';
-      const creq = httpRequest({
-        host: p.hostname, port: Number(p.port || 80), method: 'CONNECT', agent: false,
-        path: `${target.hostname}:${port}`,
-        headers: { host: `${target.hostname}:${port}`, ...proxyAuth() },
-      });
-      creq.on('connect', (cres, socket) => {
-        if (cres.statusCode !== 200) { reject(new Error(`代理 CONNECT 失败: HTTP ${cres.statusCode}`)); return; }
-        const tls = tlsConnect({ socket, servername: target.hostname }, () => {
-          const greq = httpsRequest({
-            method: 'GET', path: `${target.pathname}${target.search}`,
-            headers: { host: target.host, 'user-agent': DOWNLOAD_UA },
-            createConnection: () => tls,
-          }, handle);
-          greq.on('error', reject);
-          greq.end();
-        });
-        tls.on('error', reject);
-      });
-      creq.on('error', reject);
-      creq.end();
-      return;
-    }
-
-    if (p) {
-      // Plain HTTP via proxy: send the absolute-form request line to the proxy.
-      const greq = httpRequest({
-        host: p.hostname, port: Number(p.port || 80), method: 'GET', path: rawUrl,
-        headers: { host: target.host, 'user-agent': DOWNLOAD_UA, ...proxyAuth() },
-      }, handle);
-      greq.on('error', reject);
-      greq.end();
-      return;
-    }
-
-    // Direct (no proxy).
-    const mod = isHttps ? httpsRequest : httpRequest;
-    const greq = mod(rawUrl, { headers: { 'user-agent': DOWNLOAD_UA } }, handle);
-    greq.on('error', reject);
-    greq.end();
-  });
-}
 
 async function downloadAsset(a: AssetSpec): Promise<void> {
   if (assetReady(a)) return; // already cached + correct size — bytes pre-counted
   mkdirSync(HD2D_CACHE_DIR, { recursive: true });
   const dest = join(HD2D_CACHE_DIR, a.name);
   const tmp = join(HD2D_CACHE_DIR, `.${a.name}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
-  const res = await getStream(`${RELEASE_BASE_URL}/${a.name}`, resolveHttpProxy());
+  const res = await getReleaseStream(`${RELEASE_BASE_URL}/${a.name}`, resolveHttpProxy(), DOWNLOAD_UA);
   // Count bytes via an in-stream Transform — NOT a `res.on('data')` listener,
   // which would flip the source into flowing mode and race pipeline's pull-based
   // consumption (dropping early chunks / stalling the download).

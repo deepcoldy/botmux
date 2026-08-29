@@ -1,6 +1,9 @@
 node_modules
 .pnpm-store/
 dist/
+# 编译版单文件二进制（bun build --compile，每个 ~170MB）。CI 与发版都往这里写，
+# `bun run use:here --binary` 也默认在这里找 host-arch 产物。
+dist-bin/
 packages/workflow-core/dist/
 packages/workflow-core/.packs/
 data/

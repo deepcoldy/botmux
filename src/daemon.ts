@@ -90,6 +90,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -98,7 +99,11 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
+import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
+import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
+import { resolvePricingConfig } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -648,6 +653,7 @@ import {
   type VcMeetingSealedReceiverSessionBinding,
 } from './services/vc-meeting-im-routing.js';
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -2818,7 +2824,7 @@ async function fetchVcMeetingDaemonJson(
       path,
       headers: vcAuthenticatedHeaders,
     });
-    const upstream = await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
+    const upstream = await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
       ...init,
       headers: authenticatedHeaders,
       signal: init.signal ?? controller.signal,
@@ -5537,6 +5543,16 @@ const cardDeps: CardHandlerDeps = {
     }
     handlers.replayMessageEvent(data);
   },
+  // 卡片「🗜️ 压缩」按钮：等价于用户在话题里发 /compact——走已有的
+  // deliverPassthroughToExistingSession（raw_input 透传，含完整 turn 生命周期）。
+  deliverPassthroughCommand: (ds, cmd, opts) =>
+    deliverPassthroughToExistingSession(ds, cmd, cmd, opts.anchor, ds.larkAppId, {
+      messageId: opts.messageId,
+      replyRootId: opts.replyRootId,
+      senderOpenId: opts.senderOpenId,
+      senderIsBot: opts.senderIsBot,
+      substitute: false,
+    }),
 };
 
 const LEGACY_WORKFLOW_API_RETIRED = {
@@ -17771,6 +17787,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // the contact API. Must run before any await on the sender resolver.
   learnFromMentions(larkAppId, parsed.mentions);
 
+  // 语音消息转写：下载 opus → ASR → 用转写文本替换 '[语音]' 占位符。
+  // 必须在 followupContent 之前——命令识别、标题生成、会话创建都读它。
+  // 转写失败（未配置/下载失败/空结果）已回复用户，直接返回不留孤儿会话。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
+
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
   const isForeignBotSender = isBotSenderType
@@ -19196,6 +19231,24 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+
+  // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
+  // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
+  if (parsed.msgType === 'audio') {
+    const audioOutcome = await resolveInboundAudio(
+      larkAppId,
+      parsed.messageId ?? ctx.messageId,
+      parsed.msgType,
+      data.message?.content ?? '',
+      parsed.content,
+      (text) => replyMessage(larkAppId, anchor, text, 'text'),
+    );
+    if (audioOutcome.kind === 'transcribed') {
+      parsed.content = audioOutcome.text;
+    } else if (audioOutcome.kind === 'failed') {
+      return;
+    }
+  }
 
   // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
   // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
@@ -21499,6 +21552,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
 
+  // ─── 成本/预算接线 ─────────────────────────────────────────────────────
+  // pricingResolver：把 larkAppId 解析成 bot 的定价配置（bots.json pricing 块
+  // → 内置表）。recordSink：每条正 delta 记录落盘后，累计到预算跟踪器，
+  // 超阈值时私聊 bot owner 告警。sink 内异常被 catch，绝不影响 ledger 主路径。
+  setUsageLedgerPricingResolver((larkAppId) => {
+    if (!larkAppId) return undefined;
+    return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
+  });
+  setUsageLedgerRecordSink((record) => {
+    if (!record.larkAppId || !record.costCny || record.costCny <= 0) return;
+    try {
+      const bot = getBot(record.larkAppId);
+      const budget = bot?.config?.budget;
+      if (!budget) return;
+      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
+      if (alert) {
+        const ownerOpenId = bot?.config?.ownerOpenId;
+        if (ownerOpenId) {
+          sendUserMessage(record.larkAppId, ownerOpenId, formatBudgetAlert(alert), 'text')
+            .catch(err => logger.warn(`[budget] failed to send alert to owner: ${err}`));
+        }
+        logger.warn(`[budget] ${record.larkAppId} alert: spent=${alert.spentCny} budget=${alert.monthlyCny} (${alert.percent}%)`);
+      }
+    } catch (err) {
+      logger.warn(`[budget] sink error: ${err}`);
+    }
+  });
+
   // Issue Board 领取的「激活」入口。
   //
   // 复用 handleBotAdded 而不是另写建会话逻辑：那套 CAS 注册 + ready 屏障 + 接管检测是有
@@ -21971,6 +22052,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
         });
+      }
+      // Record the failed/interrupted turn for /retry. Best-effort: a persist
+      // failure must not crash the worker IPC handler (same contract as the
+      // turn-completion enqueue above). The reply-target guard skips type-ahead
+      // scenarios where a newer turn already owns the captured prompt.
+      try {
+        // shouldRecordFailedTurn guarantees failed/ambiguous; re-narrow to the
+        // typed builder (property narrowing does not propagate to the argument).
+        const failedStatus = terminal.status === 'failed' || terminal.status === 'ambiguous'
+          ? terminal.status
+          : undefined;
+        if (failedStatus && shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)) {
+          const record = buildFailedTurnRecord(
+            { turnId: terminal.turnId, status: failedStatus, errorCode: terminal.errorCode },
+            {
+              userPrompt: ds.lastUserPrompt,
+              cliInput: ds.lastCliInput,
+              codexAppInput: ds.lastCodexAppInput,
+            },
+          );
+          if (record) {
+            ds.session.lastFailedTurn = record;
+            sessionStore.updateSession(ds.session);
+          }
+        }
+      } catch (err) {
+        logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {
