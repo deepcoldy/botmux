@@ -20,6 +20,8 @@ import {
   traexHistorySize,
   traexHistorySidIsOwned,
   traexSessionIdFromRolloutPath,
+  readTraexThreadMetadataIndex,
+  readTraexThreadTitle,
 } from '../src/services/traex-transcript.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 
@@ -2827,5 +2829,40 @@ describe('TRAE pid ownership probe on macOS/BSD', () => {
       process.env.PATH = originalPath;
     }
     expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+});
+
+describe('TraeX native thread metadata', () => {
+  it('reads authoritative titles and normalises second timestamps to milliseconds', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    const db = openDatabaseSyncNow(dbPath)!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY,',
+      '  title TEXT NOT NULL,',
+      '  first_user_message TEXT NOT NULL,',
+      '  cwd TEXT NOT NULL,',
+      '  rollout_path TEXT NOT NULL,',
+      '  updated_at INTEGER NOT NULL',
+      ');',
+      "INSERT INTO threads VALUES ('traex-native-id', 'Native renamed title', 'original prompt', '/root/current', '/root/rollout.jsonl', 1787900000);",
+    ].join('\n'));
+    db.close();
+
+    expect(readTraexThreadMetadataIndex(dbPath).get('traex-native-id')).toEqual({
+      id: 'traex-native-id',
+      title: 'Native renamed title',
+      firstUserMessage: 'original prompt',
+      cwd: '/root/current',
+      rolloutPath: '/root/rollout.jsonl',
+      updatedAtMs: 1_787_900_000_000,
+    });
+    expect(readTraexThreadTitle('traex-native-id', dbPath)).toBe('Native renamed title');
+  });
+
+  it('returns empty metadata when the state DB is absent', () => {
+    const dbPath = join(dir, 'missing-state.sqlite');
+    expect(readTraexThreadMetadataIndex(dbPath).size).toBe(0);
+    expect(readTraexThreadTitle('missing', dbPath)).toBeUndefined();
   });
 });

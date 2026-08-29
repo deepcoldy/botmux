@@ -13,7 +13,7 @@ import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
-import { findTraexRolloutByPid } from '../services/traex-transcript.js';
+import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
 import { herdrPaneGrid } from '../utils/herdr-pane-grid.js';
@@ -42,9 +42,11 @@ export interface AdoptableSession {
   startedAt?: number;        // epoch ms
   paneCols: number;          // current pane width
   paneRows: number;          // current pane height
-  /** Display name from the backend. Herdr only: pane label (any CLI) > Claude
-   *  terminal title (generic / path-like titles dropped), cleaned to one line
-   *  of at most 80 code points. Absent → callers show the cwd basename. */
+  /** Display name. Herdr: pane label (any CLI) > Claude terminal title
+   *  (generic / path-like titles dropped), cleaned to one line of at most 80
+   *  code points. TraeX (tmux / herdr without a label): the native
+   *  `threads.title` from its state DB, unless the thread is botmux-origin
+   *  (see readTraexThreadTitle). Absent → callers show the cwd basename. */
   title?: string;
 }
 
@@ -930,7 +932,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         typeof agent?.terminal_title_stripped === 'string' ? agent.terminal_title_stripped : pane?.terminal_title_stripped,
         cliId,
         agent?.agent,
-      );
+      ) ?? (cliId === 'traex' && sessionId ? readTraexThreadTitle(sessionId) : undefined);
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -971,7 +973,8 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
       const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
       const grid = herdrPaneGrid(rawInfo);
-      const title = herdrLiveTitle(pane?.label, pane?.terminal_title_stripped, process.cliId, pane?.agent);
+      const title = herdrLiveTitle(pane?.label, pane?.terminal_title_stripped, process.cliId, pane?.agent)
+        ?? (process.cliId === 'traex' && sessionId ? readTraexThreadTitle(sessionId) : undefined);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -1075,6 +1078,7 @@ function resolveAdoptableSessionForPane(
 
   // 5. Try to read CLI session metadata
   let sessionId: string | undefined;
+  let title: string | undefined;
   let startedAt: number | undefined;
   if (match.cliId === 'claude-code') {
     const meta = readClaudeSessionMeta(cliPid);
@@ -1100,7 +1104,10 @@ function resolveAdoptableSessionForPane(
     // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
     // pid as a fallback, so undefined here is acceptable.
     const rollout = findTraexRolloutByPid(cliPid);
-    if (rollout) sessionId = rollout.cliSessionId;
+    if (rollout) {
+      sessionId = rollout.cliSessionId;
+      title = readTraexThreadTitle(sessionId);
+    }
   }
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
@@ -1125,6 +1132,7 @@ function resolveAdoptableSessionForPane(
     startedAt,
     paneCols: dims.cols,
     paneRows: dims.rows,
+    ...(title ? { title } : {}),
   };
 }
 
