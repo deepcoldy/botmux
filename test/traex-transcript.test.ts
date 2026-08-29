@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { CODEX_CONNECTION_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE } from '../src/services/codex-transcript.js';
 import {
@@ -15,6 +16,8 @@ import {
   traexHistoryMatchDelta,
   traexHistorySize,
   traexHistorySidIsOwned,
+  readTraexThreadMetadataIndex,
+  readTraexThreadTitle,
 } from '../src/services/traex-transcript.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
@@ -1045,5 +1048,40 @@ describe('traexHistorySidIsOwned (ownership gate predicate)', () => {
 
   it('fails closed on an empty set (pid holds no TRAE rollout)', () => {
     expect(traexHistorySidIsOwned(OWNED, new Set())).toBe(false);
+  });
+});
+
+describe('TraeX native thread metadata', () => {
+  it('reads authoritative titles and normalises second timestamps to milliseconds', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY,',
+      '  title TEXT NOT NULL,',
+      '  first_user_message TEXT NOT NULL,',
+      '  cwd TEXT NOT NULL,',
+      '  rollout_path TEXT NOT NULL,',
+      '  updated_at INTEGER NOT NULL',
+      ');',
+      "INSERT INTO threads VALUES ('traex-native-id', 'Native renamed title', 'original prompt', '/root/current', '/root/rollout.jsonl', 1787900000);",
+    ].join('\n'));
+    db.close();
+
+    expect(readTraexThreadMetadataIndex(dbPath).get('traex-native-id')).toEqual({
+      id: 'traex-native-id',
+      title: 'Native renamed title',
+      firstUserMessage: 'original prompt',
+      cwd: '/root/current',
+      rolloutPath: '/root/rollout.jsonl',
+      updatedAtMs: 1_787_900_000_000,
+    });
+    expect(readTraexThreadTitle('traex-native-id', dbPath)).toBe('Native renamed title');
+  });
+
+  it('returns empty metadata when the state DB is absent', () => {
+    const dbPath = join(dir, 'missing-state.sqlite');
+    expect(readTraexThreadMetadataIndex(dbPath).size).toBe(0);
+    expect(readTraexThreadTitle('missing', dbPath)).toBeUndefined();
   });
 });

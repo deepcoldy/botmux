@@ -113,6 +113,25 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts[0]).not.toContain('Session ID:');
   });
 
+  it('renders a native title for a live TraeX session instead of the project directory', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'tmux',
+      tmuxTarget: 'traex:0.0',
+      cliPid: 42,
+      cliId: 'traex',
+      sessionId: 'traex-session-id',
+      title: 'Investigate rollout title metadata',
+      cwd: '/Users/test/project-dir',
+      paneCols: 120,
+      paneRows: 40,
+    }], 'om_root', 'en'));
+
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('Investigate rollout title metadata');
+    expect(texts[0]).not.toMatch(/^\*\*project-dir\*\*/);
+  });
+
   it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],

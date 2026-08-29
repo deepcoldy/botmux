@@ -3,6 +3,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'n
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
@@ -302,5 +303,42 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     expect(adapter.asksViaHook).toBe(false);
     expect(adapter.hookInstall).toBeUndefined();
+  });
+
+  it('lists TraeX history_mutation sessions with the native indexed title', async () => {
+    const sessionsDir = join(traeHome, 'cli', 'sessions', '2026', '08', '29');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'rollout-2026-08-29T10-00-00-' + SID_1 + '.jsonl'), [
+      JSON.stringify({ type: 'session_meta', payload: { id: SID_1, cwd: '/old/project' } }),
+      JSON.stringify({ type: 'history_mutation', payload: { operation: 'append', items: [{
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'the original prompt' }],
+      }] } }),
+      '',
+    ].join('\n'));
+
+    const db = new DatabaseSync(join(traeHome, 'cli', 'state_5.sqlite'));
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY,',
+      '  title TEXT NOT NULL,',
+      '  first_user_message TEXT NOT NULL,',
+      '  cwd TEXT NOT NULL,',
+      '  rollout_path TEXT NOT NULL,',
+      '  updated_at INTEGER NOT NULL',
+      ');',
+      "INSERT INTO threads VALUES ('" + SID_1 + "', 'Native TraeX title', 'the original prompt', '/current/project', '/tmp/rollout.jsonl', 1787900000);",
+    ].join('\n'));
+    db.close();
+
+    const rows = await createTraexAdapter('/bin/traex').listResumableSessions!({ limit: 10 });
+
+    expect(rows).toEqual([{
+      cliSessionId: SID_1,
+      cwd: '/current/project',
+      title: 'Native TraeX title',
+      lastActivityAt: 1_787_900_000_000,
+    }]);
   });
 });

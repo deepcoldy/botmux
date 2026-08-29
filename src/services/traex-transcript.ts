@@ -99,11 +99,11 @@ type DatabaseSyncLike = {
   close(): void;
 };
 type StatementSyncLike = {
+  get(...params: unknown[]): any;
   all(...params: unknown[]): any[];
 };
 
-function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const dbPath = traeStateDbPath();
+function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T, dbPath = traeStateDbPath()): T | null {
   if (!existsSync(dbPath)) return null;
   // Runtime-agnostic open: `node:sqlite` on Node, `bun:sqlite` on the compiled
   // single-file binary. This MUST NOT go back to requiring `node:sqlite`
@@ -117,7 +117,7 @@ function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   // logic had moved here from the traex adapter — where the Bun fix lived. A
   // clean merge is not a correct merge; re-check this call whenever the file
   // moves again.
-  const db = openDatabaseSyncNow(dbPath) as DatabaseSyncLike | null;
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true }) as DatabaseSyncLike | null;
   if (!db) return null;
   try {
     return fn(db);
@@ -126,6 +126,91 @@ function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   } finally {
     try { db.close(); } catch { /* ignore */ }
   }
+}
+
+export interface TraexThreadMetadata {
+  id: string;
+  title?: string;
+  firstUserMessage?: string;
+  cwd?: string;
+  rolloutPath?: string;
+  updatedAtMs?: number;
+}
+
+type TraexThreadMetadataRow = {
+  id?: unknown;
+  title?: unknown;
+  firstUserMessage?: unknown;
+  cwd?: unknown;
+  rolloutPath?: unknown;
+  updatedAt?: unknown;
+};
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function traexUpdatedAtMs(value: unknown): number | undefined {
+  const timestamp = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return undefined;
+  return timestamp >= 1_000_000_000_000 ? timestamp : timestamp * 1000;
+}
+
+function normalizeTraexThreadMetadata(
+  row: TraexThreadMetadataRow | undefined,
+): TraexThreadMetadata | undefined {
+  const id = nonEmptyString(row?.id);
+  if (!id) return undefined;
+  const title = nonEmptyString(row?.title);
+  const firstUserMessage = nonEmptyString(row?.firstUserMessage);
+  const cwd = nonEmptyString(row?.cwd);
+  const rolloutPath = nonEmptyString(row?.rolloutPath);
+  const updatedAtMs = traexUpdatedAtMs(row?.updatedAt);
+  return {
+    id,
+    ...(title ? { title } : {}),
+    ...(firstUserMessage ? { firstUserMessage } : {}),
+    ...(cwd ? { cwd } : {}),
+    ...(rolloutPath ? { rolloutPath } : {}),
+    ...(updatedAtMs ? { updatedAtMs } : {}),
+  };
+}
+
+const TRAEX_THREAD_METADATA_SELECT =
+  'SELECT id, title, first_user_message AS firstUserMessage, cwd, ' +
+  'rollout_path AS rolloutPath, updated_at AS updatedAt FROM threads';
+
+/** Read TraeX's authoritative resume-picker metadata. The title column is what
+ *  TraeX itself shows in resume, including names assigned through /rename.
+ *  Best-effort: older/missing/corrupt databases return an empty map and callers
+ *  fall back to parsing rollout JSONL. */
+export function readTraexThreadMetadataIndex(
+  dbPath = traeStateDbPath(),
+): ReadonlyMap<string, TraexThreadMetadata> {
+  return withTraeDb((db) => {
+    const rows = db.prepare(TRAEX_THREAD_METADATA_SELECT).all() as TraexThreadMetadataRow[];
+    const out = new Map<string, TraexThreadMetadata>();
+    for (const row of rows) {
+      const metadata = normalizeTraexThreadMetadata(row);
+      if (metadata) out.set(metadata.id, metadata);
+    }
+    return out;
+  }, dbPath) ?? new Map<string, TraexThreadMetadata>();
+}
+
+/** Resolve one live TraeX session's native title for the /adopt picker. */
+export function readTraexThreadTitle(
+  cliSessionId: string,
+  dbPath = traeStateDbPath(),
+): string | undefined {
+  if (!cliSessionId) return undefined;
+  return withTraeDb((db) => {
+    const row = db.prepare(TRAEX_THREAD_METADATA_SELECT + ' WHERE id = ? LIMIT 1')
+      .get(cliSessionId) as TraexThreadMetadataRow | undefined;
+    const title = normalizeTraexThreadMetadata(row)?.title?.replace(/\s+/g, ' ').trim();
+    if (!title) return undefined;
+    return title.length > 80 ? title.slice(0, 79) + '…' : title;
+  }, dbPath) ?? undefined;
 }
 
 type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';
