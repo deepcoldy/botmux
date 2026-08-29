@@ -12206,7 +12206,7 @@ function busyProbeRegion(content: string): string {
 }
 
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
-  const currentCliSid = lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
+  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
     log(`${source}: session state indicates active work (db busy); deferring prompt ready`);
     idleDetector?.reset();
@@ -12231,7 +12231,7 @@ function probeBusyPatternIdle(
   source: string,
   be: SessionBackend,
 ): boolean {
-  const currentCliSid = lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
+  const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
     return false;
   }
@@ -12273,8 +12273,24 @@ function probeBusyPatternIdle(
       log(`${source} idle probe captureCurrentScreen failed: ${err.message}`);
     }
   } else if (cliAdapter?.isSessionBusy) {
-    log(`${source} idle probe: session state store no longer busy, marking prompt ready`);
-    markPromptReady();
+    if (!be.settleCurrentScreen) {
+      log(`${source} idle probe: session state store no longer busy, marking prompt ready`);
+      markPromptReady();
+      return true;
+    }
+    const revisionBeforeSettle = backendScreenRevision;
+    log(`${source} idle probe: session state store no longer busy, settling authoritative screen before prompt ready`);
+    void settleBackendScreenBeforeIdle(be, revisionBeforeSettle).then((settle) => {
+      if (!settle.proceed || backend !== be || isPromptReady) return;
+      if (backendScreenRevision !== revisionBeforeSettle) {
+        log(`${source} idle probe: authoritative screen changed during settle; deferring completion`);
+        return;
+      }
+      if (settle.degraded) {
+        log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
+      }
+      markPromptReady();
+    });
     return true;
   }
   return false;

@@ -1,7 +1,7 @@
 /**
  * OpenCode busy state detection 单测：
- * 验证基于 SQLite 状态（part 表 running 状态、message 表 completed/finish 状态）
- * 对 OpenCode (V1) 和 OpenCode2 (V2) 会话忙碌态（工具执行中、模型思考中）的精准识别。
+ * 验证基于 SQLite 状态（part 表 running 状态、message 表 completed 状态）
+ * 以及时效窗口（freshness window）对 OpenCode (V1) 和 OpenCode2 (V2) 会话忙碌态的精准识别与死锁防范。
  *
  * Run:  npx vitest run test/opencode-busy-state.test.ts
  */
@@ -92,14 +92,15 @@ afterEach(() => {
 });
 
 describe('isOpenCodeSessionBusy V1', () => {
-  it('returns true when a tool part is running', () => {
+  it('returns true when a fresh tool part is running', () => {
     const db = openV1Db();
     const sid = 'ses_v1_running_tool';
     const mid = `msg_${++idSeq}`;
+    const now = Date.now();
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-      .run(mid, sid, 1000, JSON.stringify({ role: 'assistant', time: { created: 1000 } }));
+      .run(mid, sid, now, JSON.stringify({ role: 'assistant', time: { created: now } }));
     db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
-      .run(`prt_${++idSeq}`, mid, sid, 1000, JSON.stringify({
+      .run(`prt_${++idSeq}`, mid, sid, now, JSON.stringify({
         type: 'tool',
         tool: 'bash',
         state: { status: 'running' },
@@ -109,44 +110,85 @@ describe('isOpenCodeSessionBusy V1', () => {
     expect(isOpenCodeSessionBusy(sid, 'v1')).toBe(true);
   });
 
-  it('returns true when assistant message is not completed yet', () => {
+  it('returns true when a fresh assistant message is not completed yet', () => {
     const db = openV1Db();
     const sid = 'ses_v1_generating';
     const mid = `msg_${++idSeq}`;
+    const now = Date.now();
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-      .run(mid, sid, 1000, JSON.stringify({ role: 'assistant', time: { created: 1000 } }));
+      .run(mid, sid, now, JSON.stringify({ role: 'assistant', time: { created: now } }));
     db.close();
 
     expect(isOpenCodeSessionBusy(sid, 'v1')).toBe(true);
   });
 
-  it('returns true when assistant message finish is tool-calls', () => {
+  it('returns false for stale incomplete message (older than freshness window, e.g. crashed process)', () => {
     const db = openV1Db();
-    const sid = 'ses_v1_tool_calls';
+    const sid = 'ses_v1_stale_crash';
     const mid = `msg_${++idSeq}`;
+    // 10 分钟前的未完成消息
+    const staleTime = Date.now() - 600_000;
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-      .run(mid, sid, 1000, JSON.stringify({
-        role: 'assistant',
-        finish: 'tool-calls',
-        time: { created: 1000, completed: 1500 },
+      .run(mid, sid, staleTime, JSON.stringify({ role: 'assistant', time: { created: staleTime } }));
+    db.close();
+
+    // 默认 2 分钟时效窗口，10 分钟前的不应判定为忙碌（防止死锁）
+    expect(isOpenCodeSessionBusy(sid, 'v1')).toBe(false);
+  });
+
+  it('returns false for stale running tool (older than freshness window)', () => {
+    const db = openV1Db();
+    const sid = 'ses_v1_stale_tool';
+    const mid = `msg_${++idSeq}`;
+    const staleTime = Date.now() - 600_000;
+    db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
+      .run(mid, sid, staleTime, JSON.stringify({ role: 'assistant', time: { created: staleTime } }));
+    db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
+      .run(`prt_${++idSeq}`, mid, sid, staleTime, JSON.stringify({
+        type: 'tool',
+        tool: 'bash',
+        state: { status: 'running' },
       }));
     db.close();
 
-    expect(isOpenCodeSessionBusy(sid, 'v1')).toBe(true);
+    expect(isOpenCodeSessionBusy(sid, 'v1')).toBe(false);
   });
 
   it('returns false when assistant message is completed with finish stop and no running parts', () => {
     const db = openV1Db();
     const sid = 'ses_v1_done';
     const mid = `msg_${++idSeq}`;
+    const now = Date.now();
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-      .run(mid, sid, 1000, JSON.stringify({
+      .run(mid, sid, now, JSON.stringify({
         role: 'assistant',
         finish: 'stop',
-        time: { created: 1000, completed: 2000 },
+        time: { created: now, completed: now + 500 },
       }));
     db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
-      .run(`prt_${++idSeq}`, mid, sid, 1000, JSON.stringify({
+      .run(`prt_${++idSeq}`, mid, sid, now, JSON.stringify({
+        type: 'tool',
+        tool: 'bash',
+        state: { status: 'completed' },
+      }));
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v1')).toBe(false);
+  });
+
+  it('returns false when assistant message is completed even if finish is tool-calls (no running parts left)', () => {
+    const db = openV1Db();
+    const sid = 'ses_v1_completed_tool_calls';
+    const mid = `msg_${++idSeq}`;
+    const now = Date.now();
+    db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
+      .run(mid, sid, now, JSON.stringify({
+        role: 'assistant',
+        finish: 'tool-calls',
+        time: { created: now, completed: now + 500 },
+      }));
+    db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
+      .run(`prt_${++idSeq}`, mid, sid, now, JSON.stringify({
         type: 'tool',
         tool: 'bash',
         state: { status: 'completed' },
@@ -158,11 +200,12 @@ describe('isOpenCodeSessionBusy V1', () => {
 });
 
 describe('isOpenCodeSessionBusy V2', () => {
-  it('returns true when a tool part is running in session_message', () => {
+  it('returns true when a fresh tool part is running in session_message', () => {
     const db = openV2Db();
     const sid = 'ses_v2_running';
+    const now = Date.now();
     db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
-      .run(`msg_${++idSeq}`, sid, 'tool', 1000, 1000, JSON.stringify({
+      .run(`msg_${++idSeq}`, sid, 'tool', now, now, JSON.stringify({
         type: 'tool',
         state: { status: 'running' },
       }));
@@ -171,25 +214,40 @@ describe('isOpenCodeSessionBusy V2', () => {
     expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
   });
 
-  it('returns true when assistant message is incomplete in session_message', () => {
+  it('returns true when fresh assistant message is incomplete in session_message', () => {
     const db = openV2Db();
     const sid = 'ses_v2_incomp';
+    const now = Date.now();
     db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
-      .run(`msg_${++idSeq}`, sid, 'assistant', 1000, 1000, JSON.stringify({
-        time: { created: 1000 },
+      .run(`msg_${++idSeq}`, sid, 'assistant', now, now, JSON.stringify({
+        time: { created: now },
       }));
     db.close();
 
     expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
   });
 
+  it('returns false for stale incomplete message in V2', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_stale';
+    const staleTime = Date.now() - 600_000;
+    db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
+      .run(`msg_${++idSeq}`, sid, 'assistant', staleTime, staleTime, JSON.stringify({
+        time: { created: staleTime },
+      }));
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
+  });
+
   it('returns false when assistant message is completed in session_message', () => {
     const db = openV2Db();
     const sid = 'ses_v2_done';
+    const now = Date.now();
     db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
-      .run(`msg_${++idSeq}`, sid, 'assistant', 1000, 1000, JSON.stringify({
+      .run(`msg_${++idSeq}`, sid, 'assistant', now, now, JSON.stringify({
         finish: 'stop',
-        time: { created: 1000, completed: 2000 },
+        time: { created: now, completed: now + 500 },
       }));
     db.close();
 
@@ -203,17 +261,18 @@ describe('createOpenCodeAdapter isSessionBusy', () => {
     const sid = 'ses_adapterTest';
     const userMid = `msg_${++idSeq}`;
     const asstMid = `msg_${++idSeq}`;
+    const now = Date.now();
 
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-      .run(userMid, sid, 900, JSON.stringify({ role: 'user' }));
+      .run(userMid, sid, now - 1000, JSON.stringify({ role: 'user' }));
     db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
-      .run(`prt_${++idSeq}`, userMid, sid, 900, JSON.stringify({
+      .run(`prt_${++idSeq}`, userMid, sid, now - 1000, JSON.stringify({
         type: 'text',
         text: `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nhello`,
       }));
 
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-      .run(asstMid, sid, 1000, JSON.stringify({ role: 'assistant', time: { created: 1000 } }));
+      .run(asstMid, sid, now, JSON.stringify({ role: 'assistant', time: { created: now } }));
     db.close();
 
     const adapter = createOpenCodeAdapter();
@@ -231,14 +290,14 @@ describe('createOpenCode2Adapter isSessionBusy', () => {
   it('identifies busy state in V2 tables', () => {
     const db = openV2Db();
     const sid = 'ses_v2AdapterTest';
+    const now = Date.now();
     db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
-      .run(`msg_${++idSeq}`, sid, 'user', 900, 900, JSON.stringify({
+      .run(`msg_${++idSeq}`, sid, 'user', now - 1000, now - 1000, JSON.stringify({
         text: `<session_id>${BOTMUX_SESSION_ID}</session_id>`,
       }));
     db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
-      .run(`msg_${++idSeq}`, sid, 'assistant', 1000, 1000, JSON.stringify({
-        finish: 'tool-calls',
-        time: { created: 1000, completed: 1500 },
+      .run(`msg_${++idSeq}`, sid, 'assistant', now, now, JSON.stringify({
+        time: { created: now },
       }));
     db.close();
 

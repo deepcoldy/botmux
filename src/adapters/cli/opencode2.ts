@@ -133,7 +133,7 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
-    busyPattern: /ctrl\+c to interrupt|esc to interrupt/i,
+    busyPattern: undefined,
     isSessionBusy({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId)
         ? cliSessionId

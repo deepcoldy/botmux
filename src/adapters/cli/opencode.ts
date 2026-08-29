@@ -202,66 +202,70 @@ export function sessionRowExists(cliSessionId: string, kind: OpenCodeDbKind = 'v
   });
 }
 
+/** 会话忙碌态判断的时效窗口（毫秒）。超过此窗口未更新的异常/孤儿记录不判忙，避免进程异常终止导致死锁。 */
+export const OPENCODE_BUSY_FRESHNESS_MS = 120_000;
+
 /**
- * 探测 OpenCode 会话当前是否处于执行中（工具调用中、模型推理中等）。
+ * 探测 OpenCode 会话当前是否处于执行中（时效内的工具调用中或模型生成中）。
  *
- * 判 busy 准则（满足任一即为 busy）：
+ * 判 busy 准则（必须在 freshnessWindowMs 时效窗口内，满足任一即为 busy）：
  *  1. 存在属于该 session、状态为 `status: "running"` 的 tool part；
- *  2. 该 session 最新的一条 assistant message 处于未完成状态（没有 completed 时间戳，
- *     或 finish 仍为 "tool-calls" 且后续 step 尚未终态）。
+ *  2. 该 session 最新的一条 assistant message 处于未完成状态（没有 completed 时间戳）。
  */
-export function isOpenCodeSessionBusy(cliSessionId: string, kind: OpenCodeDbKind = 'v1'): boolean {
+export function isOpenCodeSessionBusy(
+  cliSessionId: string,
+  kind: OpenCodeDbKind = 'v1',
+  freshnessWindowMs: number = OPENCODE_BUSY_FRESHNESS_MS,
+): boolean {
+  const freshBaseline = Date.now() - freshnessWindowMs;
+
   if (kind === 'v2') {
     return withDb((db) => {
-      // 1. 检查是否存在 running 状态的 tool part
+      // 1. 检查是否存在时效内处于 running 状态的 tool part
       const runningTool = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
-        "WHERE session_id = ? " +
+        "WHERE session_id = ? AND time_created > ? " +
         "  AND json_extract(data, '$.state.status') = 'running' " +
         "LIMIT 1"
-      ).get(cliSessionId) as { busy?: number } | undefined;
+      ).get(cliSessionId, freshBaseline) as { busy?: number } | undefined;
       if (runningTool?.busy) return true;
 
-      // 2. 检查最新 assistant message 是否处于未完成状态
+      // 2. 检查最新 assistant message 是否处于时效内的未完成态（无 completed 时间戳）
       const lastMsg = db.prepare(
-        "SELECT json_extract(data, '$.finish') AS finish, " +
-        "       json_extract(data, '$.time.completed') AS completed " +
+        "SELECT json_extract(data, '$.time.completed') AS completed " +
         "FROM session_message " +
-        "WHERE session_id = ? AND type = 'assistant' " +
+        "WHERE session_id = ? AND type = 'assistant' AND time_created > ? " +
         "ORDER BY time_created DESC LIMIT 1"
-      ).get(cliSessionId) as { finish?: string; completed?: number } | undefined;
+      ).get(cliSessionId, freshBaseline) as { completed?: number } | undefined;
 
       if (!lastMsg) return false;
       if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
-      if (lastMsg.finish === 'tool-calls') return true;
       return false;
     }) ?? false;
   }
 
   return withDb((db) => {
-    // 1. 检查是否存在 running 状态的 tool part
+    // 1. 检查是否存在时效内处于 running 状态的 tool part
     const runningTool = db.prepare(
       "SELECT 1 AS busy FROM part " +
-      "WHERE session_id = ? " +
+      "WHERE session_id = ? AND time_created > ? " +
       "  AND json_extract(data, '$.type') = 'tool' " +
       "  AND json_extract(data, '$.state.status') = 'running' " +
       "LIMIT 1"
-    ).get(cliSessionId) as { busy?: number } | undefined;
+    ).get(cliSessionId, freshBaseline) as { busy?: number } | undefined;
     if (runningTool?.busy) return true;
 
-    // 2. 检查最新 assistant message 是否处于未完成状态
+    // 2. 检查最新 assistant message 是否处于时效内的未完成态（无 completed 时间戳）
     const lastMsg = db.prepare(
-      "SELECT json_extract(data, '$.finish') AS finish, " +
-      "       json_extract(data, '$.time.completed') AS completed " +
+      "SELECT json_extract(data, '$.time.completed') AS completed " +
       "FROM message " +
-      "WHERE session_id = ? " +
+      "WHERE session_id = ? AND time_created > ? " +
       "  AND json_extract(data, '$.role') = 'assistant' " +
       "ORDER BY time_created DESC LIMIT 1"
-    ).get(cliSessionId) as { finish?: string; completed?: number } | undefined;
+    ).get(cliSessionId, freshBaseline) as { completed?: number } | undefined;
 
     if (!lastMsg) return false;
     if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
-    if (lastMsg.finish === 'tool-calls') return true;
     return false;
   }) ?? false;
 }
@@ -408,7 +412,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
-    busyPattern: /ctrl\+c to interrupt|esc to interrupt/i,
+    busyPattern: undefined,
     isSessionBusy({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId)
         ? cliSessionId
