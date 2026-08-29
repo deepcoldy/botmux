@@ -30,6 +30,8 @@
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions, type SpawnSyncOptions, type SpawnSyncReturns } from 'node:child_process';
+import { accessSync, constants } from 'node:fs';
+import { delimiter, join } from 'node:path';
 
 /** True when the current test process is running under Bun rather than Node. */
 export function isBunRuntime(): boolean {
@@ -136,4 +138,37 @@ export function spawnSyncTsEvalWithRepoImports(
   const { command, prefixArgs } = tsRunnerPrefix();
   const { args } = tsEvalArgs(source);
   return spawnSync(command, [...prefixArgs, ...args], options);
+}
+
+/** Resolve an executable Bun from the inherited PATH without invoking a shell. */
+export function resolveBunExecutable(pathValue: string = process.env.PATH ?? ''): string | undefined {
+  const names = process.platform === 'win32' ? ['bun.exe', 'bun.cmd', 'bun'] : ['bun'];
+  for (const dir of pathValue.split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      try {
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      } catch {
+        // Keep scanning PATH.
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Spawn an inline repo-importing snippet under Bun even when the parent test
+ * process runs under Node. Use only for behavior that is specifically Bun-only.
+ */
+export function spawnSyncBunTsEvalWithRepoImports(
+  source: string,
+  options: SpawnSyncOptions = {},
+): SpawnSyncReturns<string | Buffer> {
+  const command = resolveBunExecutable();
+  if (!command) {
+    throw new Error('bun not found on PATH; cannot run the required Bun-specific regression');
+  }
+  return spawnSync(command, ['-e', source], options);
 }
