@@ -900,6 +900,47 @@ describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时
       expect(persisted()).toBe(custom);
       expect(await putSeed(`  ${builtin}  `)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
       expect(persisted()).toBeUndefined();
+
+      // 5) GET 之后 bot locale 被改掉（/config lang 立即生效、不发 bots.changed，
+      //    本页不会重拉），页面里的软预填仍是旧语言那句。此时保存必须仍判为
+      //    「未自定义」——否则 accidental pin 只是从「任何时候」收窄成 locale
+      //    时序窗口，而窗口内钉死的还是一句用户没打算自定义的旧语言文案。
+      const { localeForBot, t } = await import('../src/i18n/index.js');
+      const before = localeForBot(appId);
+      getBot(appId).config.lang = before === 'en' ? 'zh' : 'en';
+      try {
+        const switched = t('daemon.auto_start_join_seed', undefined, localeForBot(appId));
+        expect(switched).not.toBe(builtin); // 前提：两种 locale 的默认确实不同
+        const r = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          // 前端提交的是页面当时预填的旧语言默认 + 它自报的 seedDefault
+          body: JSON.stringify({
+            autoStartOnGroupJoinSeed: builtin,
+            autoStartOnGroupJoinSeedDefault: builtin,
+          }),
+        });
+        expect(r.status).toBe(200);
+        expect(await r.json()).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+        expect(persisted()).toBeUndefined();
+
+        // 同一时序下，真正的自定义文案仍须原样落盘（修法不能顺手放行一切）。
+        const stillCustom = `${builtin} —— 切 locale 后仍是自定义`;
+        const r2 = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            autoStartOnGroupJoinSeed: stillCustom,
+            autoStartOnGroupJoinSeedDefault: builtin,
+          }),
+        });
+        expect(r2.status).toBe(200);
+        expect(persisted()).toBe(stillCustom);
+        await putSeed(switched); // 清回跟随默认，避免污染后续断言
+        expect(persisted()).toBeUndefined();
+      } finally {
+        getBot(appId).config.lang = before;
+      }
     } finally {
       if (handle) await handle.close();
       handle = null;

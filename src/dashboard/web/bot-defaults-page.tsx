@@ -2845,7 +2845,7 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
-  }, [bot.autoStartOnGroupJoin, bot.autoStartOnGroupJoinPrompt, bot.autoStartOnGroupJoinSeed, bot.autoStartOnNewTopic]);
+  }, [bot.autoStartOnGroupJoin, bot.autoStartOnGroupJoinPrompt, bot.autoStartOnGroupJoinSeed, bot.autoStartOnGroupJoinSeedDefault, bot.autoStartOnNewTopic]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
@@ -2907,7 +2907,14 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
         <button type="button" className="primary" data-action="save-auto-join-prompt" disabled={busy === 'prompt'} onClick={() => void savePatch({ autoStartOnGroupJoinPrompt: prompt }, 'prompt')}>
           {tr('botDefaults.autoStartJoinPromptSave')}
         </button>
-        <button type="button" className="primary" data-action="save-auto-join-seed" disabled={busy === 'seed'} onClick={() => void savePatch({ autoStartOnGroupJoinSeed: seed }, 'seed')}>
+        <button type="button" className="primary" data-action="save-auto-join-seed" disabled={busy === 'seed'} onClick={() => void savePatch({
+          autoStartOnGroupJoinSeed: seed,
+          // 一并回传「这个页面当时预填给用户看的那句默认」。服务端据此判断本次提交
+          // 是不是原样回存的软预填值——只跟服务端当刻默认比是不够的：页面拿到
+          // payload 之后 bot locale 可能已被改掉（/config lang 立即生效且不发
+          // bots.changed，本页不会重拉），此时软预填仍是旧语言那句。
+          autoStartOnGroupJoinSeedDefault: bot.autoStartOnGroupJoinSeedDefault ?? '',
+        }, 'seed')}>
           {tr('botDefaults.autoStartJoinSeedSave')}
         </button>
         {bot.autoStartOnGroupJoinSeed ? (
