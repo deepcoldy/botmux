@@ -13889,6 +13889,11 @@ async function spawnCli(
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
+    // No-transport (apiOnly core-only bot OR HTTP virtual chat): drop the
+    // send/@/silence collaboration routing block for injectsSessionContext
+    // adapters (claude-code/genius/grok build it via buildBotmuxSystemPromptText).
+    // Reuses the same predicate computed above for the persistent-pane guard.
+    noTransport: noTransportSession,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     // dsh runner only; other adapters ignore the field.

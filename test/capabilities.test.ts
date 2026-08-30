@@ -58,6 +58,12 @@ describe('botmux capabilities contract', () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe('');
     expect(JSON.parse(result.stdout)).toEqual(botmuxCapabilities());
-    expect(readdirSync(home)).toEqual([]);
+    // The claim under test is that BOTMUX writes no runtime state. `.bun` is the
+    // Bun runtime's own install cache (`.bun/install/cache`), minted by the
+    // interpreter that runs the script, not by botmux — under `bun test` the
+    // child is spawned with Bun, so it appears here. Filter that one entry
+    // rather than relaxing to a subset match, so any botmux-created file still
+    // fails this assertion.
+    expect(readdirSync(home).filter(entry => entry !== '.bun')).toEqual([]);
   });
 });

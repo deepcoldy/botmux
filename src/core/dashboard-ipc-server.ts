@@ -4050,6 +4050,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
+    autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
+    // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
+    autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
@@ -4094,7 +4097,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     usageDisplay?: unknown;
     disableStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
-    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
@@ -4106,7 +4109,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     usageDisplay?: UsageDisplayMode;
     disableStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
     botToBotSameDir?: boolean;
-    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
@@ -4126,6 +4129,27 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
+  if (typeof body.autoStartOnGroupJoinSeed === 'string') {
+    // 编辑态软预填会把「当前生效的内置默认文案」直接填进输入框，因此一次顺手的
+    // 保存（用户其实只想改上面的 prompt）会落盘一个内容恰等于默认的「自定义值」，
+    // 把这个 bot 从「跟随动态默认」钉死成「锁定这一版文案」——升级改了默认文案
+    // 它不再跟上，且 locale 切换后仍发旧语言那句。二者在 UI 上难以区分。
+    //
+    // 判定基准优先取前端回传的 seedDefault，即「这个页面当时实际预填给用户看的
+    // 那句默认」。不能只跟服务端当刻的默认比：页面拿到 GET 之后 bot locale 若被
+    // 改掉（/config lang，effect=immediate 且不发 bots.changed，配置页不会重拉，
+    // 独立 React 页面也不卸载），软预填仍是旧语言那句，跟新 locale 的默认自然不
+    // 相等，于是又被当成自定义写进去——正是本段要消除的 accidental pin，只是收窄
+    // 成了 locale 时序窗口。回传值缺失（旧前端 / 非浏览器调用）时退回服务端默认。
+    const seed = body.autoStartOnGroupJoinSeed;
+    const presentedDefault = typeof body.autoStartOnGroupJoinSeedDefault === 'string'
+      ? body.autoStartOnGroupJoinSeedDefault
+      : '';
+    const serverDefault = t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId));
+    const looksDefault = seed.trim() === serverDefault.trim()
+      || (presentedDefault.trim() !== '' && seed.trim() === presentedDefault.trim());
+    patch.autoStartOnGroupJoinSeed = looksDefault ? '' : seed;
+  }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (typeof body.regularGroupReplyMode === 'string') {
     const m = normalizeChatReplyMode(body.regularGroupReplyMode);

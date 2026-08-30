@@ -66,6 +66,7 @@ import {
   sessionKey,
   sessionAnchorId,
   storedSessionAnchorId,
+  larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
@@ -947,7 +948,7 @@ export function ensureSessionWhiteboard(ds: DaemonSession): void {
   }
 }
 
-function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
+function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boolean }): string {
   if (!whiteboardEnabled() || !opts?.whiteboardId) return '';
   const meta = getWhiteboard(opts.whiteboardId);
   if (!meta || meta.archived) return '';
@@ -958,7 +959,13 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
     escapeXmlTagLikeTokens('更新状态：`botmux whiteboard update --id ' + id + ' --expected-updated-at <上次 read 的 updatedAt> <内容>`。'),
     '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
     '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
-    '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
+    // no-transport（apiOnly bot / HTTP 虚拟会话）：末句的「仍必须 botmux send」是本 PR
+    // 要消除的那条矛盾指令的又一个出口——send 在这类会话里被 assertTurnTransportOrExit
+    // 硬拦（exit 2），而 <botmux_http_response_mode> 又明说不要 send。白板块在首轮与
+    // 续轮都无条件注入，所以这里必须同样 gate；隐私/本地文件两条与传输无关，保留。
+    opts.noTransport
+      ? '不要直接读写本地文件；不要写密钥/隐私。'
+      : '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
     '</whiteboard>',
   ].join('\n');
 }
@@ -1064,6 +1071,22 @@ function buildCodexAppTurnInput(opts: {
   };
 }
 
+/** No-transport session predicate for prompt assembly: apiOnly core-only bot OR
+ *  HTTP virtual chat (`http_async_*` / `http_wait_*`). When true the send/@/
+ *  silence collaboration routing block is dropped — a program request/response
+ *  turn has no Feishu channel, and `usage_silence` in particular CONFLICTS with
+ *  the per-turn <botmux_http_response_mode>. Bot lookup is best-effort: an
+ *  unknown/unloaded larkAppId can't prove apiOnly, so we fall back to the chatId
+ *  test alone (an http-virtual chat is no-transport regardless of bot config). */
+function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
+  if (!chatId) return false;
+  let apiOnly: boolean | undefined;
+  if (larkAppId) {
+    try { apiOnly = getBot(larkAppId).config.apiOnly; } catch { apiOnly = undefined; }
+  }
+  return !larkTransportEnabled({ chatId, apiOnly });
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -1086,7 +1109,11 @@ export function buildNewTopicPrompt(
   // (Claude Code builds its own via --append-system-prompt). Source hints
   // freshly from i18n so they respect the resolved locale instead of the
   // static `adapter.systemHints` array that was baked at module load.
-  const hints = adapter.injectsSessionContext ? [] : buildBotmuxShellHints(locale);
+  // No-transport sessions (apiOnly bot / HTTP virtual chat) get the collapsed
+  // hints (hidden-context defense only) — same gate as buildBotmuxSystemPromptText.
+  const hints = adapter.injectsSessionContext
+    ? []
+    : buildBotmuxShellHints(locale, sessionIsNoTransport(opts?.larkAppId, opts?.chatId));
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1115,17 +1142,28 @@ export function buildNewTopicPrompt(
   const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
   if (botIdentity && (botIdentity.name || botIdentity.openId)) {
+    // No-transport (apiOnly bot / HTTP virtual chat): keep name/open_id but drop
+    // the short_routing rule (--mention collaboration requirement) — same gate as
+    // the routing block above and the system-prompt identity path in
+    // buildBotmuxSystemPromptText. botIdentity is passed even for a NORMAL bot
+    // running an HTTP task (R1), so this block reaches HTTP turns and must gate too.
+    const identityNoTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      `  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`,
+      ...(identityNoTransport
+        ? []
+        : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',
     ].join('\n');
   }
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = renderWhiteboardBlock({
+    whiteboardId: opts?.whiteboardId,
+    noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+  });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
@@ -1226,7 +1264,10 @@ export function buildNewTopicCliInput(
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = renderWhiteboardBlock({
+    whiteboardId: opts?.whiteboardId,
+    noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+  });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
@@ -1303,7 +1344,10 @@ function buildFollowUpBlocks(
 ): Array<{ key: FollowUpBlockKey; text: string }> {
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = renderWhiteboardBlock({
+    whiteboardId: opts?.whiteboardId,
+    noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+  });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -1326,9 +1370,19 @@ function buildFollowUpBlocks(
     // applies to the next follow-up turn without a daemon restart.
     // hook 模式（#794）：reminder 经 system-reminder 离带注入，命令式措辞可能触发
     // 模型的注入防御被表面化，改用描述式的 reminder_hook。
-    const reminderKey = hookMode
-      ? 'ai.followup.reminder_hook'
-      : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
+    //
+    // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：换成不含 send/@/哨兵的极简
+    // 提示（reminder_no_transport）。★ 这个判定必须落在 KEY 选择这一步、而非 inline
+    // 组装处：buildFollowUpCliInput 的 hook 模式（resolveEnvelopeInjectionMode==='hook'）
+    // 同样调本函数、但把 reminder 走 per-turn sidecar；只在 inline 分支 gate 会让 hook
+    // 模式的续轮 reminder 从 sidecar 漏出去。哨兵语义只在本轮内容的
+    // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它）。
+    const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
+    const reminderKey = noTransport
+      ? 'ai.followup.reminder_no_transport'
+      : hookMode
+        ? 'ai.followup.reminder_hook'
+        : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
     const reminder = t(reminderKey, undefined, opts?.locale);
     blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
@@ -1488,7 +1542,10 @@ export function buildFollowUpCliInput(
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
+  const whiteboardBlock = renderWhiteboardBlock({
+    whiteboardId: opts.whiteboardId,
+    noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
+  });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId);
   const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);

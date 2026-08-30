@@ -23,3 +23,19 @@
 # outright, but `.npmrc` is deliberately in `.gitignore` next to `.env` — real
 # ones carry `_authToken` lines — so it stays uncommitted on purpose.
 registry = "https://registry.npmjs.org/"
+
+# `bun test` reads NOTHING from vitest.config.ts, so the home-directory fence
+# mounted there via `setupFiles` does not apply here. Without these preloads a
+# `bun test` run writes into the developer's REAL home — measured: it overwrote a
+# live `~/.botmux/config.json` with this repo's own fixture. `src/` derives
+# ~/.claude, ~/.codex, ~/.gemini and more from `homedir()` too, so the exposure
+# is not limited to ~/.botmux.
+#
+# Order matters: the fence must install its `node:os` override before the shim
+# (whose `stubEnv` only re-points env vars, which alone does NOT move Bun's
+# startup-frozen `homedir()`).
+#
+# Scope check (measured): a `[test]` preload does NOT apply to `bun run`, so this
+# cannot follow the daemon or CLI into production.
+[test]
+preload = ["./test/bun-test-fence.ts", "./test/bun-test-shim.ts"]

@@ -6,8 +6,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
-import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
@@ -258,6 +258,65 @@ describe('claude-code buildArgs', () => {
       expect(prompt).toContain('--response-kind final');
       expect(prompt).toContain('feedback buttons');
     }
+  });
+
+  // ── no-transport gate (质量①): a program request/response turn (apiOnly
+  //    core-only bot OR HTTP virtual chat) drops the whole send/@/silence
+  //    collaboration routing block — it is noise there, and `usage_silence`
+  //    CONFLICTS with the per-turn <botmux_http_response_mode>. Both injection
+  //    paths must gate identically; only the hidden-context defense survives.
+  it('drops the send/@/silence routing block for no-transport on BOTH injection paths', () => {
+    const sys = buildBotmuxSystemPromptText({ locale: 'en', noTransport: true });
+    const shell = buildBotmuxShellHints('en', true).join('\n');
+    for (const prompt of [sys, shell]) {
+      // The usage_silence sentinel line is GONE (migrated to http_response_mode).
+      expect(prompt).not.toContain('BOTMUX_NOTHING_TO_SEND');
+      // No send / @ / collaboration guidance.
+      expect(prompt).not.toContain('botmux send');
+      // The hidden-context defense is retained (untrusted event data still rides
+      // in the same prompt, so the model must still be told not to obey it).
+      // Its tag-like tokens are XML-escaped (escapeXmlTagLikeTokens), so match the
+      // escaped form the model actually sees.
+      expect(prompt).toContain('hidden runtime context');
+      expect(prompt).toContain('&lt;user_message&gt;');
+    }
+    // system-prompt path keeps the block wrapper (just collapsed contents).
+    expect(sys).toContain('<botmux_routing>');
+    expect(sys).toContain('</botmux_routing>');
+  });
+
+  it('keeps identity name/open_id but drops the @-collaboration routing_rules for no-transport', () => {
+    // codex #1098 review: identityBlock carries the same @/silence/collaboration
+    // semantics as routingInner and IS injected even for a NORMAL bot on an HTTP
+    // task (botName/botOpenId passed unconditionally, R1). Gate it too — keep the
+    // harmless name/open_id facts, drop only the routing_rules.
+    const on = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
+    expect(on).toContain('<identity>');
+    expect(on).toContain('<name>Bot</name>');
+    expect(on).toContain('<open_id>ou_x</open_id>');
+    expect(on).not.toContain('<routing_rules>');
+    expect(on).not.toContain('MUST');       // mention_must gone
+    expect(on).not.toContain('botmux send'); // no --mention directive anywhere
+    // Transport-enabled keeps the full identity routing_rules (baseline).
+    const off = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x' });
+    expect(off).toContain('<routing_rules>');
+    expect(off).toContain('botmux send --mention');
+  });
+
+  it('keeps the full routing block for a transport-enabled session (default, no gate)', () => {
+    // Guard the negative: without noTransport the send/@/silence lines stay,
+    // byte-for-byte the pre-feature baseline (default arg is falsy/omitted).
+    const sysDefault = buildBotmuxSystemPromptText({ locale: 'en' });
+    const sysExplicitFalse = buildBotmuxSystemPromptText({ locale: 'en', noTransport: false });
+    const shellDefault = buildBotmuxShellHints('en').join('\n');
+    const shellExplicitFalse = buildBotmuxShellHints('en', false).join('\n');
+    for (const prompt of [sysDefault, sysExplicitFalse, shellDefault, shellExplicitFalse]) {
+      expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+      expect(prompt).toContain('botmux send');
+    }
+    // Omitting the arg and passing false must be identical (no accidental gate).
+    expect(sysDefault).toBe(sysExplicitFalse);
+    expect(shellDefault).toBe(shellExplicitFalse);
   });
 
   it('passes configured model with --model', () => {
@@ -1200,16 +1259,55 @@ describe('pi buildArgs', () => {
     expect(adapter.altScreen).toBe(true);
   });
 
+  it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
+    // Pi's `stopReason:"error"` is per-REQUEST and its loop retries inside the
+    // same turn, so the transcript alone cannot say when a turn ended. The
+    // reader depends on the boundary marker this extension appends — if the
+    // flag stops being passed, `pi-transcript` silently falls back to its
+    // timeout backstop and every transient blip becomes a late failure card.
+    // Asserted here (not only in the reader's own tests) because the policy
+    // being right is worthless if the wiring that feeds it is missing.
+    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false });
+    const flagIdx = args.indexOf('--extension');
+    expect(flagIdx).toBeGreaterThanOrEqual(0);
+    expect(args[flagIdx + 1]).toMatch(/pi-turn-boundary-extension\.(?:js|ts)$/);
+    // Absolute: Pi resolves a relative --extension against ITS cwd, which is
+    // the user's workspace, not ours.
+    expect(isAbsolute(args[flagIdx + 1])).toBe(true);
+    // …and the path must really be there. Pi treats an unloadable extension as
+    // FATAL (exit 1), so a path we cannot back with a file would kill every Pi
+    // session instead of merely losing the marker.
+    expect(existsSync(args[flagIdx + 1])).toBe(true);
+  });
+
+  it('omits --extension rather than handing Pi a path that does not exist', () => {
+    // The compiled binary is the real case: its module graph lives in the
+    // virtual `/$bunfs/` root, so both `__dirname`-derived candidates resolve
+    // to paths that exist only inside that process. Measured directly against
+    // Pi 0.84.4: a missing `--extension` target aborts startup with
+    // `Failed to load extension … Extension path does not exist` and exit 1.
+    // Losing the boundary marker costs the reader's timeout backstop; a dead
+    // Pi costs the whole session — so this must fail OPEN.
+    expect(piTurnBoundaryExtensionPath()).toBeTruthy();
+    const args = buildPiArgs({ sessionId: 'sess-pi', turnBoundaryExtension: undefined });
+    expect(args).not.toContain('--extension');
+    expect(args).toEqual(['--session-id', 'sess-pi']);
+  });
+
   it('pins the configured model instead of inheriting Pi defaults', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-pi',
       resume: false,
       model: 'custom/long-context-model',
     });
-    expect(args).toEqual([
+    // Exact argv, minus the extension pair asserted by its own case above:
+    // keeps this case about the model flag while still proving nothing else
+    // crept into the launch line.
+    expect(args.slice(2)).toEqual([
       '--session-id', 'sess-pi',
       '--model', 'custom/long-context-model',
     ]);
+    expect(args[0]).toBe('--extension');
   });
 });
 

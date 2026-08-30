@@ -1057,6 +1057,39 @@ describe('parseBotConfigsFromText — brand', () => {
   });
 });
 
+// ─── parseBotConfigsFromText — autoStartOnGroupJoinSeed ────────────────────
+
+describe('parseBotConfigsFromText — autoStartOnGroupJoinSeed', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps a configured seed verbatim', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinSeed: '👋 已到岗，待命中' },
+    ]));
+    expect(cfg.autoStartOnGroupJoinSeed).toBe('👋 已到岗，待命中');
+  });
+
+  it('normalizes blank seed to undefined (falls back to built-in i18n text)', () => {
+    for (const bad of ['', '   ', 42, null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinSeed: bad },
+      ]));
+      expect(cfg.autoStartOnGroupJoinSeed).toBeUndefined();
+    }
+  });
+
+  it('leaves seed undefined when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.autoStartOnGroupJoinSeed).toBeUndefined();
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {

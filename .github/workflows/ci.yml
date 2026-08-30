@@ -53,6 +53,57 @@ jobs:
       - run: bun run test
       - run: bun run workflow-core:test
 
+  # Second runner leg: the SAME unit files executed on Bun instead of Node.
+  #
+  # WHY THIS IS NOT REDUNDANT WITH `bun run test` ABOVE: vitest forks Node
+  # workers even when launched through bun (measured — `bun x vitest` still
+  # reports process.versions.node), so every test BODY in the job above runs on
+  # Node. Bun-specific behaviour is therefore structurally invisible there: its
+  # `fetch` error taxonomy (which cannot distinguish a sent from an unsent
+  # request), its startup-frozen `os.homedir()`, `Bun.file`, compiled-binary
+  # paths. Bun is what ships the single-file executable, so those paths need a
+  # leg that actually runs on it.
+  #
+  # Non-blocking on purpose (for now): the shim in test/bun-test-shim.ts
+  # deliberately does not fake `vi.doMock`/`resetModules`/`importOriginal`, and
+  # scripts/run-bun-tests.mjs excludes the files needing them, but the remaining
+  # population has not yet had a full green baseline established across a CI
+  # runner's environment. Flip `continue-on-error` off once it holds green — a
+  # gate that is red for environmental reasons trains people to ignore it.
+  #
+  # The generous timeout is inherent to the design: the runner spawns ONE bun
+  # process PER FILE, because `bun test` otherwise runs every file in a single
+  # process and cross-file interference cascades (measured: 933 failures batched
+  # vs ~2% one-per-process). Startup cost therefore dominates the wall clock.
+  bun-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # Exercise the runner itself before the 20-minute suite. `node --check` cannot
+      # catch a missing binding (a ReferenceError is a RUNTIME error, verified), so a
+      # commit that deleted two constants still printed `994 files` and then ran ZERO
+      # — the whole leg's cost with none of its value. This runs one file in ~6s and
+      # also asserts that no `bun` spawn escaped the home fence.
+      #
+      # NOT under continue-on-error semantics by accident: the job as a whole is
+      # advisory for now, but if this step fails the suite result below is meaningless,
+      # so it runs first and its failure is the one worth reading.
+      - run: bun run test:bun:self-check
+      - run: bun run test:bun
+
   # The Bun single-file executable is a SHIPPED artifact (attached to every
   # GitHub Release), but until this job existed nothing built or ran it before a
   # tag push — so `bun build --compile` breakage was only discovered at release

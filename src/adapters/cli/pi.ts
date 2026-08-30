@@ -1,9 +1,68 @@
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+
+/** Absolute path to the turn-boundary extension handed to Pi via `--extension`,
+ *  or `undefined` when no readable copy exists on disk.
+ *
+ *  Returning `undefined` matters more than it looks: Pi treats an unloadable
+ *  `--extension` as FATAL (`Failed to load extension … Extension path does not
+ *  exist` → exit 1), so handing it a path that is not really there would take
+ *  down every Pi session rather than merely lose the boundary marker. The
+ *  caller therefore omits the flag entirely in that case and the reader falls
+ *  back to its timeout backstop — degraded, not broken.
+ *
+ *  The case is real, not theoretical: inside a `bun build --compile` binary the
+ *  module graph lives in the virtual `/$bunfs/` root, so both `__dirname`-derived
+ *  candidates resolve to paths that exist only inside this process — measured
+ *  `/$bunfs/root/pi-turn-boundary-extension.{js,ts}`, neither present on disk.
+ *  See CLAUDE.md on why a `__dirname` path must never be handed to another
+ *  process. Resolved lazily at spawn time so constructing the adapter never
+ *  touches the filesystem. */
+export function piTurnBoundaryExtensionPath(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [
+    resolve(here, 'pi-turn-boundary-extension.js'),
+    resolve(here, 'pi-turn-boundary-extension.ts'),
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** Launch argv for Pi. Split out from `buildArgs` so the extension-missing
+ *  branch is reachable in a test: that branch only happens inside a compiled
+ *  binary, which no test executes, and it is the branch whose regression kills
+ *  every Pi session. Taking the resolved path as a parameter lets a test drive
+ *  BOTH sides without stubbing the filesystem. */
+export function buildPiArgs(opts: {
+  sessionId: string;
+  initialPrompt?: string;
+  model?: string;
+  turnBoundaryExtension: string | undefined;
+}): string[] {
+  const args: string[] = [];
+  // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
+  // retries inside the same turn, so the transcript alone cannot say when a
+  // turn really ended. This extension appends Pi's own `agent_settled` boundary
+  // into the session JSONL the bridge already reads. Present on every
+  // Botmux-spawned Pi (a hand-started `pi` is unaffected, since the flag lives
+  // only in the argv we build). See pi-turn-boundary-extension.ts.
+  if (opts.turnBoundaryExtension) args.push('--extension', opts.turnBoundaryExtension);
+  args.push('--session-id', opts.sessionId);
+  if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  // Pi's interactive mode processes positional initial messages after TUI
+  // startup, avoiding stdin races while keeping the native TUI visible.
+  if (opts.initialPrompt) args.push(opts.initialPrompt);
+  return args;
+}
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
  *
@@ -82,14 +141,12 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     resolvedBin: bin,
 
     buildArgs({ sessionId, initialPrompt, model }) {
-      const args = [
-        '--session-id', sessionId,
-      ];
-      if (model?.trim()) args.push('--model', model.trim());
-      // Pi's interactive mode processes positional initial messages after TUI
-      // startup, avoiding stdin races while keeping the native TUI visible.
-      if (initialPrompt) args.push(initialPrompt);
-      return args;
+      return buildPiArgs({
+        sessionId,
+        initialPrompt,
+        model,
+        turnBoundaryExtension: piTurnBoundaryExtensionPath(),
+      });
     },
 
     buildResumeCommand({ sessionId }) {

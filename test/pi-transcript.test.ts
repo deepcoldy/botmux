@@ -12,10 +12,11 @@
  *     tools → user2 → single assistant_final).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { drainPiTranscript, type PiBridgeEvent } from '../src/services/pi-transcript.js';
+import { drainPiTranscript, resetPiPendingTurnState, PI_TURN_BOUNDARY_TIMEOUT_MS, type PiBridgeEvent } from '../src/services/pi-transcript.js';
+import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
 
 const ROOT = join(tmpdir(), `botmux-pi-transcript-test-${process.pid}`);
 const SESSION_ID = 'eef935b5-4201-4e59-8bc7-06f03aa3388c';
@@ -63,13 +64,22 @@ function assistantTerminalWithTool(stopReason: string, ts = '2026-08-03T05:13:50
   };
 }
 
+/** Turn-boundary marker written by pi-turn-boundary-extension on agent_settled.
+ *  `lastStopReason` is the final assistant stopReason of the settled turn. */
+function turnSettled(lastStopReason: string | null, ts = '2026-08-03T05:14:06.000Z') {
+  return { type: 'custom', timestamp: ts, customType: PI_TURN_BOUNDARY_CUSTOM_TYPE, data: { lastStopReason } };
+}
+
 function drainAll(path: string): PiBridgeEvent[] {
   return drainPiTranscript(path, 0).events;
 }
 
 describe('drainPiTranscript: turn terminal contract', () => {
-  beforeEach(() => { rmSync(ROOT, { recursive: true, force: true }); });
-  afterEach(() => { rmSync(ROOT, { recursive: true, force: true }); });
+  // Held-error state is keyed by transcript path and every case here reuses the
+  // same path, so it must be cleared or one case's held error leaks into the
+  // next and silently changes what is being asserted.
+  beforeEach(() => { rmSync(ROOT, { recursive: true, force: true }); resetPiPendingTurnState(); });
+  afterEach(() => { rmSync(ROOT, { recursive: true, force: true }); resetPiPendingTurnState(); });
 
   it('emits user + a single assistant_final on stopReason:stop (normal turn)', () => {
     const path = writeTranscript([
@@ -124,14 +134,16 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(finals[0].terminalErrorCode).toBe('pi_turn_aborted');
   });
 
-  it('classifies a stopReason:error record via its errorMessage → failed/codex_upstream_error + redacted summary (model-gateway outage)', () => {
+  it('classifies a settled-as-error turn via its errorMessage → failed/codex_upstream_error + redacted summary (model-gateway outage)', () => {
     // Real captured shape (pi 0.84.2, live incident): the model gateway
-    // cancelled the stream mid-turn; errorMessage sits on `message`.
+    // cancelled the stream mid-turn; errorMessage sits on `message`. The
+    // boundary marker says the turn really ended that way, so it is reported.
     const path = writeTranscript([
       sessionHeader(),
       userMsg('trigger a backend error'),
       assistantFinal('error', '', '2026-08-03T05:14:05.000Z',
         'upstream stream error: rpc error: code = 1 desc = Cancelled by backend [biz error]'),
+      turnSettled('error'),
     ]);
     const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
     expect(finals).toHaveLength(1);
@@ -142,17 +154,269 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(finals[0].terminalErrorSummary).toContain('Cancelled by backend');
   });
 
-  it('keeps failed/pi_turn_error (no summary) when the error record has NO errorMessage', () => {
+  it('keeps failed/pi_turn_error (no summary) when the settled-as-error record has NO errorMessage', () => {
     const path = writeTranscript([
       sessionHeader(),
       userMsg('trigger a backend error'),
       assistantFinal('error', '', '2026-08-03T05:14:05.000Z'),
+      turnSettled('error'),
     ]);
     const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
     expect(finals).toHaveLength(1);
     expect(finals[0].terminalStatus).toBe('failed');
     expect(finals[0].terminalErrorCode).toBe('pi_turn_error');
     expect(finals[0].terminalErrorSummary).toBeUndefined();
+  });
+
+  // ── The regression this whole mechanism exists for ────────────────────────
+  //
+  // Pi retries a transient provider failure INSIDE the same turn. Reading the
+  // error record as a terminal posted a gateway-failure card (and @mentioned a
+  // human) for a turn that then succeeded. Measured on 231 real sessions:
+  // 229/339 error records were followed by that same turn continuing.
+
+  it('does NOT emit a failure when a mid-turn error is followed by a successful answer', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('error', '', '2026-08-03T05:14:02.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('stop', 'PROBE_OK', '2026-08-03T05:14:03.000Z'),
+      turnSettled('stop'),
+    ]);
+    const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
+    // Exactly one final, and it is the ANSWER — not a failure card, and not
+    // one card per failed request attempt.
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('PROBE_OK');
+    expect(finals[0].terminalStatus).toBeUndefined();
+    expect(finals[0].terminalErrorCode).toBeUndefined();
+  });
+
+  it('reports only ONE failure for a turn whose every attempt errored', () => {
+    // Retry exhausted: 3 error records, one settled-as-error boundary. The user
+    // must be told once, not three times.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('error', '', '2026-08-03T05:14:02.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('error', '', '2026-08-03T05:14:03.000Z', 'upstream stream error: service unavailable'),
+      turnSettled('error'),
+    ]);
+    const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].terminalStatus).toBe('failed');
+    // The newest attempt's detail is the one reported.
+    expect(finals[0].timestampMs).toBe(Date.parse('2026-08-03T05:14:03.000Z'));
+  });
+
+  it('holds an error across drains and resolves it on the LATER boundary (records straddle two reads)', () => {
+    // The poller reads whatever is on disk; a turn's records routinely span
+    // several drains. A held error must survive the gap.
+    const dir = join(ROOT, '--tmp-pi-probe--');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `2026-08-03T05-13-01-270Z_${SESSION_ID}.jsonl`);
+    const head = [sessionHeader(), userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable')];
+    writeFileSync(path, head.map((o) => JSON.stringify(o)).join('\n') + '\n');
+
+    const first = drainPiTranscript(path, 0);
+    expect(first.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+
+    appendFileSync(path, [assistantFinal('stop', 'PROBE_OK', '2026-08-03T05:14:03.000Z'), turnSettled('stop')]
+      .map((o) => JSON.stringify(o)).join('\n') + '\n');
+    const second = drainPiTranscript(path, first.newOffset);
+    const finals = second.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('PROBE_OK');
+    expect(finals[0].terminalStatus).toBeUndefined();
+  });
+
+  it('reports a held error once the boundary is overdue, so a Pi killed mid-retry is not silent', () => {
+    // No boundary will ever arrive (Pi was SIGKILLed). Waiting forever would
+    // turn a real outage into silence — worse than the false alarm this change
+    // removes. The timeout is anchored on the drain clock.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+    ]);
+    const t0 = 1_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    expect(first.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+
+    // Still within the window: nothing yet (and no new bytes on disk).
+    const early = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS - 1);
+    expect(early.events).toHaveLength(0);
+
+    // Overdue → the failure surfaces even though the file never grew again.
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS);
+    const finals = late.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].terminalStatus).toBe('failed');
+    expect(finals[0].terminalErrorCode).toBe('codex_upstream_error');
+
+    // …and only once: the held state is cleared, not re-reported every drain.
+    const after = drainPiTranscript(path, late.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS * 3);
+    expect(after.events).toHaveLength(0);
+  });
+
+  it('drops a held error when the turn settles as anything other than error', () => {
+    // Defensive: a boundary whose lastStopReason is absent/unknown must not be
+    // read as failure. Only the explicit 'error' value reports.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      turnSettled(null),
+    ]);
+    expect(drainAll(path).filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+  });
+
+  it('a successful answer clears the held error even if the boundary never arrives', () => {
+    // Success first, boundary lost (Pi killed right after answering, or the
+    // extension failed to load). The backstop must NOT resurrect the earlier
+    // mid-turn error — that would reintroduce the exact false failure this
+    // change removes, just delayed by the timeout.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('stop', 'PROBE_OK', '2026-08-03T05:14:03.000Z'),
+    ]);
+    const t0 = 2_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    const finals = first.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('PROBE_OK');
+
+    // Long past the timeout: still nothing — no phantom failure card.
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS * 3);
+    expect(late.events).toHaveLength(0);
+  });
+
+  // ── /adopt: a user-started Pi never receives --extension ──────────────────
+  //
+  // Those sessions produce NO boundary marker at all, so this is the shape the
+  // change degrades to when it gets no help from Pi. It must degrade to "late
+  // but correct", never to "wrong" or "silent".
+
+  it('without any boundary marker (adopt), a recovered turn still suppresses its mid-turn error', () => {
+    // Suppression here rides on the real terminal, not the marker — so adopt
+    // sessions get the false-alarm fix for free.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('stop', 'PROBE_OK', '2026-08-03T05:14:03.000Z'),
+    ]);
+    const t0 = 3_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS * 3);
+    const all = [...first.events, ...late.events];
+    expect(all.filter((e) => e.terminalStatus === 'failed')).toHaveLength(0);
+    expect(all.some((e) => e.text === 'PROBE_OK')).toBe(true);
+  });
+
+  it('without any boundary marker (adopt), a genuinely failed turn is still reported via the timeout', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+    ]);
+    const t0 = 4_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS);
+    const fails = [...first.events, ...late.events].filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].terminalErrorCode).toBe('codex_upstream_error');
+  });
+
+  // ── Steer during retry backoff (found in review) ──────────────────────────
+  //
+  // Pi's retry entry re-reads the steering queue at the TOP of the loop
+  // ("Check for steering messages at start", agent-loop.ts), so input that
+  // lands during the 2s/4s/8s backoff writes its user record BETWEEN the error
+  // and its retry. Releasing a held error there posts a failure card for a turn
+  // that then succeeds — the exact false alarm this mechanism exists to remove.
+  // Botmux runs Pi with supportsTypeAhead, so this is a live path.
+
+  it('does not report a failure when a steer lands between an error and its retry', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      turnSettled(null, '2026-08-03T05:13:30.000Z'),   // session_start announce
+      userMsg('原始问题'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      userMsg('补一句（steer，落在 backoff 期间）', '2026-08-03T05:14:03.000Z'),
+      assistantFinal('stop', 'ANSWER', '2026-08-03T05:14:06.000Z'),
+      turnSettled('stop'),
+    ]);
+    const events = drainAll(path);
+    const finals = events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('ANSWER');
+    expect(events.filter((e) => e.terminalStatus === 'failed')).toHaveLength(0);
+  });
+
+  it('still reports a first-turn failure even though the announce marker carries no verdict', () => {
+    // The session_start announcement uses lastStopReason:null purely to say
+    // "the extension is live". It must never be mistaken for "this turn ended
+    // cleanly", or a held error would be silently dropped.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('原始问题'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      turnSettled(null, '2026-08-03T05:14:02.000Z'),   // announce arrives late
+      turnSettled('error', '2026-08-03T05:14:03.000Z'),
+    ]);
+    const fails = drainAll(path).filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].terminalErrorCode).toBe('codex_upstream_error');
+  });
+
+  it('without any marker, a failed turn the user simply retyped after is still reported', () => {
+    // Marker-less transcripts (adopt, compiled binary, sessions predating the
+    // extension) have no boundary to resolve the hold, and the NEXT turn's
+    // terminal would clear it — so the user record must still release. Measured
+    // on real transcripts: 104 error records are immediately followed by a new
+    // user record. Gating this on a marker silently swallowed 109 of 120 real
+    // failures when first attempted.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('第一个问题'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      userMsg('（放弃，重新问）', '2026-08-03T05:20:00.000Z'),
+      assistantFinal('stop', 'ANSWER', '2026-08-03T05:20:10.000Z'),
+    ]);
+    const events = drainAll(path);
+    const fails = events.filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(events.some((e) => e.text === 'ANSWER')).toBe(true);
+  });
+
+  it('a SECOND declaration marker (resume re-fires session_start) does not swallow a held failure', () => {
+    // `session_start` fires on every Pi start, resume included, so declaration
+    // markers are not unique. Guarding only the FIRST one let a later
+    // declaration fall through to the "turn settled cleanly" branch and drop
+    // the hold — turning "pi died mid-turn, then botmux resumed it" into a
+    // silently lost failure. Reported in review after the first-declaration-only
+    // guard shipped; verified against this exact shape.
+    const path = writeTranscript([
+      sessionHeader(),
+      turnSettled(null, '2026-08-03T05:13:30.000Z'),   // announce (first start)
+      userMsg('原始问题'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      turnSettled(null, '2026-08-03T05:14:30.000Z'),   // announce again (resume)
+    ]);
+    const t0 = 6_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    expect(first.events.filter((e) => e.terminalStatus === 'failed')).toHaveLength(0);
+    // The hold must survive the second declaration and still reach the backstop.
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS);
+    const fails = late.events.filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].terminalErrorCode).toBe('codex_upstream_error');
   });
 
   it('emits assistant_final on stopReason:length as a completed (truncated) answer', () => {

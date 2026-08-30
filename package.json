@@ -43,6 +43,8 @@
     "test": "vitest run --project unit",
     "test:all": "vitest run",
     "test:e2e": "vitest run --project e2e",
+    "test:bun": "node scripts/run-bun-tests.mjs",
+    "test:bun:self-check": "node scripts/run-bun-tests.mjs --self-check",
     "test:bench": "tsx scripts/bench-tests.ts",
     "test:codex": "vitest run --project e2e test/codex-input.e2e.ts",
     "test:gemini": "vitest run --project e2e test/gemini-input.e2e.ts",

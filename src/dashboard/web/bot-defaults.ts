@@ -127,6 +127,9 @@ export type BotDefaultsRow = {
   riff?: Record<string, unknown> | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
+  autoStartOnGroupJoinSeed?: string;
+  /** 内置默认 seed 文案（按 bot locale），供留空时 placeholder 展示。 */
+  autoStartOnGroupJoinSeedDefault?: string;
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
@@ -254,6 +257,46 @@ export function createRefreshGate(): { begin(): { commit(): boolean } } {
   };
 }
 
+/**
+ * 「每个 key 只放行一次」闸门，给延迟加载的重型请求用。
+ *
+ * 场景：反馈设置区块需要 `memberBots`（只有 12.7MB 的完整矩阵有），而各 tab 是
+ * 用 `hidden` 隐藏而非条件卸载 —— 组件在任何 tab 下都 mount。把「是否激活」
+ * 加进 effect 依赖能避免未打开就拉，但副作用是**每次切回该 tab 都重跑**
+ * （cards → 别的 tab → 隔几秒回 cards，groups-api 的 3s 缓存已过期 ⟹ 又下载
+ * 12.7MB）。原语义是「每次 mount / 每个 botId 一次」，延迟加载不该把它放宽成
+ * 「每次回 tab 都拉」。
+ *
+ * `claim(key)` 只在该 key 尚未被认领时返回 true；`release(key)` 撤销认领，供
+ * 失败路径调用 —— 否则一次网络抖动会让该 bot 的列表永久空着。
+ *
+ * 注：当前调用点（`BotDefaultsCard` 带 `key={larkAppId:...}`）在切换 bot 时会
+ * 整体 remount，闸门随之新建，所以实际吃到的只有「同一 bot 二次激活」这一条；
+ * 按 key 而非布尔来记，是为了让「换 bot 必须重拉」在**不依赖父级 remount**时
+ * 也成立 —— 这条不变量不该悄悄挂在别处的 `key` 拼法上。
+ *
+ * 与 {@link createRefreshGate} 一样保持为纯工厂，好让「二次激活不重拉」不必起
+ * DOM 就能单测（仓库无 React 组件测试设施）。
+ */
+export function createOncePerKeyGate(): {
+  claim(key: string): boolean;
+  release(key: string): void;
+  claimed(key: string): boolean;
+} {
+  let current: string | null = null;
+  return {
+    claim(key) {
+      if (current === key) return false;
+      current = key;
+      return true;
+    },
+    release(key) {
+      if (current === key) current = null;
+    },
+    claimed: key => current === key,
+  };
+}
+
 export async function fetchBotDefaults(): Promise<LoadBotsResult> {
   try {
     const r = await fetch('/api/bots');
@@ -304,7 +347,14 @@ export async function resolveSubstituteTarget(
 
 export async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
-    const r = await fetch('/api/cli-options');
+    // `?probe=none` 显式跳过开放平台登录态探测（一趟 1-4s 的实时飞书往返）。
+    // 本页的 CliOptionsState 不含 webSession 字段，付了钱也拿不到手。
+    //
+    // 之所以是「本页 opt-out」而不是「服务端默认不探测」：路由 chunk 带
+    // immutable 长缓存，dashboard 重启后已加载的旧 chunk 仍会请求裸端点；裸端点
+    // 一旦默认不探测，旧 chunk 会把「字段缺席」判成未登录、把用户推去扫码。
+    // 详见 dashboard.ts 里 /api/cli-options 的注释。
+    const r = await fetch('/api/cli-options?probe=none');
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !Array.isArray(body?.options)) return fallbackCliOptionsState;
     const options: CliOption[] = body.options

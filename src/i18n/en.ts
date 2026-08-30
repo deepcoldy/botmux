@@ -788,6 +788,13 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  // No-transport follow-up (apiOnly bot / HTTP virtual session): a program-driven
+  // request/response turn with no Lark conversation, no sibling bots, and no
+  // `botmux send`. The nothing-to-send sentinel appears exactly once, in this
+  // turn's <botmux_http_response_mode> (migrated, not deleted — #808 async settle
+  // depends on it); this reminder MUST NOT carry send/@/BOTMUX_NOTHING_TO_SEND,
+  // or it would conflict with http_response_mode again.
+  'ai.followup.reminder_no_transport': 'This turn is a program-driven request/response: your entire reply is returned verbatim to the caller, not shown in any chat. Just follow the <botmux_http_response_mode> instructions in this turn\'s content; do not call botmux send, do not post to Feishu/Lark.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',
@@ -911,7 +918,10 @@ export const messages: Record<string, string> = {
   'worker.mojo_lineage_quarantined': '⚠️ This session was created before botmux recorded which mojo control plane (endpoint / workspace) it ran on, so its earlier remote session cannot be verified.\nIt has been parked rather than discarded — the previous context will NOT continue, and your next message starts a fresh mojo session on the current configuration. The parked id is kept on the session for manual cleanup: {lineage}',
   'worker.mojo_legacy_pinned': '⚠️ This mojo session predates the host-execution upgrade, so it is pinned to the legacy sandbox-fallback mode — tools and replies will mostly NOT work here. This is deliberate (an upgrade must never silently move a live session onto the host).\nPlease close this session (❌ button or /close) and send a new message to start a fresh session on the new behaviour.',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
-  'worker.input_delivery_failed': '⚠️ The Worker could not receive this message. Botmux retried on the same Worker but delivery still did not complete; it stopped before a cross-process retry to avoid duplicate execution. Please resend the message.\nturn: {turnId}',
+  'worker.input_delivery_failed': '⚠️ Botmux could not confirm whether this message entered the Worker execution queue. It stopped delivery to avoid duplicate execution. Check the session status first; do not resend immediately.\nturn: {turnId}',
+  'worker.input_delivery_delayed': '⏳ The message entered the Worker IPC queue, but the Worker has not acknowledged it yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
+  'worker.input_commit_delayed': '⏳ The Worker received this message, but has not confirmed that it entered the execution queue yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
+  'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',

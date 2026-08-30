@@ -53,6 +53,18 @@ describe('classifySetupOpenPlatformOutcome', () => {
     ).status).toBe('ready_with_warnings');
   });
 
+  it('🔴 版本没真提交（versionWarning）不许报成 ready —— 否则 CLI 是假绿灯', () => {
+    // 这次线上事故的形态：`publish/commit` 回 code=0，版本却仍停在未提交草稿态。
+    // scope 都写进清单了，但版本没发布 ⟹ 权限一项都不生效。daemon 自愈路径自己
+    // warn + DM 了，而 CLI / scripted JSON 走 classify…，若这里不计入 warning，
+    // 用户看到的是「✅ 完成 / 已提交发布版本 v1」的**假绿灯**，然后干等。
+    expect(classifySetupOpenPlatformOutcome(
+      success({ versionWarning: '版本 v1 提交后回读仍是「未提交审核」草稿' }),
+    ).status).toBe('ready_with_warnings');
+    // 反面：两者都没有时仍是纯 ready（别把正常路径顺手拖成 warning）
+    expect(classifySetupOpenPlatformOutcome(success()).status).toBe('ready');
+  });
+
   it('redirect 白名单没写上时不许报成纯 ready', () => {
     // 权限、事件、发版全绿也没用：白名单缺条目 = authorize 硬失败 20029
     //（群聊模式 p2pMode=group / 会话群标签 / `/login` 全都授权不了）。

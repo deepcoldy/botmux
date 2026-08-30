@@ -830,7 +830,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, noTransport }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -890,7 +890,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport }));
       return args;
     },
 

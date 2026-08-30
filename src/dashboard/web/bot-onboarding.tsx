@@ -183,6 +183,11 @@ function statusText(job: OnboardingJob): string {
 
 async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
+    // 裸端点保留「探测登录态」的旧语义，本弹窗正是要那个 webSession（决定
+    // sessionMode 走 reuse 还是 qr，并展示"将使用 …"的账号），所以不带任何
+    // probe 参数。反过来 Bot 配置页显式带 `?probe=none` 跳过探测。
+    // 为什么是 opt-out 而非 opt-in：见 dashboard.ts /api/cli-options 的注释
+    // （immutable chunk 长缓存 + stale-chunk 自愈只覆盖 import 失败）。
     const res = await fetch('/api/cli-options');
     const body = await res.json();
     if (res.ok && Array.isArray(body?.options)) {

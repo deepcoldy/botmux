@@ -63,6 +63,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.codexAppCleanInput).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
+    expect(prefs.autoStartOnGroupJoinSeed).toBe('');
     expect(prefs.regularGroupReplyMode).toBe('chat-topic');
     expect(prefs.regularGroupMentionMode).toBe('always');
   });
@@ -123,6 +124,25 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(off.ok && off.prefs.silentTurnReactions).toBe(false);
     expect(readConfig().silentTurnReactions).toBeUndefined();
     expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
+  });
+
+  it('autoStartOnGroupJoinSeed round-trips; blank clears back to the built-in i18n fallback', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').autoStartOnGroupJoinSeed).toBe('');
+
+    const set = await store.updateBotCardPrefs('app_default', { autoStartOnGroupJoinSeed: '👋 已到岗，待命中' });
+    expect(set.ok && set.prefs.autoStartOnGroupJoinSeed).toBe('👋 已到岗，待命中');
+    expect(readConfig().autoStartOnGroupJoinSeed).toBe('👋 已到岗，待命中');
+    expect(registry.getBot('app_default').config.autoStartOnGroupJoinSeed).toBe('👋 已到岗，待命中');
+
+    // 清空（空白串）→ 删键 + 内存回 undefined，daemon 侧回退内置 i18n 文案。
+    const clear = await store.updateBotCardPrefs('app_default', { autoStartOnGroupJoinSeed: '   ' });
+    expect(clear.ok && clear.prefs.autoStartOnGroupJoinSeed).toBe('');
+    expect(readConfig().autoStartOnGroupJoinSeed).toBeUndefined();
+    expect(registry.getBot('app_default').config.autoStartOnGroupJoinSeed).toBeUndefined();
   });
 
   it('codexAppCleanInput is default-off and round-trips without a restart', async () => {

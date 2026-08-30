@@ -144,6 +144,16 @@ export interface CliAdapter {
      *  their per-bot built-in skill injection mode for the system-prompt catalog;
      *  inline-prompt CLIs get theirs from session-manager instead. */
     larkAppId?: string;
+    /** No-transport session (apiOnly core-only bot OR HTTP virtual chat, i.e.
+     *  `!larkTransportEnabled({chatId, apiOnly})`). injectsSessionContext adapters
+     *  that build the routing block via `buildBotmuxSystemPromptText`
+     *  (claude-code / genius / grok) forward this so the send/@/silence
+     *  collaboration block is dropped for a program request/response turn — where
+     *  it is both noise and (for usage_silence) a conflict with the per-turn
+     *  <botmux_http_response_mode>. Non-injects CLIs get the same gate via
+     *  session-manager's buildBotmuxShellHints. Adapters without a routing block
+     *  ignore it. */
+    noTransport?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

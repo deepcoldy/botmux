@@ -202,6 +202,25 @@ export type OpenPlatformAutomationResult =
        * versionId」：前者根本没建版（下游别去后台找不存在的草稿、也别把它当 warning）。
        */
       publishSkipped?: boolean;
+      /**
+       * 本次发布**复用了已存在的未提交草稿**（而不是新建版本）。撞上
+       * `code=10043 版本已创建` 的历史卡死就是因为没这一步；带回来供调用方在日志里
+       * 说清「提交了旧草稿」还是「发了新版本」。
+       */
+      versionReused?: boolean;
+      /**
+       * 版本提交后**回读发现它仍是草稿**（或回读本身失败）。`publish/commit` 回
+       * `code=0` 不代表版本真的提交了——实测过 code=0 却留在草稿态，日志因此谎报
+       * 「published」。有这个字段时**不能**对外宣称已发布。
+       */
+      versionWarning?: string;
+      /**
+       * 这一版提交后是否**秒过**（审批流全「自动通过」、零真人审批人）。
+       * `undefined` = 判不出来（接口报错 / 算不出流程），调用方**不许**当成任一结论。
+       */
+      approvalAutoPassed?: boolean;
+      /** 需要真人审批时，那些审批人的姓名（抄送人不算——抄送只知会、不阻塞）。 */
+      approvalHumanApprovers?: string[];
     }
   | {
       ok: false;
@@ -219,7 +238,13 @@ export type OpenPlatformAutomationResult =
         | 'version_verification_failed'
         | 'visibility_unreadable'
         | 'network'
-        | 'api_error';
+        | 'api_error'
+        /**
+         * 应用正在飞书审核中（`code=10046`），开放平台把它的配置写入整体锁了。
+         * **等待即自愈**，不是错误：审批通过后写操作恢复。与其它 reason 分开是为了让
+         * 调用方既能说人话，又能跳过无意义的反复重试。
+         */
+        | 'app_under_review';
       message: string;
       sessionFile?: string;
       /** Number of events successfully subscribed (0 when event update failed before downstream error). */
@@ -240,6 +265,12 @@ export type OpenPlatformAutomationResult =
       verifiedEventCount?: number;
       /** Exact published version ACK, preserved across later scope propagation failure. */
       versionId?: string;
+      /**
+       * `app_under_review` 专用：当前那个**待审版本**的 id（读不到时 undefined）。
+       * 只用于上层「同一个待审版本别重复打扰管理员」的节流 key —— undefined 时上层
+       * 自然退化成「不节流」，那是刻意的（见 automation 里 under_review 分支的注释）。
+       */
+      inReviewVersionId?: string;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -701,6 +732,51 @@ export function buildPrivilegeUpdatePayload(appId: string, privileges: OpenPlatf
  *
  * 调用方决定失败怎么处理（两处都是非致命，但一处 warn 一处进 result.warning）。
  */
+/**
+ * 只读探查「这个应用为什么可能卡审批」，给管理员 DM 里补一句**具体线索**。
+ *
+ * 为什么值得单独探一次：光说「可能是数据范围没配」是转述，说「实测这两条现在是
+ * 『全部/未配置』」才是证据 —— 人拿着它能直接去 console 对应位置改。审核锁只锁写，
+ * `privilege/all` 这类读接口照常可用（实测），所以这次探查在审核中也能成功。
+ *
+ * 全程 best-effort：任何一步失败就返回空串，绝不让「补充线索」这种附加信息把主流程
+ * （告诉管理员卡住了）搞坏。
+ */
+export async function inspectUnderReviewConfigHints(appId: string, brand?: 'feishu' | 'lark'): Promise<string> {
+  if (brand === 'lark') return '';
+  try {
+    const prepared = await prepareFeishuWebSession({ disableQrLogin: true, disableBytedcliFallback: true });
+    if (!prepared.ok) return '';
+    const clientResult = await createOpenPlatformApiClient(prepared.cookies);
+    if (!clientResult.ok) return '';
+    const post = clientResult.client.postJson;
+    const parts: string[] = [];
+    // ① 数据范围：把「还没收敛」的必填条目点出来（这正是最常见的卡审批原因）
+    try {
+      const state = extractOpenPlatformPrivileges(await post(`/developers/v1/privilege/all/${appId}`, {}));
+      const unnarrowed = state.privileges.filter(p => p.isRequired && !isPrivilegeRangeNarrowed(p));
+      if (unnarrowed.length > 0) {
+        const listed = unnarrowed.map(p => `${p.bizName || p.bizId}/${p.name || p.resource}`).join('、');
+        parts.push(`实测该应用有 ${unnarrowed.length} 项必填「数据范围」尚未收敛（${listed}）——大概率就是卡点`);
+      } else {
+        parts.push('实测必填「数据范围」都已收敛，卡点可能是别的规则（看审批详情）');
+      }
+    } catch { /* 读不到就不提数据范围 */ }
+    // ② 租户审批规则原文链接：比我们转述强 —— 万一卡的是别的规则，链接照样有用。
+    // body 传空 `{}` 即可：实测跨 3 台（有草稿 / 审核中 / 无待发布版本）对照过
+    // `{}` 与 `{versionId}`，两者返回**逐字相同**（都拿到 auditUrl + 452 字的
+    // auditSummary）⟹ 该端点返回的是**租户级**规则、与具体版本无关，不必透传 versionId。
+    try {
+      const rule: any = await post(`/developers/v1/config/audit_rule/${appId}`, {});
+      const auditUrl = pickString(asRecord(asRecord(rule).data), ['auditUrl']);
+      if (auditUrl) parts.push(`企业审批规则原文：${auditUrl}`);
+    } catch { /* 拿不到链接不影响其余线索 */ }
+    return parts.length > 0 ? `\n\n**线索**：${parts.join('；')}。` : '';
+  } catch {
+    return '';
+  }
+}
+
 async function narrowRequiredPrivilegeRanges(
   api: { postJson(path: string, body?: unknown): Promise<unknown> },
   appId: string,
@@ -1480,6 +1556,56 @@ export async function automateOpenPlatformSetup(
     await postJson(`/developers/v1/robot/switch/${options.appId}`, { clientId: options.appId, enable: true });
     await postJson(`/developers/v1/event/switch/${options.appId}`, { clientId: options.appId, eventMode: 4 });
   } catch (err: any) {
+    // 「应用正在审核中」是**等待即自愈**的状态，不是配置错误：审核期间开放平台把整个
+    // 应用配置写锁了（scope/update / robot/switch / safe_setting/update / base_info 全
+    // 拒，读接口照常），审批通过后自然恢复。给它一个独立 reason，让上层能说人话、
+    // 并且不要每次重启都把整条链路重跑一遍（线上两台 bot 各已空转 8 次）。
+    // 注意：这一步**不是本函数第一个写操作**（redirect 白名单、scope/update、
+    // privilege/update 都在它前面，也都会被 10046 拒），而是第一个**不吞错**的写 ——
+    // 前三个各自 try/catch 成 warning 继续走，只有这里会把错误抛到这个 catch。所以
+    // 归因放在这里是可行的（它无条件执行），但别据此以为前面没有写操作：真要提前
+    // 识别 10046，得去看那几个 warning 而不是指望这里最先命中。
+    if (openPlatformUnderReview(err)) {
+      // ⚠️ **不自动撤回待审版本**（曾经写过，已删）。原先的推理是「缺必需权限 + 审核中
+      // = 权限永远补不上 ⟹ 撤回是唯一出路」，那默认了「审批是中性的排队机制」。实际
+      // **触发审批说明有配置不合规**：模板建的应用出生带「数据范围=全部」，正是租户
+      // 审批规则里「申请全员范围要额外说明理由、视情况加签至 CEO-2」那一档（见
+      // {@link isPrivilegeRangeNarrowed} 的注释），而 narrowRequiredPrivilegeRanges
+      // 只收窄**新**版本 ⟹ 卡住的必然是没收窄过的旧版。
+      //
+      // ⟹ 撤回重提交会被**同一条规则再拦一次**，等于用不可逆动作（丢掉审批队列位置，
+      // 线上见过排 18 / 23 天且不属于本机 owner 的）驱动一个死循环。更一般地：**审批是
+      // 规则驱动的闸，不是队列**，撤回不绕过规则、只丢位置 —— 所以即便存在「配置合规
+      // 但仍进审批」的情形，自动撤回照样不解决问题。正确处置是**告诉人、让人修配置**。
+      //
+      // 取待审版本 id 只为给上层做「同一个待审版本别重复打扰」的节流 key。这次读是
+      // 只读（审核锁下照常可读）、且只在失败路径发生，常态零开销。
+      //
+      // ⚠️ 读失败必须降级成「没有 versionId」，**绝不能把已经确定的 app_under_review
+      // 覆盖成 network / api_error**：分类是主信号，versionId 只是节流用的上下文，
+      // 上下文取不到不能反过来污染主信号。拿不到 id 时上层自然退化成「不节流」——
+      // 那也正是我们要的：「撞了 10046 却找不到待审版本」意味着模型与实际不一致，
+      // 每次都值得说一遍（万一是我们判据自己有 bug，节流会掐掉唯一的信号）。
+      let inReviewVersionId: string | undefined;
+      try {
+        inReviewVersionId = findInReviewVersionId(
+          await postJson(`/developers/v1/app_version/list/${options.appId}`, {}),
+        );
+      } catch { /* 拿不到就不节流，见上 */ }
+      return {
+        ok: false,
+        reason: 'app_under_review',
+        message:
+          '应用正在飞书审核中，开放平台暂时锁定了它的配置写入（权限申请、机器人能力、回调白名单都改不了）。'
+          + '**审批被触发通常意味着有配置不合规**（最常见：权限的「数据范围」没配，默认成「全部/全员」，'
+          + '撞上租户「非必要不申请全员数据」的加签规则）。需要人工处理：到开放平台看审批详情 → 修掉不合规项 '
+          + '→ 撤回该待审版本 → 重新提交。注意：撤回后直接重提**不会**自动通过，规则会再拦一次。',
+        sessionFile,
+        redirectConfigured,
+        redirectWarning,
+        inReviewVersionId,
+      };
+    }
     return {
       ok: false,
       reason: 'api_error',
@@ -1648,8 +1774,25 @@ export async function automateOpenPlatformSetup(
   //    激活 ACK（见 bot-onboarding 的 hasExactManagedAutomationAck / versionId 读取），
   //    不发版就拿不到 versionId，激活会判失败。
   // 这两条都传 false / 未传时，才走无变更短路。
+  //
+  // ⚠️ 第三个例外：**存在未提交的草稿**。草稿会让后续 `app_version/create` 一律撞
+  // `code=10043 版本已创建`（见下方 findUncommittedDraftVersionId 处的长注释），而
+  // 「有草稿」与「本轮有没有配置变更」是两件独立的事：一个 scope 已齐、事件已订阅、
+  // 数据范围已收窄的 bot，`mutated` 恒为 false，会在这里短路 return —— 下面那段
+  // 「提交草稿」的代码**永远到不了**，草稿就一直卡着。这正是本次要修的死锁，所以
+  // 有草稿时必须往下走，把它提交掉（提交草稿本身不新建版本、不烧版本号）。
+  // 读一次版本列表：既用来判「有没有卡住的草稿」（决定能否走无变更短路），也直接
+  // 复用给下面的发版逻辑，避免同一轮里重复请求。读失败不阻断——退回「按 mutated 判」
+  // 的旧行为，最坏是少救一次草稿，不会因为一个读请求把整条自愈判死。
+  let versionList: unknown;
+  try {
+    versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
+  } catch (err: any) {
+    await options.onStatus?.(`读取版本列表失败（${safeErrorMessage(err)}），跳过草稿检查`);
+  }
+  const pendingDraftVersionId = versionList === undefined ? undefined : findUncommittedDraftVersionId(versionList);
   const mustPublish = options.appJustCreated === true || options.requireVerifiedEvents === true;
-  if (!mutated && !mustPublish) {
+  if (!mutated && !mustPublish && !pendingDraftVersionId) {
     return {
       ok: true,
       sessionFile,
@@ -1708,13 +1851,40 @@ export async function automateOpenPlatformSetup(
         redirectWarning,
       };
     }
-    const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
-    const appVersion = nextAppVersion(versionList);
-    const versionPayload = buildAppVersionCreatePayload(appVersion) as unknown as Record<string, unknown>;
-    versionPayload.visibleSuggest = visibility.visibleSuggest;
-    versionPayload.blackVisibleSuggest = visibility.blackVisibleSuggest;
-    const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, versionPayload);
-    const versionId = extractVersionId(created);
+    const versions = versionList ?? await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
+    // 已存在的**未提交草稿**要先消化掉，不能直接 create：飞书不允许并存两个未提交
+    // 版本，有草稿时 create 一律回 `code=10043 版本已创建，请刷新`。历史行为是撞上就
+    // 整个自愈失败并给管理员发 DM，而下次重启又原样重跑——一个草稿把自愈**永久**卡死
+    // （线上实测 3 台、一天各 5 次）。
+    //
+    // 修法是**提交那个草稿**而不是绕过它：草稿的 scope 集合就是应用当前已声明的集合
+    // （实测逐项相等，181/181 零差集），正是我们想发的内容；`scope/update` 早在本函数
+    // 上半段就已经把缺失权限加进清单了，草稿会带上它们。实测直接 commit 即
+    // `versionStatus` 0→2（已上线），不新建版本、不烧版本号。
+    //
+    // 故意**不**做「取消草稿再重建」：那需要引入一个破坏性的删除端点（本仓库从未用过
+    // 任何 delete/cancel 版本的端点），还会多烧一个版本号，收益为零。
+    //
+    // ⚠️ 已知取舍：复用草稿等于发布**草稿自己那份可见范围快照**，而不是上面刚从
+    // `visible/online` 读出来的现值（`visibleSuggest` 只在新建版本时才用得上）。本次
+    // 涉及的两台 bot 实测草稿与线上版本的可见范围逐字相同（同一个 open_id、无部门/
+    // 黑名单），所以没有收窄发生；但一个**很久以前**留下的草稿理论上可能带着过时的
+    // 可见范围。这仍然比现状好：现状是自愈**永久失败**、权限一项都到不了位。真出现
+    // 过时草稿时，用户在开放平台能看到该版本的可见范围并自行修正。
+    const draftVersionId = findUncommittedDraftVersionId(versions);
+    let versionId: string | undefined;
+    let versionReused = false;
+    if (draftVersionId) {
+      versionId = draftVersionId;
+      versionReused = true;
+    } else {
+      const appVersion = nextAppVersion(versions);
+      const versionPayload = buildAppVersionCreatePayload(appVersion) as unknown as Record<string, unknown>;
+      versionPayload.visibleSuggest = visibility.visibleSuggest;
+      versionPayload.blackVisibleSuggest = visibility.blackVisibleSuggest;
+      const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, versionPayload);
+      versionId = extractVersionId(created);
+    }
     if (options.requireVerifiedEvents && !versionId) {
       return {
         ok: false,
@@ -1729,8 +1899,41 @@ export async function automateOpenPlatformSetup(
         redirectWarning,
       };
     }
+    let versionWarning: string | undefined;
+    let approvalAutoPassed: boolean | undefined;
+    let approvalHumanApprovers: string[] | undefined;
     if (versionId) {
+      // 提交前先问一句「这一版提交后会不会秒过」。判据见 {@link predictApprovalFlow}：
+      // 全自动通过 + 零真人审批人 ⟹ 提交不打扰任何人、立即生效，尽管提。
+      //
+      // 反过来，有真人审批人时**仍然照常提交**——这是既有行为，不改：botmux 建 bot /
+      // 补权限本来就需要发版才生效，替用户提审是本来的分工。这里查流程的作用是**把
+      // 「秒过」与「要人审」分开告知**：秒过的一声不吭办完；要人审的明确说「已提交，
+      // 需要 X 审批」，让用户知道在等谁、以及别再重复点。
+      //
+      // 判不出来（known:false，接口报错 / 没有可判定的关卡）时不猜：既不宣称秒过，
+      // 也不宣称要人审，只在日志里留原因。
+      const prediction = await fetchApprovalFlowPrediction(postJson, options.appId, versionId, visibility);
+      if (prediction.known) {
+        approvalAutoPassed = prediction.autoApproved;
+        if (prediction.humanApprovers.length > 0) approvalHumanApprovers = prediction.humanApprovers;
+      } else if (prediction.reason) {
+        await options.onStatus?.(`审批流程预判不可用（${prediction.reason}），按常规提交`);
+      }
       await postJson(`/developers/v1/publish/commit/${options.appId}/${versionId}`, { clientId: options.appId });
+      // commit 返回 code=0 ≠ 版本真的提交了：线上实测过 commit 回 `{code:0,isOk:true}`
+      // 而版本仍停在草稿态，于是日志谎报「published」，留下的草稿正是卡死后续自愈的
+      // 元凶。回读一次把「以为发了」和「真发了」分开——查得到就是查得到，别再拿返回码
+      // 当结论。回读本身失败不改判结果（版本可能已经提交成功），只记 warning。
+      try {
+        const after = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
+        if (!isVersionCommitted(after, versionId)) {
+          versionWarning =
+            `版本 ${versionId} 提交后回读仍是「未提交审核」草稿：请到开放平台「版本管理」手动点「申请发布」`;
+        }
+      } catch (err: any) {
+        versionWarning = `版本 ${versionId} 提交状态回读失败（无法确认是否已提交）: ${safeErrorMessage(err)}`;
+      }
     }
     return {
       ok: true,
@@ -1748,6 +1951,10 @@ export async function automateOpenPlatformSetup(
       eventModeReady,
       redirectConfigured,
       redirectWarning,
+      versionReused,
+      versionWarning,
+      approvalAutoPassed,
+      approvalHumanApprovers,
       ...(options.requireVerifiedEvents
         ? {
             eventMode: eventState?.eventMode,
@@ -2137,9 +2344,12 @@ export async function createOpenPlatformAppWithClient(
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
     // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
     // 这一步 fail-closed:拿到 versionId 后 commit 失败、或 code=0 却没 versionId
-    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
-    // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
-    // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示)。
+    //
+    // 这里**不做**「回读版本状态 + 补一刀 commit」:线上那 3 台卡死 bot 的 1.0.0
+    // (本函数发的版本)全部 `status=1 已上线`,即本步的 commit 是成功的;卡死源是随后
+    // automateOpenPlatformSetup 发的 1.0.1 草稿(见那边的 findUncommittedDraftVersionId)。
+    // 给没有证据坏的路径加重试,只会给建应用链路凭空引入一个 fail-closed 抛点。
     // ⚠️ version/create、publish/commit 是非幂等写操作(传输失败即结果未知,
     // 重放会重复建版/撞版本号),故绝不套 retryIdempotent… 包装,与 fetchRaw
     // 只对 GET/HEAD 重试同源。
@@ -2690,6 +2900,24 @@ function openPlatformOwnerAccessDenied(error: unknown): boolean {
   return error.status === 403 && payload.code === 10003;
 }
 
+/**
+ * 飞书开放平台的「应用整体正在审核中」锁：`code=10046 审核中, 请刷新`。
+ *
+ * 审核期间应用配置被**整体写锁**——实测被拒的不只是发版，还包括
+ * `scope/update`（申请权限本体）、`robot/switch`、`safe_setting/update`、`base_info`；
+ * 读接口（`scope/all` / `privilege/all` / `app_version/list` / `visible/online` /
+ * `event/` / `callback/`）全部照常可读。
+ *
+ * 所以这是一种**等待即可自愈**的状态，不是配置错误：审批通过后写操作自然恢复。历史
+ * 行为是把它当普通 `api_error` 硬失败，于是每次 daemon 重启都把整条链路重跑一遍、
+ * 再报一次「开放平台 API 错误」（线上两台别人的 bot 今天各撞 8 次），既没用又盖掉了
+ * 真实原因。识别出来单独给个 reason，让调用方能说人话、并且**不必反复重试**。
+ */
+export function openPlatformUnderReview(error: unknown): boolean {
+  if (!(error instanceof OpenPlatformApiError)) return false;
+  return asRecord(error.payload).code === 10046;
+}
+
 class FeishuWebSessionError extends Error {
   constructor(message: string, readonly reason: FeishuWebSessionFailureReason) {
     super(message);
@@ -2828,6 +3056,252 @@ export function nextAppVersion(payload: unknown): string {
     return a;
   });
   return [max[0], max[1], max[2] + 1].join('.');
+}
+
+/**
+ * console `app_version/list` 里 `versionStatus` 的取值。**别用公开 API
+ * (`application/v6/.../app_versions`) 的 `status` 语义去读它** ——两套枚举不一样，
+ * 实测同一批版本的对照（左 console / 右公开 API）：
+ *
+ * | console `versionStatus` | 公开 API `status` | 含义 |
+ * |---|---|---|
+ * | `0`   | `4` | 未提交审核（草稿） |
+ * | `1`   | `3` | 审核中 |
+ * | `2`   | `1` | 已上线（当前线上版本） |
+ * | `100` | `1` | 历史已上线版本 |
+ *
+ * 草稿定 `DRAFT`、审核中定 `IN_REVIEW`：两者语义**相反**（草稿要提交，审核中要撤回），
+ * 各有一个消费者。判据一律写成 `=== 常量`，别写 `!== 某个` 这种反向式——那会把
+ * `100`/`2`（历史/当前线上版本）也一起卷进来。
+ */
+export const CONSOLE_VERSION_STATUS_DRAFT = 0;
+export const CONSOLE_VERSION_STATUS_IN_REVIEW = 1;
+
+/**
+ * 找出 `app_version/list` 里那个**未提交审核的草稿**（console 上「待提交」）。
+ *
+ * 为什么需要它：飞书**不允许并存两个未提交版本**——存在草稿时 `app_version/create`
+ * 一律回 `code=10043 版本已创建，请刷新`。而 botmux 的权限自愈每次都想发一版，于是
+ * 一个草稿就能把自愈**永久**卡死：每次 daemon 重启都重跑一遍必败的请求，还给管理员
+ * 重发一遍「缺 N 项权限」的 DM（线上实测一天 5 次，其中一台还是别人的 bot）。
+ *
+ * ⚠️ **只认草稿（`versionStatus=0`），绝不碰审核中（`versionStatus=1`）。** 审核中
+ * 的版本是别人真的提交上去、正在排队的东西，自动流程去动它等于把人家的审批干掉。
+ * 线上就有两台处于审核中且**不属于本机 owner**，所以这个边界是硬的。
+ *
+ * 返回草稿的 `versionId`；没有草稿返回 undefined。
+ */
+export function findUncommittedDraftVersionId(payload: unknown): string | undefined {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (record.versionStatus !== CONSOLE_VERSION_STATUS_DRAFT) continue;
+    const versionId = pickString(record, ['versionId', 'version_id', 'id']);
+    if (versionId) return versionId;
+  }
+  return undefined;
+}
+
+/**
+ * 回读 `app_version/list`，确认某个 versionId **真的离开了草稿态**。
+ *
+ * `publish/commit` 返回 `code=0` **不等于**版本已提交：线上实测过一次
+ * commit 回 `{code:0, data:{isOk:true}}`、版本却仍停在 `versionStatus=0`，于是日志
+ * 高高兴兴写「version … published」，实际留下的正是卡死后续所有自愈的那个草稿。
+ * 同文件里 `eventModeReady` 早就立了「switch 接口返回成功≠生效，必须回读」的规矩，
+ * 发版这条链路照抄一遍。
+ *
+ * 返回 true = 该版本已不是草稿（已上线或已进审核）。
+ */
+export function isVersionCommitted(payload: unknown, versionId: string): boolean {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (pickString(record, ['versionId', 'version_id', 'id']) !== versionId) continue;
+    return record.versionStatus !== CONSOLE_VERSION_STATUS_DRAFT;
+  }
+  // 版本号在列表里找不到 → 无法证明它已提交，保守判 false（宁可多报一句 warning，
+  // 也不要重复上一次「拿 code=0 当已发布」的错）。
+  return false;
+}
+
+/**
+ * 找出正在**审核中**的版本（console 上「审核中」）。
+ *
+ * 与 {@link findUncommittedDraftVersionId} 是**互补的两种卡死**：草稿（0）让
+ * `app_version/create` 撞 `code=10043`；审核中（1）让开放平台把**整个应用配置写锁**
+ * （`scope/update` / `robot/switch` / `safe_setting/update` 全回 `code=10046`），
+ * 详见 {@link openPlatformUnderReview}。
+ *
+ * 审核中的版本**只能先撤回**才能改配置——console 自己也这么说（"Unable to edit, as
+ * the organization administrator is reviewing the app's version release request."），
+ * 它的 Withdraw 按钮打的就是 {@link cancelPendingReviewVersion} 里那个端点。
+ */
+export function findInReviewVersionId(payload: unknown): string | undefined {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (record.versionStatus !== CONSOLE_VERSION_STATUS_IN_REVIEW) continue;
+    const versionId = pickString(record, ['versionId', 'version_id', 'id']);
+    if (versionId) return versionId;
+  }
+  return undefined;
+}
+
+/**
+ * 撤回一个正在审核中的版本，好让应用配置重新可写。
+ *
+ * 端点是从 console 实测抓来的（**不是猜的**）：版本详情页的 Withdraw 按钮打
+ * `POST /developers/v1/publish/cancel_commit/<appId>/<versionId>`，body `{}` ——
+ * 与既有的 `publish/commit/<appId>/<versionId>` 完全对称。当时用页面内 hook 拦下了
+ * 请求所以没有真撤掉别人的审批。
+ *
+ * 🔴 **当前没有任何自动调用方，这是刻意的。** 曾经在「缺必需权限 + 审核中」时自动撤，
+ * 后来判定那是错的：**触发审批通常意味着有配置不合规**（最常见是数据范围默认「全部」，
+ * 撞租户加签规则），撤回重提会被同一条规则再拦一次 ⟹ 等于用不可逆动作（丢掉审批队列
+ * 位置，线上见过排 18 / 23 天的）驱动一个死循环。更一般地：**审批是规则驱动的闸，不是
+ * 队列**，撤回不绕过规则、只丢位置。所以正确处置是告诉人、让人改配置后自己撤。
+ *
+ * 保留它是为了「检测」与将来可能的**人工辅助**入口（比如显式命令）。若要再接自动调用，
+ * 先回答「撤回之后凭什么这次能过」—— 答不上就不该撤。
+ *
+ * 撤回后**回读确认**：`cancel_commit` 返回 code=0 不等于状态真的变了（同一个坑在
+ * `publish/commit` 上已经栽过一次，见 {@link isVersionCommitted}）。
+ */
+export async function cancelPendingReviewVersion(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  versionId: string,
+): Promise<{ ok: boolean; message?: string }> {
+  try {
+    await postJson(`/developers/v1/publish/cancel_commit/${appId}/${versionId}`, {});
+  } catch (err: any) {
+    return { ok: false, message: `撤回审核中版本失败: ${safeErrorMessage(err)}` };
+  }
+  try {
+    const after = await postJson(`/developers/v1/app_version/list/${appId}`, {});
+    if (findInReviewVersionId(after) === versionId) {
+      return { ok: false, message: `版本 ${versionId} 撤回后回读仍是「审核中」` };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    // 撤回请求本身没报错，只是回读失败 ⟹ 状态未知。当作失败处理（保守），让上层
+    // 落回「审核中」提示而不是继续往一个可能仍锁着的应用上写。
+    return { ok: false, message: `撤回后状态回读失败（无法确认）: ${safeErrorMessage(err)}` };
+  }
+}
+
+/**
+ * 「提交发布后会不会**秒过**」的预判结果。
+ *
+ * `autoApproved: true` = 审批流里除「发起 / 结束 / 抄送」外的节点全是「自动通过」，
+ * 没有任何真人审批人 ⟹ 提交它不打扰任何人、立即生效。
+ */
+export interface ApprovalFlowPrediction {
+  /** 能否确定地判断（false = 接口报错 / 结构不认识 / 算不出流程，调用方必须 fail-closed）。 */
+  known: boolean;
+  /** 全自动通过且零真人审批人。仅 known:true 时有意义。 */
+  autoApproved: boolean;
+  /** 流程里的真人审批人姓名（抄送人不算——抄送只是知会，不阻塞）。 */
+  humanApprovers: string[];
+  /** 无法判断时的原因（进日志用）。 */
+  reason?: string;
+}
+
+/** 审批流程里「不构成审批关卡」的节点名（中英文环境都出现过）。 */
+const APPROVAL_FLOW_NON_GATE_NODES = new Set(['发起', '结束', 'Initiate', 'End']);
+/** console 对「这一关不需要人审」的节点类型取值（中/英文环境）。 */
+const APPROVAL_FLOW_AUTO_NODE_TYPES = new Set(['自动通过', 'Auto approved']);
+
+/**
+ * 解析 `approval_nodes/get` 的返回，判断这一版提交后是否会自动通过。
+ *
+ * ⚠️ **两个「名字像在回答这个问题、实际答的是另一个」的字段，都不能当判据**：
+ *
+ * | 字段 | 来源 | 实测 | 真实语义 |
+ * |---|---|---|---|
+ * | `canAutoApproval` | 同一个 `approval_nodes/get` 响应 | 秒过那台是 **false**、无待发布版本那台反而 **true** | 更像「理论上能否免审」，与本次会不会秒过**相反** |
+ * | `ApprovalType` | `config/audit_rule` | 秒过/要人审的 **4 台全是 1**，只有无待发布版本那台是 0 | 更像「有没有审批流」 |
+ *
+ * 两个都跨 5～6 台实测过。判据只能落在 `applyNodes` 的节点类型上 —— 上面那张表是为了
+ * 让后人别图省事去读那两个字段（名字比 `applyNodes` 好懂得多，正因如此才危险）。
+ *
+ * ⚠️ 解析路径是 `data.applyInstanceInfo.applyNodes`。**不是** `approvalNodes.nodes`
+ * ——按那个路径读，跨 6 台 bot 全部返回空数组，「所有输入同一输出」正是判据失效的
+ * 特征（当时打了原始 JSON 才找到真路径）。
+ *
+ * 抄送人（`nodeCcUser`）**不算**审批人：抄送只知会、不阻塞流程，把它算进去会让本可
+ * 自动提交的版本被误判成需要人工。
+ */
+export function predictApprovalFlow(payload: unknown): ApprovalFlowPrediction {
+  const nodes = asRecord(asRecord(asRecord(payload).data).applyInstanceInfo).applyNodes;
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    // 空数组的正常成因是「没有待发布版本，无流程可算」，不是故障；但既然算不出来，
+    // 就必须让调用方走保守路径，不能默认成「可以自动提交」。
+    return { known: false, autoApproved: false, humanApprovers: [], reason: '审批流程为空（可能没有待发布版本）' };
+  }
+  const gates = nodes
+    .map(node => asRecord(node))
+    .filter(node => {
+      const name = pickString(node, ['nodeName']) ?? '';
+      if (APPROVAL_FLOW_NON_GATE_NODES.has(name)) return false;
+      // 抄送节点：有 nodeCcUser 且没有 nodeUser
+      const cc = Array.isArray(node.nodeCcUser) ? node.nodeCcUser : [];
+      const users = Array.isArray(node.nodeUser) ? node.nodeUser : [];
+      return !(cc.length > 0 && users.length === 0);
+    });
+  if (gates.length === 0) {
+    return { known: false, autoApproved: false, humanApprovers: [], reason: '审批流程里没有可判定的关卡节点' };
+  }
+  const humanApprovers: string[] = [];
+  for (const gate of gates) {
+    for (const entry of (Array.isArray(gate.nodeUser) ? gate.nodeUser : [])) {
+      const name = pickString(asRecord(asRecord(entry).approver), ['name', 'enName']);
+      if (name) humanApprovers.push(name);
+    }
+  }
+  const allAuto = gates.every(gate => APPROVAL_FLOW_AUTO_NODE_TYPES.has(pickString(gate, ['nodeType']) ?? ''));
+  return {
+    known: true,
+    autoApproved: allAuto && humanApprovers.length === 0,
+    humanApprovers: uniqueStrings(humanApprovers),
+  };
+}
+
+/**
+ * 查这一版提交后是否会自动通过。
+ *
+ * body 必须**带全字段**：只传 `{}` 会被开放平台拒 `code=10001 请求错误，请刷新页面后重试`。
+ * `visibleSuggest` 用线上现值原样填（与发版同源，见 {@link parseOnlineVisibility}），
+ * 因为可见范围会影响审批规则（申请全员范围要加签）。
+ *
+ * 任何异常都返回 `known:false`，由调用方 fail-closed —— 判不出来时**不许**自动提交。
+ */
+export async function fetchApprovalFlowPrediction(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  versionId: string,
+  visibility: { visibleSuggest: VisibilitySuggest; blackVisibleSuggest: VisibilitySuggest },
+): Promise<ApprovalFlowPrediction> {
+  try {
+    const payload = await postJson(`/developers/v1/approval_nodes/get/${appId}`, {
+      visibleSuggest: visibility.visibleSuggest,
+      blackVisibleSuggest: visibility.blackVisibleSuggest,
+      b2cShareSplitConfigSuggest: {
+        b2cGroupChatShareEnable: false,
+        b2cP2PChatShareEnable: false,
+        b2cP2PChatNeedAudit: false,
+      },
+      versionId,
+      notCalculateFlow: false,
+    });
+    return predictApprovalFlow(payload);
+  } catch (err: any) {
+    return { known: false, autoApproved: false, humanApprovers: [], reason: safeErrorMessage(err) };
+  }
 }
 
 /** 从 app_version/create 响应提取 versionId（多种响应形态兼容）。 */

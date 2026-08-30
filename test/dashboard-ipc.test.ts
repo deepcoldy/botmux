@@ -841,6 +841,149 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时不落盘', () => {
+  // 编辑态软预填把「当前生效的内置默认」直接填进输入框，所以一次顺手的保存会把
+  // bot 从「跟随动态默认」钉死成「锁定这一版文案」（升级不再跟上、切 locale 仍发
+  // 旧语言那句），而 UI 上两种状态几乎无法区分。归一化必须发生在写盘之前。
+  it('归一化：等于内置默认 → 存空（跟随默认）；真自定义 → 原样落盘', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-join-seed-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-join-seed-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // 服务端自报当前 locale 下的内置默认，避免把文案字面量写死在断言里
+      // （改文案 / 换 locale 都不该让这条用例失真）。
+      const oncall = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      const builtin: string = oncall.autoStartOnGroupJoinSeedDefault;
+      expect(typeof builtin).toBe('string');
+      expect(builtin.length).toBeGreaterThan(0);
+
+      const putSeed = async (autoStartOnGroupJoinSeed: string) => {
+        const r = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ autoStartOnGroupJoinSeed }),
+        });
+        expect(r.status).toBe(200);
+        return r.json();
+      };
+      const persisted = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0].autoStartOnGroupJoinSeed;
+
+      // 1) 软预填原样回存（内容 === 内置默认）→ 视作未自定义，键不落盘。
+      expect(await putSeed(builtin)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+      expect(getBot(appId).config.autoStartOnGroupJoinSeed).toBeUndefined();
+
+      // 2) 真正的自定义文案照常落盘（归一化不能误伤这一侧）。
+      const custom = `${builtin} —— 值班中`;
+      expect(await putSeed(custom)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
+      expect(persisted()).toBe(custom);
+      expect(getBot(appId).config.autoStartOnGroupJoinSeed).toBe(custom);
+
+      // 3) 已自定义后再存一次软预填值 → 清回跟随默认（与「恢复默认」同义）。
+      expect(await putSeed(builtin)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+
+      // 4) 仅首尾空白之差也算「等于默认」，否则一个不可见空格就把 bot 钉死。
+      await putSeed(custom);
+      expect(persisted()).toBe(custom);
+      expect(await putSeed(`  ${builtin}  `)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+
+      // 5) GET 之后 bot locale 被改掉（/config lang 立即生效、不发 bots.changed，
+      //    本页不会重拉），页面里的软预填仍是旧语言那句。此时保存必须仍判为
+      //    「未自定义」——否则 accidental pin 只是从「任何时候」收窄成 locale
+      //    时序窗口，而窗口内钉死的还是一句用户没打算自定义的旧语言文案。
+      const { localeForBot, t } = await import('../src/i18n/index.js');
+      const before = localeForBot(appId);
+      getBot(appId).config.lang = before === 'en' ? 'zh' : 'en';
+      try {
+        const switched = t('daemon.auto_start_join_seed', undefined, localeForBot(appId));
+        expect(switched).not.toBe(builtin); // 前提：两种 locale 的默认确实不同
+        const r = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          // 前端提交的是页面当时预填的旧语言默认 + 它自报的 seedDefault
+          body: JSON.stringify({
+            autoStartOnGroupJoinSeed: builtin,
+            autoStartOnGroupJoinSeedDefault: builtin,
+          }),
+        });
+        expect(r.status).toBe(200);
+        expect(await r.json()).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+        expect(persisted()).toBeUndefined();
+
+        // 同一时序下，真正的自定义文案仍须原样落盘（修法不能顺手放行一切）。
+        const stillCustom = `${builtin} —— 切 locale 后仍是自定义`;
+        const r2 = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            autoStartOnGroupJoinSeed: stillCustom,
+            autoStartOnGroupJoinSeedDefault: builtin,
+          }),
+        });
+        expect(r2.status).toBe(200);
+        expect(persisted()).toBe(stillCustom);
+        await putSeed(switched); // 清回跟随默认，避免污染后续断言
+        expect(persisted()).toBeUndefined();
+      } finally {
+        getBot(appId).config.lang = before;
+      }
+
+      // 6) 旧客户端兼容：请求体完全不带 seedDefault（旧前端 / 脚本 / curl）时，
+      //    退回「与服务端当刻默认比较」，行为与引入该字段之前一致。
+      const legacyPut = async (v: string) => {
+        const r = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ autoStartOnGroupJoinSeed: v }),
+        });
+        expect(r.status).toBe(200);
+        return r.json();
+      };
+      expect(await legacyPut(builtin)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+      expect(await legacyPut(custom)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
+      expect(persisted()).toBe(custom);
+      // 旧客户端清空（空串）仍是「恢复默认」，不因新分支改变语义。
+      expect(await legacyPut('')).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+
+      // 7) seedDefault 是非字符串（脏输入）时不得抛错，按缺失处理。
+      //    seed 必须【不等于】服务端默认，否则 `||` 左侧先为真就短路，右侧那次
+      //    presentedDefault.trim() 根本不求值，这一格就测不到脏输入（实测过：
+      //    用 builtin 当 seed 时，去掉 typeof 守卫仍然全绿）。
+      const dirty = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoStartOnGroupJoinSeed: custom, autoStartOnGroupJoinSeedDefault: 42 }),
+      });
+      expect(dirty.status).toBe(200);
+      expect(await dirty.json()).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
+      expect(persisted()).toBe(custom);
+
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — summary memory', () => {
   it('surfaces the persisted memory toggle and path in the Bot Defaults refresh payload', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-summary-memory-'));

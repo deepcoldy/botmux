@@ -105,8 +105,27 @@ describe('usage-refresh timer wiring (source lock)', () => {
     // The `ds.worker === worker` exit branch (dead generation) also clears.
     const exitIdx = src.indexOf("worker.on('exit'");
     expect(exitIdx).toBeGreaterThan(-1);
-    const exitBody = src.slice(exitIdx, exitIdx + 3000);
-    expect(exitBody).toContain('clearUsageRefreshTimer(ds)');
+    // Slice the whole exit handler (up to its terminating `\n  });`) instead of
+    // a fixed byte budget: the handler legitimately grows (delivery settlement,
+    // retirement notices) and a fixed window truncates before the
+    // dead-generation cleanup branch this lock is anchored to.
+    const exitEnd = src.indexOf('\n  });', exitIdx);
+    expect(exitEnd).toBeGreaterThan(exitIdx);
+    const exitBody = src.slice(exitIdx, exitEnd);
+    // Whole-handler containment is not enough: an unconditional clear at the
+    // handler tail (a stale old-worker exit wiping the replacement's timer)
+    // would still match. Pin the clear INSIDE the dead-generation branch by
+    // requiring it between the branch guard and a marker that is still inside
+    // that branch (`ds.session.webPort = undefined;`).
+    const branchIdx = exitBody.indexOf('if (ds.worker === worker) {');
+    expect(branchIdx).toBeGreaterThan(-1);
+    const clearIdx = exitBody.indexOf('clearUsageRefreshTimer(ds)');
+    const branchMarkerIdx = exitBody.indexOf('ds.session.webPort = undefined;');
+    expect(clearIdx).toBeGreaterThan(branchIdx);
+    expect(branchMarkerIdx).toBeGreaterThan(clearIdx);
+    // Exactly one clear in the handler — a second, unconditional one would
+    // also break the pinned-position reasoning above.
+    expect(exitBody.indexOf('clearUsageRefreshTimer(ds)', clearIdx + 1)).toBe(-1);
   });
 
   it('the ready handler is a full boundary: clears on entry, re-arms after card reuse and fresh POST', () => {

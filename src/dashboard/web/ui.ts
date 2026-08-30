@@ -1,5 +1,5 @@
 import {
-  fetchGroupsSnapshot,
+  fetchGroupsNamesSnapshot,
 } from './groups-api.js';
 
 import {
@@ -336,7 +336,17 @@ export function overrideBotAvatar(larkAppId: string, name: string | undefined, u
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
-      const data = await fetchGroupsSnapshot();
+      // 轻量视图：只要 bots 的名称/头像 + chats 的 chatId/name/avatar。完整矩阵
+      // 实测 12.59MB（memberBots 独占 12341KB），而这里一个字节都不用它——换成
+      // `?view=names` 后 372KB 级别，且省掉主线程 38-70ms 的 JSON.parse。
+      //
+      // 新鲜度**未被本次改动触及**：命中/失效时机完全照旧（成功后由下面的
+      // nameMapsPromise memo 持有，失败才清空重试），变的只有同一次请求传多少
+      // 字节。注意这个 memo 意味着名称/头像每个页面生命周期只真拉一次——这是
+      // 既有行为，不是本次引入的：bot 名称另有更快通路（/api/bots 每次刷新都带
+      // botName，Bot 配置页优先用它），头像则由 overrideBotAvatar() 在改完后
+      // 就地写内存+localStorage 生效，都不依赖本函数重跑。
+      const data = await fetchGroupsNamesSnapshot();
       for (const b of data.bots ?? []) {
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));

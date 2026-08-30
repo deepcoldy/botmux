@@ -39,6 +39,11 @@ export function classifySetupOpenPlatformOutcome(
     || (result.scopeCount === 0 && !publishSkipped)
     || result.skippedScopeCount > 0
     || (!result.versionId && !publishSkipped)
+    // 版本提交后回读发现它仍是草稿（或回读本身失败）。**必须计入 warning**：
+    // scope 都写进清单了、但版本没真提交 ⟹ 权限一项都不生效，而 CLI / scripted
+    // JSON 路径若报 `ready` 就是**假绿灯**——恰好是这次线上事故的形态（commit 回
+    // code=0 而版本停在草稿态）。daemon 自愈路径自己 warn + DM 了，别的调用方靠这里。
+    || result.versionWarning
     || !result.redirectConfigured
     || result.redirectWarning
   );

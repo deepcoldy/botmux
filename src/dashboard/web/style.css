@@ -45,6 +45,10 @@
   --button-padding-x: 15px;
   --dropdown-trigger-width: 118px;
   --dropdown-popover-min-width: 156px;
+  /* 下拉弹层的限高：超过就在弹层内部滚动，而不是把选项顶出视口。
+     滚动容器是 main（overflow-y:auto），其上的 .chrome-body / .app-shell 是
+     overflow:hidden——溢出视口的选项会被裁掉、鼠标事件也落不到弹层上。 */
+  --dropdown-popover-max-height: min(320px, 52vh);
   --page-title-row-height: 48px;
   --page-title-divider-gap: 14px;
   --section-title-row-height: 36px;
@@ -6410,7 +6414,7 @@ dialog.onboarding-dialog::backdrop {
   left: 0;
   width: 100%;
   min-width: 100%;
-  max-height: min(280px, 42vh);
+  max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh));
   overflow-y: auto;
   transform: none;
   z-index: 1300;
@@ -9994,12 +9998,23 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   display: grid;
   gap: 4px;
   min-width: var(--dropdown-popover-min-width);
+  max-height: min(var(--dropdown-popover-max-height), var(--dropdown-popover-space, 100vh));
   padding: 6px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--modal-shadow);
   transform: translateX(-50%);
+  /* 选项多于限高时在弹层内部滚动。少于限高时 auto 不会显示滚动条，
+     所以短列表（排序菜单等）外观不变。overscroll 收敛住，避免滚到底后
+     把外层 main 一起带着滚。 */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* 下方空间不够、且上方更宽裕时向上弹（DropdownMenu 量完可用空间后加的类）。 */
+.sect-sort-menu.is-drop-up > .sect-sort-pop {
+  top: auto;
+  bottom: calc(100% + 8px);
 }
 /* 会话筛选里的「来源 / 所在聊天」弹层宽度自适应 + 不折行的规则统一定义在下方
    （.sessions-filters .sect-sort-pop，靠后覆盖），此处不再重复。 */
@@ -24420,7 +24435,7 @@ dialog select[multiple]:hover:not(:disabled) {
   left: 0;
   width: 100%;
   min-width: 100%;
-  max-height: min(280px, 42vh);
+  max-height: min(280px, 42vh, var(--dropdown-popover-space, 100vh));
   overflow-y: auto;
   transform: none;
   z-index: 1300;
@@ -25562,7 +25577,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .vc-profile-agent-menu > .sect-sort-pop {
   min-width: min(300px, 84vw);
   max-width: 340px;
-  max-height: min(320px, 60vh);
+  max-height: min(320px, 60vh, var(--dropdown-popover-space, 100vh));
   overflow-y: auto;
 }
 .vc-profile-agent-menu .sect-sort-pop button {

@@ -69,6 +69,10 @@ import { execSync } from 'node:child_process';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { codexTaskFailureCode, safeFailureSummary } from './codex-transcript.js';
+import {
+  PI_TURN_BOUNDARY_CUSTOM_TYPE,
+  PI_TURN_BOUNDARY_STOP_REASON_ERROR,
+} from '../adapters/cli/pi-turn-boundary-extension.js';
 
 const PI_SESSIONS_ROOT = join(homedir(), '.pi', 'agent', 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -245,13 +249,140 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
   return undefined;
 }
 
-export function drainPiTranscript(path: string, fromOffset: number): PiDrainResult {
+/** How long a held error may wait for its turn-boundary marker before the
+ *  reader gives up and reports it anyway.
+ *
+ *  The marker can legitimately never arrive: Pi was SIGKILLed mid-retry, the
+ *  extension failed to load, or the session predates it. Waiting forever would
+ *  turn a real outage into silence — strictly worse than today's false alarms,
+ *  because the user would never learn the turn died. So the hold is bounded.
+ *
+ *  Sized from the real distribution: across 231 local sessions, an error record
+ *  that was followed by the same turn continuing saw the next record within
+ *  18.8s at p50, 90.3s at p95 and 165.6s at the maximum. 300s clears that
+ *  maximum with room to spare, so a recovering turn is never reported early;
+ *  a genuinely dead turn is reported late rather than never. */
+export const PI_TURN_BOUNDARY_TIMEOUT_MS = 300_000;
+
+/** Per-transcript state that must survive across drain calls: a turn's records
+ *  routinely straddle two reads (the poller fires every second, Pi appends
+ *  whenever it likes). Keyed by transcript path and bounded, mirroring
+ *  `traexPendingAgentCache`. */
+interface PiPendingTurnState {
+  /** Newest `stopReason:"error"` record of the turn currently in flight, held
+   *  until we learn whether the turn recovered or really failed.
+   *  `heldSinceMs` is the drain clock at which the hold started (set on the
+   *  first drain that observes it, not on the record's own timestamp). */
+  error?: {
+    uuid: string;
+    timestampMs: number;
+    text: string;
+    errorMessage?: string;
+    heldSinceMs?: number;
+  };
+  /** Sticky: set once ANY turn-boundary marker is seen on this transcript.
+   *  Proves the boundary extension is live for this session, after which the
+   *  marker — not a user record — owns the release decision. See the
+   *  `role === 'user'` branch for why that matters (steer). */
+  markerSeen?: boolean;
+}
+
+const piPendingTurnCache = new Map<string, PiPendingTurnState>();
+const PI_PENDING_TURN_CACHE_MAX = 512;
+
+function piPendingTurnState(path: string): PiPendingTurnState {
+  let state = piPendingTurnCache.get(path);
+  if (!state) {
+    state = {};
+    piPendingTurnCache.set(path, state);
+    if (piPendingTurnCache.size > PI_PENDING_TURN_CACHE_MAX) {
+      const oldest = piPendingTurnCache.keys().next().value;
+      if (oldest !== undefined) piPendingTurnCache.delete(oldest);
+    }
+  }
+  return state;
+}
+
+/** Drop held state for a transcript. Exported so tests can assert a clean slate
+ *  without reaching into module internals. */
+export function resetPiPendingTurnState(path?: string): void {
+  if (path === undefined) piPendingTurnCache.clear();
+  else piPendingTurnCache.delete(path);
+}
+
+/** True when a session record is the turn-boundary marker appended by
+ *  `pi-turn-boundary-extension`. Kept structural (not a cast) because the file
+ *  is written by another process and may predate the extension. */
+function piTurnBoundaryStopReason(obj: any): { present: boolean; lastStopReason?: string } {
+  if (obj?.type !== 'custom' || obj.customType !== PI_TURN_BOUNDARY_CUSTOM_TYPE) {
+    return { present: false };
+  }
+  const raw = obj.data?.lastStopReason;
+  return { present: true, lastStopReason: typeof raw === 'string' ? raw : undefined };
+}
+
+/** Turn a held error into the turn's failure event and clear the hold. The one
+ *  place that shape is built, so the three release paths (boundary marker, new
+ *  user turn, timeout backstop) cannot drift apart. Returns [] when nothing is
+ *  held, so callers can splat it unconditionally. */
+function flushHeldPiError(
+  state: PiPendingTurnState,
+  sessionId: string | undefined,
+): PiBridgeEvent[] {
+  const held = state.error;
+  if (!held) return [];
+  state.error = undefined;
+  return [{
+    uuid: held.uuid,
+    timestampMs: held.timestampMs,
+    kind: 'assistant_final',
+    text: held.text,
+    sourceSessionId: sessionId,
+    ...piTerminalOutcome('error', held.errorMessage),
+  }];
+}
+
+/** Emit a held error whose boundary marker never arrived within
+ *  `PI_TURN_BOUNDARY_TIMEOUT_MS`. Called on EVERY drain — including the
+ *  no-new-bytes early return, which is precisely the shape of the case this
+ *  guards (Pi died mid-turn, so the file stops growing and the marker will
+ *  never be written). Anchored on the drain clock rather than the record's own
+ *  timestamp so a transcript replayed from an old file cannot fire it. */
+function flushPiPendingError(
+  path: string,
+  sessionId: string | undefined,
+  nowMs: number,
+): PiBridgeEvent[] {
+  const state = piPendingTurnCache.get(path);
+  const held = state?.error;
+  if (!state || !held) return [];
+  if (held.heldSinceMs === undefined) {
+    held.heldSinceMs = nowMs;
+    return [];
+  }
+  if (nowMs - held.heldSinceMs < PI_TURN_BOUNDARY_TIMEOUT_MS) return [];
+  return flushHeldPiError(state, sessionId);
+}
+
+export function drainPiTranscript(
+  path: string,
+  fromOffset: number,
+  /** Injectable clock for the held-error timeout. Tests pass a fixed value;
+   *  production uses wall clock. */
+  nowMs: number = Date.now(),
+): PiDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
   let start = fromOffset;
   if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
+  if (size === start) {
+    return {
+      events: flushPiPendingError(path, piSessionIdFromPath(path), nowMs),
+      newOffset: start,
+      pendingTail: '',
+    };
+  }
 
   const len = size - start;
   const buf = Buffer.alloc(len);
@@ -266,6 +397,7 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
 
   const sessionId = piSessionIdFromPath(path);
   const events: PiBridgeEvent[] = [];
+  const pending = piPendingTurnState(path);
   let cursor = start;
   for (const line of completeText.split('\n')) {
     if (line.length === 0) {
@@ -277,6 +409,33 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
 
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+
+    // Turn-boundary marker (our extension). Written on Pi's `agent_settled`,
+    // i.e. once no automatic retry / compaction retry / queued continuation
+    // remains — so it is ordered AFTER every assistant record of the turn it
+    // closes. This is the ONLY place a held error becomes a user-visible
+    // failure: `lastStopReason === 'error'` means the turn really ended that
+    // way; anything else means Pi recovered and the held error is dropped.
+    const boundary = piTurnBoundaryStopReason(obj);
+    if (boundary.present) {
+      // One marker proves the extension is live here; from now on the marker
+      // (or the backstop) resolves holds, never a bare user record. Set before
+      // the branch below so the session_start announcement counts too.
+      pending.markerSeen = true;
+      // A declaration marker (`lastStopReason: null`, written on session_start
+      // — including EVERY resume, which re-fires session_start) carries no
+      // verdict. It must NEVER be read as "this turn settled cleanly", or a
+      // second declaration after a mid-turn crash would silently drop a held
+      // error. Only a marker that actually closes a turn resolves the hold.
+      if (boundary.lastStopReason === undefined) continue;
+      if (boundary.lastStopReason === PI_TURN_BOUNDARY_STOP_REASON_ERROR) {
+        events.push(...flushHeldPiError(pending, sessionId));
+      } else {
+        pending.error = undefined;
+      }
+      continue;
+    }
+
     if (obj?.type !== 'message' || !obj.message || typeof obj.message !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
@@ -285,6 +444,35 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
     if (role === 'user') {
       const content = joinTextContent(obj.message.content);
       if (!content) continue;
+      // A user record can mean two very different things, and only one of them
+      // ends the held error's turn:
+      //
+      //   • A genuinely NEW turn — the previous turn's last word was an error,
+      //     so it really did fail and must be reported before this turn's
+      //     events. Without this the failure is swallowed when the NEXT turn's
+      //     terminal clears the hold. Measured on real transcripts: 104 error
+      //     records are immediately followed by a new user record.
+      //   • A STEER — input submitted while the turn was still running. Pi's
+      //     retry entry point re-reads the steering queue at the TOP of the
+      //     loop ("Check for steering messages at start", agent-loop.ts), so a
+      //     message that lands during the retry backoff (2s/4s/8s, up to 14s
+      //     per turn) writes its user record BETWEEN the error and its retry.
+      //     Flushing there posts a failure card for a turn that then succeeds —
+      //     exactly the false alarm this whole mechanism removes.
+      //
+      // We cannot tell them apart from the user record alone. But we do not
+      // have to: when the boundary extension is loaded the marker resolves
+      // every held error on its own, so this release is pure downside there —
+      // it can only mis-fire on a steer. It earns its keep ONLY on transcripts
+      // that will never produce a marker (adopt sessions, a compiled binary,
+      // sessions predating the extension), where it is the sole timely signal
+      // and the alternative is waiting out the 300s backstop.
+      //
+      // `markerSeen` is sticky per transcript: one marker proves the extension
+      // is live for this session, and from then on the boundary owns the
+      // decision. Before the first marker we keep releasing, so a
+      // marker-less session still reports its failures promptly.
+      if (!pending.markerSeen) events.push(...flushHeldPiError(pending, sessionId));
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
@@ -308,9 +496,19 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
 
     // `toolUse` (and any missing/unknown reason) is mid-turn — the model is
     // still working; wait for the terminal record.
-    //   - `error`/`aborted` are HARD terminals: Pi's agent loop does
-    //     turn_end→agent_end→return regardless of content, so they MUST emit
+    //   - `aborted` is a HARD terminal: Pi's agent loop does
+    //     turn_end→agent_end→return regardless of content, so it MUST emit
     //     even empty, or the collecting head never closes.
+    //   - `error` is NOT a turn terminal on its own. Pi is an agent loop and
+    //     `stopReason` describes ONE model request: on a transient provider
+    //     failure Pi retries inside the SAME turn (agent-session.ts strips the
+    //     record from LLM context while deliberately keeping it in the session
+    //     file). Measured over 231 real local sessions, 229/339 error records
+    //     were followed by that same turn continuing. Treating one as terminal
+    //     posted a "gateway failure" card — and @mentioned a human — for turns
+    //     that then succeeded. So an error record is HELD: it closes the turn
+    //     only once the turn-boundary marker says the turn really settled that
+    //     way (see the `custom` branch above and `flushPiPendingError`).
     //   - `stop`/`length` end the turn ONLY when the message has NO tool calls.
     //     Both can carry tool calls mid-turn: agent-loop runs the batch and
     //     keeps looping unless it terminates (`length` → failToolCallsFrom-
@@ -327,10 +525,9 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
     // the started turn keeps the session projected busy until the next
     // ordinary user turn HOL-drops the unclosed collecting head. (botmux
     // ships no such tool.)
-    const isHardTerminal = stopReason === 'error' || stopReason === 'aborted';
+    const isHardTerminal = stopReason === 'aborted';
     const isTextTerminal = (stopReason === 'stop' || stopReason === 'length')
       && !hasToolCall(obj.message.content);
-    if (!isHardTerminal && !isTextTerminal) continue;
 
     // Provider error detail (verified on pi 0.84.2: lives on `message`, next to
     // stopReason; accept a top-level fallback mirroring the stopReason read).
@@ -341,6 +538,26 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
           ? obj.errorMessage
           : undefined;
 
+    if (stopReason === 'error') {
+      // Hold the newest error of this turn. If the turn recovers, the later
+      // `stop`/`length` terminal drops it; if the turn really failed, the
+      // boundary marker flushes exactly this one as the turn's failure. Any
+      // partial text stays attached so a failed turn can still show what the
+      // model managed to say.
+      pending.error = {
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        text: joinTextContent(obj.message.content),
+        errorMessage,
+      };
+      continue;
+    }
+
+    if (!isHardTerminal && !isTextTerminal) continue;
+
+    // A real terminal supersedes any held error: the turn moved past it.
+    pending.error = undefined;
+
     events.push({
       uuid: `${path}:${lineStart}`,
       timestampMs,
@@ -350,6 +567,10 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
       ...piTerminalOutcome(stopReason as PiTerminalStopReason, errorMessage),
     });
   }
+
+  // A held error whose boundary marker is overdue is reported anyway, so a Pi
+  // that died mid-retry still surfaces its failure instead of going silent.
+  events.push(...flushPiPendingError(path, sessionId, nowMs));
 
   return { events, newOffset, pendingTail };
 }

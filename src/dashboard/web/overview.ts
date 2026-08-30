@@ -1,5 +1,5 @@
 import { attentionReason, botNameForAppId } from './ui.js';
-import { fetchGroupsSnapshot } from './groups-api.js';
+import { fetchGroupsNamesSnapshot } from './groups-api.js';
 
 let groupsSnapshot: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
@@ -9,7 +9,16 @@ export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[]
 
 export async function loadGroupsSnapshot(): Promise<void> {
   try {
-    groupsSnapshot = await fetchGroupsSnapshot();
+    // 轻量视图：buildBotCards() 只遍历 snapshot.bots，且只读 larkAppId /
+    // botName / botAvatarUrl / cliId / brand 这 5 个字段；`snapshot.chats` 在
+    // 本文件里零读取（attentionReason() 只看传入的 session row，与 groups
+    // 快照无关）。所以完整矩阵里那 12.34MB 的 chats[].memberBots 是纯浪费。
+    //
+    // ⚠️ 更要紧的是**去重**：app.tsx 启动时并行跑 loadNameMaps() 与本函数。
+    // 两者必须落在 groups-api 的**同一个 in-flight** 上，否则会变成
+    // 「names 387KB + full 12.73MB」两发（MEASURED 13.11MB，比改动前的
+    // 12.73MB 更差）。loadNameMaps 走 names，本函数也必须走 names。
+    groupsSnapshot = await fetchGroupsNamesSnapshot();
   } catch {
     // Overview stays useful even when Lark group APIs are unavailable.
   }

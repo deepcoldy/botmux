@@ -23,6 +23,7 @@ import {
   buildPrivilegeUpdatePayload,
   buildSafeSettingPayload,
   buildScopeUpdatePayload,
+  cancelPendingReviewVersion,
   canFillPrivilegeWithAppAvailability,
   collectBotmuxRedirectUrls,
   createFeishuOpenPlatformApp,
@@ -32,15 +33,20 @@ import {
   extractOpenPlatformRedirectUrls,
   extractOpenPlatformSessionIdentity,
   extractOpenPlatformScopeEntries,
+  fetchApprovalFlowPrediction,
   filterScopeManifest,
+  findInReviewVersionId,
+  findUncommittedDraftVersionId,
   getCookieHeader,
   isPrivilegeRangeNarrowed,
+  isVersionCommitted,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
   readDefaultScopeManifest,
   missingRedirectUrls,
   OpenPlatformApiError,
   parseSetupOpenPlatformAutoFlag,
+  predictApprovalFlow,
   prepareFeishuWebSession,
   probeVcMeetingEventSubscription,
   readStoredCookiesFromSessionFile,
@@ -724,6 +730,518 @@ describe('privilege 数据范围 —— 自动填「与应用的可用范围一�
       expect({ label, count: failed.count, warned: Boolean(failed.warning) })
         .toEqual({ label, count: 0, warned: true });
       expect(failed.calls.some(p => p.includes('/app_version/create/')), `${label}: 仍应发版`).toBe(true);
+    }
+  });
+});
+
+/**
+ * 未提交审核的草稿会**永久**卡死权限自愈。线上实测：3 台 bot 各自留下一个
+ * `versionStatus=0` 的草稿后，`app_version/create` 每次都回
+ * `code=10043 版本已创建，请刷新`，于是每次 daemon 重启都重跑一遍必败请求、
+ * 重发一遍「缺 N 项权限」的 DM（一天各 5 次，其中一台还是别人的 bot）。
+ */
+describe('未提交草稿卡死发版', () => {
+  const versionsPayload = (versions: Array<Record<string, unknown>>) =>
+    ({ code: 0, data: { Head: { RespFormat: 0 }, versions } });
+
+  it('findUncommittedDraftVersionId 只认草稿(0)，绝不碰审核中(1)/已上线(2,100)', () => {
+    // console 与公开 API 的枚举不一样（实测对照：console 0/1/2/100 ↔ 公开 4/3/1/1）。
+    // 这里读的是 console 的 versionStatus。
+    expect(findUncommittedDraftVersionId(versionsPayload([
+      { appVersion: '1.0.1', versionId: 'draft-1', versionStatus: 0 },
+      { appVersion: '1.0.0', versionId: 'live-1', versionStatus: 2 },
+    ]))).toBe('draft-1');
+
+    // 🔴 最关键的边界：审核中的版本是别人真的提交上去、正在排队的东西。自动流程
+    // 去动它等于把人家的审批干掉——线上就有 2 台处于审核中且不属于本机 owner。
+    expect(findUncommittedDraftVersionId(versionsPayload([
+      { appVersion: '1.0.5', versionId: 'in-review', versionStatus: 1 },
+      { appVersion: '1.0.4', versionId: 'live-1', versionStatus: 2 },
+    ]))).toBeUndefined();
+
+    // 全是历史已上线 → 没有草稿，走正常建版本
+    expect(findUncommittedDraftVersionId(versionsPayload([
+      { appVersion: '1.0.1', versionId: 'a', versionStatus: 100 },
+      { appVersion: '1.0.0', versionId: 'b', versionStatus: 2 },
+    ]))).toBeUndefined();
+    // 畸形/空 → undefined，不抛
+    expect(findUncommittedDraftVersionId(versionsPayload([]))).toBeUndefined();
+    expect(findUncommittedDraftVersionId({ code: 0 })).toBeUndefined();
+    expect(findUncommittedDraftVersionId(null)).toBeUndefined();
+    // 草稿但没有 versionId → 拼不出合并键，当作没有
+    expect(findUncommittedDraftVersionId(versionsPayload([{ appVersion: '1.0.1', versionStatus: 0 }]))).toBeUndefined();
+  });
+
+  it('isVersionCommitted：仍是草稿=false，已提交=true，查不到=false(保守)', () => {
+    const payload = versionsPayload([
+      { appVersion: '1.0.2', versionId: 'still-draft', versionStatus: 0 },
+      { appVersion: '1.0.1', versionId: 'in-review', versionStatus: 1 },
+      { appVersion: '1.0.0', versionId: 'live', versionStatus: 2 },
+    ]);
+    expect(isVersionCommitted(payload, 'still-draft')).toBe(false);
+    expect(isVersionCommitted(payload, 'in-review')).toBe(true);
+    expect(isVersionCommitted(payload, 'live')).toBe(true);
+    // 查不到就是无法证明它已提交 → false。宁可多一句 warning，也别重复
+    // 「拿 code=0 当已发布」那个错。
+    expect(isVersionCommitted(payload, 'who-knows')).toBe(false);
+    expect(isVersionCommitted({ code: 0 }, 'x')).toBe(false);
+  });
+
+  /**
+   * 接线验证：纯函数全绿但没接上线是这类改动最典型的空转，所以这里跑**真实的
+   * automation**，并让 `app_version/create` 像线上那样对草稿存在的情况回 10043。
+   */
+  it('automation 撞上草稿时提交草稿而不是建新版本(10043 不再发生)', async () => {
+    const run = async (label: string, opts: {
+      versions: Array<Record<string, unknown>>;
+      /** commit 后回读时该版本是否已离开草稿态 */
+      commitTakesEffect?: boolean;
+    }) => {
+      const dir = mkdtempSync(join(tmpdir(), `draft-${label}-`));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = openPlatformSubscriptionMock('cli_d');
+      const calls: string[] = [];
+      let committed: string | undefined;
+      let created: string | undefined;
+      let listCount = 0;
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/app/cli_d/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+        const path = href.replace(/^https:\/\/[^/]+/, '');
+        if (path.startsWith('/developers/')) calls.push(path);
+        if (path.includes('/scope/all/')) {
+          return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+        }
+        if (path.includes('/privilege/all/')) return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+        if (path.includes('/app_version/list/')) {
+          listCount += 1;
+          // 第二次 list 是 commit 后的回读。真实的开放平台会把刚建的版本也列出来，
+          // 所以这里必须把 created 的版本并进列表——不然回读查不到它，
+          // isVersionCommitted 会保守判 false，测出来的失败是**夹具的**、不是代码的。
+          const listed = [...opts.versions, ...(created ? [{ appVersion: '1.0.2', versionId: created, versionStatus: 0 }] : [])];
+          if (listCount > 1 && committed && opts.commitTakesEffect !== false) {
+            return Response.json(versionsPayload(listed.map(v =>
+              (v.versionId === committed ? { ...v, versionStatus: 2 } : v))));
+          }
+          return Response.json(versionsPayload(listed));
+        }
+        if (path.includes('/app_version/create/')) {
+          // 线上真实行为：存在未提交草稿时，建版本一律被拒。
+          if (opts.versions.some(v => v.versionStatus === 0)) {
+            return Response.json({ code: 10043, msg: '版本已创建，请刷新' });
+          }
+          created = 'v-new';
+          return Response.json({ code: 0, data: { versionId: 'v-new' } });
+        }
+        if (path.includes('/publish/commit/')) {
+          committed = path.split('/').pop();
+          return Response.json({ code: 0, data: { isOk: true } });
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+      const r = await automateOpenPlatformSetup({
+        appId: 'cli_d', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      });
+      return { r, calls, committed };
+    };
+
+    // ① 有草稿 → 直接提交它，**一次 create 都不发**（所以永远撞不到 10043）
+    const withDraft = await run('with-draft', {
+      versions: [
+        { appVersion: '1.0.1', versionId: 'draft-1', versionStatus: 0 },
+        { appVersion: '1.0.0', versionId: 'live-1', versionStatus: 2 },
+      ],
+    });
+    expect(withDraft.r.ok, `ok=false reason=${(withDraft.r as any).reason} msg=${(withDraft.r as any).message}`).toBe(true);
+    expect(withDraft.calls.some(p => p.includes('/app_version/create/')), '有草稿时不该建新版本').toBe(false);
+    expect(withDraft.committed).toBe('draft-1');
+    if (withDraft.r.ok) {
+      expect(withDraft.r.versionId).toBe('draft-1');
+      expect(withDraft.r.versionReused).toBe(true);
+      expect(withDraft.r.versionWarning).toBeUndefined();
+    }
+
+    // ② 无草稿 → 原样建新版本并提交（不改既有行为）
+    const noDraft = await run('no-draft', {
+      versions: [{ appVersion: '1.0.0', versionId: 'live-1', versionStatus: 2 }],
+    });
+    expect(noDraft.r.ok).toBe(true);
+    expect(noDraft.calls.some(p => p.includes('/app_version/create/'))).toBe(true);
+    expect(noDraft.committed).toBe('v-new');
+    if (noDraft.r.ok) {
+      expect(noDraft.r.versionId).toBe('v-new');
+      expect(noDraft.r.versionReused).toBe(false);
+      expect(noDraft.r.versionWarning).toBeUndefined();
+    }
+
+    // ③ commit 返回 code=0 但版本仍是草稿 → **不许**宣称已发布，必须带 versionWarning。
+    //    这正是线上那条假日志（"version …098 published" 而它其实是草稿）的成因。
+    const silentNoop = await run('silent-noop', {
+      versions: [
+        { appVersion: '1.0.1', versionId: 'draft-1', versionStatus: 0 },
+        { appVersion: '1.0.0', versionId: 'live-1', versionStatus: 2 },
+      ],
+      commitTakesEffect: false,
+    });
+    expect(silentNoop.r.ok).toBe(true);
+    if (silentNoop.r.ok) {
+      expect(silentNoop.r.versionWarning, 'commit 空转必须带 warning').toBeTruthy();
+      expect(silentNoop.r.versionWarning).toMatch(/草稿|未提交/);
+    }
+  });
+
+  /**
+   * 审核中（`code=10046 审核中, 请刷新`）是**另一种**永久空转，与草稿的 10043 无关：
+   * 审核期间开放平台把应用配置整体写锁（实测 `scope/update` / `robot/switch` /
+   * `safe_setting/update` / `base_info` 全拒，读接口照常），历史行为把它当普通
+   * api_error 硬失败，于是每次重启重跑整条链路 + 反复提示（线上两台各撞 8 次），
+   * 而正确处置是**等审批通过**——它会自己好。
+   */
+  it('应用审核中(10046) 单独归因，不当成配置错误', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'under-review-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_r');
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_r/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = href.replace(/^https:\/\/[^/]+/, '');
+      if (path.startsWith('/developers/')) calls.push(path);
+      if (path.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (path.includes('/privilege/all/')) return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      // 审核中：所有写操作被拒（这里覆盖到本函数第一个撞上它的写：robot/switch）
+      if (/\/(scope|privilege|safe_setting)\/update\/|\/robot\/switch\/|\/base_info\//.test(path)) {
+        return Response.json({ code: 10046, msg: '审核中, 请刷新' });
+      }
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+    const r = await automateOpenPlatformSetup({
+      appId: 'cli_r', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    // 独立 reason：调用方靠它区分「等就行」和「真的配错了」。归到 api_error 时
+    // 上层只会反复报「开放平台 API 错误」并把权限深链推给管理员——而审核期间那些
+    // 链接点了也写不进去，是**错误建议**。
+    expect(r.reason).toBe('app_under_review');
+    expect(r.message).toMatch(/审核中/);
+    // 不该在审核中还去建版本/发布：这一步之后的写操作都会被同样拒掉
+    expect(calls.some(p => p.includes('/app_version/create/'))).toBe(false);
+    expect(calls.some(p => p.includes('/publish/commit/'))).toBe(false);
+  });
+
+  /**
+   * 撤回审核中版本：端点 `publish/cancel_commit/<appId>/<versionId>` 是从 console
+   * 实测抓来的（版本详情页 Withdraw 按钮），不是猜的。
+   */
+  it('findInReviewVersionId 只认审核中(1)，不碰草稿(0)/已上线(2,100)', () => {
+    const payload = (versions: Array<Record<string, unknown>>) =>
+      ({ code: 0, data: { versions } });
+    expect(findInReviewVersionId(payload([
+      { appVersion: '1.0.5', versionId: 'rev-1', versionStatus: 1 },
+      { appVersion: '1.0.4', versionId: 'live-1', versionStatus: 2 },
+    ]))).toBe('rev-1');
+    // 草稿不该走撤回路径——它要的是 commit（见上一个 describe），撤回会白烧一次不可逆操作
+    expect(findInReviewVersionId(payload([
+      { appVersion: '1.0.1', versionId: 'draft-1', versionStatus: 0 },
+      { appVersion: '1.0.0', versionId: 'live-1', versionStatus: 2 },
+    ]))).toBeUndefined();
+    expect(findInReviewVersionId(payload([
+      { appVersion: '1.0.1', versionId: 'a', versionStatus: 100 },
+    ]))).toBeUndefined();
+    expect(findInReviewVersionId(payload([]))).toBeUndefined();
+    expect(findInReviewVersionId(null)).toBeUndefined();
+  });
+
+  it('cancelPendingReviewVersion 打对端点，并回读确认真的撤了', async () => {
+    // ① 正常：撤回后回读已不在审核中
+    const calls: Array<{ path: string; body: unknown }> = [];
+    let cancelled = false;
+    const okPost = async (path: string, body?: unknown) => {
+      calls.push({ path, body });
+      if (path.includes('/publish/cancel_commit/')) { cancelled = true; return { code: 0 }; }
+      return { code: 0, data: { versions: cancelled
+        ? [{ appVersion: '1.0.5', versionId: 'rev-1', versionStatus: 2 }]
+        : [{ appVersion: '1.0.5', versionId: 'rev-1', versionStatus: 1 }] } };
+    };
+    await expect(cancelPendingReviewVersion(okPost, 'cli_w', 'rev-1')).resolves.toEqual({ ok: true });
+    expect(calls[0]).toEqual({ path: '/developers/v1/publish/cancel_commit/cli_w/rev-1', body: {} });
+    // 必须回读确认：`cancel_commit` 回 code=0 不等于状态真变了（publish/commit 已栽过一次）
+    expect(calls[1].path).toBe('/developers/v1/app_version/list/cli_w');
+
+    // ② code=0 但状态没变 → 判失败，别谎报撤回成功
+    const noopPost = async (path: string) => path.includes('/publish/cancel_commit/')
+      ? { code: 0 }
+      : { code: 0, data: { versions: [{ appVersion: '1.0.5', versionId: 'rev-1', versionStatus: 1 }] } };
+    const noop = await cancelPendingReviewVersion(noopPost, 'cli_w', 'rev-1');
+    expect(noop.ok).toBe(false);
+    expect(noop.message).toMatch(/仍是「审核中」/);
+
+    // ③ 撤回请求本身报错 → 失败且带原因
+    const failPost = async (path: string) => {
+      if (path.includes('/publish/cancel_commit/')) throw new Error('code=10046 msg=审核中, 请刷新');
+      return { code: 0, data: { versions: [] } };
+    };
+    const failed = await cancelPendingReviewVersion(failPost, 'cli_w', 'rev-1');
+    expect(failed.ok).toBe(false);
+    expect(failed.message).toMatch(/撤回审核中版本失败/);
+  });
+
+});
+
+/**
+ * 「提交后会不会秒过」的预判：`approval_nodes/get`。判据落在
+ * `data.applyInstanceInfo.applyNodes` 的 `nodeType` 上。
+ */
+describe('审核中：不自动撤回，只带出节流用的 versionId', () => {
+  /**
+   * 🔴 自动撤回已删（前提被推翻：**触发审批说明有配置不合规**，撤回重提会被同一条规则
+   * 再拦一次 ⟹ 用不可逆动作驱动死循环）。这里锁三件事：
+   *   ① 一次 `publish/cancel_commit` 都不许发
+   *   ② 带出 `inReviewVersionId` 供上层节流
+   *   ③ 读版本列表失败时**不许**把 app_under_review 覆盖成别的 reason
+   */
+  const runUnderReview = async (label: string, opts: { versionListFails?: boolean; hasInReview?: boolean }) => {
+    const dir = mkdtempSync(join(tmpdir(), `ur-${label}-`));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_ur');
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_ur/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = href.replace(/^https:\/\/[^/]+/, '');
+      if (path.startsWith('/developers/')) calls.push(path);
+      if (path.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (path.includes('/privilege/all/')) return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      // 写锁：robot/switch 抛 10046 → 走 under_review 分支
+      if (/\/(scope|privilege|safe_setting)\/update\/|\/robot\/switch\//.test(path)) {
+        return Response.json({ code: 10046, msg: '审核中, 请刷新' });
+      }
+      if (path.includes('/app_version/list/')) {
+        if (opts.versionListFails) return Response.json({ code: 1, msg: 'list denied' });
+        return Response.json({ code: 0, data: { versions: opts.hasInReview === false
+          ? [{ appVersion: '1.0.0', versionId: 'live', versionStatus: 2 }]
+          : [{ appVersion: '1.0.5', versionId: 'rev-1', versionStatus: 1 }] } });
+      }
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+    const r = await automateOpenPlatformSetup({
+      appId: 'cli_ur', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+    return { r, calls };
+  };
+
+  it('🔴 一次 cancel_commit 都不发，并带出 inReviewVersionId 做节流 key', async () => {
+    const { r, calls } = await runUnderReview('normal', {});
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.reason).toBe('app_under_review');
+    // ① 绝不自动撤回
+    expect(calls.some(p => p.includes('/publish/cancel_commit/')), '不许自动撤回').toBe(false);
+    // ② 带出节流 key
+    expect(r.inReviewVersionId).toBe('rev-1');
+    // 文案必须说清「不会自己通过」+ 给人工路径，不能说「等审批通过就好」
+    expect(r.message).toMatch(/配置不合规/);
+    expect(r.message).toMatch(/撤回/);
+    expect(r.message).not.toMatch(/审批通过后 botmux 会在下次启动时自动补齐/);
+  });
+
+  it('没有待审版本时 inReviewVersionId 为空（上层据此不节流）', async () => {
+    const { r } = await runUnderReview('none', { hasInReview: false });
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.reason).toBe('app_under_review');
+    expect(r.inReviewVersionId).toBeUndefined();
+  });
+
+  it('🔴 读版本列表失败只丢 versionId，不许污染 app_under_review 这个主信号', async () => {
+    // 分类是主信号，versionId 只是节流用的上下文；上下文取不到不能反过来把结论
+    // 改成 network / api_error —— 那会让管理员收到完全错误的诊断。
+    const { r } = await runUnderReview('list-fails', { versionListFails: true });
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.reason).toBe('app_under_review');
+    expect(r.inReviewVersionId).toBeUndefined();
+  });
+});
+
+describe('审批流程预判（秒过 vs 要人审）', () => {
+  const flow = (nodes: Array<Record<string, unknown>>, extra: Record<string, unknown> = {}) =>
+    ({ code: 0, data: { applyInstanceInfo: { applyNodes: nodes }, ...extra } });
+  const approver = (name: string) => ({ approver: { name, id: 'u1' } });
+
+  it('全自动通过 + 零真人审批人 → autoApproved', () => {
+    // 逐字复刻 Modern审核(Claude@cn1) 的线上返回形态
+    const r = predictApprovalFlow(flow([
+      { nodeName: '发起', nodeType: '', nodeUser: [approver('申晗')] },
+      { nodeName: '仅协作者免审策略', nodeType: '自动通过', nodeUser: [] },
+      { nodeName: '仅协作者免审抄送', nodeType: '', nodeCcUser: [approver('某抄送人')], nodeUser: [] },
+      { nodeName: '结束', nodeType: '', nodeUser: [] },
+    ], { canAutoApproval: false }));
+    expect(r).toEqual({ known: true, autoApproved: true, humanApprovers: [] });
+  });
+
+  it('🔴 绝不能用同响应的 canAutoApproval 当判据（会判反）', () => {
+    // 线上实测：Modern审核 是 canAutoApproval:false 而流程写着「自动通过」（上一个用例），
+    // 另一台反而 canAutoApproval:true 却根本算不出流程。所以这个字段与「会不会秒过」
+    // 无关——两个方向都钉一下，防止有人图省事改回去读它。
+    const autoFalse = predictApprovalFlow(flow([
+      { nodeName: '仅协作者免审策略', nodeType: '自动通过', nodeUser: [] },
+    ], { canAutoApproval: false }));
+    expect(autoFalse.autoApproved, 'canAutoApproval:false 不该压过节点里的「自动通过」').toBe(true);
+
+    const autoTrue = predictApprovalFlow(flow([
+      { nodeName: '安全审批', nodeType: '', nodeUser: [approver('某审批人')] },
+    ], { canAutoApproval: true }));
+    expect(autoTrue.autoApproved, 'canAutoApproval:true 不该压过真人审批人').toBe(false);
+    expect(autoTrue.humanApprovers).toEqual(['某审批人']);
+  });
+
+  it('有真人审批关卡 → 不算秒过，并列出审批人（抄送人不算）', () => {
+    const r = predictApprovalFlow(flow([
+      { nodeName: '发起', nodeType: '', nodeUser: [approver('申晗')] },
+      { nodeName: '数据安全审批', nodeType: '', nodeUser: [approver('审批人A'), approver('审批人B')] },
+      { nodeName: '知会', nodeType: '', nodeCcUser: [approver('抄送人C')], nodeUser: [] },
+      { nodeName: '结束', nodeType: '', nodeUser: [] },
+    ]));
+    expect(r.known).toBe(true);
+    expect(r.autoApproved).toBe(false);
+    // 抄送只知会、不阻塞；算进来会把本可自动提交的版本误判成要人工
+    expect(r.humanApprovers).toEqual(['审批人A', '审批人B']);
+  });
+
+  it('自动通过与人工关卡混合 → 不算秒过（有一关要人就得等人）', () => {
+    const r = predictApprovalFlow(flow([
+      { nodeName: '免审策略', nodeType: '自动通过', nodeUser: [] },
+      { nodeName: '安全复核', nodeType: '', nodeUser: [approver('审批人A')] },
+    ]));
+    expect(r.autoApproved).toBe(false);
+    expect(r.humanApprovers).toEqual(['审批人A']);
+  });
+
+  it('空流程 / 结构不认识 → known:false，调用方必须 fail-closed', () => {
+    // 空的正常成因是「没有待发布版本，无流程可算」——不是可以自动提交的意思。
+    for (const payload of [flow([]), { code: 0, data: {} }, { code: 0 }, null, 'nonsense']) {
+      const r = predictApprovalFlow(payload);
+      expect({ known: r.known, auto: r.autoApproved }).toEqual({ known: false, auto: false });
+    }
+    // 只有「发起/结束」没有任何关卡 → 也判不出来（不能当秒过）
+    const noGate = predictApprovalFlow(flow([
+      { nodeName: '发起', nodeType: '', nodeUser: [approver('申晗')] },
+      { nodeName: '结束', nodeType: '', nodeUser: [] },
+    ]));
+    expect(noGate.known).toBe(false);
+    expect(noGate.autoApproved).toBe(false);
+  });
+
+  it('英文环境的 Auto approved / Initiate / End 同样认', () => {
+    const r = predictApprovalFlow(flow([
+      { nodeName: 'Initiate', nodeType: '', nodeUser: [approver('Shen Han')] },
+      { nodeName: 'Collaborator-only auto policy', nodeType: 'Auto approved', nodeUser: [] },
+      { nodeName: 'End', nodeType: '', nodeUser: [] },
+    ]));
+    expect(r).toEqual({ known: true, autoApproved: true, humanApprovers: [] });
+  });
+
+  it('fetchApprovalFlowPrediction 带全 body（只传 {} 会被开放平台拒 code=10001）', async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const post = async (path: string, body?: unknown) => {
+      calls.push({ path, body });
+      return flow([{ nodeName: '免审策略', nodeType: '自动通过', nodeUser: [] }]);
+    };
+    const vis = {
+      visibleSuggest: { departments: ['d1'], members: ['m1'], groups: [], isAll: 0 },
+      blackVisibleSuggest: { departments: [], members: [], groups: [], isAll: 0 },
+    };
+    const r = await fetchApprovalFlowPrediction(post, 'cli_a', 'v9', vis);
+    expect(r.autoApproved).toBe(true);
+    expect(calls[0].path).toBe('/developers/v1/approval_nodes/get/cli_a');
+    // 缺字段会被拒，所以逐个钉住
+    expect(calls[0].body).toEqual({
+      visibleSuggest: vis.visibleSuggest,
+      blackVisibleSuggest: vis.blackVisibleSuggest,
+      b2cShareSplitConfigSuggest: {
+        b2cGroupChatShareEnable: false,
+        b2cP2PChatShareEnable: false,
+        b2cP2PChatNeedAudit: false,
+      },
+      versionId: 'v9',
+      notCalculateFlow: false,
+    });
+
+    // 接口报错 → known:false + 原因，绝不冒充任一结论
+    const boom = await fetchApprovalFlowPrediction(
+      async () => { throw new Error('code=10001 msg=请求错误，请刷新页面后重试'); },
+      'cli_a', 'v9', vis,
+    );
+    expect(boom.known).toBe(false);
+    expect(boom.autoApproved).toBe(false);
+    expect(boom.reason).toMatch(/10001/);
+  });
+
+  it('automation 在提交前查流程，并把秒过/要人审带回调用方', async () => {
+    const run = async (label: string, nodes: Array<Record<string, unknown>>) => {
+      const dir = mkdtempSync(join(tmpdir(), `flow-${label}-`));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = openPlatformSubscriptionMock('cli_f');
+      const calls: string[] = [];
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/app/cli_f/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+        const path = href.replace(/^https:\/\/[^/]+/, '');
+        if (path.startsWith('/developers/')) calls.push(path);
+        if (path.includes('/scope/all/')) {
+          return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+        }
+        if (path.includes('/privilege/all/')) return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+        if (path.includes('/approval_nodes/get/')) return Response.json(flow(nodes));
+        if (path.includes('/app_version/list/')) {
+          return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'live', versionStatus: 2 }] } });
+        }
+        if (path.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-new' } });
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+      const r = await automateOpenPlatformSetup({
+        appId: 'cli_f', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      });
+      return { r, calls };
+    };
+
+    const auto = await run('auto', [{ nodeName: '免审策略', nodeType: '自动通过', nodeUser: [] }]);
+    expect(auto.r.ok, `ok=false ${(auto.r as any).message}`).toBe(true);
+    if (auto.r.ok) {
+      expect(auto.r.approvalAutoPassed).toBe(true);
+      expect(auto.r.approvalHumanApprovers).toBeUndefined();
+    }
+    // 顺序判据：查流程必须在 commit **之前**（提交后再查等于没用上）
+    const flowAt = auto.calls.findIndex(p => p.includes('/approval_nodes/get/'));
+    const commitAt = auto.calls.findIndex(p => p.includes('/publish/commit/'));
+    expect(flowAt).toBeGreaterThanOrEqual(0);
+    expect(commitAt).toBeGreaterThan(flowAt);
+
+    const manual = await run('manual', [{ nodeName: '安全审批', nodeType: '', nodeUser: [approver('审批人A')] }]);
+    expect(manual.r.ok).toBe(true);
+    if (manual.r.ok) {
+      expect(manual.r.approvalAutoPassed).toBe(false);
+      expect(manual.r.approvalHumanApprovers).toEqual(['审批人A']);
+      // 要人审**照样提交**（既有行为不变），只是如实告知在等谁
+      expect(manual.calls.some(p => p.includes('/publish/commit/'))).toBe(true);
     }
   });
 });
@@ -1971,10 +2489,20 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/callback/cli_x',
       '/developers/v1/callback/update/cli_x',
       '/developers/v1/callback/cli_x',
-      '/developers/v1/visible/online/cli_x',
+      // app_version/list 提前到可见范围之前：它现在还兼任「有没有卡住的草稿」的判据，
+      // 而那个判据要先于「无变更就跳过发版」的短路（否则草稿永远等不到被提交）。
+      // 两者都是读操作，先后无副作用。
       '/developers/v1/app_version/list/cli_x',
+      '/developers/v1/visible/online/cli_x',
       '/developers/v1/app_version/create/cli_x',
+      // 提交前先查审批流程：秒过的一声不吭办完，要人审的如实说在等谁。
+      // 顺序是硬要求——提交后再查等于没用上。
+      '/developers/v1/approval_nodes/get/cli_x',
       '/developers/v1/publish/commit/cli_x/v1',
+      // commit 后回读一次版本状态：`publish/commit` 回 code=0 不代表版本真的提交了
+      // （线上实测过 code=0 却留在草稿态，日志因此谎报 published，而那个草稿会用
+      // `code=10043 版本已创建` 永久卡死后续每一次自愈）。
+      '/developers/v1/app_version/list/cli_x',
     ]);
     if (result.ok) expect(result.redirectConfigured).toBe(true);
     const updateCall = calls.find(call => call.url.includes('/scope/update/'));
@@ -2051,10 +2579,18 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/callback/cli_x',
       '/developers/v1/callback/update/cli_x',
       '/developers/v1/callback/cli_x',
-      '/developers/v1/visible/online/cli_x',
+      // app_version/list 提前到可见范围之前：它现在还兼任「有没有卡住的草稿」的判据，
+      // 而那个判据要先于「无变更就跳过发版」的短路（否则草稿永远等不到被提交）。
+      // 两者都是读操作，先后无副作用。
       '/developers/v1/app_version/list/cli_x',
+      '/developers/v1/visible/online/cli_x',
       '/developers/v1/app_version/create/cli_x',
+      // 提交前先查审批流程：秒过的一声不吭办完，要人审的如实说在等谁。
+      // 顺序是硬要求——提交后再查等于没用上。
+      '/developers/v1/approval_nodes/get/cli_x',
       '/developers/v1/publish/commit/cli_x/v1',
+      // commit 后回读版本状态（见上一个用例的说明）。
+      '/developers/v1/app_version/list/cli_x',
     ]);
     const updateCall = calls.find(call => call.url === 'https://open.larkoffice.com/developers/v1/scope/update/cli_x');
     const updateHeaders = new Headers(updateCall?.init.headers);
@@ -2638,6 +3174,65 @@ describe('automateOpenPlatformSetup', () => {
       expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
       expect(sub.updateBodies).toEqual([]);
       expect(sub.redirectWrites).toEqual([]);
+    });
+
+    /**
+     * 🔴 无变更短路 × 卡死草稿的交互：两个特性各自都对，合在一起会互相抵消。
+     *
+     * 一个 scope 已齐、事件已订阅、数据范围已收窄的 bot，`mutated` 恒为 false ⟹ 命中
+     * 无变更短路直接 return ⟹ 「提交草稿」的代码**永远到不了** ⟹ 草稿一直卡着，而
+     * 卡着的草稿会让将来任何一次 `app_version/create` 撞 `code=10043`。
+     *
+     * 「有没有草稿」与「本轮有没有配置变更」是两件独立的事，所以草稿必须能独立地把
+     * 短路顶开。（这个交互是 rebase 到 master 后发现的：两边都是新代码，文本无冲突。）
+     */
+    it('🔴 无变更但存在未提交草稿时，不许短路——必须把草稿提交掉', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-noop-draft-'));
+      const sessionFile = join(dir, 'feishu-session.json');
+      writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+      const sub = noopMock('cli_nd');
+      const calls: string[] = [];
+      let committed: string | undefined;
+      const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+        const href = String(url);
+        calls.push(href);
+        if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+        if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+        if (href.includes('/scope/all/')) return Response.json({ code: 0, data: { appScopeList: [], userScopeList: [] } });
+        // 建新版本仍然不该发生（草稿要复用，不是再建一个）
+        if (href.includes('/app_version/create/')) throw new Error(`must not create a new version: ${href}`);
+        if (href.includes('/publish/commit/')) { committed = href.split('/').pop(); return Response.json({ code: 0 }); }
+        if (href.includes('/approval_nodes/get/')) {
+          return Response.json({ code: 0, data: { applyInstanceInfo: { applyNodes: [
+            { nodeName: '免审策略', nodeType: '自动通过', nodeUser: [] },
+          ] } } });
+        }
+        if (href.includes('/app_version/list/')) {
+          return Response.json({ code: 0, data: { versions: committed
+            ? [{ appVersion: '1.0.1', versionId: 'stuck-draft', versionStatus: 2 }]
+            : [{ appVersion: '1.0.1', versionId: 'stuck-draft', versionStatus: 0 },
+               { appVersion: '1.0.0', versionId: 'live', versionStatus: 2 }] } });
+        }
+        return sub.handle(href, init) ?? Response.json({ code: 0 });
+      }) as typeof fetch;
+
+      const result = await automateOpenPlatformSetup({
+        appId: 'cli_nd',
+        sessionFilePath: sessionFile,
+        fetchImpl,
+        scopeManifest: { scopes: { tenant: [], user: [] } },
+      });
+
+      expect(result.ok, `ok=false ${(result as any).message}`).toBe(true);
+      // 草稿被提交了 —— 而不是被短路跳过
+      expect(committed, '卡住的草稿必须被提交').toBe('stuck-draft');
+      if (result.ok) {
+        expect(result.versionReused).toBe(true);
+        expect(result.versionId).toBe('stuck-draft');
+        expect(result.publishSkipped, '有草稿要处理时不该报「跳过发版」').not.toBe(true);
+      }
+      // 仍然不许凭空建新版本
+      expect(calls.some(u => u.includes('/app_version/create/'))).toBe(false);
     });
 
     it('appJustCreated=true 时即便无变更也照常发版（新应用要靠首发上架）', async () => {

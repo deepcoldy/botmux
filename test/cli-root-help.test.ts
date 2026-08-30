@@ -89,7 +89,12 @@ describe('botmux root help workflow surface', () => {
 
       expect(stdout).toContain('botmux v');
       expect(stdout).toContain('restart     重启 daemon');
-      expect(readdirSync(home).sort()).toEqual(before);
+      // The claim under test is that BOTMUX mutates nothing in HOME. `.bun` is
+      // the Bun runtime's own install cache (`.bun/install/cache`), minted by the
+      // interpreter that runs the child — it appears when the suite runs under
+      // `bun test`, never under Node. Filter just that entry rather than
+      // weakening to a subset match, so any botmux-created file still fails.
+      expect(readdirSync(home).filter(entry => entry !== '.bun').sort()).toEqual(before);
       expect(readFileSync(sentinel, 'utf8')).toBe('untouched\n');
     } finally {
       rmSync(home, { recursive: true, force: true });

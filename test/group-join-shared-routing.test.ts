@@ -205,6 +205,33 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
   });
 
+  it('配置 autoStartOnGroupJoinSeed 时 shared 锚点发送自定义文案', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_join_shared_seed';
+    const chatId = 'oc_join_shared_seed';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinSeed: '👋 已到岗，开始排查群内线索',
+      defaultWorkingDir: tempDir('repo-shared-seed'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // daemon 侧取值咬合：自定义 seed 优先于内置 i18n 文案（防止取值逻辑被改坏而测试不报警）。
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      appId,
+      chatId,
+      '👋 已到岗，开始排查群内线索',
+      'text',
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalledWith(appId, chatId, '🚀 已加入本群，开始工作…', 'text');
+  });
+
   it('尊重群级 shared 覆盖而不是只读取 bot 默认值', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_override';
@@ -962,6 +989,39 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     // 话题群自动开工：seed 消息 id 即首轮权威 turnId（修复前为 false，首轮回复
     // 发不回飞书）。
     expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' });
+  });
+
+  it('话题群配置自定义 seed 时锚点消息用自定义文案', async () => {
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    const { daemon, registry } = modules;
+    const appId = 'app_join_topic_seed';
+    const chatId = 'oc_join_topic_seed';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinSeed: '🔍 已接入，正在读取群内缺陷线索',
+      defaultWorkingDir: tempDir('repo-topic-seed'),
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // thread 锚点发送点同样咬合：话题群路径的自定义 seed 优先于内置文案。
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      appId,
+      chatId,
+      '🔍 已接入，正在读取群内缺陷线索',
+      'text',
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalledWith(appId, chatId, '🚀 已加入本群，开始工作…', 'text');
   });
 
   it('普通群 new-topic 模式开话题并锚定独立 thread-scope session', async () => {

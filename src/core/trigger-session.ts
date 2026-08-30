@@ -108,6 +108,16 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
       'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
       'request is…", "here is my answer"). Do not call botmux send; do not post to Feishu/Lark.',
+      // 哨兵语义的唯一权威出处（no-transport 会话下 routing/reminder 的 usage_silence
+      // 被整块网关掉，见 shared-hints.ts + session-manager buildFollowUpBlocks）。
+      // ⚠️ 迁移不删：async settle（#808）**依赖**模型吐出字面 BOTMUX_NOTHING_TO_SEND
+      // ——isBridgeNothingToSendFinal 要求 trailing sentinel line（bridge-fallback-gate.ts）
+      // → nothingToSendTurns → turn_terminal 带 outputDisposition:'nothing_to_send'，
+      // durable/async caller 只认这个 flag 才把 genuine-empty turn settle 成 completed，
+      // 否则挂 running 到超时。删掉这一句 = genuine-empty 的 HTTP 任务重新挂死。
+      // 这段随 buildUntrustedEventPrompt 同时进首轮与续轮（buildExistingSessionContent
+      // 复用同一 prompt），所以两轮的 settle 都靠它触发。
+      'If you have nothing to answer (e.g. the request needs no reply), output ONLY the single token BOTMUX_NOTHING_TO_SEND — the program receives an empty result.',
       '</botmux_http_response_mode>',
     );
   }
