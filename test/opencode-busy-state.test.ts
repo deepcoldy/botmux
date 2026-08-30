@@ -31,13 +31,14 @@ function openV1Db(): DatabaseSync {
       directory TEXT NOT NULL,
       title TEXT NOT NULL DEFAULT '',
       time_created INTEGER NOT NULL,
-      time_updated INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL DEFAULT 0,
       time_archived INTEGER
     );
     CREATE TABLE IF NOT EXISTS message (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL DEFAULT 0,
       data TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS part (
@@ -45,6 +46,7 @@ function openV1Db(): DatabaseSync {
       message_id TEXT NOT NULL,
       session_id TEXT NOT NULL,
       time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL DEFAULT 0,
       data TEXT NOT NULL
     );
   `);

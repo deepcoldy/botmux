@@ -502,13 +502,16 @@ describe('worker structured-turn status wiring', () => {
     // the busy pattern, so a stale Working... in ZMX history can never block
     // a structured terminal; on a busy authoritative viewport it re-arms the
     // detector and reuses the busy-pattern probe until the marker clears.
+    // Non-visual session busy checks (isSessionBusy) run ahead of screen gates.
     const defer = functionSlice('deferPromptReadyWhileBusy', 'probeBusyPatternIdle');
+    const dbGate = defer.indexOf('cliAdapter?.isSessionBusy');
     const authoritativeGate = defer.indexOf('!backendScreenEvidenceIsAuthoritativeForMutation()');
     const busyTest = defer.indexOf('cliAdapter.busyPattern.test(');
-    expect(authoritativeGate).toBeGreaterThanOrEqual(0);
+    expect(dbGate).toBeGreaterThanOrEqual(0);
+    expect(authoritativeGate).toBeGreaterThan(dbGate);
     expect(busyTest).toBeGreaterThan(authoritativeGate);
-    expect(defer.indexOf('idleDetector?.reset()')).toBeGreaterThan(busyTest);
-    expect(defer.indexOf('scheduleBusyPatternIdleProbe(source)')).toBeGreaterThan(busyTest);
+    expect(defer.indexOf('idleDetector?.reset()', busyTest)).toBeGreaterThan(busyTest);
+    expect(defer.indexOf('scheduleBusyPatternIdleProbe(source)', busyTest)).toBeGreaterThan(busyTest);
 
     // The re-armed probe itself refuses to arm on non-authoritative backends,
     // so a deferred ZMX turn can never be pinned by the probe loop.

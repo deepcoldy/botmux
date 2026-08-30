@@ -694,7 +694,7 @@ describe('worker pipe initial screen ordering', () => {
     const helper = source.slice(helperStart, helperEnd);
 
     expect(helperStart).toBeGreaterThan(-1);
-    expect(helper).toContain('if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;');
+    expect(helper).toContain('if ((!cliAdapter?.busyPattern && !cliAdapter?.isSessionBusy) || (!be.captureCurrentScreen && !be.captureViewport && !cliAdapter?.isSessionBusy)) return;');
     expect(helper).toContain('if (backend !== be || !awaitingFirstPrompt || isPromptReady) return;');
     expect(helper).not.toContain('pendingMessages.length > 0');
   });
