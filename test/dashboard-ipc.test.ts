@@ -941,6 +941,39 @@ describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时
       } finally {
         getBot(appId).config.lang = before;
       }
+
+      // 6) 旧客户端兼容：请求体完全不带 seedDefault（旧前端 / 脚本 / curl）时，
+      //    退回「与服务端当刻默认比较」，行为与引入该字段之前一致。
+      const legacyPut = async (v: string) => {
+        const r = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ autoStartOnGroupJoinSeed: v }),
+        });
+        expect(r.status).toBe(200);
+        return r.json();
+      };
+      expect(await legacyPut(builtin)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+      expect(await legacyPut(custom)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
+      expect(persisted()).toBe(custom);
+      // 旧客户端清空（空串）仍是「恢复默认」，不因新分支改变语义。
+      expect(await legacyPut('')).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+
+      // 7) seedDefault 是非字符串（脏输入）时不得抛错，按缺失处理。
+      //    seed 必须【不等于】服务端默认，否则 `||` 左侧先为真就短路，右侧那次
+      //    presentedDefault.trim() 根本不求值，这一格就测不到脏输入（实测过：
+      //    用 builtin 当 seed 时，去掉 typeof 守卫仍然全绿）。
+      const dirty = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoStartOnGroupJoinSeed: custom, autoStartOnGroupJoinSeedDefault: 42 }),
+      });
+      expect(dirty.status).toBe(200);
+      expect(await dirty.json()).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
+      expect(persisted()).toBe(custom);
+
     } finally {
       if (handle) await handle.close();
       handle = null;
