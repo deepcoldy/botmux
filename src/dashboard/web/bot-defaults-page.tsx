@@ -2829,7 +2829,7 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
   return { mode, workingDir: bot.defaultWorkingDir || def.workingDir || '' };
 }
 
-function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
@@ -2845,7 +2845,14 @@ function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: Card
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
-  }, [bot.autoStartOnGroupJoin, bot.autoStartOnGroupJoinPrompt, bot.autoStartOnGroupJoinSeed, bot.autoStartOnGroupJoinSeedDefault, bot.autoStartOnNewTopic]);
+  }, [
+    bot.larkAppId,
+    bot.autoStartOnGroupJoin,
+    bot.autoStartOnGroupJoinPrompt,
+    bot.autoStartOnGroupJoinSeed,
+    bot.autoStartOnGroupJoinSeedDefault,
+    bot.autoStartOnNewTopic,
+  ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
