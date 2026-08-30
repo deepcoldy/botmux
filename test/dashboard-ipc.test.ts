@@ -841,6 +841,75 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时不落盘', () => {
+  // 编辑态软预填把「当前生效的内置默认」直接填进输入框，所以一次顺手的保存会把
+  // bot 从「跟随动态默认」钉死成「锁定这一版文案」（升级不再跟上、切 locale 仍发
+  // 旧语言那句），而 UI 上两种状态几乎无法区分。归一化必须发生在写盘之前。
+  it('归一化：等于内置默认 → 存空（跟随默认）；真自定义 → 原样落盘', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-join-seed-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-join-seed-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // 服务端自报当前 locale 下的内置默认，避免把文案字面量写死在断言里
+      // （改文案 / 换 locale 都不该让这条用例失真）。
+      const oncall = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      const builtin: string = oncall.autoStartOnGroupJoinSeedDefault;
+      expect(typeof builtin).toBe('string');
+      expect(builtin.length).toBeGreaterThan(0);
+
+      const putSeed = async (autoStartOnGroupJoinSeed: string) => {
+        const r = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ autoStartOnGroupJoinSeed }),
+        });
+        expect(r.status).toBe(200);
+        return r.json();
+      };
+      const persisted = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0].autoStartOnGroupJoinSeed;
+
+      // 1) 软预填原样回存（内容 === 内置默认）→ 视作未自定义，键不落盘。
+      expect(await putSeed(builtin)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+      expect(getBot(appId).config.autoStartOnGroupJoinSeed).toBeUndefined();
+
+      // 2) 真正的自定义文案照常落盘（归一化不能误伤这一侧）。
+      const custom = `${builtin} —— 值班中`;
+      expect(await putSeed(custom)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
+      expect(persisted()).toBe(custom);
+      expect(getBot(appId).config.autoStartOnGroupJoinSeed).toBe(custom);
+
+      // 3) 已自定义后再存一次软预填值 → 清回跟随默认（与「恢复默认」同义）。
+      expect(await putSeed(builtin)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+
+      // 4) 仅首尾空白之差也算「等于默认」，否则一个不可见空格就把 bot 钉死。
+      await putSeed(custom);
+      expect(persisted()).toBe(custom);
+      expect(await putSeed(`  ${builtin}  `)).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: '' });
+      expect(persisted()).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — summary memory', () => {
   it('surfaces the persisted memory toggle and path in the Bot Defaults refresh payload', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-summary-memory-'));

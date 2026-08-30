@@ -4129,7 +4129,17 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
-  if (typeof body.autoStartOnGroupJoinSeed === 'string') patch.autoStartOnGroupJoinSeed = body.autoStartOnGroupJoinSeed;
+  if (typeof body.autoStartOnGroupJoinSeed === 'string') {
+    // 编辑态软预填会把「当前生效的内置默认文案」直接填进输入框，所以一次顺手的
+    // 保存（用户其实只想改上面的 prompt）会落盘一个内容恰等于默认的「自定义值」，
+    // 把这个 bot 从「跟随动态默认」钉死成「锁定这一版文案」——升级改了默认文案
+    // 它不再跟上，且 locale 切换后仍发旧语言那句。二者在 UI 上难以区分。
+    // 内容与当前 locale 的内置默认逐字相同 ⟹ 视作「未自定义」存空串（= 清空，
+    // 与「恢复默认」同义）。想真正自定义的人写的内容必然与默认不同，不受影响。
+    const seed = body.autoStartOnGroupJoinSeed;
+    const builtinSeed = t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId));
+    patch.autoStartOnGroupJoinSeed = seed.trim() === builtinSeed.trim() ? '' : seed;
+  }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (typeof body.regularGroupReplyMode === 'string') {
     const m = normalizeChatReplyMode(body.regularGroupReplyMode);
