@@ -37,7 +37,7 @@ import {
   resolveUpdateStrategy,
 } from '../src/core/binary-install-shape.js';
 import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
-import { buildRestartLauncher, resolveStandaloneRestartExecutable } from '../src/core/maintenance.js';
+import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
 import { withFileLock, FileLockTimeoutError } from '../src/utils/file-lock.js';
 import { botmuxVersionAt, diskVersionAt } from '../src/utils/install-info.js';
@@ -117,6 +117,68 @@ describe('classifyBinaryInstall — where the binary lives decides who updates i
       .toBe('bun add -g botmux@latest');
 
     expect(mainPackageRootForSubpackageBinary('/home/u/.botmux/bin/botmux')).toBeNull();
+  });
+
+  it("THE npm BUG: the platform package NESTS inside the main package, and that layout must resolve", () => {
+    // REGRESSION for the defect that shipped through 3.18.5→3.18.8: only the
+    // SIBLING layout was handled, but MEASURED on a real `npm i -g botmux`
+    // (npm 10.9.4) the platform subpackage lands INSIDE the main package, because
+    // npm does not hoist a package's own deps to the global root (peer globals
+    // nest identically: pm2 112 nested deps, http-server 47).
+    //
+    // Pre-fix this returned `…/node_modules/botmux/node_modules/botmux` — a
+    // directory that does not exist and matches no manager — so detect said
+    // `unknown`, the plan was null, and `botmux update` / the dashboard button /
+    // scheduled auto-update all reported "无法安全识别当前安装方式".
+    const nested = '/usr/lib/node_modules/botmux/node_modules/botmux-linux-x64/botmux';
+    const root = mainPackageRootForSubpackageBinary(nested);
+    // The MAIN package, NOT a second `botmux` below it.
+    expect(root).toBe('/usr/lib/node_modules/botmux');
+    expect(root).not.toBe('/usr/lib/node_modules/botmux/node_modules/botmux');
+    // End to end: it must reach npm with the prefix of the tree it came from.
+    // Verified against the real install on the dev box: this prefix is byte-equal
+    // to `npm prefix -g`.
+    expect(formatGlobalInstallCommand(tryResolveGlobalInstallPlan(root!, 'linux')!))
+      .toBe('npm install -g --prefix /usr botmux@latest');
+    // …and the strategy as a whole, which is what the three callers consume.
+    expect(resolveUpdateStrategy(true, nested, '/', {}, '/home/u'))
+      .toEqual({ kind: 'package-manager', packageRoot: '/usr/lib/node_modules/botmux' });
+    // The musl subpackage nests the same way.
+    expect(mainPackageRootForSubpackageBinary(
+      '/usr/lib/node_modules/botmux/node_modules/botmux-linux-x64-musl/botmux',
+    )).toBe('/usr/lib/node_modules/botmux');
+  });
+
+  it('the SIBLING layout still resolves — Bun hoists, so it is not obsolete', () => {
+    // Guard against "fixing" the nested case by REPLACING the sibling rule.
+    // MEASURED on a real `bun add -g botmux` (bun 1.4.0): the platform subpackage
+    // botmux-linux-x64 is a real directory BESIDE the main package.
+    expect(mainPackageRootForSubpackageBinary('/root/.bun/install/global/node_modules/botmux-linux-x64/botmux'))
+      .toBe('/root/.bun/install/global/node_modules/botmux');
+    expect(mainPackageRootForSubpackageBinary('/usr/lib/node_modules/botmux-linux-x64/botmux'))
+      .toBe('/usr/lib/node_modules/botmux');
+  });
+
+  it('EITHER shape resolves to the same root, so no manager needs a layout promise', () => {
+    // Bun HOISTS BY DEFAULT but does not guarantee it: measured 38 nested
+    // node_modules inside one real bun global tree (it nests in place on a version
+    // conflict). So "bun ⇒ sibling" is the common case, not an invariant, and the
+    // mapping must not depend on which manager produced the path. Both shapes of
+    // the same install must land on the same main package root.
+    const nested = '/root/.bun/install/global/node_modules/botmux/node_modules/botmux-linux-x64/botmux';
+    const sibling = '/root/.bun/install/global/node_modules/botmux-linux-x64/botmux';
+    expect(mainPackageRootForSubpackageBinary(nested))
+      .toBe(mainPackageRootForSubpackageBinary(sibling));
+    expect(mainPackageRootForSubpackageBinary(nested))
+      .toBe('/root/.bun/install/global/node_modules/botmux');
+  });
+
+  it('a subpackage nested under some OTHER package is not claimed as ours', () => {
+    // The nested rule is anchored on an enclosing package literally named
+    // `botmux`; a botmux platform binary vendored inside an unrelated dependency
+    // must not make us hand THAT package root to a global install command.
+    expect(mainPackageRootForSubpackageBinary('/app/node_modules/other/node_modules/botmux-linux-x64/botmux'))
+      .toBe('/app/node_modules/other/node_modules/botmux');
   });
 });
 
@@ -262,6 +324,23 @@ describe('buildRestartLauncher — the compiled binary dispatches its own subcom
       .toEqual({ cmd: '/usr/bin/node', args: ['/opt/botmux/dist/cli.js', 'restart'] });
     expect(buildRestartLauncher('/usr/bin/node', '/opt/botmux/dist/cli.js', true, false))
       .toEqual({ cmd: 'setsid', args: ['/usr/bin/node', '/opt/botmux/dist/cli.js', 'restart'] });
+  });
+
+  it('THE LAUNCHER SHIM IS SELF-DISPATCHING TOO — `$@` makes the subcommand argv[1]', () => {
+    // `~/.botmux/bin/botmux` is `exec "<installed form>" "$@"`, so it forwards its
+    // FIRST argument as the subcommand exactly like the compiled binary does.
+    // Handing it a cli.js path reproduces the identical shift: help banner, exit 0,
+    // no restart. This is the case the Node branch of
+    // resolveStandaloneRestartExecutable now produces, so it must be covered even
+    // though `standalone` is false there.
+    //
+    // The PAIRING of target+convention is asserted against resolveRestartInvocation
+    // below; this case pins the rendering half.
+    const LAUNCHER = '/root/.botmux/bin/botmux';
+    expect(buildRestartLauncher(LAUNCHER, '/opt/botmux/dist/cli.js', false, true))
+      .toEqual({ cmd: LAUNCHER, args: ['restart'] });
+    expect(buildRestartLauncher(LAUNCHER, '/opt/botmux/dist/cli.js', true, true))
+      .toEqual({ cmd: 'setsid', args: [LAUNCHER, 'restart'] });
   });
 
   it('THE BUG: standalone must not be handed a cli.js path — it lands in argv[2]', () => {
@@ -585,8 +664,70 @@ describe('resolveStandaloneRestartExecutable — restart the NEW binary, not the
       .toBe('/opt/bm/botmux');
   });
 
-  it('NODE PATH UNCHANGED: never redirected away from execPath', () => {
-    expect(resolveStandaloneRestartExecutable(false, '/usr/bin/node', 'unknown', LAUNCHER, true)).toBe('/usr/bin/node');
+  it('NODE PATH: prefers the launcher, which tracks the installed form across an update', () => {
+    // Since 3.18.0 the npm package ships the CLI as a platform-subpackage BINARY:
+    // `bin` is gone, node-pty left `dependencies`, and postinstall points the
+    // launcher at the binary — but `dist/` is still published and still statically
+    // imports node-pty. So a Node-form daemon that auto-updates ACROSS that
+    // boundary can no longer run `node <root>/dist/cli.js`: npm pruned node-pty
+    // from that tree. Restarting via the launcher is what survives the transition.
+    expect(resolveStandaloneRestartExecutable(false, '/usr/bin/node', 'unknown', LAUNCHER, true)).toBe(LAUNCHER);
+  });
+
+  it('NODE PATH: falls back to execPath when there is no launcher (pre-existing behaviour)', () => {
+    expect(resolveStandaloneRestartExecutable(false, '/usr/bin/node', 'unknown', LAUNCHER, false))
+      .toBe('/usr/bin/node');
+  });
+
+  it('NODE PATH: a local-dev checkout keeps execPath even when a launcher exists', () => {
+    // The launcher may point at an entirely different checkout (`use:here` claims
+    // it globally), while a dev restart must re-run the tree it just built.
+    expect(resolveStandaloneRestartExecutable(false, '/usr/bin/node', 'unknown', LAUNCHER, true, true))
+      .toBe('/usr/bin/node');
+  });
+});
+
+describe('resolveRestartInvocation — target and calling convention must agree', () => {
+  const LAUNCHER = '/root/.botmux/bin/botmux';
+  const NODE = '/usr/bin/node';
+  const PNPM_OLD = '/root/.local/share/pnpm/global/5/.pnpm/botmux-linux-x64@3.18.4/node_modules/botmux-linux-x64/botmux';
+
+  // THE INVARIANT, stated once: whenever the chosen target is the launcher shim,
+  // the invocation must be self-dispatching — the shim forwards "$@", so a cli.js
+  // path would land where the subcommand belongs (help banner, exit 0, no
+  // restart). Deriving these two halves separately is exactly how they drift, so
+  // this asserts the PAIR, which a test of either half alone cannot do.
+  //
+  // MUTATION CHECK: computing `selfDispatching` as bare `standalone` (i.e.
+  // dropping `|| executable === launcherPath`) turns the two Node-form launcher
+  // cases below red.
+  it('every case that targets the launcher is marked self-dispatching', () => {
+    const cases = [
+      // Node form crossing the 3.18 Node→binary boundary.
+      resolveRestartInvocation(false, NODE, 'unknown', LAUNCHER, true),
+      // Compiled binary owned by a package manager (versioned execPath).
+      resolveRestartInvocation(true, PNPM_OLD, 'npm-binary', LAUNCHER, true),
+    ];
+    for (const r of cases) {
+      expect(r.executable).toBe(LAUNCHER);
+      expect(r.selfDispatching).toBe(true);
+    }
+  });
+
+  it('a Node target keeps the Node calling convention (cli.js path required)', () => {
+    // No launcher on this host → execPath, which genuinely NEEDS the script path.
+    expect(resolveRestartInvocation(false, NODE, 'unknown', LAUNCHER, false))
+      .toEqual({ executable: NODE, selfDispatching: false });
+    // Local-dev checkout: execPath even though a launcher exists.
+    expect(resolveRestartInvocation(false, NODE, 'unknown', LAUNCHER, true, true))
+      .toEqual({ executable: NODE, selfDispatching: false });
+  });
+
+  it('a self-replaced binary targets itself and still self-dispatches', () => {
+    // curl-binary at a custom dir: not the launcher path, but still the compiled
+    // CLI — so `standalone` alone must keep it self-dispatching.
+    expect(resolveRestartInvocation(true, '/opt/bm/botmux', 'curl-binary', LAUNCHER, true))
+      .toEqual({ executable: '/opt/bm/botmux', selfDispatching: true });
   });
 });
 

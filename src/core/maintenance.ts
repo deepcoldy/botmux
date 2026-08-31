@@ -313,16 +313,24 @@ export function globalInstallUpdateLockTarget(): string {
  * that silently never happened while reporting success. So in standalone mode the
  * entry argument is dropped entirely and the binary is invoked as
  * `<binary> restart`.
+ *
+ * ⚠️ THE LAUNCHER SHIM IS THE SAME CASE. `selfDispatching` is not a synonym for
+ * "compiled": `~/.botmux/bin/botmux` forwards `"$@"` to whatever form is installed,
+ * so it too takes the subcommand as its FIRST argument. Handing it a cli.js path
+ * reproduces the identical argv shift — help banner, exit 0, no restart — which is
+ * why the Node branch of {@link resolveStandaloneRestartExecutable} must pair its
+ * launcher target with `selfDispatching: true`.
  */
 export function buildRestartLauncher(
   node: string,
   cliEntry: string,
   hasSetsid: boolean,
-  standalone = false,
+  selfDispatching = false,
 ): { cmd: string; args: string[] } {
-  // A compiled binary dispatches its own subcommands; passing a cli.js path
-  // would shift `restart` to argv[3] where nothing reads it.
-  const entryArgs = standalone ? ['restart'] : [cliEntry, 'restart'];
+  // Anything that dispatches its own subcommands (a compiled binary, or the
+  // launcher shim that forwards "$@") must NOT be handed a cli.js path: it would
+  // shift `restart` to argv[3] where nothing reads it.
+  const entryArgs = selfDispatching ? ['restart'] : [cliEntry, 'restart'];
   if (hasSetsid) return { cmd: 'setsid', args: [node, ...entryArgs] };
   return { cmd: node, args: entryArgs };
 }
@@ -396,6 +404,25 @@ function setsidAvailable(): boolean {
  * to `execPath` when it is missing (nothing else to go on) — that is the
  * pre-existing behaviour.
  *
+ * ⚠️⚠️ AND `execPath` IS NOT RIGHT FOR A **NODE** PROCESS EITHER, WHEN THE UPDATE
+ * IT JUST INSTALLED CHANGED THE RUNTIME FORM. This branch used to be an
+ * unconditional `if (!standalone) return execPath`, i.e. `node <root>/dist/cli.js
+ * restart`. Since 3.18.0 the npm package ships the CLI as a platform-subpackage
+ * BINARY: `bin` is gone, `node-pty` left `dependencies`, and postinstall points the
+ * launcher at the binary — but `dist/` is still published and still statically
+ * imports `node-pty` (MEASURED on the published 3.18.8 tarball: 4 import chains
+ * from `dist/cli.js`, 5 from `dist/worker.js`). So after a Node-form daemon
+ * auto-updates itself across that boundary, the very next thing it does is spawn
+ * `node <root>/dist/cli.js restart` — and npm has just PRUNED node-pty from that
+ * tree (MEASURED, 3.17.0 → 3.18.6: "removed 2 packages"). The driver dies on
+ * `ERR_MODULE_NOT_FOUND` and the fleet never comes back, having reported
+ * "restarting to apply".
+ *
+ * The launcher is the right target in exactly the same way and for the same
+ * reason as the npm-binary case: it is the one path the installer re-points to
+ * whatever form is now correct. Prefer it whenever it exists, and keep `execPath`
+ * as the fallback so a host without a launcher behaves as before.
+ *
  * Pure over its inputs so every branch is testable without a compiled binary.
  */
 export function resolveStandaloneRestartExecutable(
@@ -404,12 +431,48 @@ export function resolveStandaloneRestartExecutable(
   shape: BinaryInstallShape,
   launcherPath: string,
   launcherExists: boolean,
+  /** A local-dev checkout runs its own tree and must keep using `execPath`: the
+   *  launcher may point at an entirely different checkout, and `cmdUpgradeLocalDev`
+   *  deliberately restarts the tree it just built. */
+  localDev = false,
 ): string {
-  if (!standalone) return execPath;
+  if (!standalone) {
+    // Node form: the launcher tracks the installed form across an update that
+    // replaced Node-with-dist by a compiled binary. Not for a dev checkout.
+    if (!localDev && launcherExists) return launcherPath;
+    return execPath;
+  }
   // We own this exact path and just replaced its contents — re-exec it.
   if (shape === 'curl-binary') return execPath;
   if (shape === 'npm-binary' && launcherExists) return launcherPath;
   return execPath;
+}
+
+/**
+ * The complete restart target: WHICH executable, and whether that executable
+ * dispatches its own subcommands (so it must NOT be handed a `cli.js` path).
+ *
+ * These two decisions are returned together on purpose. They are one invariant —
+ * "the launcher shim and the compiled binary both take the subcommand as their
+ * first argument" — and computing them at separate call sites is precisely how
+ * they drift: picking the launcher as the target while still passing the Node
+ * shape re-creates the argv shift that makes a restart print the help banner and
+ * exit 0. Pure over its inputs, so the PAIRING is unit-testable rather than only
+ * each half.
+ */
+export function resolveRestartInvocation(
+  standalone: boolean,
+  execPath: string,
+  shape: BinaryInstallShape,
+  launcherPath: string,
+  launcherExists: boolean,
+  localDev = false,
+): { executable: string; selfDispatching: boolean } {
+  const executable = resolveStandaloneRestartExecutable(
+    standalone, execPath, shape, launcherPath, launcherExists, localDev,
+  );
+  // The compiled binary IS the CLI; the launcher shim `exec`s it with "$@".
+  return { executable, selfDispatching: standalone || executable === launcherPath };
 }
 
 /**
@@ -443,15 +506,18 @@ export function spawnDetachedRestart(
   const cliEntry = activePackageRoot ? botmuxCliEntryAt(activePackageRoot) : botmuxCliEntry();
   // A package-manager-owned binary's own path can be versioned (pnpm store); after
   // the update the stable launcher points at the new one while execPath does not.
+  // The Node form needs it too, for the 3.18 Node→binary transition (see below).
   const launcher = globalWrapperPath();
-  const executable = resolveStandaloneRestartExecutable(
+  // Target and calling convention resolved TOGETHER — see resolveRestartInvocation.
+  const { executable, selfDispatching } = resolveRestartInvocation(
     standalone,
     process.execPath,
     standalone ? currentBinaryInstallShape() : 'unknown',
     launcher,
     existsSync(launcher),
+    isLocalDevInstall(),
   );
-  const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), standalone);
+  const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), selfDispatching);
   const child = spawn(cmd, args, {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',

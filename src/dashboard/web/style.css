@@ -24446,6 +24446,76 @@ dialog select[multiple]:hover:not(:disabled) {
   z-index: 1300;
 }
 
+/* Reply-style overrides stay compact but explicit: every semantic layout gets
+   the same color + tri-state tag controls, with custom text revealed in place. */
+.bot-defaults-page .bd-reply-style-basics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.bot-defaults-page .bd-reply-style-layouts {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.bot-defaults-page .bd-reply-style-layout {
+  display: grid;
+  grid-template-columns: minmax(72px, .5fr) minmax(150px, 1fr) minmax(150px, 1fr) minmax(160px, 1.2fr);
+  gap: 10px;
+  align-items: end;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface-muted);
+}
+
+.bot-defaults-page .bd-reply-style-layout-name {
+  align-self: center;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.bot-defaults-page .bd-reply-style-layout .bd-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-reply-style-layout .bd-field > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.bot-defaults-page .bd-reply-style-custom-tag[hidden] {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  .bot-defaults-page .bd-reply-style-basics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bot-defaults-page .bd-reply-style-layout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .bot-defaults-page .bd-reply-style-layout-name {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 560px) {
+  .bot-defaults-page .bd-reply-style-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* ── ModelPickerField：下拉候选 + 自定义输入（defaults 页与 onboarding 共用） ── */
 .bd-model-picker {
   display: grid;

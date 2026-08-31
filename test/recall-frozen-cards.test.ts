@@ -9,13 +9,15 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
-import { sessionKey } from '../src/core/types.js';
+import { activeSessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
 const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json: string) => {});
+const pinMessageMock = vi.fn(async (_appId: string, _messageId: string) => true);
+const unpinMessageMock = vi.fn(async (_appId: string, _messageId: string) => true);
 const saveFrozenCardsMock = vi.fn();
 const loadFrozenCardsMock = vi.fn(() => new Map<string, FrozenCard>());
 const persistStreamCardStateMock = vi.fn();
@@ -27,6 +29,8 @@ vi.mock('../src/im/lark/client.js', () => {
   return {
     updateMessage: (...args: any[]) => updateMessageMock(args[0], args[1], args[2]),
     deleteMessage: (...args: any[]) => deleteMessageMock(args[0], args[1]),
+    pinMessage: (...args: any[]) => pinMessageMock(args[0], args[1]),
+    unpinMessage: (...args: any[]) => unpinMessageMock(args[0], args[1]),
     MessageWithdrawnError,
   };
 });
@@ -127,6 +131,10 @@ import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
 
+const buildStreamingCardMock = buildStreamingCard as ReturnType<typeof vi.fn>;
+const getBotMock = getBot as ReturnType<typeof vi.fn>;
+const resolveUsageDisplayMock = resolveUsageDisplay as ReturnType<typeof vi.fn>;
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 const APP_ID = 'app_test';
@@ -169,29 +177,42 @@ function makeDs(frozenCards?: Map<string, FrozenCard>): DaemonSession {
   };
 }
 
+function activate(ds: DaemonSession): void {
+  setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+}
+
 beforeEach(() => {
   deleteMessageMock.mockClear();
   updateMessageMock.mockReset();
   updateMessageMock.mockResolvedValue(undefined);
+  pinMessageMock.mockReset();
+  pinMessageMock.mockResolvedValue(true);
+  unpinMessageMock.mockReset();
+  unpinMessageMock.mockResolvedValue(true);
   saveFrozenCardsMock.mockClear();
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
-  vi.mocked(buildStreamingCard).mockClear();
-  vi.mocked(getBot).mockReturnValue({
+  buildStreamingCardMock.mockClear();
+  getBotMock.mockReturnValue({
     config: { larkAppId: APP_ID, cliId: 'claude-code' },
   } as any);
   setTerminalProxyPort(8800);
+  setActiveSessionsRegistry(new Map());
 });
 
 afterEach(() => {
   setActiveSessionsRegistry(undefined as any);
-  vi.clearAllTimers();
   vi.useRealTimers();
 });
 
 function flush(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
+}
+
+async function drainPinQueue(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -352,9 +373,8 @@ describe('recallFrozenCards', () => {
 
 describe('restoreUsageLimitRuntimeState', () => {
   it('marks restored limit sessions limited and re-arms the retry timer', () => {
-    const now = new Date('2026-05-22T10:00:00Z').getTime();
     vi.useFakeTimers();
-    vi.setSystemTime(now);
+    const now = Date.now();
     const ds = makeDs();
     ds.streamCardId = 'om_live_limit';
     ds.streamCardNonce = 'nonce_limit';
@@ -410,9 +430,8 @@ describe('restoreUsageLimitRuntimeState', () => {
   });
 
   it('marks already-expired restored limits retry-ready immediately', () => {
-    const now = new Date('2026-05-22T10:00:00Z').getTime();
     vi.useFakeTimers();
-    vi.setSystemTime(now);
+    const now = Date.now();
     const ds = makeDs();
     ds.usageLimit = {
       limited: true,
@@ -431,9 +450,8 @@ describe('restoreUsageLimitRuntimeState', () => {
   });
 
   it('Plan B: a meeting-agent session patches its Lark card on retry-ready like a normal session', () => {
-    const now = new Date('2026-05-22T10:00:00Z').getTime();
     vi.useFakeTimers();
-    vi.setSystemTime(now);
+    const now = Date.now();
     const ds = makeDs();
     // The vcMeetingReceiver marker is now pure delivery metadata — it no longer
     // suppresses the streaming card, so a meeting agent's usage-limit card patch
@@ -474,11 +492,86 @@ describe('meeting-agent streaming card (Plan B)', () => {
     };
     ds.workerPort = 4567;
     ds.workerReady = true;
+    activate(ds);
     const sessionReply = vi.fn(async () => 'om_card');
 
     await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(true);
     expect(sessionReply).toHaveBeenCalled();
     expect(buildStreamingCard).toHaveBeenCalled();
+  });
+});
+
+describe('postFreshStreamingCard', () => {
+  it('completes /card publication before its deferred Pin chain settles', async () => {
+    let resolvePin!: (value: boolean) => void;
+    pinMessageMock.mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+      resolvePin = resolve;
+    }));
+    getBotMock.mockReturnValue({
+      config: { larkAppId: APP_ID, cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    const ds = makeDs(new Map());
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardReplyTargetKey = 'thread:om_root';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_fresh_card');
+    let settled = false;
+    let result: boolean | undefined;
+    const pending = postFreshStreamingCard(ds, sessionReply).then(value => {
+      settled = true;
+      result = value;
+      return value;
+    });
+
+    await drainPinQueue();
+
+    expect(typeof resolvePin).toBe('function');
+    expect(settled).toBe(true);
+    expect(result).toBe(true);
+    expect(ds.streamCardId).toBe('om_fresh_card');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
+
+    resolvePin(true);
+    await expect(pending).resolves.toBe(true);
+  });
+
+  it('discards /card POST results once remote retirement starts waiting', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    activate(ds);
+
+    const pending = postFreshStreamingCard(ds, sessionReply);
+    ds.remoteCloseState = { phase: 'preparing', requestId: 'close-fresh-card' };
+    resolvePost('om_stale_fresh_card');
+
+    await expect(pending).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_stale_fresh_card');
+    expect(pinMessageMock).not.toHaveBeenCalledWith(APP_ID, 'om_stale_fresh_card');
+  });
+
+  it('fails closed for apiOnly sessions and never attempts /card Pinning', async () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: APP_ID, cliId: 'claude-code', apiOnly: true, pinStreamingCard: true },
+    } as any);
+    const ds = makeDs();
+    ds.workerReady = true;
+    const sessionReply = vi.fn(async () => 'om_api_only_card');
+
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(false);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+    expect(unpinMessageMock).not.toHaveBeenCalled();
   });
 });
 
@@ -500,7 +593,7 @@ describe('postTurnStartingCard', () => {
   });
 
   it('starts a live Grok turn as working instead of starting', async () => {
-    vi.mocked(getBot).mockReturnValue({
+    getBotMock.mockReturnValue({
       config: { larkAppId: APP_ID, cliId: 'grok' },
     } as any);
     const ds = makeDs();
@@ -508,11 +601,12 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
     const sessionReply = vi.fn(async () => 'om_grok_card');
 
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
 
-    expect(vi.mocked(buildStreamingCard).mock.calls[0]?.[5]).toBe('working');
+    expect(buildStreamingCardMock.mock.calls[0]?.[5]).toBe('working');
     expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
@@ -526,10 +620,11 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_1';
     ds.lastScreenStatus = 'idle';
     ds.lastScreenContent = '';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(buildStreamingCard).mock.calls[0]?.[5]).toBe('starting');
+    expect(buildStreamingCardMock.mock.calls[0]?.[5]).toBe('starting');
 
     ds.lastScreenStatus = 'working';
     ds.lastScreenContent = 'Grok is thinking';
@@ -539,9 +634,9 @@ describe('postTurnStartingCard', () => {
     await expect(post).resolves.toBe(true);
     await flush();
 
-    const statuses = vi.mocked(buildStreamingCard).mock.calls.map(call => call[5]);
+    const statuses = buildStreamingCardMock.mock.calls.map(call => call[5]);
     expect(statuses).toContain('working');
-    expect(vi.mocked(buildStreamingCard).mock.calls.at(-1)?.[4]).toBe('Grok is thinking');
+    expect(buildStreamingCardMock.mock.calls.at(-1)?.[4]).toBe('Grok is thinking');
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1', '{}');
   });
 
@@ -551,6 +646,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
     const sessionReply = vi.fn(async () => 'om_turn_card_stable');
 
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
@@ -567,6 +663,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
     ds.currentTurnTitle = 'first turn';
+    activate(ds);
     const sessionReply = vi.fn(async () => 'om_turn_card_1');
 
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
@@ -589,6 +686,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_b1';
     ds.currentTurnTitle = 'topic B';
+    activate(ds);
     ds.session.turnReplyContexts = {
       om_turn_b1: { target: { mode: 'thread', rootMessageId: 'om_topic_b' } },
       om_turn_a2: { target: { mode: 'thread', rootMessageId: 'om_topic_a' } },
@@ -630,6 +728,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
     ds.currentTurnTitle = 'first turn';
+    activate(ds);
 
     const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     expect(sessionReply).toHaveBeenCalledTimes(1);
@@ -661,6 +760,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
     ds.currentTurnTitle = 'first turn';
+    activate(ds);
     const sessionReply = vi.fn(async () => { throw new Error('network unavailable'); });
 
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
@@ -794,6 +894,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.remoteCloseState = { phase: 'preparing', requestId: 'close-1' };
@@ -818,6 +919,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.remoteShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
@@ -843,6 +945,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.remoteCloseState = { phase: 'preparing', requestId: 'close-abort' };
@@ -866,11 +969,12 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
-    const registry = new Map([[sessionKey('om_root', APP_ID), ds]]);
+    const registryKey = activeSessionKey(ds);
+    const registry = new Map([[registryKey, ds]]);
     setActiveSessionsRegistry(registry);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
-    registry.set(sessionKey('om_root', APP_ID), makeDs());
+    registry.set(registryKey, makeDs());
     resolvePost('om_displaced_registry_card');
 
     await expect(post).resolves.toBe(false);
@@ -878,6 +982,39 @@ describe('postTurnStartingCard', () => {
 
     expect(ds.streamCardId).not.toBe('om_displaced_registry_card');
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_displaced_registry_card');
+  });
+
+  it('starts the successor turn before the older turn Pin chain settles', async () => {
+    let resolvePin!: (value: boolean) => void;
+    pinMessageMock.mockImplementationOnce(() => new Promise<boolean>((resolve) => { resolvePin = resolve; }));
+    getBotMock.mockReturnValue({
+      config: { larkAppId: APP_ID, cliId: 'claude-code', pinStreamingCard: true },
+    } as any);
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_old';
+    activate(ds);
+    const sessionReply = vi.fn()
+      .mockResolvedValueOnce('om_turn_card_old')
+      .mockResolvedValueOnce('om_turn_card_successor');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_old')).resolves.toBe(true);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_turn_successor';
+    ds.streamCardId = undefined;
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_successor')).resolves.toBe(true);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(ds.streamCardId).toBe('om_turn_card_successor');
+
+    resolvePin(true);
+    await flush();
+    await flush();
   });
 });
 
@@ -1208,11 +1345,11 @@ describe('usageRefreshShouldRun (arm/clear predicate)', () => {
 
   it('is false when usageDisplay is not streaming (footer / off)', () => {
     const ds = workingDs();
-    vi.mocked(resolveUsageDisplay).mockReturnValue('footer' as any);
+    resolveUsageDisplayMock.mockReturnValue('footer' as any);
     expect(usageRefreshShouldRun(ds)).toBe(false);
-    vi.mocked(resolveUsageDisplay).mockReturnValue('off' as any);
+    resolveUsageDisplayMock.mockReturnValue('off' as any);
     expect(usageRefreshShouldRun(ds)).toBe(false);
-    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming' as any);
+    resolveUsageDisplayMock.mockReturnValue('streaming' as any);
   });
 });
 
@@ -1239,7 +1376,7 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     // asked for a fresh read (empty transcript here → concrete empty snapshot).
     const ds = workingDs();
     refreshStreamingCardUsage(ds);
-    const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
+    const call = buildStreamingCardMock.mock.calls[0]!;
     // Snapshot present (17th positional arg) and interval < throttle by design.
     expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null });
     expect(USAGE_REFRESH_INTERVAL_MS).toBeLessThan(15_000);
@@ -1251,7 +1388,7 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     const ds = workingDs();
     expect(ds.workerPort ?? null).toBeNull();
     refreshStreamingCardUsage(ds);
-    const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
+    const call = buildStreamingCardMock.mock.calls[0]!;
     expect(call[2]).toBe(''); // 3rd positional arg = read-only terminal URL
   });
 
@@ -1259,7 +1396,7 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     const ds = workingDs();
     ds.workerPort = 9101; // a real Web Terminal port
     refreshStreamingCardUsage(ds);
-    const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
+    const call = buildStreamingCardMock.mock.calls[0]!;
     expect(typeof call[2]).toBe('string');
     expect(call[2]).not.toBe('');
     expect(call[2]).toContain(`/s/${SESSION_ID}`);
@@ -1348,10 +1485,10 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
   it('does not arm when usageDisplay is off', () => {
     vi.useFakeTimers();
     const ds = workingDs();
-    vi.mocked(resolveUsageDisplay).mockReturnValue('off' as any);
+    resolveUsageDisplayMock.mockReturnValue('off' as any);
     syncUsageRefreshTimer(ds);
     expect(ds.usageRefreshTimer).toBeUndefined();
-    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming' as any);
+    resolveUsageDisplayMock.mockReturnValue('streaming' as any);
   });
 
   it('re-arms after a CLI auto-restart (working card survives, worker re-readies)', () => {
@@ -1376,8 +1513,8 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
     expect(ds.usageRefreshTimer).toBeDefined();
 
     // Now ticks resume even without a status edge (working→working).
-    const before = vi.mocked(buildStreamingCard).mock.calls.length;
+    const before = buildStreamingCardMock.mock.calls.length;
     vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
-    expect(vi.mocked(buildStreamingCard).mock.calls.length).toBe(before + 1);
+    expect(buildStreamingCardMock.mock.calls.length).toBe(before + 1);
   });
 });

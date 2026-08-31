@@ -58,7 +58,10 @@ describe('normalizePricingOverrides', () => {
     });
   });
 
-  it.each([null, undefined, 'string', 42, true, []])('returns undefined for non-object input %j', (raw) => {
+  // Tuple-wrapped rows: a bare `[]` row spreads to zero arguments, so a callback with a
+  // declared parameter reads as wanting a `done` callback and `bun test` hangs until the
+  // timeout. See the note in test/bun-test-shim.ts under KNOWN BUN DEFECTS.
+  it.each([[null], [undefined], ['string'], [42], [true], [[]]])('returns undefined for non-object input %j', (raw) => {
     expect(normalizePricingOverrides(raw)).toBeUndefined();
   });
 

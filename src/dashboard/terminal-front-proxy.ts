@@ -16,8 +16,20 @@ import type {
 
 export const TERMINAL_CONTROL_HEADER = 'x-botmux-terminal-control';
 export { TERMINAL_VIEW_FORWARD_HEADER };
-/** Covers daemon wake-up (up to 10s) plus a bounded worker handshake. Cleared
- * as soon as response/upgrade headers arrive, so live streams stay unbounded. */
+/** Covers a daemon wake-up plus a bounded worker handshake. Cleared as soon as
+ * response/upgrade headers arrive, so live streams stay unbounded.
+ *
+ * Note this 30s is now SHORTER than the wake it has to cover:
+ * `ensureTerminalWorkerPort` allows up to 40s for a cold wake (create the pane,
+ * boot the CLI), and the daemon sends no bytes until it resolves, so the last
+ * 10s is unreachable through this hop. That is not a lost wake — the fork is
+ * not cancelled by the 502 that follows, so the first click starts it and a
+ * later one hits the fast `resolvePort` path. A dashboard talking to the daemon
+ * proxy directly has no such ceiling and can use the full 40s.
+ *
+ * Raising this is a separate change, not a follow-up to that one: it is armed
+ * on both the HTTP and the upgrade path, so it also bounds requests that have
+ * nothing to do with waking. */
 export const TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS = 30_000;
 /**
  * P1-2：upgrade 请求收到非 101 回应 = 一次拒绝，不是长连接。清掉唯一那道计时器

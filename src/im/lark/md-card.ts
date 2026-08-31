@@ -29,14 +29,49 @@ import { t, type Locale } from '../../i18n/index.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
+  replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { ReplyCardHeader } from './reply-card-style.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
+/** Keep structured replies readable without letting heading-heavy model output
+ *  multiply schema-v2 body elements without bound. Each promoted heading can
+ *  split one prose buffer into another element, so six keeps ordinary cards
+ *  bounded while still covering the sections in a typical result report. */
+const MAX_PROMOTED_CARD_HEADINGS = 6;
+
+/** Canonical chrome for ordinary Bot Session reply cards. The CLI send path
+ *  and daemon final-output fallback both spread this object so layout cannot
+ *  drift between an explicit `botmux send` and an automatic fallback reply. */
+export const REPLY_CARD_CONFIG = {
+  update_multi: true,
+  width_mode: 'fill',
+} as const;
+
+export interface ReplyCardV2 {
+  schema: '2.0';
+  config: { update_multi: true; width_mode: 'fill' };
+  header?: ReplyCardHeader;
+  body: { direction: 'vertical'; elements: any[] };
+}
+
+/** Single envelope shared by direct sends and fallback reply-card builders. */
+export function createReplyCard(
+  elements: any[],
+  header?: ReplyCardHeader,
+): ReplyCardV2 {
+  return {
+    schema: '2.0',
+    config: { ...REPLY_CARD_CONFIG },
+    ...(header ? { header } : {}),
+    body: { direction: 'vertical', elements },
+  };
+}
 
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
 
@@ -73,7 +108,7 @@ export interface ReplyCardFooter {
   element: {
     tag: 'markdown';
     element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
-    text_size: 'notation_small_v2';
+    text_size: 'notation';
     content: string;
   };
 }
@@ -476,7 +511,7 @@ export function buildReplyCardFooter(opts: {
     element: {
       tag: 'markdown',
       element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content,
     },
   };
@@ -638,18 +673,71 @@ export function prepareCardMarkdown(
   return normalizeLocalHomeLinks(input, homedir(), cwd, existsSync, localHomeLinkMode);
 }
 
+export interface ExtractedReplyCardHeading {
+  /** Markdown body with the selected heading source line removed. */
+  markdown: string;
+  /** Plain visible text for `header.title`; absent when no eligible heading exists. */
+  heading?: string;
+}
+
+function inlineTokenPlainText(token: Token | undefined): string {
+  if (!token) return '';
+  if (!Array.isArray(token.children)) return token.content.trim();
+  return token.children
+    .map(child => {
+      if (child.type === 'text' || child.type === 'code_inline') return child.content;
+      if (child.type === 'softbreak' || child.type === 'hardbreak') return ' ';
+      if (child.type === 'image') return child.content;
+      return '';
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Consume the first heading that the ordinary body renderer would promote:
+ * a top-level ATX H1/H2 outside code fences. The exact source line is removed
+ * so the Card 2.0 header and body do not repeat it. No other markdown changes.
+ */
+export function extractFirstReplyCardHeading(input: string): ExtractedReplyCardHeading {
+  if (!input) return { markdown: input };
+  const parseInput = unescapeFenceLines(input);
+  const tokens = md.parse(parseInput, {});
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (
+      token.level !== 0
+      || token.type !== 'heading_open'
+      || !/^h[12]$/.test(token.tag)
+      || !/^#{1,2}$/.test(token.markup)
+      || !token.map
+    ) {
+      continue;
+    }
+    const heading = inlineTokenPlainText(tokens[index + 1]);
+    if (!heading) continue;
+    const lines = input.split('\n');
+    const [start, end] = token.map as [number, number];
+    lines.splice(start, Math.max(1, end - start));
+    return { markdown: lines.join('\n'), heading };
+  }
+  return { markdown: input };
+}
+
 /**
  * Split markdown into card v2 body elements:
  *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
  *      render them as a grid).
- *   2. Headings → bold (Feishu's markdown widget doesn't render ATX `#`).
+ *   2. H1/H2 → bounded standalone heading widgets; H3-H6 → bold (Feishu's
+ *      markdown widget doesn't render ATX `#`).
  *   3. Code fences → re-emitted with the original backtick run, joined with
  *      blank lines on either side (Feishu's widget needs them to recognise the
  *      fence).
  *   4. Everything else → original source slice, glued by blank lines.
  *
- * All non-table blocks are merged into a single `markdown` element to keep
- * card element counts modest.
+ * Prose between promoted headings/tables/image rows is merged into one
+ * `markdown` element to keep card element counts modest.
  */
 export function buildCardBodyElements(
   input: string,
@@ -665,14 +753,18 @@ export function buildCardBodyElements(
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
+  const layoutBudget = { promotedHeadings: 0 };
   for (const seg of splitImageRowSegments(input)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
-    else elements.push(...buildMarkdownElements(seg.content));
+    else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
 }
 
-function buildMarkdownElements(input: string): any[] {
+function buildMarkdownElements(
+  input: string,
+  layoutBudget: { promotedHeadings: number },
+): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
   const tokens = md.parse(input, {});
@@ -705,7 +797,33 @@ function buildMarkdownElements(input: string): any[] {
     if (t.type === 'heading_open') {
       const inline = tokens[i + 1];
       const text = (inline?.content ?? '').replace(/^#{1,6}\s+/, '').trim();
-      if (text) buf.push(`**${text}**`);
+      const level = Number.parseInt(t.tag.slice(1), 10);
+      const promote = text
+        && level <= 2
+        && /^#{1,2}$/.test(t.markup)
+        && layoutBudget.promotedHeadings < MAX_PROMOTED_CARD_HEADINGS;
+      if (promote) {
+        // Feishu's markdown widget does not render ATX markers. A standalone
+        // Card JSON 2.0 20px heading restores hierarchy without making H1
+        // model output dominate the card. The element id carries the original
+        // ATX level because message reads strip `text_size` — without it the
+        // heading would come back as bare glued text.
+        flushBuf();
+        layoutBudget.promotedHeadings++;
+        elements.push({
+          tag: 'markdown',
+          element_id: replyCardHeadingElementId(
+            level as 1 | 2,
+            layoutBudget.promotedHeadings,
+          ),
+          text_size: 'heading-2',
+          content: text,
+        });
+      } else if (text) {
+        // H3-H6 and headings beyond the safety budget retain the established
+        // compact fallback instead of increasing the component count further.
+        buf.push(`**${text}**`);
+      }
       i += 3; // heading_open, inline, heading_close
       continue;
     }
@@ -954,11 +1072,7 @@ export function buildMarkdownCard(
     elements.push({ tag: 'hr' });
     elements.push(footer.element);
   }
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: { direction: 'vertical', elements },
-  });
+  return JSON.stringify(createReplyCard(elements));
 }
 
 /** Build the canonical final-answer card. Streaming/progress/session cards
@@ -984,7 +1098,7 @@ export function buildCanonicalFinalReplyCard(opts: {
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
-  return JSON.stringify({ schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements } });
+  return JSON.stringify(createReplyCard(elements));
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -1040,7 +1154,7 @@ export function buildContextualReplyCard(opts: {
 
   elements.push({
     tag: 'markdown',
-    text_size: 'heading_2_v2',
+    text_size: 'heading-2',
     content: title,
   });
 
@@ -1076,9 +1190,5 @@ export function buildContextualReplyCard(opts: {
     elements.push(footer.element);
   }
 
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: { direction: 'vertical', elements },
-  });
+  return JSON.stringify(createReplyCard(elements));
 }

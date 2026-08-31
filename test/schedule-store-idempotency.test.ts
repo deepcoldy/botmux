@@ -152,6 +152,30 @@ describe('createTask — id provided, task exists with identical canonical input
     expect(second.repeat?.completed).toBe(1);
   });
 
+  it('keeps creator identity out of the canonical input so the same id stays idempotent', async () => {
+    const { createTask } = await freshImport();
+    const id = 'wf_owner_identity';
+    const first = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_old' });
+    const second = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_new', ownerUnionId: 'on_new' });
+    // Creator identity is audit metadata, not task input: a re-create with a
+    // different creator must return the existing task untouched rather than
+    // conflict — and must not quietly re-stamp whose identity it runs as.
+    expect(second.id).toBe(first.id);
+    expect(second.ownerUnionId).toBe('on_old');
+  });
+
+  it('rehydrates creator identity from disk (it is rebuilt field-by-field on load)', async () => {
+    const { createTask } = await freshImport();
+    createTask({ ...BASE_PARAMS, id: 'wf_owner_reload', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator' });
+    // Every read path rebuilds the task from the raw JSON, so a field that is
+    // written but not copied there survives only until the next reload. Without
+    // this the task silently loses its creator on daemon restart.
+    const reload = await freshImport();
+    const task = reload.getTask('wf_owner_reload');
+    expect(task?.ownerOpenId).toBe('ou_creator');
+    expect(task?.ownerUnionId).toBe('on_creator');
+  });
+
   it('treats chatType as canonical because it changes future session semantics', async () => {
     const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_chattype';

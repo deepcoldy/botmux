@@ -257,7 +257,10 @@ describe('handleAskCardAction', () => {
     await expect(promise).resolves.toMatchObject({ kind: 'answered', answers: [['deploy']], by: 'ou_owner' });
   });
 
-  it('旧单选路径 ask_select：非授权人返回 warning toast', async () => {
+  // 未授权点击现在会先尝试弹授权卡（见 test/ask-unauthorized-grant.test.ts）。本用例的
+  // 'cli_ask' 未 registerBot → 升级模块取不到 bot 配置，降级成 'unavailable' 回落到
+  // 原「没有权限」文案。这条断言因此同时锁住了「升级失败绝不吞掉反馈」的降级契约。
+  it('旧单选路径 ask_select：非授权人返回 warning toast（授权卡发不出时的降级）', async () => {
     let captured: PendingAsk | undefined;
     setCardDispatcher({
       async send(ask) {

@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node >= 22">
+  <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
@@ -39,27 +39,27 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 > 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
 
 ```bash
-npm install -g botmux        # 需要 Node >= 22 装包本身
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
-> npm 包内已经带了对应平台的**自包含二进制**（按 os/arch 只装匹配的那一个），安装时会把 `~/.botmux/bin/botmux` 指向它。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。把 `~/.botmux/bin` 放进 PATH 即可（安装日志会提示命令）。
+> botmux 本体是一个**自包含单文件二进制**，运行时已嵌在里面——**装它和跑它都不需要机器上有 Node**（你要接的 AI 编程 CLI 自己需要什么另算）。装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），按 OS/arch 自动选对应二进制、校验 SHA-256，并把 `~/.botmux/bin` 写进你当前 shell 的启动文件（zsh / bash / fish 各写对的那个），**开个新终端就能用**。
 >
-> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：要跑的 PTY 已经嵌在那个二进制里，npm 只是把它放到位。支持 linux / macOS × x64 / arm64；**Windows 请在 WSL2 里安装**（WSL 报告为 linux，是完整支持的一等环境）。不在支持列表里的平台会在安装时**明确报错**，而不是装上一个跑不起来的命令。
+> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：PTY 已经嵌在二进制里。支持 linux / macOS × x64 / arm64（Alpine 等 musl 环境自动选 musl 版）；**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，是完整支持的一等环境）。平台不在列表里、或下下来的二进制在本机跑不起来，安装会**明确报错并保留原有版本**，而不是装上一个起不来的命令。
+>
+> 升级：`botmux upgrade`（原地换二进制），或**重跑一遍上面那条 curl 命令**——同样原地升级，不会重复往启动文件里追加 PATH。
 
 <details>
-<summary>不想装 Node？直接下单文件可执行（连装包都不需要 Node）</summary>
-
-同一个自包含二进制也可以脱离 npm 直接下载，**自带运行时、不依赖机器上的任何 Node**。macOS / Linux：
+<summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
-botmux setup
-botmux start
+npm install -g botmux        # 需要 Node >= 22 装包本身
 ```
 
-装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），自动按 OS/arch 拉对应二进制并校验 SHA-256。命令用法与 npm 版完全一致。**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，完整支持）。
+npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
+
+区别只在**谁来装、以后谁来升**：npm 路径需要 Node ≥ 22 才能执行安装本身，升级交回 `npm i -g botmux@latest`；curl 路径全程不碰 Node。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
 </details>
 

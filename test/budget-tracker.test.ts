@@ -82,7 +82,10 @@ describe('parseBudgetConfig', () => {
     expect(parseBudgetConfig({ monthlyCny: 100, hardStop: 'yes' })?.hardStop).toBe(false);
   });
 
-  it.each([null, undefined, 'str', [], 42, true])('returns null for garbage input (%s)', (raw) => {
+  // Tuple-wrapped: a bare `[]` row spreads to zero arguments, so a callback with a
+  // declared parameter reads as wanting a `done` callback and `bun test` hangs until
+  // the timeout. See the same note in test/bot-description-schema.test.ts.
+  it.each([[null], [undefined], ['str'], [[]], [42], [true]])('returns null for garbage input (%s)', (raw) => {
     expect(parseBudgetConfig(raw)).toBeNull();
   });
 });

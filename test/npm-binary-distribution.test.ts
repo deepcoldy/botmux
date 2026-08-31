@@ -2,7 +2,8 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 
 /**
  * Pins the npm single-version binary distribution (PR #873).
@@ -51,6 +52,66 @@ describe('package.json — lockfile safety and packaging', () => {
     for (const name of PLATFORMS) {
       expect(manifest.optionalDependencies?.[name]).toBeUndefined();
     }
+  });
+
+  /**
+   * THE PUBLISHED TARBALL MUST NOT CARRY THE NODE FORM.
+   *
+   * #1047 removed the Node fallback by deleting `bin` and demoting node-pty to a
+   * devDependency — but `files` still shipped `dist/` (4221 files, 48 MB unpacked)
+   * plus an `ecosystem.config.cjs` whose `script` is `dist/index-daemon.js`. That
+   * left a complete, executable, `#!/usr/bin/env node`-shebanged CLI in the tarball
+   * whose module graph imports a package the manifest does not depend on.
+   *
+   * MEASURED on the real published botmux@3.18.8 — extracted, deps installed the way
+   * a global install does (`--omit=dev`, so node-pty is absent):
+   *   node dist/index-daemon.js
+   *   → Fatal error: ERR_MODULE_NOT_FOUND: Cannot find package 'node-pty'
+   *     imported from .../dist/adapters/backend/tmux-backend.js
+   * which is verbatim the error users reported on 3.18.7/3.18.8. The compiled
+   * binary in the platform subpackage embeds pty.node and is unaffected; only this
+   * shipped-but-unrunnable second copy of the CLI can produce it.
+   *
+   * ⚠️ ASSERTED AGAINST REAL `npm pack` OUTPUT, not against the `files` array.
+   * `files` is an input to a globbing/ignore-file algorithm, not the artifact: a
+   * modelled reading of it can be green while the tarball differs. So this asks npm
+   * itself what it would publish.
+   */
+  it('the PUBLISHED tarball ships no runnable Node form (the node-pty crash users hit)', () => {
+    const packed = spawnSync('npm', ['pack', '--dry-run', '--json'], {
+      encoding: 'utf-8',
+      cwd: resolve('.'),
+      timeout: 120_000,
+    });
+    // Never let an npm hiccup pass as "no dist/ in the tarball" — that is the
+    // vacuous-green direction for a test whose whole job is an absence claim.
+    expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
+    expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
+    const paths: string[] = JSON.parse(packed.stdout)[0].files.map((f: { path: string }) => f.path);
+    // Proof the probe saw a real file list, so the absence assertions below have
+    // something to be absent FROM.
+    expect(paths).toContain('package.json');
+    expect(paths).toContain('scripts/postinstall-bin.mjs');
+
+    // No second CLI. These three are the entry points a stale `exec node <path>`
+    // launcher, a systemd unit, or a hand-run `pm2 start` would land on.
+    for (const entry of ['dist/cli.js', 'dist/index-daemon.js', 'dist/worker.js']) {
+      expect(paths, `${entry} must not ship: it imports node-pty, which is not a dependency`).not.toContain(entry);
+    }
+    expect(paths.filter(p => p.startsWith('dist/'))).toEqual([]);
+    // The pm2 ecosystem file names dist/index-daemon.js as its `script`. Nothing in
+    // the source tree reads it (the supervisor replaced pm2), so its only remaining
+    // effect is telling a human to start the broken form by hand.
+    expect(paths).not.toContain('ecosystem.config.cjs');
+  });
+
+  it('declares no entry point that the tarball does not contain', () => {
+    // `main`/`bin` pointing into a dist/ that no longer ships would be a manifest
+    // that lies about itself: `require('botmux')` would resolve and then fail on a
+    // missing file. The package is a CLI delivered as a compiled binary, so it has
+    // no library entry point at all.
+    expect(manifest.bin).toBeUndefined();
+    expect(manifest.main).toBeUndefined();
   });
 
   it('ships the postinstall script in `files` (otherwise npm i -g fails hard)', () => {
@@ -164,7 +225,8 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     sourceCheckout?: boolean;
     /** Omit scripts/install-path-entry.mjs, to prove the import is fail-soft. */
     withoutPathHelper?: boolean;
-    /** Pretend binDir is already on PATH, so the PATH-writing branch is skipped. */
+    /** Pretend binDir is already on the INSTALLING process's PATH. Note this must
+     *  NOT suppress the startup-file write — see the test that pins it. */
     binDirOnPath?: boolean;
     /** $SHELL for the child, which decides WHICH startup file gets the PATH line. */
     shell?: string;
@@ -172,13 +234,42 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     brokenBinary?: boolean;
     /** Existing shared launcher that a rejected update must preserve byte-for-byte. */
     existingLauncher?: string;
+    /**
+     * Place the fake package at this path RELATIVE to the tmp base, instead of
+     * `pkg/`. Used to reproduce a package-manager global layout (bun/pnpm), which
+     * is the only signal available when no `npm_config_*` is set at all.
+     */
+    pkgRelPath?: string;
+    /** Ship dist/utils/global-install.js, which guard 1's location check imports. */
+    withDistPredicate?: boolean;
+    /** Run against an EXISTING home from a previous call, the way an upgrade does.
+     *  Needed to exercise idempotence across two installs (the startup file has to
+     *  survive between them, which a fresh tmp home cannot show). */
+    reuseHome?: string;
   }) {
     const base = tmp();
-    const home = join(base, 'home');
-    const pkg = join(base, 'pkg');
+    const home = opts.reuseHome ?? join(base, 'home');
+    const pkg = join(base, opts.pkgRelPath ?? 'pkg');
     mkdirSync(home, { recursive: true });
     mkdirSync(join(pkg, 'scripts'), { recursive: true });
     writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), readFileSync(POSTINSTALL));
+    // Guard 1's location check imports the repo's own layout classifier from
+    // `dist/` (it ships via package.json `files`). That module has a small import
+    // graph, so the fixture must carry ALL of it — a partial copy fails CLOSED and
+    // would make this test pass for the wrong reason. Verified against a real
+    // `bun add -g botmux` tree: all four files are present in the published package.
+    if (opts.withDistPredicate) {
+      for (const rel of [
+        join('utils', 'global-install.js'),
+        join('core', 'binary-install-shape.js'),
+        join('core', 'self-spawn.js'),
+        join('utils', 'install-info.js'),
+      ]) {
+        const dest = join(pkg, 'dist', rel);
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, readFileSync(join(__dirname, '..', 'dist', rel)));
+      }
+    }
     // postinstall imports this sibling to write the PATH entry. It ships via
     // package.json `files`, so the fixture must carry it too — otherwise this
     // exercises a package layout we never publish. (`opts.withoutPathHelper`
@@ -262,13 +353,71 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(`${r.stdout}${r.stderr}`).toContain('PATH');
   });
 
-  it('touches no startup file when binDir is already on PATH', () => {
-    // An upgrade on a machine that was set up long ago must not keep appending
-    // to (or even creating) rc files it has nothing to add to.
+  /**
+   * WRITES THE STARTUP FILE EVEN WHEN binDir IS ALREADY ON THE INSTALLING SHELL'S
+   * PATH — this replaces a test that asserted the opposite and thereby pinned a bug.
+   *
+   * The old contract ("touches no startup file when binDir is already on PATH") was
+   * reasoned from upgrade noise: "an upgrade on a machine set up long ago must not
+   * keep appending to rc files". The goal is right; the SIGNAL was wrong. It gated
+   * on `process.env.PATH`, i.e. the PATH of the process running the install, while
+   * what actually decides whether `botmux` works is whether the user's FUTURE shells
+   * get it — a property of the startup FILE.
+   *
+   * Those come apart, and botmux itself pulls them apart: the daemon prepends
+   * `~/.botmux/bin` to every CLI session's PATH (five `prependBotmuxBin` call sites
+   * in worker.ts / worker-pool.ts). So `npm i -g botmux` run from inside a botmux
+   * session hit the gate, wrote NOTHING, printed NOTHING, exited 0 — and since there
+   * is no `bin` field to fall back on, the user's next terminal had no `botmux` at
+   * all. That is the reported "3.18.8 更新之后找不到 botmux 命令", still reproducing
+   * after `exec zsh -l` because the file the login shell reads was never written.
+   *
+   * Idempotence is still required — it is just enforced where the real answer lives:
+   * `ensurePathEntry` consults `fileAlreadyHasEntry` per file (which also recognises
+   * a line the user wrote by hand) and reports those as `skipped`. The next test
+   * pins that, so "does not append twice" survives without the wrong gate.
+   */
+  it('writes the startup file even when the INSTALLING shell already has binDir on PATH', () => {
     const r = runPostinstall({ global: 'true', shell: '/usr/bin/zsh', binDirOnPath: true });
     expect(r.status).toBe(0);
     expect(r.wrote).toBe(true);                        // launcher still written
-    expect(existsSync(join(r.home, '.zshenv'))).toBe(false);
+    // The whole point: a transiently-correct PATH must not suppress the file that
+    // makes it permanent.
+    const zshenv = join(r.home, '.zshenv');
+    expect(existsSync(zshenv), 'binDir on the installer PATH must not suppress the startup file').toBe(true);
+    expect(readFileSync(zshenv, 'utf-8')).toContain(join(r.home, '.botmux', 'bin'));
+    // And the user is told, so they know to open a new terminal.
+    expect(r.stdout).toContain('open a new terminal');
+  });
+
+  it('does not append twice when the startup file already carries the entry', () => {
+    // The idempotence the old PATH gate was reaching for, asserted on the signal
+    // that actually governs it. Two installs in the SAME home: the second must
+    // report `skipped` and leave exactly one marker line.
+    const first = runPostinstall({ global: 'true', shell: '/usr/bin/zsh' });
+    expect(first.status).toBe(0);
+    const zshenv = join(first.home, '.zshenv');
+    expect(existsSync(zshenv)).toBe(true);
+    const markers = (text: string) => text.split('\n').filter(l => l.includes('# added by botmux installer')).length;
+    expect(markers(readFileSync(zshenv, 'utf-8'))).toBe(1);
+
+    // Re-run against the very same HOME (reuseHome), as an upgrade would.
+    const second = runPostinstall({ global: 'true', shell: '/usr/bin/zsh', reuseHome: first.home });
+    expect(second.status).toBe(0);
+    expect(markers(readFileSync(zshenv, 'utf-8')), 'a re-install must not append a second PATH line').toBe(1);
+    expect(second.stdout).toContain('already puts');
+  });
+
+  it('SOURCE PIN: the PATH step is not gated on the installing process\'s own PATH', () => {
+    // Behavioural coverage above needs the fixture to stage binDir on PATH; this
+    // pins the absence of the wrong predicate directly, so a re-add is caught even
+    // if someone reshapes the fixture. `process.env.PATH` may legitimately appear
+    // elsewhere in the file (it is passed through to the probe spawn), so match the
+    // specific gate shape that caused the bug: a membership test of binDir in it.
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const code = src.split('\n').filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+    expect(code).not.toMatch(/process\.env\.PATH[^\n]*\.includes\(\s*binDir\s*\)/);
+    expect(code).not.toMatch(/if\s*\(\s*!\s*\(?\s*process\.env\.PATH/);
   });
 
   it('the written launcher actually runs and preserves argument boundaries', () => {
@@ -306,6 +455,56 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.wrote).toBe(false);
   });
 
+  it('THE bun/pnpm BUG: a global LAYOUT with no npm_config_* still writes the launcher', () => {
+    // REGRESSION for a shipped defect: bun (and pnpm) pass NO `npm_config_*` to
+    // lifecycle scripts, so `npm_config_global` is absent for a perfectly real
+    // `bun add -g botmux`. The env-only guard exited 0 silently and wrote nothing —
+    // MEASURED end to end on a real `bun add -g botmux@3.18.8`: `.bun/bin/` empty,
+    // no launcher, the platform binary only in the download cache, so the user had
+    // NO `botmux` command at all. And `bun pm -g trust botmux` did NOT rescue it:
+    // bun reported `1 script ran` while this script still wrote nothing.
+    //
+    // Note `global` is deliberately NOT set — that is the whole point.
+    const r = runPostinstall({
+      pkgRelPath: join('home', '.bun', 'install', 'global', 'node_modules', 'botmux'),
+      withDistPredicate: true,
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote, r.stderr).toBe(true);
+    expect(readFileSync(r.launcher, 'utf-8')).toBe(`#!/bin/sh\nexec "${realpathSync(r.binary)}" "$@"\n`);
+  });
+
+  it('SAFETY: a LOCAL dependency install is not mistaken for a global one', () => {
+    // The counterweight to the case above. `node_modules/botmux` in someone's
+    // project must never repoint the shared launcher — that is the hijack the
+    // strict env guard existed to prevent, and the location check must not reopen
+    // it. The classifier requires a RECOGNISED GLOBAL layout, not merely a
+    // `/node_modules/botmux` suffix.
+    const r = runPostinstall({
+      pkgRelPath: join('proj', 'node_modules', 'botmux'),
+      withDistPredicate: true,
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote).toBe(false);
+  });
+
+  it('THE PUBLISHED SHAPE: works with NO dist/ present, because that is what npm ships', () => {
+    // This case previously asserted the opposite ("fail-closed when dist/ is
+    // missing"), which encoded the very defect: the check imported
+    // `dist/utils/global-install.js`, #1115 removed `dist/` from package.json
+    // `files`, so in the real published package the import ENOENTed and the guard
+    // fell back to env-only — `bun add -g botmux` stayed broken while the suite was
+    // green. The layout list is inlined now, so the published shape (no dist/ at
+    // all) MUST work. Verified end to end against a real `npm pack` tarball
+    // installed with `bun add -g`.
+    const r = runPostinstall({
+      pkgRelPath: join('home', '.bun', 'install', 'global', 'node_modules', 'botmux'),
+      withDistPredicate: false, // ← exactly what the registry serves
+    });
+    expect(r.status).toBe(0);
+    expect(r.wrote, r.stderr).toBe(true);
+  });
+
   it('inside a source checkout (.git + src/) → writes nothing even when global', () => {
     const r = runPostinstall({ global: 'true', sourceCheckout: true });
     expect(r.status).toBe(0);
@@ -332,6 +531,12 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     // Removing the runtime deps while leaving `bin` wired is the worst combination:
     // the fallback still resolves and then dies on `require('node-pty')`. Pin the
     // absence so a well-meaning re-add is caught here.
+    //
+    // ⚠️ `bin` was never the only way in. The tarball also shipped `dist/` itself,
+    // so a stale `exec node "<root>/dist/cli.js"` launcher left behind by a
+    // pre-#1047 install reached the same unrunnable CLI with no `bin` involved —
+    // that is the crash users hit on 3.18.7/3.18.8. `dist/` is out of `files` now
+    // (asserted against real `npm pack` output above); keep BOTH pins.
     const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf-8')) as {
       bin?: unknown;
       dependencies?: Record<string, string>;
@@ -465,5 +670,91 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     const src = readFileSync(POSTINSTALL, 'utf-8');
     expect(src).toContain("process.env.npm_config_global !== 'true'");
     expect(src).not.toContain("!== 'false'");
+  });
+
+  it('SOURCE PIN: the location check is SELF-CONTAINED (no dist/ import — it is not published)', () => {
+    // The first version of this guard imported `dist/utils/global-install.js` to
+    // reuse the repo classifier. That was DEAD CODE in the published package: #1115
+    // removed `dist/` from package.json `files`, so the import always ENOENTed, the
+    // catch returned false, and the guard fell back to env-only — leaving
+    // `bun add -g` exactly as broken as before. Pin that this file never again
+    // depends on anything outside its own published set.
+    const code = readFileSync(POSTINSTALL, 'utf-8')
+      .split('\n')
+      .filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n');
+    // `./install-path-entry.mjs` is the ONLY sibling it may import — that one ships.
+    const imports = [...code.matchAll(/import\s*\(?\s*['"]([^'"]+)['"]/g)].map(m => m[1]);
+    for (const spec of imports) {
+      if (spec.startsWith('node:')) continue;
+      expect(spec, `postinstall must not import ${spec} — check package.json files`)
+        .toBe('./install-path-entry.mjs');
+    }
+    expect(code).not.toContain('dist/');
+    // …and the guard actually consults the location check, not merely defines it.
+    expect(code).toMatch(/npm_config_global !== 'true'[\s\S]{0,60}locationSaysGlobal/);
+  });
+
+  it('PARITY: the inlined layout list agrees with detectGlobalInstallManager on real global paths', () => {
+    // The inlined copy is a SECOND implementation of the same rules, which is how
+    // two answers drift apart. Rather than trusting a comment, execute both over a
+    // matrix of layouts that actually occur and require the same verdict.
+    //
+    // Extract the inlined predicate from the shipped script and run it for real, so
+    // this cannot pass by merely finding similar-looking source text.
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const fn = src.match(/function locationSaysGlobal\(root\) \{[\s\S]*?\n\}/)?.[0];
+    expect(fn, 'locationSaysGlobal not found in postinstall').toBeTruthy();
+    // eslint-disable-next-line no-new-func
+    const inlined = new Function(`${fn}; return locationSaysGlobal;`)() as (r: string) => boolean;
+
+    const GLOBAL_LAYOUTS = [
+      '/usr/lib/node_modules/botmux',
+      '/usr/local/lib/node_modules/botmux',
+      '/root/.bun/install/global/node_modules/botmux',
+      '/root/.local/share/pnpm/global/5/.pnpm/botmux@3.18.9/node_modules/botmux',
+      '/root/.local/share/pnpm/global/5/node_modules/botmux',
+      '/root/.local/share/pnpm/global/v11/abc/node_modules/botmux',
+      '/root/.local/share/pnpm/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux',
+    ];
+    for (const p of GLOBAL_LAYOUTS) {
+      expect(inlined(p), `inlined said NOT global: ${p}`).toBe(true);
+      expect(detectGlobalInstallManager(p, 'linux'), `classifier said unknown: ${p}`)
+        .not.toBe('unknown');
+    }
+
+    const NON_GLOBAL = [
+      '/app/node_modules/botmux',                  // a local dependency
+      '/root/iserver/botmux',                      // a source checkout
+      '/app/node_modules/other/node_modules/botmux',
+      '/home/u/.botmux/bin',                       // the launcher dir, not a package
+    ];
+    for (const p of NON_GLOBAL) {
+      expect(inlined(p), `inlined claimed global: ${p}`).toBe(false);
+      expect(detectGlobalInstallManager(p, 'linux'), `classifier claimed known: ${p}`)
+        .toBe('unknown');
+    }
+  });
+
+  it('STRICTER THAN THE CLASSIFIER: a Windows LOCAL dependency must not count as global', () => {
+    // `detectGlobalInstallManager` ends with `platform === 'win32' ? 'npm' : 'unknown'`,
+    // so on Windows it cannot distinguish a global install from a local dependency —
+    // MEASURED: detectGlobalInstallManager('C:/projects/myapp/node_modules/botmux',
+    // 'win32') === 'npm'. That is harmless where it is used today (a wrong
+    // `npm i -g` just reinstalls), but in postinstall it would let a Windows LOCAL
+    // dependency repoint the shared ~/.botmux/bin/botmux — the exact hijack guard 1
+    // exists to prevent. So the inlined version has NO platform fallback.
+    const src = readFileSync(POSTINSTALL, 'utf-8');
+    const fn = src.match(/function locationSaysGlobal\(root\) \{[\s\S]*?\n\}/)?.[0]!;
+    // eslint-disable-next-line no-new-func
+    const inlined = new Function(`${fn}; return locationSaysGlobal;`)() as (r: string) => boolean;
+
+    const winLocal = 'C:/projects/myapp/node_modules/botmux';
+    // The divergence is deliberate: document it by asserting BOTH sides.
+    expect(detectGlobalInstallManager(winLocal, 'win32')).toBe('npm'); // the hazard
+    expect(inlined(winLocal)).toBe(false);                             // we refuse it
+    expect(inlined('C:\\projects\\myapp\\node_modules\\botmux')).toBe(false); // backslashes too
+    // A real Windows npm global is unaffected: it arrives with npm_config_global=true
+    // and never reaches this check, which the behavioural test above covers.
   });
 });

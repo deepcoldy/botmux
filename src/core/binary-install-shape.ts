@@ -83,8 +83,34 @@ export function currentBinaryInstallShape(): BinaryInstallShape {
 }
 
 /**
- * Map a platform-subpackage binary path to the MAIN `botmux` package root beside
- * it (`…/node_modules/botmux-linux-x64/botmux` → `…/node_modules/botmux`).
+ * Map a platform-subpackage binary path to the MAIN `botmux` package root that
+ * owns it. TWO layouts occur in the wild and both are load-bearing:
+ *
+ *   nested  (npm)  …/node_modules/botmux/node_modules/botmux-linux-x64/botmux
+ *                  → …/node_modules/botmux          (the ENCLOSING package)
+ *   sibling (Bun)  …/node_modules/botmux-linux-x64/botmux
+ *                  → …/node_modules/botmux          (the package BESIDE it)
+ *
+ * ⚠️ ONLY THE SIBLING SHAPE USED TO BE HANDLED, and that was the whole of a real
+ * bug: npm 10 does NOT hoist a package's own dependencies to the global root, so
+ * `npm i -g botmux` puts the platform subpackage INSIDE the main package. The
+ * sibling rule then produced `…/node_modules/botmux/node_modules/botmux`, a
+ * directory that does not exist, so `detectGlobalInstallManager` said `unknown`,
+ * no install plan resolved, and every npm user got "当前安装方式无法安全自动更新"
+ * from `botmux update`, the dashboard button, and scheduled auto-update alike.
+ * MEASURED on a real `npm i -g botmux` (npm 10.9.4): the binary lives at
+ * `<prefix>/lib/node_modules/botmux/node_modules/botmux-linux-x64/botmux`, and
+ * peer globals nest the same way (pm2: 112 nested deps, http-server: 47).
+ *
+ * The sibling rule is NOT obsolete and must not be replaced: MEASURED on the same
+ * box, Bun's global tree HOISTS (a declared global package with dependencies has
+ * 0 entries in its own `node_modules`), so a Bun-installed platform subpackage
+ * really is a sibling. Hence both, distinguished purely and without touching the
+ * filesystem: in the nested layout the directory CONTAINING that `node_modules`
+ * is itself the main package (it is literally named `botmux`), so when that holds
+ * it is the answer; otherwise the main package sits beside the subpackage. No
+ * `existsSync` probe — this stays pure, and a guess that happens to be absent on
+ * one box would otherwise silently change the answer.
  *
  * WHY GO THROUGH THE MAIN PACKAGE instead of computing an npm `--prefix` here:
  * `resolveGlobalInstallPlan` already classifies that path shape into the right
@@ -99,7 +125,15 @@ export function currentBinaryInstallShape(): BinaryInstallShape {
 export function mainPackageRootForSubpackageBinary(execPath: string): string | null {
   const path = execPath.replace(/\\/g, '/').replace(/\/+$/, '');
   const m = /^(.*\/node_modules)\/botmux-(?:linux|darwin)-(?:x64|arm64)(?:-musl)?\/botmux$/.exec(path);
-  return m ? `${m[1]}/botmux` : null;
+  if (!m) return null;
+  const nodeModules = m[1];
+  // Nested (npm): the directory holding this `node_modules` is the main package.
+  // Anchored on `/botmux` so only the real main package matches — a subpackage
+  // nested under some OTHER package would not be ours to hand to the manager.
+  const enclosing = nodeModules.slice(0, -'/node_modules'.length);
+  if (/\/node_modules\/botmux$/.test(enclosing)) return enclosing;
+  // Sibling (Bun's hoisted global tree, and Windows npm).
+  return `${nodeModules}/botmux`;
 }
 
 /**

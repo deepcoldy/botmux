@@ -1313,11 +1313,50 @@ describe('card behavior defaults', () => {
     expect(cardOff.root.findByProps({ 'data-card-off-options': true }).props.hidden).toBe(false);
     expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.checked).toBe(true);
     expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.disabled).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.disabled).toBe(false);
     expect(cardOff.root.findByProps({ 'data-action': 'toggle-writable-link' }).props.disabled).toBe(false);
     expect(cardOff.root.findByProps({ 'data-card-pref-status': '' }).props).toMatchObject({
       role: 'status',
       'aria-live': 'polite',
     });
+  });
+
+  it('pin streaming toggle defaults unchecked when the payload omits it', () => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_pin_absent' },
+        putCardPref,
+      }));
+    });
+
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(false);
+  });
+
+  it('toggling pin streaming on persists pinStreamingCard=true', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_pin_toggle' },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ pinStreamingCard: true });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(true);
   });
 
   it('enabling automatic cards persists disableStreamingCard=false', async () => {
@@ -1383,7 +1422,7 @@ describe('card behavior defaults', () => {
       }));
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
       const before = renderer.root.findByProps({ 'data-action': action }).props.checked;
       await act(async () => {
         renderer.root.findByProps({ 'data-action': action }).props.onChange({ currentTarget: { checked: !before } });
@@ -1410,7 +1449,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);

@@ -43,11 +43,16 @@ publisher.
 
 ## Create a project
 
-Botmux currently requires Node.js 22 or newer. Install Botmux, then run the
-generator:
+Plugin **development** requires Node.js 22 or newer with `npm` on your `PATH` —
+the generator shells out to npm to scaffold, install, and test the project. (This
+is a requirement of plugin development specifically; botmux itself is a
+self-contained binary and needs no Node — see [Quickstart](/en/quickstart).)
+
+Install botmux by whichever route you prefer, then run the generator:
 
 ```bash
-npm install -g botmux@latest
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+# or, if you'd rather install through npm: npm install -g botmux@latest
 
 botmux plugin init my-plugin
 cd botmux-plugin-my-plugin

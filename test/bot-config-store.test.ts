@@ -42,7 +42,8 @@ async function freshModules() {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
   const store = await import('../src/services/bot-config-store.js');
-  return { registry, store };
+  const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
+  return { registry, store, pinStreamingCardChange };
 }
 
 describe('bot-config store', () => {
@@ -72,9 +73,9 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store } = await freshModules();
+    const { registry, store, pinStreamingCardChange } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store };
+    return { registry, store, pinStreamingCardChange };
   }
 
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
@@ -135,6 +136,7 @@ describe('bot-config store', () => {
     const { store } = await freshModules();
     expect(store.findConfigField('MODEL')?.configKey).toBe('model');
     expect(store.findConfigField('disablestreamingcard')?.configKey).toBe('disableStreamingCard');
+    expect(store.findConfigField('PINSTREAMINGCARD')?.configKey).toBe('pinStreamingCard');
     expect(store.findConfigField('nope')).toBeUndefined();
   });
 
@@ -509,6 +511,108 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
   });
 
+  it('pinStreamingCard is an immediate default-off boolean', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    expect(spec).toMatchObject({
+      configKey: 'pinStreamingCard',
+      kind: 'boolean',
+      effect: 'immediate',
+      clearable: false,
+    });
+
+    const on = await store.applyConfigField('app_default', spec, true);
+    expect(on).toMatchObject({ ok: true, oldText: 'off', newText: 'on' });
+    expect(readConfig().pinStreamingCard).toBe(true);
+    expect(registry.getBot('app_default').config.pinStreamingCard).toBe(true);
+
+    const off = await store.applyConfigField('app_default', spec, false);
+    expect(off).toMatchObject({ ok: true, oldText: 'on', newText: 'off' });
+    expect(readConfig().pinStreamingCard).toBeUndefined();
+    expect(registry.getBot('app_default').config.pinStreamingCard).toBeUndefined();
+  });
+
+  it('notifies pinStreamingCard changes only after disk and live memory are synchronized', async () => {
+    const { registry, store, pinStreamingCardChange } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    const observed: Array<{ enabled: boolean; disk: unknown; memory: unknown }> = [];
+    const dispose = pinStreamingCardChange.registerPinStreamingCardChangeHandler((appId, enabled) => {
+      observed.push({
+        enabled,
+        disk: readConfig().pinStreamingCard,
+        memory: registry.getBot(appId).config.pinStreamingCard,
+      });
+    });
+
+    try {
+      const on = await store.applyConfigField('app_default', spec, true);
+      expect(on.ok).toBe(true);
+
+      const off = await store.applyConfigField('app_default', spec, false);
+      expect(off.ok).toBe(true);
+    } finally {
+      dispose();
+    }
+
+    expect(observed).toEqual([
+      { enabled: true, disk: true, memory: true },
+      { enabled: false, disk: undefined, memory: undefined },
+    ]);
+  });
+
+  it('does not notify pinStreamingCard no-op writes when the effective boolean is unchanged', async () => {
+    const { registry, store, pinStreamingCardChange } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    const observed: Array<{ enabled: boolean; disk: unknown; memory: unknown }> = [];
+    const dispose = pinStreamingCardChange.registerPinStreamingCardChangeHandler((appId, enabled) => {
+      observed.push({
+        enabled,
+        disk: readConfig().pinStreamingCard,
+        memory: registry.getBot(appId).config.pinStreamingCard,
+      });
+    });
+
+    try {
+      const offNoop = await store.applyConfigField('app_default', spec, false);
+      expect(offNoop.ok).toBe(true);
+
+      const on = await store.applyConfigField('app_default', spec, true);
+      expect(on.ok).toBe(true);
+
+      const onNoop = await store.applyConfigField('app_default', spec, true);
+      expect(onNoop.ok).toBe(true);
+
+      const off = await store.applyConfigField('app_default', spec, false);
+      expect(off.ok).toBe(true);
+
+      const offNoopAgain = await store.applyConfigField('app_default', spec, false);
+      expect(offNoopAgain.ok).toBe(true);
+    } finally {
+      dispose();
+    }
+
+    expect(observed).toEqual([
+      { enabled: true, disk: true, memory: true },
+      { enabled: false, disk: undefined, memory: undefined },
+    ]);
+  });
+
+  it('does not notify pinStreamingCard changes when the write fails', async () => {
+    const { store, pinStreamingCardChange } = await loaded();
+    const spec = store.findConfigField('PINSTREAMINGCARD')!;
+    const seen = vi.fn();
+    const dispose = pinStreamingCardChange.registerPinStreamingCardChangeHandler(seen);
+
+    try {
+      const result = await store.applyConfigField('app_missing', spec, true);
+      expect(result).toMatchObject({ ok: false, reason: 'bot_not_registered' });
+    } finally {
+      dispose();
+    }
+
+    expect(seen).not.toHaveBeenCalled();
+  });
+
   it('number field (maxLiveWorkers) round-trips and clears on null', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('maxLiveWorkers')!;
@@ -695,7 +799,7 @@ describe('bot-config store', () => {
   });
 
   it('getConfigSnapshot reports current values + info', async () => {
-    const { store } = await loaded({ model: 'sonnet', disableStreamingCard: true });
+    const { store } = await loaded({ model: 'sonnet', disableStreamingCard: true, pinStreamingCard: true });
     const snap = store.getConfigSnapshot('app_default');
     expect(snap.ok).toBe(true);
     if (snap.ok) {
@@ -705,6 +809,8 @@ describe('bot-config store', () => {
       expect(model?.value).toBe('sonnet');
       const card = snap.rows.find(r => r.key === 'disableStreamingCard');
       expect(card?.value).toBe('on');
+      const pin = snap.rows.find(r => r.key === 'pinStreamingCard');
+      expect(pin?.value).toBe('on');
     }
   });
 
@@ -768,7 +874,7 @@ describe('bot-config store', () => {
   });
 
   it('getConfigCardData returns the card view (booleans + cli options + model choices)', async () => {
-    const { store } = await loaded({ model: 'opus', disableStreamingCard: true });
+    const { store } = await loaded({ model: 'opus', disableStreamingCard: true, pinStreamingCard: true });
     const data = store.getConfigCardData('app_default', ['opus', 'sonnet']);
     expect(data).not.toBeNull();
     expect(data!.cliId).toBe('claude-code');
@@ -776,6 +882,9 @@ describe('bot-config store', () => {
     expect(data!.modelChoices).toEqual(['opus', 'sonnet']);
     expect(data!.cliOptions.length).toBeGreaterThan(0);
     expect(data!.booleans.find(b => b.key === 'disableStreamingCard')?.on).toBe(true);
+    expect(data!.booleans.find(b => b.key === 'pinStreamingCard')?.on).toBe(true);
+    const { store: store2 } = await loaded({ model: 'opus' });
+    expect(store2.getConfigCardData('app_default', ['opus'])!.booleans.find(b => b.key === 'pinStreamingCard')?.on).toBe(false);
     expect(store.getConfigCardData('app_missing')).toBeNull();
   });
 

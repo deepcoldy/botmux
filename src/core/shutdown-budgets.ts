@@ -22,6 +22,20 @@ export const REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS = 1_000;
 /** Scheduling/logging slack inside the supervisor-visible daemon budget. */
 export const DAEMON_SHUTDOWN_OVERHEAD_MS = 2_000;
 export const DAEMON_WORKER_EXIT_GRACE_MS = 3_000;
+
+/**
+ * Bound for settling live CoT thinking bubbles as「中断」on the graceful path.
+ *
+ * Deliberately NOT a new addend of DAEMON_SHUTDOWN_MAX_MS: that sum already
+ * sits exactly at its 28s assertion ceiling, so widening it would throw at
+ * module load. This is a sub-budget spent inside the existing envelope — the
+ * remote-drain phase it borrows from is entered only by remote backends
+ * (`shutdownBackendDisposition` → 'remote-drain-detach', i.e. riff/mojo),
+ * while pty/tmux sessions take 'detach'/'close' and never spend it. Every
+ * caller additionally clamps to the absolute shutdown deadline. Cosmetic work
+ * must never be the reason a shutdown misses its deadline.
+ */
+export const DAEMON_COT_SETTLE_MS = 2_000;
 export const DAEMON_SHUTDOWN_MAX_MS =
   BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
   + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS

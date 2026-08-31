@@ -4,9 +4,14 @@
  * a global package update against a daemon that runs from a git checkout
  * would not take effect and only risks confusion.
  *
- * npm publishes only `dist/` (+ a few root files; see package.json `files`),
- * never `.git` or `src/`, so the presence of either at the package root is a
- * reliable "running from source" signal.
+ * npm publishes neither `.git` nor `src/` (see package.json `files`), so the
+ * presence of either at the package root is a reliable "running from source"
+ * signal. That is the whole basis of the check, and it is unaffected by WHICH
+ * files the tarball does carry — this comment used to say "npm publishes only
+ * `dist/`", which stopped being true when `dist/` was dropped from `files` (it
+ * shipped a second, unrunnable Node CLI that imported node-pty, a package the
+ * manifest does not depend on). The predicate never depended on that; only the
+ * sentence did.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';

@@ -456,9 +456,11 @@ function normaliseNewlines(text: string): string {
  * Scan the bucket-level prompt_history.jsonl from `fromByte` for a submit
  * whose `prompt` equals `expectedText` (modulo newline normalisation — the
  * composer stores multi-line input verbatim with `\n`). prompt_history is
- * written AT SUBMIT TIME even while a turn is running (verified 0.2.93), so
- * this confirms busy-turn type-ahead submits that updates.jsonl (dequeue-time
- * user events) cannot. Returns the owning session id when found.
+ * written at submit time for an IDLE composer ("even while a turn is
+ * running" was verified on 0.2.93 but no longer holds on 1.0.5: a mid-turn
+ * submit parks in grok's queue and appends only at DEQUEUE, the instant the
+ * previous turn completes — so busy-turn verifies miss until then). Returns
+ * the owning session id when found.
  *
  * Concurrent safety: the file is cwd-bucket shared. Two workers in the same
  * repo can append identical prompt text under different session_ids. Callers

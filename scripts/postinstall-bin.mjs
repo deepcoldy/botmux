@@ -16,18 +16,48 @@
  *
  * ── THE GUARD (do not loosen this) ──────────────────────────────────────────────
  * We only write the launcher for a REAL global install. Empirically measured what
- * npm/pnpm expose to postinstall (not assumed — probed all three cases):
+ * each package manager exposes to postinstall (not assumed — probed every case):
  *
  *   `npm i -g botmux`                    → npm_config_global === "true"
  *   installed as someone's local dep     → npm_config_global ABSENT
  *   `pnpm install` INSIDE the botmux repo → npm_config_global ABSENT
+ *   `bun add -g botmux`                  → npm_config_global ABSENT (see below)
  *
  * The third case is the dangerous one: a repo-local `pnpm install` DOES run the
  * root package's postinstall. So a `!== "false"` style check would fire during
  * ordinary development and rewrite ~/.botmux/bin/botmux — hijacking the global
  * launcher of whatever fleet shares that HOME (on the dev box that is ~50 live
- * daemons). Hence the guard is a STRICT `=== "true"`, and there is a second,
+ * daemons). Hence the env check stays a STRICT `=== "true"`, and there is a second,
  * independent bail-out when we can see we are inside the source checkout.
+ *
+ * ⚠️ THE FOURTH CASE IS WHY THE ENV CHECK ALONE IS NOT ENOUGH. Bun does pass a few
+ * npm_* vars to lifecycle scripts — MEASURED with a probe package whose postinstall
+ * dumped its own env, the complete set is:
+ *
+ *   BUN_INSTALL, BUN_WHICH_IGNORE_CWD, npm_config_user_agent, npm_execpath,
+ *   npm_node_execpath
+ *
+ * — but `npm_config_global` is NOT among them, and that is the one this guard read.
+ * So for a perfectly real `bun add -g botmux` the check failed and this script
+ * exited 0 without writing anything. MEASURED end to end: `.bun/bin/` empty, no
+ * launcher, the platform binary sitting in the download cache, i.e. the user had NO
+ * `botmux` command at all. Worse, the obvious workaround did NOT help: `bun pm -g
+ * trust botmux` made bun report `1 script ran` while this script still wrote
+ * nothing, because the env check had already failed.
+ *
+ * ⚠️ TWO SEPARATE LAYERS — do not conflate them. (a) bun BLOCKS the script by
+ * default (`Blocked N postinstalls`); `bun pm trust` lifts that. (b) even once it
+ * runs, this guard killed it. Fixing (b) is what makes `bun pm trust` an actually
+ * working workaround. pnpm 10/11 is a different layer again: `onlyBuiltDependencies`
+ * means the script does not run at all, so this fix alone does not rescue pnpm —
+ * that needs approve-builds/onlyBuiltDependencies or a different mechanism.
+ *
+ * So the global check is: the env says global (npm/yarn), OR THE INSTALL LOCATION
+ * ITSELF says global. The layout list is INLINED in `locationSaysGlobal` below —
+ * see the ⚠️ notes there for why importing the repo's classifier from `dist/` was
+ * dead code in the published package, and why the inlined version is deliberately
+ * stricter on Windows. A source checkout matches no global layout (verified), so
+ * this cannot reopen the repo-local hijack that guard 2 also covers.
  *
  * ── FAIL HARD WHEN THERE IS NO BINARY ──────────────────────────────────────────
  * This used to warn and exit 0, because `bin: {botmux: "dist/cli.js"}` gave every
@@ -102,10 +132,64 @@ function isMuslLinux() {
   return false;
 }
 
-// ── Guard 1: only a real `npm i -g` (strict equality; see header) ───────────────
-if (process.env.npm_config_global !== 'true') {
+// ── Guard 1: only a real global install ─────────────────────────────────────────
+// Two independent positive signals (see header). The env check is unchanged and
+// still strict; the location check is what makes `bun add -g` / `pnpm add -g` work,
+// since those provide no npm_config_* at all.
+const here = dirname(fileURLToPath(import.meta.url));
+const pkgRoot = dirname(here); // scripts/ -> package root
+
+/**
+ * Does the install LOCATION say this is a package-manager-owned global tree?
+ *
+ * ⚠️ WHY THIS IS INLINED INSTEAD OF IMPORTING THE REPO'S CLASSIFIER. The first
+ * version did `await import('./dist/utils/global-install.js')` to reuse
+ * `detectGlobalInstallManager`. That was DEAD CODE in the published package: #1115
+ * removed `dist/` from `package.json` `files`, so the import always ENOENTs, the
+ * catch returned false, and the guard silently fell back to env-only — leaving
+ * `bun add -g botmux` exactly as broken as before. MEASURED, not reasoned:
+ *
+ *   git archive origin/master | tar x && npm pack
+ *   tar tzf botmux-*.tgz | grep -c '^package/dist/'    → 0
+ *
+ * and end to end, a real `bun add -g <that tarball>` then running this script the
+ * way bun does: exit 0, no launcher. This file is a standalone script with no build
+ * step, and neither `dist/` nor `src/` is published, so being SELF-CONTAINED is its
+ * natural form — inlining is not a compromise here.
+ *
+ * ⚠️ AND IT IS DELIBERATELY STRICTER THAN `detectGlobalInstallManager`. That
+ * function ends with `platform === 'win32' ? 'npm' : 'unknown'`, so on Windows it
+ * cannot tell a global install from a LOCAL dependency — MEASURED:
+ *
+ *   detectGlobalInstallManager('C:/projects/myapp/node_modules/botmux', 'win32') → 'npm'
+ *
+ * Harmless where it is used today (a wrong `npm i -g` merely reinstalls), but in
+ * THIS file it would mean a Windows local dependency repoints the shared
+ * `~/.botmux/bin/botmux` — the exact hijack guard 1 exists to prevent. So the list
+ * below recognises only KNOWN GLOBAL layouts and has no platform fallback. Windows
+ * npm globals are unaffected: they arrive with `npm_config_global=true` and never
+ * reach this check.
+ *
+ * The layout patterns mirror `detectGlobalInstallManager`'s; a source guard in
+ * test/npm-binary-distribution.test.ts pins the two in agreement over a matrix of
+ * real global paths, so the duplication cannot drift unnoticed.
+ */
+function locationSaysGlobal(root) {
+  const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  // Every global layout below ends at the main package; anything else is not ours.
+  if (!r.endsWith('/node_modules/botmux')) return false;
+  return r.endsWith('/lib/node_modules/botmux')                    // npm, POSIX
+    || r.includes('/.bun/install/global/node_modules/botmux')      // bun
+    || r.includes('/bun/install/global/node_modules/botmux')       // bun, custom BUN_INSTALL
+    || r.includes('/.pnpm/')                                       // pnpm virtual store
+    || /\/pnpm\/global\/[^/]+\/node_modules\/botmux$/.test(r)      // pnpm 9 global
+    || /\/pnpm\/global\/v\d+\/[^/]+\/node_modules\/botmux$/.test(r) // pnpm 11 global
+    || /\/pnpm\/store\/v\d+\/links\/@\/botmux\//.test(r);          // pnpm 11 store links
+}
+
+if (process.env.npm_config_global !== 'true' && !locationSaysGlobal(pkgRoot)) {
   // Silent: this is the overwhelmingly common case (dev installs, transitive
-  // installs). Noise here would appear on every `pnpm install` in the repo.
+  // installs). Noise here would appear on every `bun install` in the repo.
   process.exit(0);
 }
 
@@ -113,8 +197,6 @@ if (process.env.npm_config_global !== 'true') {
 // Defence in depth for guard 1. If the package directory we are running from is a
 // git checkout of botmux (has .git and src/), this is a developer environment, not
 // an installed package — the launcher must not be repointed.
-const here = dirname(fileURLToPath(import.meta.url));
-const pkgRoot = dirname(here); // scripts/ -> package root
 if (existsSync(join(pkgRoot, '.git')) && existsSync(join(pkgRoot, 'src'))) {
   process.exit(0);
 }
@@ -252,13 +334,31 @@ try {
 // only way this launcher becomes a command; we now write the right startup file
 // for the user's actual shell (bash/zsh/fish/other) and tell them what we did.
 //
+// ⚠️ DO NOT GATE THIS ON `process.env.PATH`. It used to be wrapped in
+// `if (!process.env.PATH.split(':').includes(binDir))`, which asks "is binDir on
+// the PATH of the process running the install?" — the wrong question. What decides
+// whether `botmux` works is whether the user's FUTURE shells get it, i.e. whether a
+// startup file says so. The two come apart whenever the installing shell has binDir
+// on PATH transiently, and botmux itself creates that situation: the daemon
+// prepends `~/.botmux/bin` to every CLI session's PATH (five `prependBotmuxBin`
+// call sites in worker.ts / worker-pool.ts). So `npm i -g botmux` run from inside a
+// botmux session — or any shell that merely exported the dir — wrote NO startup
+// file, printed NO hint, and exited 0; the next terminal then had no `botmux` at
+// all, because there is no `bin` field to fall back on. MEASURED with the real
+// script against an isolated HOME, changing only PATH:
+//   PATH without binDir → writes ~/.zshenv + "open a new terminal" hint
+//   PATH with    binDir → zero files, zero output, exit 0   ← the reported bug
+// `ensurePathEntry` already asks the right question per file (`fileAlreadyHasEntry`,
+// which also recognises a line the user wrote by hand) and reports those as
+// `skipped`, so this outer check was redundant as well as wrong.
+//
 // ⚠️ FAIL-SOFT, and never `fail()`: the launcher is already installed and working
 // at this point, so a PATH edit that cannot happen must degrade to the printed
 // hint — not abort a successful install. That includes the sibling module simply
 // not being there: it ships via package.json `files`, and if a future edit drops
 // it (or a mirror repacks the tarball without it) the import throws. Guarding it
 // keeps `npm i -g botmux` succeeding either way.
-if (!(process.env.PATH ?? '').split(':').includes(binDir)) {
+{
   let ensurePathEntry = null;
   try {
     ({ ensurePathEntry } = await import('./install-path-entry.mjs'));

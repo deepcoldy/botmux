@@ -345,6 +345,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   postFreshStreamingCard: vi.fn(async () => false),
   postPrivateSnapshotCard: vi.fn(async () => ({ notReady: false, sent: 1, total: 1 })),
   resolvePrivateCardAudience: vi.fn(() => ['ou_owner']),
+  reconcileBotStreamingCardPins: vi.fn(),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -498,6 +499,10 @@ vi.mock('../src/services/card-mode-store.js', () => ({
   setCardMode: vi.fn(async () => ({ ok: true })),
 }));
 
+vi.mock('../src/services/pin-streaming-card-mode-store.js', () => ({
+  setChatStreamingCardPin: vi.fn(async () => ({ ok: true, changed: true })),
+}));
+
 vi.mock('../src/services/cot-mode-store.js', () => ({
   setCotMode: vi.fn(async () => ({ ok: true })),
 }));
@@ -510,6 +515,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
+import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
@@ -524,7 +530,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -1170,6 +1176,58 @@ describe('/botconfig set p2pOpen (私聊对话全开) via the real text command'
 });
 
 describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
+  it('persists pinStreamingCard and returns promptly even when hot reconciliation throws or hangs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-pinstreaming-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+    const change = await import('../src/services/pin-streaming-card-change.js');
+
+    try {
+      const disposeThrow = change.registerPinStreamingCardChangeHandler(() => {
+        throw new Error('reconcile failed');
+      });
+      await expect(run('/botconfig set pinStreamingCard on')).resolves.toBeUndefined();
+      disposeThrow();
+      expect(stored().pinStreamingCard).toBe(true);
+      expect((bot.config as any).pinStreamingCard).toBe(true);
+
+      let release!: () => void;
+      const disposePending = change.registerPinStreamingCardChangeHandler(() => {
+        void new Promise<void>((resolve) => { release = resolve; });
+      });
+      await expect(run('/botconfig set pinStreamingCard off')).resolves.toBeUndefined();
+      disposePending();
+      expect('pinStreamingCard' in stored()).toBe(false);
+      expect((bot.config as any).pinStreamingCard).toBeUndefined();
+      release();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+
   it('rejects an over-long displayName and persists a valid one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-displayname-'));
     const configPath = join(dir, 'bots.json');
@@ -4704,6 +4762,61 @@ describe('handleCommand', () => {
       // The adopt topic root must not be retained as a bookmark.
       expect(callArgs.rootMessageId).toBeUndefined();
     });
+
+    it('stamps the human creator identity (open_id + tenant-stable union_id)', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-human' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报', {
+        senderId: 'ou_creator',
+        senderUnionId: 'on_creator',
+        senderType: 'user',
+      }), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.ownerOpenId).toBe('ou_creator');
+      expect(callArgs.ownerUnionId).toBe('on_creator');
+    });
+
+    it('withholds the union_id when the creating sender is not a human', async () => {
+      // A bot-created task must not be able to run as the bot: without a
+      // union_id the scheduled turn carries no identity at all, so
+      // identity-bound tools fail closed instead of borrowing the bot's access.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-bot' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报', {
+        senderId: 'ou_bot_sender',
+        senderUnionId: 'on_bot_sender',
+        senderType: 'app',
+      }), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.ownerOpenId).toBe('ou_bot_sender');
+      expect(callArgs.ownerUnionId).toBeUndefined();
+    });
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────
@@ -6995,6 +7108,7 @@ describe('/card — operator / canOperate gate', () => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(setCardMode).mockResolvedValue({ ok: true } as any);
+    vi.mocked(setChatStreamingCardPin).mockResolvedValue({ ok: true, changed: true } as any);
   });
 
   it('rejects a non-operator (canOperate=false): operator_only notice, no mode change', async () => {
@@ -7039,6 +7153,75 @@ describe('/card — operator / canOperate gate', () => {
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('终端尚未就绪');
     expect(reply).not.toContain('会议接收会话');
+  });
+
+  it('operator: /card pin off updates the per-chat Pin opt-out without touching streamingCardForced or setCardMode', async () => {
+    const ds = makeDaemonSession();
+    ds.streamingCardForced = true;
+    const deps = makeDeps(ds);
+
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin off', deps);
+
+    expect(setChatStreamingCardPin).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
+    expect(setCardMode).not.toHaveBeenCalled();
+    expect(ds.streamingCardForced).toBe(true);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('置顶');
+  });
+
+  it('operator: /card pin on works without a live session and does not touch setCardMode', async () => {
+    const deps = makeDeps();
+
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin on', deps);
+
+    expect(setChatStreamingCardPin).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    expect(setCardMode).not.toHaveBeenCalled();
+  });
+
+  it('operator: /card pin on under master-off removes the chat override but replies with the master-off hint', async () => {
+    const deps = makeDeps();
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: {
+        larkAppId: id,
+        larkAppSecret: 's',
+        cliId: 'claude-code' as const,
+        pinStreamingCard: false,
+        noPinStreamingCardChats: [CHAT_ID],
+      },
+    })) as any);
+
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin on', deps);
+
+    expect(setChatStreamingCardPin).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, true);
+    expect(setCardMode).not.toHaveBeenCalled();
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('bot 级');
+  });
+
+  it('operator: /card pin status distinguishes master off, chat opt-out, and effective on', async () => {
+    const deps = makeDeps();
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, pinStreamingCard: false },
+    })) as any);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin status', deps);
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('bot 级');
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, pinStreamingCard: true, noPinStreamingCardChats: [CHAT_ID] },
+    })) as any);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin status', deps);
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('当前群');
+
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, pinStreamingCard: true },
+    })) as any);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card pin status', deps);
+    expect(((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1) ?? [])[1] as string).toContain('已开启');
   });
 });
 

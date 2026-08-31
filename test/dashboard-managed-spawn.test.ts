@@ -89,6 +89,54 @@ describe('dashboard host children run on a redacted env', () => {
     expectNoSecrets(spawnedEnv());
   });
 
+  /**
+   * WIRING, not policy. `resolveCliSpawn` is unit-tested on its own
+   * (test/cli-subcommand-spawn-form.test.ts), but a correct helper that this
+   * module does not actually call is worth nothing — and that is exactly the
+   * shape the bug had: the helper's job was done inline, hardcoded to the Node
+   * form. Note the cases above assert `args.slice(1)`, which cannot see the
+   * difference: dropping or keeping a leading cli.js path leaves the tail
+   * identical. These assert args[0].
+   *
+   * MEASURED on the real published v3.18.8 binary — the broken argv
+   * `<binary> /dist/cli.js start-bot <appId> --json` prints the help banner and
+   * exits 0, while the correct one exits 1 with a JSON result. `code === 0` is
+   * how this module decides success, so the dashboard reported "已上线" for a
+   * bot it never started.
+   */
+  it('WIRING: the Node form passes a cli.js path as argv[0]', async () => {
+    const { spawnStartBotLive } = await import('../src/dashboard/managed-spawn.js');
+    await spawnStartBotLive('cli_target');
+
+    const [command, args] = childProcess.spawn.mock.calls[0] as [string, string[], unknown];
+    expect(command).toBe(process.execPath);
+    expect(args[0]).toMatch(/cli\.js$/);
+    expect(args.slice(1)).toEqual(['start-bot', 'cli_target', '--json']);
+  });
+
+  it('WIRING: the compiled form must NOT — the subcommand has to be argv[0]', async () => {
+    // isStandaloneBinary() keys off process.argv[1] (src/core/self-spawn.ts), so
+    // this drives the genuine branch rather than a flag threaded in by the test.
+    //
+    // MUTATION CHECK: reverting this module to the inline
+    // `spawn(process.execPath, [botmuxCliEntry(), verb, …])` turns this red.
+    const realArgv1 = process.argv[1];
+    process.argv[1] = '/$bunfs/root/cli.js';
+    try {
+      const { spawnStartBotLive } = await import('../src/dashboard/managed-spawn.js');
+      await spawnStartBotLive('cli_target');
+
+      const [command, args] = childProcess.spawn.mock.calls[0] as [string, string[], unknown];
+      expect(command).toBe(process.execPath);
+      expect(args).toEqual(['start-bot', 'cli_target', '--json']);
+      // The specific poison: a path where the subcommand belongs.
+      expect(args[0]).not.toContain('cli.js');
+      for (const s of args) expect(s).not.toContain('$bunfs');
+    } finally {
+      process.argv[1] = realArgv1;
+    }
+  });
+
   it('the global install (and every npm lifecycle script it runs) sees no secrets', async () => {
     const { runGlobalInstall } = await import('../src/dashboard/managed-spawn.js');
     await runGlobalInstall({

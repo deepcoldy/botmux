@@ -25,6 +25,22 @@ import { vi } from 'vitest';
  *     (`test/remote-shutdown-detach.test.ts`, which fails with
  *     `results.every is not a function`). Overriding a matcher cannot fix how the
  *     runner threads the awaited value into it.
+ *   An `it.each` row that is a BARE EMPTY ARRAY (`it.each([null, [], 'x'])`) spreads
+ *     to ZERO arguments under `bun test`. A callback that declares a parameter then
+ *     looks like it wants a `done` callback, so the runner waits for one and the case
+ *     dies at the timeout — measured: 180s on a body that is fully synchronous and
+ *     cannot hang, which makes it read as a hang rather than as bad data. vitest
+ *     passes the empty array through as the single argument instead.
+ *     NOT shimmed by CHOICE, not by impossibility: wrapping `.each` to rewrite a bare
+ *     `[]` row into `[[]]` before the runner sees it does work (measured: the hang goes
+ *     away and multi-element, tuple-wrapped and bare-value rows all still arrive
+ *     unchanged). It is rejected because it would also rewrite a table whose rows are
+ *     ALL bare `[]` — vitest calls those with ZERO arguments (measured), and a wrap that
+ *     silently changed that would be exactly the kind of quiet mismatch this file
+ *     refuses below. WRITE `[[]]` instead — unambiguous under both runners, and visible
+ *     to the reader. Repo-wide recurrence is caught by the AST scan in
+ *     `test/bun-runner-selectors.test.ts` (`test/bun-shim-parity.test.ts` pins the
+ *     delivery semantics, but only for its own rows).
  *
  * DELIBERATELY NOT SHIMMED — these are module-system semantics, not missing
  * functions, and any fake would silently not-mock while reporting success:
@@ -132,6 +148,55 @@ fill('runAllTimersAsync', async () => {
   await Promise.resolve();
   return vi;
 });
+
+// ---------------------------------------------------------------------------
+// `clearAllTimers` when fake timers were never installed.
+//
+// ⚠️ This one is an OVERRIDE, not a `fill`: Bun DOES define
+// `vi.clearAllTimers`, so `fill` would skip it — and Bun's implementation
+// THROWS `Fake timers are not active. Call useFakeTimers() first.` when no fake
+// timers are installed. vitest treats the same call as a no-op.
+//
+// MEASURED, the two runners on one 4-line file (`vi.clearAllTimers()` with no
+// `useFakeTimers`, and again after `useRealTimers`):
+//     vitest   → 2 passed
+//     bun test → 2 failed
+//
+// This is not a theoretical gap: an unconditional `vi.clearAllTimers()` in an
+// `afterEach` is the single largest cause of the bun-test leg being red — 50 of
+// its failures in one CI run, e.g. test/recall-frozen-cards.test.ts:189, where
+// the test body itself passed and only the teardown threw.
+//
+// We track installation ourselves because neither runner exposes "are fake
+// timers active?". Erring toward CALLING through is deliberate: if our flag ever
+// disagrees with reality, a spurious call throws loudly (visible) rather than a
+// skipped clear leaking timers into the next test (silent cross-test pollution).
+let fakeTimersInstalled = false;
+const realUseFakeTimers = anyVi.useFakeTimers as ((...a: unknown[]) => unknown) | undefined;
+const realUseRealTimers = anyVi.useRealTimers as ((...a: unknown[]) => unknown) | undefined;
+if (typeof realUseFakeTimers === 'function') {
+  anyVi.useFakeTimers = (...args: unknown[]) => {
+    const r = realUseFakeTimers(...args);
+    fakeTimersInstalled = true;
+    return r === undefined ? vi : r;
+  };
+}
+if (typeof realUseRealTimers === 'function') {
+  anyVi.useRealTimers = (...args: unknown[]) => {
+    const r = realUseRealTimers(...args);
+    fakeTimersInstalled = false;
+    return r === undefined ? vi : r;
+  };
+}
+const realClearAllTimers = anyVi.clearAllTimers as ((...a: unknown[]) => unknown) | undefined;
+anyVi.clearAllTimers = (...args: unknown[]) => {
+  // No fake timers installed ⇒ there is nothing to clear, which is exactly what
+  // vitest does. Swallowing here cannot hide a real failure: the only thing
+  // Bun's version would have done is throw.
+  if (!fakeTimersInstalled) return vi;
+  const r = realClearAllTimers?.(...args);
+  return r === undefined ? vi : r;
+};
 
 // Per-file config. `bun test` takes the timeout as a CLI flag, so there is no
 // runtime knob to forward this to — and scripts/run-bun-tests.mjs already passes

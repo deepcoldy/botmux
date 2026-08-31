@@ -411,6 +411,7 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('__OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_SESSION_ID');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
   });
 
   it('covers session-only capabilities AND routing keys the pane transport never carries', () => {
@@ -618,9 +619,10 @@ describe('session CLI home scrub call sites', () => {
  * the kind of coupling that is invisible from the call site.)
  */
 describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
-  it('includes BOTMUX_READ_ISOLATION and BOTMUX_API_ONLY', () => {
+  it('includes sandbox verdicts and the per-session reply-style snapshot', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
   });
 });
 

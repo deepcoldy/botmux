@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import {
   appendReplyCardFooterToV2Card,
   buildCardBodyElements,
+  buildCanonicalFinalReplyCard,
   buildImageCardElements,
   buildMarkdownCard,
   buildContextualReplyCard,
@@ -20,7 +21,9 @@ import {
   brandFooterSegment,
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
+  createReplyCard,
   DEFAULT_BRAND_LABEL,
+  extractFirstReplyCardHeading,
   hasMarkdown,
   normalizeLocalHomeLinks,
 } from '../src/im/lark/md-card.js';
@@ -28,6 +31,64 @@ import {
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
   return out.filter(e => e.tag === 'markdown');
 }
+
+describe('reply-card layout envelope and title extraction', () => {
+  it('keeps the ordinary v2 envelope identical when no header is requested', () => {
+    expect(createReplyCard([{ tag: 'markdown', content: '正文' }])).toEqual({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: '正文' }],
+      },
+    });
+  });
+
+  it('puts an optional Card 2.0 header on the same canonical envelope', () => {
+    const header = {
+      template: 'indigo' as const,
+      title: { tag: 'plain_text' as const, content: '交接 · 下一位接手发布' },
+    };
+    expect(createReplyCard([], header)).toMatchObject({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      header,
+      body: { direction: 'vertical', elements: [] },
+    });
+  });
+
+  it('consumes only the first top-level ATX H1/H2 and preserves the rest', () => {
+    const input = [
+      '> # 引用标题',
+      '',
+      '```md',
+      '# 代码里的标题',
+      '```',
+      '',
+      '### 细节',
+      '',
+      '## **发布** [说明](https://example.com) `v2`',
+      '',
+      '正文',
+      '',
+      '# 第二个标题',
+    ].join('\n');
+    const extracted = extractFirstReplyCardHeading(input);
+
+    expect(extracted.heading).toBe('发布 说明 v2');
+    expect(extracted.markdown).not.toContain('## **发布**');
+    expect(extracted.markdown).toContain('> # 引用标题');
+    expect(extracted.markdown).toContain('# 代码里的标题');
+    expect(extracted.markdown).toContain('### 细节');
+    expect(extracted.markdown).toContain('# 第二个标题');
+  });
+
+  it('does not consume H3, setext, or an empty ATX heading', () => {
+    for (const input of ['### 细节\n\n正文', '旧标题\n===\n\n正文', '#\n\n正文']) {
+      expect(extractFirstReplyCardHeading(input)).toEqual({ markdown: input });
+    }
+  });
+});
 
 describe('buildCardBodyElements', () => {
   it('returns [] for empty input', () => {
@@ -40,11 +101,86 @@ describe('buildCardBodyElements', () => {
     expect(out[0]).toMatchObject({ tag: 'markdown', content: 'hello world' });
   });
 
-  it('promotes ATX headings to bold (Feishu markdown widget can\'t render #)', () => {
+  it('promotes H1/H2 to standalone heading components', () => {
     const out = buildCardBodyElements('# Title\n\nbody text');
-    const text = mdElements(out)[0].content;
-    expect(text).toContain('**Title**');
-    expect(text).not.toMatch(/^#\s/m);
+    expect(out).toEqual([
+      { tag: 'markdown', element_id: 'botmux_md_h1_1', text_size: 'heading-2', content: 'Title' },
+      { tag: 'markdown', content: 'body text' },
+    ]);
+
+    expect(buildCardBodyElements('## Section\n\nbody')).toEqual([
+      { tag: 'markdown', element_id: 'botmux_md_h2_1', text_size: 'heading-2', content: 'Section' },
+      { tag: 'markdown', content: 'body' },
+    ]);
+  });
+
+  it('encodes the original ATX level and a per-card sequence in heading element ids', () => {
+    // Message reads strip text_size, so the element id is the only carrier of
+    // heading hierarchy that survives Lark normalization (see message-parser).
+    const out = buildCardBodyElements('# 结果\n\n正文\n\n## 验证\n\n更多\n\n## 下一步\n\n尾声');
+    const ids = out.filter((e: any) => e.element_id).map((e: any) => e.element_id);
+    expect(ids).toEqual(['botmux_md_h1_1', 'botmux_md_h2_2', 'botmux_md_h2_3']);
+  });
+
+  it('keeps H3-H6 compact as bold markdown', () => {
+    const out = buildCardBodyElements('### Detail\n\nbody text');
+    expect(out).toEqual([{ tag: 'markdown', content: '**Detail**\n\nbody text' }]);
+  });
+
+  it('keeps setext headings on the compact fallback path', () => {
+    const out = buildCardBodyElements('Legacy title\n===\n\nbody text');
+    expect(out).toEqual([{ tag: 'markdown', content: '**Legacy title**\n\nbody text' }]);
+  });
+
+  it('keeps structured heading, prose, table, and code sections in source order', () => {
+    const input = [
+      '# 执行结果',
+      '',
+      '核心链路已验证。',
+      '',
+      '| 项目 | 结果 |',
+      '| --- | --- |',
+      '| build | pass |',
+      '',
+      '## 验证命令',
+      '',
+      '```bash',
+      'bun run build',
+      '```',
+    ].join('\n');
+    const out = buildCardBodyElements(input);
+
+    expect(out.map(element => element.tag)).toEqual([
+      'markdown', 'markdown', 'table', 'markdown', 'markdown',
+    ]);
+    expect(out[0]).toMatchObject({ text_size: 'heading-2', content: '执行结果' });
+    expect(out[1].content).toBe('核心链路已验证。');
+    expect(out[2].rows).toEqual([{ c0: 'build', c1: 'pass' }]);
+    expect(out[3]).toMatchObject({ text_size: 'heading-2', content: '验证命令' });
+    expect(out[4].content).toContain('```bash\nbun run build\n```');
+  });
+
+  it('bounds promoted headings and preserves overflow headings as bold text', () => {
+    const input = Array.from(
+      { length: 8 },
+      (_, index) => `# Section ${index + 1}\n\nbody ${index + 1}`,
+    ).join('\n\n');
+    const out = buildCardBodyElements(input);
+    const promoted = out.filter(element => element.text_size === 'heading-2');
+    const rendered = mdElements(out).map(element => element.content).join('\n\n');
+
+    expect(promoted).toHaveLength(6);
+    expect(rendered).toContain('**Section 7**');
+    expect(rendered).toContain('**Section 8**');
+    expect(rendered).toContain('body 8');
+  });
+
+  it('does not promote heading-looking lines inside a code fence', () => {
+    const out = buildCardBodyElements('```markdown\n# literal heading\n```');
+    expect(out).toEqual([{
+      tag: 'markdown',
+      content: '```markdown\n# literal heading\n```',
+    }]);
   });
 
   it('Bug A: code fence with no blank line before/after still emits a fenced block', () => {
@@ -663,6 +799,33 @@ describe('normalizeLocalHomeLinks', () => {
 });
 
 describe('buildMarkdownCard', () => {
+  it('uses wide-screen chrome consistently across ordinary reply builders', () => {
+    const cards = [
+      buildMarkdownCard('hello'),
+      buildCanonicalFinalReplyCard({ markdown: 'hello' }),
+      buildContextualReplyCard({
+        title: 'Local turn',
+        assistantText: 'hello',
+        assistantLabel: 'Codex',
+      }),
+    ].map(json => JSON.parse(json));
+
+    for (const card of cards) {
+      expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+    }
+  });
+
+  it('keeps explicit builder and fallback-final body layout identical', () => {
+    const markdown = '# 结果\n\n已完成。\n\n## 验证\n\n- build\n- test';
+    const explicitSendElements = buildImageCardElements(markdown, []);
+    const fallbackElements = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown,
+      brand: '',
+    })).body.elements;
+
+    expect(fallbackElements).toEqual(explicitSendElements);
+  });
+
   it('renders native context in the reply-card footer (token stays off the footer)', () => {
     const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
       context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 },
@@ -928,7 +1091,7 @@ describe('buildReplyCardFooter', () => {
     expect(footer?.element).toMatchObject({
       tag: 'markdown',
       element_id: 'botmux_reply_footer',
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content: footer?.content,
     });
   });
@@ -1118,7 +1281,7 @@ describe('buildMarkdownCard footer brand', () => {
   it('empty brand + no recipient → no footer at all (no orphan hr)', () => {
     const els = JSON.parse(buildMarkdownCard('hi', undefined, '')).body.elements;
     expect(els.some((e: any) => e.tag === 'hr')).toBe(false);
-    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
     expect(els.some((e: any) => e.tag === 'markdown' && /hi/.test(e.content))).toBe(true);
   });
@@ -1241,6 +1404,22 @@ describe('buildImageCardElements', () => {
     expect(out[2]).toMatchObject({ tag: 'markdown', content: 'bottom' });
   });
 
+  it('shares the six-heading promotion budget across image-row segments', () => {
+    const input = Array.from({ length: 8 }, (_, index) => [
+      `# Section ${index + 1}`,
+      `body ${index + 1}`,
+      index < 7 ? '![](img:0,1)' : '',
+    ].filter(Boolean).join('\n\n')).join('\n\n');
+    const out = buildImageCardElements(input, K.slice(0, 2));
+    const promoted = out.filter(element => element.text_size === 'heading-2');
+    const rendered = mdElements(out).map(element => element.content).join('\n\n');
+
+    expect(out.filter(element => element.tag === 'column_set')).toHaveLength(7);
+    expect(promoted).toHaveLength(6);
+    expect(rendered).toContain('**Section 7**');
+    expect(rendered).toContain('**Section 8**');
+  });
+
   it('mixed: grouped row + an unreferenced image appended at the end', () => {
     const out = buildImageCardElements('![](img:0,1)', K.slice(0, 3));
     expect(out.some(e => e.tag === 'column_set')).toBe(true);
@@ -1289,7 +1468,7 @@ describe('buildContextualReplyCard footer brand', () => {
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', recipientOpenId: 'ou_x', brand: 'Acme',
     })).body.elements;
     const last = els[els.length - 1];
-    expect(last.text_size).toBe('notation_small_v2');
+    expect(last.text_size).toBe('notation');
     expect(last.content).toContain('Acme');
     expect(last.content).not.toContain('botmux');
   });
@@ -1298,7 +1477,7 @@ describe('buildContextualReplyCard footer brand', () => {
     const els = JSON.parse(buildContextualReplyCard({
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', brand: '',
     })).body.elements;
-    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
   });
 });

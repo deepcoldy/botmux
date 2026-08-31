@@ -17,6 +17,12 @@ import { describe, expect, it } from 'vitest';
 const daemonSource = readFileSync(resolve('src/daemon.ts'), 'utf8');
 const registrySource = readFileSync(resolve('src/bot-registry.ts'), 'utf8');
 
+/** Drop whole-line `//` comments so a commented-out copy of the correct code
+ *  cannot satisfy a source-lock while the live statement is broken. */
+function stripLineComments(source: string): string {
+  return source.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n');
+}
+
 function region(source: string, startMarker: string, endMarker: string): string {
   const start = source.indexOf(startMarker);
   const end = source.indexOf(endMarker, start);
@@ -446,9 +452,19 @@ describe('API-only bot mode — non-client direct-Feishu paths (source lock)', (
     // The worker uploads via its OWN client (utils/lark-upload), bypassing the
     // daemon getBot gate, so the no-transport capability must ride the init
     // message. Covers apiOnly bot AND a normal bot in an HTTP virtual session.
-    const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('apiOnlyForUpload = msg.apiOnly === true');
-    expect(workerSource).toContain("msg.chatId?.startsWith('http_async_')");
+    // The gate is derived from the CENTRAL larkTransportEnabled predicate keyed on
+    // the init message (msg.chatId/msg.apiOnly), NOT ambient/cfg — so a normal bot
+    // in an HTTP virtual session (real creds, apiOnly=false) is still disabled.
+    // Matched STRUCTURALLY (predicate + both keys), not as one exact sentence:
+    // an equivalent reformat (property reorder, prettier line-wrap) must not turn
+    // this guard red, or the next person deletes it instead of fixing the code.
+    // Each fragment is unique in worker.ts, so the trio still pins this one site.
+    // Line comments are stripped first: a commented-out copy of the correct call
+    // must not satisfy the guard while the live code is broken.
+    const workerSource = stripLineComments(readFileSync(resolve('src/worker.ts'), 'utf8'));
+    expect(workerSource).toMatch(/apiOnlyForUpload\s*=\s*!sessionLarkTransportEnabled\(/);
+    expect(workerSource).toMatch(/chatId:\s*msg\.chatId/);
+    expect(workerSource).toMatch(/apiOnly:\s*msg\.apiOnly/);
     expect(workerSource).toContain("if (apiOnlyForUpload)");
     // worker-pool forwards apiOnly on the init message (both fork sites).
     const wpSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');

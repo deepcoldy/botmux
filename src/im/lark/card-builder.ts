@@ -6,6 +6,7 @@ import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.j
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
@@ -1752,6 +1753,150 @@ export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: 
   return JSON.stringify(card);
 }
 
+export interface TurnFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** `ambiguous` softens the title: the turn may have run, we just can't tell. */
+  status: 'failed' | 'ambiguous';
+  errorCode?: string;
+  /** Human-safe failure summary from the CLI, when it provided one. */
+  reason?: string;
+  failedAt?: Date;
+  /** The user's own prompt, for "which task was this". Truncated + escaped. */
+  task?: string;
+  /** Auto-continuation count, when a recovery ladder ran and gave up. */
+  continuations?: number;
+  /** Retry affordance, decided by `turnRetryOffer` — the handler enforces the
+   *  same policy, so `none` must not render a button. */
+  retryOffer: TurnRetryOffer;
+  /** Pins the button to one specific failed turn; a stale card fails closed. */
+  retryTurnId?: string;
+  /** Human to @-mention in the body. Omitted → no mention (never @ a bot). */
+  mentionOpenId?: string;
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 通用失败卡：一条失败通知同时承载「现在什么情况」与「可以怎么办」。
+ *
+ *  取代原先的纯文本通知（`worker.ordinary_recovery_*` / `claude_terminal_failure_unrecovered`），
+ *  并覆盖此前**完全静默**的 `ambiguous` 终态（CLI 崩溃 / 写入失败）——那类失败过去与
+ *  「正常干完」在用户眼里同形。
+ *
+ *  三条刻意的设计约束：
+ *  1. **errorCode 原样打出**。`ordinary_recovery_non_retryable` 是无条件兜底分支，
+ *     daemon 重启这类非模型错误也会落到那句「不能安全自动续跑」；把码摊开才能让
+ *     这种混淆可见，而不是继续被文案糊住。
+ *  2. **重试的副作用风险必须写在卡上**。`caveated` 时明说「可能已执行了一部分」——
+ *     `/retry` 是原样重发，不像自动续跑会带 checkpoint 提示。
+ *  3. **@人只在正文**（`lark_md`）。`plain_text` 标题会被 {@link plainTitle} 剥掉
+ *     `<at>`，放那儿等于不 @。 */
+export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
+  const { locale } = o;
+  const actionBase = {
+    root_id: o.rootId,
+    session_id: o.sessionId,
+    cli_id: o.cliId ?? 'claude-code',
+  };
+  const titleKey = o.status === 'ambiguous'
+    ? 'card.turn_failed.title_ambiguous'
+    : 'card.turn_failed.title';
+
+  const lines: string[] = [];
+  // 先 @ 人再讲事：飞书的通知摘要只取前一段，@ 放最后会被截掉。
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  // errorCode 是闭集常量（`cli_exit` / `provider_*` / `codexTaskFailureCode` 的
+  // 固定返回值），从不携带 provider 原文，所以用反引号包成行内代码而不是
+  // escapeMd —— 后者会把 `a_b_c` 里的下划线转义成可见的反斜杠，正是这类码最常
+  // 见的形态。仍然剥掉反引号与尖括号，避免任何一天码变成动态值时逃出代码段。
+  lines.push(t('card.turn_failed.field_error', {
+    errorCode: `\`${(o.errorCode ?? o.status).replace(/[`<>]/g, '')}\``,
+  }, locale));
+  if (o.reason) {
+    lines.push(t('card.turn_failed.reason', { reason: escapeMd(o.reason) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.turn_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  if (o.task) {
+    const trimmed = o.task.length > 80 ? `${o.task.slice(0, 80)}…` : o.task;
+    lines.push(t('card.turn_failed.field_task', { task: escapeMd(trimmed) }, locale));
+  }
+  if (o.continuations !== undefined && o.continuations > 0) {
+    lines.push(t('card.turn_failed.field_continuations', {
+      count: String(o.continuations),
+    }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+
+  // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
+  const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
+  const adviceKey = o.retryOffer === 'none'
+    ? 'card.turn_failed.no_retry'
+    : !o.retryTurnId
+      ? 'card.turn_failed.no_input'
+      : o.retryOffer === 'safe'
+        ? 'card.turn_failed.retry_safe'
+        : 'card.turn_failed.retry_caveated';
+  elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
+
+  const actions: any[] = [];
+  if (canRetry) {
+    actions.push({
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        // 语义跟着动作走：没跑过 = 重试（重发原话）；跑过一半 = 继续（读现场后
+        // 从 checkpoint 接着做）。文案说错会让用户对副作用风险判断错。
+        content: t(
+          o.retryOffer === 'safe' ? 'card.btn.retry_turn' : 'card.btn.continue_turn',
+          undefined,
+          locale,
+        ),
+      },
+      // caveated 用 default 而不是 primary：可能重复副作用的操作不该是视觉默认项。
+      type: o.retryOffer === 'safe' ? 'primary' : 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retryTurnId,
+        // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
+        // retryOffer，卡上写的语义就是真正会发生的事。
+        mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'default',
+      multi_url: terminalMultiUrl(o.terminalUrl),
+    });
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: t(titleKey, { cliName: plainTitle(o.cliName) }, locale),
+      },
+      template: 'red',
+    },
+    elements,
+  });
+}
+
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
 function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
   return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });
@@ -2705,7 +2850,7 @@ export function buildAdoptSelectCard(
 function wrapAdoptCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
-    config: { update_multi: true, wide_screen_mode: true },
+    config: { update_multi: true, width_mode: 'fill' },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },

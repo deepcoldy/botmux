@@ -84,6 +84,7 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   projectSessionEventForAudience,
@@ -1571,9 +1572,26 @@ const daemonInternalApi = createDaemonInternalApi({
   sessionExists: (sessionId) => aggregator.sessionExists(sessionId),
 });
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+class DashboardJsonBodyTooLargeError extends Error {}
+
+async function readJsonBody(req: IncomingMessage, maxBytes?: number): Promise<unknown> {
+  const declared = req.headers['content-length'];
+  if (maxBytes !== undefined && typeof declared === 'string' && /^\d+$/.test(declared)
+    && Number(declared) > maxBytes) {
+    req.resume();
+    throw new DashboardJsonBodyTooLargeError('request body too large');
+  }
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let totalBytes = 0;
+  for await (const raw of req) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    totalBytes += chunk.byteLength;
+    if (maxBytes !== undefined && totalBytes > maxBytes) {
+      req.resume();
+      throw new DashboardJsonBodyTooLargeError('request body too large');
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   return raw ? JSON.parse(raw) : {};
 }
@@ -6141,6 +6159,32 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/reply-style — proxy the sparse reply-card style
+    // override to the target bot's daemon. The daemon owns validation, atomic
+    // bots.json persistence, and its in-memory config update for future worker
+    // spawns. Running workers intentionally retain their session snapshot.
+    let mBotReplyStyle: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReplyStyle = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-style$/))) {
+      const appId = decodeURIComponent(mBotReplyStyle[1]);
+      let raw: string;
+      try {
+        raw = JSON.stringify(await readJsonBody(req, REPLY_STYLE_REQUEST_MAX_BYTES));
+      } catch (err) {
+        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
+        return;
+      }
+      const upstream = await proxyToDaemon(appId, `/api/bot-reply-style`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

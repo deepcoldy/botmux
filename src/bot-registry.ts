@@ -38,6 +38,10 @@ import {
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import {
+  normalizeReplyStyleConfig,
+  type ReplyStyleConfig,
+} from './im/lark/reply-card-style.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
   normalizeSessionOwnerReminderConfig,
@@ -1753,6 +1757,16 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
+   * Sparse per-bot reply-writing/card-style overrides. Missing fields inherit
+   * the built-in recipe and theme defaults; malformed hand-edited fields are
+   * dropped independently by {@link normalizeReplyStyleConfig}.
+   *
+   * Workers freeze the normalized sparse object into BOTMUX_REPLY_STYLE when a
+   * session starts so the guide an Agent reads and the card renderer it invokes
+   * cannot drift halfway through a long-lived pane.
+   */
+  replyStyle?: ReplyStyleConfig;
+  /**
    * Where to show native Context / Token usage for this bot's Session cards:
    *   • `'streaming'` (default / unset) → in the live streaming card body
    *   • `'footer'`                      → in the ordinary reply-card footer
@@ -1771,6 +1785,14 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /**
+   * Pin the current public streaming card. Default false; best-effort only.
+   */
+  pinStreamingCard?: boolean;
+  /** chat_id list: chats where streaming-card Pin is disabled even when the
+   *  bot-level {@link pinStreamingCard} master switch is on. Written by
+   *  `/card pin off|on`. */
+  noPinStreamingCardChats?: string[];
   /**
    * Stream the model's thinking process (CoT) into a native Feishu CoT
    * message per turn: a fixed-height scrolling bubble showing thinking
@@ -1947,6 +1969,17 @@ export interface BotConfig {
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   /**
+   * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
+   * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
+   * --mention 只接受字面 open_id，传入邮箱等非 open_id 标识会被拒绝，避免模型
+   * 自主决定 @ 谁时“乱发”。开启后：
+   *   1. --mention 的每个值先经 resolveAllowedUsersWithMap 解析成本 app open_id；
+   *   2. 解析结果再与目标群的成员列表（listChatMemberOpenIds）做交集校验，
+   *      只有确实在群里的人才会被 @，不在群里的直接拒绝发送。
+   * 是否开放由配置该 bot 的人决定。
+   */
+  allowArbitraryMention?: boolean;
+  /**
    * Regular-group substitute trigger. When enabled, an @mention of one of the
    * configured people is treated as an address to this bot when the sender can
    * talk to the bot. Matching currently uses mention open_id / user_id / union_id;
@@ -2031,6 +2064,7 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
   usageDisplayCache = null;
+  replyStyleCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -2428,6 +2462,7 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -2528,6 +2563,52 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
     return usageDisplayCache.map.get(larkAppId) ?? DEFAULT_USAGE_DISPLAY;
   } catch {
     return DEFAULT_USAGE_DISPLAY;
+  }
+}
+
+/**
+ * Resolve the normalized sparse reply-style snapshot for a bot.
+ *
+ * Unlike hot display-only settings, a running CLI pane must keep the same
+ * replyStyle it learned through the botmux-send guide when it later invokes
+ * `botmux send`. Therefore the spawn-time env snapshot intentionally wins for
+ * the current app; daemon callers without that snapshot use the loaded registry,
+ * and one-shot host CLIs fall back to an mtime-cached bots.json read.
+ */
+export function resolveReplyStyleConfig(larkAppId: string): ReplyStyleConfig | undefined {
+  if (process.env.BOTMUX_SESSION_ID
+    && process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_REPLY_STYLE' in process.env) {
+    try {
+      const parsed = JSON.parse(process.env.BOTMUX_REPLY_STYLE || '{}');
+      return normalizeReplyStyleConfig(parsed).config;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.replyStyle;
+
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return undefined;
+  try {
+    const stat = statSync(path);
+    if (!replyStyleCache || replyStyleCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, ReplyStyleConfig | undefined>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, normalizeReplyStyleConfig(entry.replyStyle).config);
+          }
+        }
+      }
+      replyStyleCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return replyStyleCache.map.get(larkAppId);
+  } catch {
+    return undefined;
   }
 }
 
@@ -3107,6 +3188,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
+    const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
+    for (const warning of normalizedReplyStyle.warnings) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -3283,6 +3369,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      replyStyle: normalizedReplyStyle.config,
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.
@@ -3290,11 +3377,21 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       thinkingCard: entry.thinkingCard === false ? false : undefined,
       // Default ON, same convention as thinkingCard: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
+      noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
+        ? (() => {
+          const filtered = entry.noPinStreamingCardChats
+            .filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0)
+            .map((x: string) => x.trim());
+          const normalized = Array.from(new Set<string>(filtered));
+          return normalized.length > 0 ? normalized : undefined;
+        })()
+        : undefined,
       noCotChats: Array.isArray(entry.noCotChats)
         ? entry.noCotChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
@@ -3333,6 +3430,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
+      // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
+      allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
       messageListeners,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺

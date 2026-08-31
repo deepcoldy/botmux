@@ -36,10 +36,15 @@ scripts**。安装第三方插件仍等同于信任其发布者。
 
 ## 创建项目
 
-Botmux 当前要求 Node.js 22 或更高版本。安装 Botmux 后运行生成器：
+插件**开发**需要 Node.js 22 或更高版本，且 `npm` 在 `PATH` 中——生成器会调用 npm
+来搭脚手架、装依赖、跑测试。（这是插件开发本身的要求；botmux 自己是自包含二进制，
+不需要 Node，见 [快速接入](/quickstart)。）
+
+按你习惯的方式装好 botmux，然后运行生成器：
 
 ```bash
-npm install -g botmux@latest
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+# 或者走 npm 安装：npm install -g botmux@latest
 
 botmux plugin init my-plugin
 cd botmux-plugin-my-plugin

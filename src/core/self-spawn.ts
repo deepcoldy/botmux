@@ -137,6 +137,37 @@ export function resolveEntrySpawn(entry: BotmuxEntry, distDir: string): { comman
   return { command: process.execPath, args: [join(distDir, ENTRY_SCRIPT[entry])] };
 }
 
+/**
+ * Resolve the command + args to run one of OUR OWN ordinary CLI subcommands
+ * (`start-bot`, `restart`, …) as a child process.
+ *
+ * This is the `resolveEntrySpawn` rule applied to the public CLI rather than to a
+ * hidden entry token, and it exists because getting it wrong FAILS SILENTLY.
+ * Under Node the shape is `node <dist/cli.js> <sub…>`; a single-file executable IS
+ * the CLI, so passing a script path shifts the subcommand one slot right, where
+ * nothing reads it. MEASURED on the real v3.18.8 binary — the compiled form of
+ * `spawn(execPath, [botmuxCliEntry(), 'start-bot', appId, '--json'])` is
+ *
+ *     <binary> /dist/cli.js start-bot <appId> --json
+ *
+ * (`botmuxCliEntry()` yields `/dist/cli.js` because `packageRoot()` walks up from
+ * `/$bunfs/` to `/`), and the binary PRINTS THE HELP BANNER AND EXITS 0. A caller
+ * that reads `code === 0` as success — `dashboard/managed-spawn.ts` does — reports
+ * the operation as having worked while nothing happened at all.
+ *
+ * `scriptPath` is supplied by the caller (each has its own resolution order) and is
+ * unused in the compiled branch, exactly as in {@link runnerArgv0}.
+ */
+export function resolveCliSpawn(
+  scriptPath: string,
+  subcommand: readonly string[],
+): { command: string; args: string[] } {
+  if (isStandaloneBinary()) {
+    return { command: process.execPath, args: [...subcommand] };
+  }
+  return { command: process.execPath, args: [scriptPath, ...subcommand] };
+}
+
 /** The set of hidden subcommand tokens, so the CLI dispatcher can recognize them. */
 export const ENTRY_SUBCOMMANDS: ReadonlySet<string> = new Set(Object.values(ENTRY_SUBCOMMAND));
 

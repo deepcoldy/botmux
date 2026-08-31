@@ -186,6 +186,45 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     }
   });
 
+  it('clearAllTimers is a NO-OP when fake timers were never installed', () => {
+    // REGRESSION for the single largest cause of the bun-test leg being red.
+    // Bun's `vi.clearAllTimers` THROWS `Fake timers are not active. Call
+    // useFakeTimers() first.` when no fake timers are installed; vitest treats
+    // the same call as a no-op. An unconditional `vi.clearAllTimers()` in an
+    // `afterEach` is an extremely common teardown, so under bun the test BODY
+    // passed and only the teardown threw — MEASURED on
+    // test/recall-frozen-cards.test.ts: 10 pass / 50 fail before, 60 pass / 0
+    // fail after, and the whole-leg failing-file count went 39 → 38 with nothing
+    // newly failing (same machine, same command, only the shim swapped).
+    //
+    // This case runs under BOTH runners, so it pins the shim to vitest's real
+    // behaviour rather than to what we believe it to be.
+    expect(() => vi.clearAllTimers()).not.toThrow();
+  });
+
+  it('clearAllTimers is also a no-op AFTER useRealTimers, and still works while faking', () => {
+    // The other two positions around the flag we track. Installing then
+    // uninstalling must return to the no-op state (otherwise a file that fakes
+    // timers in one test and clears in a later teardown starts throwing again),
+    // and while fake timers ARE installed the call must still reach through and
+    // actually clear — a shim that always swallowed would silently leak timers
+    // into the next test, which is worse than the throw it replaced.
+    vi.useFakeTimers();
+    vi.useRealTimers();
+    expect(() => vi.clearAllTimers()).not.toThrow();
+
+    vi.useFakeTimers();
+    try {
+      const seen: string[] = [];
+      setTimeout(() => seen.push('should-not-fire'), 10);
+      vi.clearAllTimers();
+      vi.advanceTimersByTime(50);
+      expect(seen).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // NOTE: the hoisting helper is intentionally NOT asserted here, for two
   // reasons. (1) vitest's transform physically lifts that call to the top of the
   // module, above the imports — so merely writing it inside a test body makes the
@@ -396,3 +435,44 @@ describe.runIf(false)('describe.runIf(false) skips the whole block', () => {
     expect(true).toBe(true);
   });
 });
+
+// A tuple-wrapped `it.each` row must deliver its value on BOTH runners, including when
+// the value is an empty array.
+//
+// WHY THIS IS HERE: a BARE `[]` row (`it.each([null, [], 'x'])`) spreads to zero
+// arguments under `bun test`, so a callback declaring a parameter reads as wanting a
+// `done` callback — the runner waits for one and the case dies at the timeout. Three
+// real files hit it (`bot-description-schema`, `budget-tracker`, `model-pricing`) and
+// each burned the full 180s ceiling on a synchronous body, which presents as a hang
+// rather than as bad data.
+//
+// This guard pins the DELIVERY SEMANTICS for the rows below; it cannot see a new
+// offender in another file (its rows are its own). Repo-wide recurrence is caught by
+// the AST scan in `test/bun-runner-selectors.test.ts`.
+//
+// The guard asserts the SUPPORTED form rather than the broken one: a test that expects
+// a timeout would take the timeout to pass. `[[]]` is unambiguous under both runners,
+// so this stays green while pinning the value that must arrive.
+const eachRowsSeen: unknown[] = [];
+describe('it.each row delivery', () => {
+  it.each([[null], [[]], ['text'], [{ a: 1 }]])('delivers row %j as one argument', value => {
+    eachRowsSeen.push(value);
+    // `undefined` is what a zero-argument spread produces — the failure mode itself.
+    expect(wasDelivered(value)).toBe(true);
+  });
+
+  it('saw every row, with the empty array intact', () => {
+    expect(eachRowsSeen).toHaveLength(4);
+    expect(eachRowsSeen[0]).toBeNull();
+    // The empty array must arrive AS an empty array, not as `undefined` or a spread.
+    expect(Array.isArray(eachRowsSeen[1])).toBe(true);
+    expect(eachRowsSeen[1]).toEqual([]);
+    expect(eachRowsSeen[2]).toBe('text');
+    expect(eachRowsSeen[3]).toEqual({ a: 1 });
+  });
+});
+
+/** True when the row reached the callback at all; `undefined` means it did not. */
+function wasDelivered(value: unknown): boolean {
+  return value !== undefined;
+}

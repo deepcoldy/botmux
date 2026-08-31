@@ -3,12 +3,9 @@
   "version": "0.0.0",
   "description": "Bridge between IM platforms and AI coding CLIs \u2014 one topic, one CLI session with live streaming",
   "type": "module",
-  "main": "dist/index-daemon.js",
   "files": [
-    "dist/",
     "scripts/postinstall-bin.mjs",
     "scripts/install-path-entry.mjs",
-    "ecosystem.config.cjs",
     "README.md",
     "README.en.md",
     "LICENSE"

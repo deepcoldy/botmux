@@ -26,6 +26,7 @@ const { getBotMock, cancelMojoMock } = vi.hoisted(() => ({
   getBotMock: vi.fn(),
   cancelMojoMock: vi.fn(async () => ({ kind: 'cancelled' as const })),
 }));
+const unpinMessageMock = vi.hoisted(() => vi.fn(async () => true));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: getBotMock,
@@ -54,6 +55,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   addReaction: vi.fn(),
   removeReaction: vi.fn(),
   getMessageChatId: vi.fn(),
+  unpinMessage: (...args: any[]) => unpinMessageMock(...args),
   MessageWithdrawnError: class extends Error {},
 }));
 
@@ -70,6 +72,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import { config } from '../src/config.js';
 import {
   __testOnly_setupWorkerHandlers,
+  __testOnly_waitForPinStreamingCardIdle,
   closeSession,
   closeSessionForBackgroundCleanup,
   forkWorker,
@@ -215,6 +218,23 @@ afterEach(() => {
 });
 
 describe('mojo explicit close', () => {
+  it('starts streaming-card cleanup after a durable closed_with_residual result', async () => {
+    const fixture = createFixture({ legacyUnfrozen: true });
+    fixture.session.streamCardId = 'om_mojo_stream';
+    fixture.ds.streamCardId = 'om_mojo_stream';
+    getBotMock.mockReturnValue({
+      resolvedAllowedUsers: [],
+      config: { mojo: { cloud: true }, pinStreamingCard: true },
+    });
+
+    await expect(closeSession(fixture.session.sessionId)).resolves.toMatchObject({
+      ok: true, outcome: 'closed_with_residual',
+    });
+    await __testOnly_waitForPinStreamingCardIdle();
+
+    expect(unpinMessageMock).toHaveBeenCalledWith('app', 'om_mojo_stream');
+  });
+
   it('does NOT roll back an uncertain close prepare', async () => {
     // The tri-state existed only inside the worker: the daemon saw a bare ok:false
     // and sent close_abort unconditionally, laundering `uncertain` straight back

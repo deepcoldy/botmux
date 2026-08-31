@@ -114,4 +114,3 @@ export function sessionReadyHookCommand(): string {
 export function userPromptHookCommand(): string {
   return renderShellCommand(undefined, 'user-prompt-hook');
 }
-

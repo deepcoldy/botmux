@@ -661,12 +661,16 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
  * Throws on API failure (e.g. missing `im:chat`/member-read scope) so the
  * caller can decide how to degrade — it does NOT swallow errors, because a
  * silent empty list would look like "no allowedUser present" and wrongly
- * suppress auto-start.
+ * suppress auto-start. For the same reason it also throws when the member list
+ * exceeds the page cap (>2000 members) and is still `has_more`: a silently
+ * truncated list would make members past the cap look like "not in the chat"
+ * (wrong-answer fail-open), so a truncation is surfaced as an error instead.
  */
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   const c = getBotClient(larkAppId);
   const openIds: string[] = [];
   let pageToken: string | undefined;
+  let truncated = false;
   // Hard page cap as a runaway guard (100 members/page × 20 = 2000 members).
   for (let page = 0; page < 20; page++) {
     const params: Record<string, string> = { member_id_type: 'open_id', page_size: '100' };
@@ -681,6 +685,15 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
     }
     if (!res.data?.has_more || !res.data?.page_token) break;
     pageToken = res.data.page_token;
+    // Hit the cap with more pages remaining → the list is incomplete. Fail
+    // closed rather than return a truncated list (see docstring).
+    if (page === 19) truncated = true;
+  }
+  if (truncated) {
+    throw new Error(
+      `Chat ${chatId} has more than 2000 members; member list truncated at the page cap. ` +
+      `Refusing to return an incomplete list (would misjudge members past the cap as "not in chat").`,
+    );
   }
   return openIds;
 }
@@ -930,6 +943,48 @@ export async function deleteMessage(larkAppId: string, messageId: string): Promi
       return false;
     }
   });
+}
+
+/**
+ * Pin a message in a chat (best-effort QoL). Returns `true` only when Lark
+ * explicitly confirms success (`code === 0`); any other outcome returns `false`
+ * and must not affect session behavior.
+ */
+export async function pinMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'pinMessage');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await c.im.v1.pin.create({ data: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[pin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`[pin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
+    return false;
+  }
+}
+
+/**
+ * Unpin a message in a chat (best-effort QoL). Returns `true` only when Lark
+ * explicitly confirms success (`code === 0`); any other outcome returns `false`
+ * and must not affect session behavior.
+ */
+export async function unpinMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'unpinMessage');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await c.im.v1.pin.delete({ path: { message_id: messageId } });
+    if (res?.code !== 0) {
+      logger.debug(`[unpin:${larkAppId}] failed message=${messageId} code=${res?.code ?? 'missing'}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`[unpin:${larkAppId}] failed message=${messageId}: ${formatLarkError(err) ?? (err instanceof Error ? err.message : 'unknown error')}`);
+    return false;
+  }
 }
 
 /** Error code Feishu returns from `ephemeral/v1/send` when the target chat is a
@@ -1565,7 +1620,14 @@ function wantsUnlimitedMessages(pageSize: number): boolean {
   return pageSize <= 0 || !Number.isFinite(pageSize);
 }
 
-/** List thread messages using container_id_type="thread" (fast path). */
+/** List thread-container messages, most-recent first but returned chronologically
+ *  (oldest → newest, capped at `pageSize`). Fast path for `botmux history` in a
+ *  topic session — same contract as `listChatMessages` below, and for the same
+ *  reason: the caller asked for `pageSize` messages of *context*, which is the
+ *  tail of the thread, not its head. A thread that has outgrown `pageSize` used
+ *  to come back as its oldest N here while the chat-scope sibling returned its
+ *  newest N — and the two ends are indistinguishable downstream, because both
+ *  are N real messages in chronological order. */
 async function listByThread(c: any, threadId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
@@ -1576,7 +1638,8 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
       container_id_type: 'thread',
       container_id: threadId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeAsc',
+      // Page in Desc order so a long thread yields its TAIL; reversed below.
+      sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -1593,7 +1656,8 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
     if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
-  return unlimited ? allMessages : allMessages.slice(0, pageSize);
+  // Cap to pageSize newest, then reverse to chronological for the caller.
+  return (unlimited ? allMessages : allMessages.slice(0, pageSize)).reverse();
 }
 
 /** List chat-container messages, most-recent first but returned chronologically
@@ -1775,7 +1839,22 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
   } while (pageToken);
 
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
-  return unlimited ? allMessages : allMessages.slice(0, pageSize);
+  // Take the TAIL, matching `listByThread` above and the chat-scope sibling.
+  // The loop above pages in Desc order and breaks on `>= pageSize`, so a single
+  // 50-item page can overshoot: what we hold is the newest N+k. After the
+  // ascending sort, `slice(0, pageSize)` would hand back the OLDEST N of those
+  // — i.e. silently drop the newest k, which is exactly the end the caller
+  // asked for. `limit > 50` always pages, and the dashboard history popover
+  // defaults to 80 (`src/core/dashboard-ipc-server.ts`), so this is the common
+  // path, not a corner.
+  //
+  // ⚠️ `Math.max(0, …)` is load-bearing, not defensive dressing: when fewer
+  // than `pageSize` messages were collected — a thread shorter than the limit,
+  // which is the NORMAL case — `allMessages.length - pageSize` is negative and
+  // `slice(negative)` counts from the end, dropping the OLDEST messages
+  // instead. Without the guard this trades a rare bug for a common one.
+  // Same idiom as `filterAmbientChatMessages` above.
+  return unlimited ? allMessages : allMessages.slice(Math.max(0, allMessages.length - pageSize));
 }
 
 /**

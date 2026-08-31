@@ -189,6 +189,8 @@
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
+| `pinStreamingCard` | `true` 时为该 bot **置顶当前公开的实时状态卡片**；默认关闭，只有显式 `true` 才开启。只认当前公开 live-status 的真实 `streamCardId`，repo 选择卡、私有 `/card`、最终回复卡、CoT、关闭卡、以及其它交互卡都不参与。开关支持热更新：通过 dashboard 或 `/botconfig set pinStreamingCard on/off` 成功写盘且有效值发生变化后，会对这个 bot 的**现有活跃会话**做 best-effort 热重算；配置响应**不等待**飞书 Pin/Unpin 完成。失败不会中断发卡、转移、恢复、关闭或配置本身；异常期间可能暂时出现 0 个或多个 Pin。该功能**不维护持久重试日志，也不会全量扫描整群 Pin 状态**：显式从 on 切到 off 时会清理当前会话已知的实时卡 ID；若配置已经是 off 且进程丢失了来源记录，后续关闭或转移不会冒险移除可能由人工创建的 Pin |
+| `noPinStreamingCardChats` | 一个 `chatId` 数组，表示即使 bot 已开启 `pinStreamingCard`，这些群里也**不要自动置顶**流式卡片。它就是 `/card pin off|on` 背后的 negative set。实时流式卡片本身仍照常发送，只是当前群不再触发 Pin 副作用；为空或缺省表示没有按群关闭 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
 | `receivedReactionEmoji` | 无卡片会话「已收到」reaction 的飞书 emoji_type；`undefined`=默认 `GoGoGo`（冲!）。自由字符串，填错只是静默不加表情（best-effort） |
 | `doneReactionEmoji` | 无卡片会话「已完成」reaction 的飞书 emoji_type；`undefined`=默认 `DONE`（✅）。设成与 `receivedReactionEmoji` 相同值可让完成态不翻脸——适合 idle 判定可能提前触发的 CLI（如 Pi），避免过早出现误导性的 ✅ |

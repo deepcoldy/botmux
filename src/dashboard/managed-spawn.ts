@@ -17,6 +17,7 @@
 // ports and starts probes), so nothing inside it is reachable from a unit test.
 import { spawn } from 'node:child_process';
 import { botmuxCliEntry } from '../utils/install-info.js';
+import { resolveCliSpawn } from '../core/self-spawn.js';
 import { globalInstallUpdateCwd } from '../core/maintenance.js';
 import { redactChildEnv } from '../utils/child-env.js';
 import type { GlobalInstallPlan } from '../utils/global-install.js';
@@ -39,7 +40,8 @@ function spawnBotLifecycleCli(
     let settled = false;
     const done = (r: BotLifecycleSpawnResult) => { if (!settled) { settled = true; resolve(r); } };
     try {
-      const child = spawn(process.execPath, [botmuxCliEntry(), verb, appId, '--json'], {
+      const { command, args } = resolveCliSpawn(botmuxCliEntry(), [verb, appId, '--json']);
+      const child = spawn(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         // NOT process.env: this child re-enters the botmux CLI, which invokes
         // pm2 — pm2 bakes the caller env into the managed app and into

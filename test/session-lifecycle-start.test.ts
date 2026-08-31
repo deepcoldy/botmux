@@ -38,6 +38,15 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptCard: vi.fn(() => '{"type":"tui"}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{"type":"tui-resolved"}'),
   getCliDisplayName: vi.fn(() => 'Codex'),
+  // Echo the inputs the failure-notice assertions care about (error code +
+  // retry action) rather than a fixed blob, so those assertions test the
+  // delivery path instead of this stub's literal.
+  buildTurnFailedCard: vi.fn((o: any) => JSON.stringify({
+    type: 'turn-failed',
+    errorCode: o.errorCode ?? o.status,
+    retryOffer: o.retryOffer,
+    action: o.retryOffer !== 'none' && o.retryTurnId ? 'retry_turn' : undefined,
+  })),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -70,6 +79,10 @@ vi.mock('../src/bot-registry.js', () => ({
     plugins: ['demo'],
     skills: { include: ['skill:deploy'] },
   }]),
+  // The failure card resolves a human to @-mention; with no allowlisted user
+  // configured here it must degrade to "nobody to mention" rather than throw.
+  getOwnerOpenId: vi.fn(() => undefined),
+  loadKnownBotOpenIdsForApp: vi.fn(() => new Set<string>()),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -1175,14 +1188,20 @@ describe('ordinary Claude semantic recovery', () => {
     await Promise.resolve();
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    // The recovery notice is now an interactive failure card rather than plain
+    // text. This fixture never recorded a lastFailedTurn (no onTurnTerminal
+    // callback is wired here), so the card correctly offers NO retry button —
+    // there is no input to re-send. The raw error code must still be visible:
+    // it is the only thing distinguishing a real provider fault from the
+    // unconditional "cannot retry safely" fallback wording.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('自动续跑 2 次'),
-      'text',
+      expect.stringContaining('provider_unexpected_eof'),
+      'interactive',
       'app_test',
       'om_original',
     );
-    expect(ds.agentAttention).toEqual(expect.objectContaining({
+    expect(vi.mocked(sessionReply).mock.calls[0][1]).not.toContain('retry_turn');    expect(ds.agentAttention).toEqual(expect.objectContaining({
       kind: 'blocked',
       reason: expect.stringContaining('自动续跑 2 次'),
     }));
@@ -1260,10 +1279,14 @@ describe('ordinary Claude semantic recovery', () => {
       retryable: true,
     });
 
+    // Adopt sessions have no recovery consumer, so this failure now surfaces as
+    // the interactive failure card. The raw error code stays visible in the
+    // card body — it is the only thing distinguishing a real provider fault
+    // from the unconditional "cannot retry safely" fallback wording.
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('provider_unexpected_eof'),
-      'text',
+      'interactive',
       'app_test',
       'om_adopted',
       undefined,
@@ -1273,6 +1296,101 @@ describe('ordinary Claude semantic recovery', () => {
       kind: 'blocked',
       reason: expect.stringContaining('provider_unexpected_eof'),
     }));
+  });
+
+  // The failure card must not become a SECOND notice for a failure the user can
+  // already see. Structured-bridge CLIs (codex/pi/omp/grok/traex/ebsd) post
+  // their own `final_output` card on a `failed` terminal — one that also
+  // preserves any partial answer — so this path must stay out of their way and
+  // only cover what was previously SILENT.
+  it('does not double-notify a structured CLI whose failed turn already posted a card', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const sessionReply = vi.fn(async () => 'om_x');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } } as any);
+    forkWorker(ds, 'codex turn', 'om_codex');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_codex',
+      status: 'failed',
+      errorCode: 'codex_task_failed',
+    });
+    // Let the terminal handler's async work settle. No fake timers in this
+    // describe block, so yield the real microtask/macrotask queue instead.
+    await new Promise(r => setTimeout(r, 50));
+
+    const cards = vi.mocked(sessionReply).mock.calls.filter(c => c[2] === 'interactive');
+    expect(cards).toHaveLength(0);
+  });
+
+  it('posts a card for a structured CLI turn that would otherwise be silent', async () => {
+    // `ambiguous` is the gap: the bridge gate only emits its own notice for
+    // `failed`, so a dead CLI / failed input write previously produced NOTHING
+    // and looked exactly like a clean finish.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const sessionReply = vi.fn(async () => 'om_x');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } } as any);
+    forkWorker(ds, 'codex turn', 'om_codex2');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_codex2',
+      status: 'ambiguous',
+      errorCode: 'cli_exit',
+    });
+
+    await vi.waitFor(() => {
+      const cards = vi.mocked(sessionReply).mock.calls.filter(c => c[2] === 'interactive');
+      expect(cards).toHaveLength(1);
+      expect(cards[0][1]).toContain('cli_exit');
+    });
+  });
+
+  it('stays silent when the user aborted the turn themselves', async () => {
+    // Esc, or the card's own ⏹ stop button (which sends ^C). The user already
+    // knows; a card here would be the very alert noise this feature reduces.
+    //
+    // The code is the one a REAL codex session produces — reason-suffixed, per
+    // codex-transcript.ts. A fixed code from another adapter would pass while
+    // this session's actual abort code sailed through to a card.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const sessionReply = vi.fn(async () => 'om_x');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } } as any);
+    forkWorker(ds, 'codex turn', 'om_codex3');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_codex3',
+      status: 'ambiguous',
+      errorCode: 'codex_turn_aborted:user_interrupt',
+    });
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(vi.mocked(sessionReply).mock.calls.filter(c => c[2] === 'interactive')).toHaveLength(0);
   });
 
   it('keeps turn N as recovery owner when type-ahead N+1 is admitted', async () => {
@@ -1608,13 +1726,24 @@ describe('ordinary Claude semantic recovery', () => {
         && message?.turnId?.startsWith('bmx-recovery-'));
     expect(recoverySends).toHaveLength(2);
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    // Now an interactive failure card. `recovery_delivery_failed` describes the
+    // CONTINUATION's fate, not the original turn's — and the button re-injects
+    // `lastFailedTurn`, which still points at the original turn (this path
+    // emits no turn_terminal). So the card must NOT advertise a safe resend.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringContaining('未能送达 Worker'),
-      'text',
+      expect.stringContaining('recovery_delivery_failed'),
+      'interactive',
       'app_test',
       'om_original',
     );
+    // The builder is stubbed in this suite, so assert on the policy decision it
+    // was handed: `caveated`, never `safe`. A safe offer here would render a
+    // verbatim-resend button for a turn whose progress is unknown.
+    const recoveryCard = JSON.parse(
+      vi.mocked(sessionReply).mock.calls.find(c => c[2] === 'interactive')![1] as string,
+    );
+    expect(recoveryCard.retryOffer).toBe('caveated');
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
       status: 'attention_required',
       lastErrorCode: 'recovery_delivery_failed',
@@ -3100,6 +3229,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       prompt: '<bridge>hello from Lark</bridge>',
       turnId: 'om_refork_turn',
     }));
+    expect(init).not.toHaveProperty('replyStyle');
   });
 
   it('defaults to an observe-only empty prompt when no turn rides along (restore path)', () => {

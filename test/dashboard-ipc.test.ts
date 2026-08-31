@@ -42,6 +42,11 @@ import {
   withBotTurnAdmission,
 } from '../src/core/bot-turn-mutation-gate.js';
 import { SESSION_WAKE_DEADLINE_HEADER } from '../src/core/session-wake-deadline.js';
+import { REPLY_STYLE_REQUEST_MAX_BYTES } from '../src/dashboard/reply-style.js';
+import {
+  REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
+  REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
+} from '../src/im/lark/reply-card-style.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -973,7 +978,132 @@ describe('PUT /api/bot-card-prefs — 入群 seed 文案与内置默认一致时
       expect(dirty.status).toBe(200);
       expect(await dirty.json()).toMatchObject({ ok: true, autoStartOnGroupJoinSeed: custom });
       expect(persisted()).toBe(custom);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
+describe('PUT /api/bot-card-prefs — pin streaming card', () => {
+  it('is default-off, preserves unrelated partial patches, and rejects non-boolean writes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-pin-streaming-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-pin-streaming-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.pinStreamingCard).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinStreamingCard: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, pinStreamingCard: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].pinStreamingCard).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).pinStreamingCard).toBe(true);
+
+      const unrelated = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ silentTurnReactions: true }),
+      });
+      expect(unrelated.status).toBe(200);
+      expect(await unrelated.json()).toMatchObject({
+        ok: true,
+        silentTurnReactions: true,
+        pinStreamingCard: true,
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].pinStreamingCard).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).pinStreamingCard).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinStreamingCard: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, pinStreamingCard: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].pinStreamingCard).toBeUndefined();
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).pinStreamingCard).toBe(false);
+
+      const bogus = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinStreamingCard: 'true' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns promptly even when hot reconciliation throws or remains pending', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-pin-streaming-async-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-pin-streaming-async-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const change = await import('../src/services/pin-streaming-card-change.js');
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const disposeThrow = change.registerPinStreamingCardChangeHandler(() => {
+        throw new Error('reconcile failed after write');
+      });
+      const throwRes = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinStreamingCard: true }),
+      });
+      disposeThrow();
+      expect(throwRes.status).toBe(200);
+      expect(await throwRes.json()).toMatchObject({ ok: true, pinStreamingCard: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].pinStreamingCard).toBe(true);
+
+      let release!: () => void;
+      const disposePending = change.registerPinStreamingCardChangeHandler(() => {
+        void new Promise<void>((resolve) => { release = resolve; });
+      });
+      const pendingRes = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pinStreamingCard: false }),
+      });
+      disposePending();
+      expect(pendingRes.status).toBe(200);
+      expect(await pendingRes.json()).toMatchObject({ ok: true, pinStreamingCard: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].pinStreamingCard).toBeUndefined();
+      release();
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -1302,6 +1432,132 @@ describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, usageDisplay: 'off' });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('off');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-reply-style — sparse reply-card appearance', () => {
+  it('persists normalized overrides, hot-updates GET, and clears the default block', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-style-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-reply-style-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'must-not-leak',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const put = await fetch(`${base}/api/bot-reply-style`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          replyStyle: {
+            recipes: false,
+            layout: true,
+            theme: 'vivid',
+            recipePrompt: '  风险优先  ',
+            layoutColors: { result: 'turquoise', blocked: 'laser', handoff: 'grey' },
+            layoutTags: { result: '', risk: '请确认', progress: 42 },
+          },
+        }),
+      });
+      expect(put.status).toBe(200);
+      const body = await put.json();
+      expect(body).toMatchObject({
+        ok: true,
+        replyStyle: {
+          recipes: false,
+          theme: 'vivid',
+          recipePrompt: '风险优先',
+          layoutColors: { result: 'turquoise' },
+          layoutTags: { result: '', risk: '请确认' },
+        },
+      });
+      expect(body.warnings).toHaveLength(3);
+      expect(body).not.toHaveProperty('larkAppSecret');
+
+      const disk = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(disk.replyStyle).toEqual(body.replyStyle);
+      expect(disk.larkAppSecret).toBe('must-not-leak');
+      expect((getBot(appId).config as any).replyStyle).toEqual(body.replyStyle);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ replyStyle: body.replyStyle });
+
+      const overLimit = await fetch(`${base}/api/bot-reply-style`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          replyStyle: {
+            recipes: false,
+            recipePrompt: '配'.repeat(REPLY_RECIPE_PROMPT_MAX_CODEPOINTS + 1),
+            layoutTags: {
+              risk: '签'.repeat(REPLY_LAYOUT_TAG_MAX_CODEPOINTS + 1),
+              blocked: '请处理',
+            },
+          },
+        }),
+      });
+      expect(overLimit.status).toBe(200);
+      expect(await overLimit.json()).toMatchObject({
+        ok: true,
+        replyStyle: { recipes: false, layoutTags: { blocked: '请处理' } },
+        warnings: [expect.stringContaining('recipePrompt'), expect.stringContaining('layoutTags.risk')],
+      });
+
+      for (const replyStyle of [[], 'primitive', 42]) {
+        const invalidReplyStyle = await fetch(`${base}/api/bot-reply-style`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ replyStyle }),
+        });
+        expect(invalidReplyStyle.status, JSON.stringify(replyStyle)).toBe(400);
+        expect(await invalidReplyStyle.json())
+          .toMatchObject({ ok: false, error: 'invalid_body' });
+        expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].replyStyle)
+          .toEqual({ recipes: false, layoutTags: { blocked: '请处理' } });
+      }
+
+      const clear = await fetch(`${base}/api/bot-reply-style`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyStyle: null }),
+      });
+      expect(clear.status).toBe(200);
+      expect(await clear.json()).toMatchObject({ ok: true, replyStyle: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].replyStyle).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ replyStyle: null });
+
+      for (const raw of ['null', '[]', '"primitive"', '{}', '{"replyStyle":null,"extra":true}']) {
+        const invalid = await fetch(`${base}/api/bot-reply-style`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        expect(invalid.status, raw).toBe(400);
+        expect(await invalid.json()).toMatchObject({ ok: false, error: 'invalid_body' });
+      }
+
+      const oversized = await fetch(`${base}/api/bot-reply-style`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyStyle: { recipePrompt: 'x'.repeat(REPLY_STYLE_REQUEST_MAX_BYTES) } }),
+      });
+      expect(oversized.status).toBe(413);
+      expect(await oversized.json()).toMatchObject({ ok: false, error: 'body_too_large' });
     } finally {
       if (handle) await handle.close();
       handle = null;

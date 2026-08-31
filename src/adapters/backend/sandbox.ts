@@ -961,7 +961,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
   }
 }
 
-// ─────────────────────── botmux send relay (unchanged) ───────────────────────
+// ─────────────────────── botmux send / dispatch relay ───────────────────────
 
 // Relay request schema (written by cli.ts relaySend, validated here). The
 // watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
@@ -969,6 +969,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 // write any outbox file, so everything here is treated as untrusted.
 //   { contentFile: <basename>, preparedContentFile?: <basename>, cardFile?: <basename>, ... }
 export interface RelayRequest {
+  command?: unknown;
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
@@ -986,9 +987,10 @@ export interface RelayRequest {
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
+const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--layout']);
 
 export interface ValidatedRelay {
+  command: 'send' | 'dispatch';
   contentName: string;
   preparedContentName?: string;
   cardName?: string;
@@ -1045,11 +1047,42 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
     if (!safeName(a)) return { ok: false, error: 'video cover must be a plain outbox basename' };
     videoCoverNames.push(a);
   }
+  const command = req.command === undefined || req.command === 'send'
+    ? 'send'
+    : req.command === 'dispatch'
+      ? 'dispatch'
+      : null;
+  if (command === null) return { ok: false, error: 'command must be send or dispatch' };
+  if (command === 'dispatch' && (
+    preparedContentName !== undefined
+    || cardName !== undefined
+    || attachmentNames.length > 0
+    || videoNames.length > 0
+    || videoCoverNames.length > 0
+  )) {
+    return { ok: false, error: 'dispatch relay does not accept cards or attachments' };
+  }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
+    if (command === 'dispatch') {
+      if (f === '--steer') { flags.push(f); continue; }
+      if (!dispatchValueFlags.has(f)) return { ok: false, error: `dispatch flag not allowed: ${f}` };
+      const v = rawFlags[i + 1];
+      if (typeof v !== 'string' || !v || v.startsWith('--') || v.length > 512) {
+        return { ok: false, error: `dispatch flag ${f} needs a bounded string value` };
+      }
+      if (f === '--bot-app' && !/^cli_[A-Za-z0-9_-]{1,128}(?::[^\0]{1,200})?$/.test(v)) {
+        return { ok: false, error: 'dispatch --bot-app must be a stable app id' };
+      }
+      if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
+        return { ok: false, error: 'dispatch --chat-id is invalid' };
+      }
+      flags.push(f, v); i++; continue;
+    }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
     if (RELAY_FLAGS_VAL.has(f)) {
       const v = rawFlags[i + 1];
@@ -1060,6 +1093,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
+      if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
+        return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
       }
       flags.push(f, v); i++; continue;
     }
@@ -1092,6 +1128,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   return {
     ok: true,
     value: {
+      command,
       contentName: req.contentFile,
       preparedContentName,
       cardName,
@@ -1283,10 +1320,12 @@ export function startOutboxWatcher(
 
       const hostArgs = [
         ...v.value.flags,
-        ...(cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
-        ...attPaths.flatMap(a => ['--files', a]),
-        ...videoPaths.flatMap(a => ['--videos', a]),
-        ...videoCoverPaths.flatMap(a => ['--video-covers', a]),
+        ...(v.value.command === 'dispatch'
+          ? ['--brief-file', contentDest]
+          : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
+        ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
+        ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
+        ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),
         '--session-id', sessionId,  // forced — sandbox cannot target another session
       ];
       // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
@@ -1316,7 +1355,7 @@ export function startOutboxWatcher(
       } else {
         delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
       }
-      const child = spawn(cliInvocation.command, [...cliInvocation.args, 'send', ...hostArgs], { env: requestEnv });
+      const child = spawn(cliInvocation.command, [...cliInvocation.args, v.value.command, ...hostArgs], { env: requestEnv });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });

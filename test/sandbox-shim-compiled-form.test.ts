@@ -149,7 +149,7 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
     // that reverts to `spawn(process.execPath, [cli, 'send', …])` would leave
     // every assertion above passing while the bug returns.
     const src = readFileSync(new URL('../src/adapters/backend/sandbox.ts', import.meta.url), 'utf-8');
-    expect(src).toContain("spawn(cliInvocation.command, [...cliInvocation.args, 'send'");
+    expect(src).toContain('spawn(cliInvocation.command, [...cliInvocation.args, v.value.command,');
     expect(src).toContain('botmuxCliInvocation(opts.cliPath)');
     // And the shim writer must go through the helper too.
     expect(src).toContain('writeFileSync(shim, botmuxShimExecLine())');

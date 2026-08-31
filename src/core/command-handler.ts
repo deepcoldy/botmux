@@ -74,6 +74,7 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
@@ -1014,6 +1015,7 @@ async function handleScheduleCommand(
   deps: CommandHandlerDeps,
   larkAppId?: string,
   senderOpenId?: string,
+  senderUnionId?: string,
 ): Promise<void> {
   const { activeSessions } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
@@ -1039,7 +1041,13 @@ async function handleScheduleCommand(
       const nextStr = next ? t('schedule.next_label', { time: next.toLocaleString(timeLocale, { timeZone }) }, loc) : '';
       const lastStr = task.lastRunAt ? t('schedule.last_label', { time: new Date(task.lastRunAt).toLocaleString(timeLocale, { timeZone }) }, loc) : '';
       const display = task.parsed?.display ?? task.schedule;
-      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
+      // Whose identity this task's turns run as. Worth a line of its own: with
+      // it absent the task still runs, but identity-bound tools fail closed,
+      // and that is otherwise only discoverable at fire time.
+      const runAsStr = task.ownerUnionId
+        ? `\n   runAs: ${task.ownerOpenId ?? task.ownerUnionId}`
+        : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
+      return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${runAsStr}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);
     return;
@@ -1131,6 +1139,11 @@ async function handleScheduleCommand(
       // allowed at every run mutation; the default non-sandbox route does
       // not re-check membership.
       ownerOpenId: senderOpenId,
+      // union_id is the tenant-stable half of the same identity; it is what a
+      // scheduled turn presents to per-user backends. Only stamped for human
+      // creators (see the call site) — a task created by a bot deliberately
+      // keeps no user identity.
+      ownerUnionId: senderUnionId,
       deliver: 'origin',
       silent,
     });
@@ -1424,6 +1437,34 @@ export async function handleCardCommand(
 
   const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
+  const botConfig = getBot(larkAppId).config;
+
+  if (sub === 'pin off') {
+    const r = await setChatStreamingCardPin(larkAppId, chatId, false);
+    await reply(r.ok ? t('cmd.card.pin.off_ok', undefined, loc) : t('cmd.card.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'pin on') {
+    const r = await setChatStreamingCardPin(larkAppId, chatId, true);
+    await reply(r.ok
+      ? (botConfig.pinStreamingCard === true
+        ? t('cmd.card.pin.on_ok', undefined, loc)
+        : t('cmd.card.pin.on_master_off', undefined, loc))
+      : t('cmd.card.fail', { reason: r.reason }, loc));
+    return;
+  }
+  if (sub === 'pin status') {
+    if (botConfig.pinStreamingCard !== true) {
+      await reply(t('cmd.card.pin.status_master_off', undefined, loc));
+      return;
+    }
+    if (botConfig.noPinStreamingCardChats?.includes(chatId)) {
+      await reply(t('cmd.card.pin.status_chat_off', undefined, loc));
+      return;
+    }
+    await reply(t('cmd.card.pin.status_on', undefined, loc));
+    return;
+  }
 
   if (sub === 'off') {
     const r = await setCardMode(larkAppId, chatId, true);
@@ -2917,7 +2958,15 @@ export async function handleCommand(
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
-        await handleScheduleCommand(scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId);
+        await handleScheduleCommand(
+          scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId,
+          // Non-human senders (bots, and anything else Lark reports as an app)
+          // must not hand their own identity to a task: a bot-created task that
+          // could query as itself would let any caller of that bot borrow its
+          // access, with the audit trail pointing at the bot. Withholding the
+          // union_id here is what makes such a task fail closed later.
+          message.senderType === 'user' ? message.senderUnionId : undefined,
+        );
         logger.info(`[${logTag}] Schedule command handled`);
         break;
       }

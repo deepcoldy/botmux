@@ -258,6 +258,13 @@ function migrate(raw: any): ScheduledTask | null {
     creatorChatId: raw.creatorChatId,
     creatorRootMessageId: raw.creatorRootMessageId,
     creatorLarkAppId: raw.creatorLarkAppId,
+    // Creator identity is rebuilt field-by-field like everything else here, so
+    // it has to be listed explicitly: without these two lines `createTask`
+    // persists them but every reload (daemon restart, external `schedule add`
+    // bumping the file version) drops them, and the task silently degrades to
+    // "no creator".
+    ownerOpenId: raw.ownerOpenId,
+    ownerUnionId: raw.ownerUnionId,
     enabled: raw.enabled !== false,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
@@ -471,6 +478,7 @@ export function createTask(params: {
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
   ownerOpenId?: string;
+  ownerUnionId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -525,6 +533,7 @@ export function createTask(params: {
       creatorRootMessageId: params.creatorRootMessageId,
       creatorLarkAppId: params.creatorLarkAppId,
       ownerOpenId: params.ownerOpenId,
+      ownerUnionId: params.ownerUnionId,
       enabled: true,
       createdAt: new Date().toISOString(),
       nextRunAt: params.nextRunAt,

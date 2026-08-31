@@ -3,6 +3,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
 import {
   detectOpenCodeSubmit,
+  isOpenCodeSessionBusy,
   isOpenCodeSessionId,
   latestOpenCodeSessionForBotmuxSession,
   listOpenCodeResumableSessions,
@@ -132,6 +133,14 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    busyPattern: undefined,
+    isSessionBusy({ sessionId, cliSessionId }) {
+      const sid = isOpenCodeSessionId(cliSessionId)
+        ? cliSessionId
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
+      if (!sid) return false;
+      return isOpenCodeSessionBusy(sid, 'v2');
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）
     readOnlyRemoteScroll: true,

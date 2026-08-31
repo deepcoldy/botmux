@@ -122,3 +122,87 @@ describe('bun leg selectors — this guard runs inside the leg it guards', () =>
     expect(isDeferredFromBunLeg(readFileSync('test/bun-runner-selectors.test.ts', 'utf8'))).toBe(false);
   });
 });
+
+describe('no test file may use a bare empty-array each row', () => {
+  it('finds none across the whole suite', async () => {
+    // A BARE `[]` row in `it.each([...])` spreads to ZERO arguments under `bun test`, so
+    // a callback declaring a parameter looks like it wants a `done` callback: the runner
+    // waits and the case dies at the timeout. Three files had it, each burning the full
+    // 180s ceiling on a body that cannot hang, which reads as a deadlock rather than as
+    // bad data. Writing `[[]]` is unambiguous under both runners.
+    //
+    // Scanned with the TypeScript AST, not a regex: a text pattern for this missed
+    // `test/model-pricing.test.ts` (the row sat among other bare values), and a
+    // silently-incomplete scan is exactly how the third instance survived the first fix.
+    //
+    // NOT COVERED, by nature: rows passed as an identifier or a call
+    // (`it.each(ALL_CLI_IDS)`, `it.each(PLAIN_ADAPTERS.filter(...))` — 28 sites) hide the
+    // row shape behind a value this scan cannot resolve without a type checker. Those are
+    // out of reach here, not overlooked. Everything expressible as a literal IS covered.
+    const ts = await import('typescript');
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const excluded = new Set(['e2e-browser', 'node_modules', 'fixtures', '__snapshots__']);
+    const walk = (dir: string): string[] => {
+      const out: string[] = [];
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!excluded.has(entry.name)) out.push(...walk(full));
+        } else if (/\.(test|spec)\.ts$/.test(entry.name)) {
+          out.push(full);
+        }
+      }
+      return out;
+    };
+
+    const files = walk('test');
+    // Guard the guard: an empty file list would make this pass vacuously.
+    expect(files.length).toBeGreaterThan(500);
+
+    const offenders: string[] = [];
+    // Type-only wrappers (`as const`, `satisfies T`, `(…)`, `!`) leave the array
+    // untouched at runtime, so the defect fires through them identically — but each
+    // hides the literal behind a different node and would slip past a bare
+    // `isArrayLiteralExpression` check. Measured: `as const` alone wraps 87 of the 231
+    // `.each` sites here (51 files), so skipping them would blind this scan to most of
+    // the repo while still reporting green.
+    const unwrap = (node: import('typescript').Node): import('typescript').Node => {
+      let current = node;
+      while (ts.isAsExpression(current)
+        || ts.isSatisfiesExpression(current)
+        || ts.isParenthesizedExpression(current)
+        || ts.isNonNullExpression(current)) {
+        current = current.expression;
+      }
+      return current;
+    };
+    for (const file of files) {
+      const source = readFileSync(file, 'utf8');
+      const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const visit = (node: import('typescript').Node): void => {
+        if (ts.isCallExpression(node)
+          && ts.isPropertyAccessExpression(node.expression)
+          && node.expression.name.text === 'each') {
+          for (const rawArg of node.arguments) {
+            const arg = unwrap(rawArg);
+            if (!ts.isArrayLiteralExpression(arg)) continue;
+            for (const rawEl of arg.elements) {
+              const el = unwrap(rawEl);
+              if (ts.isArrayLiteralExpression(el) && el.elements.length === 0) {
+                // Report the row as WRITTEN, so the line points at the source text a
+                // reader has to edit rather than at the unwrapped inner node.
+                const { line } = sf.getLineAndCharacterOfPosition(rawEl.getStart(sf));
+                offenders.push(`${file}:${line + 1}`);
+              }
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    expect(offenders).toEqual([]);
+  });
+});

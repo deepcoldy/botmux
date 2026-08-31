@@ -12,7 +12,12 @@ describe('normalizeBotDescriptions', () => {
     });
   });
 
-  it.each([null, [], 'text', {}, { zh: 'x' }, { __proto__: 'x' }])(
+  // Rows are wrapped in tuples on purpose. A BARE `[]` row spreads to ZERO arguments,
+  // and a callback that declares a parameter then looks like it wants a `done`
+  // callback — `bun test` waits for one and the case dies at the timeout (measured:
+  // 180s, on a synchronous body that cannot hang). vitest passes the empty array
+  // through as the single argument instead. `[[]]` is unambiguous under both.
+  it.each([[null], [[]], ['text'], [{}], [{ zh: 'x' }], [{ __proto__: 'x' }]])(
     'rejects a malformed map: %j',
     value => expect(normalizeBotDescriptions(value)).toMatchObject({ ok: false }),
   );
