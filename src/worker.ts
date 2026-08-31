@@ -94,6 +94,7 @@ import {
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
+import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
@@ -14370,6 +14371,19 @@ async function spawnCli(
     };
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = canonicalizeForSandbox(claudeDataDir); // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = canonicalizeForSandbox(isolatedCodexHome!);
+  }
+  // Sandboxed Codex cannot discover a trust store inside Seatbelt (see
+  // utils/darwin-ca-bundle for why, and for why realpath matters). `codex-app`
+  // needs this too: its outer child is a Node runner that spawns the same Codex
+  // `app-server` with `env: process.env`, so the variable injected here reaches
+  // the same TLS stack. An explicit value from the operator always wins.
+  if (
+    sandboxRequested
+    && (cfg.cliId === 'codex' || cfg.cliId === 'codex-app')
+    && !childEnv.SSL_CERT_FILE
+  ) {
+    const caBundle = resolveDarwinCodexCaBundle({ warn: log });
+    if (caBundle) childEnv.SSL_CERT_FILE = caBundle;
   }
   if (willReadIsolate) {
     if (!readIsolationOriginChannelId) {

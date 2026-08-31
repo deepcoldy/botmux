@@ -626,6 +626,10 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
   });
+
+  it('includes SSL_CERT_FILE for sandboxed Codex CA-bundle injection', () => {
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('SSL_CERT_FILE');
+  });
 });
 
 /**

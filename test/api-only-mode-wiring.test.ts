@@ -602,6 +602,20 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain('no-transport suppressed');
   });
 
+  it('worker injects a host CA bundle for sandboxed Codex without overriding an explicit value', () => {
+    // Candidate list and selection rules are behaviour, covered by
+    // test/darwin-ca-bundle.test.ts. What can only be asserted here is the
+    // WIRING: both Codex cliIds, sandbox-only, explicit value wins, and the
+    // worker's own logger carries the writable-bundle warning.
+    expect(workerSource).toContain("from './utils/darwin-ca-bundle.js'");
+    expect(workerSource).toContain("&& (cfg.cliId === 'codex' || cfg.cliId === 'codex-app')");
+    // Operator precedence: childEnv starts from the daemon env, so an
+    // operator-supplied SSL_CERT_FILE is what this guard preserves.
+    expect(workerSource).toContain('&& !childEnv.SSL_CERT_FILE');
+    expect(workerSource).toContain('resolveDarwinCodexCaBundle({ warn: log })');
+    expect(workerSource).toContain('if (caBundle) childEnv.SSL_CERT_FILE = caBundle;');
+  });
+
   it('persistent-pane guard: state-machine + injectable executor wiring (behavioral tests in read-isolation)', () => {
     // The reattach guard delegates the DECISION to evaluatePersistentPaneMigration
     // and the ORDERED, fail-closed side effects to executePersistentPaneMigration.
