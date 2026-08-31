@@ -1288,6 +1288,8 @@ export const messages: Record<string, string> = {
   'card.ask.title': 'botmux ask',
   'card.ask.title_done': 'botmux ask · done',
   'card.ask.toast.unauthorized': "You're not allowed to answer this ask",
+  'card.ask.toast.grant_requested': 'Access requested from the owner — click again once approved',
+  'card.ask.toast.grant_pending': 'Your access request is pending — click again once the owner approves',
   'card.ask.toast.already_settled': 'This ask was already answered or closed',
   'card.ask.toast.stale': '⚠️ This ask is no longer valid',
   'card.ask.custom_reply': 'Custom reply',

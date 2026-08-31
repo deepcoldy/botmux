@@ -1286,6 +1286,10 @@ export const messages: Record<string, string> = {
   'card.ask.title': 'botmux ask',
   'card.ask.title_done': 'botmux ask 已结束',
   'card.ask.toast.unauthorized': '你没有权限回答这个 ask',
+  // 未授权点击已升级成向 owner 申请授权。措辞必须点明「通过后要再点一次」——ask 的答案
+  // 取决于点了哪个按钮，授权通过不会自动替用户作答（与对话路径的重放语义不同）。
+  'card.ask.toast.grant_requested': '已向 owner 申请授权，通过后请再点一次',
+  'card.ask.toast.grant_pending': '授权申请已提交，等 owner 处理后再点一次',
   'card.ask.toast.already_settled': '这个 ask 已经被回答或结束',
   'card.ask.toast.stale': '⚠️ 此 ask 已失效',
   'card.ask.custom_reply': '自定义回复',
