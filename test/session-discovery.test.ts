@@ -10,12 +10,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(),
-}));
+// Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's
+// `vi` shim has no `importActual`, and the real module must be SPREAD IN because bun
+// links named exports for real — a factory returning only the overridden keys fails
+// the whole file with "Export named 'X' not found in module '…'" (measured: `fork`,
+// imported by src/core/self-spawn.ts on the transitive graph).
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return { ...actual, execSync: vi.fn() };
+});
 
-vi.mock('node:fs', async () => {
-  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
   return {
     ...actual,
     existsSync: vi.fn(() => false),
@@ -25,8 +31,8 @@ vi.mock('node:fs', async () => {
   };
 });
 
-vi.mock('node:os', async () => {
-  const actual = await vi.importActual<typeof import('node:os')>('node:os');
+vi.mock('node:os', () => {
+  const actual = require('node:os') as typeof import('node:os');
   return {
     ...actual,
     homedir: () => '/home/testuser',
