@@ -420,14 +420,6 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Per-bot isolated data roots for Claude/Codex.
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
-  // CA bundle for sandboxed Codex, needed by npm Codex's Rust TLS stack on macOS
-  // when trust-store discovery comes up empty inside Seatbelt. Precedence is
-  // operator-first: a value in the daemon's own environment is inherited by
-  // childEnv and kept as-is; only when there is none does the worker select a
-  // host bundle (utils/darwin-ca-bundle). Listed here so the tmux backend
-  // forwards the resolved value into the pane rather than letting the pane
-  // inherit whatever the shared tmux server's global env happens to hold.
-  'SSL_CERT_FILE',
   // CLI-specific non-interactive/resume startup controls.
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
@@ -535,6 +527,15 @@ export const PROXY_ENV_KEYS = [
   'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY',
 ] as const;
 
+/** CA-bundle vars. Same shape as {@link PROXY_ENV_KEYS} and excluded from
+ *  BOTMUX_INJECTED_ENV_KEYS for the same reason: that list also drives the pane
+ *  `unset` clause and scrubTmuxServerGlobalEnv(), so listing a standard,
+ *  user-ownable variable there would DELETE the CA bundle a user configured for
+ *  their own tmux server / rcfile — and it would do so for every CLI on every
+ *  platform, not just the sandboxed Codex this exists for. Forwarded per pane by
+ *  buildBotmuxEnvAssignments instead. */
+export const CA_BUNDLE_ENV_KEYS = ['SSL_CERT_FILE'] as const;
+
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
@@ -546,6 +547,9 @@ const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   // via buildBotmuxEnvAssignments reads opts.env directly, so it's unaffected
   // by this client-side strip.
   ...PROXY_ENV_KEYS,
+  // Same reasoning as the proxy keys: keep a daemon-side CA bundle out of the
+  // shared server's global env, but never delete one the user set there.
+  ...CA_BUNDLE_ENV_KEYS,
 ]);
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([

@@ -75,6 +75,20 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+describe('buildBotmuxEnvAssignments() — CA bundle', () => {
+  it('forwards SSL_CERT_FILE per pane (it is deliberately not on the injected allowlist)', () => {
+    // The value reaches the pane through this per-pane injection, NOT through
+    // BOTMUX_INJECTED_ENV_KEYS — listing it there would also make every pane
+    // `unset` it and let daemon startup delete a user's own tmux server value.
+    const out = buildBotmuxEnvAssignments({ SSL_CERT_FILE: '/private/etc/ssl/cert.pem' });
+    expect(out).toContain('SSL_CERT_FILE=/private/etc/ssl/cert.pem');
+  });
+
+  it('omits SSL_CERT_FILE when the worker resolved none and the operator set none', () => {
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(a => a.startsWith('SSL_CERT_FILE='))).toBe(false);
+  });
+});
+
 describe('buildBotmuxEnvAssignments()', () => {
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
     const out = buildBotmuxEnvAssignments({

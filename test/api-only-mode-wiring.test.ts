@@ -608,7 +608,10 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // WIRING: both Codex cliIds, sandbox-only, explicit value wins, and the
     // worker's own logger carries the writable-bundle warning.
     expect(workerSource).toContain("from './utils/darwin-ca-bundle.js'");
-    expect(workerSource).toContain("&& (cfg.cliId === 'codex' || cfg.cliId === 'codex-app')");
+    // Assert both cliIds are covered, not the exact clause text: swapping the
+    // two sides of `||` is semantically identical and must not fail this.
+    expect(workerSource).toContain("cfg.cliId === 'codex'");
+    expect(workerSource).toContain("cfg.cliId === 'codex-app'");
     // Operator precedence: childEnv starts from the daemon env, so an
     // operator-supplied SSL_CERT_FILE is what this guard preserves.
     expect(workerSource).toContain('&& !childEnv.SSL_CERT_FILE');

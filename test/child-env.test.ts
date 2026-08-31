@@ -4,10 +4,12 @@ import {
   applySessionOwnerEnv,
   scrubExternalMemberEnv,
   BOTMUX_INJECTED_ENV_KEYS,
+  CA_BUNDLE_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
   INVOKER_TERMINAL_ENV_KEYS,
+  PROXY_ENV_KEYS,
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
@@ -627,8 +629,15 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
   });
 
-  it('includes SSL_CERT_FILE for sandboxed Codex CA-bundle injection', () => {
-    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('SSL_CERT_FILE');
+  it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {
+    // BOTMUX_INJECTED_ENV_KEYS also drives the pane `unset` clause and
+    // scrubTmuxServerGlobalEnv(), so a standard, user-ownable variable listed
+    // there would delete the CA bundle a user configured for their own tmux
+    // server — for every CLI, on every platform. Same reason PROXY_ENV_KEYS is
+    // kept out. Per-pane forwarding happens in buildBotmuxEnvAssignments.
+    expect(BOTMUX_INJECTED_ENV_KEYS).not.toContain('SSL_CERT_FILE');
+    expect(CA_BUNDLE_ENV_KEYS).toContain('SSL_CERT_FILE');
+    expect(PROXY_ENV_KEYS as readonly string[]).not.toContain('SSL_CERT_FILE');
   });
 });
 
