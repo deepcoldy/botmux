@@ -15,7 +15,10 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const requestMock = vi.hoisted(() => vi.fn());
+// Plain const, not `vi.hoisted`: that helper is a vitest TRANSFORM (it lifts the
+// call above the imports) with no bun equivalent. The factory below only reads
+// this at call time, after the const is initialised, so both runners work.
+const requestMock = vi.fn();
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient {
