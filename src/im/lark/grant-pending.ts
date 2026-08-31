@@ -133,23 +133,44 @@ export function markDenied(larkAppId: string, chatId: string, target: string): v
   table.set(key(larkAppId, chatId, target), { state: 'denied', ts: now });
 }
 
-/** 入口 A 节流判断：pending 中、或 denied 冷却未过 → true（静默不发卡）。 */
+/** 入口 A 节流判断：pending 中、或 denied 冷却未过 → true（静默不发卡）。
+ *  只需要「要不要发卡」的布尔（对话路径静默丢弃，无需区分原因）；要给用户回话、
+ *  需要区分「等 owner 处理」和「已被拒绝」时用 throttleReason。 */
 export function isThrottled(larkAppId: string, chatId: string, target: string): boolean {
+  return throttleReason(larkAppId, chatId, target) !== null;
+}
+
+/**
+ * 节流原因（null = 未节流，可发卡）。
+ *
+ * 与 isThrottled 的关系：后者是本函数的布尔化封装。拆开是因为两者的**消费方式**不同——
+ * 对话路径（maybeSendGrantRequestCard）节流时静默 return，用户看不到任何反馈，所以
+ * pending 与 denied 混成一个 true 无害；而 ask 卡片点击必须回一句 toast，混用会在
+ * owner **已经拒绝**后仍告诉点击者「等 owner 处理」，把已决事项说成待决（pi review F1）。
+ *
+ * 顺带回收无效条目（与旧 isThrottled 行为一致，不能丢）：废弃的 pending 过 24h、
+ * 冷却已过的 denied，都即时删除，让同一发送方能重新申请。
+ */
+export function throttleReason(
+  larkAppId: string,
+  chatId: string,
+  target: string,
+): 'pending' | 'denied' | null {
   const k = key(larkAppId, chatId, target);
   const e = table.get(k);
-  if (!e) return false;
+  if (!e) return null;
   if (e.state === 'pending') {
     // 废弃 pending（owner 一直没处置，或发卡失败残留）过 stale 窗口 → 本 key 即时回收，
     // 让同一发送方能重新申请。否则只有「别的 target 触发全表 prune」或 daemon 重启才会清，
     // 单一发送方反复 @ 会被永久静默压死、owner 永远看不到卡片。与下面 denied 的回收同构。
-    if (Date.now() - e.ts < STALE_PENDING_MS) return true;
+    if (Date.now() - e.ts < STALE_PENDING_MS) return 'pending';
     table.delete(k);
-    return false;
+    return null;
   }
   // 冷却已过的 denied 不再节流，且无任何用途 → 顺手删除，避免「每个被拒用户」永久占位。
-  if (Date.now() - e.ts < DENY_COOLDOWN_MS) return true;
+  if (Date.now() - e.ts < DENY_COOLDOWN_MS) return 'denied';
   table.delete(k);
-  return false;
+  return null;
 }
 
 export function _resetForTest(): void { table.clear(); lastPrunedAt = 0; }

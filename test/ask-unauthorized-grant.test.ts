@@ -21,7 +21,7 @@ import {
   requestGrantForAskClicker,
   type AskGrantRequestDeps,
 } from '../src/im/lark/ask-grant-request.js';
-import { _resetForTest as _resetPending, isThrottled } from '../src/im/lark/grant-pending.js';
+import { _resetForTest as _resetPending, isThrottled, markDenied } from '../src/im/lark/grant-pending.js';
 import { DEFAULT_GRANT_QUOTA, DEFAULT_GRANT_DURATION_MS } from '../src/services/grant-policy.js';
 
 const ASK = {
@@ -94,6 +94,17 @@ describe('requestGrantForAskClicker', () => {
     expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
     const deliverCard = vi.fn(async () => {});
     expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ deliverCard }))).toBe('pending');
+    expect(deliverCard).not.toHaveBeenCalled();
+  });
+
+  // pi review F1：owner 点过「拒绝」后处于 10min 冷却期，必须与 pending 区分开——
+  // 否则会把「已被拒绝」这件已决的事说成「等 owner 处理」。
+  it('owner 拒绝后的冷却期 → denied（不再混报成 pending）', () => {
+    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps())).toBe('sent');
+    markDenied('cli_ask', 'oc_chat', 'ou_pm');
+    const deliverCard = vi.fn(async () => {});
+    expect(requestGrantForAskClicker(ASK, 'ou_pm', okDeps({ deliverCard }))).toBe('denied');
+    // 冷却期内同样不重复骚扰 owner
     expect(deliverCard).not.toHaveBeenCalled();
   });
 
@@ -237,5 +248,64 @@ describe('ask 卡片点击：unauthorized → 授权卡', () => {
     const res: any = await click(askId, 'wrong-nonce', 'ou_pm', { requestGrant });
     expect(res.toast.content).toContain('失效');
     expect(requestGrant).not.toHaveBeenCalled();
+  });
+
+  it('owner 拒绝过 → toast 说实话（已拒绝），不是「等 owner 处理」', async () => {
+    const { askId, nonce } = await seedAsk();
+    const res: any = await click(askId, nonce, 'ou_pm', { requestGrant: () => 'denied' as const });
+    expect(res.toast.type).toBe('warning');
+    expect(res.toast.content).toContain('已拒绝');
+    expect(res.toast.content).not.toContain('等 owner 处理');
+  });
+
+  // pi review F2 的纵深防御：即便 broker 门序哪天被改成先判鉴权，escalateUnauthorized
+  // 自己也会拦住「为已 settle / nonce 不匹配的 ask 去要授权」。这里用桩把 broker
+  // 强行改成「先返回 unauthorized」，验证升级仍不发卡。
+  it('纵深防御：broker 若先报 unauthorized，已 settle 的 ask 也不会去要授权', async () => {
+    const { askId, nonce } = await seedAsk();
+    await click(askId, nonce, 'ou_owner');          // 先被 owner 答掉
+    const broker = await import('../src/core/ask-broker.js');
+    const spy = vi.spyOn(broker, 'tryResolveAsk').mockReturnValue('unauthorized');
+    try {
+      const requestGrant = vi.fn(() => 'sent' as const);
+      const res: any = await click(askId, nonce, 'ou_pm', { requestGrant });
+      expect(res.toast.content).toContain('失效');
+      expect(requestGrant).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // pi 提的 nit：toggle / submit 走的是同一个 outcomeResponse 闭包，但没端到端测过。
+  it('多问卡（toggle 路径）未授权点击同样升级发卡', async () => {
+    let cap: { askId: string; nonce: string } | undefined;
+    setCardDispatcher({
+      async send(a) { cap = { askId: a.askId, nonce: a.nonce }; return { messageId: 'om_askcard' }; },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask', chatId: 'oc_chat', rootMessageId: 'om_root', sessionId: 's2',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'a', label: 'A' }], multiSelect: true },
+        { prompt: 'q2', options: [{ key: 'b', label: 'B' }], multiSelect: false },
+      ],
+      timeoutMs: 10_000,
+    });
+    await vi.waitFor(() => expect(cap).toBeDefined());
+    const requestGrant = vi.fn(() => 'sent' as const);
+
+    // toggle
+    const toggled: any = await handleAskCardAction(
+      { operator: { open_id: 'ou_pm' }, action: { value: { action: 'ask_toggle', ask_id: cap!.askId, nonce: cap!.nonce, question_index: '0', key: 'a' } } },
+      { requestGrant },
+    );
+    expect(toggled.toast.content).toContain('再点一次');
+
+    // submit
+    const submitted: any = await handleAskCardAction(
+      { operator: { open_id: 'ou_pm' }, action: { value: { action: 'ask_submit', ask_id: cap!.askId, nonce: cap!.nonce } } },
+      { requestGrant },
+    );
+    expect(submitted.toast.content).toContain('再点一次');
+    expect(requestGrant).toHaveBeenCalledTimes(2);
   });
 });

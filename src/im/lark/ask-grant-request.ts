@@ -27,14 +27,17 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { logger } from '../../utils/logger.js';
 import { buildGrantCard } from './card-builder.js';
 import { getUserProfile, replyMessage, sendMessage } from './client.js';
-import { clearPending, isThrottled, openPending } from './grant-pending.js';
+import { clearPending, openPending, throttleReason } from './grant-pending.js';
 
 /** 本次升级的结论。调用方据此选 toast 文案。 */
 export type AskGrantRequestOutcome =
   /** 已开卡并在后台发送 → 告诉点击者「已申请授权，通过后再点一次」。 */
   | 'sent'
-  /** 该 (bot, chat, 点击者) 已有未处置的申请、或处于拒绝冷却期 → 不重复发卡。 */
+  /** 该 (bot, chat, 点击者) 已有未处置的申请 → 让他等 owner 处理。 */
   | 'pending'
+  /** owner 已经拒绝过，还在 10 分钟冷却期内 → 必须跟 pending 分开说，
+   *  否则会把「已被拒绝」说成「等 owner 处理」（pi review F1）。 */
+  | 'denied'
   /** 发不了（未配 owner 的开放模式 / bot 关了 autoGrantRequestCards / bot 未注册）
    *  → 调用方回落到原本的「你没有权限回答这个 ask」。 */
   | 'unavailable';
@@ -51,7 +54,7 @@ export interface AskGrantRequestTarget {
 
 export interface AskGrantRequestDeps {
   getOwnerOpenId?: typeof getOwnerOpenId;
-  isThrottled?: typeof isThrottled;
+  throttleReason?: typeof throttleReason;
   openPending?: typeof openPending;
   clearPending?: typeof clearPending;
   /** 读 bot 配置（额度/有效期默认值 + autoGrantRequestCards 开关）。 */
@@ -78,7 +81,7 @@ export function requestGrantForAskClicker(
   deps: AskGrantRequestDeps = {},
 ): AskGrantRequestOutcome {
   const ownerOf = deps.getOwnerOpenId ?? getOwnerOpenId;
-  const throttled = deps.isThrottled ?? isThrottled;
+  const reasonOf = deps.throttleReason ?? throttleReason;
   const open = deps.openPending ?? openPending;
   const clear = deps.clearPending ?? clearPending;
   const readConfig = deps.getBotConfig ?? ((appId: string) => getBot(appId).config);
@@ -93,7 +96,9 @@ export function requestGrantForAskClicker(
     const owner = ownerOf(larkAppId);
     // 开放模式（没配 owner）没人能处置这张卡 —— 不发，回落原 toast。
     if (!owner) return 'unavailable';
-    if (throttled(larkAppId, chatId, clickerOpenId)) return 'pending';
+    // 节流原因要如实透出：owner 已拒绝（denied 冷却）不能说成「等 owner 处理」。
+    const throttled = reasonOf(larkAppId, chatId, clickerOpenId);
+    if (throttled) return throttled;
 
     const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
     const durationMs = botConfig.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS;

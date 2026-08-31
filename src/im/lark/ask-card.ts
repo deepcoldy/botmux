@@ -204,7 +204,7 @@ export async function handleAskCardAction(
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
   const outcomeResponse = (outcome: AskClickOutcome) =>
     outcome === 'unauthorized'
-      ? escalateUnauthorized(askId, by, locale, deps)
+      ? escalateUnauthorized(askId, nonce, by, locale, deps)
       : toastForOutcome(outcome, locale);
 
   // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）。
@@ -513,16 +513,20 @@ export function parseFormSelections(
  * 所以不像对话路径那样重放触发消息（ask-grant-request 故意不挂 messageData）。这里
  * 也不动 broker 状态——unauthorized 本来就不改 ask，ask 保持 pending 等着被再点。
  *
- * ask 已失效（快照没了）时不发卡：授权也救不回一个不存在的 ask，直接回 stale。
+ * ask 已失效 / 已 settle / nonce 不匹配时不发卡：授权也救不回一个已结束或不存在的 ask。
+ * 这几条正常由 broker 先判（它的门序是 stale → already_settled → unauthorized），这里
+ * 再自查一遍是纵深防御——把「不为已决的 ask 骚扰 owner」从对 broker 内部顺序的隐式依赖
+ * 变成本函数自己的显式前置条件（pi review F2）。
  */
 function escalateUnauthorized(
   askId: string,
+  nonce: string,
   clickerOpenId: string,
   locale: Locale | undefined,
   deps: AskCardActionDeps,
 ): { toast: { type: string; content: string } } {
   const ask = getAskSnapshot(askId);
-  if (!ask) return staleToast(locale);
+  if (!ask || ask.settled || ask.nonce !== nonce) return staleToast(locale);
   const requestGrant = deps.requestGrant ?? requestGrantForAskClicker;
   const outcome = requestGrant(
     {
@@ -538,6 +542,9 @@ function escalateUnauthorized(
       return { toast: { type: 'info', content: t('card.ask.toast.grant_requested', undefined, locale) } };
     case 'pending':
       return { toast: { type: 'info', content: t('card.ask.toast.grant_pending', undefined, locale) } };
+    case 'denied':
+      // owner 已明确拒绝，还在冷却期 —— 说实话，别谎报「等 owner 处理」。
+      return { toast: { type: 'warning', content: t('card.ask.toast.grant_denied', undefined, locale) } };
     case 'unavailable':
       // 发不出授权卡（开放模式无 owner / owner 关了自动发卡）→ 回落原文案。
       return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };

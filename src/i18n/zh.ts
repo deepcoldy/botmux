@@ -1290,6 +1290,8 @@ export const messages: Record<string, string> = {
   // 取决于点了哪个按钮，授权通过不会自动替用户作答（与对话路径的重放语义不同）。
   'card.ask.toast.grant_requested': '已向 owner 申请授权，通过后请再点一次',
   'card.ask.toast.grant_pending': '授权申请已提交，等 owner 处理后再点一次',
+  // 与 grant_pending 分开：owner 已明确拒绝、还在冷却期内，不能谎报成「等 owner 处理」。
+  'card.ask.toast.grant_denied': 'owner 已拒绝你的授权申请，如需答复请直接联系 ta',
   'card.ask.toast.already_settled': '这个 ask 已经被回答或结束',
   'card.ask.toast.stale': '⚠️ 此 ask 已失效',
   'card.ask.custom_reply': '自定义回复',
