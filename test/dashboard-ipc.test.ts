@@ -2067,7 +2067,10 @@ describe('GET /api/sessions/:sessionId/usage', () => {
 });
 
 describe('POST /api/sessions/:sessionId/rename', () => {
-  it('updates the canonical title and requests native sync from a live Codex worker', async () => {
+  it.each([
+    ['codex', '/bin/codex'],
+    ['traex', '/bin/traex'],
+  ] as const)('updates the canonical title and requests native sync from a live %s worker', async (cliId, cliPathOverride) => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-session-rename-'));
     const prevDataDir = config.session.dataDir;
     const events: any[] = [];
@@ -2078,8 +2081,8 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       config.session.dataDir = dataDir;
       sessionStore.init();
       const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
-      session.cliId = 'codex';
-      session.cliPathOverride = '/bin/codex';
+      session.cliId = cliId;
+      session.cliPathOverride = cliPathOverride;
       session.backendType = 'tmux';
       sessionStore.updateSession(session);
 

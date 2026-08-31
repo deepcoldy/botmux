@@ -2550,9 +2550,11 @@ describe('buildResumeCommand', () => {
 });
 
 describe('native session rename capability', () => {
-  it('is declared only by the verified Codex, Claude Code, and Grok adapters', () => {
+  it('is declared only by the verified Codex-family, Claude Code, and Grok adapters', () => {
     expect(createCodexAdapter('/bin/codex').buildSessionRenameCommand?.('新的标题'))
       .toBe('/rename 新的标题');
+    expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('TraeX 标题'))
+      .toBe('/rename TraeX 标题');
     expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))

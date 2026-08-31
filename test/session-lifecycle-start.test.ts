@@ -3508,10 +3508,15 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
-  it('passes the persisted Lark topic title to a fresh Codex worker before its first prompt', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('passes the persisted Lark topic title to a fresh %s worker before its first prompt', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         title: '@TestBot 排查这个 TTP logid',
         nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
       },
@@ -3532,10 +3537,15 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
-  it('waits when a fresh Codex topic only contains the bot mention', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('waits when a fresh %s topic only contains the bot mention', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         title: '@@TestBot',
         nativeSessionTitle: '[BotMux·Lark] @@TestBot',
         chatDisplayName: 'BotMux 标题优化群',
@@ -3556,10 +3566,15 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
   });
 
-  it('reapplies the group fallback when a pending Codex worker restarts before any content', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('reapplies the group fallback when a pending %s worker restarts before any content', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
         nativeSessionTitleAwaitingContent: true,
         chatDisplayName: 'BotMux 标题优化群',
@@ -3577,13 +3592,17 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
   });
 
-  it('consumes only the first meaningful follow-up for a pending Codex title', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('consumes only the first meaningful follow-up for a pending %s title', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const worker = makeFakeWorker();
     const ds = makeDs({
       worker,
       session: {
         ...makeDs().session,
-        cliId: 'codex',
+        cliId,
         nativeSessionTitle: '[BotMux·Lark] 新话题',
         nativeSessionTitleAwaitingContent: true,
       },
@@ -3616,10 +3635,15 @@ describe('session.start lifecycle integration', () => {
     });
   });
 
-  it('consumes a pending Codex title when a stopped worker resumes', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('consumes a pending %s title when a stopped worker resumes', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         cliSessionId: 'codex-native-pending',
         nativeSessionTitle: '[BotMux·Lark] 新话题',
         nativeSessionTitleAwaitingContent: true,
@@ -3637,10 +3661,15 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
   });
 
-  it('passes the pending fallback when a stopped Codex worker has no native session id yet', () => {
+  it.each([
+    ['codex'],
+    ['traex'],
+  ] as const)('passes the pending fallback when a stopped %s worker has no native session id yet', (cliId) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, wrapperCli: undefined }));
     const ds = makeDs({
       session: {
         ...makeDs().session,
+        cliId,
         nativeSessionTitle: '[BotMux·Lark] 新话题',
         nativeSessionTitleAwaitingContent: true,
       },

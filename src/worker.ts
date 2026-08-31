@@ -1047,6 +1047,34 @@ async function syncFreshCodexNativeSessionTitle(
   }
 }
 
+function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
+  const cfg = lastInitConfig;
+  const trimmed = title?.trim();
+  if (!cfg || cfg.adoptMode || !trimmed) return false;
+  if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
+  if (codexRpcEngine || remoteWsUrl) return false;
+  if (!cliAdapter?.buildSessionRenameCommand) return false;
+  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') return false;
+  nativeSessionTitleRevision += 1;
+  nativeSessionTitleAppliedThreadId = undefined;
+  cfg.nativeSessionTitle = trimmed;
+  cfg.nativeSessionTitlePrompt = undefined;
+  stopNativeSessionTitleSync();
+  pendingSessionRename = trimmed;
+  log(`Queued automatic native session rename after first user input (${cliName()}): ${trimmed}`);
+  const kick = setTimeout(() => void flushPending(), 0);
+  kick.unref?.();
+  return true;
+}
+
+function maybeQueuePostSubmitNativeSessionTitle(item: PendingCliInput): boolean {
+  if (!item.nativeSessionTitle) return false;
+  const queued = queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
+  item.nativeSessionTitle = undefined;
+  item.nativeSessionTitlePrompt = undefined;
+  return queued;
+}
+
 /** 在 resume 首条输入前记录 updatedAt，后续用其确认历史派生标题已完成回写。 */
 async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexRpcEngine): Promise<void> {
   const cfg = lastInitConfig;
@@ -2118,6 +2146,10 @@ function cliName(): string {
     : undefined)
     ?? CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '']
     ?? 'CLI';
+}
+
+function supportsPostSubmitRenameSessionTitle(cliId: string | undefined): boolean {
+  return cliId === 'traex';
 }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -10721,7 +10753,7 @@ function scheduleSubmitFailureNotify(
   bridgeTurnId?: string,
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
-  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
 ): void {
@@ -10803,6 +10835,7 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
@@ -11698,6 +11731,9 @@ async function flushPending(): Promise<void> {
         && result?.submitted !== false) {
         rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
       }
+      const queuedPostSubmitNativeTitle = result?.submitted !== false
+        ? maybeQueuePostSubmitNativeSessionTitle(item)
+        : false;
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
       // outcome — the rotation is real even when the current Enter didn't
@@ -11807,6 +11843,7 @@ async function flushPending(): Promise<void> {
           activationToken: item.queuedActivationToken,
         });
       }
+      if (queuedPostSubmitNativeTitle) break;
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
       // identically to `role:user`; CoCo parks queued submits in its TUI queue
@@ -11870,6 +11907,8 @@ function sendToPty(
     replyTurnId?: string;
     trustedCaller?: import('./types.js').TrustedCaller;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    nativeSessionTitle?: string;
+    nativeSessionTitlePrompt?: string;
     /** mojo credential snapshot delivered with this turn; applied at write time. */
     mojoLivePatch?: MojoLivePatch;
     /** At-most-once (idempotency lease): tag this keyed input so a CLI exit never
@@ -11889,6 +11928,8 @@ function sendToPty(
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.mojoLivePatch ? { mojoLivePatch: opts.mojoLivePatch } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
+    ...(opts.nativeSessionTitle ? { nativeSessionTitle: opts.nativeSessionTitle } : {}),
+    ...(opts.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: opts.nativeSessionTitlePrompt } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
@@ -18544,6 +18585,8 @@ process.on('message', async (raw: unknown) => {
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
           }));
+        const initialNativeSessionTitle = msg.nativeSessionTitle;
+        const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         let initialInputCommitted = false;
         if (shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
@@ -18577,6 +18620,8 @@ process.on('message', async (raw: unknown) => {
             // group root — accepted[0] — to be steerable). Without this the first
             // turn of a codex-app session could never absorb a follow-up steer.
             ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
+            ...(initialNativeSessionTitle ? { nativeSessionTitle: initialNativeSessionTitle } : {}),
+            ...(initialNativeSessionTitlePrompt ? { nativeSessionTitlePrompt: initialNativeSessionTitlePrompt } : {}),
             // At-most-once (idempotency lease): tag the KEYED init prompt so a CLI
             // exit never replays it onto the auto-restarted CLI — while leaving a
             // later plain follow-up turn on the same http_async_ session intact
@@ -18705,6 +18750,7 @@ process.on('message', async (raw: unknown) => {
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0 && !messageAdoptMode) exitTmuxScrollMode();
       let content = msg.content;
+      const postSubmitNativeSessionTitle = msg.nativeSessionTitle;
       let codexAppInput = msg.codexAppInput;
       if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
         content = `${content}\n\n${deferredPluginSkillCatalog}`;
@@ -18753,6 +18799,7 @@ process.on('message', async (raw: unknown) => {
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
           trustedCaller: msg.trustedCaller,
           codexAppInput,
+          nativeSessionTitle: postSubmitNativeSessionTitle,
         };
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
@@ -18784,6 +18831,8 @@ process.on('message', async (raw: unknown) => {
           trustedCaller: msg.trustedCaller,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
+          ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
         });
         if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
         else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');

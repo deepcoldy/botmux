@@ -1243,6 +1243,10 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
 }
 
+function supportsBotmuxLarkNativeSessionTitle(cliId: CliId): boolean {
+  return cliId === 'codex' || cliId === 'traex';
+}
+
 function ordinaryTurnRecoveryEligible(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
@@ -9244,7 +9248,8 @@ export function sendWorkerInput(
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
-  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const bot = getBot(ds.larkAppId);
+  const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
     ? `codex-app-dispatch-${randomUUID()}`
     : undefined);
@@ -9255,8 +9260,7 @@ export function sendWorkerInput(
   let nativeSessionTitlePrompt: string | undefined;
   let nativeSessionTitle: string | undefined;
   if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
-    const bot = getBot(ds.larkAppId);
-    if (effectiveCliId === 'codex') {
+    if (supportsBotmuxLarkNativeSessionTitle(effectiveCliId)) {
       nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
         normalized.codexAppInput?.text ?? normalized.content,
         bot.botName ? [{ name: bot.botName }] : undefined,
@@ -10344,7 +10348,7 @@ export function forkWorker(
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
-  if (agentCfg.cliId === 'codex' && !isSharedAdoptSession(ds)) {
+  if (supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)) {
     const isFreshNativeSession = !resume && !ds.session.cliSessionId;
     const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
       promptPayload.codexAppInput?.text ?? prompt,

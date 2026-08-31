@@ -2977,10 +2977,13 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('Agent 当前未运行');
     });
 
-    it('requests native rename from a live Codex worker without restarting it', async () => {
+    it.each([
+      ['codex', '/bin/codex'],
+      ['traex', '/bin/traex'],
+    ] as const)('requests native rename from a live %s worker without restarting it', async (cliId, cliPathOverride) => {
       const send = vi.fn();
       const ds = makeDaemonSession({
-        session: makeSession({ cliId: 'codex', cliPathOverride: '/bin/codex' }),
+        session: makeSession({ cliId, cliPathOverride }),
         worker: { killed: false, connected: true, send } as any,
       });
       const deps = makeDeps(ds);
@@ -2993,7 +2996,7 @@ describe('handleCommand', () => {
       expect(ds.session.nativeSessionTitle).toBe('Native 同步');
       expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('已向 codex 发送原生改名请求');
+      expect(replyContent).toContain(`已向 ${cliId} 发送原生改名请求`);
     });
   });
 
