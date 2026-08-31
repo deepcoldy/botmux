@@ -1027,16 +1027,16 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
 
-function composeDashboardSessionRows(): SessionRow[] {
-  const active = listActiveSessions().map((ds) => composeRowFromActive(ds));
+function composeDashboardSessionRows(opts?: { includeTokenUsage?: boolean }): SessionRow[] {
+  const active = listActiveSessions().map((ds) => composeRowFromActive(ds, opts));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
   const unregisteredActive = persisted
     .filter(session => session.status === 'active' && !activeIds.has(session.sessionId))
-    .map(composeRowFromPersistedActive);
+    .map(session => composeRowFromPersistedActive(session, opts));
   const closed = persisted
     .filter(session => session.status === 'closed' && !activeIds.has(session.sessionId))
-    .map(composeRowFromClosed);
+    .map(session => composeRowFromClosed(session, opts));
   return [...active, ...unregisteredActive, ...closed];
 }
 
@@ -1120,7 +1120,7 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Runtime active first, then persisted active rows that restore deliberately
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
-  jsonRes(res, 200, { sessions: composeDashboardSessionRows() });
+  jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {

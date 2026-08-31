@@ -94,6 +94,22 @@ describe('dashboard SessionRow token usage', () => {
     });
   });
 
+  it('can skip expensive token scans for bulk session list snapshots', () => {
+    const active = composeRowFromActive(makeDs(), { includeTokenUsage: false });
+    const persisted = composeRowFromPersistedActive({
+      ...makeDs().session,
+      status: 'active',
+    }, { includeTokenUsage: false });
+    const closed = composeRowFromClosed({
+      ...makeDs().session,
+      status: 'closed',
+    }, { includeTokenUsage: false });
+
+    expect(active.tokenUsage).toBeNull();
+    expect(persisted.tokenUsage).toBeNull();
+    expect(closed.tokenUsage).toBeNull();
+  });
+
   it('carries chatType for active and closed rows', () => {
     const active = makeDs();
     active.chatType = 'p2p';

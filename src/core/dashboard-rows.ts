@@ -212,7 +212,26 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
-export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean }): SessionRow {
+export interface DashboardRowOptions {
+  fresh?: boolean;
+  /**
+   * Expensive native transcript/token scan. Dashboard list snapshots can contain
+   * thousands of historical rows, so callers that only need routing/status
+   * metadata should leave this off and use the per-session detail endpoint for
+   * on-demand usage.
+   */
+  includeTokenUsage?: boolean;
+}
+
+function maybeSessionTokenUsage(
+  s: Session,
+  workingDir: string | undefined,
+  opts?: DashboardRowOptions,
+): SessionTokenUsage | null {
+  return opts?.includeTokenUsage === false ? null : sessionTokenUsage(s, workingDir);
+}
+
+export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
   return {
@@ -273,7 +292,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     agentAttention: ds.agentAttention
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
-    tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
+    tokenUsage: maybeSessionTokenUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
@@ -281,7 +300,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
   };
 }
 
-export function composeRowFromClosed(s: Session): SessionRow {
+export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
   return {
@@ -315,7 +334,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: feishuChatLink(s.chatId, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
-    tokenUsage: sessionTokenUsage(s),
+    tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
   };
 }
@@ -328,7 +347,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
  * dashboard presents it as dormant, with no terminal port, so operators can
  * see and explicitly retry closing it without an unsafe resume affordance.
  */
-export function composeRowFromPersistedActive(s: Session): SessionRow {
+export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
   return {
@@ -363,7 +382,7 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
-    tokenUsage: sessionTokenUsage(s),
+    tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
   };
 }
