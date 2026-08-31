@@ -550,6 +550,50 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(content).toContain('<botmux_silent_schedule');
   });
 
+  it('live injection carries the creator identity in OPTS (sendWorkerInput never reads the payload)', async () => {
+    // sendWorkerInput reads trustedCaller from its 4th argument only; forkWorker
+    // reads payload ?? opts. Putting the identity on the payload type-checks and
+    // is then silently dropped — and this is the path every recurring fire after
+    // the first one takes, so the bug would read as "worked once, then quietly
+    // ran without identity".
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    }), active, refreshCliVersion);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({
+      trustedCaller: {
+        requestUserOpenId: 'ou_creator',
+        requestUserUnionId: 'on_creator',
+        requestLarkAppId: APP,
+        source: 'schedule_creator',
+        taskId: 'task0001',
+      },
+    });
+  });
+
+  it('live injection passes no identity when the task has no creator union_id', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion);
+
+    // Byte-for-byte the pre-change behaviour for legacy/bot-created tasks.
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({});
+  });
+
   it('riff-backed claude-code session: scheduled fire stays inline（锁 sessionBackendType 传参）', async () => {
     // review 要求：executeScheduledTask → buildFollowUpCliInput 必须传 sessionBackendType。
     // 删掉该实参，旧代码（&& 短路）会让 riff 会话误进 hook 模式（reminder 不在 PTY 文本里，

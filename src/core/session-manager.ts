@@ -3548,7 +3548,18 @@ export async function executeScheduledTask(
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
           try {
-            if (sendWorkerInput(existing, input, scheduledTurnId)) {
+            // sendWorkerInput reads the identity from OPTS, never from the
+            // payload (unlike forkWorker, which reads payload ?? opts). Passing
+            // it on `input` alone type-checks and then silently drops it — and
+            // this is the steady-state path for a recurring task (first fire
+            // creates the session, every later fire injects into it), so the
+            // failure shape would be "worked once, silently identity-less after".
+            if (sendWorkerInput(
+              existing,
+              input,
+              scheduledTurnId,
+              scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
+            )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
               return;
             }
