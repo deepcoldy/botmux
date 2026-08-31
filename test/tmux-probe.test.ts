@@ -19,8 +19,14 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
+// ⚠️ `require` INSIDE the factory, not the factory's `importOriginal` argument:
+// that argument is vitest-only (bun passes nothing, so awaiting it throws and the
+// whole file dies). A top-level `import * as actual` does not work either —
+// vitest hoists `vi.mock` above the imports, so the factory would read the
+// namespace before initialisation. Resolving at factory-call time satisfies both
+// runners; verified on each.
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
   return { ...actual, execSync: vi.fn(), execFileSync: vi.fn() };
 });
 
