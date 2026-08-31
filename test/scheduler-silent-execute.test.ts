@@ -181,6 +181,10 @@ function forkedTurnId(): string {
   return forkWorkerMock.mock.calls[0][2];
 }
 
+function forkedPayload(): any {
+  return forkWorkerMock.mock.calls[0][1];
+}
+
 beforeEach(() => {
   store.clear();
   sessionSeq = 0;
@@ -216,6 +220,37 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(input).toContain('检查服务状态，挂了才报警');
     // dashboard-facing lastUserPrompt keeps the raw task prompt (no hint blob)
     expect(ds.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('runs the turn as the task creator: identity + schedule_creator provenance on the payload', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    }), active, refreshCliVersion);
+
+    expect(forkedPayload().trustedCaller).toEqual({
+      requestUserOpenId: 'ou_creator',
+      requestUserUnionId: 'on_creator',
+      requestLarkAppId: APP,
+      source: 'schedule_creator',
+      taskId: 'task0001',
+    });
+  });
+
+  it('carries no identity when the task has no creator union_id (fail closed, not "runs as the bot")', async () => {
+    const active = new Map<string, DaemonSession>();
+    // ownerOpenId alone is what legacy tasks and bot-created tasks have. It is
+    // app-scoped and deliberately not enough to act as that user.
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion);
+
+    expect(forkedPayload().trustedCaller).toBeUndefined();
   });
 
   it('loud fire (control): banner reply posted in-thread, no silent flag, no hint', async () => {

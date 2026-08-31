@@ -49,6 +49,15 @@ export interface TrustedCaller {
   requestUserOpenId?: string;
   requestUserUnionId?: string;
   requestLarkAppId?: string;
+  /** Where this identity came from. Absent = the ordinary IM path (the sender of
+   *  the inbound message that opened this turn). `'schedule_creator'` = a
+   *  daemon-fired scheduled turn running as the task's creator; `taskId` names
+   *  the task. Consumers that must distinguish "a human asked just now" from
+   *  "someone's scheduled task is running" (audit trails, approval gates) read
+   *  this instead of inferring it. */
+  source?: 'schedule_creator';
+  /** Scheduled task id — set only alongside `source: 'schedule_creator'`. */
+  taskId?: string;
 }
 
 export interface VcMeetingConsumerProfileFilter {
@@ -932,6 +941,15 @@ export interface ScheduledTask {
    *  creator — those keep the historical behavior (scheduled turns cannot
    *  run Saved Workflows). */
   ownerOpenId?: string;
+  /** Creator's Lark `union_id`, captured next to `ownerOpenId`. Stable across
+   *  apps within a tenant (unlike `ownerOpenId`, which is app-scoped), so it is
+   *  the identity a scheduled turn presents to per-user backends. Stamped only
+   *  when the creating message came from a human sender; absent for legacy
+   *  tasks, CLI-created tasks and bot-created tasks — a scheduled turn without
+   *  it carries no user identity at all (see `trustedCallerForScheduledTask`),
+   *  which is what keeps identity-bound tools fail-closed instead of silently
+   *  running as the bot. */
+  ownerUnionId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;

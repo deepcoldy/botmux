@@ -580,6 +580,9 @@ export function addTask(params: {
    *  scheduled-turn-provenance). Absent for CLI-created tasks without a
    *  resolvable creator — those keep the historical behavior. */
   ownerOpenId?: string;
+  /** Creator's Lark union_id (tenant-stable). Stamped only for human creators;
+   *  a task without it runs its scheduled turns with no user identity. */
+  ownerUnionId?: string;
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -615,6 +618,7 @@ export function addTask(params: {
     creatorRootMessageId: params.creatorRootMessageId,
     creatorLarkAppId: params.creatorLarkAppId,
     ownerOpenId: params.ownerOpenId,
+    ownerUnionId: params.ownerUnionId,
     nextRunAt,
     repeat: params.repeat,
     // Delivery shape is now expressed by scope/rootMessageId. Persist only the

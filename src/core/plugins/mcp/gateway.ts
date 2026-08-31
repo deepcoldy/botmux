@@ -508,6 +508,13 @@ export class PluginMcpGateway {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
       ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+      // Provenance travels with the identity so a plugin can tell "a human just
+      // asked" from "a scheduled task is running as them". Deliberately NOT
+      // mirrored into the `x-botmux-trusted-*` HTTP headers: those go to every
+      // HTTP-transport MCP server, and widening what they carry widens what an
+      // unrelated (possibly remote) plugin learns about the caller.
+      ...(caller?.source ? { source: caller.source } : {}),
+      ...(caller?.taskId ? { taskId: caller.taskId } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
     };
