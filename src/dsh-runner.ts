@@ -696,15 +696,6 @@ async function main(): Promise<void> {
   const sessionRoot = join(homedir(), '.dsh', 'sessions', 'botmux', args.sessionId);
   mkdirSync(sessionRoot, { recursive: true });
 
-  // Per-bot workspace directory for DSH Web GUI grouping.
-  // dsh-workspace groups sessions by canonical cwd, so we give each bot a
-  // unique synthetic cwd that maps to its own workspace. The actual agent
-  // working directory is set via spawn({ cwd }) — the initialize cwd is
-  // only used for workspace affiliation.
-  const botName = args.botName?.trim() || 'botmux';
-  const workspaceDir = join(homedir(), '.dsh', 'workspaces', botName);
-  mkdirSync(workspaceDir, { recursive: true });
-
   // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
   // environment (bots.json env) wins on conflict, and the runner's
   // session/cwd always win.
@@ -731,7 +722,7 @@ async function main(): Promise<void> {
 
   const initializeResult = await client.request<unknown>(
     'initialize',
-    { cwd: workspaceDir, provider: native.provider, model: native.model, maxTokens: DEFAULT_MAX_TOKENS },
+    { cwd, provider: native.provider, model: native.model, maxTokens: DEFAULT_MAX_TOKENS },
     HANDSHAKE_TIMEOUT_MS,
   );
   const { serverInfo } = parseInitializeResult(initializeResult);
