@@ -1004,6 +1004,7 @@ export const messages: Record<string, string> = {
   'daemon.foreign_bot_mention_prefix': '[来自 {botName} 的 @mention]',
   'daemon.ordinary_ingress_failed': '⚠️ 这条消息没有送达 CLI，请重发一次；若持续失败，可 /close 后重开话题。',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ 这条消息已接收，请勿原样重发（重发会重复执行）；失败发生在接收之后的状态回复/收尾步骤。若话题迟迟没有动静，可 /close 后重开话题再继续。',
+  'daemon.ordinary_turn_attention_required': '⚠️ Botmux 检测到本轮在异常中断后状态无法安全确认（{reason}）。为避免重复执行，系统没有自动重放；请检查 Web 终端和会话状态，再决定继续或重试。',
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.cmd_activation_pending': '{cmd} 暂不能发送：上一条消息仍在提交中，请稍后重试。',
   'daemon.force_topic_ready': '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',

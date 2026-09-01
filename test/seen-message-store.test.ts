@@ -35,6 +35,22 @@ describe('seen-message-store', () => {
     expect(claimMessageOnce(APP, 'om_1')).toBe(false);
   });
 
+  it('still runs a fail-closed payload validator for a seen duplicate', () => {
+    expect(claimMessageOnce(APP, 'om_conflict')).toBe(true);
+    const validateExisting = vi.fn(() => {
+      throw new Error('message-id payload conflict');
+    });
+
+    expect(() => claimMessageOnce(
+      APP,
+      'om_conflict',
+      Date.now(),
+      undefined,
+      validateExisting,
+    )).toThrow('message-id payload conflict');
+    expect(validateExisting).toHaveBeenCalledOnce();
+  });
+
   it('distinct message_ids are independent', () => {
     expect(claimMessageOnce(APP, 'om_a')).toBe(true);
     expect(claimMessageOnce(APP, 'om_b')).toBe(true);
@@ -81,6 +97,30 @@ describe('seen-message-store', () => {
     expect(claimMessageOnce('app-x', 'om_same')).toBe(true);
     expect(claimMessageOnce('app-y', 'om_same')).toBe(true);
     expect(claimMessageOnce('app-x', 'om_same')).toBe(false);
+  });
+
+  it('runs a durable prepare hook before publishing the seen tombstone', () => {
+    const order: string[] = [];
+    expect(claimMessageOnce(APP, 'om_prepared', Date.now(), () => {
+      order.push('prepared');
+      return true;
+    })).toBe(true);
+    expect(order).toEqual(['prepared']);
+    expect(existsSync(join(dataDir, 'dedup', `seen-messages-${APP}.json`))).toBe(true);
+  });
+
+  it('does not publish a seen tombstone when durable preparation fails', () => {
+    expect(() => claimMessageOnce(APP, 'om_prepare_failed', Date.now(), () => {
+      throw new Error('disk unavailable');
+    })).toThrow('disk unavailable');
+
+    // The event must remain claimable so the transport can redeliver it.
+    expect(claimMessageOnce(APP, 'om_prepare_failed')).toBe(true);
+  });
+
+  it('treats an already-prepared durable turn as a duplicate before seen persistence', () => {
+    expect(claimMessageOnce(APP, 'om_ledger_only', Date.now(), () => false)).toBe(false);
+    expect(existsSync(join(dataDir, 'dedup', `seen-messages-${APP}.json`))).toBe(false);
   });
 
   it('a corrupt store file is treated as empty (never throws, never drops)', () => {

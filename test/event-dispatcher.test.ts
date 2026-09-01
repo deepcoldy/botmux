@@ -4987,6 +4987,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] }); // default = always
     mockGetChatMode.mockResolvedValue('group');
     handlers.isSessionOwner.mockReturnValue(false);
+    handlers.onMessageIgnored = vi.fn();
+    handlers.onMessageProcessingFailed = vi.fn();
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: 'no at-mention at all, top level' }),
@@ -5000,6 +5002,9 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.onMessageIgnored).toHaveBeenCalledOnce();
+    expect(handlers.onMessageIgnored).toHaveBeenCalledWith(event, 'msg-always-toplevel');
+    expect(handlers.onMessageProcessingFailed).not.toHaveBeenCalled();
   });
 
   // ── ambient tier — end-to-end gating across the three no-@ decision points ──
@@ -7830,6 +7835,77 @@ describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
     release();
     await flushEventWork();
+  });
+
+  it('persists explicit processing failure when classification throws after durable claim', async () => {
+    handlers.prepareMessageClaim = vi.fn(() => true);
+    handlers.onMessageIgnored = vi.fn();
+    handlers.onMessageProcessingFailed = vi.fn();
+    mockGetChatMode.mockRejectedValueOnce(new Error('classification unavailable'));
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA classify this' }),
+      messageId: 'msg-classification-failed',
+      chatId: 'chat-classification-failed',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.prepareMessageClaim).toHaveBeenCalledWith(event, 'msg-classification-failed');
+    await flushEventWork();
+
+    expect(handlers.onMessageProcessingFailed).toHaveBeenCalledOnce();
+    expect(handlers.onMessageProcessingFailed).toHaveBeenCalledWith(event, 'msg-classification-failed');
+    expect(handlers.onMessageIgnored).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('validates payload identity before suppressing a seen message-id duplicate', async () => {
+    handlers.prepareMessageClaim = vi.fn(() => true);
+    handlers.validateMessageClaim = vi.fn();
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA stable payload' }),
+      messageId: 'msg-seen-payload-validation',
+      chatId: 'chat-seen-payload-validation',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.prepareMessageClaim).toHaveBeenCalledOnce();
+    expect(handlers.validateMessageClaim).toHaveBeenCalledOnce();
+    expect(handlers.validateMessageClaim)
+      .toHaveBeenCalledWith(event, 'msg-seen-payload-validation');
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('routes direct async handler failures into the same durable attention hook', async () => {
+    handlers.onMessageRouted = vi.fn();
+    handlers.onMessageHandled = vi.fn();
+    handlers.onMessageProcessingFailed = vi.fn();
+    handlers.handleNewTopic.mockRejectedValueOnce(new Error('handler failed'));
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA run this' }),
+      messageId: 'msg-handler-failed',
+      chatId: 'chat-handler-failed',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.onMessageRouted).toHaveBeenCalledOnce();
+    expect(handlers.onMessageProcessingFailed).toHaveBeenCalledOnce();
+    expect(handlers.onMessageProcessingFailed).toHaveBeenCalledWith(event, 'msg-handler-failed');
+    expect(handlers.onMessageHandled).not.toHaveBeenCalled();
   });
 
   it('reserves same-chat arrival order before the first async routing lookup', async () => {

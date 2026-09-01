@@ -86,6 +86,30 @@ import { setDisplayNameRefresher, findConfigField, applyConfigField } from './se
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
+import {
+  markOrdinaryTurnAccepted,
+  markOrdinaryTurnAttention,
+  markOrdinaryTurnAttentionNotified,
+  markOrdinaryTurnCommitted,
+  markOrdinaryTurnHeartbeat,
+  markOrdinaryTurnIgnored,
+  markOrdinaryTurnOutputDelivered,
+  markOrdinaryTurnRejected,
+  markOrdinaryTurnReplayScheduled,
+  markOrdinaryTurnRouted,
+  markOrdinaryTurnRunning,
+  markOrdinaryTurnTerminal,
+  markOrdinaryTurnWorkerReceived,
+  limitOrdinaryTurnRecoveryPlanToClaimedBefore,
+  ordinaryTurnRecoveryUuid,
+  planOrdinaryTurnRecovery,
+  prepareOrdinaryTurnClaim,
+  prepareOrdinaryTurnOutput,
+  selectOrdinaryTurnAttentionForDelivery,
+  selectOrdinaryTurnPendingOutputForDelivery,
+  validateOrdinaryTurnClaim,
+  type OrdinaryTurnRecord,
+} from './services/ordinary-turn-ledger.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
@@ -198,6 +222,7 @@ import {
   sessionSupportsWebTerminal,
   readableTerminalUrlFor,
   findActiveBySessionId,
+  buildSessionTurnFailedCard,
   withActiveSessionKeyLock,
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
@@ -5027,6 +5052,290 @@ const v3GateRunner = createV3GateRunner({
 // 每个 bot 的 EventHandlers，授权成功后重放消息时需要。
 // key = larkAppId，在 startLarkEventDispatcher 调用时写入。
 const botHandlers = new Map<string, EventHandlers>();
+
+const ORDINARY_TURN_RECOVERY_DRAIN_MS = 30_000;
+const ORDINARY_TURN_RECOVERY_SHUTDOWN_SETTLE_MS = 2_000;
+type OrdinaryTurnRecoveryDrainState = {
+  requested: boolean;
+  replayReceived: boolean;
+  replayClaimedBeforeMs?: number;
+  inFlight?: Promise<void>;
+};
+const ordinaryTurnRecoveryDrainStates = new Map<string, OrdinaryTurnRecoveryDrainState>();
+const ordinaryTurnRecoveryStoppingApps = new Set<string>();
+
+async function settleOrdinaryTurnRecoveryDrains(deadlineMs: number): Promise<boolean> {
+  const inFlight = [...ordinaryTurnRecoveryDrainStates.values()]
+    .map(state => state.inFlight)
+    .filter((promise): promise is Promise<void> => !!promise);
+  return waitAllWithin(inFlight, deadlineMs);
+}
+
+export const __testOnly_ordinaryTurnRecoveryDrainStates = ordinaryTurnRecoveryDrainStates;
+export const __testOnly_settleOrdinaryTurnRecoveryDrains = settleOrdinaryTurnRecoveryDrains;
+
+function ordinaryTurnAttentionReply(record: OrdinaryTurnRecord): {
+  anchor: string;
+  turnId: string;
+  options: WorkerSessionReplyOptions;
+} {
+  const routing = record.routing;
+  if (!routing) {
+    return {
+      anchor: record.messageId,
+      turnId: record.turnId ?? record.messageId,
+      options: {
+        uuid: ordinaryTurnRecoveryUuid('attention', record.larkAppId, record.messageId),
+        suppressHook: true,
+        replyTarget: { mode: 'thread', rootMessageId: record.messageId },
+      },
+    };
+  }
+  const replyTarget = routing.scope === 'thread'
+    ? { mode: 'thread' as const, rootMessageId: routing.anchor }
+    : routing.replyRootId
+      ? { mode: 'thread' as const, rootMessageId: routing.replyRootId }
+      : { mode: 'plain' as const, chatId: routing.chatId };
+  return {
+    anchor: routing.anchor,
+    turnId: record.turnId ?? record.messageId,
+    options: {
+      uuid: ordinaryTurnRecoveryUuid('attention', record.larkAppId, record.messageId),
+      // An ACK-lost recovery warning can be attempted again with the stable
+      // provider UUID. The local outbound hook is an independent side effect
+      // and must never be replayed by this daemon-owned recovery path.
+      suppressHook: true,
+      replyTarget,
+    },
+  };
+}
+
+export const __testOnly_ordinaryTurnAttentionReply = ordinaryTurnAttentionReply;
+
+function ordinaryTurnAttentionReason(record: OrdinaryTurnRecord): string {
+  if (record.attention?.reason) return record.attention.reason;
+  if (record.terminal) return `terminal_${record.terminal.status}`;
+  if (record.worker?.runningAt || record.worker?.heartbeatAt) return 'running_state_unknown_after_restart';
+  if (record.worker?.committedAt) return 'cli_commit_state_unknown_after_restart';
+  if (record.worker?.receivedAt) return 'worker_receipt_state_unknown_after_restart';
+  if (record.acceptedAt) return 'accepted_state_unknown_after_restart';
+  if (record.routedAt) return 'routed_state_unknown_after_restart';
+  return 'replay_schedule_state_unknown_after_restart';
+}
+
+function ordinaryTurnAttentionMessage(record: OrdinaryTurnRecord): {
+  content: string;
+  msgType: 'text' | 'interactive';
+} {
+  const reason = ordinaryTurnAttentionReason(record);
+  const ds = record.sessionId
+    ? findActiveBySessionId(record.sessionId)
+      ?? [...activeSessions.values()].find(candidate =>
+        candidate.session.sessionId === record.sessionId)
+    : undefined;
+  if (ds && ds.larkAppId === record.larkAppId && ds.session.status === 'active') {
+    const recovery = ds.session.ordinaryTurnRecovery;
+    const continuations = recovery?.logicalTurnId === (record.turnId ?? record.messageId)
+      ? recovery.continuationsStarted
+      : undefined;
+    return {
+      content: buildSessionTurnFailedCard(ds, {
+        status: record.terminal?.status === 'ambiguous' ? 'ambiguous' : 'failed',
+        errorCode: reason,
+        ...(continuations !== undefined ? { continuations } : {}),
+      }),
+      msgType: 'interactive',
+    };
+  }
+  return {
+    content: tr('daemon.ordinary_turn_attention_required', { reason }, localeForBot(record.larkAppId)),
+    msgType: 'text',
+  };
+}
+
+export const __testOnly_ordinaryTurnAttentionMessage = ordinaryTurnAttentionMessage;
+
+function ordinaryTurnPendingOutputReplyOptions(
+  record: OrdinaryTurnRecord,
+): WorkerSessionReplyOptions {
+  const delivery = record.output?.delivery;
+  if (!delivery) return { suppressHook: true };
+  return {
+    ...(delivery.options?.uuid
+      ? { uuid: delivery.options.uuid }
+      : { uuid: ordinaryTurnRecoveryUuid('output', record.larkAppId, record.messageId) }),
+    ...(delivery.options?.quoteMessageId
+      ? { quoteMessageId: delivery.options.quoteMessageId }
+      : {}),
+    // A pending output means a provider attempt may already have succeeded
+    // before its durable completion write. The stable provider UUID dedupes
+    // Lark, but the local outbound hook is a separate side effect; recovery
+    // must never emit it again.
+    suppressHook: true,
+    ...(delivery.options?.sourceSessionId
+      ? { sourceSessionId: delivery.options.sourceSessionId }
+      : {}),
+    ...(delivery.options?.replyTarget
+      ? { replyTarget: delivery.options.replyTarget }
+      : {}),
+    ...(delivery.options?.placement
+      ? { placement: delivery.options.placement }
+      : {}),
+  };
+}
+
+export const __testOnly_ordinaryTurnPendingOutputReplyOptions =
+  ordinaryTurnPendingOutputReplyOptions;
+
+async function deliverOrdinaryTurnPendingOutput(record: OrdinaryTurnRecord): Promise<void> {
+  const current = selectOrdinaryTurnPendingOutputForDelivery({
+    dataDir: config.session.dataDir,
+    larkAppId: record.larkAppId,
+    messageId: record.messageId,
+  });
+  const delivery = current?.output?.delivery;
+  if (!delivery) return;
+  const options = ordinaryTurnPendingOutputReplyOptions(current);
+  const providerMessageId = await sessionReply(
+    delivery.rootId,
+    delivery.content,
+    delivery.msgType,
+    current.larkAppId,
+    delivery.turnId,
+    options,
+  );
+  if (!providerMessageId) throw new Error('ordinary output provider returned an empty message id');
+  markOrdinaryTurnOutputDelivered({
+    dataDir: config.session.dataDir,
+    larkAppId: current.larkAppId,
+    turnId: current.turnId ?? current.messageId,
+    providerMessageId,
+  });
+}
+
+async function deliverOrdinaryTurnAttention(
+  record: OrdinaryTurnRecord,
+  allowInferred: boolean,
+): Promise<void> {
+  const current = selectOrdinaryTurnAttentionForDelivery({
+    dataDir: config.session.dataDir,
+    larkAppId: record.larkAppId,
+    messageId: record.messageId,
+    allowInferred,
+  });
+  if (!current) return;
+  const reason = ordinaryTurnAttentionReason(current);
+  markOrdinaryTurnAttention({
+    dataDir: config.session.dataDir,
+    larkAppId: current.larkAppId,
+    messageId: current.messageId,
+    reason,
+  });
+  const reply = ordinaryTurnAttentionReply(current);
+  const message = ordinaryTurnAttentionMessage(current);
+  const providerMessageId = await sessionReply(
+    reply.anchor,
+    message.content,
+    message.msgType,
+    current.larkAppId,
+    reply.turnId,
+    reply.options,
+  );
+  if (!providerMessageId) throw new Error('ordinary attention provider returned an empty message id');
+  markOrdinaryTurnAttentionNotified({
+    dataDir: config.session.dataDir,
+    larkAppId: current.larkAppId,
+    messageId: current.messageId,
+    providerMessageId,
+  });
+}
+
+function drainOrdinaryTurnRecovery(
+  larkAppId: string,
+  options: { replayReceived: boolean; replayClaimedBeforeMs?: number },
+): Promise<void> {
+  if (ordinaryTurnRecoveryStoppingApps.has(larkAppId)) {
+    return ordinaryTurnRecoveryDrainStates.get(larkAppId)?.inFlight ?? Promise.resolve();
+  }
+  const state = ordinaryTurnRecoveryDrainStates.get(larkAppId) ?? {
+    requested: false,
+    replayReceived: false,
+  };
+  ordinaryTurnRecoveryDrainStates.set(larkAppId, state);
+  state.requested = true;
+  if (options.replayReceived) {
+    state.replayReceived = true;
+    if (options.replayClaimedBeforeMs !== undefined) {
+      state.replayClaimedBeforeMs = state.replayClaimedBeforeMs === undefined
+        ? options.replayClaimedBeforeMs
+        : Math.max(state.replayClaimedBeforeMs, options.replayClaimedBeforeMs);
+    }
+  }
+  if (state.inFlight) return state.inFlight;
+
+  state.inFlight = (async () => {
+    while (state.requested && !ordinaryTurnRecoveryStoppingApps.has(larkAppId)) {
+      state.requested = false;
+      const replayReceived = state.replayReceived;
+      const replayClaimedBeforeMs = state.replayClaimedBeforeMs;
+      state.replayReceived = false;
+      state.replayClaimedBeforeMs = undefined;
+
+      const unboundedPlan = planOrdinaryTurnRecovery(config.session.dataDir, larkAppId);
+      const plan = replayReceived
+        ? limitOrdinaryTurnRecoveryPlanToClaimedBefore(unboundedPlan, replayClaimedBeforeMs)
+        : unboundedPlan;
+      if (replayReceived) {
+        const handlers = botHandlers.get(larkAppId);
+        for (const record of plan.replays) {
+          if (!handlers?.replayMessageEvent) {
+            logger.error(`[ordinary-turn] cannot replay ${record.messageId.slice(0, 12)}: dispatcher unavailable`);
+            continue;
+          }
+          markOrdinaryTurnReplayScheduled({
+            dataDir: config.session.dataDir,
+            larkAppId,
+            messageId: record.messageId,
+          });
+          handlers.replayMessageEvent(record.payload);
+          logger.warn(`[ordinary-turn] replay scheduled for received-only ${record.messageId.slice(0, 12)}`);
+        }
+      }
+      for (const record of plan.pendingOutputs) {
+        try {
+          await deliverOrdinaryTurnPendingOutput(record);
+        } catch (error) {
+          logger.error(
+            `[ordinary-turn] pending output retry failed ${record.messageId.slice(0, 12)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      // Boot reconciliation may infer attention from an incomplete lifecycle
+      // left by the previous daemon generation. Periodic drains must not do so:
+      // an accepted/running row can be perfectly healthy in this live daemon.
+      // Outside boot, deliver only an explicitly persisted attention fence
+      // (worker event-loop stall, terminal failure, or payload conflict).
+      const attentions = replayReceived
+        ? plan.attentions
+        : plan.attentions.filter(record => !!record.attention);
+      for (const record of attentions) {
+        try {
+          await deliverOrdinaryTurnAttention(record, replayReceived);
+        } catch (error) {
+          logger.error(
+            `[ordinary-turn] attention delivery failed ${record.messageId.slice(0, 12)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    }
+  })().finally(() => {
+    state.inFlight = undefined;
+    if (!state.requested) ordinaryTurnRecoveryDrainStates.delete(larkAppId);
+  });
+  return state.inFlight;
+}
 
 const codexNotifierStores = new Map<string, CodexNotifierEventStore>();
 const codexNotifierDeliveries = new Map<string, Promise<{ status: 'accepted'; messageId: string }>>();
@@ -17538,6 +17847,12 @@ function mergeVcMeetingApplicationContext(
 function markIngressAdmitted(ctx: RoutingContext): void {
   if (ctx.ingressAdmission) ctx.ingressAdmission.admitted = true;
   else ctx.ingressAdmission = { admitted: true };
+  markOrdinaryTurnAccepted({
+    dataDir: config.session.dataDir,
+    larkAppId: ctx.larkAppId,
+    messageId: ctx.messageId,
+    turnId: ctx.replyAnchorMessageId ?? ctx.messageId,
+  });
 }
 
 /**
@@ -17555,6 +17870,7 @@ function markIngressAdmitted(ctx: RoutingContext): void {
  */
 async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): Promise<never> {
   const replyAnchor = ctx.scope === 'thread' ? ctx.anchor : ctx.chatId;
+  const turnId = ctx.replyAnchorMessageId ?? ctx.messageId;
   const noticeKey = ctx.ingressAdmission?.admitted
     ? 'daemon.ordinary_ingress_admitted_reply_failed'
     : 'daemon.ordinary_ingress_failed';
@@ -17563,12 +17879,32 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
     ? `⚠️ ${err.message}\n\n可直接发给当前 agent：\n请帮我修复 botmux 的 CLI 选择配置：检查当前 bot 的 env、Riff 和 codexRpcInput 设置，移除与会话级 /cli <cliId> 选择冲突的配置；不要修改代码，完成后告诉我具体改了什么。`
     : tr(noticeKey, undefined, localeForBot(ctx.larkAppId));
   try {
-    await sessionReply(
+    const attention = markOrdinaryTurnAttention({
+      dataDir: config.session.dataDir,
+      larkAppId: ctx.larkAppId,
+      messageId: ctx.messageId,
+      reason: ctx.ingressAdmission?.admitted
+        ? 'ordinary_ingress_failed_after_accept'
+        : 'ordinary_ingress_failed_before_accept',
+    });
+    const providerMessageId = await sessionReply(
       replyAnchor,
       notice,
       'text',
       ctx.larkAppId,
+      turnId,
+      attention
+        ? { uuid: ordinaryTurnRecoveryUuid('attention', ctx.larkAppId, attention.messageId) }
+        : undefined,
     );
+    if (attention && providerMessageId) {
+      markOrdinaryTurnAttentionNotified({
+        dataDir: config.session.dataDir,
+        larkAppId: ctx.larkAppId,
+        messageId: attention.messageId,
+        providerMessageId,
+      });
+    }
   } catch (noticeErr) {
     logger.warn(
       `[${ctx.larkAppId}] ordinary ingress failure notice for ${ctx.messageId.substring(0, 12)} `
@@ -21951,8 +22287,114 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
+    onOrdinaryImInputReceived(ds, context) {
+      markOrdinaryTurnWorkerReceived({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        sessionId: ds.session.sessionId,
+        workerGeneration: context.workerGeneration,
+      });
+    },
+    onOrdinaryImInputCommitted(ds, context) {
+      markOrdinaryTurnCommitted({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        sessionId: ds.session.sessionId,
+        workerGeneration: context.workerGeneration,
+      });
+    },
+    onOrdinaryImInputRejected(ds, context) {
+      markOrdinaryTurnRejected({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        sessionId: ds.session.sessionId,
+        workerGeneration: context.workerGeneration,
+        reason: context.reason,
+      });
+    },
+    onOrdinaryImProgress(ds, context) {
+      const input = {
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        sessionId: ds.session.sessionId,
+        workerGeneration: context.workerGeneration,
+      };
+      if (context.source === 'screen_update') markOrdinaryTurnRunning(input);
+      else markOrdinaryTurnHeartbeat(input);
+    },
+    onWorkerHeartbeatStalled(ds, context) {
+      if (!context.turnId?.startsWith('om_')) return;
+      const record = markOrdinaryTurnAttention({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        reason: 'worker_event_loop_stalled',
+        now: context.detectedAt,
+      });
+      if (!record) {
+        throw new Error(
+          `ordinary turn ledger row missing for stalled turn ${context.turnId}`,
+        );
+      }
+      setImmediate(() => {
+        void drainOrdinaryTurnRecovery(ds.larkAppId, { replayReceived: false })
+          .catch(error => logger.error(
+            `[ordinary-turn] stalled-worker attention drain failed: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ));
+      });
+    },
+    prepareOrdinaryFinalOutput(ds, context) {
+      return prepareOrdinaryTurnOutput({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        delivery: context.delivery,
+      });
+    },
+    completeOrdinaryFinalOutput(ds, context) {
+      markOrdinaryTurnOutputDelivered({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        providerMessageId: context.providerMessageId,
+      });
+    },
+    prepareOrdinaryAttention(ds, context) {
+      const record = markOrdinaryTurnAttention({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        reason: context.reason,
+      });
+      return record
+        ? { uuid: ordinaryTurnRecoveryUuid('attention', ds.larkAppId, record.messageId) }
+        : undefined;
+    },
+    completeOrdinaryAttention(ds, context) {
+      markOrdinaryTurnAttentionNotified({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: context.turnId,
+        providerMessageId: context.providerMessageId,
+      });
+    },
     onQueuedActivationSubmitted,
     async onTurnTerminal(ds, terminal, context) {
+      markOrdinaryTurnTerminal({
+        dataDir: config.session.dataDir,
+        larkAppId: ds.larkAppId,
+        turnId: terminal.turnId,
+        status: terminal.status,
+        ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
+        ...(terminal.outputDisposition === 'nothing_to_send'
+          ? { outputDisposition: 'nothing_to_send' as const }
+          : {}),
+      });
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
       // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
@@ -22454,6 +22896,68 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Build the dispatcher now for authorization replay, but start it only
     // after restore has published every durable route owner.
     const botEventHandlers: EventHandlers = {
+      prepareMessageClaim: (data, messageId) => prepareOrdinaryTurnClaim({
+        dataDir: config.session.dataDir,
+        larkAppId: cfg.larkAppId,
+        messageId,
+        payload: data,
+      }) === 'created',
+      validateMessageClaim: (data, messageId) => {
+        validateOrdinaryTurnClaim({
+          dataDir: config.session.dataDir,
+          larkAppId: cfg.larkAppId,
+          messageId,
+          payload: data,
+        });
+      },
+      onMessageRouted: (_data, ctx) => {
+        markOrdinaryTurnRouted({
+          dataDir: config.session.dataDir,
+          larkAppId: cfg.larkAppId,
+          messageId: ctx.messageId,
+          routing: {
+            chatId: ctx.chatId,
+            scope: ctx.scope,
+            anchor: ctx.anchor,
+            ...(ctx.replyRootId ? { replyRootId: ctx.replyRootId } : {}),
+          },
+        });
+      },
+      onMessageHandled: (_data, ctx) => {
+        if (ctx.ingressAdmission?.admitted) return;
+        markOrdinaryTurnIgnored({
+          dataDir: config.session.dataDir,
+          larkAppId: cfg.larkAppId,
+          messageId: ctx.messageId,
+        });
+      },
+      onMessageIgnored: (_data, messageId) => {
+        markOrdinaryTurnIgnored({
+          dataDir: config.session.dataDir,
+          larkAppId: cfg.larkAppId,
+          messageId,
+        });
+      },
+      onMessageProcessingFailed: (_data, messageId) => {
+        const record = markOrdinaryTurnAttention({
+          dataDir: config.session.dataDir,
+          larkAppId: cfg.larkAppId,
+          messageId,
+          reason: 'ordinary_message_processing_failed',
+        });
+        if (!record) {
+          logger.error(
+            `[ordinary-turn] cannot persist processing failure for `
+            + `${messageId.substring(0, 12)}: claim missing`,
+          );
+          return;
+        }
+        void drainOrdinaryTurnRecovery(cfg.larkAppId, { replayReceived: false })
+          .catch(error => logger.error(
+            `[ordinary-turn] processing-failure attention drain failed: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ));
+      },
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
         () => handleCardAction(data, cardDeps, appId),
@@ -22560,7 +23064,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // after every durable owner is visible in the canonical registry.
   markIpcReady();
 
+  // Freeze the replay horizon before opening the WebSocket. A message claimed
+  // by this fresh daemon immediately after connect must never be mistaken for
+  // an orphan from the previous generation merely because its async routing
+  // callback has not run yet.
+  const ordinaryTurnRecoveryBootCutoffMs = Date.now();
   for (const startDispatcher of startEventDispatchers) startDispatcher();
+  let ordinaryTurnRecoveryTimer: ReturnType<typeof setInterval> | undefined;
+  if (!cfg.apiOnly) {
+    ordinaryTurnRecoveryStoppingApps.delete(cfg.larkAppId);
+    await drainOrdinaryTurnRecovery(cfg.larkAppId, {
+      replayReceived: true,
+      replayClaimedBeforeMs: ordinaryTurnRecoveryBootCutoffMs,
+    });
+    ordinaryTurnRecoveryTimer = setInterval(() => {
+      void drainOrdinaryTurnRecovery(cfg.larkAppId, { replayReceived: false })
+        .catch(error => logger.error(
+          `[ordinary-turn] periodic recovery drain failed: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        ));
+    }, ORDINARY_TURN_RECOVERY_DRAIN_MS);
+    ordinaryTurnRecoveryTimer.unref?.();
+  }
 
   try {
     await reconcileVcMeetingManagedActionsOnBoot(cfg.larkAppId);
@@ -23077,6 +23602,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // completed/failed/cancelled after the fact). Keep the queue and dispatcher
     // live through worker teardown.
     stopMaintenance();
+    ordinaryTurnRecoveryStoppingApps.add(cfg.larkAppId);
+    if (ordinaryTurnRecoveryTimer) {
+      clearInterval(ordinaryTurnRecoveryTimer);
+      ordinaryTurnRecoveryTimer = undefined;
+    }
+    const ordinaryTurnRecoveryDrain = ordinaryTurnRecoveryDrainStates.get(cfg.larkAppId);
+    if (ordinaryTurnRecoveryDrain) {
+      ordinaryTurnRecoveryDrain.requested = false;
+      ordinaryTurnRecoveryDrain.replayReceived = false;
+      ordinaryTurnRecoveryDrain.replayClaimedBeforeMs = undefined;
+    }
+    const ordinaryTurnRecoverySettled = await settleOrdinaryTurnRecoveryDrains(
+      Math.min(
+        shutdownDeadlineMs,
+        Date.now() + ORDINARY_TURN_RECOVERY_SHUTDOWN_SETTLE_MS,
+      ),
+    );
+    if (!ordinaryTurnRecoverySettled) {
+      logger.warn(
+        '[ordinary-turn] shutdown recovery drain timed out; durable rows remain for next boot',
+      );
+    }
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
     for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
@@ -23315,6 +23862,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
+    if (ordinaryTurnRecoveryTimer) clearInterval(ordinaryTurnRecoveryTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

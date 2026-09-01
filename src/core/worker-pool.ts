@@ -388,6 +388,7 @@ import {
   type OrdinaryTurnRecoveryDispatch,
 } from '../services/ordinary-turn-recovery.js';
 import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
+import { workerHeartbeatStalled } from './liveness-watchdog.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -592,6 +593,70 @@ export interface WorkerPoolCallbacks {
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
+  /** Ordinary Lark IM lifecycle write-ahead hooks. They are synchronous on
+   * purpose: a storage failure must stop the next side-effect boundary. */
+  onOrdinaryImInputReceived?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void;
+  onOrdinaryImInputCommitted?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void;
+  onOrdinaryImInputRejected?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number; reason: string },
+  ) => void;
+  onOrdinaryImProgress?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number; source: 'screen_update' | 'worker_heartbeat' },
+  ) => void;
+  /** Persist attention before the exact stuck generation is SIGKILLed. */
+  onWorkerHeartbeatStalled?: (
+    ds: DaemonSession,
+    context: {
+      sessionId: string;
+      workerGeneration: number;
+      turnId?: string;
+      lastHeartbeatAt: number;
+      detectedAt: number;
+    },
+  ) => void;
+  /** Write the complete ordinary Lark provider request before calling Lark. */
+  prepareOrdinaryFinalOutput?: (
+    ds: DaemonSession,
+    context: {
+      turnId: string;
+      delivery: {
+        rootId: string;
+        content: string;
+        msgType?: string;
+        turnId: string;
+        options?: {
+          uuid?: string;
+          quoteMessageId?: string;
+          suppressHook?: boolean;
+          replyTarget?: FrozenSessionReplyTarget;
+          placement?: 'auto' | 'chat' | 'topic';
+        };
+      };
+    },
+  ) => 'absent' | 'pending' | 'delivered';
+  completeOrdinaryFinalOutput?: (
+    ds: DaemonSession,
+    context: { turnId: string; providerMessageId: string },
+  ) => void;
+  /** Prepare one fail-closed attention notification before calling Lark, then
+   * settle it after the provider ACK. The returned UUID is shared with boot
+   * recovery so an ACK-lost retry cannot create a second visible warning. */
+  prepareOrdinaryAttention?: (
+    ds: DaemonSession,
+    context: { turnId: string; reason: string },
+  ) => { uuid: string } | undefined;
+  completeOrdinaryAttention?: (
+    ds: DaemonSession,
+    context: { turnId: string; providerMessageId: string },
+  ) => void;
   /** Durable consumers subscribe to transcript-backed turn completion here.
    *  Optional so ordinary sessions and tests keep their existing behavior. */
   onTurnTerminal?: (
@@ -1286,7 +1351,7 @@ function ordinaryTurnRecoveryWarning(
  *  一次性凭据（handler 用 turnId 逐字比对），没有它就只剩「去看 Web 终端」。
  *  记录缺失是正常情况——turn 在 prompt 被 wrap 前就死掉时 buildFailedTurnRecord
  *  返回 undefined。 */
-function buildSessionTurnFailedCard(
+export function buildSessionTurnFailedCard(
   ds: DaemonSession,
   opts: {
     status: 'failed' | 'ambiguous';
@@ -1364,6 +1429,7 @@ export function ensureOrdinaryTurnRecoveryAttached(
       }
     },
     warn: state => {
+      const cb = requireCallbacks();
       const warning = ordinaryTurnRecoveryWarning(state, localeForBot(ds.larkAppId));
       ds.agentAttention = {
         kind: 'blocked',
@@ -1376,21 +1442,56 @@ export function ensureOrdinaryTurnRecoveryAttached(
         errorCode: state.lastErrorCode,
         logicalTurnId: state.logicalTurnId,
       });
-      void requireCallbacks().sessionReply(
-        sessionAnchorId(ds),
-        buildSessionTurnFailedCard(ds, {
-          status: 'failed',
-          ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
-          // recovery 走到 warn 一定是「自动续跑救不回来」，把已试次数摊给用户，
-          // 免得他以为系统什么都没做。
-          continuations: state.continuationsStarted,
-          // 这条路径的 retryable 已经在 coordinator 里判过并否掉了（否则不会
-          // warn），所以按钮的安全性交给 errorCode 白名单判断，不再谎称 safe。
-        }),
-        'interactive',
-        ds.larkAppId,
-        state.logicalTurnId,
-      ).catch(err => logger.error(
+      let attention: { uuid: string } | undefined;
+      try {
+        attention = cb.prepareOrdinaryAttention?.(ds, {
+          turnId: state.logicalTurnId,
+          reason: state.lastErrorCode ?? 'ordinary_turn_recovery_exhausted',
+        });
+      } catch (error) {
+        logger.error(
+          `[${tag(ds)}] Refused to send ordinary-turn recovery warning before durable attention: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+      const card = buildSessionTurnFailedCard(ds, {
+        status: 'failed',
+        ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
+        // recovery 走到 warn 一定是「自动续跑救不回来」，把已试次数摊给用户，
+        // 免得他以为系统什么都没做。
+        continuations: state.continuationsStarted,
+        // 这条路径的 retryable 已经在 coordinator 里判过并否掉了（否则不会
+        // warn），所以按钮的安全性交给 errorCode 白名单判断，不再谎称 safe。
+      });
+      // Keep the legacy five-argument call shape when the daemon has no
+      // durable-attention hook (notably old embedders and unit-test callers).
+      // Passing an explicit sixth `undefined` needlessly changes observable
+      // adapter behavior and breaks mocks that verify the compatibility seam.
+      const warningReply = attention
+        ? cb.sessionReply(
+            sessionAnchorId(ds),
+            card,
+            'interactive',
+            ds.larkAppId,
+            state.logicalTurnId,
+            attention,
+          )
+        : cb.sessionReply(
+            sessionAnchorId(ds),
+            card,
+            'interactive',
+            ds.larkAppId,
+            state.logicalTurnId,
+          );
+      void warningReply.then(providerMessageId => {
+        if (attention && providerMessageId) {
+          cb.completeOrdinaryAttention?.(ds, {
+            turnId: state.logicalTurnId,
+            providerMessageId,
+          });
+        }
+      }).catch(err => logger.error(
         `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
         + `${err instanceof Error ? err.message : String(err)}`,
       ));
@@ -6944,6 +7045,227 @@ const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 // IPC transport and worker acknowledgement are separate stages. A transport
 // timeout may retry because the parent never confirmed enqueue; an ACK timeout
 // is only a delayed/ambiguous state because the child may still execute later.
+const WORKER_HEARTBEAT_STALE_MS = Math.max(
+  15_000,
+  Number(process.env.BOTMUX_WORKER_HEARTBEAT_STALE_MS) || 30_000,
+);
+const WORKER_HEARTBEAT_SCAN_MS = Math.max(
+  1_000,
+  Number(process.env.BOTMUX_WORKER_HEARTBEAT_SCAN_MS) || 5_000,
+);
+const WORKER_DURABLE_PROGRESS_INTERVAL_MS = 15_000;
+const WORKER_SETTLED_TURN_FENCE_LIMIT = 256;
+
+type WorkerHeartbeatLease = {
+  ds: DaemonSession;
+  worker: ChildProcess;
+  workerGeneration: number;
+  lastHeartbeatAt: number;
+  lastDurableProgressAt: number;
+  durableProgressTurnId?: string;
+  turnId?: string;
+  /** A terminal is stronger than delayed screen/heartbeat observations. Keep a
+   * bounded per-generation fence so those observations cannot revive a lease;
+   * only a later explicit worker receipt/commit may reopen the same turn. */
+  settledTurnIds: Set<string>;
+  handlingStall: boolean;
+};
+
+const workerHeartbeatLeases = new Map<ChildProcess, WorkerHeartbeatLease>();
+let workerHeartbeatScanTimer: ReturnType<typeof setInterval> | undefined;
+let workerHeartbeatLastScanAt: number | undefined;
+
+function ensureWorkerHeartbeatScanner(): void {
+  if (workerHeartbeatScanTimer) return;
+  workerHeartbeatLastScanAt = Date.now();
+  workerHeartbeatScanTimer = setInterval(() => scanWorkerHeartbeatLeases(), WORKER_HEARTBEAT_SCAN_MS);
+  workerHeartbeatScanTimer.unref?.();
+}
+
+function registerWorkerHeartbeatLease(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  workerGeneration: number,
+): void {
+  const cb = requireCallbacks();
+  if (!cb.onWorkerHeartbeatStalled && !cb.onOrdinaryImProgress) return;
+  const now = Date.now();
+  workerHeartbeatLeases.set(worker, {
+    ds,
+    worker,
+    workerGeneration,
+    lastHeartbeatAt: now,
+    lastDurableProgressAt: now,
+    settledTurnIds: new Set(),
+    handlingStall: false,
+  });
+  worker.once('exit', () => workerHeartbeatLeases.delete(worker));
+  if (cb.onWorkerHeartbeatStalled) ensureWorkerHeartbeatScanner();
+}
+
+function updateWorkerHeartbeatTurn(
+  worker: ChildProcess,
+  turnId?: string,
+  source: 'observed' | 'explicit' = 'observed',
+): boolean {
+  const lease = workerHeartbeatLeases.get(worker);
+  if (!lease) return false;
+  if (turnId && source === 'observed' && lease.settledTurnIds.has(turnId)) {
+    return false;
+  }
+  if (turnId && source === 'explicit') lease.settledTurnIds.delete(turnId);
+  if (lease.turnId !== turnId) {
+    lease.durableProgressTurnId = undefined;
+    lease.lastDurableProgressAt = 0;
+  }
+  lease.turnId = turnId;
+  return true;
+}
+
+function clearWorkerHeartbeatTurn(worker: ChildProcess, turnId: string): void {
+  const lease = workerHeartbeatLeases.get(worker);
+  if (!lease) return;
+  lease.settledTurnIds.delete(turnId);
+  lease.settledTurnIds.add(turnId);
+  while (lease.settledTurnIds.size > WORKER_SETTLED_TURN_FENCE_LIMIT) {
+    const oldest = lease.settledTurnIds.values().next().value as string | undefined;
+    if (!oldest) break;
+    lease.settledTurnIds.delete(oldest);
+  }
+  if (lease.turnId !== turnId) return;
+  lease.turnId = undefined;
+  lease.durableProgressTurnId = undefined;
+  lease.lastDurableProgressAt = Date.now();
+}
+
+function persistOrdinaryImProgress(
+  worker: ChildProcess,
+  turnId: string,
+  source: 'screen_update' | 'worker_heartbeat',
+  now = Date.now(),
+): void {
+  if (!turnId.startsWith('om_')) return;
+  const lease = workerHeartbeatLeases.get(worker);
+  if (!lease) return;
+  const firstForTurn = lease.durableProgressTurnId !== turnId;
+  if (!firstForTurn
+    && now - lease.lastDurableProgressAt < WORKER_DURABLE_PROGRESS_INTERVAL_MS) return;
+  try {
+    requireCallbacks().onOrdinaryImProgress?.(lease.ds, {
+      turnId,
+      workerGeneration: lease.workerGeneration,
+      source,
+    });
+    lease.durableProgressTurnId = turnId;
+    lease.lastDurableProgressAt = now;
+  } catch (error) {
+    logger.error(
+      `[${tag(lease.ds)}] Failed to persist ordinary IM progress `
+      + `turn=${turnId.slice(0, 16)} source=${source}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function observeWorkerHeartbeat(
+  worker: ChildProcess,
+  msg: Extract<WorkerToDaemon, { type: 'worker_heartbeat' }>,
+): void {
+  const lease = workerHeartbeatLeases.get(worker);
+  if (!lease) return;
+  const now = Date.now();
+  lease.lastHeartbeatAt = now;
+  if (msg.turnId) {
+    if (!updateWorkerHeartbeatTurn(worker, msg.turnId, 'observed')) return;
+    persistOrdinaryImProgress(worker, msg.turnId, 'worker_heartbeat', now);
+  }
+}
+
+function scanWorkerHeartbeatLeases(now = Date.now()): void {
+  const cb = requireCallbacks();
+  const previousScanAt = workerHeartbeatLastScanAt;
+  workerHeartbeatLastScanAt = now;
+  // Receipt-time heartbeats only distinguish a stuck worker while the daemon's
+  // own event loop is known to be sampling normally. If this scanner itself
+  // missed an entire stale window, the daemon may have been blocked and all
+  // child heartbeats may simply be queued behind it. Give every lease a fresh
+  // observation window; the independent fleet supervisor owns daemon stalls.
+  if (previousScanAt !== undefined && workerHeartbeatStalled({
+    nowMs: now,
+    lastHeartbeatAtMs: previousScanAt,
+    staleMs: WORKER_HEARTBEAT_STALE_MS,
+  })) {
+    for (const lease of workerHeartbeatLeases.values()) {
+      lease.lastHeartbeatAt = now;
+      lease.handlingStall = false;
+    }
+    logger.warn(
+      `[worker-heartbeat] scanner delayed for ${now - previousScanAt}ms; `
+      + 'resetting worker leases because daemon liveness was not established',
+    );
+    return;
+  }
+  for (const [worker, lease] of workerHeartbeatLeases) {
+    if (
+      lease.ds.worker !== worker
+      || worker.killed
+      || lease.ds.workerGeneration !== lease.workerGeneration
+      || lease.ds.session.workerGeneration !== lease.workerGeneration
+    ) {
+      workerHeartbeatLeases.delete(worker);
+      continue;
+    }
+    if (lease.handlingStall || !workerHeartbeatStalled({
+      nowMs: now,
+      lastHeartbeatAtMs: lease.lastHeartbeatAt,
+      staleMs: WORKER_HEARTBEAT_STALE_MS,
+    })) continue;
+
+    lease.handlingStall = true;
+    try {
+      // The callback is deliberately synchronous. If durable attention cannot
+      // be recorded, leave the process alive and retry the scan instead of
+      // killing away the only remaining evidence of an ambiguous turn.
+      cb.onWorkerHeartbeatStalled?.(lease.ds, {
+        sessionId: lease.ds.session.sessionId,
+        workerGeneration: lease.workerGeneration,
+        ...(lease.turnId ? { turnId: lease.turnId } : {}),
+        lastHeartbeatAt: lease.lastHeartbeatAt,
+        detectedAt: now,
+      });
+    } catch (error) {
+      lease.handlingStall = false;
+      logger.error(
+        `[${tag(lease.ds)}] Refused to kill stalled worker before durable attention: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      continue;
+    }
+    try {
+      if (!worker.kill('SIGKILL')) {
+        lease.handlingStall = false;
+        logger.error(
+          `[${tag(lease.ds)}] Stalled-worker SIGKILL was not accepted; `
+          + `retaining lease generation=${lease.workerGeneration} `
+          + `turn=${lease.turnId?.slice(0, 16) ?? '-'} for retry`,
+        );
+        continue;
+      }
+      workerHeartbeatLeases.delete(worker);
+      logger.error(
+        `[${tag(lease.ds)}] Worker event loop stalled for ${now - lease.lastHeartbeatAt}ms; `
+        + `SIGKILL generation=${lease.workerGeneration} turn=${lease.turnId?.slice(0, 16) ?? '-'}`,
+      );
+    } catch (error) {
+      lease.handlingStall = false;
+      logger.error(
+        `[${tag(lease.ds)}] Stalled-worker SIGKILL failed; retaining lease for retry: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
@@ -10806,6 +11128,7 @@ function setupWorkerHandlers(
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds);
+  registerWorkerHeartbeatLease(ds, worker, workerGeneration);
   // A new worker generation is starting. As a backstop, invalidate any
   // stuck-warning card posted by the previous generation — explicit kill/suspend/
   // exit paths should already have done this, but fork/refork/takeover paths
@@ -11032,6 +11355,14 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'worker_heartbeat': {
+        if (msg.sessionId && msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Ignored worker_heartbeat with mismatched sessionId`);
+          break;
+        }
+        observeWorkerHeartbeat(worker, msg);
+        break;
+      }
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -11046,6 +11377,15 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_received from stale worker generation`);
           break;
         }
+        updateWorkerHeartbeatTurn(worker, msg.turnId, 'explicit');
+        try {
+          cb.onOrdinaryImInputReceived?.(ds, { turnId: msg.turnId, workerGeneration });
+        } catch (error) {
+          logger.error(
+            `[${t}] Failed to persist ordinary IM receipt for ${msg.turnId.slice(0, 16)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
         break;
       }
@@ -11057,6 +11397,19 @@ function setupWorkerHandlers(
         ) {
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
+        }
+        clearWorkerHeartbeatTurn(worker, msg.turnId);
+        try {
+          cb.onOrdinaryImInputRejected?.(ds, {
+            turnId: msg.turnId,
+            workerGeneration,
+            reason: msg.reason,
+          });
+        } catch (error) {
+          logger.error(
+            `[${t}] Failed to persist ordinary IM rejection for ${msg.turnId.slice(0, 16)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
         }
         rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason);
         break;
@@ -11075,6 +11428,15 @@ function setupWorkerHandlers(
         }
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
+        updateWorkerHeartbeatTurn(worker, msg.turnId, 'explicit');
+        try {
+          cb.onOrdinaryImInputCommitted?.(ds, { turnId: msg.turnId, workerGeneration });
+        } catch (error) {
+          logger.error(
+            `[${t}] Failed to persist ordinary IM commit for ${msg.turnId.slice(0, 16)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
           sessionStore.updateSession(ds.session);
@@ -11771,6 +12133,12 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        if (msg.turnId
+          && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing')) {
+          if (updateWorkerHeartbeatTurn(worker, msg.turnId, 'observed')) {
+            persistOrdinaryImProgress(worker, msg.turnId, 'screen_update');
+          }
+        }
         bumpStreamCardStatusRevision(ds);
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
@@ -12897,6 +13265,7 @@ function setupWorkerHandlers(
           );
           break;
         }
+        clearWorkerHeartbeatTurn(worker, msg.turnId);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -13044,7 +13413,11 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await scopedReply(
+            const attention = cb.prepareOrdinaryAttention?.(ds, {
+              turnId: msg.turnId,
+              reason: failureCode,
+            });
+            const providerMessageId = await scopedReply(
               buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
@@ -13052,7 +13425,14 @@ function setupWorkerHandlers(
               }),
               'interactive',
               msg.turnId,
+              attention,
             );
+            if (attention && providerMessageId) {
+              cb.completeOrdinaryAttention?.(ds, {
+                turnId: msg.turnId,
+                providerMessageId,
+              });
+            }
           } catch (err) {
             logger.error(
               `[${t}] Failed to deliver turn failure card: `
@@ -14399,7 +14779,7 @@ function deliverFinalOutput(
         onComplete?.(false);
         return;
       }
-      const deliveryReplyOptions = preparedListenerReply
+      const deliveryReplyOptions: WorkerSessionReplyOptions = preparedListenerReply
         ? {
             uuid: preparedListenerReply.providerKey,
             quoteMessageId: canonicalOutput.quoteTargetId,
@@ -14416,14 +14796,61 @@ function deliverFinalOutput(
               : {}),
           }
         : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
+      const scopedDeliveryReplyOptions: WorkerSessionReplyOptions = frozenReplyTarget && !managedReceiver
+        ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
+        : deliveryReplyOptions;
+      if (msg.turnId.startsWith('om_') && !managedReceiver) {
+        const prepared = cb.prepareOrdinaryFinalOutput?.(ds, {
+          turnId: msg.turnId,
+          delivery: {
+            rootId: sessionAnchorId(ds),
+            content: canonicalOutput.content,
+            msgType: canonicalOutput.msgType,
+            turnId: msg.replyTurnId ?? msg.turnId,
+            options: {
+              ...(scopedDeliveryReplyOptions.uuid
+                ? { uuid: scopedDeliveryReplyOptions.uuid }
+                : {}),
+              ...(scopedDeliveryReplyOptions.quoteMessageId
+                ? { quoteMessageId: scopedDeliveryReplyOptions.quoteMessageId }
+                : {}),
+              ...(scopedDeliveryReplyOptions.suppressHook
+                ? { suppressHook: true }
+                : {}),
+              ...(scopedDeliveryReplyOptions.replyTarget
+                ? { replyTarget: scopedDeliveryReplyOptions.replyTarget }
+                : {}),
+              ...(scopedDeliveryReplyOptions.placement
+                ? { placement: scopedDeliveryReplyOptions.placement }
+                : {}),
+            },
+          },
+        });
+        if (prepared === 'delivered') {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          logger.info(
+            `[${t}] Ordinary final_output already delivered durably `
+            + `(turn ${msg.turnId.substring(0, 8)})`,
+          );
+          onComplete?.(true);
+          return;
+        }
+      }
       const messageId = await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
-        frozenReplyTarget && !managedReceiver
-          ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
-          : deliveryReplyOptions,
+        scopedDeliveryReplyOptions,
       );
+      if (msg.turnId.startsWith('om_') && !managedReceiver && messageId) {
+        // Provider ACK precedes every best-effort auxiliary mutation below. If
+        // this durable completion write fails, the catch/retry path reuses the
+        // same provider UUID, closing the ACK-lost dual-write window.
+        cb.completeOrdinaryFinalOutput?.(ds, {
+          turnId: msg.turnId,
+          providerMessageId: messageId,
+        });
+      }
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       if (msg.turnId.startsWith('mlrp_turn_')) {
@@ -14487,6 +14914,13 @@ export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
+export const __testOnly_scanWorkerHeartbeatLeases = scanWorkerHeartbeatLeases;
+export function __testOnly_resetWorkerHeartbeatLeases(): void {
+  if (workerHeartbeatScanTimer) clearInterval(workerHeartbeatScanTimer);
+  workerHeartbeatScanTimer = undefined;
+  workerHeartbeatLastScanAt = undefined;
+  workerHeartbeatLeases.clear();
+}
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 

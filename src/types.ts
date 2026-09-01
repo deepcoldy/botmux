@@ -1265,6 +1265,14 @@ export type WorkerToDaemon =
       turnId?: string;
       dispatchAttempt?: number;
     }
+  /** Event-loop liveness lease. Absence is the signal: a live OS process that
+   * stops emitting these is independently fenced by the daemon watchdog. */
+  | {
+      type: 'worker_heartbeat';
+      sessionId?: string;
+      turnId?: string;
+      dispatchAttempt?: number;
+    }
   | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   /** The exact inbound turn is now durably owned by this worker generation's
    * CLI input queue. The daemon persists a root-bound receipt only after this

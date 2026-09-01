@@ -75,6 +75,7 @@ vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
 
 import { registerBot } from '../src/bot-registry.js';
 import { activeSessionKey, sessionKey } from '../src/core/types.js';
+import * as daemonModule from '../src/daemon.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -141,6 +142,90 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     mocks.topicQueues.clear();
     activeSessions.clear();
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
+  });
+
+  it('forces pending-output recovery to suppress the independent outbound hook', () => {
+    const replyOptions = (daemonModule as any).__testOnly_ordinaryTurnPendingOutputReplyOptions({
+      larkAppId: APP,
+      messageId: 'om_pending_output',
+      output: {
+        delivery: {
+          rootId: CHAT,
+          content: 'already attempted output',
+          msgType: 'text',
+          turnId: 'om_pending_output',
+          options: { uuid: 'bf_stable_provider_uuid' },
+        },
+      },
+    });
+
+    expect(replyOptions).toMatchObject({
+      uuid: 'bf_stable_provider_uuid',
+      suppressHook: true,
+    });
+  });
+
+  it('forces attention recovery to suppress the independent outbound hook', () => {
+    const reply = (daemonModule as any).__testOnly_ordinaryTurnAttentionReply({
+      larkAppId: APP,
+      messageId: 'om_pending_attention',
+      turnId: 'om_pending_attention',
+      routing: {
+        chatId: CHAT,
+        scope: 'thread',
+        anchor: 'om_attention_root',
+      },
+    });
+
+    expect(reply.options).toMatchObject({
+      suppressHook: true,
+    });
+  });
+
+  it('uses the same actionable failure-card shape when a live session backs drain attention', () => {
+    const ds = seedSharedSession();
+    const message = (daemonModule as any).__testOnly_ordinaryTurnAttentionMessage({
+      larkAppId: APP,
+      messageId: 'om_attention_card_race',
+      turnId: 'om_attention_card_race',
+      sessionId: ds.session.sessionId,
+      attention: {
+        requiredAt: NOW,
+        reason: 'worker_event_loop_stalled',
+      },
+    });
+
+    expect(message.msgType).toBe('interactive');
+    expect(() => JSON.parse(message.content)).not.toThrow();
+  });
+
+  it('awaits an in-flight ordinary recovery drain at the shutdown fence', async () => {
+    const states = (daemonModule as any).__testOnly_ordinaryTurnRecoveryDrainStates as Map<
+      string,
+      { requested: boolean; replayReceived: boolean; inFlight?: Promise<void> }
+    >;
+    const settle = (daemonModule as any).__testOnly_settleOrdinaryTurnRecoveryDrains as
+      ((deadlineMs: number) => Promise<boolean>);
+    expect(states).toBeInstanceOf(Map);
+    expect(typeof settle).toBe('function');
+
+    let release!: () => void;
+    const inFlight = new Promise<void>(resolve => { release = resolve; });
+    states.set(APP, { requested: false, replayReceived: false, inFlight });
+    try {
+      let completed = false;
+      const waiting = settle(Date.now() + 1_000).then(result => {
+        completed = true;
+        return result;
+      });
+      await Promise.resolve();
+      expect(completed).toBe(false);
+      release();
+      await expect(waiting).resolves.toBe(true);
+    } finally {
+      states.delete(APP);
+      release();
+    }
   });
 
   it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {

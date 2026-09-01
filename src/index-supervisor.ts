@@ -41,14 +41,28 @@ async function main(): Promise<void> {
   // the dashboard to add their first bot.
   const members = resolveFleetMembers();
   const botCount = resolveFleetBots().length;
+  const daemonEnv = resolveFleetDaemonEnv();
+  const positiveInt = (raw: string | undefined, fallback: number): number => {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+  };
 
   const supervisor = new FleetSupervisor({
     statePath: fleetStatePath(),
     distDir: fleetDistDir(),
-    daemonEnv: resolveFleetDaemonEnv(),
+    daemonEnv,
     cwd: configDir,
     daemonNodeArgs: fleetDaemonNodeArgs(),
     logDir: fleetLogDir(),
+    heartbeat: {
+      dataDir: daemonEnv.SESSION_DATA_DIR!,
+      scanIntervalMs: positiveInt(process.env.BOTMUX_DAEMON_HEARTBEAT_SCAN_MS, 5_000),
+      staleMs: positiveInt(process.env.BOTMUX_DAEMON_HEARTBEAT_STALE_MS, 45_000),
+      // Daemons publish the first beat only after their durable boot
+      // reconciliation and session restore. Keep that work outside the stale
+      // window while still detecting a wedged bootstrap in bounded time.
+      startupGraceMs: positiveInt(process.env.BOTMUX_DAEMON_HEARTBEAT_STARTUP_GRACE_MS, 180_000),
+    },
     log: (m) => logger.info(`[supervisor] ${m}`),
   });
 

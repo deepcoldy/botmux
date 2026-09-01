@@ -7,6 +7,7 @@ import {
   anyDaemonBusyTo,
   heartbeatDirIn,
   HEARTBEAT_FRESH_MS,
+  readDaemonHeartbeatTo,
 } from '../src/core/daemon-heartbeat.js';
 
 const T0 = Date.parse('2026-06-07T04:00:00.000Z');
@@ -46,6 +47,21 @@ describe('daemon heartbeat / anyDaemonBusy', () => {
     writeHeartbeatTo(dir, 'cli_app_a', 3, iso(T0));
     writeHeartbeatTo(dir, 'cli_app_a', 0, iso(T0 + 1_000)); // overwrite same daemon
     expect(anyDaemonBusyTo(dir, T0 + 2_000)).toBe(false);
+  });
+
+  it('reads back the exact daemon pid and parsed timestamp for watchdog use', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 0, iso(T0), 4321);
+    expect(readDaemonHeartbeatTo(dir, 'cli_app_a')).toEqual({ pid: 4321, atMs: T0 });
+    expect(readDaemonHeartbeatTo(dir, 'cli_other')).toBeNull();
+  });
+
+  it('does not treat a legacy pid-less heartbeat as event-loop liveness proof', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 0, iso(T0), 4321);
+    writeFileSync(
+      join(heartbeatDirIn(dir), 'cli_app_a.json'),
+      JSON.stringify({ larkAppId: 'cli_app_a', busyCount: 0, at: iso(T0) }),
+    );
+    expect(readDaemonHeartbeatTo(dir, 'cli_app_a')).toBeNull();
   });
 
   it('tolerates a corrupt heartbeat file (ignored, no throw)', () => {

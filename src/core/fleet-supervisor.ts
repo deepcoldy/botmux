@@ -27,6 +27,8 @@ import {
 } from './fleet-supervisor-policy.js';
 import { mutateFleetState, readFleetState } from './fleet-state-store.js';
 import type { FleetCommand } from './fleet-command-queue.js';
+import { readDaemonHeartbeatTo } from './daemon-heartbeat.js';
+import { daemonHeartbeatStatus } from './liveness-watchdog.js';
 
 export interface FleetBotSpec {
   /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
@@ -102,6 +104,14 @@ export interface FleetSupervisorOptions {
    *  can tail a specific bot — mirrors pm2's out_file/error_file. When unset
    *  (tests), children inherit the supervisor's stdio. */
   logDir?: string;
+  /** Independent event-loop watchdog for daemon members only. Dashboard and
+   * external plugin members do not publish this heartbeat and are excluded. */
+  heartbeat?: {
+    dataDir: string;
+    scanIntervalMs: number;
+    staleMs: number;
+    startupGraceMs: number;
+  };
   /** Injected for tests; defaults to console. */
   log?: (msg: string) => void;
 }
@@ -117,6 +127,9 @@ export class FleetSupervisor {
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly childStartedAtMs = new Map<string, number>();
+  private readonly heartbeatKillInFlight = new Set<string>();
+  private heartbeatScanTimer?: ReturnType<typeof setInterval>;
   /** Names an operator explicitly stopped (stop-bot). Their SIGTERM would look
    *  like a crash to onChildExit, so we suppress the restart for exactly one exit
    *  and mark them stopped. Cleared when the bot is explicitly started again. */
@@ -200,6 +213,58 @@ export class FleetSupervisor {
     for (const name of toStart) {
       const spec = specByName.get(name);
       if (spec) this.spawnBot(spec, /* isRestart */ false);
+    }
+    this.ensureHeartbeatScanner();
+  }
+
+  private ensureHeartbeatScanner(): void {
+    const heartbeat = this.opts.heartbeat;
+    if (!heartbeat || this.heartbeatScanTimer || this.stopping) return;
+    const intervalMs = Math.max(10, heartbeat.scanIntervalMs);
+    this.heartbeatScanTimer = setInterval(() => this.scanDaemonHeartbeats(), intervalMs);
+    this.heartbeatScanTimer.unref?.();
+  }
+
+  private scanDaemonHeartbeats(nowMs = Date.now()): void {
+    const heartbeat = this.opts.heartbeat;
+    if (!heartbeat || this.stopping) return;
+    for (const [name, child] of this.children) {
+      const spec = this.knownSpecs.get(name);
+      if (!spec || spec.external || (spec.entry ?? 'daemon') !== 'daemon') continue;
+      if (this.explicitStop.has(name) || this.heartbeatKillInFlight.has(name)) continue;
+      const pid = child.pid ?? 0;
+      const startedAtMs = this.childStartedAtMs.get(name) ?? nowMs;
+      const status = daemonHeartbeatStatus({
+        nowMs,
+        startedAtMs,
+        expectedPid: pid,
+        heartbeat: readDaemonHeartbeatTo(heartbeat.dataDir, spec.appId),
+        startupGraceMs: heartbeat.startupGraceMs,
+        staleMs: heartbeat.staleMs,
+      });
+      if (status !== 'stalled') continue;
+      // Keep the ordinary crash/restart budget and generation policy as the
+      // single restart owner. This watchdog contributes only the missing exit.
+      this.heartbeatKillInFlight.add(name);
+      this.log(
+        `${name} daemon heartbeat stalled (pid ${pid}); SIGKILL so the existing `
+        + 'crash policy can restart the exact member',
+      );
+      try {
+        if (!child.kill('SIGKILL')) {
+          this.heartbeatKillInFlight.delete(name);
+          this.log(
+            `${name} heartbeat SIGKILL was not accepted; retaining supervision `
+            + 'and retrying on the next stale scan',
+          );
+        }
+      } catch (error) {
+        this.heartbeatKillInFlight.delete(name);
+        this.log(
+          `${name} heartbeat SIGKILL failed: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
   }
 
@@ -383,6 +448,7 @@ export class FleetSupervisor {
     }).procs.find((p) => p.name === spec.name)!.generation;
 
     this.children.set(spec.name, child);
+    this.childStartedAtMs.set(spec.name, Date.now());
     this.liveGeneration.set(spec.name, generation);
     this.log(`${isRestart ? 'restarted' : 'started'} ${spec.name} (pid ${child.pid}, gen ${generation})`);
 
@@ -398,6 +464,8 @@ export class FleetSupervisor {
     // exit must never mutate the newer generation's row or trigger a double spawn.
     if (this.liveGeneration.get(spec.name) !== generation) return;
     this.children.delete(spec.name);
+    this.childStartedAtMs.delete(spec.name);
+    this.heartbeatKillInFlight.delete(spec.name);
     if (this.stopping) return;
 
     // Explicit stop-bot: this exit is operator-intended, not a crash. Suppress the
@@ -462,6 +530,11 @@ export class FleetSupervisor {
    *  `status` reflects reality — onChildExit is short-circuited while stopping. */
   async stopAll(): Promise<void> {
     this.stopping = true;
+    if (this.heartbeatScanTimer) {
+      clearInterval(this.heartbeatScanTimer);
+      this.heartbeatScanTimer = undefined;
+    }
+    this.heartbeatKillInFlight.clear();
     for (const t of this.restartTimers.values()) clearTimeout(t);
     this.restartTimers.clear();
     const pending = [...this.children.entries()];

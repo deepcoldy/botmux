@@ -18,6 +18,9 @@ export interface Heartbeat {
   larkAppId: string;
   busyCount: number;
   at: string; // ISO 8601
+  /** OS process identity for event-loop supervision. A stale file from the
+   * previous daemon generation must never keep its replacement "healthy". */
+  pid?: number;
 }
 
 /** A heartbeat older than this is treated as "daemon not reporting" → ignored.
@@ -28,12 +31,18 @@ export function heartbeatDirIn(dir: string): string {
   return join(dir, 'heartbeats');
 }
 
-export function writeHeartbeatTo(dir: string, larkAppId: string, busyCount: number, atIso: string): void {
+export function writeHeartbeatTo(
+  dir: string,
+  larkAppId: string,
+  busyCount: number,
+  atIso: string,
+  pid = process.pid,
+): void {
   const hbDir = heartbeatDirIn(dir);
   if (!existsSync(hbDir)) mkdirSync(hbDir, { recursive: true });
   const path = join(hbDir, `${sanitize(larkAppId)}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
-  const beat: Heartbeat = { larkAppId, busyCount, at: atIso };
+  const beat: Heartbeat = { larkAppId, busyCount, at: atIso, pid };
   writeFileSync(tmp, JSON.stringify(beat));
   renameSync(tmp, path);
 }
@@ -59,13 +68,32 @@ export function anyDaemonBusyTo(dir: string, nowMs: number, freshMs: number = HE
 function readBeat(path: string): Heartbeat | null {
   try {
     const v = JSON.parse(readFileSync(path, 'utf-8'));
-    if (v && typeof v === 'object' && typeof v.busyCount === 'number' && typeof v.at === 'string') {
+    if (v
+      && typeof v === 'object'
+      && typeof v.larkAppId === 'string'
+      && typeof v.busyCount === 'number'
+      && typeof v.at === 'string'
+      && (v.pid === undefined || (Number.isSafeInteger(v.pid) && v.pid > 1))) {
       return v as Heartbeat;
     }
   } catch {
     /* corrupt/partial write → ignore */
   }
   return null;
+}
+
+/** Read one daemon's event-loop heartbeat with a parsed timestamp. Invalid,
+ * mismatched, corrupt, or legacy pid-less files are not liveness evidence. */
+export function readDaemonHeartbeatTo(
+  dir: string,
+  larkAppId: string,
+): { pid: number; atMs: number } | null {
+  const beat = readBeat(join(heartbeatDirIn(dir), `${sanitize(larkAppId)}.json`));
+  if (!beat || beat.larkAppId !== larkAppId) return null;
+  const atMs = Date.parse(beat.at);
+  return Number.isFinite(atMs) && beat.pid !== undefined
+    ? { pid: beat.pid, atMs }
+    : null;
 }
 
 /** App ids are already filesystem-safe (cli_…), but guard against separators. */

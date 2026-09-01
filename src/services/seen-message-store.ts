@@ -103,11 +103,28 @@ function pruneAndCap(map: Map<string, number>, now: number): void {
  * 8h 内重复命中（飞书重推 / at-least-once 重复）→ 返回 `false`（重投，应丢弃）。
  * 空 `messageId` 无法去重 → 永远 `true`（绝不因缺 id 而误吞真实消息）。
  */
-export function claimMessageOnce(larkAppId: string, messageId: string, now = Date.now()): boolean {
+export function claimMessageOnce(
+  larkAppId: string,
+  messageId: string,
+  now = Date.now(),
+  prepareClaim?: () => boolean,
+  validateExistingClaim?: () => void,
+): boolean {
   if (!messageId) return true;
   const cache = load(larkAppId);
   const exp = cache.map.get(messageId);
-  if (exp && exp > now) return false; // 命中未过期记录 → 重投
+  if (exp && exp > now) {
+    // Validate without creating a new ledger row: older seen tombstones may
+    // legitimately predate the ledger rollout, and backfilling one here would
+    // manufacture unsafe replay work for an already-processed message.
+    validateExistingClaim?.();
+    return false; // 命中未过期记录 → 重投
+  }
+  // Write the full durable input intent before publishing the payload-free seen
+  // tombstone. Throwing deliberately escapes the synchronous WS handler so no
+  // ACK is emitted; false means an earlier attempt already prepared the same
+  // durable turn (including ledger-written/seen-not-yet-written crash windows).
+  if (prepareClaim && !prepareClaim()) return false;
   pruneAndCap(cache.map, now);
   cache.map.set(messageId, now + TTL_MS);
   persist(larkAppId, cache.map);

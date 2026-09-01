@@ -40,6 +40,7 @@ vi.mock('../src/im/lark/doc-comment.js', () => ({
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildStreamingCard: vi.fn(() => '{}'),
   buildSessionCard: vi.fn(() => '{}'),
+  buildTurnFailedCard: vi.fn(() => '{}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
@@ -105,6 +106,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
+  __testOnly_resetWorkerHeartbeatLeases,
+  __testOnly_scanWorkerHeartbeatLeases,
   __testOnly_setupWorkerHandlers,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
@@ -144,7 +147,8 @@ function makeDs(): DaemonSession {
   const fakeWorker = new EventEmitter() as any;
   fakeWorker.killed = false;
   fakeWorker.send = vi.fn();
-  fakeWorker.kill = vi.fn();
+  // Match ChildProcess.kill(): true means the signal was accepted.
+  fakeWorker.kill = vi.fn(() => true);
   fakeWorker.pid = 99999;
   fakeWorker.stdout = new EventEmitter();
   fakeWorker.stderr = new EventEmitter();
@@ -257,6 +261,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
+    __testOnly_resetWorkerHeartbeatLeases();
     vi.useRealTimers();
   });
 
@@ -2435,6 +2440,51 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(closeSession).not.toHaveBeenCalled();
   });
 
+  it('write-aheads an ordinary final output before every provider attempt and leaves it pending on exhaustion', async () => {
+    const order: string[] = [];
+    const sessionReply = vi.fn(async () => {
+      order.push('provider');
+      throw new Error('persistent');
+    });
+    const prepareOrdinaryFinalOutput = vi.fn(() => {
+      order.push('prepare');
+      return 'pending' as const;
+    });
+    const completeOrdinaryFinalOutput = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      prepareOrdinaryFinalOutput,
+      completeOrdinaryFinalOutput,
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      turnId: 'om_outbox_turn',
+      lastUuid: 'ordinary-outbox-answer',
+    }, 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(15000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(prepareOrdinaryFinalOutput).toHaveBeenCalledTimes(3);
+    expect(completeOrdinaryFinalOutput).not.toHaveBeenCalled();
+    expect(order).toEqual([
+      'prepare', 'provider',
+      'prepare', 'provider',
+      'prepare', 'provider',
+    ]);
+    const preparedUuids = prepareOrdinaryFinalOutput.mock.calls.map(call => call[1].delivery.options?.uuid);
+    expect(new Set(preparedUuids).size).toBe(1);
+    expect(preparedUuids[0]).toMatch(/^bf_[0-9a-f]{46}$/);
+  });
+
   it('MessageWithdrawnError aborts retries, commits dedup, and closes session', async () => {
     const sessionReply = vi.fn().mockRejectedValue(new MessageWithdrawnError('om_root'));
     const closeSession = vi.fn();
@@ -2525,6 +2575,10 @@ describe('Worker turn_terminal routing', () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    __testOnly_resetWorkerHeartbeatLeases();
+  });
+
   it('routes a matching terminal receipt independently of final_output', async () => {
     const ds = makeDs();
     const onTurnTerminal = vi.fn(async () => {});
@@ -2548,6 +2602,195 @@ describe('Worker turn_terminal routing', () => {
 
     expect(onTurnTerminal).toHaveBeenCalledTimes(1);
     expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
+  });
+
+  it('persists exact-generation stall attention before SIGKILL and retries the fence if persistence fails', async () => {
+    const ds = makeDs();
+    const onWorkerHeartbeatStalled = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('ledger unavailable'); })
+      .mockImplementation(() => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerHeartbeatStalled,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const workerGeneration = ds.workerGeneration!;
+
+    (ds.worker as any).emit('message', {
+      type: 'worker_heartbeat',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_stalled_turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'worker_heartbeat' }>);
+    await Promise.resolve();
+
+    const heartbeatObservedAt = Date.now();
+    __testOnly_scanWorkerHeartbeatLeases(heartbeatObservedAt + 5_000);
+    expect(onWorkerHeartbeatStalled).not.toHaveBeenCalled();
+    const firstDetectedAt = heartbeatObservedAt + 30_001;
+    __testOnly_scanWorkerHeartbeatLeases(firstDetectedAt);
+    expect(onWorkerHeartbeatStalled).toHaveBeenCalledWith(ds, {
+      sessionId: ds.session.sessionId,
+      workerGeneration,
+      turnId: 'om_stalled_turn',
+      lastHeartbeatAt: expect.any(Number),
+      detectedAt: firstDetectedAt,
+    });
+    expect((ds.worker as any).kill).not.toHaveBeenCalled();
+
+    const retryDetectedAt = firstDetectedAt + 1;
+    __testOnly_scanWorkerHeartbeatLeases(retryDetectedAt);
+    expect(onWorkerHeartbeatStalled).toHaveBeenCalledTimes(2);
+    expect((ds.worker as any).kill).toHaveBeenCalledOnce();
+    expect((ds.worker as any).kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.workerGeneration).toBe(workerGeneration);
+    expect(ds.session.workerGeneration).toBe(workerGeneration);
+  });
+
+  it('retains the stalled-worker lease and retries when SIGKILL is not accepted', async () => {
+    const ds = makeDs();
+    const kill = vi.mocked((ds.worker as any).kill)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const onWorkerHeartbeatStalled = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerHeartbeatStalled,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'worker_heartbeat',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_kill_retry_turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'worker_heartbeat' }>);
+    await Promise.resolve();
+
+    const observedAt = Date.now();
+    __testOnly_scanWorkerHeartbeatLeases(observedAt + 5_000);
+    __testOnly_scanWorkerHeartbeatLeases(observedAt + 30_001);
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(onWorkerHeartbeatStalled).toHaveBeenCalledTimes(1);
+
+    __testOnly_scanWorkerHeartbeatLeases(observedAt + 30_002);
+    expect(kill).toHaveBeenCalledTimes(2);
+    expect(kill).toHaveBeenLastCalledWith('SIGKILL');
+    expect(onWorkerHeartbeatStalled).toHaveBeenCalledTimes(2);
+  });
+
+  it('fences late heartbeats after terminal until an explicit receipt reactivates the turn', async () => {
+    const ds = makeDs();
+    const onOrdinaryImProgress = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImProgress,
+      onTurnTerminal: vi.fn(async () => {}),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const heartbeat = {
+      type: 'worker_heartbeat',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_settled_heartbeat_turn',
+    } satisfies Extract<WorkerToDaemon, { type: 'worker_heartbeat' }>;
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_input_received',
+      turnId: heartbeat.turnId,
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_input_received' }>);
+    (ds.worker as any).emit('message', heartbeat);
+    expect(onOrdinaryImProgress).toHaveBeenCalledTimes(1);
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: heartbeat.turnId,
+      status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+    onOrdinaryImProgress.mockClear();
+
+    (ds.worker as any).emit('message', heartbeat);
+    expect(onOrdinaryImProgress).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'turn_input_received',
+      turnId: heartbeat.turnId,
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_input_received' }>);
+    (ds.worker as any).emit('message', heartbeat);
+    expect(onOrdinaryImProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not blame every worker when the daemon-side scanner itself missed a stale window', () => {
+    const ds = makeDs();
+    const onWorkerHeartbeatStalled = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerHeartbeatStalled,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const scannerReadyAt = Date.now();
+
+    __testOnly_scanWorkerHeartbeatLeases(scannerReadyAt + 31_000);
+
+    expect(onWorkerHeartbeatStalled).not.toHaveBeenCalled();
+    expect((ds.worker as any).kill).not.toHaveBeenCalled();
+  });
+
+  it('settles a durable failure-card attention only after ACK and reuses its UUID after ACK loss', async () => {
+    const sessionReply = vi.fn()
+      .mockRejectedValueOnce(new Error('accepted but ACK lost'))
+      .mockResolvedValueOnce('om_failure_card');
+    const prepareOrdinaryAttention = vi.fn(() => ({ uuid: 'oa_stable_attention_uuid' }));
+    const completeOrdinaryAttention = vi.fn();
+    const ds = makeDs();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      prepareOrdinaryAttention,
+      completeOrdinaryAttention,
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const terminal = {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_failure_card_turn',
+      status: 'ambiguous',
+      errorCode: 'cli_exit',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>;
+
+    (ds.worker as any).emit('message', terminal);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(prepareOrdinaryAttention).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][5]).toEqual({ uuid: 'oa_stable_attention_uuid' });
+    expect(completeOrdinaryAttention).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', terminal);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(prepareOrdinaryAttention).toHaveBeenCalledTimes(2);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls.map(call => call[5]?.uuid))
+      .toEqual(['oa_stable_attention_uuid', 'oa_stable_attention_uuid']);
+    expect(completeOrdinaryAttention).toHaveBeenCalledOnce();
+    expect(completeOrdinaryAttention).toHaveBeenCalledWith(ds, {
+      turnId: 'om_failure_card_turn',
+      providerMessageId: 'om_failure_card',
+    });
   });
 
   it('captures silent fallback output and keeps the bounded legacy marker after terminal', async () => {

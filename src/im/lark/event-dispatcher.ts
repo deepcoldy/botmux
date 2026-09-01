@@ -2440,17 +2440,68 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   };
 }
 
+function notifyMessageProcessingFailed(
+  handlers: EventHandlers,
+  data: any,
+  messageId: string,
+): void {
+  try {
+    handlers.onMessageProcessingFailed?.(data, messageId);
+  } catch (error) {
+    logger.error(
+      `[ordinary-turn] failed to persist processing failure for `
+      + `${messageId.substring(0, 12)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+async function invokeMessageHandlerWithLifecycle(
+  handlers: EventHandlers,
+  data: any,
+  ctx: RoutingContext,
+  work: () => Promise<void>,
+): Promise<void> {
+  try {
+    // This is the last synchronous point before daemon routing can create a
+    // session, mutate command state, or enqueue CLI input. Persist the routed
+    // milestone first so a crash can never be mistaken for safe non-execution.
+    handlers.onMessageRouted?.(data, ctx);
+    await work();
+  } catch (error) {
+    notifyMessageProcessingFailed(handlers, data, ctx.messageId);
+    throw error;
+  }
+  // A successfully handled command/rejection/ignore path may intentionally
+  // never admit CLI work. Close that ledger row explicitly so a later daemon
+  // restart does not misclassify the completed non-CLI path as an orphan.
+  try { handlers.onMessageHandled?.(data, ctx); }
+  catch (error) {
+    logger.error(
+      `[ordinary-turn] failed to persist handled disposition for `
+      + `${ctx.messageId.substring(0, 12)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    notifyMessageProcessingFailed(handlers, data, ctx.messageId);
+  }
+}
+
 async function dispatchHumanMessageViaHandlers(
   larkAppId: string,
   handlers: EventHandlers,
   payload: PendingForwardTopicPayload,
   capMs?: number,
 ): Promise<void> {
-  await serializeByAnchor(payload.ctx.anchor, () => {
+  await serializeByAnchor(payload.ctx.anchor, async () => {
     const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
-    return ownsSession
-      ? handlers.handleThreadReply(payload.data, payload.ctx)
-      : handlers.handleNewTopic(payload.data, payload.ctx);
+    await invokeMessageHandlerWithLifecycle(
+      handlers,
+      payload.data,
+      payload.ctx,
+      () => ownsSession
+        ? handlers.handleThreadReply(payload.data, payload.ctx)
+        : handlers.handleNewTopic(payload.data, payload.ctx),
+    );
   }, capMs);
 }
 
@@ -2462,7 +2513,17 @@ async function dispatchPolledMessageListenerMatch(input: {
   chatId: string;
   messageId: string;
 }): Promise<void> {
-  if (!claimMessageOnce(input.larkAppId, input.messageId)) {
+  if (!claimMessageOnce(
+    input.larkAppId,
+    input.messageId,
+    Date.now(),
+    input.handlers.prepareMessageClaim
+      ? () => input.handlers.prepareMessageClaim!(input.data, input.messageId)
+      : undefined,
+    input.handlers.validateMessageClaim
+      ? () => input.handlers.validateMessageClaim!(input.data, input.messageId)
+      : undefined,
+  )) {
     logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
     return;
   }
@@ -2574,6 +2635,25 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** Synchronous write-ahead hook invoked before the seen-message tombstone.
+   * false means this exact input intent already exists durably. Throwing keeps
+   * the WS event unacknowledged so Lark can redeliver after storage recovers. */
+  prepareMessageClaim?: (data: any, messageId: string) => boolean;
+  /** Synchronous payload-identity validation for a message id already present
+   * in the seen store. Must not synthesize a missing legacy ledger row. */
+  validateMessageClaim?: (data: any, messageId: string) => void;
+  /** Synchronous lifecycle write immediately before daemon routing starts. */
+  onMessageRouted?: (data: any, ctx: RoutingContext) => void;
+  /** Synchronous lifecycle closure after a routed handler returns normally.
+   * The daemon uses ctx.ingressAdmission to distinguish an asynchronous CLI
+   * turn from a completed command/rejection path. */
+  onMessageHandled?: (data: any, ctx: RoutingContext) => void;
+  /** Synchronous lifecycle closure for a claimed raw message that routing
+   * intentionally ignores before it enters an asynchronous handler. */
+  onMessageIgnored?: (data: any, messageId: string) => void;
+  /** Persist fail-closed attention when classification or a routed handler
+   * throws after the transport has already durably claimed the message. */
+  onMessageProcessingFailed?: (data: any, messageId: string) => void;
   /** 主动开工 — 场景①: fired when this bot is added to a chat
    *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
    *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
@@ -3320,6 +3400,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     data: any,
     seedRoutingGate?: { ready: Promise<void>; complete: () => void },
   ): Promise<void> {
+    const rawLifecycleMessageId = data?.message?.message_id;
+    const lifecycleMessageId = typeof rawLifecycleMessageId === 'string' && rawLifecycleMessageId
+      ? rawLifecycleMessageId
+      : undefined;
+    let retainedForAsyncDispatch = false;
+    let processingFailed = false;
     try {
       const message = data.message;
       const sender = data.sender;
@@ -3388,8 +3474,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Serialize per anchor so back-to-back messages to the same thread
           // (e.g. dispatch's /repo prime + brief kickoff) don't interleave with
           // the first's async session-spawn. See anchor-serializer.ts.
-          void serializeByAnchor(ctx.anchor, () =>
-            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }), 0)
+          retainedForAsyncDispatch = true;
+          const routeCtx: RoutingContext = { ...ctx, chatId, messageId, chatType, larkAppId };
+          void serializeByAnchor(ctx.anchor, () => invokeMessageHandlerWithLifecycle(
+            handlers,
+            data,
+            routeCtx,
+            () => handlers.handleThreadReply(data, routeCtx),
+          ), 0)
             .catch(err => logger.error(`Error handling message event: ${err}`));
           return;
         }
@@ -3443,6 +3535,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             `[message-listener:${larkAppId}] matched bot-sender chat=${chatId.substring(0, 12)} ` +
             `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
           );
+          retainedForAsyncDispatch = true;
           await dispatchHumanMessage(listenerRoutingContext({
             data,
             match: botMessageListener,
@@ -3538,6 +3631,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                 `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'} reason=${seedBotTalk.reason}`,
               );
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
+              retainedForAsyncDispatch = true;
               await dispatchHumanMessage({ data, ctx: seedCtx, ownsSession: false })
                 .catch(err => logger.error(`Error auto-starting on foreign-bot new topic: ${err}`));
               return;
@@ -3622,8 +3716,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
-        void serializeByAnchor(ctx.anchor, () =>
-          handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId }), 0)
+        retainedForAsyncDispatch = true;
+        const routeCtx: RoutingContext = { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId };
+        void serializeByAnchor(ctx.anchor, () => invokeMessageHandlerWithLifecycle(
+          handlers,
+          data,
+          routeCtx,
+          () => handlers.handleThreadReply(data, routeCtx),
+        ), 0)
           .catch(err => logger.error(`Error handling bot @mention: ${err}`));
         return;
       }
@@ -4194,6 +4294,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         } catch (err) {
           logger.warn(`[forward-followup] failed to persist paired payload before dispatch: ${err}`);
         }
+        retainedForAsyncDispatch = true;
         void dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
           .catch(err => logger.error(`Error handling paired message event: ${err}`));
         return;
@@ -4205,6 +4306,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // current reply once session restoration is complete. Both calls append
         // synchronously to the same canonical FIFO; their handler completion is
         // deliberately not awaited by the raw lane.
+        retainedForAsyncDispatch = true;
         void sessionsReady.then(() => {
           void dispatchHumanMessage(stalePendingSeed.payload)
             .then(() => removeForwardFollowup(larkAppId, stalePendingSeed.messageId))
@@ -4227,11 +4329,27 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // release the raw lane so independent topics in the same chat can run
       // concurrently. Same-anchor handlers remain strictly serialized by
       // dispatchHumanMessage's canonical queue.
+      retainedForAsyncDispatch = true;
       void dispatchHumanMessage(payload)
         .catch(err => logger.error(`Error handling message event: ${err}`));
     } catch (err) {
+      processingFailed = true;
       logger.error(`Error handling message event: ${err}`);
     } finally {
+      if (lifecycleMessageId && !retainedForAsyncDispatch) {
+        if (processingFailed) {
+          notifyMessageProcessingFailed(handlers, data, lifecycleMessageId);
+        } else {
+          try { handlers.onMessageIgnored?.(data, lifecycleMessageId); }
+          catch (error) {
+            logger.error(
+              `[ordinary-turn] failed to persist ignored disposition for `
+              + `${lifecycleMessageId.substring(0, 12)}: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      }
       seedRoutingGate?.complete();
     }
   }
@@ -4323,7 +4441,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const messageIdForKey = data?.message?.message_id;
       const eventKey = `im.message.receive_v1:${larkAppId}:${messageIdForKey ?? eventIdForKey(data) ?? unkeyableEventKey()}`;
       const claim = messageIdForKey
-        ? () => claimMessageOnce(larkAppId, messageIdForKey)
+        ? () => claimMessageOnce(
+            larkAppId,
+            messageIdForKey,
+            Date.now(),
+            handlers.prepareMessageClaim
+              ? () => handlers.prepareMessageClaim!(data, messageIdForKey)
+              : undefined,
+            handlers.validateMessageClaim
+              ? () => handlers.validateMessageClaim!(data, messageIdForKey)
+              : undefined,
+          )
         : () => claimEventOnce(eventKey);
       const rawMessage = data?.message;
       const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);

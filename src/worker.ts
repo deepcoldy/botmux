@@ -18085,6 +18085,13 @@ function emitTurnTerminal(
     // fresh process behind the receiver's newer dispatch attempt.
     inflightInputs.onTurnComplete();
     durableTurnInFlight = false;
+    // Do not keep publishing the settled turn in the independent heartbeat.
+    // The next explicitly admitted input installs a fresh identity before it
+    // can reach the CLI; delayed screen/IPC observations are fenced daemon-side.
+    currentBotmuxTurnId = undefined;
+    currentBotmuxDispatchAttempt = undefined;
+    currentGatewayTrustedCaller = undefined;
+    currentVcMeetingImTurnOrigin = undefined;
     // The terminal may be emitted from inside an active flush continuation
     // (for example a synchronous hard-submit failure). Wake after that
     // continuation releases the mutex so queued work cannot remain stranded.
@@ -19709,6 +19716,23 @@ process.on('SIGTERM', () => shutdownWorkerForParentExit('SIGTERM'));
 process.on('SIGINT', () => shutdownWorkerForParentExit('SIGINT'));
 // If parent daemon dies, IPC channel closes — clean up
 process.on('disconnect', () => { log('Daemon disconnected'); shutdownWorkerForParentExit('IPC disconnect'); });
+
+// Independent worker event-loop lease. The daemon observes receipt time rather
+// than trusting a worker-authored clock. A process that is alive but blocked in
+// synchronous work cannot run this interval, so the daemon can persist an
+// attention fence and SIGKILL the exact generation instead of leaving a turn
+// silently stuck forever.
+const WORKER_HEARTBEAT_INTERVAL_MS = 5_000;
+setInterval(() => {
+  send({
+    type: 'worker_heartbeat',
+    ...(sessionId ? { sessionId } : {}),
+    ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+  });
+}, WORKER_HEARTBEAT_INTERVAL_MS).unref();
 
 // Watchdog: belt-and-braces parent-death detection. SIGTERM and 'disconnect'
 // should both reach us when the daemon dies, but if main thread is stuck in
