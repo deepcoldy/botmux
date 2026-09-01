@@ -8694,8 +8694,24 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  // 命令仍然可以 @ 触发 —— 本特性只加放行条款，不改 @ 路径的任何语义。
-  it('leaves the @mention path untouched', async () => {
+  // 命令的含义不该取决于有没有 @：@ 了 bot 再发同一条命令，模板同样生效。
+  // 这是刻意的（否则「@ 了就变成另一种行为」才是特例），在此显式钉住。
+  it('@ 路径同样应用模板 —— 命令含义与是否 @ 无关', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '先复现再改：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@BotA /solve 修一下', {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: { cmd: '/solve', prompt: '先复现再改：{args}', args: '修一下' },
+    }));
+  });
+
+  // @ 路径的**路由**不受影响（正文侧见上一条：模板同样生效）。
+  it('leaves the @mention path routing untouched', async () => {
     setup({ enabled: true, commands: [{ cmd: '/solve' }] });
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
     const event = fire('@BotA /solve 修一下', {

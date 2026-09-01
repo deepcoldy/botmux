@@ -4387,11 +4387,24 @@ function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
       if (res.ok) {
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
         void runChecks(commands.map(c => c.cmd));
-      } else if (res.body?.error === 'reserved_command') {
-        // 服务端把冲突项原样带回来，直接渲染成红字，不用前端再猜一遍命令表。
-        const detail: Array<{ cmd: string; kind: CommandTriggerCheck['kind'] }> = res.body.detail ?? [];
-        setChecks(detail.map(d => ({ input: d.cmd, valid: true, cmd: d.cmd, kind: d.kind })));
+        return;
+      }
+      // 服务端把出问题的条目原样带回来（detail），直接标红对应的命令行，前端不必
+      // 再猜一遍命令表。四种拒绝理由都要有中文文案 —— 落到 responseErrorText 就
+      // 会把 `prompt_too_large` 这种生 key 显示给用户。
+      const detail = res.body?.detail;
+      if (res.body?.error === 'reserved_command') {
+        const conflicts: Array<{ cmd: string; kind: CommandTriggerCheck['kind'] }> = detail ?? [];
+        setChecks(conflicts.map(d => ({ input: d.cmd, valid: true, cmd: d.cmd, kind: d.kind })));
         setStatus({ text: `✗ ${tr('botDefaults.commandTriggerReservedRejected')}` });
+      } else if (res.body?.error === 'invalid_command') {
+        const invalid: string[] = detail ?? [];
+        setChecks(invalid.map(input => ({ input, valid: false, kind: null })));
+        setStatus({ text: `✗ ${tr('botDefaults.commandTriggerInvalid')}` });
+      } else if (res.body?.error === 'prompt_too_large') {
+        setStatus({ text: `✗ ${tr('botDefaults.commandTriggerPromptTooLarge')}` });
+      } else if (res.body?.error === 'commands_required') {
+        setStatus({ text: `✗ ${tr('botDefaults.commandTriggerCommandsRequired')}` });
       } else {
         setStatus({ text: `✗ ${responseErrorText(res)}` });
       }
