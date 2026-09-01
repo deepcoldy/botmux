@@ -30,6 +30,14 @@ const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.ur
 //
 // These rule bodies contain no nested blocks, so the first `}` after the
 // selector is the closing brace. Throw rather than slice from -1.
+//
+// Every rule assertion in this file goes through here. Leaving even one
+// landmark-bounded slice behind is what let the pattern spread in the first
+// place: the fill-height shell block used to be sliced as one 800-char window
+// spanning five rules, and deleting `overflow: hidden` from `main:has(...)`
+// alone kept every assertion green, because the very next rule carries the
+// same declaration and `[\s\S]*?` walked into it. That window needed no
+// planted decoy at all — the duplicates were already there.
 function ruleBody(selector: string): string {
   const start = css.indexOf(selector);
   if (start === -1) throw new Error(`selector not found in style.css: ${selector}`);
@@ -76,12 +84,14 @@ describe('bot defaults focused layout', () => {
     // sliding it up and clips #bd-filters. Desktop therefore uses the same
     // fill-height shell as roles-page: main does not scroll, both columns
     // stretch, the list and the detail pane are the scrollports.
-    const desktop = css.slice(css.indexOf('main:has(.bot-defaults-page)'), css.indexOf('main:has(.bot-defaults-page) .bd-detail') + 280);
-    expect(desktop).toMatch(/main:has\(\.bot-defaults-page\)\s*\{[\s\S]*?overflow:\s*hidden;/);
-    expect(desktop).toMatch(/\.bot-defaults-page\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
-    expect(desktop).toMatch(/\.bd-layout\s*\{[\s\S]*?align-items:\s*stretch;/);
-    expect(desktop).toMatch(/\.bd-roster\s*\{[\s\S]*?position:\s*static;[\s\S]*?height:\s*100%;/);
-    expect(desktop).toMatch(/\.bd-detail\s*\{[\s\S]*?overflow-y:\s*auto;/);
+    const desktop = ruleBody('main:has(.bot-defaults-page) {');
+    expect(desktop).toMatch(/overflow:\s*hidden;/);
+    expect(ruleBody('main:has(.bot-defaults-page) .bot-defaults-page {')).toMatch(/grid-template-rows:\s*auto minmax\(0,\s*1fr\);/);
+    expect(ruleBody('main:has(.bot-defaults-page) .bd-layout {')).toMatch(/align-items:\s*stretch;/);
+    const shellRoster = ruleBody('main:has(.bot-defaults-page) .bd-roster {');
+    expect(shellRoster).toMatch(/position:\s*static;/);
+    expect(shellRoster).toMatch(/height:\s*100%;/);
+    expect(ruleBody('main:has(.bot-defaults-page) .bd-detail {')).toMatch(/overflow-y:\s*auto;/);
 
     const roster = ruleBody('.bot-defaults-page .bd-roster {');
     expect(roster).toMatch(/grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
