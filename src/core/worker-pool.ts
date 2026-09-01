@@ -10332,6 +10332,11 @@ export function forkWorker(
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
     env: ds.session.cliLaunchSnapshot ? undefined : botCfg.env,
+    // Freeze the normalized sparse reply style at worker spawn. Both the
+    // session-rendered botmux-send guide and the CLI card renderer consume the
+    // same env snapshot, so a dashboard edit cannot split their behavior inside
+    // an already-running pane.
+    replyStyle: botCfg.replyStyle,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,

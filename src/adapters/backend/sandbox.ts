@@ -987,7 +987,7 @@ export interface RelayRequest {
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
+const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--layout']);
 
 export interface ValidatedRelay {
   command: 'send' | 'dispatch';
@@ -1093,6 +1093,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
+      if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
+        return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
       }
       flags.push(f, v); i++; continue;
     }

@@ -4486,6 +4486,61 @@ describe('handleCommand', () => {
       // The adopt topic root must not be retained as a bookmark.
       expect(callArgs.rootMessageId).toBeUndefined();
     });
+
+    it('stamps the human creator identity (open_id + tenant-stable union_id)', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-human' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报', {
+        senderId: 'ou_creator',
+        senderUnionId: 'on_creator',
+        senderType: 'user',
+      }), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.ownerOpenId).toBe('ou_creator');
+      expect(callArgs.ownerUnionId).toBe('on_creator');
+    });
+
+    it('withholds the union_id when the creating sender is not a human', async () => {
+      // A bot-created task must not be able to run as the bot: without a
+      // union_id the scheduled turn carries no identity at all, so
+      // identity-bound tools fail closed instead of borrowing the bot's access.
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '每日 09:00' },
+        prompt: '生成日报',
+        name: '生成日报',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
+        deliver: 'origin' as const,
+        silent: false,
+        prompt,
+      }));
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-bot' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-03-28T09:00:00+08:00'));
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每日9:00 生成日报', {
+        senderId: 'ou_bot_sender',
+        senderUnionId: 'on_bot_sender',
+        senderType: 'app',
+      }), deps, LARK_APP_ID);
+
+      const callArgs = (scheduler.addTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.ownerOpenId).toBe('ou_bot_sender');
+      expect(callArgs.ownerUnionId).toBeUndefined();
+    });
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────

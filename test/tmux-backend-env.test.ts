@@ -125,9 +125,11 @@ describe('buildBotmuxEnvAssignments()', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
       BOTMUX_USAGE_DISPLAY: 'footer',
+      BOTMUX_REPLY_STYLE: JSON.stringify({ layout: false, theme: 'minimal' }),
       PATH: '/usr/bin',
     });
     expect(out).toContain('BOTMUX_USAGE_DISPLAY=footer');
+    expect(out).toContain('BOTMUX_REPLY_STYLE={"layout":false,"theme":"minimal"}');
     expect(out).not.toContain('PATH=/usr/bin');
   });
 

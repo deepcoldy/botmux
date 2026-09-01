@@ -2850,7 +2850,7 @@ export function buildAdoptSelectCard(
 function wrapAdoptCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
-    config: { update_multi: true, wide_screen_mode: true },
+    config: { update_multi: true, width_mode: 'fill' },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },

@@ -194,20 +194,241 @@ describe('handleCotThinkingUpdate', () => {
     const start1 = events.find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === 'toolu_1')!;
     expect(start1.content.icon).toBe('bash');
     expect(start1.content.toolCallName).toBe('Bash');
-    // Category label shown in the bubble instead of raw name+args.
-    expect(start1.content.title).toBeTruthy();
-    expect(start1.content.title).not.toContain('{');
+    // Category label PLUS the concrete command — the renderer ignores
+    // TOOL_CALL_ARGS, so the title is the only place the command shows up.
+    expect(start1.content.title).toContain('ls');
+    expect(start1.content.title).not.toContain('{'); // never the raw JSON blob
     expect(start1.content.parentMessageId).toBeDefined(); // attached to the preceding thinking node
     const args = events.find(e => e.type === 'TOOL_CALL_ARGS')!;
     expect(args.content).toEqual({ toolCallId: 'toolu_1', delta: '{"command":"ls"}' });
     const result = events.find(e => e.type === 'TOOL_CALL_RESULT')!;
     expect(result.content.toolCallId).toBe('toolu_1');
-    expect(JSON.parse(result.content.content)).toEqual({ type: 'code', code: 'file-a\nfile-b' });
+    // Shell output is tagged `bash` so the block highlights instead of
+    // reading「plaintext」(the renderer never infers this on its own).
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'code', language: 'bash', code: 'file-a\nfile-b' });
     // Empty args → no TOOL_CALL_ARGS event, but START/END still sent.
     const start2 = events.find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === 'toolu_2')!;
     expect(start2.content.icon).toBe('search');
     expect(events.filter(e => e.type === 'TOOL_CALL_ARGS').length).toBe(1);
     expect(events.filter(e => e.type === 'TOOL_CALL_END').map(e => e.content.toolCallId)).toEqual(['toolu_1', 'toolu_2']);
+  });
+
+  /**
+   * The title is the ONLY carrier the Feishu CoT renderer draws for a tool
+   * call: a live A/B showed a node with full TOOL_CALL_ARGS and a control
+   * node with no args event at all rendering identically. Each case below is
+   * a real shape harvested from on-disk transcripts, not an invented one.
+   */
+  it('carries the tool subject in the title across both CLIs\' arg shapes', async () => {
+    const ds = makeDs();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+
+    handleCotThinkingUpdate(ds, upd([
+      // Claude Bash — by far the most common call (~1900 in local transcripts).
+      { kind: 'tool_call', id: 't1', name: 'Bash', args: '{"command":"git log --oneline -5","description":"recent commits"}' },
+      // Claude file ops key off file_path, not command.
+      { kind: 'tool_call', id: 't2', name: 'Read', args: '{"file_path":"/root/iserver/botmux/src/daemon.ts","limit":50}' },
+      // Codex local_shell_call: command is argv; the script is the last element.
+      { kind: 'tool_call', id: 't3', name: 'shell', args: '{"command":["bash","-lc","pnpm run build"]}' },
+      // Codex custom_tool_call ships a RAW non-JSON string — must not be dropped.
+      { kind: 'tool_call', id: 't4', name: 'exec', args: 'await tools.exec_command({ cmd: "free -h" })' },
+      // Multi-line script collapses to one line (the title never wraps).
+      { kind: 'tool_call', id: 't5', name: 'Bash', args: '{"command":"line one\\nline two\\n  line three"}' },
+    ]));
+    await flush();
+
+    expect(titleOf('t1')).toContain('git log --oneline -5');
+    expect(titleOf('t1')).not.toContain('recent commits'); // description is not the subject
+    expect(titleOf('t2')).toContain('/root/iserver/botmux/src/daemon.ts');
+    expect(titleOf('t3')).toContain('pnpm run build');
+    expect(titleOf('t3')).not.toContain('bash'); // argv boilerplate stripped
+    expect(titleOf('t4')).toContain('free -h');
+    expect(titleOf('t5')).toBe('执行命令 · line one line two line three');
+  });
+
+  it('falls back to the bare category label when no subject can be extracted', async () => {
+    const ds = makeDs();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'n1', name: 'TaskList', args: '' },            // no args at all
+      { kind: 'tool_call', id: 'n2', name: 'TaskUpdate', args: '{"taskId":"1","status":"done"}' }, // no known field
+      { kind: 'tool_call', id: 'n3', name: 'Bash', args: '{"command":"   "}' },  // whitespace-only
+      { kind: 'tool_call', id: 'n4', name: 'Bash', args: '{"command":' },        // truncated/invalid JSON
+    ]));
+    await flush();
+
+    // Degrades to exactly today's rendering — never '[object Object]' or a
+    // dangling separator.
+    expect(titleOf('n1')).toBe('任务管理');
+    expect(titleOf('n2')).toBe('任务管理');
+    expect(titleOf('n3')).toBe('执行命令');
+    expect(titleOf('n4')).toBe('执行命令'); // broken JSON fragment never shown
+    for (const id of ['n1', 'n2', 'n3', 'n4']) {
+      expect(titleOf(id)).not.toContain('·');
+      expect(titleOf(id)).not.toContain('object Object');
+    }
+  });
+
+  /**
+   * The renderer echoes `language` verbatim and never auto-detects (verified
+   * live: a bogus value prints as-is; Python content with no language set
+   * still reads "plaintext"). So the mapping must be a whitelist, and an
+   * unmapped tool must omit the field rather than pass an extension through.
+   */
+  it('tags result code blocks with a whitelisted language, omitting it when unknown', async () => {
+    const ds = makeDs();
+    const resultFor = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'g1', name: 'Bash', args: '{"command":"ls -la"}' },
+      { kind: 'tool_result', id: 'g1', result: 'total 0' },
+      { kind: 'tool_call', id: 'g2', name: 'Read', args: '{"file_path":"/a/b/daemon.ts"}' },
+      { kind: 'tool_result', id: 'g2', result: 'export const x = 1;' },
+      { kind: 'tool_call', id: 'g3', name: 'Read', args: '{"file_path":"/a/b/conf.yml"}' },
+      { kind: 'tool_result', id: 'g3', result: 'key: value' },
+      // Extension with no whitelist entry: must NOT leak "wat" as the label.
+      { kind: 'tool_call', id: 'g4', name: 'Read', args: '{"file_path":"/a/b/notes.wat"}' },
+      { kind: 'tool_result', id: 'g4', result: 'blah' },
+      // No file, no shell → no language at all (renders as plaintext).
+      { kind: 'tool_call', id: 'g5', name: 'TaskUpdate', args: '{"taskId":"1"}' },
+      { kind: 'tool_result', id: 'g5', result: 'Updated task #1' },
+    ]));
+    await flush();
+
+    expect(resultFor('g1')).toEqual({ type: 'code', language: 'bash', code: 'total 0' });
+    expect(resultFor('g2').language).toBe('typescript');
+    expect(resultFor('g3').language).toBe('yaml');
+    // Unmapped / inapplicable → field absent entirely, never a bogus label.
+    expect(resultFor('g4')).toEqual({ type: 'code', code: 'blah' });
+    expect(resultFor('g5')).toEqual({ type: 'code', code: 'Updated task #1' });
+    expect(resultFor('g4').language).toBeUndefined();
+    expect(resultFor('g5').language).toBeUndefined();
+  });
+
+  /**
+   * Regression: truncation is a rendering concern and must not feed logic.
+   * The first version resolved the language off the DISPLAY string, so any
+   * path longer than the 80-char title cap lost its extension to the ellipsis
+   * and silently fell back to plaintext.
+   */
+  it('detects the language from the untruncated path, not the shortened title', async () => {
+    const ds = makeDs();
+    const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
+    expect(longPath.length).toBeGreaterThan(80); // the case only bites past the cap
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'L', name: 'Read', args: JSON.stringify({ file_path: longPath }) },
+      { kind: 'tool_result', id: 'L', result: 'export const x = 1;' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    const body = JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!.content.content);
+    expect(title.endsWith('…')).toBe(true);   // still bounded for layout
+    expect(title).not.toContain('.ts');        // extension really is cut from the title
+    expect(body.language).toBe('typescript');  // …yet detection still sees it
+  });
+
+  /**
+   * The transcript layer hard-cuts args at 600 chars, so a Write/Edit whose
+   * `content` dwarfs the path arrives as unparseable JSON. The leading
+   * `"file_path":"…"` survives that cut, so recover it rather than showing a
+   * bare label.
+   */
+  it('recovers a subject by regex when oversized args arrive truncated', async () => {
+    const ds = makeDs();
+    const path = '/root/iserver/botmux/src/core/worker-pool.ts';
+    const full = JSON.stringify({ file_path: path, content: 'x'.repeat(2000) });
+    const truncated = full.slice(0, 600); // exactly what truncateForCot does
+    expect(() => JSON.parse(truncated)).toThrow(); // precondition: really broken
+
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'W', name: 'Write', args: truncated },
+      { kind: 'tool_result', id: 'W', result: 'ok' },
+      // A value cut mid-string must NOT be shown half-rendered.
+      { kind: 'tool_call', id: 'W2', name: 'Write', args: '{"file_path":"/a/b/unterminat' },
+      { kind: 'tool_result', id: 'W2', result: 'ok' },
+    ]));
+    await flush();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+    const bodyOf = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+
+    expect(titleOf('W')).toContain(path);
+    expect(titleOf('W')).not.toContain('{');       // never the JSON fragment
+    expect(bodyOf('W').language).toBe('typescript'); // recovery feeds detection too
+    // Incomplete pair → no match → bare label, exactly as before.
+    expect(titleOf('W2')).toBe('编辑文件');
+    expect(bodyOf('W2').language).toBeUndefined();
+  });
+
+  it('keeps sub-agent and fetch style calls honest', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // description/prompt are the only identifying fields a Task call has.
+      { kind: 'tool_call', id: 'T', name: 'TaskCreate', args: JSON.stringify({ subject: '跑一遍回归', activeForm: '跑回归' }) },
+      { kind: 'tool_result', id: 'T', result: 'created' },
+      { kind: 'tool_call', id: 'A', name: 'Agent', args: JSON.stringify({ description: 'Find the auth flow', subagent_type: 'Explore' }) },
+      { kind: 'tool_result', id: 'A', result: 'found' },
+      // A .json URL must not label fetched prose as json.
+      { kind: 'tool_call', id: 'F', name: 'WebFetch', args: JSON.stringify({ url: 'https://example.com/api/spec.json' }) },
+      { kind: 'tool_result', id: 'F', result: 'The page describes…' },
+      // execute_* is not a shell despite containing "exec".
+      { kind: 'tool_call', id: 'S', name: 'execute_sql', args: JSON.stringify({ query: 'select 1' }) },
+      { kind: 'tool_result', id: 'S', result: '1' },
+    ]));
+    await flush();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+    const bodyOf = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+
+    expect(titleOf('T')).toContain('跑一遍回归');
+    expect(titleOf('A')).toContain('Find the auth flow');
+    expect(bodyOf('F').language).toBeUndefined(); // not "json"
+    expect(bodyOf('S').language).toBeUndefined(); // not "bash"
+  });
+
+  it('does not highlight search results by the pattern\'s extension', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // A pattern ending in an extension says what to FIND; the result is a
+      // match list, not a file of that type.
+      { kind: 'tool_call', id: 'G', name: 'Grep', args: JSON.stringify({ pattern: 'readme\\.md' }) },
+      { kind: 'tool_result', id: 'G', result: 'docs/readme.md:1:# Title' },
+      { kind: 'tool_call', id: 'B', name: 'Glob', args: JSON.stringify({ pattern: 'src/**/*.ts' }) },
+      { kind: 'tool_result', id: 'B', result: 'src/daemon.ts\nsrc/worker.ts' },
+    ]));
+    await flush();
+    const bodyOf = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+    expect(bodyOf('G').language).toBeUndefined(); // not "markdown"
+    expect(bodyOf('B').language).toBeUndefined(); // not "typescript"
+    // The pattern still shows in the title — only the highlight is suppressed.
+    expect(titleOf('G')).toContain('readme');
+    expect(titleOf('B')).toContain('src/**/*.ts');
+  });
+
+  it('bounds an overlong command so the title stays one readable line', async () => {
+    const ds = makeDs();
+    const long = `echo ${'x'.repeat(500)}`;
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'L1', name: 'Bash', args: JSON.stringify({ command: long }) },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title.length).toBeLessThan(120);
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).toContain('echo xxx');
+    // The untruncated args still go out on the wire — cheap, and a future
+    // client may render them.
+    const args = pushedEvents().find(e => e.type === 'TOOL_CALL_ARGS')!;
+    expect(args.content.delta).toContain('x'.repeat(500));
   });
 
   it('coalesces bursts to the latest entry list (single in-flight pump)', async () => {

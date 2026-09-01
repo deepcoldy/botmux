@@ -52,6 +52,24 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('发送失败: ${describeSendFailure(err)}');
   });
 
+  it('parses and relays an explicit layout before building the canonical reply card', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const parseAt = cmdSend.indexOf('const replyLayoutRequest = parseReplyLayoutRequest(rest);');
+    const relayAt = cmdSend.indexOf('await relaySend(rest, relayDir, replyLayout);');
+
+    expect(parseAt).toBeGreaterThanOrEqual(0);
+    expect(relayAt).toBeGreaterThan(parseAt);
+    expect(cmdSend).toContain('let replyLayout = replyLayoutRequest.layout;');
+    expect(cmdSend).toContain('extractFirstReplyCardHeading(text)');
+    expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
+    expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
+    expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
+    expect(cmdSend).toContain('createReplyCard(elements, layoutHeader)');
+    expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
+  });
+
   it('strips trailing memory citations before relay and direct-send rendering', () => {
     const relayStart = cliSource.indexOf('async function relaySend(');
     const relayEnd = cliSource.indexOf('\nfunction currentBotIsApiOnly', relayStart);
@@ -257,6 +275,7 @@ describe('cmdSend hook context wiring', () => {
       process.stdout.write(JSON.stringify({
         command: argv[0],
         content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        layout: argv.includes('--layout') ? argv[argv.indexOf('--layout') + 1] : null,
         responseKind: argv.includes('--response-kind') ? argv[argv.indexOf('--response-kind') + 1] : null,
         sessionId: argv[argv.indexOf('--session-id') + 1],
         turnId: process.env.BOTMUX_TURN_ID,
@@ -281,7 +300,7 @@ describe('cmdSend hook context wiring', () => {
     });
     try {
       const result = await runCli(
-        ['send', 'relay body', '--session-id', 'session', '--no-mention'],
+        ['send', 'relay body', '--layout', 'risk', '--session-id', 'session', '--no-mention'],
         {
           ...process.env,
           SESSION_DATA_DIR: dataDir,
@@ -295,11 +314,32 @@ describe('cmdSend hook context wiring', () => {
       expect(JSON.parse(result.stdout)).toEqual({
         command: 'send',
         content: 'relay body',
+        layout: 'risk',
         responseKind: null,
         sessionId: 'session',
         turnId: 'turn-live',
         dispatchAttempt: '4',
         requiresLedger: '1',
+      });
+
+      const layoutOff = await runCli(
+        ['send', 'relay body without shell', '--layout', 'risk', '--session-id', 'session', '--no-mention'],
+        {
+          ...process.env,
+          SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_SEND_RELAY: outbox,
+          BOTMUX_HOST_RELAY_AUTHORIZED: '',
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: 'app-a',
+          BOTMUX_REPLY_STYLE: JSON.stringify({ layout: false }),
+        },
+      );
+      expect(layoutOff.code, layoutOff.stderr).toBe(0);
+      expect(layoutOff.stderr).toContain('当前 Bot 已关闭 layout');
+      expect(JSON.parse(layoutOff.stdout)).toMatchObject({
+        content: 'relay body without shell',
+        layout: null,
       });
     } finally {
       stop();

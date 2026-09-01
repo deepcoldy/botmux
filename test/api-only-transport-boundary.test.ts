@@ -28,6 +28,8 @@ vi.mock('../src/services/groups-store.js', async (importOriginal) => {
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { larkTransportEnabled, isHttpVirtualSession, type DaemonSession } from '../src/core/types.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const APP = 'local_riff';
 
@@ -65,6 +67,31 @@ describe('larkTransportEnabled — central no-Feishu predicate', () => {
     expect(isHttpVirtualSession('http_wait_x')).toBe(true);
     expect(isHttpVirtualSession('oc_real')).toBe(false);
     expect(isHttpVirtualSession('doc:tok')).toBe(false);
+  });
+  it('tolerates a nullish chatId (a missing surface is not an HTTP virtual chat)', () => {
+    // Hardened when converging worker.ts's four inline copies onto this predicate:
+    // one site (screenshot-upload gate) fed a `msg.chatId` that could be undefined,
+    // and inline code guarded with `?.` — so the central helper must not throw.
+    expect(isHttpVirtualSession(undefined)).toBe(false);
+    expect(isHttpVirtualSession(null)).toBe(false);
+    // A nullish chatId with a non-apiOnly bot ⇒ transport still enabled (no crash).
+    expect(larkTransportEnabled({ chatId: undefined, apiOnly: false })).toBe(true);
+    expect(larkTransportEnabled({ chatId: undefined, apiOnly: true })).toBe(false);
+  });
+  it('keeps `chatId` a REQUIRED key so omitting it cannot silently fail open', () => {
+    // Tolerating a nullish VALUE (above) must not become tolerating a missing KEY.
+    // This is a fail-closed gate: `larkTransportEnabled({ apiOnly: false })` would
+    // read as "transport enabled", so the omission has to be a compile error.
+    // Asserted on the source because a type-level mistake cannot be caught at
+    // runtime — the signature must stay `chatId: string | null | undefined`.
+    const src = readFileSync(resolve('src/core/types.ts'), 'utf8');
+    const sig = /export function larkTransportEnabled\(\s*ds:\s*\{([^}]*)\}/.exec(src);
+    expect(sig, 'larkTransportEnabled signature not found').not.toBeNull();
+    // `chatId:` (required), NOT `chatId?:` (optional).
+    expect(sig![1]).toMatch(/\bchatId\s*:/);
+    expect(sig![1]).not.toMatch(/\bchatId\s*\?\s*:/);
+    // …and the nullable value form is still there, so the tolerance above holds.
+    expect(sig![1]).toMatch(/\bchatId\s*:\s*string\s*\|\s*null\s*\|\s*undefined/);
   });
 });
 

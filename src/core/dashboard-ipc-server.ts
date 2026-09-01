@@ -230,6 +230,11 @@ import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, read
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
+import {
+  normalizeSparseReplyStyleConfig,
+  REPLY_STYLE_REQUEST_MAX_BYTES,
+} from '../dashboard/reply-style.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -3887,6 +3892,12 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
   const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
+  let replyStyle: ReplyStyleConfig | null = null;
+  try {
+    const normalized = normalizeSparseReplyStyleConfig((getBot(cachedLarkAppId).config as any).replyStyle);
+    replyStyle = normalized.config ?? null;
+    for (const warning of normalized.warnings) logger.warn(`[reply-style] ${warning}`);
+  } catch { /* missing registry entry → built-in defaults */ }
   let p2pMode: 'thread' | 'chat' | 'group' = 'chat';
   try {
     const configured = getBot(cachedLarkAppId).config.p2pMode;
@@ -4026,6 +4037,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     defaultWorkingDirAutoWorktree,
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
+    replyStyle,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     codexAuthSync,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
@@ -4307,6 +4319,57 @@ ipcRoute('PUT', '/api/bot-brand-label', async (req, res) => {
   const r = await brandStore.updateBotBrandLabel(cachedLarkAppId, next);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, brandLabel: r.brandLabel });
+});
+
+// Sparse per-bot reply-card style. Invalid hand edits are deliberately
+// normalized field-by-field: cosmetic configuration must never make sends or
+// the Dashboard fail. Missing/default fields are removed from bots.json.
+ipcRoute('PUT', '/api/bot-reply-style', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody<unknown>(req, REPLY_STYLE_REQUEST_MAX_BYTES); }
+  catch (err) {
+    if (err instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!hasExactSafeJsonKeys(body, ['replyStyle'])) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+  if (
+    body.replyStyle !== null
+    && (typeof body.replyStyle !== 'object' || Array.isArray(body.replyStyle))
+  ) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+
+  const normalized = normalizeSparseReplyStyleConfig(body.replyStyle);
+  const next = normalized.config;
+  try {
+    const persisted = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
+      if (next) entry.replyStyle = next;
+      else delete entry.replyStyle;
+      return { write: true, result: next ?? null };
+    });
+    if (!persisted.ok) return jsonRes(res, 400, { ok: false, error: persisted.reason });
+    // Keep the daemon registry aligned with disk so newly spawned or restarted
+    // workers observe the change without requiring a daemon restart. Existing
+    // workers intentionally retain their spawn-time BOTMUX_REPLY_STYLE snapshot.
+    try {
+      const liveConfig = getBot(cachedLarkAppId).config as any;
+      if (next) liveConfig.replyStyle = next;
+      else delete liveConfig.replyStyle;
+    } catch { /* disk remains authoritative */ }
+    for (const warning of normalized.warnings) logger.warn(`[reply-style] ${warning}`);
+    jsonRes(res, 200, {
+      ok: true,
+      replyStyle: persisted.result,
+      ...(normalized.warnings.length > 0 ? { warnings: normalized.warnings } : {}),
+    });
+  } catch (err: any) {
+    jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 // 机器人改名（dashboard 档案头 ✎ 入口）。Body `{ name: string }`。

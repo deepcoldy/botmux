@@ -59,6 +59,23 @@ import {
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import {
+  REPLY_HEADER_COLORS,
+  REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
+  REPLY_LAYOUTS,
+  REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
+  REPLY_THEMES,
+  type ReplyHeaderColor,
+  type ReplyLayout,
+  type ReplyTheme,
+} from '../../im/lark/reply-card-style.js';
+import {
+  clampUnicodeCodePoints,
+  replyStyleConfigFromDraft,
+  replyStyleDraftFromConfig,
+  replyStyleDraftHasBlankCustomTag,
+  type ReplyTagMode,
+} from './reply-style-form.js';
 
 /** 会话群标签名的输入上限，与服务端 `MAX_SESSION_TAG_NAME_CODEPOINTS`
  *  （services/feed-group-tagger.ts）保持一致。这里不 import 那个常量：该模块会连带
@@ -1070,6 +1087,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
+            <section className="bd-tile bd-tile-wide"><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -5827,6 +5845,212 @@ function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <button type="button" className="primary" data-action="save-brand" disabled={busy} onClick={() => void save(input)}>{tr('botDefaults.brandSave')}</button>
         <button type="button" data-action="reset-brand" disabled={busy} onClick={() => void save(null)}>{tr('botDefaults.brandReset')}</button>
         <StatusSpan status={status} attr={{ 'data-brand-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+const REPLY_LAYOUT_LABEL_KEYS: Record<ReplyLayout, string> = {
+  result: 'botDefaults.replyStyleLayout.result',
+  progress: 'botDefaults.replyStyleLayout.progress',
+  risk: 'botDefaults.replyStyleLayout.risk',
+  blocked: 'botDefaults.replyStyleLayout.blocked',
+  handoff: 'botDefaults.replyStyleLayout.handoff',
+};
+
+function ReplyStyleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [draft, setDraft] = useState(() => replyStyleDraftFromConfig(props.bot.replyStyle));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setDraft(replyStyleDraftFromConfig(props.bot.replyStyle));
+    setStatus(null);
+  }, [props.bot.replyStyle]);
+
+  const themeOptions = REPLY_THEMES.map(theme => ({
+    value: theme,
+    label: tr(`botDefaults.replyStyleTheme.${theme}`),
+  }));
+  const tagModeOptions: Array<{ value: ReplyTagMode; label: string }> = [
+    { value: 'inherit', label: tr('botDefaults.replyStyleTag.inherit') },
+    { value: 'hidden', label: tr('botDefaults.replyStyleTag.hidden') },
+    { value: 'custom', label: tr('botDefaults.replyStyleTag.custom') },
+  ];
+
+  async function save(): Promise<void> {
+    setStatus(null);
+    if (replyStyleDraftHasBlankCustomTag(draft)) {
+      setStatus({ text: `✗ ${tr('botDefaults.replyStyleCustomTagRequired')}` });
+      return;
+    }
+    setBusy(true);
+    try {
+      const replyStyle = replyStyleConfigFromDraft(draft) ?? null;
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/reply-style`,
+        { replyStyle },
+      );
+      if (!res.ok || !res.body.ok) {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      const next = res.body.replyStyle ?? null;
+      setDraft(replyStyleDraftFromConfig(next));
+      props.patchBot(props.bot.larkAppId, { replyStyle: next });
+      const warningCount = Array.isArray(res.body.warnings) ? res.body.warnings.length : 0;
+      setStatus({
+        text: `✓ ${warningCount > 0
+          ? tr('botDefaults.replyStyleSavedWithWarnings', { count: warningCount })
+          : tr('botDefaults.replyStyleSaved')}`,
+        ok: warningCount === 0,
+      });
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-reply-style" aria-busy={busy}>
+      <h3 className="bd-section-title">
+        <FieldTitle help={tr('botDefaults.replyStyleHelp')}>{tr('botDefaults.sectionReplyStyle')}</FieldTitle>
+      </h3>
+      <div className="bd-reply-style-basics">
+        <ToggleRow
+          checked={draft.recipes}
+          disabled={busy}
+          title={tr('botDefaults.replyStyleRecipes')}
+          help={tr('botDefaults.replyStyleRecipesHelp')}
+          description={tr('botDefaults.replyStyleRecipesDescription')}
+          dataAction="reply-style-recipes"
+          onChange={recipes => setDraft(current => ({ ...current, recipes }))}
+        />
+        <ToggleRow
+          checked={draft.layout}
+          disabled={busy}
+          title={tr('botDefaults.replyStyleLayoutShell')}
+          help={tr('botDefaults.replyStyleLayoutShellHelp')}
+          description={tr('botDefaults.replyStyleLayoutShellDescription')}
+          dataAction="reply-style-layout"
+          onChange={layout => setDraft(current => ({ ...current, layout }))}
+        />
+      </div>
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.replyStyleThemeHelp')}>{tr('botDefaults.replyStyleTheme')}</FieldTitle>
+          <DropdownField<ReplyTheme>
+            dataInput="replyStyle.theme"
+            ariaLabel={tr('botDefaults.replyStyleTheme')}
+            value={draft.theme}
+            disabled={busy}
+            options={themeOptions}
+            onChange={theme => setDraft(current => ({ ...current, theme }))}
+          />
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.replyStyleRecipePromptHelp', { max: REPLY_RECIPE_PROMPT_MAX_CODEPOINTS })}>{tr('botDefaults.replyStyleRecipePrompt')}</FieldTitle>
+          <textarea
+            data-input="replyStyle.recipePrompt"
+            rows={4}
+            maxLength={REPLY_RECIPE_PROMPT_MAX_CODEPOINTS * 2}
+            value={draft.recipePrompt}
+            disabled={busy}
+            placeholder={tr('botDefaults.replyStyleRecipePromptPlaceholder')}
+            onChange={event => {
+              const recipePrompt = clampUnicodeCodePoints(
+                event.currentTarget.value,
+                REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
+              );
+              setDraft(current => ({ ...current, recipePrompt }));
+            }}
+          />
+        </label>
+      </div>
+      <div className="bd-reply-style-layouts">
+        <h4 className="bd-subsection-title">
+          <FieldTitle help={tr('botDefaults.replyStyleLayoutsHelp', { max: REPLY_LAYOUT_TAG_MAX_CODEPOINTS })}>{tr('botDefaults.replyStyleLayouts')}</FieldTitle>
+        </h4>
+        {REPLY_LAYOUTS.map(layout => {
+          const colorOptions: Array<{ value: ReplyHeaderColor | ''; label: string }> = [
+            { value: '', label: tr('botDefaults.replyStyleColor.inherit') },
+            ...REPLY_HEADER_COLORS
+              .filter(color => !(layout === 'handoff' && color === 'grey'))
+              .map(color => ({ value: color, label: tr(`botDefaults.replyStyleColor.${color}`) })),
+          ];
+          const tagMode = draft.layoutTagModes[layout];
+          return (
+            <div
+              className="bd-reply-style-layout"
+              data-reply-layout={layout}
+              role="group"
+              aria-label={tr(REPLY_LAYOUT_LABEL_KEYS[layout])}
+              key={layout}
+            >
+              <strong className="bd-reply-style-layout-name">{tr(REPLY_LAYOUT_LABEL_KEYS[layout])}</strong>
+              <div className="bd-field">
+                <span>{tr('botDefaults.replyStyleColor')}</span>
+                <DropdownField<ReplyHeaderColor | ''>
+                  dataInput={`replyStyle.layoutColors.${layout}`}
+                  ariaLabel={`${tr(REPLY_LAYOUT_LABEL_KEYS[layout])} ${tr('botDefaults.replyStyleColor')}`}
+                  value={draft.layoutColors[layout]}
+                  disabled={busy}
+                  options={colorOptions}
+                  onChange={color => setDraft(current => ({
+                    ...current,
+                    layoutColors: { ...current.layoutColors, [layout]: color },
+                  }))}
+                />
+              </div>
+              <div className="bd-field">
+                <span>{tr('botDefaults.replyStyleTag')}</span>
+                <DropdownField<ReplyTagMode>
+                  dataInput={`replyStyle.layoutTagModes.${layout}`}
+                  ariaLabel={`${tr(REPLY_LAYOUT_LABEL_KEYS[layout])} ${tr('botDefaults.replyStyleTag')}`}
+                  value={tagMode}
+                  disabled={busy}
+                  options={tagModeOptions}
+                  onChange={mode => setDraft(current => ({
+                    ...current,
+                    layoutTagModes: { ...current.layoutTagModes, [layout]: mode },
+                  }))}
+                />
+              </div>
+              <label className="bd-field bd-reply-style-custom-tag" hidden={tagMode !== 'custom'}>
+                <span>{tr('botDefaults.replyStyleCustomTag')}</span>
+                <input
+                  type="text"
+                  data-input={`replyStyle.layoutTags.${layout}`}
+                  maxLength={REPLY_LAYOUT_TAG_MAX_CODEPOINTS * 2}
+                  value={draft.layoutTags[layout]}
+                  disabled={busy || tagMode !== 'custom'}
+                  placeholder={tr('botDefaults.replyStyleCustomTagPlaceholder')}
+                  onChange={event => {
+                    const tag = clampUnicodeCodePoints(
+                      event.currentTarget.value,
+                      REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
+                    );
+                    setDraft(current => ({
+                      ...current,
+                      layoutTags: { ...current.layoutTags, [layout]: tag },
+                    }));
+                  }}
+                />
+              </label>
+            </div>
+          );
+        })}
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-reply-style" disabled={busy} onClick={() => void save()}>
+          {tr('botDefaults.replyStyleSave')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-reply-style-status': '' }} />
       </div>
     </section>
   );

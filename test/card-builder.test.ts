@@ -93,6 +93,12 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
       .filter((e: any) => e.tag === 'interactive_container')
       .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
 
+  it('uses Card JSON 2.0 fill width instead of the legacy wide-screen field', () => {
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en'));
+    expect(card.schema).toBe('2.0');
+    expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+  });
+
   it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',

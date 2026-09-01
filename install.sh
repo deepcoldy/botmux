@@ -211,50 +211,65 @@ append_path_line() {  # $1=file  $2=line
   printf '%s\n' "✓ added $INSTALL_DIR to PATH in $1"
 }
 
-case ":$PATH:" in
-  *":$INSTALL_DIR:"*) : ;;  # already on PATH
+# ⚠️ DO NOT WRAP THIS IN A `$PATH` CHECK. It used to be inside
+#   case ":$PATH:" in *":$INSTALL_DIR:"*) : ;;  # already on PATH
+# which asks "is INSTALL_DIR on the PATH of the process running the installer?" —
+# the wrong question. What decides whether `botmux` works is whether the user's
+# FUTURE shells get it, i.e. whether a startup file says so. The two come apart
+# whenever the installing shell has INSTALL_DIR on PATH transiently, and botmux
+# itself creates exactly that situation: the daemon prepends ~/.botmux/bin to the
+# PATH of every CLI session it spawns (5 × prependBotmuxBin). So running this
+# installer from inside a botmux session wrote NO startup file and printed NO
+# hint — exit 0, and `botmux` still missing from every new terminal. MEASURED
+# with an isolated HOME: with INSTALL_DIR pre-seeded onto PATH, not one startup
+# file was written; the same run without it correctly wrote two.
+#
+# This is the same defect #1117 fixed on the npm side; the guard rationale is
+# kept verbatim in scripts/postinstall-bin.mjs. Keep the two in step.
+#
+# Skipping the check costs nothing, because BOTH layers below are already
+# idempotent and neither depends on the current PATH:
+#   · path_line_present() — don't append a line the file already has
+#   · the emitted line itself — a `case` guard so re-sourcing cannot grow PATH
+# $PATH stays outside the quotes so it still expands; the dir cannot.
+# The STATEMENT must be idempotent too, not just the file write: an
+# unconditional prepend re-runs on every shell startup, so nested or
+# re-sourced shells keep growing PATH (measured: the dir appeared twice at
+# nesting depth 2). `case` is POSIX, needs no subshell, and the `:` padding
+# makes it an exact ELEMENT test so `<dir>-old` never satisfies it.
+posix_line="case \":\$PATH:\" in *:$QUOTED_DIR:*) ;; *) export PATH=$QUOTED_DIR\":\$PATH\" ;; esac  $MARKER"
+wrote=0
+case "$(basename "${SHELL:-}")" in
+  *zsh*)
+    # zsh reads its dotfiles from $ZDOTDIR when set, else $HOME. Writing
+    # $HOME/.zshenv on a ZDOTDIR machine produces a file zsh never reads.
+    f="${ZDOTDIR:-$HOME}/.zshenv"
+    if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+    ;;
+  *fish*)
+    # fish's config dir is $XDG_CONFIG_HOME/fish, default ~/.config/fish.
+    f="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/botmux.fish"
+    if path_line_present "$f"; then wrote=1
+    # fish: `contains` is its own exact list-element test.
+    else append_path_line "$f" "contains $QUOTED_DIR \$PATH; or set -gx PATH $QUOTED_DIR \$PATH  $MARKER" && wrote=1; fi
+    ;;
+  *bash*)
+    # .bashrc (interactive) and the login file are disjoint; write both, but
+    # never CREATE a login file that would shadow an existing one.
+    for f in "$HOME/.bashrc" "$(bash_login_file)"; do
+      if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+    done
+    ;;
   *)
-    # $PATH stays outside the quotes so it still expands; the dir cannot.
-    # The STATEMENT must be idempotent too, not just the file write: an
-    # unconditional prepend re-runs on every shell startup, so nested or
-    # re-sourced shells keep growing PATH (measured: the dir appeared twice at
-    # nesting depth 2). `case` is POSIX, needs no subshell, and the `:` padding
-    # makes it an exact ELEMENT test so `<dir>-old` never satisfies it.
-    posix_line="case \":\$PATH:\" in *:$QUOTED_DIR:*) ;; *) export PATH=$QUOTED_DIR\":\$PATH\" ;; esac  $MARKER"
-    wrote=0
-    case "$(basename "${SHELL:-}")" in
-      *zsh*)
-        # zsh reads its dotfiles from $ZDOTDIR when set, else $HOME. Writing
-        # $HOME/.zshenv on a ZDOTDIR machine produces a file zsh never reads.
-        f="${ZDOTDIR:-$HOME}/.zshenv"
-        if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
-        ;;
-      *fish*)
-        # fish's config dir is $XDG_CONFIG_HOME/fish, default ~/.config/fish.
-        f="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/botmux.fish"
-        if path_line_present "$f"; then wrote=1
-        # fish: `contains` is its own exact list-element test.
-        else append_path_line "$f" "contains $QUOTED_DIR \$PATH; or set -gx PATH $QUOTED_DIR \$PATH  $MARKER" && wrote=1; fi
-        ;;
-      *bash*)
-        # .bashrc (interactive) and the login file are disjoint; write both, but
-        # never CREATE a login file that would shadow an existing one.
-        for f in "$HOME/.bashrc" "$(bash_login_file)"; do
-          if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
-        done
-        ;;
-      *)
-        f="$HOME/.profile"
-        if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
-        ;;
-    esac
-    if [ "$wrote" = 1 ]; then
-      printf '%s\n' "  open a new terminal (or re-source that file) and \`botmux\` will be on PATH"
-    else
-      printf '\n%s\n' "Add $INSTALL_DIR to your PATH, e.g.:"
-      printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
-    fi
+    f="$HOME/.profile"
+    if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
     ;;
 esac
+if [ "$wrote" = 1 ]; then
+  printf '%s\n' "  open a new terminal (or re-source that file) and \`botmux\` will be on PATH"
+else
+  printf '\n%s\n' "Add $INSTALL_DIR to your PATH, e.g.:"
+  printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
+fi
 
 printf '\n%s\n' "Next: botmux setup"

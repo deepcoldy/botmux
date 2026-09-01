@@ -1254,6 +1254,9 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    /** Host-resolved identity for this turn. Only the caller knows where the
+     *  turn came from, so it is passed in rather than derived here. */
+    trustedCaller?: CliTurnPayload['trustedCaller'];
   },
 ): CliTurnPayload {
   const content = buildNewTopicPrompt(
@@ -1262,7 +1265,9 @@ export function buildNewTopicCliInput(
   );
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
-  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
+  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
+    return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+  }
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
@@ -1279,6 +1284,7 @@ export function buildNewTopicCliInput(
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
   return {
     content,
+    ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
@@ -1334,6 +1340,8 @@ type FollowUpOpts = {
    *  hook 模式下 sidecar 按 (turnId, fingerprint) 绑定，claim 时按权威 turnId 精确取。
    *  缺失时无法做 turn 绑定，回退 inline（避免 reminder 被剥离却无 sidecar 可领）。 */
   turnId?: string;
+  /** Host-resolved identity for this turn (see buildNewTopicCliInput). */
+  trustedCaller?: CliTurnPayload['trustedCaller'];
 };
 
 function buildFollowUpBlocks(
@@ -1535,12 +1543,14 @@ export function buildFollowUpCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return { content: ptyText };
+      return { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
     }
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
-  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
+  if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
+    return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+  }
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
@@ -1554,6 +1564,7 @@ export function buildFollowUpCliInput(
   const mentionBlock = renderMentionBlock(opts.mentions);
   return {
     content: legacyContent,
+    ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
@@ -3199,6 +3210,32 @@ export function resolveScheduledTaskExecutionPosition(
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
 }
 
+/**
+ * Identity a scheduled turn runs as: the task's creator, as captured at
+ * creation time. The turn itself is authenticated by the daemon-minted
+ * `schedule:<taskId>:<uuid>` turn id (see scheduled-turn-provenance) — this
+ * only decides WHICH identity that authenticated turn carries.
+ *
+ * Returns undefined when the task has no creator union_id (legacy tasks,
+ * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
+ * fail-closed story: with no identity on the turn, identity-bound tools refuse
+ * to run instead of falling back to the bot's own access, while everything that
+ * does not need a user identity keeps working.
+ */
+function trustedCallerForScheduledTask(
+  task: ScheduledTask,
+  larkAppId: string,
+): CliTurnPayload['trustedCaller'] | undefined {
+  if (!task.ownerUnionId) return undefined;
+  return {
+    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
+    requestUserUnionId: task.ownerUnionId,
+    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
+    source: 'schedule_creator',
+    taskId: task.id,
+  };
+}
+
 async function buildScheduledTargetNotice(params: {
   kind: 'chat' | 'thread';
   taskName: string;
@@ -3271,6 +3308,7 @@ export async function executeScheduledTask(
   // silent-output suppression, this identifies the exact shared-topic reply
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
 
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
@@ -3504,12 +3542,24 @@ export async function executeScheduledTask(
           whiteboardId: existing.session.whiteboardId,
           sessionBackendType: existing.session.backendType,
           turnId: scheduledTurnId,
+          trustedCaller: scheduledTrustedCaller,
         });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
           try {
-            if (sendWorkerInput(existing, input, scheduledTurnId)) {
+            // sendWorkerInput reads the identity from OPTS, never from the
+            // payload (unlike forkWorker, which reads payload ?? opts). Passing
+            // it on `input` alone type-checks and then silently drops it — and
+            // this is the steady-state path for a recurring task (first fire
+            // creates the session, every later fire injects into it), so the
+            // failure shape would be "worked once, silently identity-less after".
+            if (sendWorkerInput(
+              existing,
+              input,
+              scheduledTurnId,
+              scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
+            )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
               return;
             }
@@ -3592,7 +3642,7 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's

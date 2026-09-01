@@ -205,6 +205,8 @@ describe('plugin MCP Gateway', () => {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
             requestLarkAppId: 'cli_trusted',
+            source: 'schedule_creator',
+            taskId: 'task_123',
           },
           turnId: 'om_turn',
           dispatchAttempt: 2,
@@ -231,6 +233,8 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"requestUserOpenId":"ou_trusted"');
     expect(text).toContain('"requestUserUnionId":"on_trusted"');
     expect(text).toContain('"requestLarkAppId":"cli_trusted"');
+    expect(text).toContain('"source":"schedule_creator"');
+    expect(text).toContain('"taskId":"task_123"');
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
     expect(text).toContain('"customTrace":"keep-me"');
@@ -304,6 +308,8 @@ describe('plugin MCP Gateway', () => {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
             requestLarkAppId: 'cli_trusted',
+            source: 'schedule_creator',
+            taskId: 'task_123',
           },
           turnId: 'om_trusted',
           dispatchAttempt: 2,
@@ -319,6 +325,10 @@ describe('plugin MCP Gateway', () => {
     expect(trusted.get('x-botmux-trusted-app-id')).toBe('cli_trusted');
     expect(trusted.get('x-botmux-turn-id')).toBe('om_trusted');
     expect(trusted.get('x-botmux-dispatch-attempt')).toBe('2');
+    // Provenance stays on the local `_meta` path only: these headers reach every
+    // HTTP-transport MCP server, so they must not start carrying it.
+    expect(trusted.get('x-botmux-trusted-source')).toBeNull();
+    expect(trusted.get('x-botmux-task-id')).toBeNull();
   });
 
   it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {

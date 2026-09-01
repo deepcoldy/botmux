@@ -1,6 +1,7 @@
 import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
+import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
 
 export type CliOption = {
   id: string;
@@ -73,6 +74,8 @@ export type BotDefaultsRow = {
   defaultWorkingDirAutoWorktree?: boolean;
   autoboundChatCount?: number;
   brandLabel?: string | null;
+  /** Sparse per-bot reply-card style override; null means all built-in defaults. */
+  replyStyle?: ReplyStyleConfig | null;
   sandbox?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).

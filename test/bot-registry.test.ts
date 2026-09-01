@@ -215,6 +215,34 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  // allowArbitraryMention is a SAFETY switch (gates whether an agent may @
+  // arbitrary group members via email). Default MUST be off, and only a literal
+  // boolean `true` may turn it on — a mutation that flips normalization to
+  // `!== false` (default-open) or accepts the string "true" must fail here.
+  it('sets allowArbitraryMention only for a literal boolean true', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', allowArbitraryMention: true },
+    ]));
+    expect(cfg.allowArbitraryMention).toBe(true);
+  });
+
+  it('defaults allowArbitraryMention to NOT-true (undefined) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.allowArbitraryMention).not.toBe(true);
+    expect(cfg.allowArbitraryMention).toBeUndefined();
+  });
+
+  it('keeps allowArbitraryMention NOT-true for false / "true" / 1 / {} (never default-open)', () => {
+    for (const val of [false, 'true', 1, {}] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', allowArbitraryMention: val },
+      ]));
+      expect(cfg.allowArbitraryMention).not.toBe(true);
+    }
+  });
+
   it('keeps only a valid sessionOwnerReminder configuration', () => {
     const reminder = {
       enabled: true,
@@ -1090,6 +1118,58 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinSeed', () => {
   });
 });
 
+describe('parseBotConfigsFromText — replyStyle', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps a normalized sparse replyStyle without freezing theme defaults', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'a',
+      larkAppSecret: 's',
+      replyStyle: {
+        recipes: false,
+        layout: true,
+        theme: 'vivid',
+        recipePrompt: '  自定义配方  ',
+        layoutColors: { progress: 'wathet', handoff: 'grey' },
+        layoutTags: { result: '', blocked: '  等你拍板  ' },
+      },
+    }]));
+
+    expect(cfg.replyStyle).toEqual({
+      recipes: false,
+      layout: true,
+      theme: 'vivid',
+      recipePrompt: '自定义配方',
+      layoutColors: { progress: 'wathet' },
+      layoutTags: { result: '', blocked: '等你拍板' },
+    });
+  });
+
+  it('drops malformed replyStyle fields independently instead of rejecting the bot', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'a',
+      larkAppSecret: 's',
+      replyStyle: {
+        recipes: 'yes',
+        layout: false,
+        theme: 'rainbow',
+        layoutColors: { risk: 'not-a-color', progress: 'blue' },
+        layoutTags: { blocked: 1, risk: '需要你' },
+      },
+    }]));
+
+    expect(cfg.replyStyle).toEqual({
+      layout: false,
+      layoutColors: { progress: 'blue' },
+      layoutTags: { risk: '需要你' },
+    });
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {
@@ -1366,16 +1446,22 @@ describe('getBot / getBotClient', () => {
 describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   const saved = {
+    session: process.env.BOTMUX_SESSION_ID,
     app: process.env.BOTMUX_LARK_APP_ID,
     brand: process.env.BOTMUX_BRAND_LABEL,
     usageDisplay: process.env.BOTMUX_USAGE_DISPLAY,
+    replyStyle: process.env.BOTMUX_REPLY_STYLE,
   };
   beforeEach(async () => { mod = await freshImport(); });
   afterEach(() => {
+    if (saved.session === undefined) delete process.env.BOTMUX_SESSION_ID;
+    else process.env.BOTMUX_SESSION_ID = saved.session;
     if (saved.app === undefined) delete process.env.BOTMUX_LARK_APP_ID; else process.env.BOTMUX_LARK_APP_ID = saved.app;
     if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
     if (saved.usageDisplay === undefined) delete process.env.BOTMUX_USAGE_DISPLAY;
     else process.env.BOTMUX_USAGE_DISPLAY = saved.usageDisplay;
+    if (saved.replyStyle === undefined) delete process.env.BOTMUX_REPLY_STYLE;
+    else process.env.BOTMUX_REPLY_STYLE = saved.replyStyle;
   });
 
   it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {
@@ -1439,6 +1525,70 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     process.env.BOTMUX_USAGE_DISPLAY = 'off';
     mod.registerBot(makeCfg({ larkAppId: 'app_hot' }));
     expect(mod.resolveUsageDisplay('app_hot')).toBe('streaming');
+  });
+
+  it('prefers the frozen replyStyle env for its own app but never leaks it across apps', () => {
+    process.env.BOTMUX_SESSION_ID = 'session_frozen';
+    process.env.BOTMUX_LARK_APP_ID = 'app_frozen';
+    process.env.BOTMUX_REPLY_STYLE = JSON.stringify({ layout: false, theme: 'minimal' });
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_frozen',
+      replyStyle: { layout: true, theme: 'vivid' },
+    }));
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_other',
+      replyStyle: { recipes: false },
+    }));
+
+    expect(mod.resolveReplyStyleConfig('app_frozen')).toEqual({
+      layout: false,
+      theme: 'minimal',
+    });
+    expect(mod.resolveReplyStyleConfig('app_other')).toEqual({ recipes: false });
+  });
+
+  it('uses the live registry when an adopt/global send has no worker snapshot', () => {
+    delete process.env.BOTMUX_SESSION_ID;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    delete process.env.BOTMUX_REPLY_STYLE;
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_adopt_live',
+      replyStyle: { layout: true, theme: 'vivid' },
+    }));
+    expect(mod.resolveReplyStyleConfig('app_adopt_live')).toEqual({
+      layout: true,
+      theme: 'vivid',
+    });
+
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_adopt_live',
+      replyStyle: { layout: false, theme: 'minimal' },
+    }));
+    expect(mod.resolveReplyStyleConfig('app_adopt_live')).toEqual({
+      layout: false,
+      theme: 'minimal',
+    });
+  });
+
+  it('ignores stale ambient style outside a BotMux session and uses live config', () => {
+    delete process.env.BOTMUX_SESSION_ID;
+    process.env.BOTMUX_LARK_APP_ID = 'app_adopt_live';
+    process.env.BOTMUX_REPLY_STYLE = JSON.stringify({ layout: false, theme: 'minimal' });
+    mod.registerBot(makeCfg({
+      larkAppId: 'app_adopt_live',
+      replyStyle: { layout: true, theme: 'vivid' },
+    }));
+    expect(mod.resolveReplyStyleConfig('app_adopt_live')).toEqual({
+      layout: true,
+      theme: 'vivid',
+    });
+  });
+
+  it('fails soft to the default replyStyle when the injected snapshot is malformed', () => {
+    process.env.BOTMUX_SESSION_ID = 'session_frozen';
+    process.env.BOTMUX_LARK_APP_ID = 'app_frozen';
+    process.env.BOTMUX_REPLY_STYLE = '{broken';
+    expect(mod.resolveReplyStyleConfig('app_frozen')).toBeUndefined();
   });
 });
 

@@ -243,6 +243,27 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
+  it('allows only canonical reply layouts through the sandbox relay', () => {
+    for (const layout of ['result', 'progress', 'risk', 'blocked', 'handoff']) {
+      expect(validateRelayRequest({
+        contentFile: 'c.content',
+        flags: ['--layout', layout, '--no-mention'],
+      })).toMatchObject({
+        ok: true,
+        value: { flags: ['--layout', layout, '--no-mention'] },
+      });
+    }
+    for (const layout of ['diff', 'compare', 'green', '']) {
+      expect(validateRelayRequest({
+        contentFile: 'c.content',
+        flags: ['--layout', layout],
+      })).toMatchObject({
+        ok: false,
+        error: 'flag --layout must be result, progress, risk, blocked, or handoff',
+      });
+    }
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',

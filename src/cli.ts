@@ -6173,8 +6173,12 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --layout result|progress|risk|blocked|handoff
+                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
-       --mention <open_id:name>        @提及（可重复）
+       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
+                                       allowArbitraryMention 后也可传完整邮箱/手机号/union_id，
+                                       自动解析并校验其为目标群成员，否则拒发
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
        --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）
@@ -7252,16 +7256,31 @@ import {
   appendReplyCardFooterToV2Card,
   buildImageCardElements,
   buildReplyCardFooter,
+  createReplyCard,
+  extractFirstReplyCardHeading,
   prepareCardMarkdown,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
+import {
+  buildReplyLayoutHeader,
+  parseReplyLayoutRequest,
+  resolveReplyStyle,
+  type ReplyLayout,
+} from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay, getBot } from './bot-registry.js';
+import {
+  effectiveDefaultWorkingDir,
+  getBot,
+  loadBotConfigs,
+  resolveBrandLabel,
+  resolveReplyStyleConfig,
+  resolveUsageDisplay,
+} from './bot-registry.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
@@ -7269,6 +7288,8 @@ import {
   resolveQuoteTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
+  classifyMentionIdentifiers,
+  outsidersForMembership,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
   parseAttentionFlag,
@@ -7291,6 +7312,7 @@ import {
 async function relaySend(
   rest: string[],
   relayDir: string,
+  replyLayout?: ReplyLayout,
 ): Promise<void> {
   const unsupportedRouting = ['--chat-id', '--into', '--top-level']
     .filter(flag => rest.some(token => token === flag || token.startsWith(`${flag}=`)));
@@ -7406,6 +7428,10 @@ async function relaySend(
     }
     // else dropped
   }
+  // `--layout` is parsed before entering the sandbox relay. Forward only the
+  // canonical five-name form; malformed requests already warned and fell back
+  // in the child, while the host validator still rejects forged outbox input.
+  if (replyLayout) flags.push('--layout', replyLayout);
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
   // watcher 永远不会读到半截 JSON（tmp 后缀不匹配 .req.json 过滤）。
   atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
@@ -7722,6 +7748,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
     feedback: cred.feedback,
+    replyStyle: resolveReplyStyleConfig(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -7807,6 +7834,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     cliId: 'riff',
     allowedUsers: [],
     feedback,
+    replyStyle: resolveReplyStyleConfig(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -7866,6 +7894,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // central session-capability gate — same hard door every Feishu-touching CLI
   // command consults.
   assertTurnTransportOrExit('send');
+  const replyLayoutRequest = parseReplyLayoutRequest(rest);
+  if (replyLayoutRequest.warning) console.error(replyLayoutRequest.warning);
+  let replyLayout = replyLayoutRequest.layout;
   // Resolve isolation marker-first. A visible host marker always wins over a
   // leftover capability. Linux bwrap keeps its host-execution outbox; macOS
   // read isolation instead challenges the owning daemon and trusts only the
@@ -7975,7 +8006,15 @@ async function cmdSend(rest: string[]): Promise<void> {
   // The relay watcher therefore binds a short-lived host-issued capability to
   // the worker's live turn and performs the authoritative policy check.
   if (relayDir && isolatedCapabilityCtx) {
-    await relaySend(rest, relayDir);
+    if (replyLayout) {
+      const ownAppId = process.env.BOTMUX_LARK_APP_ID?.trim();
+      const style = resolveReplyStyle(ownAppId ? resolveReplyStyleConfig(ownAppId) : undefined);
+      if (!style.layout) {
+        console.error('botmux send: 当前 Bot 已关闭 layout，本次按普通回复卡发送');
+        replyLayout = undefined;
+      }
+    }
+    await relaySend(rest, relayDir, replyLayout);
     return;
   }
   if (relayDir && !liveMarkerCtx?.sessionId) {
@@ -8308,6 +8347,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(2);
     }
   }
+  if (replyLayout && (customCardRequested || asVoice || isSlashSend)) {
+    const mode = customCardRequested ? '自定义卡片' : asVoice ? '语音气泡' : '原生斜杠命令';
+    console.error(`botmux send: --layout 不作用于${mode}，本次已忽略`);
+    replyLayout = undefined;
+  }
 
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
@@ -8344,6 +8388,11 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
+  if (replyLayout && !replyStyle.layout) {
+    console.error('botmux send: 当前 Bot 已关闭 layout，本次按普通回复卡发送');
+    replyLayout = undefined;
+  }
   // Target-aware gate on the RESOLVED source session: `send --session-id <virtual>`
   // (or an apiOnly bot's session) must be refused even if the ambient env looks
   // transport-capable, and regardless of any `--chat-id` override — a no-transport
@@ -8491,6 +8540,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
     || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
   if (isOriginDocCommentTurn) {
+    if (replyLayout) {
+      console.error('botmux send: --layout 不作用于文档评论回复，本次已忽略');
+      replyLayout = undefined;
+    }
     if (!docTarget || !originSession?.larkAppId) {
       console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
       process.exit(2);
@@ -8765,6 +8818,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     try {
       // @ 落点：--mention-back → 回 @ 原评论人；--mention <open_id[:name]> → @ 指定人；
       // 否则（--no-mention / 无）不 @。文档评论里靠 person 元素渲染 @，仅首块加。
+      //
+      // 注意：这条文档评论路径在 allowArbitraryMention 闸之外（闸在下方 group
+      // 发送分支里）。这里直接取 mentionArgs[0] 冒号前的原文当 open_id 用，不做
+      // 解析/群成员校验。风险较低：文档评论的权限模型是文档权限而非群成员，且
+      // 传非 open_id（邮箱等）进去会被飞书侧拒绝渲染 person 元素（fail-closed）。
+      // 但「默认关」这个开关在此路径上不生效，若将来放开需一并过 gate。
       let docMentionOpenId: string | undefined;
       if (mentionBack) docMentionOpenId = exactDocTarget.replyToOpenId;
       else if (mentionArgs.length > 0) {
@@ -8816,17 +8875,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
 
-  // Parse mentions: "open_id:Display Name" or bare "open_id"
-  // Bare form appends a trailing <at id=...> to the message and still writes
-  // a bot-mention signal — useful when the sender doesn't know the target's
-  // display name or just wants to notify without inline substitution.
+  // Parse mentions: "identifier:Display Name" or bare "identifier".
+  // `identifier` is a literal open_id (ou_…) by default. When the bot config
+  // enables `allowArbitraryMention`, it may also be a full email / union_id
+  // (on_…) / mobile — those are resolved to this app's open_id after bot
+  // registration (see the resolve block below), then gated against the target
+  // chat's membership so an agent can only @ people who are actually in the
+  // group. With the switch off, non-open_id identifiers are rejected
+  // (default-deny: the model can't @ arbitrary people).
+  // Splitting on the FIRST ':' is safe: open_id / union_id / email / mobile
+  // never contain ':', only the optional trailing Display Name might.
   const mentions: Array<{ open_id: string; name: string }> = [];
+  const rawMentions: Array<{ identifier: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
     if (idx > 0) {
-      mentions.push({ open_id: m.slice(0, idx), name: m.slice(idx + 1) });
+      rawMentions.push({ identifier: m.slice(0, idx).trim(), name: m.slice(idx + 1) });
     } else if (m.trim()) {
-      mentions.push({ open_id: m.trim(), name: '' });
+      rawMentions.push({ identifier: m.trim(), name: '' });
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
@@ -8862,6 +8928,81 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
+  // ── --mention resolution + group-membership gate ──────────────────────────
+  // Turn each raw --mention identifier into a { open_id, name } entry.
+  //   • Literal open_id (ou_…): kept as-is, always allowed (pre-existing
+  //     behavior — an agent that already has an app-scoped open_id is trusted).
+  //   • Anything else (email / union_id / mobile): only when the bot config
+  //     sets `allowArbitraryMention: true`. Resolve via the existing
+  //     resolveAllowedUsersWithMap (email→open_id etc.), then require the
+  //     resolved open_id to be a member of the destination chat. This is the
+  //     safety gate: default-deny, and even when opened, an agent can only @
+  //     people who are actually in the group.
+  {
+    const mentionChatId = overrideChatId ?? s.chatId;
+    const arbitraryAllowed = (() => {
+      try { return getBot(s.larkAppId).config.allowArbitraryMention === true; }
+      catch { return false; }
+    })();
+    const classified = classifyMentionIdentifiers(rawMentions, arbitraryAllowed);
+    if (!classified.ok) { console.error(classified.error); process.exit(2); }
+
+    // Resolved open_id per non-open_id identifier, filled by the block below.
+    // Kept separate from the push loop so we can emit `mentions` in the ORIGINAL
+    // command-line order (rawMentions) rather than "open_ids first, resolved
+    // second" — that order leaks into atPrefix / atSummary / mentioned[] / the
+    // footer, so a mixed `--mention email:A --mention ou_b --mention email:C`
+    // must stay A, b, C.
+    const resolvedOpenId = new Map<string, string>();
+
+    const nonOpenId = classified.toResolve;
+    if (nonOpenId.length > 0) {
+      const { resolveAllowedUsersWithMap, listChatMemberOpenIds } = await import('./im/lark/client.js');
+      const { map, errored } = await resolveAllowedUsersWithMap(
+        s.larkAppId, nonOpenId.map(r => r.identifier),
+      );
+      const unresolved = nonOpenId.filter(r => !map.get(r.identifier));
+      if (unresolved.length > 0) {
+        console.error(
+          `--mention 无法解析这些标识为群内 open_id：${unresolved.map(r => r.identifier).join(', ')}` +
+          (errored ? `（部分为临时失败，可稍后重试）` : `（不存在或本 bot 不可见）`),
+        );
+        process.exit(2);
+      }
+      // Membership gate: only @ people actually in the destination chat.
+      let memberIds: Set<string>;
+      try {
+        memberIds = new Set(await listChatMemberOpenIds(s.larkAppId, mentionChatId));
+      } catch (err: any) {
+        console.error(
+          `--mention 群成员校验失败（无法读取群 ${mentionChatId} 成员，可能缺 im:chat 成员读取权限）：` +
+          `${err?.message ?? err}`,
+        );
+        process.exit(2);
+      }
+      const outsiders = outsidersForMembership(
+        nonOpenId.map(r => ({ identifier: r.identifier, openId: map.get(r.identifier)! })),
+        memberIds,
+      );
+      if (outsiders.length > 0) {
+        console.error(
+          `--mention 拒绝：以下用户不在目标群里，不能 @：` +
+          outsiders.map(o => `${o.identifier}→${o.openId}`).join(', '),
+        );
+        process.exit(2);
+      }
+      for (const r of nonOpenId) resolvedOpenId.set(r.identifier, map.get(r.identifier)!);
+    }
+
+    // Emit in original command-line order: literal open_ids pass through, the
+    // rest use their resolved open_id.
+    for (const r of rawMentions) {
+      const openId = r.identifier.startsWith('ou_') ? r.identifier : resolvedOpenId.get(r.identifier);
+      if (openId) mentions.push({ open_id: openId, name: r.name });
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
   try {
@@ -9486,6 +9627,10 @@ async function cmdSend(rest: string[]): Promise<void> {
           videoCount: videoAttachments.length,
           mentionCount: mentions.length,
         });
+    if (pureVideoSend && replyLayout) {
+      console.error('botmux send: --layout 不作用于纯视频消息，本次已忽略');
+      replyLayout = undefined;
+    }
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
     } else if (isSlashSend) {
@@ -9536,7 +9681,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
       // rendered on the footer `发送给：` line below, not the body.
-      const { text: md, usedIds } = applyInlineMentions(text, mentions);
+      const layoutBody = replyLayout
+        ? extractFirstReplyCardHeading(text)
+        : { markdown: text, heading: undefined };
+      const layoutHeader = replyLayout
+        ? buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)
+        : undefined;
+      const { text: md, usedIds } = applyInlineMentions(layoutBody.markdown, mentions);
       // Non-inlined mentions are no longer dangled as a trailing @ block at the
       // body bottom — they're consolidated onto the footer `发送给：` line below
       // (human addressee first, then explicit targets). See orderedFooterRecipients.
@@ -9612,7 +9763,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
                 elements: [footer?.element ?? {
                   tag: 'markdown',
-                  text_size: 'notation_small_v2',
+                  text_size: 'notation',
                   content: ' ',
                 }],
               },
@@ -9636,16 +9787,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-        const canonicalCard = { schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements: [...elements] } } as { schema: string; config: Record<string, unknown>; body: { direction: string; elements: unknown[] } };
+        const canonicalCard = createReplyCard([...elements], layoutHeader);
         const feedbackElement = buildFeedbackElement(feedbackPolicy);
         const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
         messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
       } else {
-        messageId = await dispatchPrimary(JSON.stringify({
-          schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements },
-        }), 'interactive');
+        messageId = await dispatchPrimary(JSON.stringify(createReplyCard(elements, layoutHeader)), 'interactive');
       }
     }
 

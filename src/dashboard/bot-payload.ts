@@ -3,6 +3,7 @@ import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
+import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -87,6 +88,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     defaultWorkingDirAutoWorktree: j?.defaultWorkingDirAutoWorktree === true,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     brandLabel: j?.brandLabel ?? null,
+    // Private Bot Defaults payload only. Keep the persisted shape sparse and
+    // drop malformed hand edits field-by-field before they reach form state.
+    replyStyle: normalizeSparseReplyStyleConfig(j?.replyStyle).config ?? null,
     sandbox: j?.sandbox === true,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {

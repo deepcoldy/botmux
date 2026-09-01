@@ -3229,6 +3229,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       prompt: '<bridge>hello from Lark</bridge>',
       turnId: 'om_refork_turn',
     }));
+    expect(init).not.toHaveProperty('replyStyle');
   });
 
   it('defaults to an observe-only empty prompt when no turn rides along (restore path)', () => {

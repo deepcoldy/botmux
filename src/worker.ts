@@ -58,6 +58,9 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+// Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
+// (the role-library gate) already binds that name in one function scope.
+import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -12767,6 +12770,15 @@ async function spawnCli(
         hasRoutingBlock: false,
       }),
     });
+    // mojo.env is intentionally the highest user-configured layer in the
+    // per-turn child, so freeze this one platform-owned session snapshot after
+    // buildEffectiveMojoConfig has merged it. Otherwise a stale raw env value
+    // could make `botmux skill show` advertise one style while `botmux send`
+    // renders another.
+    (riffBackendConfig as EffectiveMojoConfig).env = {
+      ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
+      BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+    };
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
   }
@@ -12792,6 +12804,7 @@ async function spawnCli(
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+      BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
     };
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
     // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
@@ -12837,6 +12850,11 @@ async function spawnCli(
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
     else delete mergedEnv.BOTMUX_FEEDBACK_POLICY;
+    // Reply style is likewise a host-normalized spawn snapshot. Riff's raw
+    // backendConfig.env merges last and is intentionally permissive, so freeze
+    // it again here to prevent a stale/forged remote value from desynchronising
+    // the guide and the actual card renderer.
+    mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
     // The workflow kill-switch is likewise a host-resolved snapshot. Re-freeze it
     // AFTER the merge: unlike per-bot `env` (sanitizePerBotEnv strips the BOTMUX*
     // prefix), `riffCfg.env` merges LAST and is NOT sanitized, so a stale or
@@ -12850,9 +12868,7 @@ async function spawnCli(
     // otherwise override the frozen values, restoring send capability for a
     // core-only bot or an HTTP virtual session. The host-owned session context
     // is authoritative here — these keys cannot be overridden from config.
-    const noTransport = cfg.apiOnly === true
-      || cfg.chatId?.startsWith('http_async_') === true
-      || cfg.chatId?.startsWith('http_wait_') === true;
+    const noTransport = !sessionLarkTransportEnabled({ chatId: cfg.chatId, apiOnly: cfg.apiOnly });
     if (noTransport) {
       delete mergedEnv.BOTMUX_LARK_APP_SECRET;
       mergedEnv.BOTMUX_API_ONLY = '1';
@@ -13205,11 +13221,8 @@ async function spawnCli(
   // no-transport (apiOnly bot OR HTTP virtual chat) is the ONLY session shape the
   // removed force-isolation rule ever confined; the policy-off migration arm is
   // scoped to it so an ordinary transport-enabled chat is never subjected to the
-  // tombstone requirement (no false kills). Computed locally — the merge-scoped
-  // `noTransport` above is out of scope here.
-  const noTransportSession = cfg.apiOnly === true
-    || cfg.chatId?.startsWith('http_async_') === true
-    || cfg.chatId?.startsWith('http_wait_') === true;
+  // tombstone requirement (no false kills).
+  const noTransportSession = !sessionLarkTransportEnabled({ chatId: cfg.chatId, apiOnly: cfg.apiOnly });
   const isolationCapableBackend = effectiveBackendType === 'tmux';
   // Existence via no-follow probes so a planted/tampered leaf still counts as
   // present (→ triggers cleanup / conservative kill) and can never be used to
@@ -14114,6 +14127,10 @@ async function spawnCli(
     if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
   }
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
+  // The stable native/global skill loader and `botmux send` must see one exact
+  // normalized snapshot for the lifetime of this pane. Always inject `{}` for
+  // defaults so an inherited stale value can never bleed across bot sessions.
+  childEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
   // NOTE: under read isolation `botmux send` gets this bot's secret from the worker-
   // written cred FILE in its BOT_HOME (send-cred.json, see sendCredFilePath) located
   // via the BOTMUX_LARK_APP_ID above — NOT from the env. The secret is deliberately kept OUT
@@ -14544,9 +14561,7 @@ async function spawnCli(
     // (buildFsPolicy independently re-gates roleLibrarySubtree on larkTransport;
     // this mirror keeps the worker from resolving/diagnosing a subtree the policy
     // will discard.)
-    const larkTransportEnabled = !(cfg.apiOnly === true
-      || cfg.chatId?.startsWith('http_async_') === true
-      || cfg.chatId?.startsWith('http_wait_') === true);
+    const larkTransportEnabled = sessionLarkTransportEnabled({ chatId: cfg.chatId, apiOnly: cfg.apiOnly });
     // Own role-library subtree, plus the ONE diagnosable failure mode of keying it
     // on appId: a deployment that named the per-bot dir something else (the layout
     // pre-2026-07 runbooks used) gets no rule, and "the role system EPERMs" is
@@ -18278,9 +18293,7 @@ process.on('message', async (raw: unknown) => {
       // a NORMAL bot whose turn runs in an HTTP virtual session (chatId is
       // http_async_*/http_wait_*): it has real creds so apiOnly is false, but the
       // synthetic chat has no card to attach a screenshot to.
-      apiOnlyForUpload = msg.apiOnly === true
-        || msg.chatId?.startsWith('http_async_') === true
-        || msg.chatId?.startsWith('http_wait_') === true;
+      apiOnlyForUpload = !sessionLarkTransportEnabled({ chatId: msg.chatId, apiOnly: msg.apiOnly });
       // brand 决定截图上传打哪个域（feishu / larksuite）。缺省 feishu。
       larkBrandForUpload = msg.brand === 'lark' ? 'lark' : 'feishu';
       // Resolve render dimensions BEFORE startScreenUpdates() — the

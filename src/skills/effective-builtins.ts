@@ -104,6 +104,16 @@ export function effectiveBuiltinSkillContent(name: string, shippedContent: strin
   return shippedContent;
 }
 
+/**
+ * True only when an enabled customization supplies a replacement body for the
+ * named built-in. File delivery uses this to keep an explicit user body ahead
+ * of botmux's stable session-loader indirection.
+ */
+export function isBuiltinSkillBodyOverridden(name: string): boolean {
+  if (!customizationEnabled()) return false;
+  return readCustomizationState().builtinSkills?.[name]?.body !== undefined;
+}
+
 /** True if the named built-in skill is disabled by the user (and customization
  *  is on). Lets callers that iterate names skip disabled skills cheaply. */
 export function isBuiltinSkillDisabled(name: string): boolean {
