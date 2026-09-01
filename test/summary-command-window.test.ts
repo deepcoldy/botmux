@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'bun:test';
+import * as realBotRegistry from '../src/bot-registry.js';
 
 // Regression coverage for the regular-group /summary window builder.
 //
@@ -21,9 +22,28 @@ vi.mock('../src/im/lark/client.js', () => ({
     return out.reverse();
   }),
   listThreadMessages: vi.fn(async () => []),
+  // `getMessageDetail` is NOT used by the module under test — `summary-command.ts`
+  // imports only `listChatMessagesUntil` and `listThreadMessages`. It must still be
+  // declared here because bun links named exports across the WHOLE transitive graph,
+  // and `message-parser.ts` / `identity-cache.ts` / `card-handler.ts` each do
+  // `import { getMessageDetail } from './client.js'`. Omitting it fails the entire
+  // file with "Export named 'getMessageDetail' not found" before any test runs —
+  // measured: 6 declared tests, 0 executed. vitest performs no such check.
+  getMessageDetail: vi.fn(async () => null),
 }));
 
+// Spread the REAL module, then override just the one binding this test controls.
+// bun links named exports across the whole transitive graph, and `bot-registry` has
+// 20+ named exports pulled in by modules on this graph (getLoadedConfigPath,
+// getBotClient, loadBotConfigs, …). Listing them by hand would be both unreadable
+// and permanently out of date — production adds an export, this file breaks.
+//
+// The namespace import must be at TOP LEVEL, not inside the factory: bun resolves it
+// before the factory runs. (This shape is bun-only — vitest hoists `vi.mock` above
+// imports and would read the namespace before initialisation. That is acceptable
+// here only because this file no longer runs under vitest.)
 vi.mock('../src/bot-registry.js', () => ({
+  ...realBotRegistry,
   getBotOpenId: () => BOT_OPEN_ID,
 }));
 

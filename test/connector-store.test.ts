@@ -47,7 +47,22 @@ describe('connector-store', () => {
     expect(first.createdAt).toBe('2026-05-24T00:00:00.000Z');
     expect(getConnector('conn_test', dir)?.name).toBe('Generic alerts');
 
-    const second = upsertConnector({ ...first, name: 'Renamed' }, dir);
+    // `updatedAt` is `new Date().toISOString()` — MILLISECOND resolution. Two
+    // upserts in the same millisecond legitimately produce the same stamp, so
+    // asserting they differ was really asserting "the machine is slow enough".
+    // Node happened to always cross a millisecond boundary here; bun does not, and
+    // the assertion failed with both values equal. The bug is in the test, not in
+    // the store: pin the clock so the two writes are provably in different
+    // milliseconds, which is what the assertion means to check.
+    const laterMs = Date.parse('2026-05-24T00:00:00.000Z') + 1_000;
+    const realNow = Date.now;
+    Date.now = () => laterMs;
+    let second: ReturnType<typeof upsertConnector>;
+    try {
+      second = upsertConnector({ ...first, name: 'Renamed' }, dir);
+    } finally {
+      Date.now = realNow;
+    }
     expect(second.createdAt).toBe(first.createdAt);
     expect(second.updatedAt).not.toBe(first.updatedAt);
     expect(listConnectors(dir)).toHaveLength(1);

@@ -29,8 +29,13 @@ vi.mock('node-pty', () => ({
   })),
 }));
 
-vi.mock('node:fs', async () => {
-  const memfs = await import('memfs');
+// A synchronous `require`, NOT `await import()`. An `await import()` inside a mock
+// factory HANGS under `bun test`: the file emits no output at all and is eventually
+// killed, which looks like "0 tests collected" rather than an error — the most
+// dangerous shape of failure, since it reads as success. `require` resolves at the
+// same moment for both runners and does not deadlock.
+vi.mock('node:fs', () => {
+  const memfs = require('memfs') as typeof import('memfs');
   return memfs.fs;
 });
 
