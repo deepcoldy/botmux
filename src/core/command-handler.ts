@@ -5626,7 +5626,8 @@ export async function handleCommand(
       case '/fork': {
         // Session fork (Bot 分身): non-destructive copy of a running session
         // into a SECOND independent session at a new anchor; source untouched.
-        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork <task>` hosts it in a new sibling topic of the same chat;
+        // both topic groups and native topics inside regular groups are valid.
         // `/fork --create <name>` keeps the existing new-group destination.
         const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
         const forkAppId = larkAppId ?? ds?.larkAppId;
@@ -5714,26 +5715,16 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
             break;
           }
-          // 私聊（p2pMode chat/thread 均可）与话题群支持原地子话题分身。
-          // 私聊走 chatType 判定，不调 getChatModeStrict：DM 没有 chat_mode
-          // 概念，且该接口偶发 500，隐私敏感路径才用它（见本文件上方注释）。
+          // 私聊（p2pMode chat/thread 均可）、话题群与普通群里已有独立会话的
+          // 原生话题都支持原地分身。私聊走 chatType 判定，不调 getChatModeStrict：
+          // DM 没有 chat_mode 概念，且该接口偶发 500。群聊只要求源是 thread-scope
+          // 会话（有真实 om_ 根消息）——群类型不是会话隔离边界；普通群顶层的
+          // chat-scope 连续会话仍拒绝，改用 /fork --create。
           const forkInPlaceIsP2p = ds.chatType === 'p2p';
-          if (!forkInPlaceIsP2p) {
-            if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
-              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-              break;
-            }
-            let chatMode: string | undefined;
-            try {
-              chatMode = await getChatModeStrict(forkAppId, ds.chatId);
-            } catch {
-              // Treat an unknown mode as unsupported: sending a top-level message
-              // to a regular group would not create the isolated topic we promise.
-            }
-            if (chatMode !== 'topic') {
-              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-              break;
-            }
+          if (!forkInPlaceIsP2p
+            && (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_'))) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
           }
 
           const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
@@ -6683,7 +6674,8 @@ type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
 
-/** Fork the current session into a new sub-topic of the same topic group.
+/** Fork the current thread-scoped session into a new sibling topic of the same
+ *  chat. This works for both topic groups and native topics in regular groups.
  *  The session copy itself stays in worker-pool's generic `forkSession()`;
  *  this layer only creates the Lark destination, supplies the first task turn,
  *  and records display-only lineage for the parent panel. */
