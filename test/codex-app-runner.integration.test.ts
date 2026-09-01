@@ -1383,11 +1383,23 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-b3r-noncanon-'));
     const fakeCodex = join(dir, 'fake-codex');
     const logPath = join(dir, 'requests.jsonl');
+    const fakeCodexPidPath = join(dir, 'fake-codex.pid');
     copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
     chmodSync(fakeCodex, 0o755);
     const control = new ControlCollector(dir);
     await control.listen();
-    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-noncanonical', control.bootstrap.path);
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'steer-noncanonical',
+      control.bootstrap.path,
+      { env: { FAKE_CODEX_PID_PATH: fakeCodexPidPath } },
+    );
+    let fakeCodexPid: number | undefined;
+    let fakeCodexStopped = false;
+    let runnerStopped = false;
 
     const send = (text: string, replyTurnId: string) => {
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
@@ -1402,7 +1414,26 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       await waitFor(harness, () => control.states.some(state => state.busy === false));
       send('root', 'om_nc_root');
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+
+      // Force the response and completion into one stdout chunk so this test
+      // deterministically covers the steer/completion race under CI load.
+      fakeCodexPid = Number(readFileSync(fakeCodexPidPath, 'utf8'));
+      expect(Number.isInteger(fakeCodexPid) && fakeCodexPid > 0).toBe(true);
+      process.kill(fakeCodexPid, 'SIGSTOP');
+      fakeCodexStopped = true;
       send('follow', 'om_nc_follow');
+      await waitFor(harness, () => control.markers.some(
+        marker => marker.kind === 'lifecycle' && marker.payload.kind === 'steer_attempt',
+      ));
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+      process.kill(harness.child.pid!, 'SIGSTOP');
+      runnerStopped = true;
+      process.kill(fakeCodexPid, 'SIGCONT');
+      fakeCodexStopped = false;
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/steer'));
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+      process.kill(harness.child.pid!, 'SIGCONT');
+      runnerStopped = false;
 
       // Two finals expand (group settled fail-closed), and the settlement is a
       // diagnostic conflict — never the foreign root-only answer.
@@ -1415,7 +1446,20 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const realFinal = control.finals[control.finals.length - 1];
       expect(realFinal.content).toContain('Codex App turn failed');
       expect(realFinal.content).not.toContain('foreign root-only answer');
+      expect(realFinal.nativeTurnId).not.toBe('turn-foreign-noncanonical');
+      const lifecycleKinds = control.markers
+        .filter(marker => marker.kind === 'lifecycle')
+        .map(marker => marker.payload.kind);
+      expect(lifecycleKinds.indexOf('completion_race'))
+        .toBeLessThan(lifecycleKinds.indexOf('steer_accepted'));
+      expect(readRequests(logPath).filter(r => r.method === 'thread/turns/list')).toHaveLength(1);
     } finally {
+      if (runnerStopped && harness.child.pid) {
+        try { process.kill(harness.child.pid, 'SIGCONT'); } catch { /* already exited */ }
+      }
+      if (fakeCodexStopped && fakeCodexPid) {
+        try { process.kill(fakeCodexPid, 'SIGCONT'); } catch { /* already exited */ }
+      }
       await stopChild(harness.child);
       await control.close();
       rmSync(dir, { recursive: true, force: true });

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   beginDashboardRoute,
   createDashboardRouteState,
@@ -18,6 +19,14 @@ describe('dashboard route lifecycle', () => {
     const route = findDashboardRoute('#/feedback');
     expect(route?.id).toBe('feedback');
     expect(await route?.load()).toEqual(expect.any(Function));
+  });
+
+  it('exposes the authenticated goals page in the React navigation', () => {
+    const source = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf8');
+    expect(source).toContain("id: 'goals'");
+    expect(source).toContain("href: '#/goals'");
+    expect(source).toContain("labelKey: 'nav.goals'");
+    expect(source).toMatch(/id: 'goals',[\s\S]*?manage: true,/);
   });
   it('does not run a stale lazy route renderer after a newer route commits', async () => {
     const state = createDashboardRouteState();
@@ -86,6 +95,7 @@ describe('dashboard route lifecycle', () => {
     const teamDispose = vi.fn();
     const teamManageDispose = vi.fn();
     const v3Dispose = vi.fn();
+    const goalsDispose = vi.fn();
     const insightsDispose = vi.fn();
 
     vi.doMock('../src/dashboard/web/overview-page.js', () => ({
@@ -113,6 +123,9 @@ describe('dashboard route lifecycle', () => {
     }));
     vi.doMock('../src/dashboard/web/v3-page.js', () => ({
       renderV3RunsPage: vi.fn(() => v3Dispose),
+    }));
+    vi.doMock('../src/dashboard/web/goals.js', () => ({
+      renderGoalsPage: vi.fn(() => goalsDispose),
     }));
     vi.doMock('../src/dashboard/web/insights-page.js', () => ({
       renderInsightsPage: vi.fn(() => insightsDispose),
@@ -151,6 +164,9 @@ describe('dashboard route lifecycle', () => {
     const v3Render = await routes.findDashboardRoute('#/workflows')!.load();
     expect(v3Render(root)).toBe(v3Dispose);
 
+    const goalsRender = await routes.findDashboardRoute('#/goals')!.load();
+    expect(goalsRender(root)).toBe(goalsDispose);
+
     const insightsRender = await routes.findDashboardRoute('#/insights')!.load();
     expect(insightsRender(root)).toBe(insightsDispose);
 
@@ -162,6 +178,7 @@ describe('dashboard route lifecycle', () => {
     vi.doUnmock('../src/dashboard/web/roles-page.js');
     vi.doUnmock('../src/dashboard/web/team-federation-page.js');
     vi.doUnmock('../src/dashboard/web/v3-page.js');
+    vi.doUnmock('../src/dashboard/web/goals.js');
     vi.doUnmock('../src/dashboard/web/insights-page.js');
   });
 });

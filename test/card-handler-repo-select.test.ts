@@ -702,6 +702,26 @@ describe('repo select card — plain switch', () => {
     expect(ds.pendingRepo).toBe(true);
     expect(ds.pendingPrompt).toBe('first prompt');
     expect(ds.pendingTurnId).toBeUndefined();
+  });
+
+  it('keeps the pending repo card untouched when skip_repo is clicked while a worktree is being created', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: 'hello world',
+      pendingTurnId: 'om_pending_turn',
+      repoCardMessageId: 'om_card',
+      worktreeCreating: true,
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    const result = await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(result?.toast?.content).toContain('已有一个 worktree 正在创建');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingPrompt).toBe('hello world');
+    expect(ds.pendingTurnId).toBe('om_pending_turn');
     expect(ds.repoCardMessageId).toBe('om_card');
     expect(deleteMessage).not.toHaveBeenCalled();
   });

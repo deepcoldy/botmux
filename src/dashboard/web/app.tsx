@@ -99,6 +99,7 @@ const MANAGE_ROUTES = [
   'insights',
   'feedback',
   'whiteboards',
+  'goals',
 ];
 
 const NAV_ITEMS: NavItem[] = [
@@ -163,6 +164,19 @@ const NAV_ITEMS: NavItem[] = [
       </>
     ),
   },
+  {
+    id: 'goals',
+    href: '#/goals',
+    labelKey: 'nav.goals',
+    manage: true,
+    icon: (
+      <>
+        <circle cx="8" cy="8" r="6.2" />
+        <circle cx="8" cy="8" r="2.8" />
+        <path d="M8 1.8V4M8 12v2.2M1.8 8H4M12 8h2.2" />
+      </>
+    ),
+  },
   { id: 'schedules', href: '#/schedules', labelKey: 'nav.schedules', icon: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.4 1.6" /></> },
   { id: 'whiteboards', href: '#/whiteboards', labelKey: 'nav.whiteboards', manage: true, icon: <><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></> },
   { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
@@ -183,7 +197,7 @@ const NAV_ITEMS: NavItem[] = [
  */
 const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
-  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
+  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'goals', 'office'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'bot-defaults'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },

@@ -64,6 +64,7 @@ describe('Slice C0 — chat side-effect isolation', () => {
     ['whiteboard', 'status'],
     ['vc-agent', 'join'],
     ['actor', 'current', '--json'],
+    ['goal', 'start', '--title', 'x', '--worker', 'bot'],
   ])('botmux %s is denied by the workflow root-command allowlist', (...args) => {
     const out = runCli(args, { BOTMUX_WORKFLOW: '1' });
     expect(out.status).toBe(2);

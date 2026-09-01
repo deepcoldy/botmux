@@ -284,4 +284,38 @@ describe('botmux whiteboard CLI', () => {
     expect(runCli(['whiteboard', 'update', '--id', 'nocas_board'], 'second\n').status).toBe(0);
     expect(runCli(['whiteboard', 'read', '--id', 'nocas_board']).stdout).toContain('second');
   });
+
+  it('goal charter works while global whiteboard injection feature is disabled', () => {
+    expect(runCli(['whiteboard', 'disable']).status).toBe(0);
+    const regular = runCli(['whiteboard', 'current', '--create', '--chat-id', 'goal-disabled']);
+    expect(regular.status).not.toBe(0);
+    expect(regular.stderr).toContain('Whiteboard is disabled');
+
+    const current = runCli(['goal', 'charter', 'current', '--goal', 'goal-disabled', '--create', '--title', 'Goal Disabled']);
+    expect(current.status).toBe(0);
+    const parsedCurrent = JSON.parse(current.stdout);
+    expect(parsedCurrent.enabled).toBe(false);
+    expect(parsedCurrent.goal).toBe('goal-disabled');
+    expect(parsedCurrent.current.id).toMatch(/^goal_[0-9a-f]{16}$/);
+    expect(parsedCurrent.current.title).toBe('Goal Disabled');
+    expect(parsedCurrent.current.scope).toBe('custom');
+    expect(parsedCurrent.current.chatId).toBe('goal-disabled');
+
+    const read = runCli(['goal', 'charter', 'read', '--goal', 'goal-disabled', '--json']);
+    expect(read.status).toBe(0);
+    const base = JSON.parse(read.stdout);
+    expect(base.id).toBe(parsedCurrent.current.id);
+    expect(base.content).toContain('# 当前状态');
+
+    const update = runCli(['goal', 'charter', 'update', '--goal', 'goal-disabled', '--expected-updated-at', base.updatedAt], 'goal charter state\n');
+    expect(update.status).toBe(0);
+    const stale = runCli(['goal', 'charter', 'update', '--goal', 'goal-disabled', '--expected-updated-at', base.updatedAt], 'stale charter state\n');
+    expect(stale.status).toBe(2);
+    expect(stale.stderr).toContain('botmux goal charter read --goal goal-disabled --json');
+    expect(stale.stderr).not.toContain('botmux whiteboard read');
+    const after = runCli(['goal', 'charter', 'read', '--goal', 'goal-disabled']);
+    expect(after.status).toBe(0);
+    expect(after.stdout).toContain('goal charter state');
+    expect(after.stdout).not.toContain('stale charter state');
+  });
 });

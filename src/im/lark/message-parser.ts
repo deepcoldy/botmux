@@ -72,6 +72,9 @@ export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | 
   if (typeof id === 'object') return id.open_id || undefined;
   if (typeof id === 'string') {
     if (m?.id_type && m.id_type !== 'open_id') return undefined;
+    // Bot mentions may arrive as a bare app_id without id_type. The `cli_`
+    // prefix is unambiguous; do not persist it as an observer-scoped open_id.
+    if (!m?.id_type && id.startsWith('cli_')) return undefined;
     return id || undefined;
   }
   return undefined;
@@ -135,12 +138,13 @@ export function mentionIdType(m: any): string | undefined {
  * Keep this exhaustive: the realtime @-gate (isBotMentioned) depends on it, so
  * dropping a shape silently un-@'s a bot in that shape.
  */
-export function mentionAppId(m: any): string | undefined {
+export function mentionAppId(m: any, larkAppId?: string): string | undefined {
   if (!m || typeof m !== 'object') return undefined;
   if (typeof m.appId === 'string') return m.appId;
   if (typeof m.app_id === 'string') return m.app_id;
   const idType = mentionIdType(m);
   if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (!idType && typeof m.id === 'string' && (m.id === larkAppId || m.id.startsWith('cli_'))) return m.id;
   if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
   return undefined;
 }
@@ -210,13 +214,13 @@ export function messageMentionsBot(
   const mentions: any[] = message?.mentions ?? [];
   for (const m of mentions) {
     if (botOpenId && mentionOpenId(m) === botOpenId) return true;
-    if (larkAppId && mentionAppId(m) === larkAppId) return true;
+    if (larkAppId && mentionAppId(m, larkAppId) === larkAppId) return true;
   }
   // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
   // Realtime events carry the body in `content`; the REST message-list API
   // (poll + dashboard preview/run-preview) carries it in `body.content` — read
   // both so the @-gate is identical across all three legs.
-  if (botOpenId) {
+  if (botOpenId || larkAppId) {
     const rawContent = message?.content ?? message?.body?.content;
     try {
       const content = JSON.parse(rawContent ?? '{}');
@@ -225,7 +229,7 @@ export function messageMentionsBot(
         for (const paragraph of inner.content) {
           if (!Array.isArray(paragraph)) continue;
           for (const node of paragraph) {
-            if (node?.tag === 'at' && node.user_id === botOpenId) return true;
+            if (node?.tag === 'at' && (node.user_id === botOpenId || node.user_id === larkAppId)) return true;
           }
         }
       }

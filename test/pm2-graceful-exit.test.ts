@@ -16,12 +16,16 @@ describe('PM2 graceful exit sentinel', () => {
     expect(pm2ManagedExitConfig().stopExitCodes).not.toContain(0);
   });
 
-  it('returns the sentinel only for an explicitly marked PM2 process', () => {
-    expect(gracefulProcessExitCode({
+  it('keeps restartable PM2 signal exits outside stop_exit_codes', () => {
+    const managedEnv = {
       [PM2_GRACEFUL_EXIT_CODE_ENV]: String(PM2_GRACEFUL_EXIT_CODE),
-    })).toBe(PM2_GRACEFUL_EXIT_CODE);
-    expect(gracefulProcessExitCode({})).toBe(0);
-    expect(gracefulProcessExitCode({ [PM2_GRACEFUL_EXIT_CODE_ENV]: '0' })).toBe(0);
+    };
+    expect(gracefulProcessExitCode(true, managedEnv)).toBe(PM2_GRACEFUL_EXIT_CODE);
+    const restartableExit = gracefulProcessExitCode(false, managedEnv);
+    expect(restartableExit).toBe(0);
+    expect(pm2ManagedExitConfig().stopExitCodes).not.toContain(restartableExit);
+    expect(gracefulProcessExitCode(true, {})).toBe(0);
+    expect(gracefulProcessExitCode(true, { [PM2_GRACEFUL_EXIT_CODE_ENV]: '0' })).toBe(0);
   });
 });
 

@@ -163,6 +163,10 @@ describe('worker raw_input delivery', () => {
     expect(adoptIdx).toBeGreaterThanOrEqual(0);
     expect(nonAdoptIdx).toBeGreaterThan(adoptIdx);
     expect(sendToPtyIdx).toBeGreaterThan(nonAdoptIdx);
+  });
+
+  it('routes the follow-up through sendToPty (normal busy-queue semantics)', () => {
+    expect(region).toContain('sendToPty(msg.followUpContent!, msg.followUpTurnId, {');
     expect(region).toContain('codexAppInput: msg.followUpCodexAppInput');
   });
 

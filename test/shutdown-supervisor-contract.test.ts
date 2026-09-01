@@ -16,6 +16,7 @@ import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 const ipcServer = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
 // Contract for the built-in fleet supervisor (pm2-retired). The fleet lifecycle
@@ -36,11 +37,19 @@ describe('graceful shutdown supervisor contract', () => {
     // exit suppresses a restart identically whether pm2 or the supervisor owns it.
     expect(FLEET_GRACEFUL_EXIT_CODE).toBe(DAEMON_GRACEFUL_EXIT_CODE);
 
-    const shutdownStart = daemon.indexOf('const shutdown = async () => {');
+    const shutdownStart = daemon.indexOf(
+      'const shutdown = async (suppressPm2Restart: boolean) => {',
+    );
     const shutdownEnd = daemon.indexOf("process.on('SIGTERM'", shutdownStart);
     const shutdown = daemon.slice(shutdownStart, shutdownEnd);
-    expect(shutdown).toContain('process.exit(gracefulProcessExitCode());');
+    expect(shutdown).toContain(
+      'process.exit(gracefulProcessExitCode(suppressPm2Restart));',
+    );
     expect(shutdown).not.toContain('process.exit(0);');
+    expect(daemon).toContain("process.on('SIGINT', () => { shutdown(false)");
+    expect(daemon).toContain('shutdown: () => shutdown(true)');
+    expect(dashboard).toContain("process.on('SIGTERM', () => shutdown(true));");
+    expect(dashboard).toContain("process.on('SIGINT', () => shutdown(false));");
   });
 
   it('keeps the outer daemon shutdown budget within bounds', () => {
@@ -192,7 +201,9 @@ describe('graceful shutdown supervisor contract', () => {
   // ─── Daemon-side graceful shutdown (unchanged by the pm2→supervisor migration)
 
   it('takes one Riff snapshot, batch-persists, then generation-checks and commits before service stop', () => {
-    const start = daemon.indexOf('const shutdown = async () => {');
+    const start = daemon.indexOf(
+      'const shutdown = async (suppressPm2Restart: boolean) => {',
+    );
     const stop = daemon.indexOf('scheduler.stopScheduler();', start);
     const boundedGate = daemon.indexOf('tryWithBotTurnMutation(', start);
     const initialUnique = daemon.indexOf(

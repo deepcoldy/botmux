@@ -167,7 +167,7 @@ describe('generateCodexAppThreadTitle', () => {
         FAKE_CODEX_PID_PATH: pidPath,
         FAKE_CODEX_BEHAVIOR: 'hang-turn-completion',
       }),
-      timeoutMs: 100,
+      timeoutMs: 1000,
       detached: true,
     });
 

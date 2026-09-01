@@ -149,6 +149,17 @@ describe('bot-registry grant additions', () => {
     ]))[0].noPinStreamingCardChats).toBeUndefined();
   });
 
+  it('parseBotConfigsFromText preserves only the goal-panel handler', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'panel', larkAppSecret: 's', handler: 'goal-panel' },
+      { larkAppId: 'bad', larkAppSecret: 's', handler: 'cli' },
+      { larkAppId: 'plain', larkAppSecret: 's' },
+    ]));
+    expect(cfgs[0].handler).toBe('goal-panel');
+    expect(cfgs[1].handler).toBeUndefined();
+    expect(cfgs[2].handler).toBeUndefined();
+  });
+
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
     registerBot({ larkAppId: 'a2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com', 'ou_owner', 'ou_2'] });
     expect(getOwnerOpenId('a2')).toBe('ou_owner');

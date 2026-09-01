@@ -24,6 +24,10 @@ export interface PlatformBotInfo {
   specialties?: string[];
   /** 是否有飞书传输身份能被 @（core-only/apiOnly → false）。**自报 → 仅展示、不可信**。 */
   mentionable?: boolean;
+  /** Release/debug hint only; compatibility is decided by a2aCapabilities. */
+  botmuxVersion?: string;
+  /** Machine-readable protocol set supported by the bot's deployment. */
+  a2aCapabilities?: string[];
 }
 
 /** 平台 team-sync 下发的原始负载（校验/落盘在 platform-team-store）。 */
@@ -39,6 +43,8 @@ export interface TunnelClientOptions {
   /** 当前 dashboard token（会轮转，每次读最新） */
   getDashboardToken: () => string | null;
   getVersion: () => string;
+  /** Protocol capabilities supported by this deployment. */
+  getA2ACapabilities?: () => readonly string[];
   /** 本机的 bot 清单（每次读最新；随心跳上报） */
   getBots?: () => PlatformBotInfo[];
   /** 本机已应用的 team-sync rev（每次读最新；随 register/heartbeat 上报，平台
@@ -308,6 +314,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       type: 'register',
       name: opts.binding.name || hostname(),
       botmuxVersion: opts.getVersion(),
+      a2aCapabilities: opts.getA2ACapabilities?.() ?? [],
       dashboardToken: opts.getDashboardToken() || '',
       dashboardPort: opts.getDashboardPort(),
       directHosts: localDirectHosts(opts.getDashboardPort()),
@@ -321,6 +328,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
     safeSend(sock, {
       type: 'heartbeat',
       botmuxVersion: opts.getVersion(),
+      a2aCapabilities: opts.getA2ACapabilities?.() ?? [],
       dashboardToken: opts.getDashboardToken() || '',
       directHosts: localDirectHosts(opts.getDashboardPort()),
       memberships: teams,

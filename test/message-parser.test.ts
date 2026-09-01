@@ -1940,6 +1940,10 @@ describe('parseEventMessage: mention identity formats', () => {
     });
     expect(parsed.mentions?.[0].openId).toBeUndefined();
   });
+
+  it('does not expose a bare cli_ app_id as openId when id_type is omitted', () => {
+    expect(mentionOpenId({ id: 'cli_bot_without_type' })).toBeUndefined();
+  });
 });
 
 // ─── messageMentionsBot: single-source @-gate across realtime/poll/preview ──

@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 function reportCommandSource(): string {
   const source = readFileSync(resolve('src/cli.ts'), 'utf8');
   const start = source.indexOf('async function cmdReport(');
-  const end = source.indexOf('// ─── Exact chat-grant subcommand', start);
+  const end = source.indexOf('// ─── Verified delivery help', start);
 
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
@@ -32,7 +32,7 @@ describe('botmux report daemon IPC auth wiring', () => {
     expect(sanitize).toBeLessThan(source.indexOf('if (!content.trim())'));
     expect(sanitize).toBeLessThan(source.indexOf('report: content'));
     expect(sanitize).toBeLessThan(source.indexOf('body: { dispatchRoot: dispatchRootCandidate, content }'));
-    expect(sanitize).toBeLessThan(source.indexOf('const paras = buildReportContent({ orchOpenId: reportRecipient, content });'));
+    expect(sanitize).toBeLessThan(source.indexOf('const paras = buildReportContent({'));
   });
 
   it('routes through the authenticated source daemon when the host secret is available', () => {
@@ -58,7 +58,7 @@ describe('botmux report daemon IPC auth wiring', () => {
 
     expect(dispatchSource).toContain('path: DISPATCH_REPORT_REGISTER_ROUTE');
     expect(dispatchSource).toContain('seedText: built.seedText');
-    expect(dispatchSource).toContain('const seedId = registrationBody?.dispatchRoot');
+    expect(dispatchSource).toContain('seedId = registrationBody?.dispatchRoot');
     expect(dispatchSource).not.toContain('const seedId = await sendMessage(appId, targetChatId, built.seedText');
     expect(daemonSource).toContain("sendMessage(ds.larkAppId, targetChatId, seedText, 'text')");
   });

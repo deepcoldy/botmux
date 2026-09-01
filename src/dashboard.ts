@@ -299,8 +299,15 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
+import { CURRENT_A2A_CAPABILITIES } from './core/a2a-readiness.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
+import { buildGoalAttentionBoardWithContext, withGoalAttentionLiveRisks } from './core/goal-attention.js';
+import {
+  listGoalNotificationRetries,
+  removeGoalNotificationRetry,
+  retryGoalNotification,
+} from './services/goal-notification-retry-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
@@ -346,6 +353,7 @@ import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
 // marker would make those CLI commands fail at the workflow safety gate before
 // they can reach their own cleanup boundary.
 scrubWorkflowWorkerEnv(process.env);
+import { buildGoalBoard } from './verified-delivery/goal-board.js';
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -2518,6 +2526,25 @@ function fetchDaemonUrl(input: string | URL | Request, init?: RequestInit): Prom
   return fetchDaemonIpc(port, `${url.pathname}${url.search}`, init);
 }
 
+async function collectGoalAttentionLiveRisks(chatId?: string): Promise<any[]> {
+  const qs = chatId ? `?chatId=${encodeURIComponent(chatId)}` : '';
+  const chunks = await Promise.all(registry.list().map(async d => {
+    try {
+      const path = `/api/goals/attention/live${qs}`;
+      const upstream = await fetchDaemonIpc(d.ipcPort, path, {
+        method: 'GET',
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (!upstream.ok) return [];
+      const body = await upstream.json().catch(() => null) as { systemRisk?: any[] } | null;
+      return Array.isArray(body?.systemRisk) ? body.systemRisk : [];
+    } catch {
+      return [];
+    }
+  }));
+  return chunks.flat();
+}
+
 /** Create a Feishu group from the team UI: pick a creator daemon among the
  *  selected bots, proxy to its /api/groups/create, invite the requesting user.
  *  Surfaces invalidBotIds/invalidUserIds so the UI never implies a non-added
@@ -2582,7 +2609,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
   };
 }
 
-function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkTransportEnabled?: boolean }[] {
+function liveBots(): { larkAppId: string; botName: string; botOpenId?: string; cliId?: string; larkTransportEnabled?: boolean }[] {
   const ids = configuredCliIds();
   // core-only (apiOnly) bots have no Feishu transport → flag them so the
   // aggregated roster (and any spoke pulling it) can exclude them from group
@@ -2597,7 +2624,7 @@ function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkT
   catch { apiOnlyIds = null; }
   const base = registry.list().map(d => {
     const b = withConfiguredCliId(d, ids);
-    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+    return { larkAppId: b.larkAppId, botName: b.botName, botOpenId: b.botOpenId, cliId: b.cliId };
   });
   return resolveLiveBotTransport(base, apiOnlyIds);
 }
@@ -2798,6 +2825,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
         }
         cur.memberBots.push({
           larkAppId: d.larkAppId,
+          botOpenId: d.botOpenId,
           botName: d.botName,
           cliId: d.cliId,
           inChat: true,
@@ -2818,7 +2846,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
     const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
     for (const b of onlineBots) {
       if (!present.has(b.larkAppId)) {
-        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false, hasMessageListener: false });
+        c.memberBots.push({ larkAppId: b.larkAppId, botOpenId: b.botOpenId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false, hasMessageListener: false });
       }
     }
   }
@@ -4895,6 +4923,139 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
       return jsonRes(res, 200, { enabled: whiteboardEnabled(), whiteboards: listWhiteboards() });
     }
+    if (req.method === 'GET' && url.pathname === '/api/goals') {
+      return jsonRes(res, 200, buildGoalBoard());
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goals/attention') {
+      const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+      const board = buildGoalAttentionBoardWithContext({ chatId });
+      const liveRisks = await collectGoalAttentionLiveRisks(chatId);
+      return jsonRes(res, 200, withGoalAttentionLiveRisks(board, liveRisks));
+    }
+    if (req.method === 'GET' && url.pathname === '/api/goal-notification-retries') {
+      return jsonRes(res, 200, { records: listGoalNotificationRetries() });
+    }
+    const mGoalWatchdog = url.pathname.match(/^\/api\/goals\/([^/]+)\/watchdog$/);
+    if (req.method === 'POST' && mGoalWatchdog) {
+      const goalChatId = decodeURIComponent(mGoalWatchdog[1]);
+      let parsed: any = {};
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        parsed = {};
+      }
+      const taskId = typeof parsed?.taskId === 'string' && parsed.taskId.trim() ? parsed.taskId.trim() : undefined;
+      const reason = `dashboard_attention${taskId ? `:${taskId}` : ''}`;
+      let contacted = 0;
+      let injected = 0;
+      let reconciled = 0;
+      let revived = 0;
+      let reassigned = 0;
+      let busy = 0;
+      let rateLimited = 0;
+      let lastError: any = null;
+      await Promise.all(registry.list().map(async (d) => {
+        try {
+          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/goal/watchdog', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ goalChatId, reason }),
+            signal: AbortSignal.timeout(3_000),
+          });
+          contacted++;
+          const txt = await upstream.text();
+          let json: any = null;
+          try { json = txt ? JSON.parse(txt) : null; } catch { /* keep null */ }
+          if (!upstream.ok) {
+            lastError = json ?? { status: upstream.status, body: txt };
+            return;
+          }
+          const results = Array.isArray(json?.results) ? json.results : [];
+          injected += results.filter((r: any) => r?.status === 'injected').length;
+          reconciled += results.filter((r: any) => r?.status === 'reconciled').length;
+          revived += results.filter((r: any) => r?.status === 'revived').length;
+          reassigned += results.filter((r: any) => r?.status === 'reassigned').length;
+          busy += results.filter((r: any) => r?.status === 'busy').length;
+          rateLimited += results.filter((r: any) => r?.status === 'rate-limited').length;
+        } catch (err: any) {
+          logger.warn(`[dashboard] goal watchdog trigger failed: ${err?.message ?? String(err)}`);
+          lastError = { error: 'goal_watchdog_request_failed' };
+        }
+      }));
+      return jsonRes(res, 200, { ok: true, goalChatId, taskId, contacted, injected, reconciled, revived, reassigned, busy, rateLimited, lastError });
+    }
+    const mGoalNotificationRetry = url.pathname.match(/^\/api\/goal-notification-retries\/([^/]+)\/(retry|clear)$/);
+    if (req.method === 'POST' && mGoalNotificationRetry) {
+      const id = decodeURIComponent(mGoalNotificationRetry[1]);
+      const action = mGoalNotificationRetry[2];
+      if (action === 'retry') {
+        const record = retryGoalNotification(id);
+        if (!record) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+        const d = registry.getByAppId(record.ownerLarkAppId);
+        let triggered = false;
+        let triggerError: string | undefined;
+        if (d) {
+          try {
+            const upstream = await fetchDaemonIpc(d.ipcPort, '/api/goal-notification-retries/process', {
+              method: 'POST',
+              signal: AbortSignal.timeout(3_000),
+            });
+            triggered = upstream.ok;
+            if (!upstream.ok) triggerError = `HTTP ${upstream.status}`;
+          } catch (err: any) {
+            logger.warn(`[dashboard] goal notification retry trigger failed: ${err?.message ?? String(err)}`);
+            triggerError = 'goal_notification_retry_request_failed';
+          }
+        } else {
+          triggerError = 'owner_daemon_offline';
+        }
+        return jsonRes(res, 200, { ok: true, record, triggered, triggerError });
+      }
+      removeGoalNotificationRetry(id);
+      return jsonRes(res, 200, { ok: true });
+    }
+    const mGoalDecision = url.pathname.match(/^\/api\/goals\/([^/]+)\/decision$/);
+    if (req.method === 'POST' && mGoalDecision) {
+      const goalChatId = decodeURIComponent(mGoalDecision[1]);
+      let parsed: any;
+      try {
+        parsed = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const text = typeof parsed?.text === 'string' ? parsed.text.trim() : '';
+      const taskId = typeof parsed?.taskId === 'string' && parsed.taskId.trim() ? parsed.taskId.trim() : undefined;
+      if (!text) return jsonRes(res, 400, { ok: false, error: 'missing_text' });
+      const body = JSON.stringify({ taskId, text });
+      let contacted = 0;
+      let lastError: any = null;
+      for (const d of registry.list()) {
+        try {
+          const upstream = await fetchDaemonIpc(d.ipcPort, `/api/goals/${encodeURIComponent(goalChatId)}/decision`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body,
+            signal: AbortSignal.timeout(3_000),
+          });
+          contacted++;
+          const txt = await upstream.text();
+          let json: any = null;
+          try { json = txt ? JSON.parse(txt) : null; } catch { /* keep null */ }
+          if (upstream.ok && json?.ok) return jsonRes(res, 200, json);
+          if (json?.error !== 'no_supervisor') lastError = json ?? { status: upstream.status, body: txt };
+        } catch (err: any) {
+          logger.warn(`[dashboard] goal decision delivery failed: ${err?.message ?? String(err)}`);
+          lastError = { error: 'goal_decision_request_failed' };
+        }
+      }
+      return jsonRes(res, 404, {
+        ok: false,
+        error: 'no_supervisor',
+        goalChatId,
+        contacted,
+        lastError,
+      });
+    }
     const mWhiteboard = url.pathname.match(/^\/api\/whiteboards\/([^/]+)$/);
     if (req.method === 'GET' && mWhiteboard) {
       try {
@@ -5605,9 +5766,10 @@ const server = createServer(async (req, res) => {
       if (url.searchParams.get('view') === 'names') {
         return jsonRes(res, 200, groupsNamesMatrix(matrix));
       }
+      const publicBots = matrix.bots.map(({ botOpenId: _botOpenId, ...rest }) => rest);
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
-        bots: matrix.bots,
+        bots: authed ? matrix.bots : publicBots,
       });
     }
 
@@ -7308,7 +7470,7 @@ function readBotmuxVersion(): string {
   }
 }
 /** 读本机 bots-info.json，转成上报给平台的 bot 概要（人→机器→bot + 拉群用）。 */
-function readPlatformBotsInfo(): PlatformBotInfo[] {
+function readPlatformBotsInfo(version: string = readBotmuxVersion()): PlatformBotInfo[] {
   try {
     const fp = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(fp)) return [];
@@ -7353,6 +7515,8 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
           //    （fail-open 仅在本机自报、无跨部署放大风险；真正的 no-transport 由 apiOnly 明示）。
           specialties: e.larkAppId ? getBotSpecialties(config.session.dataDir, e.larkAppId) : [],
           mentionable: cfg?.apiOnly !== true,
+          botmuxVersion: version,
+          a2aCapabilities: [...CURRENT_A2A_CAPABILITIES],
         };
       })
       .filter((b) => b.appId);
@@ -7382,7 +7546,8 @@ function startPlatformTunnelIfBound(): void {
       getDashboardPort: () => boundDashboardPort,
       getDashboardToken: currentDashboardToken,
       getVersion: () => version,
-      getBots: () => readPlatformBotsInfo(),
+      getA2ACapabilities: () => CURRENT_A2A_CAPABILITIES,
+      getBots: () => readPlatformBotsInfo(version),
       getTeamSyncRev: () => getPlatformTeamSyncRev(config.session.dataDir),
       onTeamSync: handlePlatformTeamSync,
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
@@ -7503,7 +7668,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+function shutdown(suppressPm2Restart: boolean): void {
   codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();
@@ -7513,9 +7678,11 @@ function shutdown(): void {
   debugTerminalManager.shutdown();
   feedbackAnalyticsService?.close();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
-  server.close(() => process.exit(gracefulProcessExitCode()));
+  server.close(() => process.exit(gracefulProcessExitCode(suppressPm2Restart)));
   // Hard-exit fallback after 5s
-  setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
+  setTimeout(() => process.exit(gracefulProcessExitCode(suppressPm2Restart)), 5_000).unref();
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+// Botmux's fleet orchestrator uses SIGTERM for the dashboard; PM2 uses SIGINT
+// for rolling process management and must be allowed to autorestart it.
+process.on('SIGTERM', () => shutdown(true));
+process.on('SIGINT', () => shutdown(false));

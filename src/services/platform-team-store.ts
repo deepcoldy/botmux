@@ -25,9 +25,10 @@
  *
  * Storage: `{dataDir}/platform-team-sync.json`.
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { replaceTeamGroupsByPrefix } from './team-groups-store.js';
 
 /** teamId prefix used when mirroring platform team groups into team-groups.json. */
@@ -37,6 +38,8 @@ export interface PlatformTeamBot {
   appId: string;
   unionId?: string;
   name?: string;
+  botmuxVersion?: string;
+  a2aCapabilities?: string[];
 }
 
 export interface PlatformTeamSyncTeam {
@@ -94,7 +97,21 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
-      bots.push({ appId, unionId: unionId || undefined, name });
+      const botmuxVersion = typeof (b as Record<string, unknown>).botmuxVersion === 'string'
+        ? String((b as Record<string, unknown>).botmuxVersion).trim()
+        : '';
+      const a2aCapabilities = Array.isArray((b as Record<string, unknown>).a2aCapabilities)
+        ? ((b as Record<string, unknown>).a2aCapabilities as unknown[])
+          .filter((value): value is string => typeof value === 'string' && !!value.trim())
+          .map((value) => value.trim())
+        : undefined;
+      bots.push({
+        appId,
+        unionId: unionId || undefined,
+        name,
+        ...(botmuxVersion ? { botmuxVersion } : {}),
+        ...(a2aCapabilities ? { a2aCapabilities } : {}),
+      });
     }
   }
   const memberUnionIds = Array.isArray(t.memberUnionIds)
@@ -120,14 +137,22 @@ export function applyPlatformTeamSync(
     .map(sanitizeTeam)
     .filter((t): t is PlatformTeamSyncTeam => !!t);
   const shape: FileShape = { rev, teams, updatedAt: now };
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(shape, null, 2) + '\n');
-  replaceTeamGroupsByPrefix(
-    dataDir,
-    PLATFORM_TEAM_PREFIX,
-    teams.flatMap(t => t.groupChatIds.map(chatId => ({ teamId: `${PLATFORM_TEAM_PREFIX}${t.teamId}`, chatId }))),
-    now,
-  );
-  return { rev, teams };
+  mkdirSync(dataDir, { recursive: true });
+  return withFileLockSync(filePath(dataDir), () => {
+    // The rev file is the commit marker reported on the next heartbeat. Mirror
+    // the trust roots first, then publish the new rev: if the process crashes
+    // or the mirror write fails, the old rev remains and the platform re-pushes
+    // the full snapshot. Publishing rev first could strand stale group trust
+    // forever because subsequent heartbeats would incorrectly report success.
+    replaceTeamGroupsByPrefix(
+      dataDir,
+      PLATFORM_TEAM_PREFIX,
+      teams.flatMap(t => t.groupChatIds.map(chatId => ({ teamId: `${PLATFORM_TEAM_PREFIX}${t.teamId}`, chatId }))),
+      now,
+    );
+    atomicWriteFileSync(filePath(dataDir), JSON.stringify(shape, null, 2) + '\n');
+    return { rev, teams };
+  });
 }
 
 /** The rev of the last applied team-sync ('' when none) — reported on

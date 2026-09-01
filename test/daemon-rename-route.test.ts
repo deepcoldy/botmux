@@ -1373,6 +1373,13 @@ describe('/rename production routing — must not pre-create a session (review P
   it('new topic: passes the accepted Lark message id into the first worker', async () => {
     process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
     try {
+      registerBot({
+        larkAppId: APP,
+        larkAppSecret: 's',
+        cliId: 'claude-code',
+        allowedUsers: [OWNER],
+        defaultWorkingDir: '/tmp',
+      }).resolvedAllowedUsers = [OWNER];
       await handleNewTopic(
         makeEventData('om_workflow_new', '/workflow new 修复首轮授权'),
         makeCtx('om_workflow_new', 'om_workflow_new'),
@@ -2158,18 +2165,63 @@ describe('/rename production routing — must not pre-create a session (review P
     }
   });
 
-  it('pending raw follow-up keeps the raw root identity and durably stages an exact successor', async () => {
-    // codex ruling (merge migration): #597 replaced master's "coalesce raw root +
-    // follow-up into one raw_input IPC and rotate both turn ids" model with a
-    // 1-input:1-durable-owner FIFO. In the `pendingRepo && hasOpening` branch a
-    // same-caller raw follow-up is staged as an INDEPENDENT, persisted, exact-
-    // turn-id queuedActivationTail successor — the raw root keeps its own
-    // om_initial_raw id (rotating it would erase the exact provenance #597
-    // guarantees), and the follow-up is NOT dropped back into the legacy
-    // pendingFollowUps source buffer. This test migrates the old
-    // "don't-lose/cross-follow-up" safety goal onto the new model and closes the
-    // entry blind spot (does the pendingRepo raw root actually stage a durable
-    // successor?) that 723/789 don't cover.
+  it('thread safety-net: passes the accepted reply id into the first worker', async () => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      registerBot({
+        larkAppId: APP,
+        larkAppSecret: 's',
+        cliId: 'claude-code',
+        allowedUsers: [OWNER],
+        defaultWorkingDir: '/tmp',
+      }).resolvedAllowedUsers = [OWNER];
+      await handleThreadReply(
+        makeEventData('om_workflow_reply', '/workflow new 修复首轮授权', 'om_fresh_root'),
+        makeCtx('om_fresh_root', 'om_workflow_reply'),
+      );
+
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+        turnId: 'om_workflow_reply',
+      }));
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it('live passthrough binds raw input and reply metadata to the accepted message', async () => {
+    const send = vi.fn();
+    const ds = seedLiveChatSession(send);
+    const messageId = 'om_model_turn';
+    const replyRootId = 'om_model_reply_root';
+
+    await handleThreadReply(
+      makeEventData(messageId, '/model opus', replyRootId),
+      {
+        chatId: CHAT,
+        messageId,
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        replyRootId,
+        larkAppId: APP,
+      },
+    );
+
+    expect(send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/model opus',
+      turnId: messageId,
+    });
+    expect(ds.session.quoteTargetId).toBe(messageId);
+    expect(ds.session.quoteTargetSenderOpenId).toBe(OWNER);
+    expect(ds.session.lastCallerOpenId).toBe(OWNER);
+    expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: replyRootId, turnId: messageId });
+    expect(ds.session.currentReplyTarget).toMatchObject({ rootMessageId: replyRootId, turnId: messageId });
+    expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('pending raw same-caller follow-up keeps the raw root and stages an exact successor', async () => {
     const anchor = 'om_pending_raw_root';
     const ds = seedPendingRawSession(anchor);
     const messageId = 'om_pending_raw_followup';

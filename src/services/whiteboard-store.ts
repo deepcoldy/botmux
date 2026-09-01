@@ -39,6 +39,10 @@ export interface EnsureWhiteboardInput extends WhiteboardBindingInput {
   title?: string;
 }
 
+interface WhiteboardAccessOptions {
+  allowDisabled?: boolean;
+}
+
 export interface WhiteboardSummary extends WhiteboardMeta {
   path: string;
   preview: string;
@@ -265,8 +269,8 @@ export function ensureDefaultWhiteboard(input: EnsureWhiteboardInput): Whiteboar
   });
 }
 
-export function createWhiteboard(input: EnsureWhiteboardInput & { id?: string; scope?: WhiteboardScope }): WhiteboardMeta {
-  if (!whiteboardEnabled()) throw new Error('whiteboard_disabled');
+export function createWhiteboard(input: EnsureWhiteboardInput & { id?: string; scope?: WhiteboardScope }, opts?: WhiteboardAccessOptions): WhiteboardMeta {
+  if (!opts?.allowDisabled && !whiteboardEnabled()) throw new Error('whiteboard_disabled');
   return withIndexLock(() => {
     const index = readIndex();
     const id = input.id ? safeId(input.id) : `wb_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
@@ -385,8 +389,8 @@ function rotateWhiteboardLogIfNeeded(id: string, incomingBytes = 0): void {
   renameSync(fp, join(dir, 'log.1.jsonl'));
 }
 
-export function writeWhiteboard(id: string, content: string, opts?: { actor?: string; kind?: string; expectedUpdatedAt?: string }): WhiteboardMeta {
-  if (!whiteboardEnabled()) throw new Error('whiteboard_disabled');
+export function writeWhiteboard(id: string, content: string, opts?: { actor?: string; kind?: string; expectedUpdatedAt?: string; allowDisabled?: boolean }): WhiteboardMeta {
+  if (!opts?.allowDisabled && !whiteboardEnabled()) throw new Error('whiteboard_disabled');
   const clean = safeId(id);
   // Reject empty/whitespace-only content at the store boundary so no caller
   // (CLI flag misuse, future dashboard writes) can silently blank a shared

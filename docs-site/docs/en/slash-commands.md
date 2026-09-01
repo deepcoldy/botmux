@@ -97,6 +97,7 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 | `/adopt` | Scan the local tmux and pop up a card to select a running session to adopt |
 | `/adopt <tmux_pane>` | Directly adopt the specified pane (e.g. `/adopt 0:2.0`) |
 | `/detach` | Disconnect this topic from the adopted session (the original CLI is untouched; `/disconnect` is an alias) |
+| `@botA @botB /introduce` | Record the mentioned bots in this group's collaboration roster; this discovers routing identities only and grants no chat or operation permission |
 
 ## 🔐 User Authorization
 

@@ -3736,6 +3736,27 @@ describe('handleCommand', () => {
       expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).not.toContain('/close');
     });
 
+    it('does not consume the pending launch while a card commit owns the shared claim', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingRepoCommitInFlight: true,
+        pendingPrompt: 'hello world',
+        pendingTurnId: 'om_pending_turn',
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(getAvailableBots).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.pendingRepoCommitInFlight).toBe(true);
+      expect(ds.pendingPrompt).toBe('hello world');
+      expect(ds.pendingTurnId).toBe('om_pending_turn');
+      const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(replies).toContain('已有一个 worktree 正在创建');
+    });
+
     it('should boot the CLI idle (no prompt submitted) when launched via /repo itself', async () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
@@ -3864,6 +3885,7 @@ describe('handleCommand', () => {
           description: 'https://example.test/issue/detail/123',
         },
       });
+      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({ whiteboardId: 'wb_test' });
       expect(forkWorker).toHaveBeenCalledWith(
         ds,
         { content: 'WRAPPED:帮我看看这个 bug' },

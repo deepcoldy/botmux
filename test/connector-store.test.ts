@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   deleteConnector,
   getConnector,
@@ -41,12 +41,17 @@ function sample(id = 'conn_test'): ConnectorDefinition {
 }
 
 describe('connector-store', () => {
+  afterEach(() => vi.useRealTimers());
+
   it('upserts, reads, and deletes connector definitions', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-24T01:00:00.000Z'));
     const dir = mkdtempSync(join(tmpdir(), 'botmux-connectors-'));
     const first = upsertConnector(sample(), dir);
     expect(first.createdAt).toBe('2026-05-24T00:00:00.000Z');
     expect(getConnector('conn_test', dir)?.name).toBe('Generic alerts');
 
+    vi.setSystemTime(new Date('2026-05-24T01:00:01.000Z'));
     const second = upsertConnector({ ...first, name: 'Renamed' }, dir);
     expect(second.createdAt).toBe(first.createdAt);
     expect(second.updatedAt).not.toBe(first.updatedAt);

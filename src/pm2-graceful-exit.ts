@@ -18,9 +18,13 @@ export function pm2ManagedExitConfig(): {
   };
 }
 
-/** Keep direct/foreground launches on the conventional successful exit code. */
-export function gracefulProcessExitCode(env: NodeJS.ProcessEnv = process.env): number {
-  return env[PM2_GRACEFUL_EXIT_CODE_ENV] === String(PM2_GRACEFUL_EXIT_CODE)
+/** Only an explicit Botmux fleet stop may suppress PM2 autorestart. */
+export function gracefulProcessExitCode(
+  suppressPm2Restart: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  return suppressPm2Restart
+    && env[PM2_GRACEFUL_EXIT_CODE_ENV] === String(PM2_GRACEFUL_EXIT_CODE)
     ? PM2_GRACEFUL_EXIT_CODE
     : 0;
 }
