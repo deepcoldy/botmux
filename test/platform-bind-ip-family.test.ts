@@ -36,6 +36,8 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
     process.exitCode = undefined;
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(console.log).mockClear();
+    vi.mocked(console.error).mockClear();
   });
 
   afterEach(() => {
@@ -87,6 +89,7 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
     expect(postJson).not.toHaveBeenCalled();
     expect(readPlatformBinding).not.toHaveBeenCalled();
     expect(writePlatformBinding).not.toHaveBeenCalled();
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('宿主终端'));
+    expect(console.error).toHaveBeenCalled();
+    expect(vi.mocked(console.error).mock.calls.some(c => String(c[0]).includes('宿主终端'))).toBe(true);
   });
 });

@@ -12,7 +12,7 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -95,7 +95,7 @@ describe('dsh worker final_output integration', () => {
     const sessionId = `dsh-it-${randomBytes(4).toString('hex')}-${process.pid}`;
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -174,7 +174,7 @@ describe('dsh worker final_output integration', () => {
     const sessionId = `dsh-sb-${randomBytes(4).toString('hex')}-${process.pid}`;
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

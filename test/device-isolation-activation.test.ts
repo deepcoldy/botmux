@@ -56,16 +56,19 @@ describe('device isolation activation freeze', () => {
   });
 
   it('expires fail-safe without permanently wedging worker spawns', async () => {
-    vi.useFakeTimers();
     const callback = vi.fn();
+    const started = 1_000;
     acquireDeviceIsolationFreeze({
-      nonce: 'n'.repeat(32), inventoryGeneration: 'g1', now: Date.now(),
+      nonce: 'n'.repeat(32), inventoryGeneration: 'g1', now: started,
       leaseMs: 1_000, leaseIdFactory: () => 'lease-1',
     });
-    deferWorkerSpawnDuringDeviceIsolation('s1', callback);
-    await vi.advanceTimersByTimeAsync(1_010);
-    await vi.runAllTimersAsync();
-    expect(currentDeviceIsolationFreezeLease()).toBeNull();
-    expect(callback).toHaveBeenCalledOnce();
+    expect(deferWorkerSpawnDuringDeviceIsolation('s1', callback, started)).toBe(true);
+    // Drive expiry through the `now` argument rather than fake timers: Bun's
+    // fake clock does not move `Date.now()`, so `setTimeout` + `Date.now()`
+    // fail-safes never fire under `bun test`. Passing the scheduled expiry
+    // instant is the same branch production takes when the timer fires.
+    expect(currentDeviceIsolationFreezeLease(started + 1_010)).toBeNull();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(callback).toHaveBeenCalledTimes(1);
   });
 });

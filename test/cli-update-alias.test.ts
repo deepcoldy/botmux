@@ -45,8 +45,11 @@ describe('botmux update alias', () => {
     // after the banner, so the test never runs a real pull/build/restart.
     expect(upgrade.status).toBe(1);
     expect(upgrade.stdout).toContain('本地 checkout 更新');
-    // The core contract: `update` is a pure alias of `upgrade`.
-    expect(update).toEqual(upgrade);
+    // The core contract: `update` is a pure alias of `upgrade`. Compare the
+    // observable CLI output, not the whole spawnSync result — bun adds extra
+    // enumerable fields (`resourceUsage`, …) that differ across two invocations.
+    expect(update.status).toBe(upgrade.status);
+    expect(update.stdout).toBe(upgrade.stdout);
   });
 
   it('documents the alias in help', () => {

@@ -1112,8 +1112,8 @@ describe('buildReplyCardFooter', () => {
     expect(card.body.elements.at(-1)).toMatchObject({
       tag: 'markdown',
       element_id: 'botmux_reply_footer',
-      content: expect.stringContaining('Sent to: <at id=ou_owner></at>'),
     });
+    expect(card.body.elements.at(-1).content).toContain('Sent to: <at id=ou_owner></at>');
     expect(card.body.elements.at(-1).content).toContain(
       '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
     );

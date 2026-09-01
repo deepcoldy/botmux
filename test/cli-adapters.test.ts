@@ -1795,7 +1795,11 @@ describe('hermes buildArgs', () => {
     // Hermes must NOT arm the gate; its ❯ readyPattern (input box up in ~3.6s) is
     // the earliest reliable readiness signal.
     expect(adapter.injectsReadyHook).toBeFalsy();
-    expect(adapter.readyPattern?.source).toBe('❯');
+    // Bun's `RegExp#source` serializes U+276F as `\\u276F` while Node keeps the
+    // literal `❯`. Matching the glyph (not `.source ===`) is the dual-runtime
+    // form of "this pattern is exactly the Hermes prompt symbol".
+    expect(adapter.readyPattern?.test('❯')).toBe(true);
+    expect(adapter.readyPattern?.test('x')).toBe(false);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBeFalsy();
   });

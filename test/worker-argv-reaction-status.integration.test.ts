@@ -3,7 +3,7 @@ import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
@@ -147,7 +147,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -241,7 +241,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -350,7 +350,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -438,7 +438,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -547,7 +547,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -658,7 +658,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -764,7 +764,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -851,7 +851,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -942,7 +942,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -1037,7 +1037,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -1110,7 +1110,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -1174,7 +1174,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

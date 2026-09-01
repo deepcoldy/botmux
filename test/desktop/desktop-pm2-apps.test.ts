@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeLaunchTarget } from '../../src/desktop/main/runtime-service.js';
 import { defaultPm2ListTimeoutMs, listPm2Apps } from '../../src/desktop/main/pm2-apps.js';
 
@@ -30,12 +30,30 @@ function childProcessStub() {
   return child;
 }
 
+type SpawnCall = [string, string[], { env: NodeJS.ProcessEnv }];
+
+function trackedSpawn(child?: ReturnType<typeof childProcessStub>) {
+  const calls: SpawnCall[] = [];
+  // Plain function, not `vi.fn(() => child)`: bun drops mock implementations
+  // (measured: spawn returned undefined and the 25s jlist timer never settled,
+  // so the file hit FILE_WALL SIGKILL).
+  const spawn = ((command: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
+    calls.push([command, args, opts]);
+    return child;
+  }) as typeof import('node:child_process').spawn;
+  return { spawn, calls };
+}
+
 const runningPm2 = { pm2QueryAvailable: () => true };
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('desktop PM2 app listing', () => {
   it('passes the inspected God generation to the read-only helper', async () => {
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
+    const { spawn, calls } = trackedSpawn(child);
     const expectedGod = {
       pid: 7310,
       cgroup: '/user.slice/botmux.service',
@@ -51,14 +69,14 @@ describe('desktop PM2 app listing', () => {
     child.stdout.emit('data', '[]');
     child.emit('close', 0);
 
-    await expect(promise).resolves.toEqual([]);
-    const env = (spawn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env;
+    expect(await promise).toEqual([]);
+    const env = calls[0][2].env;
     expect(JSON.parse(env.BOTMUX_PM2_EXPECTED_GOD!)).toEqual(expectedGod);
   });
 
   it('runs PM2 through the bundled Node absolute path', async () => {
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
+    const { spawn, calls } = trackedSpawn(child);
     const bundled: RuntimeLaunchTarget = {
       kind: 'bundled',
       root: '/Applications/Botmux.app/Contents/Resources/runtime',
@@ -76,17 +94,15 @@ describe('desktop PM2 app listing', () => {
 
     child.stdout.emit('data', '[]');
     child.emit('close', 0);
-    await expect(promise).resolves.toEqual([]);
-    expect(spawn).toHaveBeenCalledWith(
-      bundled.nodePath,
-      [`${bundled.root}/dist/cli/pm2-readonly-client.js`, 'jlist'],
-      expect.objectContaining({ env: expect.not.objectContaining({ ELECTRON_RUN_AS_NODE: expect.anything() }) }),
-    );
+    expect(await promise).toEqual([]);
+    expect(calls[0][0]).toBe(bundled.nodePath);
+    expect(calls[0][1]).toEqual([`${bundled.root}/dist/cli/pm2-readonly-client.js`, 'jlist']);
+    expect(calls[0][2].env.ELECTRON_RUN_AS_NODE).toBeUndefined();
   });
 
   it('keeps the probed shell PATH in the bundled PM2 environment', async () => {
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
+    const { spawn, calls } = trackedSpawn(child);
     const bundled: RuntimeLaunchTarget = {
       kind: 'bundled',
       root: '/Applications/Botmux.app/Contents/Resources/runtime',
@@ -105,8 +121,8 @@ describe('desktop PM2 app listing', () => {
 
     child.stdout.emit('data', '[]');
     child.emit('close', 0);
-    await expect(promise).resolves.toEqual([]);
-    const env = (spawn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env;
+    expect(await promise).toEqual([]);
+    const env = calls[0][2].env;
     // Must match the daemon-start ordering exactly (buildBundledPath): pm2's
     // sticky daemon env propagates into resurrected apps, so which node a
     // per-bot CLI resolves must not depend on pm2 startup order. pm2 itself is
@@ -131,7 +147,7 @@ describe('desktop PM2 app listing', () => {
 
   it('rejects when PM2 exits nonzero so runtime state can degrade', async () => {
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
+    const { spawn } = trackedSpawn(child);
     const promise = listPm2Apps(paths, runtime, {
       ...runningPm2,
       existsSync: () => true,
@@ -148,7 +164,7 @@ describe('desktop PM2 app listing', () => {
 
   it('treats the read-only helper absence code as an empty process list', async () => {
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
+    const { spawn } = trackedSpawn(child);
     const promise = listPm2Apps(paths, runtime, {
       ...runningPm2,
       existsSync: () => true,
@@ -159,53 +175,54 @@ describe('desktop PM2 app listing', () => {
 
     child.emit('close', 3);
 
-    await expect(promise).resolves.toEqual([]);
+    expect(await promise).toEqual([]);
   });
 
   it('rejects and kills PM2 discovery when it times out', async () => {
     vi.useFakeTimers();
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
-    const promise = expect(listPm2Apps(paths, runtime, {
+    const { spawn } = trackedSpawn(child);
+    const pending = listPm2Apps(paths, runtime, {
       ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
       env: {},
       timeoutMs: 25,
-    })).rejects.toThrow('timed out');
+    });
+    // Swallow until the assertion below; bun hangs if `.rejects` is attached
+    // before the fake clock fires, and vitest flags an unhandled rejection if
+    // the clock fires first with no handler.
+    void pending.catch(() => {});
 
     await vi.advanceTimersByTimeAsync(25);
-
-    await promise;
+    await expect(pending).rejects.toThrow('timed out');
     expect(child.kill).toHaveBeenCalled();
-    vi.useRealTimers();
   });
 
   it('uses a desktop-friendly default timeout before marking PM2 discovery failed', async () => {
     vi.useFakeTimers();
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
-    const promise = expect(listPm2Apps(paths, runtime, {
+    const { spawn } = trackedSpawn(child);
+    const pending = listPm2Apps(paths, runtime, {
       ...runningPm2,
       existsSync: () => true,
       spawn: spawn as any,
       execPath: '/Electron',
       env: {},
-    })).rejects.toThrow(`PM2 jlist timed out after ${defaultPm2ListTimeoutMs}ms`);
+    });
+    void pending.catch(() => {});
 
     await vi.advanceTimersByTimeAsync(defaultPm2ListTimeoutMs - 1);
     expect(child.kill).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-
-    await promise;
+    await expect(pending).rejects.toThrow(`PM2 jlist timed out after ${defaultPm2ListTimeoutMs}ms`);
     expect(child.kill).toHaveBeenCalled();
-    vi.useRealTimers();
   });
 
   it('uses the discovered login shell PATH when spawning PM2 for a wrapper runtime', async () => {
     const child = childProcessStub();
-    const spawn = vi.fn(() => child);
+    const { spawn, calls } = trackedSpawn(child);
     const shellPath = '/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin';
     const promise = listPm2Apps(paths, {
       ...runtime,
@@ -222,19 +239,19 @@ describe('desktop PM2 app listing', () => {
     child.stdout.emit('data', '[]');
     child.emit('close', 0);
 
-    await expect(promise).resolves.toEqual([]);
-    const pathEntries = (spawn.mock.calls[0]![2] as any).env.PATH.split(':');
+    expect(await promise).toEqual([]);
+    const pathEntries = calls[0][2].env.PATH!.split(':');
     expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeGreaterThan(-1);
     expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeLessThan(pathEntries.indexOf('/usr/bin'));
   });
 
   it('does not spawn PM2 while listing an absent daemon', async () => {
-    const spawn = vi.fn();
-    await expect(listPm2Apps(paths, runtime, {
+    const { spawn, calls } = trackedSpawn();
+    expect(await listPm2Apps(paths, runtime, {
       existsSync: () => true,
       spawn: spawn as any,
       pm2QueryAvailable: () => false,
-    })).resolves.toEqual([]);
-    expect(spawn).not.toHaveBeenCalled();
+    })).toEqual([]);
+    expect(calls).toHaveLength(0);
   });
 });

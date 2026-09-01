@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { isBunRuntime, nodeTsRunnerPrefix } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const { Terminal } = xtermHeadless;
@@ -200,9 +200,9 @@ async function spawnPicker(
     'BOTMUX_DAEMON_IPC_PORT',
   ]) delete env[key];
 
-  // node-pty takes command and args separately, so build the runtime-aware
-  // prefix by hand instead of going through the spawnTsScript wrapper.
-  const { command, prefixArgs } = tsRunnerPrefix();
+  // Drive the picker with Node+tsx even under `bun test`. bun-as-PTY-child
+  // produced a blank TUI (0 `botmux sessions` renders in 5s on CI Linux).
+  const { command, prefixArgs } = nodeTsRunnerPrefix();
   const child = pty.spawn(command, [...prefixArgs, CLI_PATH, 'list'], {
     cwd: join(TEST_DIR, '..'),
     env,
@@ -223,7 +223,7 @@ async function spawnPicker(
   const waitForRender = async (minimum: number): Promise<void> => {
     const deadline = Date.now() + 5_000;
     while (renderCount() < minimum && Date.now() < deadline) await delay(20);
-    expect(renderCount()).toBeGreaterThanOrEqual(minimum);
+    expect(renderCount(), `picker TUI was empty. command=${command} raw=${JSON.stringify(raw.slice(0, 800))}`).toBeGreaterThanOrEqual(minimum);
     await delay(60);
     await writes;
   };
@@ -254,7 +254,10 @@ async function closePicker(child: pty.IPty, terminal: InstanceType<typeof Termin
   if (idx >= 0) children.splice(idx, 1);
 }
 
-describe('session picker real terminal responsiveness', () => {
+// bun's in-process node-pty delivers no onData (measured: Node+tsx child,
+// vitest green, bun test raw=""). The picker still runs under the Node/vitest
+// leg on both macOS and Linux CI.
+describe.runIf(!isBunRuntime())('session picker real terminal responsiveness', () => {
   it('rebuilds horizontal layout when a wide terminal shrinks', async () => {
     const picker = await spawnPicker(180, false);
     const beforeResize = picker.renderCount();
@@ -265,7 +268,7 @@ describe('session picker real terminal responsiveness', () => {
     const screen = inspectScreen(picker.terminal);
     expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
     expect(screen.lines.some(line => line.includes('❯') && line.includes('48000000'))).toBe(true);
-    expect(screen.lines).toContainEqual(expect.stringContaining('↓ 37 更多'));
+    expect(screen.lines.some(line => line.includes('↓ 37 更多'))).toBe(true);
     expect(screen.wrappedRows).toEqual([]);
     await closePicker(picker.child, picker.terminal);
   });

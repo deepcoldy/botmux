@@ -27,12 +27,26 @@
  *
  * Run:  pnpm vitest run test/write-input.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(() => ''),
-  execFileSync: vi.fn(),
-}));
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execSync: vi.fn(() => ''),
+    execFileSync: vi.fn(),
+    // writeInput's coco/codex paths call execFile. Spreading the real builtin
+    // without stubbing it would spawn live CLIs and hang the file (measured).
+    execFile: vi.fn((...args: unknown[]) => {
+      const cb = args.find(a => typeof a === 'function') as ((...a: unknown[]) => void) | undefined;
+      if (cb) queueMicrotask(() => cb(null, '', ''));
+      return {};
+    }),
+    spawn: vi.fn(),
+    spawnSync: vi.fn(() => ({ status: 0, stdout: '', stderr: '' })),
+  };
+});
 
 // A synchronous `require`, NOT `await import()`. An `await import()` inside a mock
 // factory HANGS under `bun test`: the file emits no output at all and is eventually
@@ -90,6 +104,13 @@ import { codexHistoryPath } from '../src/services/codex-paths.js';
 // (equally scaled) confirm budget.
 process.env.BOTMUX_TIME_SCALE ??= '0.05';
 const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
+
+afterEach(() => {
+  // Bun's `runAllTimersAsync` can leave fake timers installed when a test
+  // times out before `finally`. A leftover fake clock then hangs every later
+  // `writeInput` poll in this file (measured: a cascade of 30s timeouts).
+  vi.useRealTimers();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -693,7 +714,7 @@ describe('writeInput: edge cases', () => {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeTmuxPty();
       const write = adapter.writeInput(pty, 'steer this turn');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await write;
 
       expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
@@ -712,7 +733,7 @@ describe('writeInput: edge cases', () => {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeRawPty();
       const write = adapter.writeInput(pty, 'steer raw turn');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await write;
 
       expect(pty.write.mock.calls.map(c => c[0])).toEqual([
@@ -735,12 +756,12 @@ describe('writeInput: edge cases', () => {
       expect(pty.pasteText).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(Math.round(250 * TIME_SCALE));
       expect(pty.pasteText).toHaveBeenCalledOnce();
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await first;
 
       const second = adapter.writeInput(pty, 'second');
       expect(pty.pasteText).toHaveBeenCalledTimes(2);
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await second;
     } finally {
       vi.useRealTimers();
@@ -1185,7 +1206,7 @@ describe('claude-code writeInput submission confirmation', () => {
       };
 
       const resultPromise = adapter.writeInput(pty, 'delayed append after pid rotate');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       const result = await resultPromise;
 
       expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });

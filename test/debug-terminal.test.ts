@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { WebSocket } from 'ws';
+import { WebSocket } from './helpers/node-ws.js';
+import { isBunRuntime } from './helpers/ts-runner.js';
 
 // 平台绑定读的是 ~/.botmux/platform.json；测试要能自由开关「已绑定/未绑定」，所以
 // 把底层 secure-host-file 打桩。默认返回 null = 未绑定，既有用例完全不受影响。
@@ -380,7 +381,7 @@ describe('debug-terminal shell environment', () => {
     });
   }
 
-  it('the bash session cannot read the Dashboard H5 app secret', async () => {
+  it.runIf(!isBunRuntime())('the bash session cannot read the Dashboard H5 app secret', async () => {
     process.env.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET = 'h5-secret-must-not-leak';
     try {
       expect(await readShellVar('BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET')).toBe('ABSENT');
@@ -389,7 +390,7 @@ describe('debug-terminal shell environment', () => {
     }
   });
 
-  it('the bash session cannot read the bot IM app secret either', async () => {
+  it.runIf(!isBunRuntime())('the bash session cannot read the bot IM app secret either', async () => {
     // Same boundary, different family: the debug shell is a repro環境 for a
     // session's CLI command, so it must see what that CLI would see.
     process.env.LARK_APP_SECRET = 'lark-secret-must-not-leak';
@@ -400,7 +401,7 @@ describe('debug-terminal shell environment', () => {
     }
   });
 
-  it('still inherits the ordinary environment — redaction removes only the deny list', async () => {
+  it.runIf(!isBunRuntime())('still inherits the ordinary environment — redaction removes only the deny list', async () => {
     // Redaction must not gut the shell: the whole point of this terminal is
     // running `botmux` / CLI repro commands. (PATH itself is not asserted here
     // — `bash -l` re-sources the login profiles and rebuilds it.)

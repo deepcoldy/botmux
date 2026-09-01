@@ -1551,11 +1551,11 @@ describe('PUT /api/bot-reply-style — sparse reply-card appearance', () => {
         }),
       });
       expect(overLimit.status).toBe(200);
-      expect(await overLimit.json()).toMatchObject({
-        ok: true,
-        replyStyle: { recipes: false, layoutTags: { blocked: '请处理' } },
-        warnings: [expect.stringContaining('recipePrompt'), expect.stringContaining('layoutTags.risk')],
-      });
+      const overBody = await overLimit.json();
+      expect(overBody.ok).toBe(true);
+      expect(overBody.replyStyle).toEqual({ recipes: false, layoutTags: { blocked: '请处理' } });
+      expect(overBody.warnings.some((w: string) => String(w).includes('recipePrompt'))).toBe(true);
+      expect(overBody.warnings.some((w: string) => String(w).includes('layoutTags.risk'))).toBe(true);
 
       for (const replyStyle of [[], 'primitive', 42]) {
         const invalidReplyStyle = await fetch(`${base}/api/bot-reply-style`, {
@@ -2428,11 +2428,10 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-riff/restart`, { method: 'POST' });
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toMatchObject({
-      ok: false,
-      error: 'remote_restart_unsupported',
-      message: expect.stringMatching(/Riff.*不支持重启.*\/close/),
-    });
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('remote_restart_unsupported');
+    expect(String(body.message)).toMatch(/Riff.*不支持重启.*\/close/);
     expect(send).not.toHaveBeenCalled();
     expect(forkSpy).not.toHaveBeenCalled();
     findSpy.mockRestore();
@@ -5797,19 +5796,20 @@ describe('role profile IPC routes', () => {
 
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body).toMatchObject({
+      expect(body.ok).toBe(true);
+      expect(body.runId).toMatch(/^mlrp_/);
+      expect(body.matches).toHaveLength(1);
+      expect(body.matches[0].messageId).toBe('om_match_run');
+      expect(body.matches[0].messageText).toBe('CPU 告警');
+      expect(body.results).toHaveLength(1);
+      expect(body.results[0]).toMatchObject({
+        messageId: 'om_match_run',
         ok: true,
-        runId: expect.stringMatching(/^mlrp_/),
-        matches: [{ messageId: 'om_match_run', messageText: 'CPU 告警' }],
-        results: [{
-          messageId: 'om_match_run',
-          ok: true,
-          action: 'queued',
-          state: 'triggered',
-          runId: expect.stringMatching(/^mlrp_/),
-          triggerId: expect.stringMatching(/^mlrp_turn_/),
-        }],
+        action: 'queued',
+        state: 'triggered',
       });
+      expect(body.results[0].runId).toMatch(/^mlrp_/);
+      expect(body.results[0].triggerId).toMatch(/^mlrp_turn_/);
       expect(body.results[0].runId).toBe(body.runId);
       expect(messageChatSpy).toHaveBeenCalledWith('cli_listener_run', 'om_match_run');
       expect(forkSpy).toHaveBeenCalledTimes(1);

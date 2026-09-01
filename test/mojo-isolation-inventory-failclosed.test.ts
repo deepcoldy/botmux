@@ -47,6 +47,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   quarantinedLauncherEnvKeys: () => [],
   rememberAppliedUnprovableEnvKeys: () => {},
   startNewGenerationEnvLedger: () => {},
+  // device-isolation-daemon imports this name. Bun's mock is the whole module,
+  // so omitting it is a SyntaxError at import time (vitest is more lenient).
+  killWorker: () => {},
 }));
 
 const daemon = await import('../src/core/device-isolation-daemon.js');
