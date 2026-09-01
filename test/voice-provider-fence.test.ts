@@ -2,7 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const { FakeWebSocket } = vi.hoisted(() => {
+/**
+ * The fake socket class is created INSIDE the `ws` factory, and the tests reach it
+ * by importing the mocked module itself (below) — no shared outer binding.
+ *
+ * Two shapes were tried first and both failed, in opposite runners:
+ *   · `vi.hoisted(() => { class … })` — a vitest-only TRANSFORM, no `bun test`
+ *     equivalent; the file died under bun.
+ *   · a top-level `class`/`const` holder read from the factory body — vitest calls
+ *     the factory during the hoisted import phase, before those statements run.
+ *     Measured, twice: "Cannot access 'FakeWebSocket' before initialization", then
+ *     "Cannot access 'wsMock' before initialization".
+ * Anything the factory dereferences in its own body must therefore be created in
+ * that body. Importing the mock back is what both runners agree on.
+ */
+vi.mock('ws', () => {
   class FakeWebSocket {
     static instances: FakeWebSocket[] = [];
 
@@ -30,10 +44,24 @@ const { FakeWebSocket } = vi.hoisted(() => {
     }
   }
 
-  return { FakeWebSocket };
+  return { default: FakeWebSocket };
 });
 
-vi.mock('ws', () => ({ default: FakeWebSocket }));
+// The mocked class, pulled back in through the same specifier the code under test
+// uses. `vi.mocked` is not involved: this IS the fake, not a spy on the real one.
+import FakeWebSocketDefault from 'ws';
+
+interface FakeSocket {
+  readonly url: string;
+  readonly send: ReturnType<typeof vi.fn>;
+  readonly close: ReturnType<typeof vi.fn>;
+  emit(event: string, ...args: any[]): Promise<void>;
+}
+
+/** The live instance list, asserted on by the tests below. */
+function instances(): FakeSocket[] {
+  return (FakeWebSocketDefault as unknown as { instances: FakeSocket[] }).instances;
+}
 
 import { openaiSynthesizePcm } from '../src/services/voice/openai.js';
 import { mintSamiToken, samiSynthesizePcm } from '../src/services/voice/sami.js';
@@ -61,7 +89,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 
 describe('voice provider effect fences', () => {
   beforeEach(() => {
-    FakeWebSocket.instances.length = 0;
+    instances().length = 0;
   });
 
   afterEach(() => {
@@ -98,7 +126,7 @@ describe('voice provider effect fences', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(beforeProviderEffect).toHaveBeenCalledTimes(2);
-    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(instances()).toHaveLength(0);
   });
 
   it('awaits a fresh fence after async WebSocket open before sending', async () => {
@@ -116,8 +144,8 @@ describe('voice provider effect fences', () => {
       { speaker: 'voice' },
       { beforeProviderEffect },
     );
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const socket = FakeWebSocket.instances[0]!;
+    await vi.waitFor(() => expect(instances()).toHaveLength(1));
+    const socket = instances()[0]!;
 
     const opening = socket.emit('open');
     await vi.waitFor(() => expect(beforeProviderEffect).toHaveBeenCalledTimes(3));
@@ -159,8 +187,8 @@ describe('voice provider effect fences', () => {
       { speaker: 'voice' },
       { beforeProviderEffect },
     );
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const socket = FakeWebSocket.instances[0]!;
+    await vi.waitFor(() => expect(instances()).toHaveLength(1));
+    const socket = instances()[0]!;
 
     await socket.emit('open');
 

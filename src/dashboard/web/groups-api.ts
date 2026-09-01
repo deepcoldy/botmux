@@ -8,6 +8,9 @@ export interface GroupMemberBot extends GroupBot {
   inChat: boolean;
   hasRole?: boolean;
   error?: unknown;
+  pinStreamingCardMasterEnabled?: boolean;
+  pinStreamingCardChatEnabled?: boolean;
+  pinStreamingCardEffectiveEnabled?: boolean;
   oncallChat?: { workingDir?: string } | null;
 }
 
@@ -132,4 +135,21 @@ export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = 
   }
 
   return request;
+}
+
+export async function setGroupPinStreamingCard(
+  chatId: string,
+  appId: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; status: number; body: any }> {
+  const r = await fetch(
+    `/api/groups/${encodeURIComponent(chatId)}/pin-streaming-card/${encodeURIComponent(appId)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    },
+  );
+  const body = await r.json().catch(() => ({}));
+  return { ok: r.ok && body?.ok !== false, status: r.status, body };
 }

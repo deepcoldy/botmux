@@ -1,359 +1,228 @@
 ---
-title: Session 架构拆解回收与 store-first 重新分步
+title: Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 type: design
 date: 2026-08-12
-updated: 2026-08-27（Step 3 第一 PR rebase 到 origin/master@06db2b48；会话库改走 sqlite-compat，engines 跟 master）
-topic: session-restage-store-first
-status: proposed
-baseline: origin/master@06db2b48（0827 复核基线；0820 复核基线 3d84aaad；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
+updated: 2026-09-01（rebase 到 origin/master@7bd2e974；基线含 #852 / #1073 / #1093）
+topic: session-virtual-actor
+status: active
+baseline: origin/master@7bd2e974（含已合入的 #852、#1073 导入 WAL 空壳、#1093 中毒库恢复）；#1051 删除 daemon 侧 JSON 写路径（进行中）
 references:
-  - feat/virtual_actor_stage2@b6a4982ea（不合入；仅作参考实现、竞态清单与写点地图）
-  - docs/design/2026-08-08-virtual-actor-session-runtime.md（原始提案；本目录保留未跟踪副本）
-  - PR #846（Step 1+2 产出）
-  - PR #852（Step 3 第一 PR：引擎替换 + 导入 + 混合窗口；JSON 净删除另立第二 PR）
+  - PR #846（会话行唯一写入入口）
+  - PR #852（per-bot SQLite + JSON 导入 + 混合窗口；已合入 master）
+  - PR #1051（删除 daemon 侧 JSON 写路径 + 行级持久化；进行中）
+  - #831 / feat/virtual_actor_stage2（不合入；SessionRuntime 只覆盖部分写点的失败记录）
 ---
 
-# Session 架构拆解回收与 store-first 重新分步
+# Session 终态：非分布式 virtual actor（持久化仅 SQLite）
 
-> 本文取代 stage2 分支上的 `2026-08-11-session-actor-core-implementation.md` 成为
-> 后续实施的唯一口径。原 0811 文档随其分支一并归档，不再维护。
->
-> **2026-08-13 修订**：Step 1 执行后发现 7 项候选中 6 项的「缺陷」是 stage2
-> runtime 分层自身引入的回归（master 无此缺陷或机制仍活），只有 1 项在 master
-> 真实存在。这暴露了原计划的一个方法论缺陷：**Step 1 的候选清单直接采信了
-> stage2 的修复记录，而 stage2 的修复大多是在收拾迁移自己造成的回归**（§0 的
-> 「fix(session) 15 个」判断在候选粒度上再次得到证实）。据此本次修订：
-> ① 记录 Step 1 实际产出与逐项处置；② **以 master 为唯一证据源重新核实
-> Step 2/3/4 的全部前提**——核实结论是三步全部成立，且 Step 3 的收益比原文
-> 写的更大，但两处前提表述需要修正（见各节【master 复核】）。
->
-> **2026-08-19 修订**：#831 / virtual-actor 仍不合入；现行范式是 store-first，
-> 不是把 actor 缝隙再包一层。Step 3 第一 PR（#852）rebase 到
-> `origin/master@47b2c11a` 后复核：引擎替换与行级写的收益成立，但原文收益
-> 第 1 条（「仲裁不再依赖 findDaemon-TOCTOU」）过满——SQLite 只排序写者，
-> daemon 在位探测仍必须保留；净删除未在本 PR 兑现（JSON 机器仍在，留给灰度
-> 稳定后的第二 PR）。0813 之后 master 还叠了 Remote lineage 改名、Mojo close
-> journal、`SessionStoreUnavailableError` 写门，Step 3 必须带着这些 API 一起
-> 换引擎，不能只按 0813 的 JSON store 形状施工。
->
-> **2026-08-20 修订**：#852 再 rebase 到 `origin/master@3d84aaad`。#846 的
-> 唯一门仍然健壮：src 无会话行直写绕过，CLI 只委托 `loadAllSessionsSnapshot` /
-> `mutateSessionRowOffline`，provenance 仍走 `readSessionRowCopiesAcrossStores`。
-> 0819 之后 master 新增的 Workbench `previewTarget` 在 close/resume 路径上清除，
-> 已语义化并进本 PR 的 `persistRow`。收益判定不变；原则 1 仍待第二 PR 净删除。
-> 同日补记：残余 `findDaemon` probe-vs-publish TOCTOU 的消法是 **store 内占位
-> 租约**（与行写同一 `BEGIN IMMEDIATE`），不是 virtual actor / SessionRuntime；
-> 见 Step 4 候选 (f)。本 PR 不实施。
->
-> **2026-08-27 修订**：#852 再 rebase 到 `origin/master@06db2b48`。master 在
-> 0820 之后把运行时切到 bun 单二进制，并把所有 SQLite 打开收进
-> `sqlite-compat`（Node: `node:sqlite` / Bun: `bun:sqlite`，见 `005ce0ae`）。
-> 会话库若仍 `createRequire('node:sqlite')`，会在编译态把 Step 3 硬门打成假
-> 失败——这是「干净 rebase 不是正确 rebase」（traex-transcript 已写过的
-> 同一类合并坑）。本 PR 改走 compat：引擎缺失抛 `SessionStoreSqliteUnavailableError`；
-> 损坏 `.db` 仍是普通打开失败，扫描可 skip。`engines` 跟 master 的 `node: >=22`，
-> 真门仍是 daemon `assertSqliteSupported()`。原则 1–5 与 Step 2 唯一门、混合窗口
-> `owner: false`、`abortIf`+`findDaemon`、非目标（不回流 actor / 不卷旁路 store）
-> 均未被后续 master 提交破坏；#889 `/cli`、#1017 发信人、#1008 schedule、#946
-> pending-turn journal 要么走 store 字段、要么是设计允许的旁路文件。
+本文是会话态后续实施的唯一口径。旧标题「store-first 重新分步」以及「每步合入必须立刻变简单」不再适用。#852 已把会话行持久化换到 SQLite；后续按终态收拢 occupancy、命令路径和 per-session 串行，不再把这三件事拆成互不相关的独立轨道。
 
-## 0. 背景与决策
+## 0. 原则
 
-对 feat/virtual_actor_stage2（含第一、二阶段全部工作，37 个分支独有提交）以
-origin/master 为基线的综合评估结论：
+核心判据是 **架构简明、可维护、可读**：稳态下需要同时理解的协议要少。不要求每个 PR 的 diff 行数立刻变负。
 
-- 会话态 1,408 个 mutation 中仅 453（32%）收进 SessionRuntime 缝隙，910（65%）仍直写；
-  最大写面（worker-pool 530、daemon 221、session-manager 135）未动。
-- 零个 src 文件被删除，legacy 公共文件体量持平——新层是包上去的，不是换出来的。
-  （补充精确化：`session-store.ts` 在 stage2 上从 832 行**增长到 1,387 行**——
-  在 JSON 全量文件之上叠了一套 owner-bound typed-transition + readback 的平行
-  API，旧 API 原封保留。这正是本计划要反着做的事。）
-- 过渡资产（`current-*` 适配层 17k 行 src + 26k 行绑定测试）按设计将来整体报废；
-  审计脚手架 23k 行挂在 build gate 上，master 每合入一个碰会话态的 PR 都要人工入册。
-- 37 个提交中 fix(session) 15 个（多为迁移自身回归的收束）；identity 子系统经历完整
-  的「建成—修复—拆除」往返。
-- 结论：按调用方群组横切的 staging 使共存面不随进度收窄、收益全部递延到 Target-B，
-  中间态负担大于收益。**决策：#831 不合入，拆解回收，按 store-first 重新分步。**
+1. **终态优先。** 步骤为终态服务。允许一步只做其中一块，但禁止引入「旧路径完整保留、新层按设计将来整段删除」的平行实现。
+2. **禁止只覆盖部分写点的 actor 层。** 不再引入 `SessionRuntime` / `SessionProjection`、按调用方群组横切、写点台账、审计 gate。occupancy / apply / turn 必须走同一条命令路径，CLI 与 daemon 共用。新增协议时必须写明将被替换的旧协议，以及旧协议的删除条件（可以分 PR 删除，但不能两套所有权长期并存且没有结束条件）。
+3. **边界必须是结构性的**（模块导出、tsc 可检查）。禁止只靠约定维护的边界。
+4. **修改会话状态 = 向该 session 发命令；同一时刻至多一个激活。** daemon 未运行时，不是另开一套磁盘写入协议，而是由宿主 CLI 或 supervisor 取得租约、在本进程执行同一套 apply。产品语义「daemon 未运行时仍能 close / abandon」保留。沙盒内的 CLI 不在此列（见 §1）。
+5. **不把旁路存储并入会话库。** turn-sends、frozen-card、whiteboard 文件、usage-ledger、idempotency、vc-meeting-*、`utils/file-lock.ts` 保持独立生命周期。会话行上的 `whiteboardId` 等字段走会话命令；白板正文仍走 whiteboard store。
+6. **BotId 仍由地址推导，不引入分配式注册表。** 会话库内的占位租约只表示 occupancy，不是身份注册表。
 
-## 1. 分步原则（硬性判据）
+施工可以分 stage；**稳态下的协议种类必须减少。** occupancy、JSON 回落、离线写、IPC、`abortIf`、mailbox 若无限期并行，读者需要同时记住多套互斥规则。
 
-1. **每一步合入后，系统必须比之前更简单，或至少删掉了东西。** 不满足即不立项。
-2. **边界必须是结构性的**（interface / 唯一导出点，tsc 可执法）；禁止台账式纪律
-   边界与随附的审计 gate。
-3. **收益不许递延超过一步。** 任何「为了第 N+2 步铺路」的纯铺垫不单独成步。
-4. 每一步是一个可独立发布、可独立回退的 PR；事务/串行化语义只在有实测竞态处
-   逐个引入（ROI gate，I1 的教训）。
-5. **（0813 新增）证据只认 master。** stage2 的修复记录、竞态清单、写点地图
-   一律只当「去哪里看」的线索，不当「那里有问题」的证明——Step 1 的执行证明
-   照抄会把 runtime 层自己的回归误判成 master 缺陷。任何一步立项前，其前提
-   必须在 master 代码/实测上独立复核。
+## 1. 终态
 
-## 2. 步骤
+产品单元是 **一条话题对应一个 CLI 会话**。运行时按这个单元寻址和串行，而不是按「本机上的一份会话文件」来理解。
 
-### Step 1 — 独立修复摘取【已完成，PR #846】
+```
+飞书事件 / botmux CLI / dashboard / worker IPC
+        ↓
+   按 sessionId 寻址（bot 级操作按 botId）
+        ↓
+   在 SQLite 事务内读取并获取 occupancy 租约
+        ↓
+   执行同一套 command apply（与当前 host 进程无关）
+        ↓
+   行级写入 SQLite；PTY / worker 由该会话激活持有，不另作状态权威
+```
 
-以 stage2 实现为对照，逐条核实 7 项候选「能否脱离 runtime 层在 master 最小重做」。
-**执行结论：6 项不成立，1 项重做落地。**
+三部分必须同时成立，不能当成可以无限期分开交付的独立功能：
 
-| 候选 | 处置 | 判定依据（均已在 master 代码上核实） |
-|---|---|---|
-| bot listing 热路径 | 无需重做 | master 所有 `getAvailableBots` 调用点本就只在 opening/initial 路径；每消息放大是 C1 切换自身回归（stage2 注释自证 "master parity"） |
-| generation reconcile 单调判定 | 不适用 | 整行深比较 + 隔离台账只存在于 `current-session-executor-runtime.ts`；master `reserveWorkerGeneration` 写失败即回滚重抛（worker-pool.ts:10119），无永久封禁路径 |
-| /close 竞态 VC reconcile 时序 | 不适用 | 竞态由 C1 把 exit 回调改 context-only + `findActiveBySessionId` 早退引入；master 回调闭包 `ds` 直调（daemon.ts:20743/20765），reconcile 不过守卫 |
-| 幂等台账/executor slot 有界回收 | 不适用 | 被 cap 的 Map 全是 runtime 层新建物；master 对应物本已有界（`eventClaims` TTL+prune、`dispatchInputReceipts` cap 64、delivery/fence settle 即删） |
-| 删 async tail-admission | **降级 Step 4 素材** | master 上是活代码：daemon.ts:18766/18825/19370 三个生产投递点仍在调用（见 Step 4 候选 d） |
-| classify/gate 三份收敛 | 不适用 | 重复是 staging 自身制造；master gate 唯一定义（worker-pool.ts:6055），「孤儿 import」在 master 均为活引用 |
-| ingress 终态失败回可行动提示 | **✅ 已重做** | master 真实缺陷：dispatcher 对两个消息入口只有 log-only catch，transport ACK 后异常 = 静默吞消息。PR #846（src +29/−2，回归测试 +273） |
+| 部分 | 稳态含义 |
+|---|---|
+| **身份** | `sessionId` 即寻址键 |
+| **occupancy** | 同一时刻至多一个激活；租约与会话行在同一 SQLite 事务中读写 |
+| **turn** | 针对该 `sessionId` 的命令在跨 `await` 后仍串行执行。实现是按 session 的 Promise 链 / 队列，不引入新的类型层 |
 
-**教训入库**：Step 1 比预期薄——这本身是对 §0「stage2 的 fix 多为迁移自身回归」
-判断的正面验证，不动摇 store-first 决策；动摇的是「拿 stage2 记录当候选清单」
-的做法，已固化为分步原则 5。
+Host 进程可以更换，apply 实现不能分叉：
 
-### Step 2 — 存储缝隙收口【已完成，并入 PR #846】
+- **daemon 运行中**：由该 bot 的长驻 daemon（或 supervisor 下的 bot 进程）持有激活。进程拓扑与现状相同。
+- **daemon 未运行**：宿主 CLI 或 supervisor 获取租约，在本进程执行同一段 close / abandon / 解绑白板，写入同一行后释放租约。不再使用 `mutateSessionRowOffline` 作为另一套权威写入。
+- **沙盒内的 CLI 取不到租约。** `botmux send` 一类跑在 bwrap / Seatbelt 里的进程对会话库只有 readOnly 授权，也读不到 daemon IPC secret（改用本轮的 origin capability 证明身份）。它只能发命令；daemon 不在时它只能失败，不能退化成自己写盘。因此「取租约就地 apply」的主体是宿主 CLI 与 supervisor，不是全部 CLI 进程——Stage 2 的设计必须显式区分这两类调用方。
 
-`services/session-store.ts` 已在 master 存在（832 行、18 个消费模块、全仓 119 处
-`updateSession` 调用）。本步把它变成**唯一的门**：收编绕过它直接触碰会话行持久化
-的路径，persistence 细节（文件布局、锁、tmp+rename）全部内部化为私有。行为零变化。
+持久化：
 
-【master 复核 ✅ 前提成立；实施中的事实修正见「执行结果」】
+- 运行时唯一的会话行存储是 per-bot `session-stores/<appId>/sessions.db`。打开连接必须走 `sqlite-compat`（Node `node:sqlite` / Bun `bun:sqlite`），禁止直连。
+- 写入是行级 upsert；`journal_mode=WAL`、`synchronous=NORMAL`（不低于历史上 JSON `tmp+rename` 且不 fsync 的耐久性；本阶段不提高 durability）。
+- 磁盘上可能仍有导入后未删除的 `sessions-*.json`，只作回退到旧版本时的副本，运行时不读不写。发布产物里不再包含 JSON 会话读写实现。
 
-绕过写者：
+粒度：
 
-- `cli.ts saveSession()` —— **无锁**的整文件 read-modify-write（连 tmp 文件名
-  都是固定 `.tmp`）。**实施期修正**：其唯一调用链
-  `closeSessionForDelete → closeSessionOffline → saveSession` 在 master 上已是
-  **死代码**（活的 delete 流早已换到 `abandonSessionAuthoritatively →
-  abandonSessionOffline`，全程走带锁的 `mutateSessionOffline`）。处置从「修复
-  无锁缺口」改为**整链净删除**（连同孤儿 `loadSessionFresh` 与
-  `SessionDeleteCloseResult`）。
-- `cli.ts mutateSessionOffline()` —— 带锁 + `findDaemon` fail-closed 的离线
-  CAS。语义正确，但它是 store 之外第二份「锁 + 读改写 + strip legacy 字段」的
-  拷贝；收编为 store 导出的唯一离线突变入口。
-- `cli.ts loadSessions()` —— 第二份「读全部会话文件 + repair」实现；由 store
-  的读 API 替代。
+- **寻址和 turn 的键是 session。** 激活可以仍由 per-bot daemon 进程承载（不必引入 Orleans 或跨机器调度）。
+- 现状是整个 bot 的 `Map<string, Session>` 共用一个进程：该进程退出后，此 bot 下所有会话的内存权威同时失效。终态允许只激活单个 session；SQLite 行级读写已支持这一点。
+- `DaemonSession` 的共享可变别名可以保留，直到有独立的重构理由。去掉别名既不能实现 occupancy，也不等于 mailbox。
 
-绕过读者（改为 store 导出的读 API，语义不变）：
+Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker 会并发进入同一 `sessionId`，但一条会话一次只应执行一个 turn。JavaScript 单线程不能防止这一点——`await` 之后另一条请求可以插进同一 session。现有 FIFO、generation、inflight、gate、tail-admission 是分散的串行化实现；终态用按 `sessionId` 的命令队列替换它们，而不是再包一层 runtime 类型。
 
-- `daemon.ts readSessionFreshFromDisk()` —— daemon 自己的无锁直读（per-bot +
-  legacy 双文件）。热回复路径上无锁快照读是正确语义（atomic rename 保证单文件
-  自洽；带锁的 `getSessionFresh` 会阻塞且超时抛错），故收编为 store 的无锁点读
-  导出，与 worker 用的带锁 `getSessionFresh`（刻意要求写序）并存、各守其义。
-- `core/current-turn-provenance.ts readPersistedSession()` —— 跨全部会话文件的
-  只读身份证明扫描。安全敏感：扫描机制收编进 store（数据目录不可枚举 →
-  fail-closed 抛错；单个损坏文件跳过），「恰好解析一次」的判定策略留在原模块。
+## 2. 当前基线
 
-**执行结果（2026-08-13）**：store 新增 4 个导出——`loadAllSessionsSnapshot`
-（跨文件快照读，含 sandbox fallback）、`mutateSessionRowOffline`（带锁离线行
-突变，`abortIf` 在锁内入口与发布前各探测一次 daemon 在位）、
-`readSessionRowFromDisk`（无锁点读）、`readSessionRowCopiesAcrossStores`
-（fail-closed 逐文件身份扫描）；cli.ts 的平行持久化实现与死链整体删除
-（cli.ts +29/−250），daemon/provenance 直读改走 store（−16/−20）。src 全仓
-不再有 session 文件路径拼装点（rg 验证为零）。新增回归 14 例（快照合并/sandbox fallback、
-点读回退、fail-closed 扫描、离线突变的 fresh-row/abortIf 双探测/收敛清理）。
+以 **#852 合入 master（会话行已在 SQLite）** 为基线。#1051 合入后，daemon 进程不再写 JSON。
 
-**范围边界（防蔓延）**：本步只管**会话行**store。以 sessionId 为键的旁路存储
-（turn-sends jsonl、frozen-card-store、whiteboard-store、usage-ledger、
-idempotency-store、vc-meeting-* 系列）不动——它们各自有独立文件与生命周期，
-不属于「会话行持久化」。`utils/file-lock.ts`（1,004 行）是 ~30 个 store 共用的
-基础设施，同样不动。
+已具备：
 
-验收：会话行落盘入口收敛为 1 个模块导出面；删除 cli.ts 分散拷贝与死链。
-**无台账、无审计脚本。** ✅
+- 会话行的落盘入口在 `session-store.ts`（#846）。其它模块不应再按路径拼装并直接写 `sessions*.json`。
+- per-bot SQLite：整行 JSON 列 + VIRTUAL 生成列；首次 `load()` 使用 `BEGIN IMMEDIATE`；worker `owner: false` 不执行导入。
+- 行级 `persistRow`：不再每次把整个 `Map` 序列化覆盖文件，因此不再出现「外部已提交的行被陈旧整图覆盖」。
+- `closeSession` / `reactivateClosedSession` / mojo journal：先写入副本，成功后再 `Object.assign` 到内存对象（别名保持）。
+- bun 单文件二进制；打开库走 `sqlite-compat`。损坏的 `.db` 与「运行时没有 SQLite 引擎」分开处理。
 
-### Step 3 — SQLite 引擎替换（1~2 个 PR）
+相对终态仍缺：
 
-在 Step 2 的门后把 JSON 换成 per-bot SQLite。打开库必须走 `sqlite-compat`
-（Node 的 `node:sqlite` / Bun 的 `bun:sqlite`），禁止再直连 `node:sqlite`。
-Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
-`>=22`（bun 分发）；现行门是 daemon `assertSqliteSupported()` 经 compat 探测。
+- **occupancy 存在旁路文件里。** `utils/daemon-discovery.ts` 的 `findOnlineDaemon` 读 `dashboard-daemons/*.json` 心跳（90s 过期），写入目标却是会话行。SQLite 锁只串行化写者，不能判断「另一进程是否仍持有将要 `persistRow` 的内存缓存」。在租约写入 SQLite 之前，必须保留 `abortIf` 双次探测。
+- **两套 apply。** daemon 使用 `updateSession` / `persistRow`；其它进程使用 `services/session-offline-write.ts` 的 `mutateSessionRowWhenUnowned`（心跳探测 + `mutateSessionRowOffline`）。后者是第二套权威，不是「临时 host 执行同一套命令」。#1051 已把它收敛成一份实现，删除时只有一个入口。
+- **没有 per-session turn。** 进程内仍依赖多处独立的 fence。
+- **跨进程仍可能读 JSON**（#1051 保留）：当 CLI 已升级、daemon 仍在写 JSON 时，快照、点读、身份扫描、worker、`owner: false` 走 db-else-json。这是迁移兼容，不是终态。删除这些分支的条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。磁盘上的冻结 JSON 文件可以保留。
 
-【master 复核 ⚠️ 前提表述需修正，但修正后收益更大】
+#831 / `SessionRuntime` **不合入**。失败原因是只把约 32% 的写点迁入新层、旧 API 完整保留、约 17k 行适配层按设计要整段删除，并在 build 上挂审计脚本。这不能证明会话桥不该用 virtual actor。写点地图和 receipts/lane 只作线索，立项前在现行代码上复核。
 
-原文「每 bot daemon 本来就是自身会话文件的唯一写者——单写者拓扑现成」**不准确**。
-实际写者拓扑：
+## 3. 后续 stage（#852 之后）
 
-- per-bot daemon 是唯一**在线**写者（一 bot 一 daemon 进程）；
-- **CLI 是离线维护写者**（offline close/abandon 等），今天靠
-  「`withFileLockSync` + 锁内 `findDaemon` 探测」维持互斥，存在 TOCTOU 窗口，
-  且 `saveSession` 这条腿连锁都没有（Step 2 先收口）；
-- worker 子进程与其它 bot 的 daemon 是跨文件**读者**（`findInOtherFiles`、
-  `findActiveSessionsMatching`、`countActiveSessionsOnDisk` 等）。
+从会话行已在 SQLite 起重新划分。旧 Step 1–5（摘取缺陷 / 唯一写入入口 / 换引擎 / 按痛点加事务 / 归档）只记录已完成工作，不再当路线图。
 
-这个修正不削弱反而加强 Step 3 的立项理由——SQLite 在 master 上可核实的收益：
+### Stage 0 — 删除 daemon JSON 写路径【进行中：#1051】
 
-1. **写者互斥从文件锁换成引擎锁**：WAL 下多读者成立；离线 CLI 与 daemon 的
-   **写排序**由 `BEGIN IMMEDIATE` 承担。**不是**「findDaemon 探测可以删」——
-   SQLite 锁只排序写者，防的是写写交错；探测防的是「daemon 内存缓存与磁盘
-   分叉」，二者不可互替。残余 probe-vs-publish TOCTOU 与 JSON 时代等宽，仍
-   是 Step 4 候选 (f)，不是本步验收项。消法见该候选：占位进 store，不是再包
-   actor。
-2. **消灭整图覆盖丢失更新这一整类问题**：今天 daemon 进程终身持有一份
-   `Map<string, Session>` 缓存（`load()` 仅一次），每次 `save()` 把**整个 map**
-   序列化重写文件——任何外部进程在窗口内写入的行都会被陈旧整图覆盖。改成
-   行级 upsert 后该类问题在 SQLite 路径上结构性消失。首次 load 必须与离线
-   写者走同一排他协议（`BEGIN IMMEDIATE` 快照读），否则仍会把提交前旧行读进
-   终身缓存。
-3. **热路径成本**：`updateSession` 全仓约 125 个 src 调用点（0813 计 119；
-   0819 基线因 Mojo/dashboard 等新增约 +6）、每条入站消息触发多次，
-   每次 `JSON.stringify` 全部会话行（live 数据实测：单 bot 文件 228KB/40 行、
-   closed 行从不回收、只增不减）再做 byte-identical 跳写。行级写把 O(全部行)
-   变 O(1)。
-4. **净删除**（本步的删除项，兑现原则 1；**第一 PR 不兑现，灰度稳定后的
-   第二 PR 才删**）：store 内 JSON 机器全部私有报废——`withFileLockSync`
-   编排、tmp+rename 原子替换、byte-identical 跳写、legacy `sessions.json`
-   迁移分支、`repairMissingChatScopes`（转为导入期一次性步骤）；以及
-   **Remote lineage CAS + readback 的 JSON 实现**（0813 时名为 Riff；0819
-   基线已改名为 Remote，含 Mojo 共用）。第一 PR 只在 SQLite 上等价重写，
-   JSON 实现与 db-else-json 分流逻辑必须留到回滚窗口关闭。因此第一 PR
-   **暂时违反原则 1 的「合入即更简单」**——这是设计允许的 1~2 PR 切分，
-   不是另起 actor 层；验收以第二 PR 的净删除为准。
-5. durability 口径修正：今天的语义是 **tmp+rename、无 fsync**；SQLite WAL +
-   `synchronous=NORMAL` 首版即不弱于现状，不顺带升级（维持原验收）。
+**目标**：daemon 只写 SQLite；JSON → SQLite 导入正确；运行时更新走行级 upsert。
 
-实施要点（0819 按现行基线补齐，不改目标）：
+#1051 已覆盖本 stage 中收益最大的部分（§4）。本 stage 只收尾，不要把 occupancy 放进同一 PR。
 
-- 首启从既有 JSON **确定性自动导入**（per-bot 文件 + legacy `sessions.json`
-  中属于本 bot 的行；`repairMissingChatScope` 在导入时执行一次）：无操作员
-  仪式、无 promotion、无 HIL。JSON 不可读则 **fail-closed**（`loadFailure` +
-  `SessionStoreUnavailableError`），禁止导入出空库把唯一副本毁掉。
-- **保持 `updateSession(session)` 等既有签名不变**（内部变行级 upsert）。
-  0819 基线门面已比 0813 宽：`listSessionsStrict` / `loadForWrite` /
-  `persistActiveRemoteLineage*`（原 Riff）/ Mojo close journal 必须走同一
-  引擎，不能只换 `updateSession`。
-- 跨 bot 发现类读者改为只读打开兄弟 bot 的 `.db`；扫描函数按 db-else-json
-  解析每个 store。远程 sandbox 无本地 store 的路径（cli.ts `loadSessions`
-  走 `loadAllSessionsSnapshot` + sandbox fallback）语义不变。
-- per-bot 库放 `session-stores/<appId>/sessions.db`（目录 bind，避免 bwrap
-  单文件 inode 钉死 WAL sidecar）；legacy 无 appId 库保持平铺、不进沙盒。
-- worker `owner: false`：混合窗口内旧 daemon 从新 dist spawn 的 worker 不得
-  首启导入。
-- 运行时门：打开库走 `src/services/sqlite-compat.ts`（与 feedback / opencode /
-  traex 同一入口）。Node 免 flag 线仍是 v22.13.0 / v23.4.0，但 `package.json`
-  `engines` **不收紧**——跟 master `node: >=22`（bun 单二进制用 `bun:sqlite`）。
-  真门是 daemon 启动 `assertSqliteSupported()`：模块加载失败才算引擎不可用；
-  损坏 `.db` 不得收成 Unavailable（否则身份扫描会把坏库误判成整机无 SQLite）。
-  opencode.ts 仍标注 experimental，那是先例不是现行能力边界。
-- 经 npm canary 渠道灰度；稳定后删除 JSON 会话持久化路径（第二 PR）。
+已纳入 #1051 的 Stage 0 缺口：
 
-验收：第一 PR = 引擎互换 + 混合窗口 + 行为等价（含 0819 基线新增 API）；
-第二 PR = 上述净删除。durability 首版与今日等价。
+- dashboard 删除白板：daemon 运行中经 IPC 解绑，daemon 不可见时才离线写。两条路径都对板 id 做比对后再改——删板已经先把板移出 index，daemon 的 `ensureSessionWhiteboard` 会在该会话下一轮立刻补一块新板，无条件清除会把这块新绑定一起抹掉。IPC 侧的比对是路由新增的 `expectWhiteboardId`（不匹配返回 409）。
+- 因 daemon 可见而没能解绑的会话计入 `unresolvedSessions` 返回，不再和「没有会话引用这块板」一样报 0。
+- 解绑的 daemon IPC 带超时：心跳新鲜但 socket 不响应的 daemon 不能把 dashboard 的删除请求一直挂住。
+- 离线写收敛为一个入口 `services/session-offline-write.ts#mutateSessionRowWhenUnowned`（`mutateSessionRowOffline` + 心跳探测），CLI 与 whiteboard-store 共用；CLI 私有的那份心跳解析与 90s 判定删除，改用 `utils/daemon-discovery.ts`。探测与 store 读写用同一个 dataDir。
+- `mutateSessionRowOffline` 的 sqlite 路径在 `openDbForOwnStore` 前再做一次 `existsSync`：读写 open 会创建空库，导致导入门把尚未导入的 store 当成已导入。
+- PR 标题与描述以「daemon 不再写 JSON；跨进程在升级窗口内仍可读 JSON」为准，不再写全仓 db-only。
 
-**执行结果（2026-08-20，#852 rebase onto origin/master@3d84aaad）**：
+**JSON 读路径的删除条件（两条，先到先算）：**
 
-- store 公共签名保持；内部 SQLite 单表 + 整行 JSON 列 + VIRTUAL 生成列索引。
-- 混合窗口统一 db-else-json；abortIf 双探测保留；首次 load 走 BEGIN IMMEDIATE。
-- 0819 基线新增面已接上：Remote lineage CAS、Mojo journal 经 `persistRow`、
-  损坏 store 的写门对 .db 同样 fail-closed。`BEGIN IMMEDIATE` 超时
-  （SQLITE_BUSY）**不得**收成空投影：daemon restore 走 `listSessions()`，
-  锁等待必须抛错而不能当成「没有会话」。
-- 0820 基线新增面：Workbench `previewTarget` 在 `closeSession` / `reactivateClosedSession`
-  清除并随 `persistRow` 回滚；#846 四导出在 SQLite + 混合窗口下仍是唯一门。
-- 体量：0813 master `session-store.ts` 1390 行 → 本 PR ~2161 行。这是「JSON 机器
-  + SQLite 机器」共存的中间态，印证原则 1 的兑现点在第二 PR，不在本 PR。
-- src 无 SessionRuntime / virtual-actor 缝隙回流。
+1. 升级后自动重启 fleet 落地——线上不再有仍在写 JSON 的 daemon。
+2. 兜底复核点 **2026-11-26**（本文 2026-08-28 定稿起 90 天）。届时若 fleet 自动重启仍未落地，就按当时 latest 与「`sessions.db` 首次进入 latest 的版本」之间的跨度，决定直接删除还是再延一期，并把结论写回本节。
 
-**执行结果（2026-08-27，#852 rebase onto origin/master@06db2b48）**：
+第 2 条是必需的：fleet 自动重启不在本文范围，也没有承诺时间点。只写第 1 条，等于把跨进程 JSON 读做成 §不做 明令禁止的「长期不变量」。
 
-- 会话库不再直连 `node:sqlite`，经 `sqliteEngineAvailable` +
-  `openDatabaseSyncOrThrow` 打开；与 master bun 分发同一运行时原则。
-- `engines` 恢复 master 的 `>=22`；硬门文案同时覆盖 Node 升级线与 Bun
-  `bun:sqlite`。损坏库与引擎缺失分型：扫描 skip vs 穿透抛错。
-- 原则自检（对照 3d84aaad..06db2b48）：唯一门仍在（src 无 `sessions*.json`
-  直写绕过；CLI 只委托 store）；worker `owner: false`、fs-policy 授
-  `session-stores/<appId>` 目录、descriptor 后再 `listSessions()` +
-  `BEGIN IMMEDIATE`、`abortIf`+`findDaemon` 均保住。#889 会话级 `/cli` 写的是
-  Session 字段经 `updateSession`；#1017 发信人仍走
-  `readSessionRowCopiesAcrossStores`；#946 journal / #1008 schedule 仍是旁路
-  文件，符合非目标。无 SessionRuntime 回流，Step 4(f) 占位租约仍未实施。
+条件满足后，再开一个仍属 Stage 0 的 PR，从代码中删除 JSON 读路径（不必等 occupancy）：
 
-### Step 4 — 按痛点上事务（N 个独立小 PR，ROI gate）
+- 删除跨进程 JSON 读/写、`StoreFileRef.kind` 分流、沙盒对冻结 JSON 的授权。
+- 若无 `.db` 且尚未导入：失败并提示重启 daemon 完成迁移，不再实现完整的 JSON 离线写。
+- 线上不再有仍在写 JSON 的 daemon 之后，删除导入实现及其文件锁；新 bot 直接创建空库。
+- 磁盘上的冻结 JSON 文件可以保留，供回退旧版本读取。
 
-仅对**在 master 上有实测复现**的竞态，用 SQLite 事务原语逐个重做。
-**（0813 收紧）复现要求 test-first：每个候选先在 master 写出能红的竞态测试或
-给出线上事故指针，才允许立项——stage2 竞态清单只指路，不作数。**
-每个 PR 必须删掉它所替代的 ad-hoc 防御——不删旧的，就不上新的。
+删除条件满足之前，#1051 保留 db-else-json：升级窗口内 `botmux send` 必须仍能读到会话。这不是终态要求。
 
-【master 复核 ✅ 事务形状的 ad-hoc 防御真实存在，候选素材如下（未验复现，
-仅为「去哪里看」清单）】
+### Stage 1 — Occupancy 写入 SQLite
 
-- (a) `closeSession`/`reactivateClosedSession` 的手工回滚（session-store.ts
-  `closeSession` / `reactivateClosedSession` / `mutateMojoCloseJournal` 的
-  persistRow 失败还原）——save 抛错时逐字段还原。Step 3 落地后事务化即天然
-  替代，可能不需要独立 PR。行号随 master 漂移，以符号名为准。
-- (b) `reserveWorkerGeneration` 回滚重抛（0819：worker-pool.ts `reserveWorkerGeneration`）
-  与 worker exit fence 的**无保护** `updateSession`——后者是 Step 1 分析中发现
-  的疑似真实脆弱点。立项前必须在现行 master 重新定位行号并写出能红的测试。
-- (c) `admitQueuedActivationTail` 的 priorTail 回滚舞蹈（0819：worker-pool.ts
-  `admitQueuedActivationTail`）。
-- (d) **async tail-admission 整套**（0819：daemon.ts
-  `queuedActivationTailAdmissionsOutstanding` / ReleasePending / RetryTimer
-  三件套 + DaemonSession 三字段 + gate 分支）——Step 1 候选 5 的降级素材归位处：
-  若队首激活的 FIFO 语义由事务表达，这套进程内计数器机器就是它替代并删除的
-  ad-hoc 防御。
-- (e) `initial-user-turn` 的 best-effort persist（落盘失败退化为进程内生效）。
-- (f) **离线写 `findDaemon` probe-vs-publish TOCTOU**（0820 口径备忘，未立项）。
-  Step 3 收益第 1 条已写明：SQLite 只排序写者，`abortIf` + `findDaemon` 必须留；
-  残余窗口与 JSON 时代等宽。下面「占位租约」是这条候选若立项时的**消法**，
-  不是本步或 Step 3 的验收项。
+**目标**：occupancy 与会话行在同一事务中读写。这是 grain directory（哪个进程持有激活），不是 actor 框架。
 
-stage2 的 receipts / per-session lane 语义仍作设计参考，代码不搬。
+实现要点：
 
-#### 候选 (f) 消法：占位进 store，不必叫 actor
+1. 库内保存占位：`owner_pid` / `boot_id` / `lease_until`（或等价的 SQLite 锁会话）。第一版粒度可以 per-bot（与当前 daemon 进程同构）；表结构不要排除将来改为 per-session。
+2. daemon 在首次 `load()` 的同一事务里写入占位。现状是先写 descriptor 文件再 `load()`，两者不在同一原子操作中。
+3. 非当前 host 的写入：`BEGIN IMMEDIATE` → 读租约 → 租约有效则中止并走 IPC（或等待）；租约过期才进入 Stage 2 的短生命周期激活。探测与写入在同一事务内完成。
+4. 租约按心跳续期。90s 过期已有实现，只是心跳文件与会话行不在同一事务。
 
-这段窗口**不是**「daemon 进程内少了一个 mailbox」。产品规定了两种权威——
-daemon 活着时内存 `Map` 是权威；daemon 不在时 CLI 必须能改盘（离线 close /
-abandon）。第二种权威不会消失。TOCTOU 来自实现选择：`findDaemon` 读的是旁路
-descriptor（`dashboard-daemons/*.json` 心跳），写的是会话库——检查 A、动手 B。
+验收：`findOnlineDaemon` **不再作为所有权判断**（仍可用于发现 IPC 地址）。#1051 已把 CLI 私有的那份心跳探测并进 `utils/daemon-discovery.ts`，所以验收只需盯住这一个实现的调用点——`services/session-offline-write.ts` 的 `abortIf`、`cli.ts` 的 close / abandon / prune、`whiteboard-store` 的解绑。`dashboard/registry.ts` 读同一批心跳文件，但只用于展示和路由，不参与所有权判断。
 
-因此：
+长期同时使用心跳探测和库内租约不算完成。仅用 `BEGIN IMMEDIATE` 替换心跳探测也不算完成：锁不能表示「另一进程仍持有待写回的内存缓存」。禁止 daemon 未运行时提交 close / abandon 也不算完成：产品语义保留，实现改为获取租约后在本进程 apply。
 
-- **必然存在的**：daemon 挂了仍要有人能写盘。
-- **不是必然的**：探 descriptor 和写会话行之间的缝。那是占位放在旁路文件上。
-- **与 virtual actor 无关的**：stage2 的 `SessionRuntime` 管进程内怎么改字段；
-  窗口发生在 CLI 进程 vs daemon 进程之间。进程内单线程化消不掉它。stage2 也
-  没消：CLI 仍是第二写者，descriptor 仍在库外。用缝隙层消这条是用错工具。
-- **相关的只是 occupancy 协议**（Orleans grain directory / Durable Object 的
-  瘦身版）：同一时刻一个 activation；没有 activation 才允许 failover 写存储；
-  **占位和数据在同一个原子里**。落到本仓库就是 store 元数据，不是 actor 框架，
-  也不是 §3 禁止的 BotId 注册表。
+#852 之后，这一 stage 的架构收益最大。不做它，turn 队列和单一 apply 无法约束 CLI / dashboard 进程。
 
-若立项（仍要 test-first 复现 + 合入即删旧探测），形态是：
+### Stage 2 — 单一 apply 路径
 
-1. 会话库持有占位：`owner_pid` / `boot_id` / `lease_until`（或 SQLite 锁会话）。
-2. daemon 启动：与首次 load **同一事务**占位（现协议是先写 descriptor 再 load，
-   占位与行不在同一原子）。
-3. CLI 离线写：`BEGIN IMMEDIATE` → 读占位 → 租约有效则 abort 去 IPC，否则改行
-   并 COMMIT。检查和动手一次事务。
-4. 租约靠心跳续期；过期才允许 CLI 当 failover 写者（90s 心跳过期已有，只是
-   和行不在同一原子）。
+**目标**：close / abandon / 解绑白板 / prune 等命令只有一份实现。依赖 Stage 1。
 
-验收必须**删掉或降级**旁路 `findDaemon` 探路（发现仍可读 descriptor，所有权
-不得再靠它 abort），不能两套探测并存——否则违反「上新必须删旧」。
-`BEGIN IMMEDIATE` 单独代替 `findDaemon` 不构成验收：锁看不见「对面有一份会
-写回的缓存」。禁止 CLI 写盘也不构成验收：离线收尸没了。
+- CLI、dashboard 只发送命令。daemon 运行中：经 IPC 进入当前激活。daemon 未运行：宿主 CLI / supervisor 获取租约，在本进程调用 **同一模块** 的 apply，然后释放租约。
+- 沙盒内的 CLI 没有租约能力（§1）：它只发命令，daemon 不在时明确失败。别把它和宿主 CLI 当成同一类调用方。
+- 删除 `mutateSessionRowWhenUnowned` / `mutateSessionRowOffline` 作为对外权威写入的语义（若仍存在，只能是短生命周期激活的内部实现，不再是第二条公共写协议）。
+- `abortIf` + `findOnlineDaemon` 的所有权探测随 Stage 1 删除。
+- daemon 持有激活时，其它进程不得直接更新会话行。
 
-### Step 5 — 资产归档（无代码）
+这一步才把「daemon 未运行仍能修改会话」做成与终态一致的实现。若只完成 Stage 1、CLI 仍作为另一套权威写 SQLite，需要理解的协议几乎没有减少。
 
-- feat/virtual_actor_stage2 打 tag 归档，#831 关闭并留结论指针；
-- 两份审计台账转为一次性《会话写点地图》静态文档（1,408 写点分布本身有诊断
-  价值），声明停止维护，审计脚本不迁移。
+### Stage 3 — Per-session turn
 
-## 3. 非目标
+**目标**：同一 `sessionId` 上的命令在跨 `await` 后仍串行。按 session 排队，不引入 `SessionRuntime`。
 
-- 不迁移调用方群组，不建 actor 抽象层，不引入 SessionRuntime/SessionProjection 缝隙；
-  virtual-actor（#831 / feat/virtual_actor_stage2）维持不合入，不在 Step 3/4
-  「顺便固化」。store-first 就是对它的替代，不是前置。
-- 不引入分配式身份或任何注册表（BotId 保持地址纯推导）。会话库内的**占位租约**
-  （Step 4 候选 f：哪个 daemon 此刻拥有本 bot 的行）是 store 元数据，不是身份
-  注册表，立项时不得借此引入 BotId 分配。
-- 不动内存 DaemonSession 的共享可变语义——它在单 daemon 进程内工作正常，
-  重构它需要独立的实测理由；也**消不掉**跨进程离线写 TOCTOU（见候选 f）。
-- （0813 明确）不把 sessionId 旁路存储（turn-sends、frozen-card、whiteboard、
-  usage-ledger、idempotency、vc-meeting-*）卷进 Step 2/3 的范围。
+- 按 `sessionId` 将命令闭包入队（或等价的 Promise 链）。host 仍是 bot 进程。
+- 用队列替换已有测试或线上证据的分散 fence（async tail-admission、worker generation / exit 路径上无保护的 `updateSession`、队首激活 FIFO 等）。没有复现的路径不要为了「更像 actor」而改。
+- stage2 的 receipts / lane 只作线索，立项前在现行代码复核。
 
-## 4. 与 stage2 资产的关系
+daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外部入口都走同一 apply，否则队列覆盖不到 CLI / dashboard。
 
-代码不搬，知识全收：1,408 写点地图（台账坐标）、竞态与幂等语义清单
-（receipts/lane 设计）、以及「纪律性边界必然演化出监视系统」这条反面教训。
-**（0813 追加）使用方式收紧：全部按「线索」使用，逐条在 master 复核后才可
-立项——Step 1 的执行记录（7 项候选 6 项不成立）就是这条规则的成因。**
+`admitQueuedActivationTail` 一类在 store 外做字段备份再回滚的逻辑：在「按命令更新且不替换 `ds.session` 引用」的 apply 入口出现后删除。不要为少写几行回滚代码单独增加一个公共 patch API。
+
+### Stage 4 — （可选）按 session 隔离激活
+
+仅当「同一 bot 进程内容纳全部会话」导致事件循环或崩溃域不可接受时立项。Stage 1–3 不依赖本 stage。调度仍在本机，不引入跨机器放置。
+
+### 不做
+
+- 合入 #831，或任何只把部分写点迁入新层、旧路径完整保留的 runtime。
+- 把旁路文件并入会话库。
+- 为 actor 引入 BotId 分配或注册表。
+- 把跨进程 JSON 读取写成长期不变量。
+- 以「本 PR 净行数未减少」否决朝终态收敛的改动。
+
+## 4. #1051 与终态的关系
+
+**Stage 0 中收益最大的部分已经覆盖，应当合入；不要在本 PR 做 Stage 1。** 增补仅限 Stage 0 缺口。
+
+已覆盖：
+
+- 删除 daemon 的 JSON 写路径（整图 `save()`、JSON CAS、运行时 JSON 迁移写入）。这是换引擎之后减少协议种类最多的一块。
+- 行级 upsert，不再用陈旧整图覆盖已提交行。
+- 导入：暂存库使用 `journal_mode=DELETE`（避免 bun:sqlite 在 WAL 下 `rename` 出只有文件头的库）、按文件 key 插入而不按行内 `sessionId` 重键、`owner: false` 只读、不因探测路径创建空库而跳过导入。
+- close 路径先写 SQLite 再合并回内存对象，与单一 apply 方向一致，保留。
+- 测试夹具写入真实 SQLite，不再靠写 JSON 让「唯一写入入口」测试误绿。
+- 删除白板：daemon 运行中 IPC 解绑，未运行时离线写，两侧都对板 id 比对；无法解绑的会话计入返回。sqlite 离线写打开前拒绝缺文件。
+- 离线写与 daemon 发现各收敛成一份实现（见 §3 Stage 0 缺口）。Stage 1 / Stage 2 的删除面因此只剩一个入口。
+
+本 PR 明确不做、也不应做：
+
+- occupancy（Stage 1）。与「删除 JSON 写路径」风险和范围都不同。
+- 跨进程改为只读 SQLite。在升级窗口关闭前删除 JSON 回落，会让窗口内的 `botmux send` 失败。删除条件见 Stage 0，不是本 PR 的前置。
+
+合入后的实际状态：daemon 只写 SQLite；其它进程在升级窗口内仍可能读 JSON；occupancy 仍在心跳文件；apply 仍有两套——daemon 的 `updateSession`，和 `mutateSessionRowWhenUnowned` 这一个离线入口。之后按 Stage 1 → 2 → 3 推进。
+
+## 5. 建议顺序
+
+```
+现在          #1051 合入        删除条件满足          occupancy      单一 apply       turn
+ |               |          (fleet 落地 / 复核点)         |              |              |
+ |-- Stage 0 ----+-- Stage 0 收尾 -----|                  |              |              |
+ |  (本 PR)      |  删除 JSON 读路径   |----- Stage 1 -----+-- Stage 2 ---+-- Stage 3 ---|
+```
+
+- **#1051**：删除 daemon JSON 写路径；含白板解绑的 compare-and-set、离线写打开前拒绝缺文件、离线写与 daemon 发现各收敛成一份实现。
+- **删除 JSON 读路径**：条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。fleet 实现不在本文范围。
+- **下一个架构主 PR**：Stage 1 occupancy。先写能失败的测试覆盖「读心跳文件与写会话行之间的窗口」，合入后 `findOnlineDaemon` 不再用于所有权判断。
+- **再下一个**：Stage 2，daemon 未运行时获取租约并执行同一 apply，删除第二套对外写协议。这一阶段减少的概念最多。
+- **Stage 3**：按已有证据把分散 fence 收进 per-session 队列。不设「迁完全部写点」的完成门。
+
+`closeSession` 的字段级回滚已在 #1051 替换。`admitQueuedActivationTail`、async tail-admission、generation / exit 上无保护的写入归 Stage 3。`initial-user-turn` 在落盘失败时仅更新内存：有复现再进入 Stage 2 或 3，不单独开事务修复轨道。
+
+## 6. 历史
+
+2026-08 曾用 `SessionRuntime` 包装会话写入（#831）。按调用方群组迁移导致新旧路径长期并存，大部分写点未迁入，适配层按设计要整段删除，审计脚本挂在 build 上。**不合入。** 从中保留并已落地的是：会话行唯一写入入口（#846）、JSON 换成 SQLite（#852）。当时记录的多数「缺陷」是那次包装自己引入的回归，不作为现行证据。
+
+同期口径要求「每步合入必须立刻更简单、收益不得递延、先做存储且不实现 actor」。它避免了再次合入只覆盖部分写点的 runtime，也把 occupancy、单一 apply、turn 拆成互不相关的步骤。本文取代该口径。会话行已由 SQLite 持久化之后，终态是本机 virtual actor：命令、库内租约、按 session 串行；host 进程可更换；不存在第二套权威写入。

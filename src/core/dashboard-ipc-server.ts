@@ -35,6 +35,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
@@ -2133,13 +2134,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
 // short-lived `botmux whiteboard` process rewriting a stale whole Session row
 // over a concurrent Codex App FIFO transition.
 ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params) => {
-  let body: { whiteboardId?: unknown };
+  let body: { whiteboardId?: unknown; expectWhiteboardId?: unknown };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  if (typeof body.whiteboardId !== 'string'
-    || body.whiteboardId.length === 0
-    || body.whiteboardId.length > 256) {
+  const unbind = body.whiteboardId === null;
+  const bindId = typeof body.whiteboardId === 'string' ? body.whiteboardId : '';
+  const bind = !unbind
+    && bindId.length > 0
+    && bindId.length <= 256;
+  if (!unbind && !bind) {
     return jsonRes(res, 400, { ok: false, error: 'bad_whiteboard_id' });
+  }
+  // Optional compare-and-set. Board deletion needs it: between the deleter's
+  // snapshot and this request the daemon may have rebound the session
+  // (`ensureSessionWhiteboard` mints a replacement as soon as the old board
+  // leaves the index), and an unconditional clear would drop that new binding
+  // and orphan the board the daemon just created.
+  const hasExpect = body.expectWhiteboardId !== undefined;
+  const expect = typeof body.expectWhiteboardId === 'string' ? body.expectWhiteboardId : undefined;
+  if (hasExpect && expect === undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_expect_whiteboard_id' });
   }
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
@@ -2148,9 +2162,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    current.whiteboardId = body.whiteboardId as string;
+    if (expect !== undefined && current.whiteboardId !== expect) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'whiteboard_changed',
+        whiteboardId: current.whiteboardId ?? null,
+      });
+    }
+    if (unbind) current.whiteboardId = undefined;
+    else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
-    jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId });
+    jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId ?? null });
   });
 });
 
@@ -3247,6 +3269,16 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const chats = await groupsStore.listChats(cachedLarkAppId);
+    let pinStreamingCardMasterEnabled = false;
+    let noPinStreamingCardChats = new Set<string>();
+    try {
+      const botConfig = getBot(cachedLarkAppId).config;
+      pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
+      noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
+    } catch {
+      // Fail open for the groups board when config lookup is unavailable:
+      // rows still render with safe defaults instead of dropping the whole list.
+    }
     // Stamp a firstSeenAt timestamp for every chat (preserve existing values,
     // backfill new ones with Date.now()). Lark doesn't expose chat create_time
     // anywhere, so the dashboard sorts by this client-side proxy instead.
@@ -3262,6 +3294,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const observedBotNames = observedBotsStore
         .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
         .map(b => b.name);
+      const pinStreamingCardChatEnabled = !noPinStreamingCardChats.has(c.chatId);
       return {
         ...c,
         oncallChat: oncall ?? null,
@@ -3269,6 +3302,9 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         hasRole,
         hasMessageListener,
         observedBotNames,
+        pinStreamingCardMasterEnabled,
+        pinStreamingCardChatEnabled,
+        pinStreamingCardEffectiveEnabled: pinStreamingCardMasterEnabled && pinStreamingCardChatEnabled,
         // 会话群分型（p2pMode=group 自动创建）：dashboard 群面板据此把它们
         // 收进独立折叠区，避免淹没需要人工管理的常驻群。
         ...(isSessionGroup(c.chatId) ? { sessionGroup: true } : {}),
@@ -5103,6 +5139,17 @@ ipcRoute('PUT', '/api/chat-feedback/:chatId', async (req, res, params) => {
   const result = await setChatFeedbackPolicy(cachedLarkAppId, decodeURIComponent(params.chatId), feedback as any);
   if (!result.ok) return jsonRes(res, result.reason === 'bot_not_registered' ? 404 : 400, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true, feedback });
+});
+
+ipcRoute('PUT', '/api/chat-pin-streaming-card/:chatId', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { enabled?: unknown };
+  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.enabled !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'invalid_enabled' });
+  const result = await setChatStreamingCardPin(cachedLarkAppId, decodeURIComponent(params.chatId), body.enabled);
+  if (!result.ok) return jsonRes(res, result.reason === 'bot_not_registered' ? 404 : 500, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, enabled: body.enabled, changed: result.changed });
 });
 
 ipcRoute('GET', '/api/feedback-effective', async (req, res) => {

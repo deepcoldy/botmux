@@ -29,7 +29,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
@@ -870,6 +870,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -924,6 +925,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1038,6 +1040,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1117,6 +1120,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1200,6 +1204,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1218,6 +1223,20 @@ function clearPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+/** Live per-bot `dshRuntime` for a session's card. Only meaningful for cliId
+ *  'dsh': 'tui' means the worker spawns the PTY-driven dsh-tui adapter (a real
+ *  interactive TUI), so `/compact` affordances stay enabled. Read from the LIVE
+ *  bot config on purpose — `SessionCliLaunchSnapshotV1` has no dshRuntime field
+ *  and the worker likewise pairs a frozen cliId with the live runtime, so this
+ *  matches what actually spawns. */
+export function dshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | undefined {
+  try {
+    return getBot(ds.larkAppId).config.dshRuntime;
+  } catch {
+    return undefined;
+  }
 }
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
@@ -1897,6 +1916,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2414,6 +2434,12 @@ type PendingBotStreamingCardReconcileRequest = {
   enabled: boolean;
   chatId?: string;
   authoritativeCleanupBySession: Map<string, { chatId: string; ids: string[] }>;
+  restoreCandidatesBySession?: Map<string, {
+    chatId: string;
+    currentId?: string;
+    frozenIds: string[];
+    enabled: boolean;
+  }>;
 };
 
 type PendingBotStreamingCardReconcile = {
@@ -2446,7 +2472,7 @@ async function drainBotStreamingCardReconcileQueue(larkAppId: string): Promise<v
     while (true) {
       const request = state.pending.shift();
       if (!request) break;
-      const { enabled, chatId, authoritativeCleanupBySession } = request;
+      const { enabled, chatId, authoritativeCleanupBySession, restoreCandidatesBySession } = request;
       // An on->off transition grants authority over the exact card IDs visible
       // at that transition.  This work must not depend on a later active-registry
       // lookup: close/removal can happen while an earlier reconcile request is
@@ -2469,6 +2495,13 @@ async function drainBotStreamingCardReconcileQueue(larkAppId: string): Promise<v
             /* captured cleanup remains fail-open */
           }
         }));
+      }
+      if (restoreCandidatesBySession) {
+        await reconcileRestoredStreamingCardPinsForRequest(
+          larkAppId,
+          restoreCandidatesBySession,
+        );
+        continue;
       }
       const sessions = snapshotBotStreamingCardReconcileSessions(larkAppId);
       const targetSessions = chatId === undefined
@@ -2530,6 +2563,128 @@ function snapshotAuthoritativeCleanupIdsForBotWideOff(
   );
 }
 
+function snapshotRestoreCandidatesForBot(
+  larkAppId: string,
+): Map<string, {
+  chatId: string;
+  currentId?: string;
+  frozenIds: string[];
+  enabled: boolean;
+}> {
+  return new Map(
+    snapshotBotStreamingCardReconcileSessions(larkAppId)
+      .filter(ds => retainsLarkStreamingCardTransport(ds))
+      .map((ds) => {
+        const currentId = isRealStreamingCardId(ds.streamCardId) ? ds.streamCardId : undefined;
+        const frozenIds = snapshotStreamingCardIds(ds).filter(id => id !== currentId);
+        return [ds.session.sessionId, {
+          chatId: ds.chatId,
+          currentId,
+          frozenIds,
+          enabled: pinStreamingCardEnabledFor(ds.larkAppId, ds.chatId),
+        }];
+      }),
+  );
+}
+
+function sameAppRemoteAppIdProofIds(
+  larkAppId: string,
+  candidateIds: ReadonlySet<string>,
+  remotePins: Awaited<ReturnType<typeof listChatPins>>,
+): Set<string> {
+  const proven = new Set<string>();
+  for (const pin of remotePins) {
+    if (pin.operatorIdType !== 'app_id' || pin.operatorId !== larkAppId) continue;
+    if (!candidateIds.has(pin.messageId)) continue;
+    proven.add(pin.messageId);
+  }
+  return proven;
+}
+
+async function reconcileRestoredStreamingCardPinsForRequest(
+  larkAppId: string,
+  restoreCandidatesBySession: Map<string, {
+    chatId: string;
+    currentId?: string;
+    frozenIds: string[];
+    enabled: boolean;
+  }>,
+): Promise<void> {
+  if (restoreCandidatesBySession.size === 0) return;
+  const liveSessions = new Map(
+    snapshotBotStreamingCardReconcileSessions(larkAppId)
+      .map(ds => [ds.session.sessionId, ds] as const),
+  );
+  const byChat = new Map<string, Array<{
+    ds: DaemonSession;
+    owner: StreamingCardOwner;
+    currentId?: string;
+    frozenIds: string[];
+    enabled: boolean;
+  }>>();
+  for (const [sessionId, candidate] of restoreCandidatesBySession) {
+    if (!retainsLarkStreamingCardTransportFor(larkAppId, candidate.chatId)) continue;
+    const ds = liveSessions.get(sessionId);
+    if (!ds) continue;
+    const entries = byChat.get(candidate.chatId) ?? [];
+    entries.push({
+      ds,
+      owner: { larkAppId, sessionId },
+      currentId: candidate.currentId,
+      frozenIds: candidate.frozenIds,
+      enabled: candidate.enabled,
+    });
+    byChat.set(candidate.chatId, entries);
+  }
+  for (const [chatId, entries] of byChat) {
+    const summary = (err: unknown): string => err instanceof Error ? err.message : String(err);
+    try {
+      const localCandidateIds = new Set(
+        entries.flatMap(entry => [
+          ...(entry.currentId ? [entry.currentId] : []),
+          ...entry.frozenIds,
+        ]).filter(isRealStreamingCardId),
+      );
+      if (localCandidateIds.size === 0) continue;
+      const remotePins = await listChatPins(larkAppId, chatId);
+      const provenIds = sameAppRemoteAppIdProofIds(larkAppId, localCandidateIds, remotePins);
+      await Promise.allSettled(entries.map(async (entry) => {
+        const provenFrozen = entry.frozenIds.filter(id => provenIds.has(id));
+        if (entry.enabled) {
+          if (!entry.currentId || !isRealStreamingCardId(entry.currentId)) return;
+          const pinned = await pinStreamingCardIfEnabled(entry.ds, entry.currentId);
+          if (!pinned || provenFrozen.length === 0) return;
+          for (const frozenId of provenFrozen) rememberOwnedStreamingCard(entry.owner, frozenId);
+          await unpinStreamingCardIds(larkAppId, provenFrozen, entry.owner);
+          return;
+        }
+        if (provenIds.size === 0) return;
+        const provenCurrent = entry.currentId && provenIds.has(entry.currentId)
+          ? entry.currentId
+          : undefined;
+        if (provenCurrent) rememberOwnedStreamingCard(entry.owner, provenCurrent);
+        for (const frozenId of provenFrozen) rememberOwnedStreamingCard(entry.owner, frozenId);
+        // Maintainer intent: bot-wide OFF still excludes chats that had already
+        // opted out from the authoritative local snapshot, but a restart-time
+        // remote same-app proof may retry cleanup strictly inside those
+        // enqueue-time local candidates. This adds authorization only; it must
+        // never expand cleanup beyond the locally captured ids.
+        await unpinStreamingCardIds(
+          larkAppId,
+          [
+            ...(provenCurrent ? [provenCurrent] : []),
+            ...provenFrozen,
+          ],
+          entry.owner,
+        );
+      }));
+    } catch (err) {
+      logger.debug(`[${larkAppId}] streaming-card restore pin proof list failed for chat ${chatId}: ${summary(err)}`);
+      /* one chat's remote proof failure must not block other chats */
+    }
+  }
+}
+
 /** Fire-and-forget bot-wide reconciliation so configuration mutation remains
  * responsive even when Lark Pin APIs are slow or unavailable. */
 export function reconcileBotStreamingCardPins(
@@ -2551,6 +2706,28 @@ export function reconcileBotStreamingCardPins(
     chatId,
     authoritativeCleanupBySession,
   };
+  if (state) {
+    state.pending.push(request);
+    if (!state.running) trackPinStreamingCardTask(drainBotStreamingCardReconcileQueue(larkAppId));
+    return;
+  }
+  pendingBotStreamingCardReconciles.set(larkAppId, {
+    pending: [request],
+    running: false,
+  });
+  trackPinStreamingCardTask(drainBotStreamingCardReconcileQueue(larkAppId));
+}
+
+/** Queue restart-time streaming-card provenance recovery behind the same
+ * per-bot FIFO used by config-driven reconciliation. Remote discovery may only
+ * authorize work within the enqueue-time local candidate set captured here. */
+export function reconcileRestoredStreamingCardPins(larkAppId: string): void {
+  const request: PendingBotStreamingCardReconcileRequest = {
+    enabled: false,
+    authoritativeCleanupBySession: new Map<string, { chatId: string; ids: string[] }>(),
+    restoreCandidatesBySession: snapshotRestoreCandidatesForBot(larkAppId),
+  };
+  const state = pendingBotStreamingCardReconciles.get(larkAppId);
   if (state) {
     state.pending.push(request);
     if (!state.running) trackPinStreamingCardTask(drainBotStreamingCardReconcileQueue(larkAppId));
@@ -2628,6 +2805,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -2693,6 +2871,7 @@ export async function postTurnStartingCard(
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -2832,6 +3011,7 @@ export async function postFreshStreamingCard(
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -5985,6 +6165,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     silentIdleCardFlag(ds),
+    dshRuntimeForSession(ds),
   );
 }
 
@@ -11330,6 +11511,7 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
+              dshRuntimeForSession(ds),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -11438,6 +11620,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
+            dshRuntimeForSession(ds),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -11919,6 +12102,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
+            dshRuntimeForSession(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -12032,6 +12216,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             silentIdleCardFlag(ds),
+            dshRuntimeForSession(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -12107,6 +12292,7 @@ function setupWorkerHandlers(
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           silentIdleCardFlag(ds),
+          dshRuntimeForSession(ds),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -12517,6 +12703,7 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
+              dshRuntimeForSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -12589,6 +12776,7 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               silentIdleCardFlag(ds),
+              dshRuntimeForSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }

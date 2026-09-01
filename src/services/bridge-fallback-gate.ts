@@ -194,6 +194,8 @@ export function bridgePostText(finalText: string, adoptMode: boolean): string {
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
+  turnId?: string;
+  dispatchAttempt?: number;
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */

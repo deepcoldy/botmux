@@ -15,7 +15,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bun run audit:domains && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs",
+    "build": "bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
     "verify:binary": "bun scripts/verify-binary.mjs",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "workflow-core:build": "node scripts/build-workflow-core-package.mjs",

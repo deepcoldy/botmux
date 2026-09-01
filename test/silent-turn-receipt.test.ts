@@ -443,4 +443,26 @@ describe('buildStreamingCard call sites all pass silentIdleCardFlag', () => {
       expect(missing).toEqual([]);
     });
   }
+
+  /**
+   * Same structural argument for `dshRuntime`, the trailing positional that
+   * decides whether a `dsh` bot's card keeps the 🗜️ compact button: bare `'dsh'`
+   * is the headless JSON-RPC runner (raw `/compact` is dropped as non-frame
+   * input), while `dshRuntime: 'tui'` is the PTY-driven dsh-tui — a real
+   * interactive TUI that accepts it. Forgetting the argument is FAIL-CLOSED (the
+   * button hides, matching the pre-existing behaviour for dsh), so a miss is not
+   * a broken button — but it does silently drop the affordance on a CLI that
+   * supports it, which no behavioural test at another call site would catch.
+   */
+  for (const file of files) {
+    it(`${file} — passes dshRuntime`, async () => {
+      const { readFileSync } = await import('node:fs');
+      const calls = callArgs(readFileSync(file, 'utf8'));
+      expect(calls.length).toBeGreaterThan(0);
+      const missing = calls
+        .filter(c => !/dshRuntime/.test(c.args))
+        .map(c => `${file}:${c.line}`);
+      expect(missing).toEqual([]);
+    });
+  }
 });

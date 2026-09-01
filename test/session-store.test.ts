@@ -86,6 +86,7 @@ import {
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
 } from '../src/services/session-store.js';
+import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1220,11 +1221,12 @@ describe('Edge cases', () => {
 
 // ─── legacy field sanitization ───────────────────────────────────────────────
 
-describe('legacy placeholder-card field stripping', () => {
-  it('removes pendingResponseCard* fields from disk on the next save', () => {
+describe('import-time convergence', () => {
+  it('strips pendingResponseCard* fields while importing, so no written row carries them', () => {
     // A session persisted before the「处理中」placeholder card was removed still
-    // carries the three legacy fields on disk. The next save must drop them so
-    // the file converges to clean (nothing reads them anymore).
+    // carries the three legacy fields. The import drops them once; nothing can
+    // reintroduce them (the fields no longer exist on `Session`), which is why
+    // the write paths no longer re-check.
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(join(tempDir, 'sessions.json'), JSON.stringify({
       s1: {
@@ -1245,15 +1247,47 @@ describe('legacy placeholder-card field stripping', () => {
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardState');
     expect(onDisk.s1).not.toHaveProperty('lastPatchedResponseCardId');
   });
+
+  it('never lets a duplicate-sessionId ghost overwrite the live row', () => {
+    // Two entries can carry the SAME sessionId under different file keys.
+    // Importing under `row.sessionId` would collapse them and let whichever
+    // comes last win — a stale closed ghost silently replacing the live row,
+    // irreversibly (the import runs once, the JSON is frozen afterwards).
+    // Rows are imported under their own file key; a mis-keyed row stays inert.
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions.json'), JSON.stringify({
+      realId: {
+        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'CURRENT',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      wrongKey: {
+        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'STALE-DUP',
+        status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    }));
+
+    init();
+    expect(getSession('realId')?.title).toBe('CURRENT');
+    expect(getSession('realId')?.status).toBe('active');
+    const onDisk = readPersistedRows(tempDir);
+    expect(onDisk.realId.title).toBe('CURRENT');
+    expect(onDisk.wrongKey.title).toBe('STALE-DUP');
+  });
 });
 
 // ─── cross-process offline access ────────────────────────────────────────────
 // The absorbed CLI-side persistence (formerly cli.ts loadSessions /
 // mutateSessionOffline / saveSession) and the daemon/provenance direct reads.
 
+/** Pre-SQLite JSON — an IMPORT SOURCE only; the store never reads it at runtime. */
 function seedFile(name: string, rows: Record<string, unknown>): void {
   mkdirSync(tempDir, { recursive: true });
   writeFileSync(join(tempDir, name), JSON.stringify(rows, null, 2));
+}
+
+/** Seed a real store on disk — what "another bot's daemon already wrote" means. */
+function seedStore(appId: string | undefined, rows: Record<string, unknown>): string {
+  return seedPersistedSessionRows(tempDir, appId, rows);
 }
 
 function row(sessionId: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -1264,12 +1298,12 @@ function row(sessionId: string, extra: Record<string, unknown> = {}): Record<str
 }
 
 describe('loadAllSessionsSnapshot()', () => {
-  it('merges legacy + per-bot files, per-bot wins duplicates and gets larkAppId stamped', () => {
-    seedFile('sessions.json', {
+  it('merges the legacy store + per-bot stores, per-bot wins duplicates and gets larkAppId stamped', () => {
+    seedStore(undefined, {
       legacy1: row('legacy1'),
       dup: row('dup', { title: 'legacy copy' }),
     });
-    seedFile('sessions-appA.json', {
+    seedStore('appA', {
       dup: row('dup', { title: 'per-bot copy' }),
       a1: row('a1'),
     });
@@ -1282,67 +1316,98 @@ describe('loadAllSessionsSnapshot()', () => {
     expect(snapshot.get('a1')?.larkAppId).toBe('appA');
   });
 
-  it('applies the scope repair and skips malformed entries', () => {
-    seedFile('sessions.json', {
+  it('skips malformed rows', () => {
+    seedStore(undefined, {
       broken: { notASession: true },
-      chatScoped: { ...row('chatScoped'), chatId: 'oc_x', rootMessageId: 'oc_x' },
+      ok: row('ok'),
     });
     const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
-    expect(snapshot.size).toBe(1);
-    expect(snapshot.get('chatScoped')?.scope).toBe('chat');
+    expect([...snapshot.keys()]).toEqual(['ok']);
   });
 
-  it('falls back to the exact per-bot file when the data dir cannot be enumerated', () => {
-    seedFile('sessions-appB.json', { b1: row('b1') });
-    seedFile('sessions-appC.json', { c1: row('c1') });
+  it('falls back to the exact per-bot store when the data dir cannot be enumerated', () => {
+    seedStore('appB', { b1: row('b1') });
+    seedStore('appC', { c1: row('c1') });
     fsControl.failReaddir = true;
     try {
       const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appB' });
-      // The sandboxed fallback loads only the injected bot's own file.
+      // The sandboxed fallback loads only the injected bot's own store.
       expect([...snapshot.keys()]).toEqual(['b1']);
       expect(snapshot.get('b1')?.larkAppId).toBe('appB');
     } finally {
       fsControl.failReaddir = false;
     }
   });
+
+  it('never creates a store it was only asked to read', () => {
+    mkdirSync(tempDir, { recursive: true });
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir }).size).toBe(0);
+    // A read-write SQLite open would have CREATED this file, and its mere
+    // existence disables the owning daemon's one-shot JSON import.
+    expect(existsSync(sessionStorePath(tempDir))).toBe(false);
+  });
+
+  it('still reads a store whose owning daemon has not imported it yet', () => {
+    // Upgrade window: npm already replaced dist and repointed the launcher, but
+    // the daemon that owns these rows still runs the pre-SQLite build and keeps
+    // writing the JSON. Every live session's `botmux send` resolves itself
+    // through here — going db-only would leave the agent unable to reply until
+    // someone restarts the daemon, which nothing forces them to do.
+    seedFile('sessions-appB.json', { b1: row('b1') });
+    seedStore('appA', { a1: row('a1') });
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect([...snapshot.keys()].sort()).toEqual(['a1', 'b1']);
+    expect(snapshot.get('b1')?.larkAppId).toBe('appB');
+  });
 });
 
 describe('readSessionRowFromDisk()', () => {
-  it('prefers the owning per-bot file and falls back to legacy', () => {
-    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
-    seedFile('sessions-appA.json', { s1: row('s1', { title: 'per-bot' }) });
+  it('prefers the owning per-bot store and falls back to legacy', () => {
+    seedStore(undefined, { s1: row('s1', { title: 'legacy' }) });
+    seedStore('appA', { s1: row('s1', { title: 'per-bot' }) });
     expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('per-bot');
     expect(readSessionRowFromDisk('s1', 'appMissing', tempDir)?.title).toBe('legacy');
     expect(readSessionRowFromDisk('s1', undefined, tempDir)?.title).toBe('legacy');
     expect(readSessionRowFromDisk('nope', 'appA', tempDir)).toBeUndefined();
   });
 
-  it('skips a corrupt per-bot file and still reads the legacy copy', () => {
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, 'sessions-appA.json'), '{corrupt');
-    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+  it('skips a corrupt per-bot store and still reads the legacy copy', () => {
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'not a database');
+    seedStore(undefined, { s1: row('s1', { title: 'legacy' }) });
     expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('legacy');
   });
 });
 
 describe('readSessionRowCopiesAcrossStores()', () => {
-  it('returns one entry per file that holds the id', () => {
-    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
-    seedFile('sessions-appA.json', { s1: row('s1', { title: 'per-bot' }) });
-    seedFile('sessions-appB.json', { other: row('other') });
+  it('returns one entry per store that holds the id', () => {
+    seedStore(undefined, { s1: row('s1', { title: 'legacy' }) });
+    seedStore('appA', { s1: row('s1', { title: 'per-bot' }) });
+    seedStore('appB', { other: row('other') });
     const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
     expect(copies.map(c => c.title).sort()).toEqual(['legacy', 'per-bot']);
     expect(readSessionRowCopiesAcrossStores('other', tempDir)).toHaveLength(1);
     expect(readSessionRowCopiesAcrossStores('missing', tempDir)).toHaveLength(0);
   });
 
-  it('skips corrupt files and key-mismatched rows without failing the scan', () => {
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, 'sessions-appA.json'), 'not json');
-    seedFile('sessions-appB.json', { s1: row('someOtherId') }); // key ≠ row.sessionId
-    seedFile('sessions.json', { s1: row('s1') });
+  it('skips corrupt stores and key-mismatched rows without failing the scan', () => {
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'not a database');
+    seedStore('appB', { s1: row('someOtherId') }); // key ≠ row.sessionId
+    seedStore(undefined, { s1: row('s1') });
     const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
     expect(copies).toHaveLength(1);
+  });
+
+  it('a frozen pre-SQLite JSON is not a second copy of an imported store', () => {
+    // The identity scan authorises only when a row resolves EXACTLY once. The
+    // frozen import source must not read as a second store, or every migrated
+    // session would be refused as ambiguous.
+    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    init('appA');
+    listSessions(); // import → .db, JSON frozen in place
+    init();
+    expect(readSessionRowCopiesAcrossStores('s1', tempDir)).toHaveLength(1);
   });
 
   it('throws when the data dir itself cannot be listed (fail-closed identity scan)', () => {
@@ -1355,10 +1420,8 @@ describe('mutateSessionRowOffline()', () => {
   it('mutates the FRESH on-disk row, never the caller snapshot (stale-clobber regression)', () => {
     // The row gained a newer field on disk after the caller took its snapshot.
     // The old cli.ts saveSession() would have written the stale snapshot back,
-    // erasing workerGeneration; the locked mutation must preserve it.
-    seedFile('sessions-appA.json', {
-      s1: row('s1', { workerGeneration: 7, larkAppId: 'appA' }),
-    });
+    // erasing workerGeneration; the exclusive row mutation must preserve it.
+    seedStore('appA', { s1: row('s1', { workerGeneration: 7, larkAppId: 'appA' }) });
 
     const published = mutateSessionRowOffline(
       { sessionId: 's1', larkAppId: 'appA' },
@@ -1372,25 +1435,24 @@ describe('mutateSessionRowOffline()', () => {
 
     expect(published?.status).toBe('closed');
     expect(published?.workerGeneration).toBe(7);
-    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8'));
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
     expect(onDisk.s1.status).toBe('closed');
     expect(onDisk.s1.workerGeneration).toBe(7);
   });
 
   it('returns the fresh row without writing when mutate declines', () => {
-    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
     const current = mutateSessionRowOffline(
       { sessionId: 's1', larkAppId: 'appA' },
       () => false,
       { dataDir: tempDir },
     );
     expect(current?.sessionId).toBe('s1');
-    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
   it('returns undefined for a missing row', () => {
-    seedFile('sessions-appA.json', { s1: row('s1') });
+    seedStore('appA', { s1: row('s1') });
     expect(mutateSessionRowOffline(
       { sessionId: 'ghost', larkAppId: 'appA' },
       () => true,
@@ -1399,22 +1461,21 @@ describe('mutateSessionRowOffline()', () => {
   });
 
   it('aborts untouched when abortIf trips at entry', () => {
-    seedFile('sessions-appA.json', { s1: row('s1') });
-    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    seedStore('appA', { s1: row('s1') });
     const result = mutateSessionRowOffline(
       { sessionId: 's1', larkAppId: 'appA' },
       current => { current.status = 'closed'; return true; },
       { dataDir: tempDir, abortIf: () => true },
     );
     expect(result).toBeUndefined();
-    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
-  it('re-checks abortIf immediately before publication and leaves the file untouched', () => {
+  it('re-checks abortIf immediately before publication and leaves the row untouched', () => {
     // A daemon that appears during the read/decision phase becomes
-    // authoritative — the second probe must catch it.
-    seedFile('sessions-appA.json', { s1: row('s1') });
-    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    // authoritative — the second probe must catch it. SQLite's own locking
+    // orders writers but cannot see a daemon holding a stale in-memory cache.
+    seedStore('appA', { s1: row('s1') });
     let probes = 0;
     const result = mutateSessionRowOffline(
       { sessionId: 's1', larkAppId: 'appA' },
@@ -1423,34 +1484,46 @@ describe('mutateSessionRowOffline()', () => {
     );
     expect(result).toBeUndefined();
     expect(probes).toBe(2);
-    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
   });
 
-  it('converges the file on write: drops key-mismatched rows and legacy card fields', () => {
-    seedFile('sessions-appA.json', {
-      s1: row('s1', { pendingResponseCardId: 'om_old' }),
-      wrongKey: row('actualId'),
-    });
-    mutateSessionRowOffline(
-      { sessionId: 's1', larkAppId: 'appA' },
-      current => { current.title = 'touched'; return true; },
-      { dataDir: tempDir },
-    );
-    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8'));
-    expect(onDisk.s1.title).toBe('touched');
-    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
-    expect(onDisk).not.toHaveProperty('wrongKey');
-  });
-
-  it('targets the legacy sessions.json when the row carries no larkAppId', () => {
-    seedFile('sessions.json', { s1: row('s1') });
+  it('targets the legacy store when the row carries no larkAppId', () => {
+    seedStore(undefined, { s1: row('s1') });
     const published = mutateSessionRowOffline(
       { sessionId: 's1' },
       current => { current.status = 'closed'; return true; },
       { dataDir: tempDir },
     );
     expect(published?.status).toBe('closed');
-    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions.json'), 'utf-8'));
-    expect(onDisk.s1.status).toBe('closed');
+    expect(readPersistedSessionRows(tempDir).s1.status).toBe('closed');
+  });
+
+  it('never creates the store — an empty one would disable the daemon import gate', () => {
+    // A read-write SQLite open CREATES the file. If an offline write planted an
+    // empty store here, the owning daemon's `existsSync(db)` gate would skip
+    // the one-shot JSON import and silently discard every pre-SQLite row.
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    expect(mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      () => true,
+      { dataDir: tempDir },
+    )).toBeUndefined();
+    expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
+  });
+
+  it('writes the JSON store while its owning daemon has not imported it yet', () => {
+    // Upgrade window: the pre-SQLite daemon still owns these rows and reads the
+    // JSON, so an offline close has to land there. Creating a .db here would
+    // fork the two representations behind that daemon's back — and the empty
+    // store would also disable its one-shot import gate.
+    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    const published = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir },
+    );
+    expect(published?.status).toBe('closed');
+    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('closed');
+    expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
 });

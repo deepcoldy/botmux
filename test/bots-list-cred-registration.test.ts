@@ -19,6 +19,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
@@ -47,7 +48,7 @@ function runCli(args: string[], env: NodeJS.ProcessEnv) {
   });
 }
 
-/** Read-isolated layout: per-bot session file + send-cred inside BOT_HOME, NO bots.json. */
+/** Read-isolated layout: per-bot session store + send-cred inside BOT_HOME, NO bots.json. */
 function seedIsolatedBot(): { home: string; dataDir: string } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-bots-list-cred-'));
   tempDirs.push(root);
@@ -57,7 +58,9 @@ function seedIsolatedBot(): { home: string; dataDir: string } {
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(botHome, { recursive: true });
 
-  writeFileSync(join(dataDir, `sessions-${APP_ID}.json`), JSON.stringify({
+  // The bot's real session store: `session-stores/<appId>/sessions.db`, the only
+  // engine the CLI reads at runtime.
+  seedPersistedSessionRows(dataDir, APP_ID, {
     [SESSION_ID]: {
       sessionId: SESSION_ID,
       chatId: 'oc_isolated_roster_chat',
@@ -69,7 +72,7 @@ function seedIsolatedBot(): { home: string; dataDir: string } {
       createdAt: '2026-01-01T00:00:00.000Z',
       larkAppId: APP_ID,
     },
-  }));
+  });
 
   // The only credential source available to an isolated bot.
   writeFileSync(join(botHome, 'send-cred.json'), JSON.stringify({

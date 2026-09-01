@@ -74,8 +74,7 @@ export const messages: Record<string, string> = {
   'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
 
   // ─── 上下文余量指示 ──────────────────────────────────────────────────────
-  'card.context.indicator': '上下文 {pct}%',
-  'card.context.over_threshold': '上下文 {pct}% · 建议压缩',
+  'card.context.compact_hint': '建议压缩',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -1382,9 +1381,10 @@ export const messages: Record<string, string> = {
 
   // Worker-side submit / notify messages
   'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
+  'worker.transcriptLabel': '会话存储',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
-  'worker.submit_unconfirmed': '⚠️ 消息提交状态未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 已写入消息并重试 Enter，但 {secs} 秒内未在{transcriptLabel}发现 {cliName} 的新会话记录。尚无请求到达模型的证据，因此当前没有模型侧错误可透传。\n请打开 Web 终端检查输入框；确认消息未执行后再重发。\n原消息：{preview}',
-  'worker.submit_unconfirmed_zmx': '⚠️ 消息提交状态未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 等待了 {secs} 秒，仍未发现 {cliName} 的提交证据。尚无请求到达模型的证据，因此当前没有模型侧错误可透传。\n不要直接重发；请在本机运行 botmux list，进入该 ZMX 会话检查输入框。\n原消息：{preview}',
+  'worker.submit_unconfirmed': '⚠️ 消息提交自动确认失败\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 未能在{transcriptLabel}确认 {cliName} 已接收这条消息。自动确认失败不代表消息一定没有执行：它可能仍在执行或已经执行。\n请打开 Web 终端检查输入框与执行状态；确认消息确实未执行后再重发。\n原消息：{preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ 消息提交自动确认失败\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 未能在{transcriptLabel}确认 {cliName} 已接收这条消息。自动确认失败不代表消息一定没有执行：它可能仍在执行或已经执行。\n不要直接重发；请在本机运行 botmux list，进入该 ZMX 会话检查输入框与执行状态，确认消息确实未执行后再重发。\n原消息：{preview}',
   'worker.zmx_recovery_pending': 'ZMX 控制面暂时无法确认会话身份，自动清理没有执行。不要直接重发；请在本机运行 botmux list 进入会话，检查并按 Ctrl+C 清空输入框，然后用 /restart 重启会话后再试。',
   'worker.zmx_recovery_unconfirmed': 'ZMX 自动清理 Ctrl+C 的结果无法确认；为避免重复、拼接或截断输入，本会话已停止自动写入。不要直接重发；请在本机运行 botmux list 进入会话检查并手动清空输入框，然后用 /restart 重启会话后再试。',
   'worker.interrupt_unconfirmed': '⚠️ 中断键 {key} 连续两次未送达 {cliName}，CLI 可能仍在运行；卡片不会把这次操作标成已停止。{recovery}',

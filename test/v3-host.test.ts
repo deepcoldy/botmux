@@ -25,6 +25,7 @@ import { DagValidationError } from '../src/workflows/v3/dag.js';
 import { loadAuthorizedV3Run, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 function base(): string {
   return mkdtempSync(join(tmpdir(), 'v3-host-'));
@@ -863,13 +864,13 @@ describe('host — chatBindingFromEnv（grill 出生落话题绑定）', () => {
         join(dataDir, '.botmux-cli-pids', String(process.pid)),
         JSON.stringify({ sessionId: 'sess-1', turnId: 'turn-current', procStart }),
       );
-      writeFileSync(join(dataDir, 'sessions-cli_real.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'cli_real', {
         'sess-1': {
           sessionId: 'sess-1', status: 'active', scope: 'thread',
           larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
           ownerOpenId: 'ou_owner_a', lastCallerOpenId: 'ou_caller_b', quoteTargetId: 'turn-current',
         },
-      }));
+      });
 
       expect(chatBindingFromEnv({
         SESSION_DATA_DIR: dataDir,
@@ -903,13 +904,13 @@ describe('host — chatBindingFromEnv（grill 出生落话题绑定）', () => {
         join(dataDir, '.botmux-cli-pids', String(process.pid)),
         JSON.stringify({ sessionId: 'sess-1', turnId: 'turn-old', procStart }),
       );
-      writeFileSync(join(dataDir, 'sessions-cli_real.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'cli_real', {
         'sess-1': {
           sessionId: 'sess-1', status: 'active', scope: 'thread',
           larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
           lastCallerOpenId: 'ou_caller_b', quoteTargetId: 'turn-new',
         },
-      }));
+      });
       expect(() => chatBindingFromEnv({
         SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: 'sess-1', BOTMUX_OWNER_OPEN_ID: 'ou_owner_a',
       } as NodeJS.ProcessEnv, process.pid)).toThrow(/turn-old.*turn-new/);

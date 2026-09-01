@@ -14,6 +14,7 @@ import {
   serializeRunEnvelope,
   type Sha256Digest,
 } from '../src/workflows/v3/run-envelope.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const DIGEST = `sha256:${'a'.repeat(64)}` as Sha256Digest;
 const BINDING: RunChatBinding = {
@@ -50,20 +51,25 @@ describe('agent-facing v3 daemon command authority', () => {
     );
   }
 
+  /**
+   * The durable session record now lives only in the per-bot SQLite store
+   * (`session-stores/<appId>/sessions.db`); `sessions-<appId>.json` is no
+   * longer a runtime read path. The row is seeded into the store owned by its
+   * own `larkAppId`, which is exactly how a live daemon would have written it.
+   */
   function writeSession(overrides: Record<string, unknown> = {}): void {
-    writeFileSync(join(dataDir, 'sessions-cli_owner.json'), JSON.stringify({
-      'sess-1': {
-        sessionId: 'sess-1',
-        status: 'active',
-        scope: 'thread',
-        larkAppId: 'cli_owner',
-        chatId: 'oc_owner',
-        rootMessageId: 'om_root',
-        lastCallerOpenId: 'ou_caller',
-        quoteTargetId: 'turn-current',
-        ...overrides,
-      },
-    }));
+    const row = {
+      sessionId: 'sess-1',
+      status: 'active',
+      scope: 'thread',
+      larkAppId: 'cli_owner',
+      chatId: 'oc_owner',
+      rootMessageId: 'om_root',
+      lastCallerOpenId: 'ou_caller',
+      quoteTargetId: 'turn-current',
+      ...overrides,
+    };
+    seedPersistedSessionRows(dataDir, String(row.larkAppId), { 'sess-1': row });
   }
 
   function writeEnvelope(runId: string, binding?: RunChatBinding): void {

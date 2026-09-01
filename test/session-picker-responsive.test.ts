@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const { Terminal } = xtermHeadless;
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -159,7 +160,9 @@ function makeFixture(
       chmodSync(secretPath, 0o600);
     }
   }
-  writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(sessions));
+  // The picker (`botmux list`) reads the SQLite session store; these rows carry
+  // no larkAppId, so they belong in the flat legacy store `<dataDir>/sessions.db`.
+  seedPersistedSessionRows(dataDir, undefined, sessions);
   return { root, dataDir };
 }
 

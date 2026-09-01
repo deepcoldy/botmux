@@ -6612,6 +6612,37 @@ dialog.onboarding-dialog::backdrop {
   flex: 0 1 auto;
 }
 
+#g-drawer .g-pin-row {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+#g-drawer .g-pin-row:first-of-type {
+  border-top: none;
+}
+
+#g-drawer .g-pin-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+#g-drawer .g-pin-row-head strong {
+  font-size: 13px;
+}
+
+#g-drawer .g-pin-row-head small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 #g-drawer .g-manage-danger-hint {
   display: inline-flex;
   align-items: center;
@@ -13100,6 +13131,28 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 .toggle-tx small:hover { color: var(--muted); }
 .toggle-tx small.open { -webkit-line-clamp: unset; color: var(--muted); }
+.streaming-card-pin-toggle {
+  display: grid;
+  gap: 6px;
+}
+.streaming-card-pin-toggle-row {
+  min-width: 0;
+  margin: 0;
+}
+.streaming-card-pin-toggle-help,
+.streaming-card-pin-toggle-detail,
+.streaming-card-pin-toggle-status {
+  margin: 0 0 0 48px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.streaming-card-pin-toggle-help {
+  color: var(--muted);
+}
+.streaming-card-pin-toggle-detail.hint-muted,
+.streaming-card-pin-toggle-status.hint-muted {
+  color: var(--muted);
+}
 /* toggle 行之外的长帮助文字（签名/额度说明）同样默认一行，点开展开 */
 .bd-tile small.bd-help {
   display: -webkit-box;
@@ -23542,9 +23595,14 @@ dialog select[multiple]:hover:not(:disabled) {
   box-shadow: none;
 }
 
+/* align-content:start 不能省：桌面名册被 fill-height 壳撑满，列表这一行拿到
+   整段剩余高度。grid 默认 align-content:normal(=stretch) 会把这点余量摊给
+   每个自动行——搜索只剩两三个结果时，行高从 54px 拉成几百 px，选中项变成一
+   整块色带、末位被推到面板底部。列表只按内容排、余量留白，才是名册该有的样子。 */
 .bot-defaults-page .bd-roster-list {
   display: grid;
   gap: 3px;
+  align-content: start;
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
@@ -24164,6 +24222,10 @@ dialog select[multiple]:hover:not(:disabled) {
   line-height: 1.45;
   -webkit-box-orient: initial;
   -webkit-line-clamp: unset;
+}
+
+.bot-defaults-page .streaming-card-pin-toggle {
+  padding: 4px 0;
 }
 
 .bot-defaults-page .bd-card-primary-toggle {

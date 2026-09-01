@@ -63,6 +63,18 @@ describe('bot defaults focused layout', () => {
     expect(list).toMatch(/overscroll-behavior:\s*contain;/);
   });
 
+  it('keeps roster rows at their natural height when the filter leaves only a few', () => {
+    // The desktop shell hands the list row the whole remaining column height.
+    // A grid defaults to align-content:normal (=stretch), which splits that
+    // slack across the auto rows: filtering 56 bots down to 2 measured 348px
+    // per row instead of 54.4px, so the selected row rendered as a tall block
+    // and the last row sank to the panel floor. align-content:start makes the
+    // rows keep their content height and leaves the slack as empty space.
+    const listStart = css.indexOf('.bot-defaults-page .bd-roster-list {');
+    const list = css.slice(listStart, css.indexOf('@media (max-width: 980px)', listStart));
+    expect(list).toMatch(/align-content:\s*start;/);
+  });
+
   it('keeps the mobile roster bounded with a real scrollport instead of clipping', () => {
     // Grid auto rows keep max-content height, so the list row must be
     // forced into the remaining space (minmax(0,1fr) + min-height:0) or

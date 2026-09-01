@@ -203,6 +203,7 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
   reconcileBotStreamingCardPins,
+  reconcileRestoredStreamingCardPins,
   isSessionTransferring,
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
@@ -210,6 +211,7 @@ import {
   migrateMojoSessionIdentities,
   mojoLivePatchForSession,
   silentIdleCardFlag,
+  dshRuntimeForSession,
   recordTurnExplicitMention,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
@@ -669,6 +671,29 @@ const activeSessions = new Map<string, DaemonSession>();
  *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
  *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
 let sessionsRestored = false;
+
+function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
+  queueMicrotask(() => {
+    try {
+      reconcileRestoredStreamingCardPins(larkAppId);
+    } catch (err) {
+      logger.warn(
+        `[card-pin] startup restore reconcile failed for ${larkAppId}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  });
+}
+
+async function restoreSessionsAndScheduleStartupRecovery(opts: {
+  larkAppId: string;
+  restoreSessions: () => Promise<void>;
+  markSessionsRestored: () => void;
+}): Promise<void> {
+  await opts.restoreSessions();
+  scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
+  opts.markSessionsRestored();
+}
 /** Once-per-daemon guard for the mojo containment boot reconciliation. The store
  *  is bot-agnostic, so it must run once regardless of how many bots start. */
 let mojoContainmentReconciledThisBoot = false;
@@ -3671,6 +3696,8 @@ async function sessionReply(
 // composition it relies on. See test/reply-target-fallback.test.ts.
 export const __testOnly_sessionReply = sessionReply;
 export const __testOnly_activeSessions = activeSessions;
+export const __testOnly_scheduleRestoredStreamingCardPinRecovery = scheduleRestoredStreamingCardPinRecovery;
+export const __testOnly_restoreSessionsAndScheduleStartupRecovery = restoreSessionsAndScheduleStartupRecovery;
 
 async function maybeSeedCardlessForceTopicTurn(args: {
   ds: DaemonSession;
@@ -4734,6 +4761,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       // A silently-closed previous turn freezes with its honest label
       // (「已处理 · 判定无需回复」), not a misleading 「等待输入」.
       silentIdleCardFlag(ds),
+      dshRuntimeForSession(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -22608,10 +22636,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   // Restore active sessions from previous run
-  await restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds);
-  // Restore complete → /api/asks may now safely 403 unknown sessions again; a
-  // reconnecting ask hook that raced the restore got retryable 503s until here.
-  sessionsRestored = true;
+  await restoreSessionsAndScheduleStartupRecovery({
+    larkAppId: cfg.larkAppId,
+    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),
+    // Restore complete → /api/asks may now safely 403 unknown sessions again; a
+    // reconnecting ask hook that raced the restore got retryable 503s until here.
+    markSessionsRestored: () => {
+      sessionsRestored = true;
+    },
+  });
 
   // Close CoT thinking bubbles orphaned by the previous daemon generation
   // (created mid-turn, never settled — their in-memory state died with the

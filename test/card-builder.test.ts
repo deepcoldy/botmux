@@ -1301,17 +1301,20 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      // 压缩按钮不依赖 usage/百分比，也不限 working 态——idle 恰是最适合压缩的时机
+      // （没有 turn 在跑），handler 侧只要求 worker 活着。
+      expect(actions.map((a: any) => a.value?.action ?? 'url'))
+        .toEqual(['toggle_display', 'url', 'get_write_link', 'compact_session', 'close']);
     });
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
       const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'compact_session', 'close']);
       expect(actions[2].text.content).toBe('Open TRAE');
       expect(actions[2].value.cli_id).toBe('traex');
     });

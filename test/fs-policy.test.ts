@@ -260,9 +260,15 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons/cli_x.json').access).toBe('readOnly'); // daemon IPC discovery
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_self.json').access).toBe('readOnly'); // own
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own
+    // own session store = the per-bot SQLite DIRECTORY (dir grant, not file binds:
+    // SQLite recreates -wal/-shm, so a pinned inode would read a dead WAL forever)
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-wal').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
+    // …and the bot's OWN pre-SQLite `sessions-<self>.json` is NOT granted any more:
+    // it is a one-shot import source the store never reads at runtime, so the
+    // allow-list stops covering it (narrower surface, not a weakened assertion).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own（升级窗口内仍是唯一可读的会话来源）
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');        // OWN session marker only
     // blocker #4: turn-sends is granted per-session-FILE, not the whole dir —
     // another session's marker is NOT writable (can't corrupt its send-dedup).
@@ -283,7 +289,12 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
+    // sibling session stores stay deny-by-default: neither the store DIR nor any
+    // file in it is covered (the grant is scoped to `session-stores/<self>`).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('none');
+    // the shared parent is not granted either — no umbrella over every bot's store
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_other.json').access).toBe('none'); // sibling
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
@@ -291,6 +302,7 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m/f.pdf').access).toBe('none');
     // a file created AFTER spawn (codex #3 fail-open) is ALSO denied — allow-list, not enumeration
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_futureBot.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_futureBot/sessions.db').access).toBe('none');
   });
 
   it('lark-cli key store: OWN appsecret + master.key readable, siblings denied (verified live: without this `lark-cli auth` fails EPERM)', () => {
@@ -443,10 +455,16 @@ describe('buildFsPolicy', () => {
     const p = buildFsPolicy(ctx());
     expect(accessForPath(p.rules, '/Users/u/proj/src/x.ts').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/claude/x.jsonl').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');
+    // own session store: the per-bot SQLite dir (and everything inside it) is ro
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-shm').access).toBe('readOnly');
+    // the legacy `sessions-<self>.json` is a one-shot import source, never read at
+    // runtime → deliberately NOT granted (was readOnly before the SQLite-only cut)
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own（升级窗口内仍是唯一可读的会话来源）
     // siblings simply not covered under the allow-list → inaccessible
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m1/f.pdf').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m1/f.pdf').access).toBe('none');
@@ -1586,8 +1604,13 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/.data-dir').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
+    // the legacy `sessions-<self>.json` is no longer allow-listed, so under
+    // no-transport it falls back to the frozen ~/.botmux authority deny.
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');
+    // sibling store dirs get no carve-out out of that authority deny either
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('deny');
     expect(accessForPath(p.rules, '/opt/botmux/dist/cli.js').access).toBe('readOnly');
   });
 

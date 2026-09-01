@@ -13,14 +13,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const procScanControl = vi.hoisted(() => ({
+const procScanControl = {
   enabled: false,
   pid: 42_424,
   environReads: 0,
-}));
+};
 
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs')>();
+vi.mock('node:fs', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const actual = require('node:fs') as typeof import('node:fs');
   return {
     ...actual,
     readdirSync: (...args: any[]) => {

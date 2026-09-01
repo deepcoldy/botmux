@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { seedPersistedSessionRows, readPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,7 +33,8 @@ function runCli(args: string[], input?: string): { status: number; stdout: strin
 }
 
 function writeSession(sessionId: string, workingDir: string): void {
-  writeFileSync(join(dataDir, 'sessions-app1.json'), JSON.stringify({
+  // 会话行只有 SQLite 一种持久层；sessions-<appId>.json 已是一次性导入源。
+  seedPersistedSessionRows(dataDir, 'app1', {
     [sessionId]: {
       sessionId,
       chatId: 'chat1',
@@ -43,7 +45,7 @@ function writeSession(sessionId: string, workingDir: string): void {
       larkAppId: 'app1',
       workingDir,
     },
-  }, null, 2));
+  });
 }
 
 describe('botmux whiteboard CLI', () => {
@@ -125,7 +127,7 @@ describe('botmux whiteboard CLI', () => {
     const cur = runCli(['whiteboard', 'current', '--create', '--session-id', 'session1']);
     expect(cur.status).toBe(0);
     const id = JSON.parse(cur.stdout).current.id;
-    const sessions = JSON.parse(readFileSync(join(dataDir, 'sessions-app1.json'), 'utf-8'));
+    const sessions = readPersistedSessionRows(dataDir, 'app1');
     expect(sessions.session1.whiteboardId).toBe(id);
   });
 
@@ -216,14 +218,14 @@ describe('botmux whiteboard CLI', () => {
     expect(created.status).toBe(0);
     const dir = join(dataDir, 'whiteboards', 'delete_board');
     expect(existsSync(dir)).toBe(true);
-    writeFileSync(join(dataDir, 'sessions-app1.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app1', {
       s1: { sessionId: 's1', chatId: 'delete-chat', rootMessageId: 'r', title: 's', status: 'active', createdAt: new Date().toISOString(), larkAppId: 'app1', whiteboardId: 'delete_board' },
-    }, null, 2));
+    });
 
     const prevDataDir = process.env.SESSION_DATA_DIR;
     process.env.SESSION_DATA_DIR = dataDir;
     const { deleteWhiteboard } = await import('../dist/services/whiteboard-store.js');
-    const result = deleteWhiteboard('delete_board');
+    const result = await deleteWhiteboard('delete_board');
     if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
     else process.env.SESSION_DATA_DIR = prevDataDir;
     expect(result).toMatchObject({ ok: true, id: 'delete_board', clearedSessions: 1 });
@@ -231,7 +233,7 @@ describe('botmux whiteboard CLI', () => {
     const index = JSON.parse(readFileSync(join(dataDir, 'whiteboards', 'index.json'), 'utf-8'));
     expect(index.boards.delete_board).toBeUndefined();
     expect(Object.values(index.bindings)).not.toContain('delete_board');
-    const sessions = JSON.parse(readFileSync(join(dataDir, 'sessions-app1.json'), 'utf-8'));
+    const sessions = readPersistedSessionRows(dataDir, 'app1');
     expect(sessions.s1.whiteboardId).toBeUndefined();
   });
 

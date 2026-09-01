@@ -1,4 +1,5 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -8,7 +9,7 @@ import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
+import { cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -897,7 +898,9 @@ function pushStreamBody(
   // Native Context / Token usage line (grey, small) when this bot displays usage
   // on the streaming card. Missing metrics are omitted independently by
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
-  const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
+  const usageSeg = usage
+    ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
+    : null;
   if (usageSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
@@ -911,10 +914,16 @@ function pushStreamBody(
     // runtime → the metrics render alone, unchanged.
     const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
     const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
+    // 上下文吃紧时整行转红（而不是另起一行报警）：提示就在用量数字旁边，一眼可见，
+    // 且不多占卡片高度。判据与 footer 里追加「建议压缩」的**是同一个谓词**——刻意不去
+    // 嗅 usageSeg 里有没有那串提示文案：那份文案是可被用户自定义覆盖的（覆盖成空串时
+    // `includes('')` 恒真 ⟹ 每张卡都会变红），且把颜色行为耦合到文案上会让「改个翻译」
+    // 静默改掉配色。
+    const overThreshold = !!usage && contextOverCompactThreshold(usage, contextCompactThreshold());
     elements.push({
       tag: 'markdown',
       text_size: 'notation_small_v2',
-      content: `<font color='grey'>${line}</font>`,
+      content: `<font color='${overThreshold ? 'red' : 'grey'}'>${line}</font>`,
     });
   }
 }
@@ -951,6 +960,14 @@ export function buildStreamingCard(
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
   silentIdle?: boolean,
+  /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
+   *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
+   *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
+   *  fail-closed to the headless JSON-RPC runner, which matches this card's
+   *  pre-existing behaviour for dsh (no transcript ⇒ the old percentage gate
+   *  never showed the button either), so a call site that forgets to pass it
+   *  degrades to the status quo rather than to a broken button. */
+  dshRuntime?: 'official' | 'tui',
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -962,21 +979,13 @@ export function buildStreamingCard(
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
-  // ── 上下文余量指示（header 之下、控制行之上的显著位置）────────────────────
-  // 数据来自 usage.context.percentUsed（worker-pool 的 getDaemonStreamingCardUsageSnapshot
-  // 算好传入）；无 contextWindow 数据（percentUsed 非有限数）时不渲染——优雅降级。
-  const contextPct = usage?.context?.percentUsed;
-  const hasContextPct = typeof contextPct === 'number' && Number.isFinite(contextPct);
-  if (hasContextPct) {
-    const pct = Math.min(100, Math.round(contextPct));
-    const overThreshold = pct >= contextCompactThreshold();
-    elements.push({
-      tag: 'markdown',
-      content: overThreshold
-        ? `<font color='red'>⚠️ ${t('card.context.over_threshold', { pct }, locale)}</font>`
-        : `<font color='grey'>📊 ${t('card.context.indicator', { pct }, locale)}</font>`,
-    });
-  }
+  // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
+  // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer
+  // （md-card.ts 的 cardUsageFooterSegment，streaming 变体）在渲染
+  // `上下文 34.3K/258.4K (13%) · 累计 … · 模型`——两者**同源**（都读
+  // usage.context.percentUsed），于是同一个百分比在一张卡上出现两次，而这一行还
+  // 比 footer 少了绝对值。唯一不冗余的是「超阈值提醒」，已折进 footer 那一行
+  // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -1029,10 +1038,23 @@ export function buildStreamingCard(
       value: { action: 'get_write_link', ...actionBase },
     });
   }
-  // 「🗜️ 压缩」：仅在有上下文占用数据时出现（无 contextWindow 的 CLI 优雅降级为不渲染）。
-  // 点击走 card-handler 的 compact_session → daemon 的 deliverPassthroughToExistingSession
-  // （raw_input 透传 /compact，含完整 turn 生命周期），不新造压缩逻辑。
-  if (hasContextPct) {
+  // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
+  // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
+  // pi（读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里根本没有
+  // 上下文窗口字段（只有 model），于是 Claude 会话永远看不到压缩按钮——而 Claude 恰好
+  // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
+  // 闸门是拿错了判据。
+  //
+  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
+  //   ① remote CLI（riff/mojo）无本地终端可驱动；
+  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
+  //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
+  //      `ignoring non-frame input` 静默丢弃，mira/mir 把 `/compact` 当**普通用户消息**
+  //      发给模型白烧一个 turn。打字发 /compact 本就被 router 的
+  //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
+  // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
+  // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
+  if (!isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },

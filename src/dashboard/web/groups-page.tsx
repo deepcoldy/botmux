@@ -12,6 +12,8 @@ import {
 } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { setGroupPinStreamingCard } from './groups-api.js';
+import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
@@ -1075,7 +1077,98 @@ function OncallRow(props: {
   );
 }
 
-function ManageDialog(props: {
+function responseErrorText(res: { status: number; body: any }): string {
+  const reason = typeof res.body?.reason === 'string' ? res.body.reason : '';
+  return String(reason || res.body?.error || res.status);
+}
+
+function GroupPinStreamingCardRow(props: {
+  chat: GroupChat;
+  member: GroupChat['memberBots'][number];
+  tr: Translator;
+  onSaved(): Promise<void>;
+}) {
+  const { chat, member, tr } = props;
+  const initialChecked = member.pinStreamingCardChatEnabled === true;
+  const [checked, setChecked] = useState(initialChecked);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState('');
+  const [statusTone, setStatusTone] = useState<'ok' | 'warn' | 'muted'>('muted');
+
+  useEffect(() => {
+    setChecked(member.pinStreamingCardChatEnabled === true);
+  }, [member.pinStreamingCardChatEnabled]);
+
+  const masterEnabled = member.pinStreamingCardMasterEnabled === true;
+  const effectiveEnabled = member.pinStreamingCardEffectiveEnabled === true;
+  const detail = !masterEnabled
+    ? tr('groups.pinStreamingCardMasterOff')
+    : effectiveEnabled
+      ? tr('groups.pinStreamingCardEnabled')
+      : tr('groups.pinStreamingCardDisabled');
+  const detailTone = !masterEnabled ? 'warn' : effectiveEnabled ? 'ok' : 'muted';
+
+  async function save(nextChecked: boolean): Promise<void> {
+    const previous = checked;
+    setChecked(nextChecked);
+    setSaving(true);
+    setStatus(tr('groups.pinStreamingCardSaving'));
+    setStatusTone('warn');
+    try {
+      const res = await setGroupPinStreamingCard(chat.chatId, member.larkAppId, nextChecked);
+      if (!res.ok) {
+        setChecked(previous);
+        setStatus(tr('groups.pinStreamingCardSaveFailed', { error: responseErrorText(res) }));
+        setStatusTone('warn');
+        return;
+      }
+      setStatus(tr('groups.pinStreamingCardSaved'));
+      setStatusTone('ok');
+      try {
+        await props.onSaved();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(tr('groups.pinStreamingCardRefreshFailed', { error: message }));
+        setStatusTone('warn');
+      }
+    } catch (error) {
+      setChecked(previous);
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(tr('groups.pinStreamingCardSaveFailed', { error: message }));
+      setStatusTone('warn');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="g-pin-row" data-bot={member.larkAppId}>
+      <div className="g-pin-row-head">
+        <strong>{member.botName ?? member.larkAppId}</strong>
+        <small>{member.larkAppId}</small>
+      </div>
+      <StreamingCardPinToggle
+        scope="group-manage"
+        checked={checked}
+        disabled={saving}
+        title={tr('groups.pinStreamingCard')}
+        description={tr('groups.pinStreamingCardDescription')}
+        help={tr('groups.pinStreamingCardHelp')}
+        detail={detail}
+        detailTone={detailTone}
+        detailAttrs={{ 'data-pin-master-state': masterEnabled ? 'on' : 'off' }}
+        status={status}
+        statusTone={statusTone}
+        statusAttrs={{ 'data-pin-status': member.larkAppId }}
+        dataAction="toggle-pin-streaming-card-group"
+        dataAppId={member.larkAppId}
+        onChange={nextChecked => void save(nextChecked)}
+      />
+    </div>
+  );
+}
+
+export function ManageDialog(props: {
   chat: GroupChat;
   tr: Translator;
   onClose(): void;
@@ -1184,6 +1277,22 @@ function ManageDialog(props: {
         ) : inChat.map(member => (
           <OncallRow
             key={member.larkAppId}
+            chat={chat}
+            member={member}
+            tr={tr}
+            onSaved={async () => { await props.onReloadGroups({ force: true }); }}
+          />
+        ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('groups.pinStreamingCardSection')}</legend>
+        <p><small>{tr('groups.pinStreamingCardBotHint')}</small></p>
+        {inChat.length === 0 ? (
+          <p className="empty">没有机器人在群里</p>
+        ) : inChat.map(member => (
+          <GroupPinStreamingCardRow
+            key={`pin-${member.larkAppId}`}
             chat={chat}
             member={member}
             tr={tr}

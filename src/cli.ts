@@ -249,7 +249,8 @@ import {
   writeManualIntentIfAbsentTo,
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
-import { loadAllSessionsSnapshot, mutateSessionRowOffline } from './services/session-store.js';
+import { loadAllSessionsSnapshot } from './services/session-store.js';
+import { mutateSessionRowWhenUnowned } from './services/session-offline-write.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -270,7 +271,12 @@ import {
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
 import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
-import { resolveDaemonIpcPort } from './utils/daemon-discovery.js';
+import {
+  findOnlineDaemon,
+  listOnlineDaemons as listOnlineDaemonsIn,
+  resolveDaemonIpcPort,
+  type OnlineDaemonInfo,
+} from './utils/daemon-discovery.js';
 import {
   isSuspendableBackendType,
   killPersistentBackendTarget,
@@ -3574,29 +3580,19 @@ function loadSessions(): Map<string, SessionData> {
 }
 
 /** Offline-only narrow session mutation. Callers must prefer the owning daemon
- * while it is available; session-store rereads the exact row under the shared
- * session-file lock so stale CLI snapshots can never be written back. The
- * daemon-liveness probe runs under that same lock (entry + pre-publication) so
- * two CLIs cannot race each other and an already-published daemon cannot be
- * bypassed by the offline fallback. */
+ * while it is available; the shared helper rereads the exact row under the
+ * store's write exclusion (so a stale CLI snapshot can never be written back)
+ * and re-evaluates the daemon-liveness probe inside it, at entry and again
+ * before publication. */
 function mutateSessionOffline(
   session: SessionData,
   mutate: (current: SessionData) => boolean,
 ): SessionData | undefined {
   const larkAppId = session.larkAppId;
-  return mutateSessionRowOffline(
+  return mutateSessionRowWhenUnowned(
     { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
     current => mutate(current as unknown as SessionData),
-    {
-      dataDir: resolveDataDir(),
-      ...(larkAppId
-        ? {
-            abortIf: () => {
-              try { return !!findDaemon(larkAppId); } catch { return false; /* offline */ }
-            },
-          }
-        : {}),
-    },
+    { dataDir: resolveDataDir() },
   ) as unknown as SessionData | undefined;
 }
 
@@ -5378,53 +5374,19 @@ async function cmdRoleSwitch(argv: string[]): Promise<void> {
  * so SESSION_DATA_DIR / breadcrumb-overridden deployments find the right
  * descriptor directory.
  */
-interface DaemonDescriptorLite {
-  ipcPort: number;
-  larkAppId: string;
-  pid?: number;
-  bootInstanceId?: string;
-  workflowIpcProtocol?: string;
-  lastHeartbeat?: number;
-}
+type DaemonDescriptorLite = OnlineDaemonInfo;
 
-function listDaemonDescriptors(): DaemonDescriptorLite[] {
-  const regDir = join(resolveDataDir(), 'dashboard-daemons');
-  if (!existsSync(regDir)) return [];
-  const all: DaemonDescriptorLite[] = [];
-  let names: string[] = [];
-  try { names = readdirSync(regDir); } catch { return []; }
-  for (const f of names) {
-    if (!f.endsWith('.json')) continue;
-    try {
-      const d = JSON.parse(readFileSync(join(regDir, f), 'utf-8'));
-      if (typeof d?.ipcPort !== 'number' || typeof d?.larkAppId !== 'string') continue;
-      all.push({
-        ipcPort: d.ipcPort,
-        larkAppId: d.larkAppId,
-        ...(typeof d.pid === 'number' ? { pid: d.pid } : {}),
-        ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId
-          ? { bootInstanceId: d.bootInstanceId }
-          : {}),
-        ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
-          ? { workflowIpcProtocol: d.workflowIpcProtocol }
-          : {}),
-        ...(typeof d.lastHeartbeat === 'number' ? { lastHeartbeat: d.lastHeartbeat } : {}),
-      });
-    } catch { /* skip malformed */ }
-  }
-  return all;
-}
-
+/** Daemon discovery is `utils/daemon-discovery`; the CLI used to carry its own
+ *  copy of the descriptor parse and the 90s staleness cutoff. These two
+ *  wrappers only pin it to THIS process's resolved data dir, so the liveness
+ *  probe and the session store always read the same directory. */
 function listOnlineDaemons(): DaemonDescriptorLite[] {
-  const STALE_MS = 90_000;
-  const now = Date.now();
-  return listDaemonDescriptors().filter(d => now - (d.lastHeartbeat ?? 0) <= STALE_MS);
+  return listOnlineDaemonsIn(resolveDataDir());
 }
 
 function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
-  const all = listOnlineDaemons();
-  if (larkAppId) return all.find(d => d.larkAppId === larkAppId) ?? null;
-  return all[0] ?? null;
+  if (larkAppId) return findOnlineDaemon(larkAppId, resolveDataDir());
+  return listOnlineDaemons()[0] ?? null;
 }
 
 function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
@@ -8777,7 +8739,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         try {
           const markerDir = join(resolveDataDir(), 'turn-sends');
           if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-          const marker: Record<string, unknown> = { sentAtMs, messageId };
+          const marker: Record<string, unknown> = {
+            sentAtMs,
+            messageId,
+            ...(originTurnId ? { turnId: originTurnId } : {}),
+            ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+          };
           const previewText = buildBridgeSendPreviewText(content);
           if (previewText) marker.previewText = previewText;
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
@@ -8857,6 +8824,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
           messageId: `doc:${exactDocTarget.commentId}`,
+          ...(originTurnId ? { turnId: originTurnId } : {}),
+          ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           contentLength: content.length,
         };
         const previewText = buildBridgeSendPreviewText(content);
@@ -9294,7 +9263,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
       if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-      const marker: Record<string, unknown> = { sentAtMs, messageId };
+      const marker: Record<string, unknown> = {
+        sentAtMs,
+        messageId,
+        ...(originTurnId ? { turnId: originTurnId } : {}),
+        ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+      };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
       appendFileSync(join(markerDir, `${sid}.jsonl`), line);

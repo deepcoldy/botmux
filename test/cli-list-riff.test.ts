@@ -19,11 +19,12 @@
  * kept OUT of every other column (title, session id, working dir), so a matched
  * substring can only have come from the target label the fix produces.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { readPersistedSessionRows, seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
@@ -64,11 +65,15 @@ function makeSession(sessionId: string, overrides: Partial<StoredSession> = {}):
   };
 }
 
-function writeSessions(dataDir: string, sessions: StoredSession[]): string {
-  mkdirSync(dataDir, { recursive: true });
-  const path = join(dataDir, `sessions-${APP_ID}.json`);
-  writeFileSync(path, JSON.stringify(Object.fromEntries(sessions.map(s => [s.sessionId, s]))));
-  return path;
+/** Seed the bot's real session store (`session-stores/<appId>/sessions.db`) —
+ *  the only engine the CLI reads at runtime. */
+function writeSessions(dataDir: string, sessions: StoredSession[]): void {
+  seedPersistedSessionRows(dataDir, APP_ID, Object.fromEntries(sessions.map(s => [s.sessionId, s])));
+}
+
+/** Read the seeded store back to prove `list` did not mutate/prune any row. */
+function readSessions(dataDir: string): Record<string, StoredSession> {
+  return readPersistedSessionRows(dataDir, APP_ID) as Record<string, StoredSession>;
 }
 
 function runList(
@@ -113,7 +118,7 @@ describe('botmux list — active Riff session', () => {
       backendType: 'riff',
       // No persistentBackendTarget on purpose: Riff has no local backing pane.
     });
-    const sessionsPath = writeSessions(dataDir, [session]);
+    writeSessions(dataDir, [session]);
 
     const result = await runList(dataDir, homeDir);
 
@@ -126,7 +131,7 @@ describe('botmux list — active Riff session', () => {
     expect(result.stdout).toContain('riff');
 
     // list is a READ command: the active record must survive untouched.
-    const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
+    const stored = readSessions(dataDir);
     expect(stored[session.sessionId]).toBeDefined();
     expect(stored[session.sessionId].status).toBe('active');
     expect(stored[session.sessionId].backendType).toBe('riff');
@@ -152,7 +157,7 @@ describe('botmux list — active Riff session', () => {
       title: 'row-gamma',
       cliId: 'codex',
     });
-    const sessionsPath = writeSessions(dataDir, [riff, pty, legacy]);
+    writeSessions(dataDir, [riff, pty, legacy]);
 
     const result = await runList(dataDir, homeDir);
 
@@ -168,7 +173,7 @@ describe('botmux list — active Riff session', () => {
     expect(result.stdout).toContain('pty');
 
     // None of the three real managed sessions may be pruned or mutated by list.
-    const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
+    const stored = readSessions(dataDir);
     for (const s of [riff, pty, legacy]) {
       expect(stored[s.sessionId]).toBeDefined();
       expect(stored[s.sessionId].status).toBe('active');

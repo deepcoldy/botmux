@@ -966,6 +966,69 @@ export async function pinMessage(larkAppId: string, messageId: string): Promise<
   }
 }
 
+export interface LarkPinRecord {
+  messageId: string;
+  chatId?: string;
+  operatorId?: string;
+  operatorIdType?: string;
+  createTime?: string;
+}
+
+const LARK_PIN_LIST_MAX_PAGE = 50;
+
+/**
+ * List every Pin record in one chat, following explicit page_token pagination.
+ * This is a strict read wrapper: non-zero or missing `code`, missing next-page
+ * tokens, and repeated tokens all throw so callers never silently accept a
+ * truncated provenance chain.
+ */
+export async function listChatPins(larkAppId: string, chatId: string): Promise<LarkPinRecord[]> {
+  const c = getBotClient(larkAppId);
+  const out: LarkPinRecord[] = [];
+  const seenPageTokens = new Set<string>();
+  let pageToken: string | undefined;
+
+  for (;;) {
+    const res: any = await c.im.v1.pin.list({
+      params: {
+        chat_id: chatId,
+        page_size: LARK_PIN_LIST_MAX_PAGE,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+
+    if (typeof res?.code !== 'number') {
+      throw new Error('Failed to list chat pins: missing code');
+    }
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat pins: ${res.msg ?? 'unknown error'} (code: ${res.code})`);
+    }
+
+    for (const item of res.data?.items ?? []) {
+      out.push({
+        messageId: typeof item?.message_id === 'string' ? item.message_id : '',
+        chatId: typeof item?.chat_id === 'string' ? item.chat_id : undefined,
+        operatorId: typeof item?.operator_id === 'string' ? item.operator_id : undefined,
+        operatorIdType: typeof item?.operator_id_type === 'string' ? item.operator_id_type : undefined,
+        createTime: typeof item?.create_time === 'string' ? item.create_time : undefined,
+      });
+    }
+
+    if (res.data?.has_more !== true) break;
+    const nextPageToken = res.data?.page_token;
+    if (typeof nextPageToken !== 'string' || nextPageToken.length === 0 || nextPageToken.trim() !== nextPageToken) {
+      throw new Error(`Failed to list chat pins for ${chatId}: malformed pagination token`);
+    }
+    if (seenPageTokens.has(nextPageToken)) {
+      throw new Error(`Failed to list chat pins for ${chatId}: repeated page token ${nextPageToken}`);
+    }
+    seenPageTokens.add(nextPageToken);
+    pageToken = nextPageToken;
+  }
+
+  return out;
+}
+
 /**
  * Unpin a message in a chat (best-effort QoL). Returns `true` only when Lark
  * explicitly confirms success (`code === 0`); any other outcome returns `false`

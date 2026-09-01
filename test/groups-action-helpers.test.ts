@@ -5,6 +5,7 @@ import {
   bindOncall,
   disbandGroup,
   leaveGroup,
+  setPinStreamingCardForGroup,
   unbindOncall,
   type DaemonHandle,
   type GroupsActionDeps,
@@ -259,5 +260,41 @@ describe('unbindOncall', () => {
     expect(call[1]).toBe('/api/oncall/oc_demo');
     expect((call[2] as RequestInit).method).toBe('DELETE');
     expect(deps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+});
+
+describe('setPinStreamingCardForGroup', () => {
+  it('proxies exact decoded chat/app ids to the daemon route, forwards body verbatim, preserves upstream status, and invalidates groups on success', async () => {
+    const proxySpy = vi.fn(async (_appId, _daemonPath, _init) => makeRes(202, { ok: true, enabled: false, changed: true }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+
+    const r = await setPinStreamingCardForGroup(
+      'oc topic/with slash',
+      'cli/app with space',
+      '{"enabled":false}',
+      deps,
+    );
+
+    expect(r.status).toBe(202);
+    expect(r.body).toEqual({ ok: true, enabled: false, changed: true });
+    expect(proxySpy).toHaveBeenCalledOnce();
+    const call = proxySpy.mock.calls[0]!;
+    expect(call[0]).toBe('cli/app with space');
+    expect(call[1]).toBe('/api/chat-pin-streaming-card/oc%20topic%2Fwith%20slash');
+    expect((call[2] as RequestInit).method).toBe('PUT');
+    expect((call[2] as RequestInit).body).toBe('{"enabled":false}');
+    expect(((call[2] as RequestInit).headers as Record<string, string>)['content-type']).toBe('application/json');
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+
+  it('does not invalidate the cache when upstream reports failure', async () => {
+    const proxySpy = vi.fn(async () => makeRes(409, { ok: false, error: 'already_disabled' }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+
+    const r = await setPinStreamingCardForGroup('oc_demo', 'cli_owner', '{"enabled":false}', deps);
+
+    expect(r.status).toBe(409);
+    expect(r.body).toEqual({ ok: false, error: 'already_disabled' });
+    expect(deps.invalidateGroups).not.toHaveBeenCalled();
   });
 });

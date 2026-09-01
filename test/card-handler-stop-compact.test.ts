@@ -94,6 +94,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(),
   silentIdleCardFlag: vi.fn(() => false),
+  dshRuntimeForSession: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/core/session-manager.js', () => ({
@@ -140,6 +141,7 @@ vi.mock('../src/global-config.js', () => ({
 
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { getBot } from '../src/bot-registry.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 import { readFileSync } from 'node:fs';
@@ -321,6 +323,39 @@ describe('compact_session card action', () => {
     expect(result.toast.type).toBe('warning');
     expect(result.toast.content).toContain('会话已不在线');
     expect(deliver).not.toHaveBeenCalled();
+  });
+
+  // ── defense-in-depth: 按钮路径不得重新打开 router 故意关掉的通道 ──────────
+  // /compact 走 raw_input 把**字面量**写进 PTY，绕过 runner 的
+  // `::botmux-<id>:<base64>` 帧协议：dsh 打 `ignoring non-frame input` 静默丢弃，
+  // mira/mir 把它当**普通用户消息**发给模型白烧一个 turn。router
+  // （resolvePassthroughCommands）对这些 CLI 返回空集，handler 也必须拒——否则
+  // 卡片侧闸门一旦再漏，这条路又会被打开（本次缺陷正是这么发生的）。
+  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app'])(
+    'refuses for %s (no raw passthrough surface) instead of writing a literal /compact',
+    async (cliId) => {
+      const ds = makeDs({ sessionOverrides: { cliId } as any });
+      const deliver = vi.fn();
+      const result = await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+      expect(result.toast.type).toBe('warning');
+      expect(deliver).not.toHaveBeenCalled();
+    },
+  );
+
+  // dsh-tui 是 PTY 驱动的交互式 TUI，raw /compact 有效；它靠 bot 级 dshRuntime='tui'
+  // 选中（cliId 仍是 'dsh'），所以 handler 必须把运行时一并喂给谓词，不能只看 cliId。
+  it('still delivers for a dsh bot running the interactive TUI (dshRuntime=tui)', async () => {
+    vi.mocked(getBot).mockReturnValueOnce({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'dsh', dshRuntime: 'tui' },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    } as any);
+    const ds = makeDs({ sessionOverrides: { cliId: 'dsh' } as any });
+    const deliver = vi.fn();
+    const result = await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(result.toast.type).toBe('success');
   });
 
   it('is silently blocked for non-operators (canOperate gate)', async () => {

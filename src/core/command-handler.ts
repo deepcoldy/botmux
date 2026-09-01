@@ -122,7 +122,7 @@ import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-tur
 // normalization without a circular import; imported for internal use and
 // re-exported to keep callers (daemon.ts, tests) importing from command-handler
 // unchanged.
-import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput } from './passthrough-commands.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, normalizePassthroughCommand, parseCustomPassthroughInput, cliHasNoRawPassthroughSurface } from './passthrough-commands.js';
 export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
 
 /**
@@ -234,12 +234,11 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
 /** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
  * requires every user message to pass through its service-user envelope and
  * structured turn ledger. Both the routing and /list-slash-command display must
- * agree on CLIs with no raw passthrough surface. */
-const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
-
-export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
-  return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
-}
+ * agree on CLIs with no raw passthrough surface — and so must the Lark card's
+ * `/compact` button, which is why the set + predicate live in the dependency-free
+ * `passthrough-commands` leaf (card-builder cannot import this module: it would
+ * cycle). Re-exported here so existing callers are unaffected. */
+export { cliHasNoRawPassthroughSurface } from './passthrough-commands.js';
 
 export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);

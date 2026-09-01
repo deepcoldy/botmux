@@ -1333,6 +1333,7 @@ describe('card behavior defaults', () => {
     });
 
     expect(renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(false);
+    expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'bot-defaults' })).toBeTruthy();
   });
 
   it('toggling pin streaming on persists pinStreamingCard=true', async () => {

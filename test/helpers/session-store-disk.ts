@@ -1,59 +1,92 @@
 /**
- * 直接读/改会话行持久层的测试夹具，按运行时的混合窗口规则解析引擎：
- * 「有 .db 用 .db，否则用 .json」。引擎替换后 daemon store 落在 sessions*.db
- * （既有 JSON 冻结），但夹具保持两种引擎都可用，方便混合窗口场景直接播种 JSON。
+ * 直接读/改/播种会话行持久层的测试夹具。会话库只有 SQLite 一种引擎：
+ * per-bot 落在 `session-stores/<appId>/sessions.db`，legacy 无 appId 落在扁平
+ * `sessions.db`。迁移前的 `sessions*.json` 只是**一次性导入源**，播种它请直接
+ * 写文件（见各测试里的 seedJson），不要走本模块。
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-function storePaths(dataDir: string, appId?: string): { db: string; json: string } {
-  return {
-    db: appId ? join(dataDir, 'session-stores', appId, 'sessions.db') : join(dataDir, 'sessions.db'),
-    json: join(dataDir, appId ? `sessions-${appId}.json` : 'sessions.json'),
-  };
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  row TEXT NOT NULL,
+  chat_id TEXT GENERATED ALWAYS AS (json_extract(row, '$.chatId')) VIRTUAL,
+  root_message_id TEXT GENERATED ALWAYS AS (json_extract(row, '$.rootMessageId')) VIRTUAL,
+  scope TEXT GENERATED ALWAYS AS (json_extract(row, '$.scope')) VIRTUAL
+);
+`;
+
+export function sessionStorePath(dataDir: string, appId?: string): string {
+  return appId
+    ? join(dataDir, 'session-stores', appId, 'sessions.db')
+    : join(dataDir, 'sessions.db');
 }
 
-/** db-else-json 读某个 store 的全部行（键 → 行对象）。 */
-export function readPersistedSessionRows(dataDir: string, appId?: string): Record<string, any> {
-  const { db, json } = storePaths(dataDir, appId);
-  if (existsSync(db)) {
-    const conn = new DatabaseSync(db);
-    try {
-      conn.exec('PRAGMA busy_timeout = 3000');
-      const rows = conn.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
-      return Object.fromEntries(rows.map(r => [r.session_id, JSON.parse(r.row)]));
-    } finally {
-      conn.close();
+function open(path: string, create: boolean): DatabaseSync {
+  if (create) mkdirSync(dirname(path), { recursive: true });
+  const db = new DatabaseSync(path);
+  db.exec('PRAGMA busy_timeout = 3000');
+  if (create) db.exec(SCHEMA_SQL);
+  return db;
+}
+
+/**
+ * 播种一个 store 的若干行（键 → 行对象），模拟「另一个 bot 的 daemon 已经写过盘」。
+ * 键与 `row.sessionId` 可以故意不一致，用来覆盖脏行场景。
+ */
+export function seedPersistedSessionRows(
+  dataDir: string,
+  appId: string | undefined,
+  rows: Record<string, any>,
+): string {
+  const path = sessionStorePath(dataDir, appId);
+  const db = open(path, true);
+  try {
+    const insert = db.prepare(
+      'INSERT OR REPLACE INTO sessions (session_id, status, row) VALUES (?, ?, ?)',
+    );
+    for (const [key, value] of Object.entries(rows)) {
+      insert.run(key, typeof value?.status === 'string' ? value.status : '', JSON.stringify(value));
     }
+  } finally {
+    db.close();
   }
-  return JSON.parse(readFileSync(json, 'utf8'));
+  return path;
 }
 
-/** 模拟「另一个进程」直改持久层里的一行（旧夹具直接改 JSON 文件的等价物）。 */
+/** 读某个 store 的全部行（键 → 行对象）。 */
+export function readPersistedSessionRows(dataDir: string, appId?: string): Record<string, any> {
+  const path = sessionStorePath(dataDir, appId);
+  if (!existsSync(path)) throw new Error(`no session store at ${path}`);
+  const db = open(path, false);
+  try {
+    const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
+    return Object.fromEntries(rows.map(r => [r.session_id, JSON.parse(r.row)]));
+  } finally {
+    db.close();
+  }
+}
+
+/** 模拟「另一个进程」直改持久层里的一行。 */
 export function mutatePersistedSessionRow(
   dataDir: string,
   appId: string | undefined,
   sessionId: string,
   mutate: (row: any) => void,
 ): void {
-  const { db, json } = storePaths(dataDir, appId);
-  if (existsSync(db)) {
-    const conn = new DatabaseSync(db);
-    try {
-      conn.exec('PRAGMA busy_timeout = 3000');
-      const hit = conn.prepare('SELECT row FROM sessions WHERE session_id = ?').get(sessionId) as { row: string } | undefined;
-      if (!hit) throw new Error(`no session row ${sessionId} in ${db}`);
-      const row = JSON.parse(hit.row);
-      mutate(row);
-      conn.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
-        .run(typeof row?.status === 'string' ? row.status : '', JSON.stringify(row), sessionId);
-    } finally {
-      conn.close();
-    }
-    return;
+  const path = sessionStorePath(dataDir, appId);
+  const db = open(path, false);
+  try {
+    const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?').get(sessionId) as { row: string } | undefined;
+    if (!hit) throw new Error(`no session row ${sessionId} in ${path}`);
+    const row = JSON.parse(hit.row);
+    mutate(row);
+    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+      .run(typeof row?.status === 'string' ? row.status : '', JSON.stringify(row), sessionId);
+  } finally {
+    db.close();
   }
-  const projection = JSON.parse(readFileSync(json, 'utf8')) as Record<string, any>;
-  mutate(projection[sessionId]);
-  writeFileSync(json, JSON.stringify(projection, null, 2));
 }

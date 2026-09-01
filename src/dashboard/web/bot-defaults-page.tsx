@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
+import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -3721,11 +3722,12 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
             }}
           />
-          <ToggleRow
+          <StreamingCardPinToggle
+            scope="bot-defaults"
             checked={pinStreamingCard}
             disabled={busy !== null}
             dataAction="toggle-pin-streaming-card"
-            title={tr('botDefaults.pinStreamingCard')}
+            title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
             description={tr('botDefaults.pinStreamingCardDescription')}
             help={tr('botDefaults.pinStreamingCardHelp')}
             onChange={checked => {

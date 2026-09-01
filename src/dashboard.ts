@@ -225,6 +225,7 @@ import {
   bindOncall,
   disbandGroup,
   leaveGroup,
+  setPinStreamingCardForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -2786,7 +2787,17 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       if (!r.ok) return;
       const j = await r.json() as { chats?: any[] };
       for (const c of j.chats ?? []) {
-        const { oncallChat, firstSeenAt, hasRole, hasMessageListener, observedBotNames, ...chatBase } = c;
+        const {
+          oncallChat,
+          firstSeenAt,
+          hasRole,
+          hasMessageListener,
+          observedBotNames,
+          pinStreamingCardMasterEnabled,
+          pinStreamingCardChatEnabled,
+          pinStreamingCardEffectiveEnabled,
+          ...chatBase
+        } = c;
         const cur = out.get(c.chatId) ?? {
           ...chatBase,
           memberBots: [] as any[],
@@ -2804,6 +2815,9 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           oncallChat: oncallChat ?? null,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
+          pinStreamingCardMasterEnabled: pinStreamingCardMasterEnabled ?? false,
+          pinStreamingCardChatEnabled: pinStreamingCardChatEnabled ?? true,
+          pinStreamingCardEffectiveEnabled: pinStreamingCardEffectiveEnabled ?? false,
         });
         if (typeof firstSeenAt === 'number') {
           cur._firstSeenAt = cur._firstSeenAt === null
@@ -2818,7 +2832,18 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
     const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
     for (const b of onlineBots) {
       if (!present.has(b.larkAppId)) {
-        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false, hasMessageListener: false });
+        c.memberBots.push({
+          larkAppId: b.larkAppId,
+          botName: b.botName,
+          cliId: b.cliId,
+          inChat: false,
+          oncallChat: null,
+          hasRole: false,
+          hasMessageListener: false,
+          pinStreamingCardMasterEnabled: false,
+          pinStreamingCardChatEnabled: true,
+          pinStreamingCardEffectiveEnabled: false,
+        });
       }
     }
   }
@@ -4907,7 +4932,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'DELETE' && mWhiteboard) {
       try {
         const id = decodeURIComponent(mWhiteboard[1]);
-        return jsonRes(res, 200, deleteWhiteboard(id));
+        return jsonRes(res, 200, await deleteWhiteboard(id));
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
       }
@@ -6029,6 +6054,17 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+
+    let mPinStreamingCard: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mPinStreamingCard = url.pathname.match(/^\/api\/groups\/([^/]+)\/pin-streaming-card\/([^/]+)$/))) {
+      const chatId = decodeURIComponent(mPinStreamingCard[1]);
+      const appId = decodeURIComponent(mPinStreamingCard[2]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const result = await setPinStreamingCardForGroup(chatId, appId, raw, groupsActionDeps);
+      return writeHandlerResult(res, result);
     }
 
     // ─── Per-bot defaults (Bot Defaults tab) ─────────────────────────────────

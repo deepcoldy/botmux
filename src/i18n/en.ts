@@ -71,8 +71,7 @@ export const messages: Record<string, string> = {
   'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
 
   // ─── Context headroom indicator ──────────────────────────────────────────
-  'card.context.indicator': 'Context {pct}%',
-  'card.context.over_threshold': 'Context {pct}% · compact recommended',
+  'card.context.compact_hint': 'compact recommended',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -1381,9 +1380,10 @@ export const messages: Record<string, string> = {
 
   // Worker-side submit / notify messages
   'worker.codex_composer_conflict': 'The adopted Codex terminal already has an unsubmitted local draft. botmux left that draft untouched and did not append the Lark message. Submit or clear the local draft, then resend the Lark message.',
+  'worker.transcriptLabel': 'conversation store',
   'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
-  'worker.submit_unconfirmed': '⚠️ Message submission is unconfirmed\nStage: input submission\nError code: submit_unconfirmed\nBotMux wrote the message and retried Enter, but no new {cliName} session entry appeared in {transcriptLabel} within {secs} seconds. There is no evidence that the request reached the model, so there is currently no model-side error to pass through.\nOpen the Web terminal and inspect the composer. Resend only after confirming the message did not run.\nOriginal message: {preview}',
-  'worker.submit_unconfirmed_zmx': '⚠️ Message submission is unconfirmed\nStage: input submission\nError code: submit_unconfirmed\nAfter {secs} seconds, BotMux still found no evidence that {cliName} accepted the message. There is no evidence that the request reached the model, so there is currently no model-side error to pass through.\nDo not resend blindly; run botmux list locally, enter the ZMX session, and inspect its composer.\nOriginal message: {preview}',
+  'worker.submit_unconfirmed': '⚠️ Message submission auto-confirmation failed\nStage: input submission\nError code: submit_unconfirmed\nBotMux could not confirm that {cliName} received this message in {transcriptLabel}. Auto-confirmation failure does not mean the message did not run: it may still be running or may already have run.\nOpen the Web terminal and inspect the composer and run state. Resend only after confirming the message did not actually run.\nOriginal message: {preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ Message submission auto-confirmation failed\nStage: input submission\nError code: submit_unconfirmed\nBotMux could not confirm that {cliName} received this message in {transcriptLabel}. Auto-confirmation failure does not mean the message did not run: it may still be running or may already have run.\nDo not resend blindly; run botmux list locally, enter the ZMX session, and inspect its composer and run state before deciding.\nOriginal message: {preview}',
   'worker.zmx_recovery_pending': 'The ZMX control plane could not verify the session identity, so automatic cleanup did not run. Do not resend blindly; run botmux list locally, inspect the session, press Ctrl+C to clear the composer, then use /restart before trying again.',
   'worker.zmx_recovery_unconfirmed': 'The ZMX cleanup Ctrl+C could not be confirmed. To prevent duplicate, concatenated, or truncated input, automatic writes to this session are now blocked. Do not resend blindly; run botmux list locally, inspect and clear the composer, then use /restart before trying again.',
   'worker.interrupt_unconfirmed': '⚠️ Interrupt key {key} could not be delivered to {cliName} after two attempts. The CLI may still be running, and the card will not claim it stopped. {recovery}',

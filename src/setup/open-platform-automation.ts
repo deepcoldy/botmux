@@ -13,6 +13,10 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
+// Plain ESM import, deliberately: `--compile` traces it into the binary, while tsc /
+// tsx / vitest treat it as an ordinary module. See defaultBotmuxAppIcon() for why the
+// icon is base64 in the module graph instead of a file read off disk.
+import { BOTMUX_APP_ICON_BASE64, BOTMUX_APP_ICON_BYTES } from './app-icon-data.js';
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
@@ -2195,15 +2199,49 @@ class CreatedOpenPlatformAppError extends Error {
   }
 }
 
-function defaultBotmuxAppIconPath(): string | undefined {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    // npm build: dist/setup/open-platform-automation.js -> dist/dashboard-web/favicon.png
-    join(here, '..', 'dashboard-web', 'favicon.png'),
-    // tsx / vitest: src/setup/open-platform-automation.ts -> src/dashboard/web/favicon.png
-    join(here, '..', 'dashboard', 'web', 'favicon.png'),
-  ];
-  return candidates.find(existsSync);
+/**
+ * The default Feishu app icon bytes (512×512 PNG).
+ *
+ * ⚠️ THIS USED TO BE A DISK PATH AND THAT BROKE THE COMPILED BINARY. The old
+ * implementation derived candidates from `import.meta.url`:
+ *
+ *     const here = dirname(fileURLToPath(import.meta.url));
+ *     [join(here,'..','dashboard-web','favicon.png'),
+ *      join(here,'..','dashboard','web','favicon.png')].find(existsSync)
+ *
+ * In a `bun build --compile` binary `import.meta.url` lives in the virtual
+ * `/$bunfs/`, so `here` is `/$bunfs/root` and BOTH candidates miss. MEASURED by
+ * compiling that exact function: `here = /$bunfs/root`, result `undefined` — and it
+ * misses even with a real favicon.png sitting beside the binary, because `here`
+ * never points at the filesystem. Every install.sh / npm / bun global user therefore
+ * got `找不到 botmux 默认应用图标` and could not create a bot at all. Same class as
+ * the Dashboard 404 (88e3d7f24) and the missing lark-scopes.json (2ef5c3a58).
+ *
+ * The icon now arrives as a base64 constant in the module graph, which `--compile`
+ * traces like any other import. Base64 rather than the Dashboard's
+ * `with { type: 'file' }` because this module is also compiled by `tsc` and run under
+ * tsx/vitest, where that attribute fails outright (MEASURED: node
+ * `ERR_UNKNOWN_FILE_EXTENSION`; tsx `Transform failed`). The Dashboard can use it
+ * because its preamble is injected at compile time and Node never parses it.
+ * See scripts/generate-app-icon-data.mjs for the full comparison.
+ *
+ * Do NOT reintroduce a `join(__dirname, …)` lookup here.
+ */
+function defaultBotmuxAppIcon() {
+  const icon = Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64');
+  // A silently truncated decode would upload a corrupt image and produce an app
+  // with a broken icon, which is far harder to diagnose than a failed create.
+  if (icon.length !== BOTMUX_APP_ICON_BYTES) {
+    throw new Error(`botmux 默认应用图标解码后长度异常（${icon.length} != ${BOTMUX_APP_ICON_BYTES}）`);
+  }
+  return icon;
+}
+
+/** The custom/test icon override, read off disk. Fails with the path in the message
+ *  so a caller that passed a bad path can see which one. */
+function readIconFile(iconFilePath: string) {
+  if (!existsSync(iconFilePath)) throw new Error(`找不到指定的应用图标: ${iconFilePath}`);
+  return readFileSync(iconFilePath);
 }
 
 function pickPayloadString(payload: unknown, keys: string[]): string | undefined {
@@ -2273,10 +2311,17 @@ export async function createOpenPlatformAppWithClient(
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
   if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
-  const iconFile = options.iconFilePath ?? defaultBotmuxAppIconPath();
-  if (!iconFile || !existsSync(iconFile)) throw new Error('找不到 botmux 默认应用图标');
+  // `iconFilePath` stays a DISK path: it is the test/custom-icon override, always
+  // supplied by a caller that knows the file exists. Only the DEFAULT moved into the
+  // module graph — that is the one that has to work inside the compiled binary.
+  //
+  // No explicit `Buffer` annotation on purpose: it widens to `Buffer<ArrayBufferLike>`,
+  // which tsc rejects as a `BlobPart` (SharedArrayBuffer is in that union). Inference
+  // keeps the narrower `Buffer<ArrayBuffer>` both branches actually produce.
+  const icon = options.iconFilePath
+    ? readIconFile(options.iconFilePath)
+    : defaultBotmuxAppIcon();
 
-  const icon = readFileSync(iconFile);
   const form = new FormData();
   form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
   form.append('uploadType', '4'); // Open Platform console enum: Icon

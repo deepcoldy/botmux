@@ -526,7 +526,6 @@ export async function prepareRemoteFleetForShutdown(
   try {
     snapshots = sessionStore.getActiveRemoteShutdownSnapshotsBatch(
       candidates.map(ds => ds.session.sessionId),
-      { maxWaitMs: Math.min(configuredSnapshotTimeout, remaining) },
     );
   } catch (error) {
     const message = `initial_riff_snapshot_failed:${error instanceof Error
@@ -693,9 +692,7 @@ export function persistPreparedRemoteShutdownFleet(
       owner: result.durableOwnerAtPrepare,
       targetTaskId: result.taskId,
       expectedCurrentTaskIds: [result.durableTaskIdAtPrepare, result.taskId],
-    })), {
-      maxWaitMs: Math.min(configuredPersistTimeout, remaining),
-    });
+    })));
   } catch (error) {
     const batchError = error instanceof sessionStore.RemoteLineageBatchError ? error : undefined;
     const stage = batchError?.stage ?? 'prewrite_io';

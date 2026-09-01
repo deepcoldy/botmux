@@ -39,7 +39,10 @@ function textMatches(actual: string, expected: string): boolean {
   // 宽容前缀匹配：多行内容在 TUI 里可能被嵌入换行提前提交（只提交了第一段），
   // 或 DB 侧截断。宁可认作已提交，也不误报"未确认"（与旧盲发行为对齐，不回退）。
   if (na.length > 0 && (ne.startsWith(na) || na.startsWith(ne.slice(0, na.length)))) return true;
-  return false;
+  // OpenCode 只会在原始输入前加 Directory Context；BotMux 信封本身必须作为
+  // 完整、不变的后缀落库。把 user_message 内容视为不透明文本，不解析其中可能
+  // 出现的 XML-looking 字符串。
+  return ne.length > 0 && na.endsWith(ne);
 }
 
 // -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------
@@ -158,6 +161,14 @@ export async function detectOpenCodeSubmit(
         : { submitted: true };
     }
     await delayFn(800);
+    // 等待期间记录可能已落库：发送重试 Enter 前先复查，命中就不再补发 Enter
+    // （避免对已提交的内容多按一次回车，把输入框里本已提交的行再触发一次）。
+    const afterWait = detectNewSubmit(baseline, content, kind);
+    if (afterWait.found) {
+      return afterWait.cliSessionId
+        ? { submitted: true, cliSessionId: afterWait.cliSessionId }
+        : { submitted: true };
+    }
     if (!trySendEnter()) return { submitted: false };
   }
   const finalMatch = detectNewSubmit(baseline, content, kind);

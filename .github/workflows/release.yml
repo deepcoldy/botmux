@@ -147,6 +147,11 @@ jobs:
     outputs:
       tag: ${{ steps.dist_tag.outputs.tag }}
       prerelease: ${{ steps.dist_tag.outputs.prerelease }}
+      # The origin/master SHA the ancestry guard below actually validated against.
+      # `release` re-checks against THIS value rather than re-fetching, so a commit
+      # landing on master mid-run cannot flip the verdict after the platform
+      # subpackages are already on npm (issue #1150).
+      master_sha: ${{ steps.master_ancestry.outputs.master_sha }}
     steps:
       - uses: actions/checkout@v6
         # fetch-depth: 0 —— 「stable 必须包含最新 master」那道闸要跑
@@ -233,6 +238,7 @@ jobs:
         # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
         # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
         # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        id: master_ancestry
         if: steps.dist_tag.outputs.tag == 'latest'
         run: |
           git fetch origin master --quiet
@@ -243,6 +249,10 @@ jobs:
             exit 1
           fi
           echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
+          # PIN the exact master this verdict was computed against, so `release`
+          # can re-check the SAME fact instead of re-reading a moving ref. See the
+          # TOCTOU note on the release-side guard below.
+          echo "master_sha=$(git rev-parse origin/master)" >> "$GITHUB_OUTPUT"
 
   # ── MAIN PACKAGE PUBLISH — DELIBERATELY LAST ─────────────────────────────────
   # Publishes `botmux-workflow-core` + the main `botmux` package, then creates
@@ -392,15 +402,46 @@ jobs:
         # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
         # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
         if: steps.dist_tag.outputs.tag == 'latest'
+        env:
+          # ⚠️ TOCTOU (issue #1150): re-reading `origin/master` HERE is what burned
+          # v3.18.10. `binary-subpackages` publishes the six platform packages BEFORE
+          # this job — and it must, because the main package declares OPTIONAL deps on
+          # them and an unresolvable optional dep is a silent npm no-op that would
+          # install a binary-less main package. Those publishes are irreversible.
+          #
+          # Measured timeline of the lost release, all UTC:
+          #   09:53:46  preflight ancestry OK   (origin/master = 61620be7, the tag itself)
+          #   09:56:22  six subpackages PUBLISHED to npm        <- irreversible
+          #   09:57:47  def4275b (#1128) lands on master        <- inside the window
+          #   09:58:33  this guard REFUSES      (origin/master = def4275b)
+          #
+          # Same guard, same run, opposite verdicts, 4m47s apart — the tag never moved.
+          # Retrying cannot recover: re-tagging changes the code, so rebuilt binaries
+          # hash differently and publish-npm-if-missing.mjs correctly refuses to
+          # overwrite a published version with different content. 3.18.10 was burned.
+          #
+          # So this job re-checks the SHA preflight PINNED, not whatever master is now.
+          # The guard keeps its meaning — the tag must contain the master that was
+          # current when this release was ADMITTED — while the verdict stays immutable
+          # for the rest of the run. A commit landing mid-release belongs to the next
+          # release, not to a burned version number.
+          PINNED_MASTER: ${{ needs.preflight.outputs.master_sha }}
         run: |
-          git fetch origin master --quiet
-          if ! git merge-base --is-ancestor origin/master HEAD; then
-            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
+          if [ -z "$PINNED_MASTER" ]; then
+            echo "REFUSING: preflight pinned no master SHA, so this job cannot re-check the"
+            echo "same fact preflight admitted. Failing closed rather than re-reading a ref"
+            echo "that may have moved since (issue #1150)."
+            exit 1
+          fi
+          # Fetch by SHA — the pinned commit is not necessarily master's tip any more.
+          git fetch origin "$PINNED_MASTER" --quiet
+          if ! git merge-base --is-ancestor "$PINNED_MASTER" HEAD; then
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the master preflight admitted ($(git rev-parse --short "$PINNED_MASTER"))."
             echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
             echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
             exit 1
           fi
-          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
+          echo "OK: tagged commit contains the master preflight admitted ($(git rev-parse --short "$PINNED_MASTER"))."
 
       - run: bun run build
 

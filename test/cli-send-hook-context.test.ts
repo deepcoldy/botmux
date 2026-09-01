@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 import {
   managedOriginCapabilityPath,
@@ -183,7 +184,7 @@ describe('cmdSend hook context wiring', () => {
   it('does not promote detached spawn-time turn env while durable output is unsettled', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-stale-origin-'));
     try {
-      writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+      seedPersistedSessionRows(dataDir, 'app-a', {
         origin: {
           sessionId: 'origin',
           chatId: 'oc_origin',
@@ -210,7 +211,7 @@ describe('cmdSend hook context wiring', () => {
           createdAt: new Date(0).toISOString(),
           larkAppId: 'app-a',
         },
-      }));
+      });
       const result = spawnSyncTsScript(
         join(__dirname, '..', 'src', 'cli.ts'),
         ['send', 'must-not-leak', '--session-id', 'destination', '--no-mention'],
@@ -261,13 +262,13 @@ describe('cmdSend hook context wiring', () => {
       content: 'prompt',
       deliverySink: 'lark',
     }];
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
         title: 'read isolated', status: 'active', createdAt: new Date(0).toISOString(),
         larkAppId: 'app-a', cliId: 'codex-app', codexAppDispatchLedger: ledger,
       },
-    }));
+    });
     const fixture = join(root, 'host-send.mjs');
     writeFileSync(fixture, `
       import { readFileSync } from 'node:fs';
@@ -400,7 +401,7 @@ describe('cmdSend hook context wiring', () => {
         turnId: 'turn-stale', dispatchAttempt: 9,
       }),
     );
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
         title: 'host', status: 'active', createdAt: new Date(0).toISOString(),
@@ -410,7 +411,7 @@ describe('cmdSend hook context wiring', () => {
           state: 'prepared', content: 'prompt', deliverySink: 'http_wait',
         }],
       },
-    }));
+    });
     try {
       const result = await runCli(
         ['send', 'must not relay', '--session-id', 'session', '--no-mention'],
@@ -434,13 +435,13 @@ describe('cmdSend hook context wiring', () => {
 
   it('rejects a trusted host re-exec when its authorized Codex App ledger was already settled', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-ledger-gone-'));
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
+    seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
         title: 'settled', status: 'active', createdAt: new Date(0).toISOString(),
         larkAppId: 'app-a', cliId: 'codex-app', pid: process.pid,
       },
-    }));
+    });
     try {
       const result = await runCli(
         ['send', 'must not downgrade', '--session-id', 'session', '--no-mention'],

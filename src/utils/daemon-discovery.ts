@@ -29,8 +29,11 @@ export interface OnlineDaemonInfo {
 
 const STALE_MS = 90_000;
 
-function registryDir(): string {
-  return join(resolveBotmuxDataDir(), 'dashboard-daemons');
+/** `dataDir` lets a caller that already resolved a data dir keep the daemon
+ *  probe and its store access on the SAME directory. Omitting it falls back to
+ *  the process-wide resolution, which is what every host-CLI caller wants. */
+function registryDir(dataDir?: string): string {
+  return join(dataDir ?? resolveBotmuxDataDir(), 'dashboard-daemons');
 }
 
 /** Parse a loopback daemon IPC port from a descriptor or injected env value. */
@@ -58,8 +61,8 @@ export function resolveDaemonIpcPort(
 }
 
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(): OnlineDaemonInfo[] {
-  const dir = registryDir();
+export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
+  const dir = registryDir(dataDir);
   if (!existsSync(dir)) return [];
   const now = Date.now();
   const out: OnlineDaemonInfo[] = [];
@@ -92,6 +95,6 @@ export function listOnlineDaemons(): OnlineDaemonInfo[] {
 }
 
 /** Find a specific online daemon by larkAppId. Returns null if offline / not found. */
-export function findOnlineDaemon(larkAppId: string): OnlineDaemonInfo | null {
-  return listOnlineDaemons().find(d => d.larkAppId === larkAppId) ?? null;
+export function findOnlineDaemon(larkAppId: string, dataDir?: string): OnlineDaemonInfo | null {
+  return listOnlineDaemons(dataDir).find(d => d.larkAppId === larkAppId) ?? null;
 }

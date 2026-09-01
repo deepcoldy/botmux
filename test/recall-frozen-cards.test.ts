@@ -425,6 +425,9 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 20th arg: silent-idle label flag — no deliberately-silent turn here.
       false,
+      // 21st arg: per-bot dshRuntime — undefined for this Claude fixture (only
+      // meaningful for cliId 'dsh', where 'tui' keeps the 🗜️ compact button).
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
