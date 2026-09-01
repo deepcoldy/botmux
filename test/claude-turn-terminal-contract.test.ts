@@ -373,6 +373,21 @@ describe('Claude durable turn terminal contract', () => {
       expect(source).toMatch(
         /if \(turn\.isLocal && outcome && outcome\.status !== 'completed'\) \{/,
       );
+      // ORDER, not merely presence. Keeping every byte of the gate but moving
+      // it one call later — below emitTurnTerminal — resurrects the phantom
+      // card exactly (the failure terminal ships, then the gate logs and
+      // `continue`s into nothing), and every string assertion above stays
+      // green. Both indices are pinned > -1 first: toBeLessThan(-1, n) passes
+      // silently, so a slice that missed the function would fake a pass.
+      const fn = source.slice(
+        source.indexOf('function emitReadyTurns('),
+        source.indexOf('function drainPathInto('),
+      );
+      const gateAt = fn.indexOf('Bridge terminal suppressed for synthesised local turn');
+      const emitAt = fn.indexOf('emitTurnTerminal(');
+      expect(gateAt).toBeGreaterThan(-1);
+      expect(emitAt).toBeGreaterThan(-1);
+      expect(gateAt).toBeLessThan(emitAt);
     });
   });
 });
