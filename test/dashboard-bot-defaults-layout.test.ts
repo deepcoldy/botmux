@@ -5,6 +5,32 @@ const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', 
 const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.url), 'utf8');
 
+// Slice out ONE rule body, ending at its own closing brace.
+//
+// Bounding the slice on the *next* landmark instead (`@media`, the following
+// selector) makes the window wider than the rule: any declaration in a rule
+// that later gets inserted into that gap satisfies the assertions, while the
+// property they are meant to pin has already been deleted. Verified: dropping
+// `align-content: start` from .bd-roster-list and adding an unrelated rule
+// carrying it before the @media kept all assertions green.
+//
+// `.bd-roster-list` is declared TWICE — once at top level for desktop, once
+// inside @media (max-width: 980px). Every caller here wants the desktop rule,
+// which is the first match, so this takes the first and does not offer a
+// choice. Note this is no safety net for a rename: renaming the desktop rule
+// leaves the mobile copy as the first match, and what catches that is the
+// assertions failing against the wrong body.
+//
+// These rule bodies contain no nested blocks, so the first `}` after the
+// selector is the closing brace. Throw rather than slice from -1.
+function ruleBody(selector: string): string {
+  const start = css.indexOf(selector);
+  if (start === -1) throw new Error(`selector not found in style.css: ${selector}`);
+  const end = css.indexOf('}', start);
+  if (end === -1) throw new Error(`unterminated rule in style.css: ${selector}`);
+  return css.slice(start, end);
+}
+
 describe('bot defaults focused layout', () => {
   it('keeps every task panel mounted while hiding inactive categories', () => {
     for (const tab of ['common', 'sessions', 'security', 'cards', 'advanced']) {
@@ -50,14 +76,12 @@ describe('bot defaults focused layout', () => {
     expect(desktop).toMatch(/\.bd-roster\s*\{[\s\S]*?position:\s*static;[\s\S]*?height:\s*100%;/);
     expect(desktop).toMatch(/\.bd-detail\s*\{[\s\S]*?overflow-y:\s*auto;/);
 
-    const rosterStart = css.indexOf('.bot-defaults-page .bd-roster {');
-    const roster = css.slice(rosterStart, css.indexOf('.bot-defaults-page #bd-filters', rosterStart));
+    const roster = ruleBody('.bot-defaults-page .bd-roster {');
     expect(roster).toMatch(/grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
     expect(roster).toMatch(/overflow:\s*hidden;/);
     expect(roster).not.toMatch(/max-height:\s*calc\(100dvh/);
 
-    const listStart = css.indexOf('.bot-defaults-page .bd-roster-list {');
-    const list = css.slice(listStart, css.indexOf('@media (max-width: 980px)', listStart));
+    const list = ruleBody('.bot-defaults-page .bd-roster-list {');
     expect(list).toMatch(/min-height:\s*0;/);
     expect(list).toMatch(/overflow-y:\s*auto;/);
     expect(list).toMatch(/overscroll-behavior:\s*contain;/);
@@ -70,8 +94,7 @@ describe('bot defaults focused layout', () => {
     // per row instead of 54.4px, so the selected row rendered as a tall block
     // and the last row sank to the panel floor. align-content:start makes the
     // rows keep their content height and leaves the slack as empty space.
-    const listStart = css.indexOf('.bot-defaults-page .bd-roster-list {');
-    const list = css.slice(listStart, css.indexOf('@media (max-width: 980px)', listStart));
+    const list = ruleBody('.bot-defaults-page .bd-roster-list {');
     expect(list).toMatch(/align-content:\s*start;/);
   });
 
