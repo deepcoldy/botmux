@@ -14,7 +14,8 @@ import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMe
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
-import { parseForceTopicInvocation } from '../../core/command-handler.js';
+import { parseForceTopicInvocation, parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -2291,6 +2292,8 @@ export interface RoutingContext {
   summaryCommand?: SummaryCommandRuntimeContext;
   /** This turn was triggered by @mentioning a configured substitute person. */
   substituteTrigger?: import('../../types.js').SubstituteTrigger;
+  /** 本轮由免@ 斜杠命令（commandTriggers）触发；带配置的模板与本条消息的参数。 */
+  commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
   /** Earlier topic seed coalesced into this root-linked clarification. */
@@ -3952,6 +3955,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         ? stripLeadingMentions(routingText.trim(), message?.mentions ?? []).trim()
         : '';
       const isControlCommand = strippedRoutingText.startsWith('/');
+      // 免@ 斜杠命令：复用守护进程自己的命令解析器取首 token，语义因此与 @ 路径
+      // 完全一致 —— 带参数的 `/solve 修一下登录` 照样命中，而多行的命令清单 /
+      // 带尖括号占位符的讨论文本（parseSlashCommandInvocation 里那两条规则）不会
+      // 误触发。放行结算在下面群聊 @ 闸的 relax 里。
+      const triggeredCommand = isControlCommand
+        ? parseSlashCommandInvocation(strippedRoutingText)?.cmd
+        : undefined;
       let pairedForwardSeed;
       let stalePendingSeed;
       // Require isAllowed before pairing: a root-linked clarification from a
@@ -4024,6 +4034,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       //   ownsSession + multi     → require @mention
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
+      // 免@ 斜杠命令的命中结果：在群聊闸里结算，随 ctx 下发给 daemon 渲染 prompt。
+      let commandTrigger: CommandTriggerMatch | undefined;
       if (chatType === 'group') {
         const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
         // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
@@ -4035,6 +4047,32 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
           stats = await getGroupStats(larkAppId, chatId);
         }
+        // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
+        // 的免@，只放开配置里那几条命令，所以 mentionMode 留在默认 'always' 的群
+        // 也能用。三道闸（群范围 / 命令白名单 / 保留命令 fail-closed）都在
+        // matchesCommandTrigger 里；透传集按本 bot 的**实际 CLI** 求值（adapter 会
+        // 追加自己的命令，无裸输入面的 CLI 则为空集），不能用静态常量。
+        //
+        // 三个额外约束：
+        //   • `!!triggeredCommand` 必须在前 —— 它让 resolvePassthroughCommands
+        //     （建 Set + 解析 adapter 默认集）只在真是斜杠命令时才求值，不进每条
+        //     群消息的热路径。
+        //   • `!mentionsOther` 与 ambient 同款语义：`@张三 /solve` 是指给张三的，
+        //     命令形态不改变「点名了别人就让路」这条群礼仪。
+        //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
+        //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
+        const commandTriggerEntry = isAllowed
+          && !mentionsOther
+          && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
+          && triggeredCommand
+          ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))
+          : undefined;
+        // 命中的条目连同本条消息的参数一起下发；模板渲染在 daemon 侧做（与
+        // messageListener 同款：dispatcher 只判定，daemon 才拼 prompt）。
+        commandTrigger = commandTriggerEntry
+          ? { ...commandTriggerEntry, args: commandTriggerArgs(strippedRoutingText) }
+          : undefined;
+        const commandTriggerRelax = !!commandTrigger;
         // replyRootId means this turn has already been explicitly addressed
         // to the bot by shared-topic logic (possibly from inside an existing
         // Lark thread). Do not re-run the generic group @ gate, which would
@@ -4079,7 +4117,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           || (isAllowed && mentionMode === 'never')
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
+          || commandTriggerRelax
           || (ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
+        if (commandTriggerRelax) {
+          logger.info(
+            `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
+            `${commandTrigger?.prompt ? '（模板）' : '（原文）'} chat=${chatId.substring(0, 12)} ` +
+            `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+          );
+        }
         if (!relax) {
           const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);
           if (access === 'not_allowed') {
@@ -4134,6 +4180,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         ...routing,
         replyRootId,
         promptOverride,
+        commandTrigger,
         summaryCommand: summaryCommandTriggered && summaryCommandMatch
           ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
           : undefined,

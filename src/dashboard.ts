@@ -5764,6 +5764,61 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // ─── 免@ 斜杠命令 commandTriggers (proxy to daemon) ─────────────────────
+    // GET /api/command-triggers/:larkAppId
+    // PUT /api/command-triggers/:larkAppId
+    // PUT /api/command-triggers/:larkAppId/chats/:chatId
+    // GET /api/command-triggers/:larkAppId/conflicts?cmds=/solve,/clear
+    let mCommandTrigger: RegExpMatchArray | null;
+    if ((mCommandTrigger = url.pathname.match(/^\/api\/command-triggers\/([^/]+)\/conflicts$/))) {
+      const larkAppId = decodeURIComponent(mCommandTrigger[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/command-triggers/conflicts${url.search}`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    if ((mCommandTrigger = url.pathname.match(/^\/api\/command-triggers\/([^/]+)\/chats\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mCommandTrigger[1]);
+      const chatId = decodeURIComponent(mCommandTrigger[2]);
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, `/api/command-triggers/chats/${encodeURIComponent(chatId)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    if ((mCommandTrigger = url.pathname.match(/^\/api\/command-triggers\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mCommandTrigger[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, '/api/command-triggers', { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, '/api/command-triggers', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
     let mGroupMembersDisplay: RegExpMatchArray | null;
     if (req.method === 'GET' && (mGroupMembersDisplay = url.pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/members-display$/))) {
       const larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);

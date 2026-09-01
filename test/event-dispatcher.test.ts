@@ -814,6 +814,7 @@ function setupBotState(opts?: {
 	  autoGrantRequestCards?: boolean;
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
+	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
 	  p2pMode?: 'thread' | 'chat';
@@ -848,6 +849,7 @@ function setupBotState(opts?: {
       autoGrantRequestCards: opts?.autoGrantRequestCards,
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
+	      commandTriggers: opts?.commandTriggers,
 	      chatReplyModes: opts?.chatReplyModes,
 	      chatMentionModes: opts?.chatMentionModes,
 	      p2pMode: opts?.p2pMode,
@@ -8500,5 +8502,212 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
     // 本群缓存命中(没有多余重查),仍按 1v1 放行。
     expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
     expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── 免@ 斜杠命令（commandTriggers） ────────────────────────────────────────
+// 普通群里旁人直接发一条配置内的命令（未 @ 任何 bot）→ 落进该群已有的 chat-scope
+// 会话续聊。默认 mentionMode 保持 'always'：本特性与「群聊 @ 策略」正交，不靠
+// 把整个群改成免@ 来实现。
+describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  function setup(commandTriggers: any, opts?: { allowedUsers?: string[] }) {
+    setupBotState({
+      allowedUsers: opts?.allowedUsers ?? [USER_OPEN_ID],
+      commandTriggers,
+    });
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    // 多人多 bot 群：末条 solo 放行不成立，只有命令闸能放行。
+    mockGetChatInfo.mockResolvedValue({ userCount: 5, botCount: 2 });
+  });
+
+  let fireSeq = 0;
+  function fire(text: string, extra?: { chatId?: string; mentions?: TestMention[]; sender?: string }) {
+    // 每条消息一个独立 message_id：事件去重按 message_id 认领，同 id 的第二条会被
+    // 静默丢掉（本 describe 里有单测连发两条）。
+    return makeUserMessageEvent({
+      senderOpenId: extra?.sender ?? USER_OPEN_ID,
+      content: JSON.stringify({ text }),
+      messageId: `msg-cmd-trigger-${++fireSeq}`,
+      chatId: extra?.chatId ?? 'chat-cmd',
+      chatType: 'group',
+      mentions: extra?.mentions,
+    });
+  }
+
+  it('routes a bare configured command into the group chat-scope session', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('/solve 修一下登录超时');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  // 模板是命令的行为定义；dispatcher 只负责把「命中的条目 + 本条消息的参数」下发，
+  // 真正的渲染在 daemon 侧（renderCommandTriggerPrompt）。
+  it('carries the configured template and the parsed args on the routing context', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve', prompt: '先复现再改：{args}' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下登录超时'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      commandTrigger: { cmd: '/solve', prompt: '先复现再改：{args}', args: '修一下登录超时' },
+    }));
+  });
+
+  // 核心需求：群里已经有会话时，裸命令要**续聊**，不是另起一个。
+  it('continues the existing group session instead of forking a new one', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-cmd');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('/solve 修一下登录超时');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ignores a command that is not on the whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/deploy prod'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('ignores ordinary chatter while the trigger is configured', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('今天这个登录问题谁看一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 危险命令必须 @：白名单被手改塞进 /close 也不生效（运行期 fail-closed）。
+  it('fails closed on a reserved daemon command smuggled into the whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/close' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/close'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on a reserved passthrough command', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/clear' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/clear'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('honours the chat allow-list and block-list', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }], chats: ['chat-in'] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve a', { chatId: 'chat-out' }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve b', { chatId: 'chat-in' }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-in',
+    }));
+  });
+
+  it('stays quiet when the sender cannot talk to the bot', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] }, { allowedUsers: ['ou_someone_else'] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // `@张三 /solve` 是指给张三的 —— 命令形态不改变「点名了别人就让路」这条群礼仪。
+  it('yields when the command message @mentions another member', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('@张三 /solve 看看这个', {
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_zhangsan' } }],
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not fire in a topic group (话题群另有续话规则)', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    mockGetChatMode.mockResolvedValue('topic');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('stays off until enabled', async () => {
+    setup({ enabled: false, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/solve 修一下'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // 命令仍然可以 @ 触发 —— 本特性只加放行条款，不改 @ 路径的任何语义。
+  it('leaves the @mention path untouched', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/solve' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = fire('@BotA /solve 修一下', {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-cmd',
+    }));
   });
 });

@@ -24,6 +24,7 @@ import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
+import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
@@ -247,6 +248,41 @@ export interface MessageListenerConfig {
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
+}
+
+/**
+ * 免@ 斜杠命令：普通群里旁人直接发一条配置内的命令（如 `/solve`，未 @ 任何 bot）
+ * 时，把它当作对本 bot 的寻址，喂进该群已有的 chat-scope 会话续聊。
+ *
+ * 与 `messageListeners` 的分工：listener 是**观察者**（把消息包成
+ * `<observed_message trusted="false">` + 配置的 prompt，每条命中新开一个话题会话）；
+ * 这里是**命令通道**（原文直投既有会话）。两者语义不同，刻意不合并。
+ *
+ * 生效范围沿用 substituteMode 的惯用形状：`chats` 为空 = 所有群，非空 = 白名单；
+ * `excludedChats` deny-wins。判定见 services/command-trigger.ts。
+ */
+export interface CommandTriggerCommand {
+  /** 小写、`/` 开头的裸命令词。botmux 保留命令在运行期被硬拒
+   *  （reservedCommandKind），dashboard 保存时也会拒绝写入。 */
+  cmd: string;
+  /**
+   * 命中后交给 Agent 的 prompt 模板 —— 命令的**行为定义**。
+   *
+   * 不填则把用户原文投给会话（Agent 只看到 `/solve xxx` 这段文本，做什么由模型
+   * 自己判断）。填了则用模板替换原文：`{args}` 会被替换成命令后面那段文本；模板
+   * 里没有 `{args}` 时，参数追加在模板末尾（宁可多一段也不静默丢掉用户输入）。
+   */
+  prompt?: string;
+}
+
+export interface CommandTriggerConfig {
+  enabled: boolean;
+  /** 免@ 生效的命令白名单，每条可带自己的 prompt 模板。 */
+  commands: CommandTriggerCommand[];
+  /** 可选的群白名单。留空/缺省 = 所有普通群。 */
+  chats?: string[];
+  /** 可选的群黑名单。deny-wins（同时出现在 chats 里也不生效）。 */
+  excludedChats?: string[];
 }
 
 export interface SummaryRangeConfig {
@@ -1929,6 +1965,11 @@ export interface BotConfig {
    */
   messageListeners?: Record<string, MessageListenerConfig>;
   /**
+   * 免@ 斜杠命令。per-bot 一份命令表 + 生效群范围（chats 空 = 所有群，
+   * excludedChats deny-wins）。见 {@link CommandTriggerConfig}。
+   */
+  commandTriggers?: CommandTriggerConfig;
+  /**
    * Worktree picker mode on the repo-select card. When true, the worktree
    * control renders the multi-repo selector (pick N repos + branch) instead of
    * the single-select dropdown. Toggled from the card's 「切换多仓库选择器」button;
@@ -3204,6 +3245,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -3434,6 +3476,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
       allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
       messageListeners,
+      commandTriggers,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
       // 连续会话；群内原生话题各自独立会话), so only the NON-default modes

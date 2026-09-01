@@ -147,6 +147,10 @@ import {
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
 import { getMessageListenerConfig, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
+import { reservedCommandKind } from '../services/command-trigger.js';
+import { resolvePassthroughCommands } from './command-handler.js';
+import { normalizeTriggerCommand } from '../services/command-trigger-normalize.js';
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   normalizeMessageListenerPreviewLimit,
@@ -3782,6 +3786,57 @@ ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {
   const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, { enabled: false, prompt: '' });
   if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true });
+});
+
+// ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────
+// per-bot 一份命令表 + 生效群范围。冲突判定只在服务端做：透传集按本 bot 的实际
+// CLI 求值（resolvePassthroughCommands），前端自带一份必然过期。
+
+ipcRoute('GET', '/api/command-triggers', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  jsonRes(res, 200, { config: getCommandTriggerConfig(cachedLarkAppId) });
+});
+
+ipcRoute('PUT', '/api/command-triggers', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+  const result = await updateCommandTriggerConfig(cachedLarkAppId, body, resolvePassthroughCommands(cachedLarkAppId));
+  if (!result.ok) {
+    const status = result.reason === 'bot_not_registered' || result.reason === 'bot_not_in_config' ? 500 : 400;
+    return jsonRes(res, status, { ok: false, error: result.reason, detail: result.detail });
+  }
+  jsonRes(res, 200, { ok: true, config: result.config });
+});
+
+// 群页的逐群开关：白名单模式下增删 chats，「所有群」模式下增删 excludedChats。
+ipcRoute('PUT', '/api/command-triggers/chats/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const result = await setCommandTriggerChatEnabled(cachedLarkAppId, p.chatId, body?.enabled === true);
+  if (!result.ok) {
+    const status = result.reason === 'not_configured' || result.reason === 'last_chat_in_scope' ? 400 : 500;
+    return jsonRes(res, status, { ok: false, error: result.reason });
+  }
+  jsonRes(res, 200, { ok: true, config: result.config });
+});
+
+// 输入即校验：前端每敲一条命令问一次，拿到「这是 botmux 的哪类命令」再决定标红。
+ipcRoute('GET', '/api/command-triggers/conflicts', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  const raw = new URL(req.url ?? '/', 'http://localhost').searchParams.get('cmds') ?? '';
+  const passthrough = resolvePassthroughCommands(cachedLarkAppId);
+  const results = raw.split(',').map(s => s.trim()).filter(Boolean).map((item) => {
+    const cmd = normalizeTriggerCommand(item);
+    if (!cmd) return { input: item, valid: false as const, kind: null };
+    return { input: item, valid: true as const, cmd, kind: reservedCommandKind(cmd, passthrough) };
+  });
+  jsonRes(res, 200, { results });
 });
 
 ipcRoute('GET', '/api/groups/:chatId/members-display', async (_req, res, p) => {

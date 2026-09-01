@@ -295,6 +295,7 @@ import {
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -17781,6 +17782,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
 
+  // 免@ 斜杠命令：配了模板就用模板替换正文（未配则保留用户原文）。必须在
+  // followupContent / cmdContent 取值之前改写，让标题、命令解析、注入 CLI 的
+  // 正文三者看到同一份内容——与 botSteerDirective 的改写同一位置、同一理由。
+  const newTopicCommandPrompt = ctx.commandTrigger
+    ? renderCommandTriggerPrompt(ctx.commandTrigger)
+    : undefined;
+  if (newTopicCommandPrompt) parsed.content = newTopicCommandPrompt;
+
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
@@ -19214,6 +19223,12 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
+  // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同位置——都在 parsed.content 仍
+  // 权威时改写，下面的 content / cmdContent 才会一致地看到模板渲染结果。
+  const threadCommandPrompt = ctx.commandTrigger
+    ? renderCommandTriggerPrompt(ctx.commandTrigger)
+    : undefined;
+  if (threadCommandPrompt) parsed.content = threadCommandPrompt;
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot

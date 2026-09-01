@@ -1048,6 +1048,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><CommandTriggerSection bot={bot} /></section>
             <section className="bd-tile">
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
@@ -4285,6 +4286,262 @@ function SessionModeSection(props: {
           />
         </div>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
+      </div>
+    </section>
+  );
+}
+
+type CommandTriggerCheck = {
+  input: string;
+  valid: boolean;
+  cmd?: string;
+  kind: 'daemon' | 'passthrough' | 'force-topic' | null;
+};
+
+type CommandTriggerRow = { key: number; cmd: string; prompt: string };
+
+/**
+ * 免@ 斜杠命令。普通群里旁人直接发一条配置内的命令（未 @ 任何 bot）→ 落进该群
+ * 已有的会话续聊，正文由该命令的 prompt 模板决定。
+ *
+ * 冲突判定一律问服务端（/conflicts）：透传命令集随 bot 的实际 CLI 变化，前端自带
+ * 一份必然过期。
+ */
+function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const [enabled, setEnabled] = useState(false);
+  const [rows, setRows] = useState<CommandTriggerRow[]>([{ key: 1, cmd: '', prompt: '' }]);
+  const [scope, setScope] = useState<'all' | 'list'>('list');
+  const [chatsText, setChatsText] = useState('');
+  const [excludedChatsText, setExcludedChatsText] = useState('');
+  const [checks, setChecks] = useState<CommandTriggerCheck[]>([]);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const rowSeq = useRef(1);
+  const larkAppId = props.bot.larkAppId;
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const r = await fetch(`/api/command-triggers/${encodeURIComponent(larkAppId)}`);
+        const body = await r.json().catch(() => ({}));
+        if (!live) return;
+        const cfg = body?.config ?? null;
+        const list: CommandTriggerRow[] = Array.isArray(cfg?.commands)
+          ? cfg.commands.map((c: any) => ({
+              key: ++rowSeq.current,
+              cmd: typeof c === 'string' ? c : String(c?.cmd ?? ''),
+              prompt: typeof c === 'string' ? '' : String(c?.prompt ?? ''),
+            }))
+          : [];
+        setEnabled(cfg?.enabled === true);
+        setRows(list.length ? list : [{ key: ++rowSeq.current, cmd: '', prompt: '' }]);
+        setChatsText(formatSubstituteChats(cfg?.chats));
+        setExcludedChatsText(formatSubstituteChats(cfg?.excludedChats));
+        setScope(Array.isArray(cfg?.chats) && cfg.chats.length > 0 ? 'list' : 'all');
+      } catch { /* 加载失败保持空白草稿，保存时再报错 */ }
+    })();
+    return () => { live = false; };
+  }, [larkAppId]);
+
+  async function runChecks(cmds: string[]): Promise<void> {
+    const list = [...new Set(cmds.map(c => c.trim()).filter(Boolean))];
+    if (list.length === 0) { setChecks([]); return; }
+    try {
+      const r = await fetch(
+        `/api/command-triggers/${encodeURIComponent(larkAppId)}/conflicts?cmds=${encodeURIComponent(list.join(','))}`,
+      );
+      const body = await r.json().catch(() => ({}));
+      setChecks(Array.isArray(body?.results) ? body.results : []);
+    } catch {
+      setChecks([]);
+    }
+  }
+
+  function checkText(check: CommandTriggerCheck): string {
+    if (!check.valid) return tr('botDefaults.commandTriggerInvalid');
+    switch (check.kind) {
+      case 'daemon': return tr('botDefaults.commandTriggerConflictDaemon');
+      case 'passthrough': return tr('botDefaults.commandTriggerConflictPassthrough');
+      case 'force-topic': return tr('botDefaults.commandTriggerConflictForceTopic');
+      default: return tr('botDefaults.commandTriggerOk');
+    }
+  }
+
+  async function save(): Promise<void> {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const commands = rows
+        .filter(r => r.cmd.trim())
+        .map(r => ({ cmd: r.cmd.trim(), ...(r.prompt.trim() ? { prompt: r.prompt.trim() } : {}) }));
+      const res = await sendJson('PUT', `/api/command-triggers/${encodeURIComponent(larkAppId)}`, {
+        enabled,
+        commands,
+        // 「所有群」= 空白名单（与 isCommandTriggerChat 的语义一字对应）。切到
+        // 「所有群」时不清 chats 的输入框内容，切回来还在。
+        chats: scope === 'all' ? [] : parseSubstituteChats(chatsText),
+        excludedChats: parseSubstituteChats(excludedChatsText),
+      });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+        void runChecks(commands.map(c => c.cmd));
+      } else if (res.body?.error === 'reserved_command') {
+        // 服务端把冲突项原样带回来，直接渲染成红字，不用前端再猜一遍命令表。
+        const detail: Array<{ cmd: string; kind: CommandTriggerCheck['kind'] }> = res.body.detail ?? [];
+        setChecks(detail.map(d => ({ input: d.cmd, valid: true, cmd: d.cmd, kind: d.kind })));
+        setStatus({ text: `✗ ${tr('botDefaults.commandTriggerReservedRejected')}` });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const scopeOptions: DropdownFieldOption<'all' | 'list'>[] = [
+    { value: 'list', label: tr('botDefaults.commandTriggerScopeList') },
+    { value: 'all', label: tr('botDefaults.commandTriggerScopeAll') },
+  ];
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCommandTrigger')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-command-trigger"
+        title={tr('botDefaults.commandTriggerEnabled')}
+        help={tr('botDefaults.commandTriggerEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <FieldTitle help={tr('botDefaults.commandTriggerCommandsHelp')}>{tr('botDefaults.commandTriggerCommands')}</FieldTitle>
+        <div className="bd-command-trigger-list" data-input="commandTriggerCommands">
+          {rows.map((row, index) => (
+            <div className="bd-command-trigger-row" key={row.key}>
+              <div className="bd-command-trigger-head">
+                <input
+                  type="text"
+                  className="bd-command-trigger-cmd"
+                  data-input={`commandTriggerCmd-${row.key}`}
+                  aria-label={`${tr('botDefaults.commandTriggerCommands')} ${index + 1}`}
+                  placeholder={tr('botDefaults.commandTriggerCommandsPlaceholder')}
+                  value={row.cmd}
+                  disabled={busy}
+                  onChange={event => {
+                    const cmd = event.currentTarget.value;
+                    setRows(rs => rs.map(r => r.key === row.key ? { ...r, cmd } : r));
+                  }}
+                  onBlur={() => void runChecks(rows.map(r => r.cmd))}
+                />
+                <button
+                  type="button"
+                  className="bd-command-trigger-remove"
+                  data-action="remove-command-trigger"
+                  title={tr('botDefaults.commandTriggerRemove')}
+                  aria-label={tr('botDefaults.commandTriggerRemove')}
+                  disabled={busy}
+                  onClick={() => setRows(rs => {
+                    const rest = rs.filter(r => r.key !== row.key);
+                    return rest.length ? rest : [{ key: ++rowSeq.current, cmd: '', prompt: '' }];
+                  })}
+                >
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+              <textarea
+                className="bd-command-trigger-prompt"
+                data-input={`commandTriggerPrompt-${row.key}`}
+                rows={3}
+                aria-label={`${tr('botDefaults.commandTriggerPrompt')} ${index + 1}`}
+                placeholder={tr('botDefaults.commandTriggerPromptPlaceholder')}
+                value={row.prompt}
+                disabled={busy}
+                onChange={event => {
+                  const prompt = event.currentTarget.value;
+                  setRows(rs => rs.map(r => r.key === row.key ? { ...r, prompt } : r));
+                }}
+              />
+            </div>
+          ))}
+          <button
+            type="button"
+            className="bd-command-trigger-add"
+            data-action="add-command-trigger"
+            title={tr('botDefaults.commandTriggerAdd')}
+            aria-label={tr('botDefaults.commandTriggerAdd')}
+            disabled={busy}
+            onClick={() => setRows(rs => [...rs, { key: ++rowSeq.current, cmd: '', prompt: '' }])}
+          >
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+      </div>
+      <p className="bd-section-note">{tr('botDefaults.commandTriggerPromptHelp')}</p>
+      {checks.length > 0 && (
+        <ul className="bd-command-trigger-checks" data-input="commandTriggerChecks">
+          {checks.map(check => (
+            <li key={check.input} className={check.valid && !check.kind ? 'ok' : 'bad'}>
+              <code>{check.input}</code> — {checkText(check)}
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.commandTriggerScopeHelp')}>{tr('botDefaults.commandTriggerScope')}</FieldTitle>
+          <DropdownField<'all' | 'list'>
+            dataInput="commandTriggerScope"
+            ariaLabel={tr('botDefaults.commandTriggerScope')}
+            value={scope}
+            disabled={busy}
+            options={scopeOptions}
+            onChange={setScope}
+          />
+        </div>
+      </div>
+      {scope === 'all' && enabled && (
+        <p className="bd-section-note bd-command-trigger-warn" data-input="commandTriggerAllWarning">{tr('botDefaults.commandTriggerAllWarning')}</p>
+      )}
+      {scope === 'list' && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.commandTriggerChatsHelp')}>{tr('botDefaults.commandTriggerChats')}</FieldTitle>
+            <textarea
+              data-input="commandTriggerChats"
+              rows={3}
+              placeholder={tr('botDefaults.commandTriggerChatsPlaceholder')}
+              value={chatsText}
+              disabled={busy}
+              onChange={event => setChatsText(event.currentTarget.value)}
+            />
+          </label>
+        </div>
+      )}
+      {scope === 'all' && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.commandTriggerExcludedChatsHelp')}>{tr('botDefaults.commandTriggerExcludedChats')}</FieldTitle>
+            <textarea
+              data-input="commandTriggerExcludedChats"
+              rows={3}
+              placeholder={tr('botDefaults.commandTriggerChatsPlaceholder')}
+              value={excludedChatsText}
+              disabled={busy}
+              onChange={event => setExcludedChatsText(event.currentTarget.value)}
+            />
+          </label>
+        </div>
+      )}
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-command-trigger" disabled={busy} onClick={() => void save()}>
+          {tr('botDefaults.commandTriggerSave')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-command-trigger-status': '' }} />
       </div>
     </section>
   );
