@@ -227,7 +227,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -261,7 +261,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
       const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;
-      return ['resume', ...baseArgs, traeSessionId];
+      // Session fork: TraeX exposes the same native subcommand shape as Codex
+      // (`traecli fork <id>`). It mints a new thread while leaving the source
+      // untouched. The worker sets forkSession only for a fork child's first
+      // spawn; later restarts use ordinary resume against the child's new id.
+      return [forkSession ? 'fork' : 'resume', ...baseArgs, traeSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {

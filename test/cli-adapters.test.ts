@@ -493,6 +493,32 @@ describe('codex buildArgs', () => {
     ]);
   });
 
+  it('traex native fork branches the source session instead of resuming it', () => {
+    const traex = createTraexAdapter('/bin/traecli');
+    const args = traex.buildArgs({
+      sessionId: 'botmux-child',
+      resume: true,
+      resumeSessionId: 'traex-parent',
+      forkSession: true,
+      workingDir: '/workspace',
+    });
+    expect(args[0]).toBe('fork');
+    expect(args.at(-1)).toBe('traex-parent');
+    expect(args).toContain('/workspace');
+  });
+
+  it('traex restarts a completed fork child with ordinary resume', () => {
+    const traex = createTraexAdapter('/bin/traecli');
+    const args = traex.buildArgs({
+      sessionId: 'botmux-child',
+      resume: true,
+      resumeSessionId: 'traex-child',
+      forkSession: false,
+    });
+    expect(args[0]).toBe('resume');
+    expect(args.at(-1)).toBe('traex-child');
+  });
+
   it('does not inject a stale turn id into Codex shell environment policy', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     expect(args.join('\n')).not.toContain('BOTMUX_TURN_ID');
