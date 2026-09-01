@@ -164,6 +164,48 @@ describe('handleNewTopic — 免@ 斜杠命令的 prompt 模板', () => {
     expect(mocks.created[0].title).toBe('/solve 登录接口 500');
   });
 
+  // 三道闸校验的是**触发词**（/solve），但渲染后的正文里第一段是用户自己敲的。
+  // `{args}` 打头的模板会把用户输入顶到命令位置——命令解析必须只看触发词原文，
+  // 否则「保留命令必须 @」这条闸在参数里被绕过。
+  it('{args} 打头的模板不让用户参数占据命令位（新话题路径）', async () => {
+    await handleNewTopic(
+      makeEventData('om_inject_1', '/solve /clear'),
+      makeCtx('om_inject_1', { cmd: '/solve', prompt: '{args}', args: '/clear' }),
+    );
+
+    // /clear 是透传命令：一旦被当命令解析就会走 raw_input 直接清 CLI 上下文，
+    // 而不是新建一个会话。会话被正常创建 == 它只是普通正文。
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.created[0].title).toBe('/clear');
+  });
+
+  it('{args} 打头的模板不让用户参数触发 /t 另起话题', async () => {
+    await handleNewTopic(
+      makeEventData('om_inject_2', '/solve /t 新话题'),
+      makeCtx('om_inject_2', { cmd: '/solve', prompt: '{args}', args: '/t 新话题' }),
+    );
+
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.created[0].title).toBe('/t 新话题');
+  });
+
+  // 评审矩阵里的其余形态：修法是结构性的（命令车道永远看不到渲染结果），
+  // 所以它们塌缩到同一条代码路径；仍逐个钉住，防止将来有人把车道又并回去。
+  it.each([
+    ['{args}', '/close', '/close'],
+    ['{args} 顺便跑下测试', '/clear', '/clear 顺便跑下测试'],
+    ['{args}', '/cd /etc', '/cd /etc'],
+  ])('模板 %s + 参数 %s 只当正文', async (prompt, args, expected) => {
+    const id = `om_matrix_${Buffer.from(prompt + args).toString('hex').slice(0, 10)}`;
+    await handleNewTopic(
+      makeEventData(id, `/solve ${args}`),
+      makeCtx(id, { cmd: '/solve', prompt, args }),
+    );
+
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.created[0].title).toBe(expected);
+  });
+
   it('对照组：非命令触发的普通消息完全不受影响', async () => {
     await handleNewTopic(
       makeEventData('om_plain_1', '帮我看下登录接口'),
@@ -253,6 +295,21 @@ describe('handleThreadReply — 免@ 命令投进已有会话', () => {
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(sentText(send)).toContain('先复现再改：登录接口 500');
     expect(sentText(send)).not.toContain('/solve 登录接口 500');
+  });
+
+  it('{args} 打头的模板不让用户参数占据命令位（续聊路径）', async () => {
+    const send = vi.fn();
+    seedLiveChatSession(send);
+
+    await handleThreadReply(
+      makeEventData('om_inject_3', '/solve /clear'),
+      threadCtx('om_inject_3', { cmd: '/solve', prompt: '{args}', args: '/clear' }),
+    );
+
+    // 被当成命令时投出去的是 {type:'raw_input'}；当成正文时是 {type:'message'}。
+    const kinds = send.mock.calls.map(c => c[0]?.type);
+    expect(kinds).not.toContain('raw_input');
+    expect(kinds).toContain('message');
   });
 
   it('没配模板时把用户原文喂进已有会话', async () => {

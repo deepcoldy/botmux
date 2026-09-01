@@ -17782,18 +17782,25 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
 
-  // 免@ 斜杠命令：配了模板就用模板替换正文（未配则保留用户原文）。必须在
-  // followupContent / cmdContent 取值之前改写，让标题、命令解析、注入 CLI 的
-  // 正文三者看到同一份内容——与 botSteerDirective 的改写同一位置、同一理由。
+  // 免@ 斜杠命令：配了模板就用模板替换**注入 CLI 的正文**（未配则保留用户原文）。
+  //
+  // ⚠️ 命令解析（cmdContent）刻意**不**跟着改写：模板渲染结果里含用户自己敲的
+  // 参数（`{args}` 打头时参数就落在第一个 token），而免@ 的三道闸只校验过触发词
+  // 本身。若让解析器看渲染结果，用户发 `/solve /clear` 就能让 `/clear` 占住命令
+  // 位，绕过「保留命令必须 @」这条闸。cmdContent 因此始终取闸门校验过的触发词
+  // 原文——它必然不是保留命令，解析后会落到正常 spawn 路径。
   const newTopicCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
+  // 改写前的原文 = 命令解析车道。没有模板时它与 followupContent 逐字相同，
+  // 所以这里不需要分支。
+  const newTopicCommandLane = parsed.content.trim();
   if (newTopicCommandPrompt) parsed.content = newTopicCommandPrompt;
 
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
-  let cmdContent = stripLeadingMentions(followupContent, followupMentions);
+  let cmdContent = stripLeadingMentions(newTopicCommandLane, followupMentions);
 
   // `/t` / `/topic` — force the bot to reply in a thread, even in 普通群.
   // In 普通群 the inbound message is chat-scope by default; override to
@@ -19223,11 +19230,12 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
-  // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同位置——都在 parsed.content 仍
-  // 权威时改写，下面的 content / cmdContent 才会一致地看到模板渲染结果。
+  // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同理由——模板渲染结果只进 CLI
+  // 正文，命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
   const threadCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
+  const threadCommandLane = parsed.content.trim();
   if (threadCommandPrompt) parsed.content = threadCommandPrompt;
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
@@ -19292,7 +19300,9 @@ async function handleThreadReplyAdmitted(
 
   const content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
-  const cmdContent = stripLeadingMentions(content, parsed.mentions);
+  // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
+  // 逐字相同（见上方 threadCommandPrompt 处的说明）。
+  const cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
