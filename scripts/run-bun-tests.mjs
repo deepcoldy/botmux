@@ -152,7 +152,16 @@ function loadDeferredSet(files) {
 const TEST_TIMEOUT_MS = 180_000;
 // Hard wall per file, above the per-test ceiling: a file that wedges (waiting on
 // a pty, a lock, a socket) must not hold the whole leg open.
-const FILE_WALL_MS = 240_000;
+//
+// MUST stay well above `2 × TEST_TIMEOUT_MS`. At the previous 240_000 the wall sat
+// BELOW two per-test timeouts (2 × 180_000 = 360_000), so a file with two or more
+// timing-out tests was SIGKILLed after printing only the FIRST one — making "one test
+// timed out" and "twenty-seven tests timed out" indistinguishable in the log. That is
+// not hypothetical: test/write-input.test.ts reported exactly 1 timeout here while a
+// locally uncapped run of the same file showed 13+, and the smaller number was read as
+// the real failure count. The wall's job is to stop a wedged file from holding the leg
+// open, not to truncate a file that is legitimately reporting many slow failures.
+const FILE_WALL_MS = TEST_TIMEOUT_MS * 4;
 
 const all = collectTestFiles(TEST_DIR).sort();
 
@@ -377,7 +386,9 @@ function runOne(file) {
     const cap = chunk => { if (out.length < 200_000) out += chunk; };
     child.stdout.on('data', cap);
     child.stderr.on('data', cap);
-    const wall = setTimeout(() => killTree(child, 'SIGKILL'), FILE_WALL_MS);
+    // Recorded so the close handler can say the output was CUT rather than complete.
+    let wallKilled = false;
+    const wall = setTimeout(() => { wallKilled = true; killTree(child, 'SIGKILL'); }, FILE_WALL_MS);
     child.on('error', err => {
       clearTimeout(wall);
       liveChildren.delete(child);
@@ -399,7 +410,17 @@ function runOne(file) {
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
       // coerce into a pass.
       if (code !== 0) {
-        resolve({ file, ok: false, out, signal: signal ?? undefined });
+        // A wall-clock kill truncates the child's output mid-stream, so whatever
+        // failures it managed to print are a LOWER BOUND, not the total. Say so in the
+        // output itself: a reader (or a future me) counting `FAIL` lines from a killed
+        // file would otherwise report a number that is silently too small.
+        const truncated = wallKilled
+          ? `\n[runner] OUTPUT TRUNCATED: killed by the ${FILE_WALL_MS}ms per-file wall. `
+            + 'Any failure count from this file is a LOWER BOUND — the run did not finish. '
+            + `Re-run this file alone (optionally with a smaller --timeout than ${TEST_TIMEOUT_MS}ms) `
+            + 'to see the complete set.\n'
+          : '';
+        resolve({ file, ok: false, out: out + truncated, signal: signal ?? undefined });
         return;
       }
       // `bun test` exits 0 for a file that collected ZERO tests (measured — both
