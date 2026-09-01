@@ -116,6 +116,25 @@ function makeCtx(messageId: string, commandTrigger?: any): any {
   };
 }
 
+/**
+ * 真正喂进 CLI 的开场正文 —— 被当成命令时压根走不到 forkWorker，所以这是
+ * 「当命令还是当正文」的判据；只看会话标题不行，daemon 命令分支同样用
+ * cmdContent 建会话，标题会一模一样。
+ *
+ * 深度收集入参里的字符串而非 JSON.stringify：后者把换行转义成字面量 \\n，
+ * 多行正文的断言会永远为假（真机行为正确却测红）。
+ */
+function cliInput(): string {
+  const out: string[] = [];
+  const walk = (v: unknown): void => {
+    if (typeof v === 'string') out.push(v);
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk);
+  };
+  walk(mocks.forkWorker.mock.calls);
+  return out.join('\n---\n');
+}
+
 describe('handleNewTopic — 免@ 斜杠命令的 prompt 模板', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -204,6 +223,47 @@ describe('handleNewTopic — 免@ 斜杠命令的 prompt 模板', () => {
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.created[0].title).toBe(expected);
+    // 标题单独不足以判定：daemon 命令分支同样用 cmdContent 建会话，标题会一样。
+    // 真判据是正文有没有作为 prompt 喂进 CLI —— 被当命令时根本不会 fork worker。
+    expect(cliInput()).toContain(expected);
+  });
+
+  // 复审补充的两类：MULTILINE_COMMANDS（/schedule /role /fork，parser 对它们接受
+  // 多行）与 /t /topic（parseForceTopicInvocation 的正则吃 [\s\S]*，多行挡不住）。
+  // 车道分离对它们同样成立——所有解析器读的都是 cmdContent。
+  it.each([
+    ['/schedule'], ['/role'], ['/fork'],
+  ])('`{args}\\n\\n后缀` 形态下 %s 也不占据命令位', async (cmd) => {
+    const id = `om_multiline_${cmd.slice(1)}`;
+    await handleNewTopic(
+      makeEventData(id, `/solve ${cmd}`),
+      makeCtx(id, { cmd: '/solve', prompt: '{args}\n\n后缀', args: cmd }),
+    );
+
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.created[0].title).toBe(`${cmd}\n\n后缀`);
+    expect(cliInput()).toContain(`${cmd}\n\n后缀`);
+  });
+
+  // force-topic 的拦截点在 slash parse 之前、且吃多行，所以单独钉住「路由没被改」
+  // 这个更强的判据，而不只是标题。
+  it('{args} + /t 不把群会话改道成话题会话', async () => {
+    await handleNewTopic(
+      makeEventData('om_ft_1', '/solve /t 新话题'),
+      makeCtx('om_ft_1', { cmd: '/solve', prompt: '{args}', args: '/t 新话题' }),
+    );
+
+    expect(mocks.created[0].scope).toBe('chat');
+  });
+
+  it('{args}\n\n后缀 + /t 同样不改道（多行挡不住 force-topic 正则）', async () => {
+    await handleNewTopic(
+      makeEventData('om_ft_2', '/solve /t 新话题'),
+      makeCtx('om_ft_2', { cmd: '/solve', prompt: '{args}\n\n后缀', args: '/t 新话题' }),
+    );
+
+    expect(mocks.created[0].scope).toBe('chat');
+    expect(mocks.created[0].title).toBe('/t 新话题\n\n后缀');
   });
 
   it('对照组：非命令触发的普通消息完全不受影响', async () => {
