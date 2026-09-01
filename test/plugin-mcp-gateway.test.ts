@@ -207,6 +207,7 @@ describe('plugin MCP Gateway', () => {
             requestLarkAppId: 'cli_trusted',
             source: 'schedule_creator',
             taskId: 'task_123',
+            senderType: 'user',
           },
           turnId: 'om_turn',
           dispatchAttempt: 2,
@@ -235,6 +236,7 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"requestLarkAppId":"cli_trusted"');
     expect(text).toContain('"source":"schedule_creator"');
     expect(text).toContain('"taskId":"task_123"');
+    expect(text).toContain('"senderType":"user"');
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
     expect(text).toContain('"customTrace":"keep-me"');
@@ -310,6 +312,7 @@ describe('plugin MCP Gateway', () => {
             requestLarkAppId: 'cli_trusted',
             source: 'schedule_creator',
             taskId: 'task_123',
+            senderType: 'user',
           },
           turnId: 'om_trusted',
           dispatchAttempt: 2,
@@ -329,6 +332,7 @@ describe('plugin MCP Gateway', () => {
     // HTTP-transport MCP server, so they must not start carrying it.
     expect(trusted.get('x-botmux-trusted-source')).toBeNull();
     expect(trusted.get('x-botmux-task-id')).toBeNull();
+    expect(trusted.get('x-botmux-trusted-sender-type')).toBeNull();
   });
 
   it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {

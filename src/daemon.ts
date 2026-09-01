@@ -134,12 +134,23 @@ function trustedCallerForTurn(
   larkAppId: string,
   senderOpenId?: string,
   senderUnionId?: string,
+  /** Three-state: true = provably a bot (platform `sender_type` app/bot, OR a
+   *  known peer via the cross-ref foreign-bot signal), false = provably human
+   *  (`sender_type === 'user'`), undefined = cannot tell. Pass
+   *  {@link senderIsBotTriState} rather than a bare `sender_type` comparison:
+   *  that check alone reads a cross-ref-identified peer bot as `'user'`, and
+   *  `'user'` is the value a consumer maps onto a real person's access — writing
+   *  it for a bot turn actively vouches for it, which is worse than absent.
+   *  undefined leaves the field off so a consumer treats the turn as unknown
+   *  rather than as "human". */
+  senderIsBot?: boolean,
 ): TrustedCaller | undefined {
   if (!senderOpenId && !senderUnionId) return undefined;
   return {
     ...(senderOpenId ? { requestUserOpenId: senderOpenId } : {}),
     ...(senderUnionId ? { requestUserUnionId: senderUnionId } : {}),
     requestLarkAppId: larkAppId,
+    ...(senderIsBot === undefined ? {} : { senderType: senderIsBot ? 'bot' as const : 'user' as const }),
   };
 }
 export type { DaemonSession } from './core/types.js';
@@ -17818,7 +17829,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
-  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId);
+  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId, senderIsBotTriState(parsed.senderType, isForeignBotSender));
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
   // union_id 报成"自家 bot"，那个真人就会在全团队机器上被当队友 bot 放行（talk +
@@ -19289,7 +19300,7 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
-  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId);
+  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId, senderIsBotTriState(parsed.senderType, isForeignBot));
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;

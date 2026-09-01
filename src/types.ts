@@ -58,6 +58,21 @@ export interface TrustedCaller {
   source?: 'schedule_creator';
   /** Scheduled task id — set only alongside `source: 'schedule_creator'`. */
   taskId?: string;
+  /** Type of the sender whose message opened this turn. Absent when no inbound
+   *  message opened it (a daemon-fired scheduled turn — `source` says what that
+   *  is instead), when the host cannot tell what opened it (platform
+   *  `sender_type` missing or an unrecognised value AND the sender is not a
+   *  known peer), and for turns minted before this field existed. Absent is
+   *  therefore "unknown", never "human" — treat only `'user'` as a person.
+   *
+   *  A consumer cannot infer this from the identity itself: a bot's turn carries
+   *  a perfectly valid `requestUserUnionId` (its own), so "someone asked" and
+   *  "a bot triggered itself" are indistinguishable without it. Anything that
+   *  maps the caller onto a real person's access — database accounts, approval
+   *  gates, audit attribution — needs to tell those apart, otherwise a bot that
+   *  happens to hold such a mapping becomes a way for anyone who can make it
+   *  speak to borrow that access, with the audit trail pointing at the bot. */
+  senderType?: 'user' | 'bot';
 }
 
 export interface VcMeetingConsumerProfileFilter {

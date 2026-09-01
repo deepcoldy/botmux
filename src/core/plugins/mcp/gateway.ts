@@ -515,6 +515,10 @@ export class PluginMcpGateway {
       // unrelated (possibly remote) plugin learns about the caller.
       ...(caller?.source ? { source: caller.source } : {}),
       ...(caller?.taskId ? { taskId: caller.taskId } : {}),
+      // Whether a human or a bot opened this turn. Same local-only rule as the
+      // two fields above: a plugin that maps the caller onto real access needs
+      // it, an unrelated HTTP-transport server does not.
+      ...(caller?.senderType ? { senderType: caller.senderType } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
     };
