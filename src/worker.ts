@@ -5893,20 +5893,32 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // A SYNTHESISED local turn has no Lark turn behind it: `local-*` /
     // `local-headless-*` ids are minted by the queue for transcript activity
     // that matched no pending mark (terminal-typed input, or — after a restart
-    // — replayed history whose original mark is long gone). Its FALLBACK is
-    // already suppressed unconditionally (shouldSuppressBridgeEmit returns true
-    // for isLocal in non-adopt), so letting its FAILURE terminal through means
-    // the daemon posts a 「本轮执行失败」card for a turn the user never sent —
-    // and, because the daemon stamps the card with `new Date()` and the
-    // session's *current* lastUserPrompt, that card names the wrong time and
-    // the wrong task. MEASURED: a provider_server_error from 10h earlier was
-    // re-surfaced as a fresh failure card on two consecutive daemon restarts.
+    // — replayed history whose original mark is long gone). Letting its FAILURE
+    // terminal through means the daemon posts a 「本轮执行失败」card for a turn
+    // the user never sent — and, because the daemon stamps the card with
+    // `new Date()` and the session's *current* lastUserPrompt, that card names
+    // the wrong time and the wrong task. MEASURED: a provider_server_error from
+    // 10h earlier was re-surfaced as a fresh failure card on two consecutive
+    // daemon restarts.
+    //
+    // Before this gate the FAILURE TERMINAL was the sole leak, in BOTH modes.
+    // The fallback loop above skips a failed turn at its very FIRST check
+    // (`terminalOutcome.status !== 'completed' → continue`), which is
+    // mode-independent and runs before `shouldSuppressBridgeEmit` — so a failed
+    // local turn never reaches that gate, in adopt or otherwise. (Note the
+    // fallback would have carried `final_output` answer text anyway, never a
+    // card; cards come only from the terminal side.)
+    //
+    // Applies in adopt mode too, deliberately: the cause is identical in both
+    // modes — a synthesised local turn has no Lark turn to notify — so the gate
+    // is not conditioned on adoptMode.
     //
     // Scoped deliberately to the failure arm: a local turn's `completed`
     // terminal stays, because that is what settles bookkeeping (dedupe claim,
     // durable-turn release, CoT finalize) without showing the user anything.
-    // Non-local turns are untouched — a real Lark turn that genuinely failed
-    // must still raise its card, which is the whole point of that path.
+    // Non-local turns are untouched — `isLocal` is set only by the two synthesis
+    // paths and never by `mark()` (journal-restored turns go through `mark()`
+    // too), so a real Lark turn that genuinely failed still raises its card.
     if (turn.isLocal && outcome && outcome.status !== 'completed') {
       log(`Bridge terminal suppressed for synthesised local turn ${turn.turnId.substring(0, 8)} `
         + `(${outcome.status}${outcome.errorCode ? `/${outcome.errorCode}` : ''}) — no Lark turn to notify`);
