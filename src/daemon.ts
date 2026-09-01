@@ -199,6 +199,7 @@ import {
   readableTerminalUrlFor,
   findActiveBySessionId,
   withActiveSessionKeyLock,
+  destroyUnregisteredPersistentBacking,
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
@@ -294,6 +295,10 @@ import {
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import {
+  MESSAGE_LISTENER_CLEANUP_INTERVAL_MS,
+  selectExpiredMessageListenerSessions,
+} from './services/message-listener-session-cleanup.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -3371,6 +3376,74 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
   const timer = setInterval(() => logMemoryDiagnostics('interval'), intervalMs);
   if (typeof timer.unref === 'function') timer.unref();
   return timer;
+}
+
+function createMessageListenerSessionCleanupRunner(larkAppId: string): {
+  run(reason: 'startup' | 'interval'): Promise<void>;
+  start(): ReturnType<typeof setInterval>;
+} {
+  let running = false;
+  const run = async (reason: 'startup' | 'interval'): Promise<void> => {
+    if (running) return;
+    running = true;
+    try {
+      const bot = getBot(larkAppId);
+      const expired = selectExpiredMessageListenerSessions({
+        sessions: sessionStore.listSessions(),
+        listeners: bot.config.messageListeners,
+      });
+      if (expired.length === 0) return;
+      let closed = 0;
+      let failed = 0;
+      const inactive: string[] = [];
+      logger.info(`[message-listener-cleanup] ${reason}: closing ${expired.length} expired listener session(s) for ${larkAppId}`);
+      for (const session of expired) {
+        if (!findActiveBySessionId(session.sessionId)) {
+          try {
+            destroyUnregisteredPersistentBacking(session);
+            inactive.push(session.sessionId);
+          } catch (err) {
+            failed += 1;
+            logger.warn(
+              `[message-listener-cleanup] backing cleanup failed session=${session.sessionId}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          continue;
+        }
+        try {
+          const result = await closeSessionHelper(session.sessionId);
+          if (result.ok && result.known) closed += 1;
+          else failed += 1;
+        } catch (err) {
+          failed += 1;
+          logger.warn(
+            `[message-listener-cleanup] close failed session=${session.sessionId}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      if (inactive.length > 0) {
+        const inactiveIds = new Set(inactive);
+        closed += sessionStore.closeSessionsMatching(session => inactiveIds.has(session.sessionId));
+      }
+      logger.info(`[message-listener-cleanup] ${reason}: closed=${closed} failed=${failed} bot=${larkAppId}`);
+    } catch (err) {
+      logger.warn(`[message-listener-cleanup] ${reason} failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      running = false;
+    }
+  };
+  return {
+    run,
+    start() {
+      const timer = setInterval(() => {
+        void run('interval');
+      }, MESSAGE_LISTENER_CLEANUP_INTERVAL_MS);
+      timer.unref?.();
+      return timer;
+    },
+  };
 }
 
 /**
@@ -18294,6 +18367,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   session.ownerUnionId = ownerUnionIdForSession;
   session.creatorOpenId = senderOpenId;
   session.lastCallerOpenId = senderOpenId;
+  if (messageListener) session.messageListener = { chatId };
   // First turn of a brand-new topic: seed quoteTarget* so the very first
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
   // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
@@ -21665,6 +21739,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
+  const messageListenerCleanup = createMessageListenerSessionCleanupRunner(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
     config.session.dataDir,
     { receiverBootId: getDaemonBootId(), agentAppId: cfg.larkAppId },
@@ -22525,7 +22600,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   reapOrphanWorkers();
 
   // Restore active sessions from previous run
-  // Restore active sessions from previous run
+  await messageListenerCleanup.run('startup');
   await restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds);
   // Restore complete → /api/asks may now safely 403 unknown sessions again; a
   // reconnecting ask hook that raced the restore got retryable 503s until here.
@@ -22683,6 +22758,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     enforceLiveSessionCap('periodic');
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
+  const messageListenerCleanupTimer = messageListenerCleanup.start();
 
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
@@ -23100,6 +23176,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(messageListenerCleanupTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -23312,6 +23389,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(messageListenerCleanupTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);

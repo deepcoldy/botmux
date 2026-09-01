@@ -75,6 +75,7 @@ import {
   finishMojoCloseAbort,
   closeSession,
   reactivateClosedSession,
+  closeSessionsMatching,
   updateSession,
   updateSessionPid,
   persistActiveRemoteLineageExact,
@@ -941,6 +942,35 @@ describe('reactivateClosedSession()', () => {
     const reloaded = getSession(session.sessionId)!;
     expect(reloaded.status).toBe('active');
     expect(reloaded.previewTarget).toBeUndefined();
+  });
+});
+
+// ─── closeSessionsMatching() ──────────────────────────────────────────────
+
+describe('closeSessionsMatching()', () => {
+  it('closes matching active sessions in one persisted batch', () => {
+    const keep = createSession('chat1', 'root1', 'Keep');
+    const closeA = createSession('chat1', 'root2', 'Close A');
+    const closeB = createSession('chat1', 'root3', 'Close B');
+    const alreadyClosed = createSession('chat1', 'root4', 'Already Closed');
+    closeSession(alreadyClosed.sessionId);
+
+    const closedAt = '2026-08-26T04:00:00.000Z';
+    const count = closeSessionsMatching(
+      session => session.title.startsWith('Close') || session.title === 'Already Closed',
+      { closedAt },
+    );
+
+    expect(count).toBe(2);
+    expect(getSession(keep.sessionId)!.status).toBe('active');
+    expect(getSession(closeA.sessionId)!.status).toBe('closed');
+    expect(getSession(closeA.sessionId)!.closedAt).toBe(closedAt);
+    expect(getSession(closeB.sessionId)!.status).toBe('closed');
+    expect(getSession(closeB.sessionId)!.closedAt).toBe(closedAt);
+
+    init();
+    expect(getSession(closeA.sessionId)!.status).toBe('closed');
+    expect(getSession(closeB.sessionId)!.closedAt).toBe(closedAt);
   });
 });
 

@@ -26,7 +26,8 @@ interface RawEventData {
     thread_id?: string;
     parent_id?: string;
     message_type: string; // NOT msg_type
-    content: string;
+    content?: string;
+    body?: { content?: string };
     chat_id: string;
     chat_type: string;
     create_time: string;
@@ -122,6 +123,11 @@ export function mentionIdType(m: any): string | undefined {
   if (typeof m.id_type === 'string') return m.id_type;
   if (typeof m.idType === 'string') return m.idType;
   return undefined;
+}
+
+function rawEventMessageContent(message: RawEventData['message']): string {
+  const raw = message.content ?? message.body?.content;
+  return typeof raw === 'string' ? raw : '';
 }
 
 /**
@@ -336,7 +342,7 @@ export function unwrapUserDslContent(rawContent: string): string | null {
 }
 
 function unwrapUserDsl(data: RawEventData): boolean {
-  const unwrapped = unwrapUserDslContent(data.message.content);
+  const unwrapped = unwrapUserDslContent(rawEventMessageContent(data.message));
   if (unwrapped === null) return false;
   data.message.content = unwrapped;
   logger.info(`[parser] Unwrapped user_dsl for ${data.message.message_id}`);
@@ -498,12 +504,14 @@ export function parseEventMessage(
   numberer: ImgNumberer = createImgNumberer(),
 ): { parsed: LarkMessage; resources: MessageResource[] } {
   const { sender, message } = data;
+  const rawContent = rawEventMessageContent(message);
+  const normalizedContent = normalizeApiMessageContent(message.message_type, rawContent);
 
   // Trace non-text messages at debug only (DEBUG=1 gated). The raw card/post
   // content can be many KB and may include attachment metadata that's
   // noisy or sensitive — truncate to ~500 chars so DEBUG logs stay scannable.
   if (message.message_type !== 'text' && logger.isDebug()) {
-    const raw = message.content ?? '';
+    const raw = rawContent;
     const trimmed = raw.length > 500 ? raw.slice(0, 500) + `…(+${raw.length - 500}b)` : raw;
     logger.debug(`[parser] type=${message.message_type} content=${trimmed} keys=${Object.keys(message).join(',')}`);
   }
@@ -511,7 +519,7 @@ export function parseEventMessage(
   // Share numberer so in-body [图片 N] placeholders use the same numbers as
   // the attachment list. Resources first → numbers assigned; text second →
   // reuses them.
-  const resources = extractResources(message.message_type, message.content, numberer);
+  const resources = extractResources(message.message_type, rawContent, numberer);
 
   // Extract structured mentions
   const mentions: LarkMention[] | undefined =
@@ -536,7 +544,7 @@ export function parseEventMessage(
     senderUnionId: sender.sender_id?.union_id,
     senderType: sender.sender_type,
     msgType: message.message_type,
-    content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
+    content: extractTextContent(message.message_type, normalizedContent, message.mentions, numberer),
     createTime: message.create_time,
     mentions,
   };

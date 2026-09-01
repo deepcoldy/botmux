@@ -139,6 +139,16 @@ export function writeBotInfoFile(dataDir: string): void {
 /** Per-app in-flight open_id probe, so a startup burst of events shares one probe. */
 const inflightOpenIdProbes = new Map<string, Promise<void>>();
 
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Ensure the bot's own open_id is resolved before @-detection. `probeBotOpenId`
  * is fired fire-and-forget at daemon startup, so events can arrive while
@@ -165,19 +175,19 @@ export async function probeBotOpenId(larkAppId: string): Promise<void> {
   const openApi = larkHosts(normalizeBrand(bot.config.brand)).openApi;
 
   // Call /bot/v3/info to get the bot's open_id using tenant_access_token
-  const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+  const tokenRes = await fetchWithTimeout(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
-  });
+  }, 10_000);
   const tokenData = await tokenRes.json() as any;
   if (tokenData.code !== 0) {
     throw new Error(`Failed to get tenant_access_token: ${tokenData.msg}`);
   }
 
-  const botRes = await fetch(`${openApi}/open-apis/bot/v3/info/`, {
+  const botRes = await fetchWithTimeout(`${openApi}/open-apis/bot/v3/info/`, {
     headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
-  });
+  }, 10_000);
   const botData = await botRes.json() as any;
   if (botData.code !== 0) {
     throw new Error(`Failed to get bot info: ${botData.msg}`);
@@ -2368,6 +2378,40 @@ const MESSAGE_LISTENER_BACKFILL_PAGE_SIZE = Math.min(50, Math.max(
   1,
   Number(process.env.BOTMUX_MESSAGE_LISTENER_BACKFILL_PAGE_SIZE) || 50,
 ));
+const MESSAGE_LISTENER_BACKFILL_TIMEOUT_MS = Math.max(
+  1_000,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_BACKFILL_TIMEOUT_MS) || 15_000,
+);
+const MESSAGE_LISTENER_POLL_RUN_TIMEOUT_MS = Math.max(
+  MESSAGE_LISTENER_BACKFILL_TIMEOUT_MS + 5_000,
+  Number(process.env.BOTMUX_MESSAGE_LISTENER_POLL_RUN_TIMEOUT_MS) || 30_000,
+);
+
+function withMessageListenerTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function withAbortableMessageListenerTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const controller = new AbortController();
+  try {
+    return await withMessageListenerTimeout(run(controller.signal), timeoutMs, label);
+  } catch (err) {
+    controller.abort();
+    throw err;
+  }
+}
 
 function enabledMessageListenerChatIds(bot: BotState): string[] {
   return Object.entries(bot.config.messageListeners ?? {})
@@ -2420,10 +2464,14 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   const isBotSenderType = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
   const isOpenIdDomain = senderIdType === 'open_id'
     || (typeof senderOpenId === 'string' && senderOpenId.startsWith('ou_'));
+  const content = typeof message?.content === 'string'
+    ? message.content
+    : typeof message?.body?.content === 'string' ? message.body.content : '';
   return {
     message: {
       ...message,
       message_type: message?.message_type ?? message?.msg_type,
+      content,
       chat_id: message?.chat_id ?? chatId,
       chat_type: message?.chat_type ?? 'group',
     },
@@ -2486,19 +2534,26 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
   if (chatIds.length === 0) return;
 
   const cutoff = now - MESSAGE_LISTENER_BACKFILL_WINDOW_MS;
-  await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+  await withMessageListenerTimeout(ensureBotOpenId(larkAppId), 10_000, 'ensure bot open_id')
+    .catch(err => logger.warn(`[message-listener:${larkAppId}] bot open_id probe skipped: ${err instanceof Error ? err.message : String(err)}`));
 
   for (const chatId of chatIds) {
     let messages: any[];
     try {
-      messages = await listChatMessagesUntil(larkAppId, chatId, {
-        pageSize: MESSAGE_LISTENER_BACKFILL_PAGE_SIZE,
-        stopAfter: (message, seenCount) => {
-          const createdAt = messageCreateTimeMs(message);
-          return seenCount >= MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT ||
-            (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
-        },
-      });
+      messages = await withAbortableMessageListenerTimeout(
+        signal => listChatMessagesUntil(larkAppId, chatId, {
+          pageSize: MESSAGE_LISTENER_BACKFILL_PAGE_SIZE,
+          timeoutMs: MESSAGE_LISTENER_BACKFILL_TIMEOUT_MS,
+          signal,
+          stopAfter: (message, seenCount) => {
+            const createdAt = messageCreateTimeMs(message);
+            return seenCount >= MESSAGE_LISTENER_BACKFILL_SCAN_LIMIT ||
+              (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
+          },
+        }),
+        MESSAGE_LISTENER_BACKFILL_TIMEOUT_MS,
+        `poll chat ${chatId.substring(0, 12)}`,
+      );
     } catch (err) {
       logger.warn(`[message-listener:${larkAppId}] failed to poll chat=${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -2544,6 +2599,14 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
 
 export async function __pollMessageListenersOnceForTest(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
   await pollMessageListenersOnce(larkAppId, handlers, now);
+}
+
+function runMessageListenerPoll(larkAppId: string, handlers: EventHandlers, label: string): Promise<void> {
+  return withMessageListenerTimeout(
+    pollMessageListenersOnce(larkAppId, handlers),
+    MESSAGE_LISTENER_POLL_RUN_TIMEOUT_MS,
+    `${label} message-listener poll`,
+  );
 }
 
 function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
@@ -4432,7 +4495,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   const listenerPollTimer = setInterval(() => {
     if (listenerPollInFlight) return;
     listenerPollInFlight = true;
-    void pollMessageListenersOnce(larkAppId, handlers)
+    void runMessageListenerPoll(larkAppId, handlers, 'scheduled')
       .catch(err => logger.error(`[message-listener:${larkAppId}] poll failed: ${err instanceof Error ? err.message : String(err)}`))
       .finally(() => { listenerPollInFlight = false; });
   }, MESSAGE_LISTENER_POLL_INTERVAL_MS);
@@ -4442,7 +4505,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     setTimeout(() => {
       if (listenerPollInFlight) return;
       listenerPollInFlight = true;
-      void pollMessageListenersOnce(larkAppId, handlers)
+      void runMessageListenerPoll(larkAppId, handlers, 'initial')
         .catch(err => logger.error(`[message-listener:${larkAppId}] initial poll failed: ${err instanceof Error ? err.message : String(err)}`))
         .finally(() => { listenerPollInFlight = false; });
     }, 2_000).unref();

@@ -125,6 +125,14 @@ describe('attention signals', () => {
     expect(composeRowFromActive(queued).status).toBe('idle');
   });
 
+  it('composeRowFromActive can skip restore-time expensive enrichment', () => {
+    const row = composeRowFromActive(makeDs(), { lightweight: true });
+
+    expect(row.tokenUsage).toBeUndefined();
+    expect(row.previewUserText).toBeUndefined();
+    expect(row.previewBotText).toBeUndefined();
+  });
+
   it('composeRowFromActive carries the agent raise-hand signal with its reason', () => {
     const raised = composeRowFromActive(makeDs({
       agentAttention: { kind: 'authz', reason: '需要 prod 部署授权', at: 1234 },

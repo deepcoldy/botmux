@@ -216,12 +216,11 @@ export const config = {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
     cliPathOverride: process.env.CLI_PATH,
     backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as BackendType,
-    /** Auto-recovery throttle: on restart every surviving persistent-backend
-     *  session is eagerly re-forked to re-attach its pane. With dozens of
-     *  sessions per daemon (and many daemons on one box) firing them all at
-     *  once spikes CPU/IO, so the re-fork is staggered: spawn `batchSize`
-     *  workers, wait `delayMs`, repeat. Tune via BOTMUX_RECOVERY_FORK_BATCH /
-     *  BOTMUX_RECOVERY_FORK_DELAY_MS. */
+    /** Auto-recovery re-attach is opt-in: keeping restored persistent sessions
+     *  lazy protects daemon startup paths like message listeners from thousands
+     *  of worker re-forks. Tune via BOTMUX_RECOVERY_FORK_ENABLED,
+     *  BOTMUX_RECOVERY_FORK_BATCH, and BOTMUX_RECOVERY_FORK_DELAY_MS. */
+    recoveryForkEnabled: (process.env.BOTMUX_RECOVERY_FORK_ENABLED ?? 'false').toLowerCase() === 'true',
     recoveryForkBatchSize: Math.max(1, Number(process.env.BOTMUX_RECOVERY_FORK_BATCH) || 5),
     recoveryForkDelayMs: Math.max(0, Number(process.env.BOTMUX_RECOVERY_FORK_DELAY_MS ?? 250)),
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),

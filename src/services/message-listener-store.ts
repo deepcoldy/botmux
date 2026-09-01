@@ -1,5 +1,11 @@
 import { getBot, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import {
+  DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS,
+  normalizeMessageListenerCleanupConfig,
+} from './message-listener-session-cleanup.js';
+
+export { DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS };
 
 export type MessageListenerUpdate = {
   enabled: boolean;
@@ -10,6 +16,7 @@ export type MessageListenerUpdate = {
   senderPolicy?: MessageListenerConfig['senderPolicy'];
   messagePolicy?: MessageListenerConfig['messagePolicy'];
   contentPolicy?: MessageListenerConfig['contentPolicy'];
+  cleanup?: MessageListenerConfig['cleanup'];
 };
 
 function stringList(raw: unknown): string[] | undefined {
@@ -77,6 +84,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   const messagePolicy: MessageListenerConfig['messagePolicy'] = { scope: 'top_level' };
   const includeMsgTypes = stringList(rawMessage.includeMsgTypes);
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
+  const cleanup = normalizeMessageListenerCleanupConfig(entry.cleanup);
 
   const rawContent = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
     ? entry.contentPolicy as Record<string, unknown>
@@ -103,6 +111,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     messagePolicy,
     ...(contentPolicy ? { contentPolicy } : {}),
+    cleanup,
   };
 }
 
@@ -153,6 +162,7 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
     ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
     ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
     ...(patch.contentPolicy ? { contentPolicy: patch.contentPolicy } : {}),
+    cleanup: normalizeMessageListenerCleanupConfig(patch.cleanup),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
 }
@@ -166,7 +176,7 @@ export async function updateMessageListenerConfig(
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
   const validation = validateMessageListenerUpdate(patch);
-  if (!validation.ok) return { ok: false, reason: validation.reason };
+  if (validation.ok === false) return { ok: false, reason: validation.reason };
 
   // A disabled update with a non-empty prompt persists as an off DRAFT (kept for
   // the editor, never matched at runtime); only a blank-prompt disabled update
@@ -187,7 +197,7 @@ export async function updateMessageListenerConfig(
     entry.messageListeners[chatId] = normalized;
     return { write: true, result: normalized };
   });
-  if (!result.ok) return { ok: false, reason: result.reason };
+  if (result.ok === false) return { ok: false, reason: result.reason };
 
   if (!bot.config.messageListeners) bot.config.messageListeners = {};
   if (normalized) bot.config.messageListeners[chatId] = normalized;

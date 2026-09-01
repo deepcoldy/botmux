@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, validateMessageListenerUpdate } from '../src/services/message-listener-store.js';
+import {
+  DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS,
+  messageListenerConfigFromUpdate,
+  sanitizeMessageListenerUpdate,
+  validateMessageListenerUpdate,
+} from '../src/services/message-listener-store.js';
 
 describe('message listener store', () => {
   it('keeps the custom reply card title from dashboard updates', () => {
@@ -28,6 +33,56 @@ describe('message listener store', () => {
       replyCardTitle: '   ',
       prompt: '分析命中的告警消息',
     })).not.toHaveProperty('replyCardTitle');
+  });
+
+  it('defaults listener session cleanup to enabled with a seven-day retention', () => {
+    expect(sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '分析命中的告警消息',
+    })?.cleanup).toEqual({
+      enabled: true,
+      retentionHours: DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS,
+    });
+  });
+
+  it('accepts dashboard listener cleanup overrides', () => {
+    expect(sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '分析命中的告警消息',
+      cleanup: {
+        enabled: false,
+        retentionHours: '24',
+      },
+    })?.cleanup).toEqual({
+      enabled: false,
+      retentionHours: 24,
+    });
+  });
+
+  it('preserves selected sender whitelist when saving listener cleanup settings', () => {
+    expect(sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '分析命中的告警消息',
+      senderPolicy: {
+        mode: 'include_only',
+        includeSenderOpenIds: ['ou_argos', 'ou_locator'],
+        includeSenderTypes: ['bot'],
+      },
+      cleanup: {
+        enabled: true,
+        retentionHours: 24,
+      },
+    })).toMatchObject({
+      senderPolicy: {
+        mode: 'include_only',
+        includeSenderOpenIds: ['ou_argos', 'ou_locator'],
+        includeSenderTypes: ['bot'],
+      },
+      cleanup: {
+        enabled: true,
+        retentionHours: 24,
+      },
+    });
   });
 
   it('rejects enabled include-only listeners without selected senders', () => {

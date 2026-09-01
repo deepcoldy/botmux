@@ -69,6 +69,10 @@ export interface MessageListenerData {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
   };
+  cleanup?: {
+    enabled: boolean;
+    retentionHours: number;
+  };
 }
 
 export interface MessageListenerPreviewItem {
@@ -165,6 +169,7 @@ export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32768;
 export const MESSAGE_LISTENER_WARN_BYTES = Math.floor(MAX_MESSAGE_LISTENER_PROMPT_BYTES * 0.95);
 export const DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT = 5;
 export const MAX_MESSAGE_LISTENER_PREVIEW_LIMIT = 20;
+export const DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS = 168;
 
 const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -311,7 +316,12 @@ export async function deleteRole(larkAppId: string, chatId: string): Promise<boo
 export async function loadMessageListener(larkAppId: string, chatId: string): Promise<MessageListenerData> {
   const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`);
   const data = await readJson(r);
-  return data.listener ?? { enabled: false, prompt: '', messagePolicy: { scope: 'top_level' } };
+  return data.listener ?? {
+    enabled: false,
+    prompt: '',
+    messagePolicy: { scope: 'top_level' },
+    cleanup: { enabled: true, retentionHours: DEFAULT_MESSAGE_LISTENER_CLEANUP_RETENTION_HOURS },
+  };
 }
 
 export async function saveMessageListener(larkAppId: string, chatId: string, listener: MessageListenerData): Promise<boolean> {

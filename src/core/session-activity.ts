@@ -142,10 +142,10 @@ export function clearAgentAttention(ds: DaemonSession): boolean {
   return true;
 }
 
-export function announceSessionRow(ds: DaemonSession): void {
+export function announceSessionRow(ds: DaemonSession, opts?: { lightweight?: boolean }): void {
   dashboardEventBus.publish({
     type: 'session.spawned',
-    body: { session: composeRowFromActive(ds) },
+    body: { session: composeRowFromActive(ds, opts) },
   });
 }
 

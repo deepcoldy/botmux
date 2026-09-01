@@ -1845,19 +1845,16 @@ export function rememberLastCliInput(
 
 /**
  * Whether daemon restore should eagerly re-fork a worker to re-attach a
- * surviving backing pane. True for every persistent backend (tmux/herdr/zellij/zmx);
- * the pty backend has nothing to re-attach to, so it stays lazy.
- *
- * Eager re-attach is what makes a session actually come back after a restart —
- * otherwise a killed worker leaves the session dead until its next message, and
- * a pane whose CLI died in the meantime never gets healed, so the transcript
- * fallback can't fire. The old `BOTMUX_QUIET_RESTART` gate that suppressed this
- * (to avoid re-pushing cards on dev restarts) is gone: restored sessions now
- * carry `suppressRecoveryCard`, so the recovery re-fork stays silent in the
- * Lark thread without having to skip recovery altogether.
+ * surviving backing pane. This is opt-in for persistent backends: on long-lived
+ * hosts with thousands of active rows, eager recovery can saturate the daemon's
+ * event loop and starve message listeners. Lazy recovery still re-attaches on
+ * the next user message or terminal access.
  */
-export function shouldAutoForkOnRestore(backendType: BackendType): boolean {
-  return backendType !== 'pty';
+export function shouldAutoForkOnRestore(
+  backendType: BackendType,
+  enabled: boolean = config.daemon.recoveryForkEnabled === true,
+): boolean {
+  return enabled && backendType !== 'pty';
 }
 
 const RECOVERY_FORK_BATCH_SIZE = config.daemon.recoveryForkBatchSize ?? 5;
@@ -1902,6 +1899,22 @@ export async function staggeredRecoveryFork(
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     }
   }
+}
+
+export function scheduleStaggeredRecoveryFork(
+  sessions: readonly DaemonSession[],
+  fork: (ds: DaemonSession) => void,
+  batchSize: number = RECOVERY_FORK_BATCH_SIZE,
+  delayMs: number = RECOVERY_FORK_DELAY_MS,
+  stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
+): void {
+  void staggeredRecoveryFork(sessions, fork, batchSize, delayMs, stillOwned)
+    .catch(err => {
+      logger.error(
+        `[restore] background recovery re-attach failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
 }
 
 export async function restoreActiveSessions(
@@ -2255,7 +2268,7 @@ export async function restoreActiveSessions(
           continue;
         }
         restoredByThisInvocation.push(ds);
-        announceSessionRow(ds);
+        announceSessionRow(ds, { lightweight: true });
         forkAdoptWorker(ds, { restoredFromMetadata: true });
         logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
         continue;
@@ -2361,7 +2374,7 @@ export async function restoreActiveSessions(
       restoredByThisInvocation.push(ds);
       // 重启后把待办池卡片重新广播给 dashboard，否则会从看板消失（#277 同款修复，
       // 我这条 queued 分支提前 continue 绕过了下面的 announceSessionRow，要自己补）。
-      announceSessionRow(ds);
+      announceSessionRow(ds, { lightweight: true });
       if (restoredPendingRepo) {
         try {
           await resumeRestoredPendingRepoSetup(ds, activeSessions);
@@ -2592,7 +2605,7 @@ export async function restoreActiveSessions(
       continue;
     }
     restoredByThisInvocation.push(ds);
-    announceSessionRow(ds);
+    announceSessionRow(ds, { lightweight: true });
 
     if (session.initialUserTurnPending) {
       // `hasHistory: true` above means "there may be a CLI process/transcript to
@@ -2636,6 +2649,7 @@ export async function restoreActiveSessions(
     backendName: string;
   }> = [];
   const namesByBackend = new Map<PersistentBackendType, Set<string>>();
+  const skippedReattachByBackend = new Map<PersistentBackendType, number>();
   for (const ds of restoredByThisInvocation) {
     // A later restore CAS awaited after this row was registered. During that
     // yield the user may have closed/resumed/replaced it; never carry the stale
@@ -2659,7 +2673,10 @@ export async function restoreActiveSessions(
       }
       continue;
     }
-    if (!shouldAutoForkOnRestore(backendType)) continue;
+    if (!shouldAutoForkOnRestore(backendType)) {
+      skippedReattachByBackend.set(backendType, (skippedReattachByBackend.get(backendType) ?? 0) + 1);
+      continue;
+    }
     // Honour the worker-selected target (Herdr may own an agent inside a shared
     // host session) rather than assuming the deterministic whole-session name.
     const backendTarget = persistentBackendTargetForSession(ds)!;
@@ -2673,6 +2690,16 @@ export async function restoreActiveSessions(
     const names = namesByBackend.get(backendType) ?? new Set<string>();
     names.add(backendTarget.sessionName);
     namesByBackend.set(backendType, names);
+  }
+  if (skippedReattachByBackend.size > 0) {
+    const total = [...skippedReattachByBackend.values()].reduce((sum, count) => sum + count, 0);
+    const detail = [...skippedReattachByBackend.entries()]
+      .map(([backendType, count]) => `${backendType}=${count}`)
+      .join(', ');
+    logger.info(
+      `[restore] skipped eager re-attach for ${total} persistent session(s) `
+      + `(${detail}); lazy recovery remains available`,
+    );
   }
   // ZMX/Zellij can classify every requested name from one control-plane list.
   // This is both a consistent restore snapshot and avoids an O(N²) ZMX restart
@@ -2776,11 +2803,7 @@ export async function restoreActiveSessions(
     toReattach.push(ds);
   }
 
-  // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
-  // only, no new turn — same as the old per-session eager fork.
-  await staggeredRecoveryFork(
-    toReattach,
-    (ds) => {
+  const reattach = (ds: DaemonSession): void => {
       // A quarantined tail-only owner (restore promotion failed transiently) is
       // handled by the CENTRAL guard inside forkWorker: this blank fork retries
       // the old head's promotion first and, if it still fails, refuses to fork
@@ -2804,11 +2827,24 @@ export async function restoreActiveSessions(
             }
           : true,
       );
-    },
-    RECOVERY_FORK_BATCH_SIZE,
-    RECOVERY_FORK_DELAY_MS,
-    ds => activeSessions.get(activeSessionKey(ds)) === ds,
-  );
+  };
+
+  // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
+  // only, no new turn — same as the old per-session eager fork. Keep it off the
+  // restore critical path: on long-lived installations thousands of restored
+  // active rows can otherwise hold daemon readiness and message-listener
+  // backfill behind worker re-attach for minutes, even though the sessions are
+  // already registered and can lazy cold-resume on demand.
+  if (toReattach.length > 0) {
+    logger.info(`[restore] scheduling ${toReattach.length} persistent session(s) for background re-attach`);
+    scheduleStaggeredRecoveryFork(
+      toReattach,
+      reattach,
+      RECOVERY_FORK_BATCH_SIZE,
+      RECOVERY_FORK_DELAY_MS,
+      ds => activeSessions.get(activeSessionKey(ds)) === ds,
+    );
+  }
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);

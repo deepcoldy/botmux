@@ -1,12 +1,10 @@
 /**
  * Auto-recovery on daemon restart.
  *
- * On restart every surviving persistent-backend session is eagerly re-forked to
- * re-attach its pane, so the session actually comes back instead of sitting dead
- * until its next message (and a pane whose CLI died gets healed, keeping the
- * transcript fallback working). The old `BOTMUX_QUIET_RESTART` gate that
- * suppressed this is gone — card silence is now handled by `suppressRecoveryCard`
- * on restored sessions, not by skipping recovery.
+ * On restart surviving persistent-backend sessions are kept lazy by default:
+ * restoring thousands of active rows must not starve message listeners by
+ * eagerly re-forking every worker. Operators can explicitly opt in to eager
+ * re-attach when terminal readiness is more important than startup latency.
  *
  * `staggeredRecoveryFork` spaces the re-forks out (batch + delay) so a box with
  * dozens of surviving sessions doesn't spike on restart, and skips any session
@@ -21,24 +19,38 @@ vi.mock('../src/bot-registry.js', () => ({
 
 vi.mock('../src/config.js', () => ({
   config: {
-    daemon: { workingDir: '~', workingDirs: ['~'], recoveryForkBatchSize: 5, recoveryForkDelayMs: 0 },
+    daemon: {
+      workingDir: '~',
+      workingDirs: ['~'],
+      recoveryForkBatchSize: 5,
+      recoveryForkDelayMs: 0,
+      recoveryForkEnabled: false,
+    },
     session: { dataDir: '/tmp/botmux-test' },
   },
 }));
 
-import { shouldAutoForkOnRestore, staggeredRecoveryFork } from '../src/core/session-manager.js';
+import { shouldAutoForkOnRestore, staggeredRecoveryFork, scheduleStaggeredRecoveryFork } from '../src/core/session-manager.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 describe('shouldAutoForkOnRestore', () => {
-  it('eagerly re-forks every persistent backend (tmux/herdr/zellij/zmx)', () => {
-    expect(shouldAutoForkOnRestore('tmux')).toBe(true);
-    expect(shouldAutoForkOnRestore('herdr')).toBe(true);
-    expect(shouldAutoForkOnRestore('zellij')).toBe(true);
-    expect(shouldAutoForkOnRestore('zmx')).toBe(true);
+  it('keeps persistent backends lazy by default so startup does not starve listeners', () => {
+    expect(shouldAutoForkOnRestore('tmux')).toBe(false);
+    expect(shouldAutoForkOnRestore('herdr')).toBe(false);
+    expect(shouldAutoForkOnRestore('zellij')).toBe(false);
+    expect(shouldAutoForkOnRestore('zmx')).toBe(false);
+  });
+
+  it('can explicitly eager re-attach persistent backends', () => {
+    expect(shouldAutoForkOnRestore('tmux', true)).toBe(true);
+    expect(shouldAutoForkOnRestore('herdr', true)).toBe(true);
+    expect(shouldAutoForkOnRestore('zellij', true)).toBe(true);
+    expect(shouldAutoForkOnRestore('zmx', true)).toBe(true);
   });
 
   it('never eagerly forks the pty backend — it has no pane to re-attach', () => {
     expect(shouldAutoForkOnRestore('pty')).toBe(false);
+    expect(shouldAutoForkOnRestore('pty', true)).toBe(false);
   });
 });
 
@@ -111,5 +123,25 @@ describe('staggeredRecoveryFork', () => {
     );
 
     expect(forked).toEqual(['a']);
+  });
+
+  it('can be scheduled without blocking restore on delayed batches', async () => {
+    vi.useFakeTimers();
+    try {
+      const sessions = Array.from({ length: 5 }, (_, i) => ds(`s${i}`));
+      const forked: string[] = [];
+
+      scheduleStaggeredRecoveryFork(sessions, (d) => forked.push(d.session.sessionId), 2, 20);
+
+      expect(forked).toEqual(['s0', 's1']);
+      await vi.advanceTimersByTimeAsync(19);
+      expect(forked).toEqual(['s0', 's1']);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(forked).toEqual(['s0', 's1', 's2', 's3']);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(forked).toEqual(['s0', 's1', 's2', 's3', 's4']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

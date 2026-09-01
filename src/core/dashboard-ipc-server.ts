@@ -1026,16 +1026,18 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
 
+const DASHBOARD_SNAPSHOT_ROW_OPTS = { lightweight: true } as const;
+
 function composeDashboardSessionRows(): SessionRow[] {
-  const active = listActiveSessions().map((ds) => composeRowFromActive(ds));
+  const active = listActiveSessions().map(ds => composeRowFromActive(ds, DASHBOARD_SNAPSHOT_ROW_OPTS));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
   const unregisteredActive = persisted
     .filter(session => session.status === 'active' && !activeIds.has(session.sessionId))
-    .map(composeRowFromPersistedActive);
+    .map(session => composeRowFromPersistedActive(session, DASHBOARD_SNAPSHOT_ROW_OPTS));
   const closed = persisted
     .filter(session => session.status === 'closed' && !activeIds.has(session.sessionId))
-    .map(composeRowFromClosed);
+    .map(session => composeRowFromClosed(session, DASHBOARD_SNAPSHOT_ROW_OPTS));
   return [...active, ...unregisteredActive, ...closed];
 }
 
@@ -3578,6 +3580,7 @@ async function collectMessageListenerPreviewMatches(
     prompt: listener.prompt,
     ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
     ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    ...(listener.cleanup ? { cleanup: listener.cleanup } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
   const previewBot = {
@@ -5759,7 +5762,7 @@ ipcRoute('GET', '/api/events', (_req, res) => {
     const activeIds = new Set<string>();
     for (const ds of listActiveSessions()) {
       activeIds.add(ds.session.sessionId);
-      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds, DASHBOARD_SNAPSHOT_ROW_OPTS) })}\n\n`);
     }
     // Persisted active rows may be intentionally absent from the runtime Map
     // after an inconclusive exact-backend teardown. Replay them as dormant
@@ -5767,7 +5770,7 @@ ipcRoute('GET', '/api/events', (_req, res) => {
     // /api/sessions and never synthesize a closed row.
     for (const s of sessionStore.listSessions()) {
       if (s.status !== 'active' || activeIds.has(s.sessionId)) continue;
-      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromPersistedActive(s) })}\n\n`);
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromPersistedActive(s, DASHBOARD_SNAPSHOT_ROW_OPTS) })}\n\n`);
     }
     // Also replay sessions CLOSED during this run as `session.spawned` carrying a
     // closed row. The active-only replay above can't cover a restore-time zombie:
@@ -5787,7 +5790,7 @@ ipcRoute('GET', '/api/events', (_req, res) => {
       if (s.status !== 'closed' || activeIds.has(s.sessionId)) continue;
       const closedMs = s.closedAt ? Date.parse(s.closedAt) : NaN;
       if (!Number.isFinite(closedMs) || closedMs < PROCESS_START_MS) continue;
-      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromClosed(s) })}\n\n`);
+      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromClosed(s, DASHBOARD_SNAPSHOT_ROW_OPTS) })}\n\n`);
     }
   } catch (err) {
     logger.warn(`[dashboard-ipc] /api/events snapshot replay failed: ${err}`);
