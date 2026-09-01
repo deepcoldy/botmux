@@ -158,7 +158,7 @@ export type LoadBotsResult = {
 export const fallbackCliOptions: CliOption[] = [
   { id: 'claude-code', label: 'Claude' },
   { id: 'codex', label: 'Codex' },
-  { id: 'traex', label: 'traex' },
+  { id: 'traex', label: 'TRAE CLI 2.0' },
 ];
 
 export const fallbackCliOptionsState: CliOptionsState = {

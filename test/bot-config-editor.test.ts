@@ -520,6 +520,7 @@ describe('resolveCliId', () => {
     // 序号以 src/setup/bot-config-editor.ts 的 CLI_ID_CHOICES 为准；
     // 新 CLI 一律追加尾部，历史序号保持稳定（脚本化 setup 依赖）。
     expect(resolveCliId('1')).toBe('claude-code');
+    expect(resolveCliId('3')).toBe('coco');
     expect(resolveCliId('4')).toBe('codex');
     expect(resolveCliId('7')).toBe('opencode');
     expect(resolveCliId('9')).toBe('mtr');
