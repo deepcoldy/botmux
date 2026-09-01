@@ -4162,11 +4162,21 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.no_sender', undefined, loc));
           break;
         }
-        // Owner-only.
-        if (ds.session.ownerOpenId && ds.session.ownerOpenId !== forkSenderOpenId) {
+        // 会话发起人闸：默认只有发起人能 fork 自己的会话。**例外**：bot 的管理员
+        // （canOperate / allowedUsers）可以 fork 本 bot 的任意会话——他们本来就能
+        // /close /restart 掉这个会话，"能销毁却不能拷贝一份"没有安全意义；而 fork
+        // 是非破坏性的（源会话不动，子会话另起 anchor），放开只增不减。
+        // 非管理员仍限自己发起的会话，不因这条例外扩大。
+        const forkByAdminOfOthers = !!ds.session.ownerOpenId
+          && ds.session.ownerOpenId !== forkSenderOpenId;
+        if (forkByAdminOfOthers && !canOperate(forkAppId, ds.chatId, forkSenderOpenId)) {
           await sessionReply(rootId, t('cmd.fork.not_owner', undefined, loc));
           break;
         }
+        // 管理员 fork 别人的会话时，子会话归**发起 fork 的管理员**，不继承源 owner：
+        // `/fork --create` 建的新群里只有管理员自己，把子会话记在一个不在群里的人
+        // 名下会让 owner-only 回复、子会话上的 /fork /relay 全部指错人。
+        const forkChildOwnerOpenId = forkByAdminOfOthers ? forkSenderOpenId : undefined;
         // Capability gate — refuse non-forkable backends up front with a clear,
         // typed message (mirrors the design doc §4 refusal). Cheap check before
         // we create any group.
@@ -4224,7 +4234,7 @@ export async function handleCommand(
             break;
           }
 
-          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId);
+          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
           if (!result.ok) {
             const errKey = result.error === 'worker_busy' ? 'cmd.fork.mid_turn'
               : result.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
@@ -4328,6 +4338,7 @@ export async function handleCommand(
         // the raw session title.
         const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat', {
           forkTaskText: forkGroupName,
+          childOwnerOpenId: forkChildOwnerOpenId,
         });
         if (!forkResult.ok) {
           // Residual-orphan cleanup: the front guards already ran before
@@ -5067,6 +5078,9 @@ export async function startForkSubtopicSession(
   parentDs: DaemonSession,
   message: LarkMessage,
   larkAppId?: string,
+  /** Owner for the child session; omit to inherit the parent's. Set by the
+   *  `/fork` handler when an admin forks someone else's session. */
+  childOwnerOpenId?: string,
 ): Promise<ForkSubtopicResult> {
   const appId = parentDs.larkAppId ?? larkAppId;
   if (!appId) return { ok: false, error: 'missing_lark_app_id', orphanTopic: false };
@@ -5151,6 +5165,7 @@ export async function startForkSubtopicSession(
         turnId: message.messageId,
         senderOpenId: triggerSender.openId,
         senderIsBot,
+        childOwnerOpenId,
         buildInitialPrompt: childSessionId => buildNewTopicCliInput(
           `${childIntro}\n\n${taskText}`,
           childSessionId,

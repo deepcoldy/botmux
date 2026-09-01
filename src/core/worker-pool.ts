@@ -8063,6 +8063,14 @@ export async function forkSession(
     turnId?: string;
     senderOpenId?: string;
     senderIsBot?: boolean;
+    /** Owner to stamp on the CHILD session. Defaults to the source's owner
+     *  (the common case: forker === source owner, so this is a no-op).
+     *  Set it when an admin forks someone else's session — otherwise the child
+     *  is owned by a user who may not even be in the destination chat
+     *  (`/fork --create` builds a group containing only the forker), leaving
+     *  owner-only replies and `/fork`/`/relay` on the child addressed to
+     *  someone who can't see it. */
+    childOwnerOpenId?: string;
   },
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
@@ -8138,7 +8146,7 @@ export async function forkSession(
   childSession.cliSessionId = srcCliSessionId;
   childSession.cliId = ds.session.cliId;
   childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
-  childSession.ownerOpenId = ds.session.ownerOpenId;
+  childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
   childSession.backendType = ds.session.backendType;
   // Bot identity on the PERSISTED row. Every other createSession caller sets
   // this immediately after minting (trigger-session / session-manager /
@@ -8220,7 +8228,7 @@ export async function forkSession(
     lastMessageAt: Date.now(),
     hasHistory: true,           // forked child resumes (forks) prior history on first spawn
     workingDir: ds.workingDir ?? ds.session.workingDir,
-    ownerOpenId: ds.session.ownerOpenId,
+    ownerOpenId: childSession.ownerOpenId,
     // Fresh card in the target anchor — never inherit the source's card id.
     streamCardId: undefined,
     streamCardNonce: undefined,
