@@ -14,8 +14,6 @@ const { normalizeCommandTriggers, normalizeTriggerCommand, normalizeTriggerEntry
   await import('../src/services/command-trigger-normalize.js');
 const { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } =
   await import('../src/core/passthrough-commands.js');
-const { SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS } =
-  await import('../src/core/command-handler.js');
 
 // 生产里 getBot() 返回的永远是 bot-registry 归一化过的配置，所以这里也走同一个
 // normalize —— 既保证断言面与运行期一致，也顺带覆盖了字符串简写那条输入路径。
@@ -28,14 +26,11 @@ beforeEach(() => {
 });
 
 describe('reserved command tables', () => {
-  // reservedCommandKind only consults DAEMON_COMMANDS to cover all three daemon
-  // tables. That shortcut is only sound while the other two stay subsets —
-  // pin it here so adding a command to just one of them fails loudly instead of
-  // silently opening a no-@ hole.
-  it('keeps SESSIONLESS / EXISTING_SESSION_ONLY subsets of DAEMON_COMMANDS', () => {
-    for (const cmd of SESSIONLESS_DAEMON_COMMANDS) expect(DAEMON_COMMANDS.has(cmd)).toBe(true);
-    for (const cmd of EXISTING_SESSION_ONLY_DAEMON_COMMANDS) expect(DAEMON_COMMANDS.has(cmd)).toBe(true);
-  });
+  // 子集不变量（SESSIONLESS / EXISTING_SESSION_ONLY ⊂ DAEMON_COMMANDS）钉在
+  // test/command-trigger-reserved-commands.test.ts —— 那条断言要 import
+  // command-handler，会把整个 daemon 模块图拉进来；本文件把 bot-registry 整个
+  // 替换成只有 getBot 的假模块，图里任何一处静态具名 import 在 bun 腿的 ESM
+  // 链接期就会 SyntaxError（vitest 容忍、bun 不容忍）。故拆到无 mock 的文件里。
 
   it('classifies daemon / passthrough / force-topic / free commands', () => {
     expect(reservedCommandKind('/close')).toBe('daemon');
