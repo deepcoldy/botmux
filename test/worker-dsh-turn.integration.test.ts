@@ -228,7 +228,9 @@ describe('dsh worker final_output integration', () => {
 
       // The generated composition and session JSONL must land in the REAL
       // HOME's native dsh dir, not in a throwaway tmpfs that dies with the sandbox.
-      expect(existsSync(join(root, '.dsh', 'botmux', 'cordis.yml'))).toBe(true);
+      // The runner no longer generates cordis.yml — the dsh --profile CLI
+      // handles composition. It only creates the profile directory.
+      expect(existsSync(join(root, '.dsh', 'profiles', 'botmux'))).toBe(true);
       expect(existsSync(join(root, '.dsh', 'sessions', 'botmux', sessionId))).toBe(true);
     } finally {
       await stopChild(child);

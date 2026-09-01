@@ -442,7 +442,7 @@ refs:
     expect(initEntry.initialize.provider).toBe('super-relay');
   });
 
-  it('fails loud when settings.yaml is missing agent-default-model', async () => {
+  it('falls back to deepseek-official provider when settings.yaml is missing agent-default-model', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, `
 llm-pi-ai:
@@ -451,13 +451,15 @@ llm-pi-ai:
       apiKeyEnv: SUPER_RELAY_API_KEY
 `);
     h = spawnRunner('happy', [], {}, home);
-    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
-    const code = await exitPromise;
-    expect(code).toBe(1);
-    expect(h.stderr).toContain('agent-default-model');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    expect(initEntry.initialize.provider).toBe('deepseek-official');
+    expect(initEntry.initialize.model).toBe('deepseek-v4-flash');
   });
 
-  it('fails loud when the default provider is not in llm-pi-ai.providers', async () => {
+  it('passes the provider from settings.yaml to the initialize RPC even when it is not in llm-pi-ai.providers', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
     writeNativeDshConfig(home, `
 llm-pi-ai:
@@ -469,10 +471,14 @@ agent-default-model:
   model: some-model
 `);
     h = spawnRunner('happy', [], {}, home);
-    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
-    const code = await exitPromise;
-    expect(code).toBe(1);
-    expect(h.stderr).toContain('not found in ~/.dsh/settings.yaml');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const initEntry = entries.find((r: any) => r.initialize);
+    // The runner no longer validates provider against llm-pi-ai.providers —
+    // the dsh --profile CLI handles plugin composition independently.
+    expect(initEntry.initialize.provider).toBe('super-relay');
+    expect(initEntry.initialize.model).toBe('some-model');
   });
 
   it('passes deepseek-official provider/model from settings.yaml to the initialize RPC', async () => {
