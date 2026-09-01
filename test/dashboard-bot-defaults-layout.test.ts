@@ -17,9 +17,16 @@ const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.ur
 // `.bd-roster-list` is declared TWICE — once at top level for desktop, once
 // inside @media (max-width: 980px). Every caller here wants the desktop rule,
 // which is the first match, so this takes the first and does not offer a
-// choice. Note this is no safety net for a rename: renaming the desktop rule
-// leaves the mobile copy as the first match, and what catches that is the
-// assertions failing against the wrong body.
+// choice.
+//
+// This is NOT a safety net for a rename, and the gap is only partial: rename
+// the desktop rule and the mobile copy becomes the first match. Only the
+// `align-content: start` assertion then fails, because the mobile body has no
+// such declaration; `min-height: 0`, `overflow-y: auto` and
+// `overscroll-behavior: contain` all happen to be present in the mobile body
+// too, so those three keep passing against the wrong rule. Measured, not
+// assumed. Pinning a declaration that both copies share needs a check the
+// slice cannot give you.
 //
 // These rule bodies contain no nested blocks, so the first `}` after the
 // selector is the closing brace. Throw rather than slice from -1.
