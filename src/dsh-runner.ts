@@ -11,7 +11,7 @@
  *                      (`\x1b]777;botmux:<kind>:<base64>\x07`, see
  *                      adapters/cli/runner-control-channel.ts)
  *
- *   dsh side (child `dsh-jsonrpc-agent` process, newline-delimited JSON-RPC):
+ *   dsh side (child `dsh --profile <name>` process, newline-delimited JSON-RPC):
  *     - requests:  initialize / session/prompt / shutdown
  *     - notifications: session.event (full event stream), session.status,
  *                      subagent.started, subagent.finished
@@ -28,11 +28,11 @@
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { parse as parseYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 const DSH_MARKER = '::botmux-dsh:';
@@ -48,39 +48,10 @@ const SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_MODEL = 'deepseek-v4-flash';
 const DEFAULT_MAX_TOKENS = 49152;
 
-/**
- * Vendored default composition, pinned to the dsh protocol version this
- * runner speaks. Mirrors the wheel's runtime/cordis.yml; bump together with
- * the dsh release. Written to ~/.dsh/botmux/cordis.yml so the runtime always
- * gets an explicit config (it refuses to start without one).
- */
-const VENDORED_CONFIG = `# Vendored by botmux dsh-runner. Source: deepseek-harness python/sdk-runtime cordis.yml.
-- id: sdk-jsonrpc-server
-  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
-- id: agent-core
-  name: '@deepseek-ai/dsh-agent-spine-demo'
-  config:
-    workspaceContext:
-      maxBytes: 65536
-- id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
-- id: sessions
-  name: '@deepseek-ai/dsh-session-persistence-jsonl'
-  config:
-    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
-- id: session-checkpoints
-  name: '@deepseek-ai/dsh-session-checkpoint-policy'
-- id: subprocess
-  name: '@deepseek-ai/dsh-subprocess-local'
-- id: bash
-  name: '@deepseek-ai/dsh-bash-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-- id: fs-local
-  name: '@deepseek-ai/dsh-fs-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-`;
+/** Default dsh profile name used when none is specified. The profile lives
+ *  under ~/.dsh/profiles/<name>/ and follows the standard dsh profile layout:
+ *  cordis.yml (empty) + cordis.patch.yml (the full plugin composition). */
+const DEFAULT_DSH_PROFILE = 'botmux';
 
 interface Args {
   sessionId: string;
@@ -90,6 +61,7 @@ interface Args {
   botOpenId?: string;
   locale?: string;
   model?: string;
+  dshProfile?: string;
   turnTimeoutMs: number;
 }
 
@@ -133,6 +105,7 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
+    else if (key === '--dsh-profile' && val !== undefined) { out.dshProfile = val; i++; }
     else if (key === '--turn-timeout-ms' && val !== undefined) {
       const n = Number(val);
       // Accept only a positive integer within the arm-able bound; anything else
@@ -190,12 +163,12 @@ function prompt(): void {
   output.display('› ');
 }
 
-/** Native dsh config resolved from ~/.dsh (settings.yaml + .credentials.yaml).
- *  When the native settings document exists, the runner generates a composition
- *  that mounts the user's own pi-ai providers — zero env config in bots.json. */
+/** Native dsh config resolved from ~/.dsh (profile + settings.yaml + .credentials.yaml).
+ *  The runner spawns `dsh --profile <name>`; the dsh CLI composes the full plugin tree
+ *  from dsh-base bundles + the profile's cordis.patch.yml. */
 interface NativeDshConfig {
-  /** Path to the cordis composition the runtime boots. */
-  configPath: string;
+  /** Profile name under ~/.dsh/profiles/ (passed to `dsh --profile`). */
+  profileName: string;
   /** Provider route for SDK initialize. */
   provider: string;
   /** Model for SDK initialize (argv --model > settings.yaml > default). */
@@ -204,63 +177,12 @@ interface NativeDshConfig {
   credentials: Record<string, string>;
 }
 
-/** The botmux-owned subdir under the native dsh home (~/.dsh/botmux). */
-function dshBotmuxDir(): string {
-  return join(homedir(), '.dsh', 'botmux');
-}
-
-/** Write a composition to ~/.dsh/botmux/cordis.yml and return its path. */
-function writeComposition(content: string): string {
-  const dir = dshBotmuxDir();
+/** Ensure the profile directory exists under ~/.dsh/profiles/<name>.
+ *  The dsh CLI auto-creates cordis.yml if missing; we just need the dir. */
+function ensureProfileDir(name: string): string {
+  const dir = join(homedir(), '.dsh', 'profiles', name);
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, 'cordis.yml');
-  writeFileSync(path, content, 'utf8');
-  return path;
-}
-
-/** Serialize a JS object to YAML indented `spaces` levels (for embedding in
- *  a composition template). */
-function indentYaml(obj: unknown, spaces: number): string {
-  const str = stringifyYaml(obj, { indent: 2 }).trim();
-  const pad = ' '.repeat(spaces);
-  return str.split('\n').map(line => line ? pad + line : line).join('\n');
-}
-
-/** Generate a composition that mounts the user's pi-ai providers (translated
- *  verbatim from ~/.dsh/settings.yaml llm-pi-ai.providers). The wheel bundles
- *  dsh-llm-pi-ai, so each provider becomes a native llm route. */
-function generatePiAiComposition(providers: Record<string, unknown>): string {
-  const providersYaml = indentYaml(providers, 6);
-  return `# Generated by botmux dsh-runner from ~/.dsh/settings.yaml.
-- id: sdk-jsonrpc-server
-  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
-- id: agent-core
-  name: '@deepseek-ai/dsh-agent-spine-demo'
-  config:
-    workspaceContext:
-      maxBytes: 65536
-- id: llm-pi-ai
-  name: '@deepseek-ai/dsh-llm-pi-ai'
-  config:
-    providers:
-${providersYaml}
-- id: sessions
-  name: '@deepseek-ai/dsh-session-persistence-jsonl'
-  config:
-    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
-- id: session-checkpoints
-  name: '@deepseek-ai/dsh-session-checkpoint-policy'
-- id: subprocess
-  name: '@deepseek-ai/dsh-subprocess-local'
-- id: bash
-  name: '@deepseek-ai/dsh-bash-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-- id: fs-local
-  name: '@deepseek-ai/dsh-fs-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-`;
+  return dir;
 }
 
 /** Load credential references from ~/.dsh/.credentials.yaml as an env map.
@@ -283,68 +205,37 @@ function loadCredentials(): Record<string, string> {
   return out;
 }
 
-/** Resolve the composition, provider, model, and credentials.
+/** Resolve the profile name, provider, model, and credentials.
  *
  *  Precedence:
- *  1. DSH_CORDIS_CONFIG env — explicit override, skip native path entirely.
- *  2. ~/.dsh/settings.yaml — native config; generate a pi-ai composition.
- *  3. Fallback — vendored deepseek-official composition (DEEPSEEK_API_KEY env). */
+ *  1. --dsh-profile (default "botmux") — profile name under ~/.dsh/profiles/.
+ *  2. Provider & model from ~/.dsh/settings.yaml for the initialize RPC.
+ *  3. Credentials from ~/.dsh/.credentials.yaml. */
 function resolveNativeDshConfig(): NativeDshConfig {
-  // 1. Explicit DSH_CORDIS_CONFIG wins — full manual override.
-  const fromEnv = process.env.DSH_CORDIS_CONFIG?.trim();
-  if (fromEnv) {
-    if (!existsSync(fromEnv)) {
-      throw new Error(`DSH_CORDIS_CONFIG does not exist: ${fromEnv}`);
-    }
-    return {
-      configPath: fromEnv,
-      provider: 'deepseek-official',
-      model: args.model?.trim() || DEFAULT_MODEL,
-      credentials: {},
-    };
-  }
+  const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
 
-  // 2. Native ~/.dsh/settings.yaml — translate to a pi-ai composition.
+  // Ensure the profile directory exists (dsh CLI auto-creates cordis.yml).
+  ensureProfileDir(profileName);
+
+  // Resolve provider & model from ~/.dsh/settings.yaml for the initialize RPC.
+  //    The plugin composition is managed entirely by the profile's cordis.patch.yml.
   const settingsPath = join(homedir(), '.dsh', 'settings.yaml');
+  let provider = 'deepseek-official';
+  let settingsModel = '';
   if (existsSync(settingsPath)) {
     const settings = parseYaml(readFileSync(settingsPath, 'utf8')) as unknown;
     const s = isRecord(settings) ? settings : {};
     const defaultModel = isRecord(s['agent-default-model']) ? s['agent-default-model'] : {};
-    const provider = typeof defaultModel.provider === 'string' ? defaultModel.provider : '';
-    const settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
-    if (!provider || !settingsModel) {
-      throw new Error('~/.dsh/settings.yaml is missing agent-default-model.provider or agent-default-model.model');
-    }
-
-    // deepseek-official uses the stock llm-deepseek adapter (vendored composition).
-    if (provider === 'deepseek-official') {
-      return {
-        configPath: writeComposition(VENDORED_CONFIG),
-        provider,
-        model: args.model?.trim() || settingsModel,
-        credentials: loadCredentials(),
-      };
-    }
-
-    // Any other provider must be a configured pi-ai route.
-    const piAi = isRecord(s['llm-pi-ai']) ? s['llm-pi-ai'] : {};
-    const providers = isRecord(piAi.providers) ? piAi.providers : undefined;
-    if (!providers || !(provider in providers)) {
-      throw new Error(`provider "${provider}" not found in ~/.dsh/settings.yaml llm-pi-ai.providers`);
-    }
-    return {
-      configPath: writeComposition(generatePiAiComposition(providers)),
-      provider,
-      model: args.model?.trim() || settingsModel,
-      credentials: loadCredentials(),
-    };
+    provider = typeof defaultModel.provider === 'string' && defaultModel.provider
+      ? defaultModel.provider
+      : provider;
+    settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
   }
 
-  // 3. Fallback — vendored deepseek-official composition.
   return {
-    configPath: writeComposition(VENDORED_CONFIG),
-    provider: 'deepseek-official',
-    model: args.model?.trim() || DEFAULT_MODEL,
+    profileName,
+    provider,
+    model: args.model?.trim() || settingsModel || DEFAULT_MODEL,
     credentials: loadCredentials(),
   };
 }
@@ -396,13 +287,13 @@ class DshJsonRpcClient {
 
   constructor(
     private readonly dshBin: string,
-    private readonly configPath: string,
+    private readonly profileName: string,
     private readonly env: NodeJS.ProcessEnv,
     private readonly cwd: string,
   ) {}
 
   start(): void {
-    this.child = spawn(this.dshBin, [this.configPath], {
+    this.child = spawn(this.dshBin, ['--profile', this.profileName], {
       env: this.env,
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -808,7 +699,7 @@ async function main(): Promise<void> {
   // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
   // environment (bots.json env) wins on conflict, and the runner's
   // session/cwd always win.
-  client = new DshJsonRpcClient(args.dshBin, native.configPath, {
+  client = new DshJsonRpcClient(args.dshBin, native.profileName, {
     ...native.credentials,
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,

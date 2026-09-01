@@ -11,6 +11,8 @@ import {
   fetchBotDefaults,
   fetchCliOptions,
   fetchDetectedModels,
+  fetchDshProfiles,
+  createDshProfile,
   fmtSince,
   mergeModelCandidates,
   modelSuggestionsForOption,
@@ -2042,6 +2044,10 @@ export function BotAgentSection(props: {
   // headless runner. `touched` gates whether a save sends the field at all.
   const [dshRuntime, setDshRuntime] = useState<'official' | 'tui'>(bot.dshRuntime === 'tui' ? 'tui' : 'official');
   const [dshRuntimeTouched, setDshRuntimeTouched] = useState(false);
+  const [dshProfile, setDshProfile] = useState(bot.dshProfile ?? '');
+  const [dshProfileTouched, setDshProfileTouched] = useState(false);
+  const [dshProfileList, setDshProfileList] = useState<string[]>([]);
+  const [dshProfileStatus, setDshProfileStatus] = useState<StatusMessage>(null);
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -2061,6 +2067,8 @@ export function BotAgentSection(props: {
     setTurnTimeoutError(null);
     setDshRuntime(bot.dshRuntime === 'tui' ? 'tui' : 'official');
     setDshRuntimeTouched(false);
+    setDshProfile(bot.dshProfile ?? '');
+    setDshProfileTouched(false);
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -2099,6 +2107,13 @@ export function BotAgentSection(props: {
       .finally(() => { if (!stale) setDetectingModels(false); });
     return () => { stale = true; };
     // 只按 cliKey 重新探测；cliState 刷新带来的静态候选经 suggestions 合入，无需重探。
+  }, [cliKey]);
+  // Fetch DSH profile list when dsh is selected.
+  useEffect(() => {
+    if (cliKey !== 'dsh') return;
+    let stale = false;
+    fetchDshProfiles().then(list => { if (!stale) { setDshProfileList(list); if (!list.includes(dshProfile) && dshProfile !== '') { setDshProfile(''); } } });
+    return () => { stale = true; };
   }, [cliKey]);
   const modelCandidates = mergeModelCandidates(suggestions, detectedModels?.models ?? null);
   const detectedLiveCount = detectedModels?.source === 'live' ? detectedModels.models.length : 0;
@@ -2200,6 +2215,7 @@ export function BotAgentSection(props: {
         // dsh-only runtime variant: only send when touched, same semantics as
         // turnTimeoutMs. 'official' clears a stored 'tui' selection.
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
+        ...(cliKey === 'dsh' && dshProfileTouched ? { dshProfile: dshProfile || null } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
@@ -2245,6 +2261,7 @@ export function BotAgentSection(props: {
           reasoningEffort: res.body.reasoningEffort ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
+          dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
         // Re-sync the minutes input from the authoritative saved ms and clear
@@ -2609,6 +2626,57 @@ export function BotAgentSection(props: {
               {tr(dshRuntime === 'tui' ? 'botDefaults.dshRuntimeTuiNote' : 'botDefaults.dshRuntimeOfficialNote')}
             </p>
           </div>
+        </div>
+      )}
+      {isDsh && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.dshProfileHelp')}>{tr('botDefaults.dshProfileTitle')}</FieldTitle>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+              <select
+                data-input="dshProfile"
+                className="bd-field-select"
+                style={{ width: 220 }}
+                value={dshProfile}
+                disabled={agentBusy}
+                onChange={event => {
+                  setDshProfile(event.currentTarget.value);
+                  setDshProfileTouched(true);
+                }}
+              >
+                <option value="">{tr('botDefaults.dshProfileDefault')}</option>
+                {dshProfileList.map(p => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="bd-aux"
+                disabled={agentBusy}
+                onClick={async () => {
+                  const name = window.prompt(tr('botDefaults.dshProfileCreatePrompt'));
+                  if (!name || !name.trim()) return;
+                  const created = await createDshProfile(name.trim());
+                  if (created) {
+                    setDshProfileList(prev => prev.includes(created) ? prev : [...prev, created]);
+                    setDshProfile(created);
+                    setDshProfileTouched(true);
+                    setDshProfileStatus({ text: `✓ ${tr('botDefaults.dshProfileCreated', { name: created })}`, ok: true });
+                    setTimeout(() => setDshProfileStatus(null), 3000);
+                  } else {
+                    setDshProfileStatus({ text: `✗ ${tr('botDefaults.dshProfileCreateFailed')}` });
+                  }
+                }}
+              >
+                {tr('botDefaults.dshProfileCreate')}
+              </button>
+            </div>
+            {dshProfileStatus && (
+              <p className={`bd-aux-note ${dshProfileStatus.ok ? 'bd-aux-ok' : 'bd-aux-err'}`}>
+                {dshProfileStatus.text}
+              </p>
+            )}
+          </label>
         </div>
       )}
       {isDsh && (

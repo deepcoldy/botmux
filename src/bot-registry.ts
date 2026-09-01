@@ -1394,6 +1394,13 @@ export interface BotConfig {
    */
   turnTimeoutMs?: number;
   /**
+   * Per-bot dsh profile name. Only meaningful when `cliId === 'dsh'`:
+   * the profile lives under ~/.dsh/profiles/<name>/ and contains the plugin
+   * composition (cordis.yml + cordis.patch.yml). Defaults to 'botmux'.
+   * Non-dsh CLIs ignore the field.
+   */
+  dshProfile?: string;
+  /**
    * Per-bot dsh runtime variant. Only meaningful when `cliId === 'dsh'`:
    *   - `'official'` (default): the headless JSON-RPC runner (dsh-runner.ts).
    *   - `'tui'`: the interactive dsh-tui Ink TUI, driven via PTY (dsh-tui adapter).

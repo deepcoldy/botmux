@@ -36,18 +36,19 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `mira` | Mira APP | API / 远端 | |
 | `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
 | `riff` | riff | 云 Agent（API） | |
-| `dsh` | DeepSeek Harness（dsh-jsonrpc-agent） | 本地进程（SDK JSON-RPC） | ✅ |
+| `dsh` | DeepSeek Harness（dsh CLI） | 本地进程（SDK JSON-RPC） | ✅ |
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
 
 ## DeepSeek Harness（dsh）
 
-`cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh-jsonrpc-agent`（[deepseek-harness](https://github.com/deepseekai/deepseek-harness) 的打包 runtime），走 SDK JSON-RPC 协议。前置条件：
+`cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh` CLI（[deepseek-harness](https://github.com/deepseekai/deepseek-harness)），走 `dsh --profile <name>` 的 SDK JSON-RPC 协议。前置条件：
 
-1. `dsh-jsonrpc-agent` 在 PATH 上（或用 `cliPathOverride` 指定路径）。
+1. `dsh` 在 PATH 上（或用 `cliPathOverride` 指定路径）。
 2. 已通过原生 `dsh` CLI 完成配置（`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`）。
+3. 目标 profile（默认 `botmux`）的 `cordis.patch.yml` 已配置好社区插件和 LLM provider。
 
-runner 默认读取 `~/.dsh/settings.yaml` 的 `agent-default-model`（provider + model）和 `llm-pi-ai.providers`，生成对应的 cordis composition 并注入 `~/.dsh/.credentials.yaml` 里的凭据——`bots.json` 不需要配任何 env。如果 `~/.dsh/settings.yaml` 不存在，回退到 vendored deepseek-official 组合（此时仍需 `DEEPSEEK_API_KEY` env）。也可以设 `DSH_CORDIS_CONFIG` 环境变量显式指定 composition 路径，跳过原生配置读取。
+runner 读取 `~/.dsh/settings.yaml` 的 `agent-default-model`（provider + model）传给 initialize RPC；插件组合由 profile 的 `cordis.patch.yml` 完全控制，runner 不再生成 cordis.yml。
 
 会话 JSONL 落在 `~/.dsh/sessions/botmux/`；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。
 

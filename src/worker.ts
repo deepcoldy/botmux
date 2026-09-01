@@ -13987,6 +13987,8 @@ async function spawnCli(
     model: ttadkGateway ? undefined : cfg.model,
     // dsh runner only; other adapters ignore the field.
     turnTimeoutMs: cfg.turnTimeoutMs,
+    // dsh runner only; other adapters ignore the field.
+    dshProfile: cfg.dshProfile,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
     codexBrowser: cfg.codexBrowser,

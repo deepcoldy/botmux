@@ -702,7 +702,7 @@ describe('mira buildArgs', () => {
 });
 
 describe('dsh buildArgs (runner model)', () => {
-  const adapter = createDshAdapter('/opt/dsh/bin/dsh-jsonrpc-agent');
+  const adapter = createDshAdapter('/opt/dsh/bin/dsh');
 
   it('spawns the node runner and passes the dsh runtime binary', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
@@ -711,7 +711,7 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).toContain('--session-id');
     expect(args).toContain('sess-dsh');
     expect(args).toContain('--dsh-bin');
-    expect(args).toContain('/opt/dsh/bin/dsh-jsonrpc-agent');
+    expect(args).toContain('/opt/dsh/bin/dsh');
     expect(args).toContain('--cwd');
     expect(args).toContain('/repo/root');
   });
@@ -768,7 +768,7 @@ describe('dsh buildArgs (runner model)', () => {
   });
 
   it('canonicalizes a symlinked bin so --dsh-bin matches the sandbox-authorized path', () => {
-    // Regression: a symlink-installed dsh-jsonrpc-agent (e.g. ~/.local/bin →
+    // Regression: a symlink-installed dsh (e.g. ~/.local/bin →
     // SDK package dir) plus a symlinked HOME made the runner spawn the raw
     // symlink path, which the file sandbox never exposes (it authorizes only
     // dirname(realpath(bin))) → `spawn ... ENOENT` crash-loop under sandbox=true.
@@ -777,11 +777,11 @@ describe('dsh buildArgs (runner model)', () => {
     try {
       const realDir = join(root, 'opt', 'runtime');
       mkdirSync(realDir, { recursive: true });
-      const realBin = join(realDir, 'dsh-jsonrpc-agent-pkg-linux-x64');
+      const realBin = join(realDir, 'dsh-pkg-linux-x64');
       writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
       const linkDir = join(root, 'local', 'bin');
       mkdirSync(linkDir, { recursive: true });
-      const linkBin = join(linkDir, 'dsh-jsonrpc-agent');
+      const linkBin = join(linkDir, 'dsh');
       symlinkSync(realBin, linkBin);
 
       const symlinkAdapter = createDshAdapter(linkBin);

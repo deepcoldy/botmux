@@ -30,11 +30,11 @@ function pushOpt(args: string[], key: string, value: string | undefined): void {
 }
 
 export function createDshAdapter(pathOverride?: string): CliAdapter {
-  // Resolve the wrapped `dsh-jsonrpc-agent` binary lazily, on first buildArgs
+  // Resolve the wrapped `dsh` binary lazily, on first buildArgs
   // (spawn time), so constructing the adapter during `botmux setup` doesn't
   // shell out via resolveCommand. resolvedBin is the node runner, not dsh
   // itself.
-  const rawDshBin = pathOverride ?? 'dsh-jsonrpc-agent';
+  const rawDshBin = pathOverride ?? 'dsh';
   let cachedDshBin: string | undefined;
   return {
     id: 'dsh',
@@ -58,14 +58,13 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommandReal(rawDshBin))];
     },
 
-    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs }) {
-      // Pre-create the native dsh home + botmux subdirs in the real HOME
+    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
+      // Pre-create the native dsh home + sessions subdir in the real HOME
       // before the worker enters the sandbox: the sandbox's keepExisting
       // filter drops authPaths that don't exist yet, and the runner can't
       // create them from inside.
       const dshHome = join(homedir(), '.dsh');
       mkdirSync(dshHome, { recursive: true });
-      mkdirSync(join(dshHome, 'botmux'), { recursive: true });
       mkdirSync(join(dshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
         runnerArgv0('dsh-runner', runnerPath()),
@@ -77,6 +76,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      pushOpt(args, '--dsh-profile', dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux');
       // Per-bot turn timeout override; undefined → runner default (10 min).
       pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
         ? String(turnTimeoutMs)

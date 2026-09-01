@@ -36,18 +36,19 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
-| `dsh` | DeepSeek Harness (dsh-jsonrpc-agent) | local process (SDK JSON-RPC) | ✅ |
+| `dsh` | DeepSeek Harness (dsh CLI) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
 
 ## DeepSeek Harness (dsh)
 
-`cliId: "dsh"` drives a local `dsh-jsonrpc-agent` (the packaged runtime of [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner over the SDK JSON-RPC protocol. Prerequisites:
+`cliId: "dsh"` drives a local `dsh` CLI (the [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner via `dsh --profile <name>` over the SDK JSON-RPC protocol. Prerequisites:
 
-1. `dsh-jsonrpc-agent` on PATH (or point `cliPathOverride` at it).
+1. `dsh` on PATH (or point `cliPathOverride` at it).
 2. Native `dsh` CLI configured (`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`).
+3. The target profile's `cordis.patch.yml` (default `botmux`) configured with community plugins and LLM providers.
 
-The runner reads `agent-default-model` (provider + model) and `llm-pi-ai.providers` from `~/.dsh/settings.yaml`, generates a matching cordis composition, and injects credentials from `~/.dsh/.credentials.yaml` — no `env` config needed in `bots.json`. If `~/.dsh/settings.yaml` is absent, it falls back to the vendored deepseek-official composition (which still needs `DEEPSEEK_API_KEY` in env). You can also set `DSH_CORDIS_CONFIG` to explicitly specify a composition path and skip native config resolution.
+The runner reads `agent-default-model` (provider + model) from `~/.dsh/settings.yaml` for the initialize RPC; the plugin composition is entirely controlled by the profile's `cordis.patch.yml` — the runner no longer generates cordis.yml.
 
 Session JSONL lives under `~/.dsh/sessions/botmux/`. Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume).
 

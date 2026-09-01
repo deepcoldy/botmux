@@ -26,7 +26,7 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
 
 ### 2.2 dsh 侧
 
-- 有打包好的单文件 runtime **`dsh-jsonrpc-agent`**（`python/sdk-runtime`，wheel 自带，目标机无需 Node），说 **SDK JSON-RPC 协议**（`packages/sdk/protocol/src/types.ts`）：
+- 本地安装 `dsh` CLI（`@deepseek-ai/dsh` npm 包），说 **SDK JSON-RPC 协议**（`packages/sdk/protocol/src/types.ts`）：
   - 请求 3 个：`initialize {cwd, provider, model, maxTokens?}` → `{serverInfo}`；`session/prompt {sessionId, contentBlocks}` → `{messageId}`（入队回执，**不是最终结果**）；`shutdown`。
   - 通知 4 个：`session.event {sessionId, event}`（完整事件流）、`session.status {sessionId, status: 'idle'|'running'}`、`subagent.started`、`subagent.finished`。
   - session 语义：`sessionId` 由客户端指定，未知 id 懒创建；**同一连接内**复用 id 即多轮（server 内存 Map 持有 agent）。
@@ -49,14 +49,14 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
 
 ```
 飞书消息 → worker → dsh.ts (thin adapter)
-  buildArgs: node dsh-runner.js --session-id <id> --dsh-bin dsh-jsonrpc-agent --cwd <dir> ...
+  buildArgs: node dsh-runner.js --session-id <id> --dsh-bin dsh --cwd <dir> ...
   writeInput: ::botmux-dsh:<base64> 帧（writeRunnerInput）
       │
       ▼
 dsh-runner.js（长驻 Node 进程）
-  ├─ spawn: dsh-jsonrpc-agent --config <cordis.yml>
-  │    env: DSH_SESSION_ROOT=~/.botmux/dsh/sessions/<id>, DSH_CWD, DEEPSEEK_API_KEY
-  ├─ initialize（握手，provider=deepseek-official, model）
+  ├─ spawn: dsh --profile botmux
+  │    env: DSH_SESSION_ROOT=~/.dsh/sessions/botmux/<id>, DSH_CWD, credentials
+  ├─ initialize（握手，provider, model）
   ├─ 每 turn：session/prompt（固定 sessionId，连接内多轮）
   ├─ session.event → 工具调用渲染成进度行写 stdout（worker 当卡片渲染）
 │                → 累积 assistant 文本块
@@ -75,7 +75,7 @@ worker 解码 final → 投递飞书
 |---|---|
 | `id` | `'dsh'` |
 | `resolvedBin` | `process.execPath`（node 跑 runner） |
-| `sandboxExtraExecPaths` | lazy `resolveCommand(pathOverride ?? 'dsh-jsonrpc-agent')` |
+| `sandboxExtraExecPaths` | lazy `resolveCommand(pathOverride ?? 'dsh')` |
 | `buildArgs` | `[runnerPath(), '--session-id', sessionId, '--dsh-bin', <resolved>, '--cwd', workingDir, '--bot-name', botName, '--locale', locale, '--model', model?]` |
 | `writeInput` | `writeRunnerInput(pty, '::botmux-dsh:', content, undefined, context?.turnId)` |
 | `systemHints` | `[]`（runner 模式不走 botmux send 约定） |
@@ -85,7 +85,7 @@ worker 解码 final → 投递飞书
 | `readyPattern` | `/›/`（runner 握手完成后打印 `›`） |
 | `deferFirstPromptTimeoutUntilReady` | `true` |
 | `modelChoices` | `['deepseek-v4-flash', 'deepseek-v4-pro']` |
-| `authPaths` | `['~/.botmux/dsh']`（adapter 在进沙盒前预创建） |
+| `authPaths` | `['~/.dsh']`（adapter 在进沙盒前预创建） |
 | `buildResumeCommand` | `() => null`（v1 不支持） |
 
 ### 5.2 `src/dsh-runner.ts`（新增，~450 行）
@@ -93,9 +93,9 @@ worker 解码 final → 投递飞书
 **argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-config`（可选）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout`（默认 600s）。
 
 **boot**：
-1. 解析 config 路径：`--dsh-config` > `$DSH_CORDIS_CONFIG` > botmux 内置 `assets/dsh/cordis.yml`（vendored，见 5.4）。
-2. `spawn(dshBin, [configPath], {env: {...process.env, DSH_SESSION_ROOT: ~/.botmux/dsh/sessions/<session-id>, DSH_CWD: cwd}})`。
-3. NDJSON 握手：发 `initialize {cwd, provider: 'deepseek-official', model, maxTokens: 49152}`，等 result；超时 30s → lifecycle fatal 退出。
+1. 解析 profile 名称：`--dsh-profile`（默认 `botmux`）。
+2. `spawn(dshBin, ['--profile', profileName], {env: {...process.env, DSH_SESSION_ROOT: ~/.dsh/sessions/botmux/<session-id>, DSH_CWD: cwd}})`。
+3. NDJSON 握手：发 `initialize {cwd, provider, model, maxTokens: 49152}`，等 result；超时 30s → lifecycle fatal 退出。
 4. 成功后 stdout 打印 `›`（ready 标记）。
 
 **输入循环**：逐字节读 stdin，遇换行解析 `::botmux-dsh:<base64>` → JSON `{type:'message', content, replyTurnId}`：
@@ -135,11 +135,11 @@ runner→dsh（SDK JSON-RPC，NDJSON over stdio）：见 2.2。
 
 ### 5.4 配置与注册点
 
-- **vendored 配置**：`assets/dsh/cordis.yml`，内容取自 dsh `python/sdk-runtime/src/deepseek_harness_runtime/runtime/cordis.yml`（含 jsonrpc-server/agent-spine/llm-deepseek/jsonl/checkpoint/bash/fs），随 botmux 版本 pin dsh 协议版本。
+- **profile 配置**：`~/.dsh/profiles/botmux/cordis.patch.yml`，在 `dsh-base` bundle 基础上叠加社区插件（sdk-jsonrpc-server、archify-skill-filesystem、openviking-memory、genui 等）和 LLM provider（llm-pi-ai 通过 traex-bridge）。`dsh --profile botmux` 自动 compose 完整插件树。
 - **bots.json**：`"cliId": "dsh"`，`"env": {"DEEPSEEK_API_KEY": "..."}`，可选 `"model": "deepseek-v4-pro"`、`"workingDir"`。
 - **注册点**（照 `src/adapters/cli/CLAUDE.md`）：
   1. `src/adapters/cli/types.ts` CliId 加 `'dsh'`
-  2. `src/adapters/cli/registry.ts`：import + `RAW_CLI_EXECUTABLES['dsh-jsonrpc-agent']` + switch case
+  2. `src/adapters/cli/registry.ts`：import + `RAW_CLI_EXECUTABLES['dsh']` + switch case
   3. `src/worker.ts` CLI_DISPLAY_NAMES、`src/im/lark/card-builder.ts` cliDisplayNames
   4. `src/setup/bot-config-editor.ts`：CLI_ID_CHOICES **尾部追加** + labels
   5. `test/cli-adapters.test.ts`：ALL_CLI_IDS + dsh describe 段
