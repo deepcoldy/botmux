@@ -17,7 +17,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // imported by src/core/self-spawn.ts on the transitive graph).
 vi.mock('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process');
-  return { ...actual, execSync: vi.fn() };
+  return {
+    ...actual,
+    execSync: vi.fn(),
+    // ⚠️ `execFileSync` MUST be stubbed, even though no test configures it.
+    // `readProcessStartTime()` falls back to `execFileSync('ps', ['-o','lstart=' …])`
+    // when /proc parsing yields nothing. Before the spread was added, this factory
+    // returned ONLY `execSync`, so that call threw and `startedAt` stayed undefined —
+    // the "should not include sessionId for non-claude CLI types" and "metadata file
+    // not found" cases silently depended on that OMISSION. Spreading the real module
+    // (required: bun links named exports for real) handed the fallback a working `ps`,
+    // which returned a genuine timestamp and failed both `toBeUndefined()` assertions.
+    // Throwing here preserves the original behaviour explicitly instead of by accident.
+    execFileSync: vi.fn(() => { throw new Error('execFileSync not stubbed for this test'); }),
+  };
 });
 
 vi.mock('node:fs', () => {
