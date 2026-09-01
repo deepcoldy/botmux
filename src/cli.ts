@@ -13197,6 +13197,30 @@ async function removePluginSkillRegistryEntries(pluginId: string): Promise<void>
   }
 }
 
+/** The per-machine enabled set lives in `~/.botmux/config.json`, which the file
+ *  sandbox deliberately does NOT expose (it can hold voice credentials), so
+ *  `readGlobalConfig()` returns `{}` there — indistinguishable from "read fine,
+ *  nothing enabled". Printing a bare id in that case would assert a fact we did
+ *  not observe, so classify the read: `undefined` = could not read it.
+ *
+ *  ANY read failure counts, ENOENT included, because the two sandbox backends hide
+ *  the file differently: seatbelt leaves it in place and denies the read (EPERM),
+ *  while bwrap never binds it into the fresh tmpfs at all (ENOENT). Keying on the
+ *  errno would make this work on macOS and silently do nothing on Linux — where the
+ *  daemon actually runs. The cost is a host that has plugins installed but no
+ *  config file yet, which now prints `enabled?` instead of a bare id: still true
+ *  (nothing IS enabled and we claim nothing), just less specific — the right side
+ *  to err on when the alternative is asserting "not enabled" from a file we never
+ *  read. */
+function readEnabledPluginIdsOrUnknown(): Set<string> | undefined {
+  try {
+    readFileSync(globalConfigPath(), 'utf-8');
+  } catch {
+    return undefined;
+  }
+  return new Set(readGlobalConfig().plugins ?? []);
+}
+
 function assertPluginInstalled(pluginId: string): void {
   const { plugins } = readPluginRegistryCached();
   if (!plugins[pluginId]) {
@@ -13392,12 +13416,15 @@ async function cmdPlugin(args: string[]): Promise<void> {
       console.log('暂无已安装插件。');
       return;
     }
-    const globalPlugins = new Set(readGlobalConfig().plugins ?? []);
+    const globalPlugins = readEnabledPluginIdsOrUnknown();
     for (const plugin of plugins) {
-      const flags = [
-        globalPlugins.has(plugin.id) ? 'enabled' : '',
-      ].filter(Boolean).join(' ');
+      const flags = globalPlugins === undefined
+        ? 'enabled?'
+        : (globalPlugins.has(plugin.id) ? 'enabled' : '');
       console.log(`${plugin.id}\t${plugin.packageName}@${plugin.version}${flags ? `\t${flags}` : ''}`);
+    }
+    if (globalPlugins === undefined) {
+      console.log(`（enabled? = 未知：本会话没有 ${globalConfigPath()} 的读权限，启用状态无法观测）`);
     }
     return;
   }
