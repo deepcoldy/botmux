@@ -375,7 +375,7 @@ import {
   publishSessionPreviewCleared,
   takeSessionPreviewTarget,
 } from './session-preview-registry.js';
-import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
+import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
 import {
   attachOrdinaryTurnRecovery,
@@ -6366,7 +6366,7 @@ export async function closeSession(
     publishClosedSessionPatch(
       sessionId,
       after?.closedAt ? Date.parse(after.closedAt) : undefined,
-      { tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null },
+      { tokenUsage: after?.tokenUsage ?? null },
     );
   }
 

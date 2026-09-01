@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import type { SessionTokenUsageSnapshot } from '../types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
 import {
   __resetTranscriptResolverCacheForTest,
@@ -31,7 +32,7 @@ export interface SessionCost {
   turns: number;
 }
 
-export interface SessionTokenUsage extends SessionCost {
+export interface SessionTokenUsage extends SessionCost, SessionTokenUsageSnapshot {
   in: number;
   out: number;
 }

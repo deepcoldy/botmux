@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
+import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import {
@@ -1861,11 +1862,25 @@ export function closeSession(
     const priorDashboardAttachments = session.dashboardAttachments;
     // Durable first: build the closed row, commit it, and only then merge it
     // into the live object. A failed write leaves the session exactly as it
-    // was, which is what the hand-written field-by-field restore used to
-    // approximate.
+    // was, including any prior tokenUsage snapshot.
     const next: Session = { ...session };
     next.status = 'closed';
     next.closedAt = new Date().toISOString();
+    try {
+      const tokenUsage = getSessionTokenUsage({
+        cliId: session.cliId ?? 'unknown',
+        sessionId: session.sessionId,
+        cliSessionId: session.cliSessionId,
+        cwd: session.workingDir,
+        larkAppId: session.larkAppId,
+        fresh: true,
+      });
+      if (tokenUsage !== null) next.tokenUsage = tokenUsage;
+      else if (next.tokenUsage === undefined) next.tokenUsage = null;
+    } catch (err: any) {
+      logger.warn(`Failed to snapshot token usage for session ${sessionId}: ${err?.message ?? err}`);
+      if (next.tokenUsage === undefined) next.tokenUsage = null;
+    }
     next.dashboardAttachments = undefined;
     next.queuedAttachments = undefined;
     // `previewTarget` is a live loopback (host, port) the session's agent
@@ -1938,7 +1953,9 @@ export function reactivateClosedSession(
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Durable first (see closeSession): the reactivated row is committed before
-  // it is merged into the live object, so a failed write is a no-op.
+  // it is merged into the live object, so a failed write is a no-op. Reactivate
+  // starts a new lifecycle, so the previous close-time token snapshot must not
+  // survive into the active row or the next close.
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
@@ -1960,11 +1977,13 @@ export function reactivateClosedSession(
   next.pendingRepoSetup = undefined;
   next.previewTarget = undefined;
   next.mojoCloseJournal = undefined;
+  next.tokenUsage = undefined;
 
   persistRow(next);
   Object.assign(session, next);
   return { ok: true, session };
 }
+
 
 export function updateSessionPid(sessionId: string, pid: number | null): void {
   loadForWrite();

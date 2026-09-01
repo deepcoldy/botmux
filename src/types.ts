@@ -45,6 +45,17 @@ export interface VcMeetingImTurnOrigin {
   replyTargetSenderOpenId?: string;
 }
 
+export interface SessionTokenUsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+  model: string;
+  turns: number;
+  in: number;
+  out: number;
+}
+
 export interface TrustedCaller {
   requestUserOpenId?: string;
   requestUserUnionId?: string;
@@ -364,6 +375,9 @@ export interface Session {
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
   closedAt?: string;
+  /** Last cumulative token usage persisted at close time. Dashboard list
+   *  reads this durable snapshot without rescanning historical transcripts. */
+  tokenUsage?: SessionTokenUsageSnapshot | null;
   /**
    * Restore/runtime ownership quarantine. Set when botmux cannot prove that an
    * existing external/persistent target is safe to attach or tear down, and

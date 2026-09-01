@@ -14,6 +14,9 @@ import { tmpdir } from 'os';
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
 const fsControl = vi.hoisted(() => ({ failSessionWrite: false, failReaddir: false }));
+const costCalculatorMock = vi.hoisted(() => ({
+  getSessionTokenUsage: vi.fn(() => null),
+}));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
@@ -59,6 +62,8 @@ const mockDeleteFrozenCards = vi.fn();
 vi.mock('../src/services/frozen-card-store.js', () => ({
   deleteFrozenCards: (...args: any[]) => mockDeleteFrozenCards(...args),
 }));
+
+vi.mock('../src/core/cost-calculator.js', () => costCalculatorMock);
 
 // Import the module under test after mocks are set up
 import {
@@ -129,6 +134,8 @@ function readPersistedRows(dir: string, appId?: string): Record<string, any> {
 beforeEach(() => {
   tempDir = makeTempDir();
   fsControl.failSessionWrite = false;
+  costCalculatorMock.getSessionTokenUsage.mockReset();
+  costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
   __testOnly_setBeforeRowPersist(undefined);
   mockDeleteFrozenCards.mockReset();
   // Reset module state for each test
@@ -563,6 +570,94 @@ describe('closeSession()', () => {
     expect(reloaded!.closedAt).toBeDefined();
   });
 
+  it('snapshots token usage in the same durable close write', () => {
+    const tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'claude-test',
+    };
+    costCalculatorMock.getSessionTokenUsage.mockReturnValue(tokenUsage);
+    const session = createSession('chat1', 'root1', 'Close With Usage');
+    session.cliId = 'claude-code';
+    session.cliSessionId = 'native-1';
+    session.workingDir = '/repo';
+    session.larkAppId = 'cli_app';
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(costCalculatorMock.getSessionTokenUsage).toHaveBeenCalledWith({
+      cliId: 'claude-code',
+      sessionId: session.sessionId,
+      cliSessionId: 'native-1',
+      cwd: '/repo',
+      larkAppId: 'cli_app',
+      fresh: true,
+    });
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(tokenUsage);
+    init();
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(tokenUsage);
+    expect(readPersistedRows(tempDir)[session.sessionId].tokenUsage).toEqual(tokenUsage);
+  });
+
+  it('preserves existing token usage when close-time usage scan returns empty', () => {
+    const existingTokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'previous-model',
+    };
+    costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
+    const session = createSession('chat1', 'root1', 'Close With Existing Usage');
+    session.tokenUsage = existingTokenUsage;
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+    init();
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(existingTokenUsage);
+  });
+
+  it('does not fail close or overwrite existing token usage when close-time scan throws', () => {
+    const existingTokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'previous-model',
+    };
+    costCalculatorMock.getSessionTokenUsage.mockImplementation(() => {
+      throw new Error('transcript unavailable');
+    });
+    const session = createSession('chat1', 'root1', 'Close With Throwing Usage');
+    session.tokenUsage = existingTokenUsage;
+    updateSession(session);
+
+    expect(() => closeSession(session.sessionId)).not.toThrow();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+    init();
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(existingTokenUsage);
+  });
+
   it('clears Riff lineage atomically with the durable closed row', () => {
     const session = createSession('chat1', 'root1', 'Close Riff');
     session.backendType = 'riff';
@@ -942,6 +1037,118 @@ describe('reactivateClosedSession()', () => {
     const reloaded = getSession(session.sessionId)!;
     expect(reloaded.status).toBe('active');
     expect(reloaded.previewTarget).toBeUndefined();
+  });
+
+  it('clears a closed token usage snapshot when starting a new lifecycle', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Usage');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+
+    init();
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.closedAt).toBeUndefined();
+    expect(reloaded.tokenUsage).toBeUndefined();
+  });
+
+  it('restores token usage if reactivation persistence fails', () => {
+    const existingTokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    const session = createSession('chat1', 'root1', 'Legacy Closed Usage Rollback');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = existingTokenUsage;
+    updateSession(legacy);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated reactivate write failure'); });
+
+    expect(() => reactivateClosedSession(session.sessionId)).toThrow(/simulated reactivate write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+
+    __testOnly_setBeforeRowPersist(undefined);
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+  });
+
+  it('does not carry a previous lifecycle token snapshot into a second close', () => {
+    const session = createSession('chat1', 'root1', 'Second Lifecycle Usage');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    updateSession(legacy);
+
+    expect(reactivateClosedSession(session.sessionId).ok).toBe(true);
+    costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: null,
+    });
+  });
+
+  it('does not restore a previous lifecycle token snapshot when the second close scan throws', () => {
+    const session = createSession('chat1', 'root1', 'Second Lifecycle Throwing Usage');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    updateSession(legacy);
+
+    expect(reactivateClosedSession(session.sessionId).ok).toBe(true);
+    costCalculatorMock.getSessionTokenUsage.mockImplementation(() => {
+      throw new Error('new lifecycle transcript unavailable');
+    });
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: null,
+    });
   });
 });
 

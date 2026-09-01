@@ -227,7 +227,9 @@ function maybeSessionTokenUsage(
   s: Session,
   workingDir: string | undefined,
   opts?: DashboardRowOptions,
+  opts2?: { usePersistedSnapshot?: boolean },
 ): SessionTokenUsage | null {
+  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return s.tokenUsage;
   return opts?.includeTokenUsage === false ? null : sessionTokenUsage(s, workingDir);
 }
 
@@ -334,7 +336,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: feishuChatLink(s.chatId, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
-    tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
+    tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
   };
 }
