@@ -13,7 +13,7 @@
  * cachedSnapshot」的超集捷径，并发时序下它有没有可能让一个走 cache、另一个
  * 发请求？那是我推理出来的，不是实测。所以这里直接数 fetch 次数。
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 const NAMES_URL = '/api/groups?view=names';
 const FULL_URL = '/api/groups';

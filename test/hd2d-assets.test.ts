@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { hd2dAssetPath, hd2dStatus, HD2D_CACHE_DIR } from '../src/dashboard/hd2d-assets.js';
 
 describe('hd2dAssetPath — allow-list guard', () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   CodexBridgeQueue,
   STRUCTURED_SUBMIT_START_GRACE_MS,

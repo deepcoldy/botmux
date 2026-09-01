@@ -13,7 +13,7 @@
  *
  * Run: pnpm vitest run test/card-handler-stop-compact.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 // ─── Mocks (before importing the module under test) ───────────────────────
 

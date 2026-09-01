@@ -4,7 +4,7 @@
  *
  * Run:  pnpm vitest run test/lark-hosts.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { appCenterAppLink, larkHosts, normalizeBrand, sdkDomain, chatAppLink, threadAppLink } from '../src/im/lark/lark-hosts.js';
 
 describe('lark-hosts', () => {

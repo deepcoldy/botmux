@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 /**
  * 侧边栏导航有两处真相源：`NAV_ITEMS` 定义每一项，`NAV_GROUPS` 决定分组与

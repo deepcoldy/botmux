@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/write-link-delivery.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 
 const { sendEphemeralCardMock, sendUserMessageMock, botState } = vi.hoisted(() => ({

@@ -24,7 +24,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../src/core/session-marker.js';
 import {
   __testOnly_setFileLockHooks,

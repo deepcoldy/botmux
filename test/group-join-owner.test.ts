@@ -2,7 +2,7 @@
  * autoInviteOwnerOnGroupJoin：bot 进群自动把 owner 拉进群（默认 ON，显式 false 关）。
  * Run: pnpm vitest run test/group-join-owner.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 const requestMock = vi.fn(async (_arg: any) => ({ code: 0, data: { items: [], has_more: false } }));
 const createMock = vi.fn(async (_arg: any) => ({ code: 0, data: {} }));

@@ -11,7 +11,7 @@ import { randomBytes } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';

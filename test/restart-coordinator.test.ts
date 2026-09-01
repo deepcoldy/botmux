@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 
 const flush = async () => {

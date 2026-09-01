@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 // Avoid real trigger-log writes to ~/.botmux/data during dispatch tests.
 vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn() }));

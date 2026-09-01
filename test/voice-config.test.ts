@@ -2,7 +2,7 @@
  * Voice config gating + audio helpers (pure logic).
  * Run: pnpm vitest run test/voice-config.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { evaluateVoiceConfig, DEFAULT_SAMI_SPEAKER } from '../src/services/voice/index.js';
 import { toSpoken, pcmDurationMs, pcmToWav } from '../src/services/voice/audio.js';
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { repinSessionWorkingDir } from '../src/core/session-cwd.js';

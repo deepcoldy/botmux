@@ -1,5 +1,5 @@
 // test/dashboard-events.test.ts
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { DashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 
 describe('DashboardEventBus', () => {

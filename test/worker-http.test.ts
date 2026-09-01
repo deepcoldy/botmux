@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import type { IncomingMessage } from 'node:http';
 import { parseWorkerRequestUrl, resolveWorkerHttpHost } from '../src/utils/worker-http.js';
 

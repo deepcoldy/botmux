@@ -2,7 +2,7 @@
  * team-bot-directory：平台团队名册 + 联邦（本地托管 + spoke→hub HTTP）三源合并目录。
  * Run: pnpm vitest run test/team-bot-directory.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

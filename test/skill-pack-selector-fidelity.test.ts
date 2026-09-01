@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { attachSkillPolicy, detachSkillPolicy } from '../src/core/skills/im-command.js';
 import { readBotSkillPolicy } from '../src/bot-registry.js';
 import type { BotSkillPolicy } from '../src/core/skills/types.js';

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { shouldPreMarkFirstTurn, shouldQueueInitialPrompt, type EngageOutcome } from '../src/codex-rpc-lifecycle.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';

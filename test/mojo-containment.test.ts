@@ -23,7 +23,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileS
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { isLinux } from './helpers/synthetic-proc.js';
 
 import {

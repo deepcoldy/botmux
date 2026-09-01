@@ -7,7 +7,7 @@
  * prepareDirectSandbox. The pure mount-plan logic lives in fs-policy.ts and is
  * covered by fs-policy.test.ts.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';

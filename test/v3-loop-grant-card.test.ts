@@ -4,7 +4,7 @@
  * 含 stale 防护（expectedIteration —— expectedAttemptId 的同款教训）。
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

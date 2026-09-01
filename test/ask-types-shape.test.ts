@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { isCustomReply, toLegacySelected, type AskQuestion, type AskResult } from '../src/core/ask-types.js';
 
 describe('ask-types 多问多选模型', () => {

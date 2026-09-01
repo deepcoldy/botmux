@@ -9,7 +9,7 @@
  *
  * Run: pnpm vitest run test/config-data-dir.test.ts
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'bun:test';
 
 afterEach(() => {
   delete process.env.SESSION_DATA_DIR;

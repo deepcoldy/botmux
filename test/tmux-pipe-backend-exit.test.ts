@@ -20,7 +20,7 @@
  * shared with every live daemon on this machine. A fake `tmux` first on PATH
  * keeps the real fifo/read/teardown path intact while touching no real server.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';

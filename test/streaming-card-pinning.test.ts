@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 

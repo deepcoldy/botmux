@@ -10,7 +10,7 @@
  * Mocks node:child_process.execFileSync (used by tryHerdrJson) and
  * node:fs.readdirSync/readFileSync (used by findUniqueClaudeSessionByCwd).
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),

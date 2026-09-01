@@ -9,7 +9,7 @@
  * 成功。证明卡片那一砖确实接到了 daemon 受阻分发上。
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

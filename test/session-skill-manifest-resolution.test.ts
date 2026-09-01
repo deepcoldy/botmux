@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { resolveSessionSkillManifest } from '../src/core/skills/session-resolver.js';
 

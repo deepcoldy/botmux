@@ -5,7 +5,7 @@
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import { buildTeamRoster, resolveLiveBotTransport } from '../src/services/team-roster.js';
 import { setBotCapability } from '../src/services/bot-profile-store.js';
 import { setBotOwner } from '../src/services/bot-owner-store.js';

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 const mockIsBotMentioned = vi.fn(() => true);
 const mockCanOperate = vi.fn(() => true);

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { assertSavedWorkflowTemplateBindings } from '../src/workflows/v3/template-bindings.js';
 

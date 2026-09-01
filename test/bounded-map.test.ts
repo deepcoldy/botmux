@@ -3,7 +3,7 @@
  * 同时保持 Map 的语义（get/has/delete、re-set 不增长、re-set 更新值）。
  * Run:  pnpm vitest run test/bounded-map.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { BoundedMap } from '../src/utils/bounded-map.js';
 
 describe('BoundedMap', () => {

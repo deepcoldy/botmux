@@ -6,7 +6,7 @@
  *
  * Run: pnpm vitest run test/feishu-login-manager.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { FeishuLoginManager } from '../src/dashboard/feishu-login.js';
 import type { FeishuWebSessionOptions, FeishuWebSessionPrepareResult } from '../src/setup/open-platform-automation.js';
 

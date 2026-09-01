@@ -7,7 +7,7 @@
  *
  * Run:  pnpm vitest run test/scheduler.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { parseNaturalSchedule, parseSchedule, computeNextRun, extractDeliveryMode, extractSilentMode, extractScheduleModifiers, planCronRealign } from '../src/core/scheduler.js';
 
 // ─── Helper ──────────────────────────────────────────────────────────────────

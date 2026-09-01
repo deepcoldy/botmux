@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { detectCodexComposerState } from '../src/services/codex-composer-state.js';
 
 describe('detectCodexComposerState', () => {

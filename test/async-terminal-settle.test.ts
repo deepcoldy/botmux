@@ -19,7 +19,7 @@
  *
  * Run:  pnpm vitest run test/async-terminal-settle.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),

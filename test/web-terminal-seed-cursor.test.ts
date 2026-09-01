@@ -20,7 +20,7 @@
  *
  * Run: pnpm vitest run test/web-terminal-seed-cursor.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import xtermHeadless from '@xterm/headless';
 import {
   composeSeedBody,

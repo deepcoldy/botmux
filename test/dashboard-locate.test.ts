@@ -1,5 +1,5 @@
 // test/dashboard-locate.test.ts
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'bun:test';
 import { LocateRateLimiter } from '../src/core/dashboard-locate.js';
 
 describe('LocateRateLimiter', () => {

@@ -2,7 +2,7 @@
  * local-cli-opener: local terminal command construction and launch guards.
  * Run: pnpm vitest run test/local-cli-opener.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

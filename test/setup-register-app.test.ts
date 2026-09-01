@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-register-app.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // 必须 hoist 到 vi.mock 工厂里; vitest 不允许工厂函数引用顶层变量.
 vi.mock('@larksuiteoapi/node-sdk', () => ({

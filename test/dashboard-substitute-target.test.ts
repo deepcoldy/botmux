@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildSubstituteTarget } from '../src/dashboard/web/bot-defaults-page.js';
 
 // Regression guard for the substitute-target edit path: re-editing a just-resolved email

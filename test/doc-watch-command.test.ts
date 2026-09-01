@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { docWatchCommandNeedsSession, parseDocWatchCommand } from '../src/core/doc-watch-command.js';
 import { isDocNativeSession } from '../src/core/types.js';
 

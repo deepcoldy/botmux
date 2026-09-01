@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, toResourceMonitorDaemonSeed, toResourceMonitorSessionSeed } from '../src/dashboard/resource-monitor-service.js';
 import type { ProcfsSample } from '../src/core/resource-monitor/types.js';
 

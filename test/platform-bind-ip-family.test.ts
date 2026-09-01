@@ -1,7 +1,7 @@
 // test/platform-bind-ip-family.test.ts
 // botmux bind 的协议族兜底链：默认路径不通 → 依次 IPv6 / IPv4 重试，
 // 但不再把 ipFamily 写进绑定文件（隧道始终用 happy-eyeballs 自动选路）。
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 const postJson = vi.fn();
 vi.mock('../src/platform/platform-http.js', () => ({

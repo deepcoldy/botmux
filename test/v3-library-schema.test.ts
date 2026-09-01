@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import {
   SAVED_WORKFLOW_METADATA_SCHEMA_VERSION,

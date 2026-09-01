@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 

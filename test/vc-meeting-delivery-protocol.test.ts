@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   VC_MEETING_DELIVERY_KEY_MAX_LENGTH,
   canonicalVcMeetingDeliveryInput,

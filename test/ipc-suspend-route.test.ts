@@ -2,7 +2,7 @@
 // worker（那会把这一轮丢掉），改为记 pendingSuspendReason 并回 reason:'deferred'，
 // 由 worker-pool 的 runPendingSuspendIfSettled 在 idle/limited 边沿兑现。
 // 兑现半边见 deferred-suspend.test.ts。
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import * as workerPool from '../src/core/worker-pool.js';
 

@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { SkillsInstallPanel } from '../src/dashboard/web/skills-page.js';
 import { SkillLibraryTab } from '../src/dashboard/web/skills/skill-library-tab.js';
 import { DeliverySettingsTab } from '../src/dashboard/web/skills/delivery-settings-tab.js';

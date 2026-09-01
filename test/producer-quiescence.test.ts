@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited, type ProducerHandle } from '../src/core/producer-quiescence.ts';

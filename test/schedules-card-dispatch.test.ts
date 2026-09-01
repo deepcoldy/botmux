@@ -2,7 +2,7 @@
  * PR3 `/dashboard schedules` slice 1 — production dispatch path.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<typeof import('../src/im/lark/client.js')>(

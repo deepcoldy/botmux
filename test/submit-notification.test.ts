@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildSubmitMessagePreview } from '../src/services/submit-notification.js';
 
 describe('buildSubmitMessagePreview', () => {

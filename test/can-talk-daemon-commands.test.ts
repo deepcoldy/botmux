@@ -4,7 +4,7 @@
  * - 闸：canRunDaemonCommand = canOperate ∪ (cmd ∈ 名单 && canTalk)
  * Run: pnpm vitest run test/can-talk-daemon-commands.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

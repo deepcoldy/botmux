@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { resolveVcMeetingConsumerProfiles } from '../src/bot-registry.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class FakeClient {} }));

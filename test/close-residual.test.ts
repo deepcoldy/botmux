@@ -5,7 +5,7 @@
  *
  * Run:  pnpm vitest run test/close-residual.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   closeResidualClause,
   closeResidualIsLocal,

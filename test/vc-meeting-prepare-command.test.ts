@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { extractVcMeetingNumber, parseVcMeetingPrepareCommand } from '../src/core/vc-meeting-prepare-command.js';
 
 describe('vc meeting prepare command', () => {

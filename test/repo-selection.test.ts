@@ -3,7 +3,7 @@
  * which lets a user skip the Lark repo-selection card by naming a path
  * (absolute/relative) or a first-level project name under a scan dir.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 import { execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';

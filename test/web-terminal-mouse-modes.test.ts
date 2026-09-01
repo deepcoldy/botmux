@@ -13,7 +13,7 @@
  *   - worker seed appends the mode seed for WRITE clients only, and the client
  *     script trailing-throttles pure-motion reports (1003 floods → send-keys)
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 

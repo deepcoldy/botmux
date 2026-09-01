@@ -2,7 +2,7 @@
  * Unit tests for structured-bridge allowlists + file path resolver.
  * Keeps the single-source helpers honest without pulling the worker.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

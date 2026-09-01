@@ -1,7 +1,7 @@
 /**
  * Unit tests for Grok updates.jsonl drain + session discovery helpers.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import {
   mkdirSync, writeFileSync, appendFileSync, rmSync, statSync, existsSync,
   openSync, closeSync, utimesSync,

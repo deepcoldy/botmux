@@ -11,7 +11,7 @@
  *   - getChildPid resolves through display-message, not list-panes
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

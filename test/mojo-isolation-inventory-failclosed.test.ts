@@ -9,7 +9,7 @@
  * 2. An active mojo row must be surfaced even when pid/cliSessionId are absent,
  *    because MojoBackend.runTurn spawns a credentialed local child every turn.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/services/session-store.js', () => ({
   // The compatible reader swallows failures and yields nothing. Production must

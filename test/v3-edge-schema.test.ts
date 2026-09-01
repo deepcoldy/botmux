@@ -6,7 +6,7 @@
  * enum 行为。引擎层（edgeResolved / skipped / decideNext）测试随 codex 的
  * 引擎实现落地，不在本文件。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

@@ -5,7 +5,7 @@
  * 并发写同一目标时读者永远看到完整内容（同进程并发近似模拟多进程场景）、
  * symlink 目标穿透写真实文件不替换链接本体。
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, statSync, readdirSync, writeFileSync, existsSync, symlinkSync, lstatSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

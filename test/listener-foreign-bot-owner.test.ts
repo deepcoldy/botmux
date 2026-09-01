@@ -17,7 +17,7 @@
  * Run: pnpm vitest run test/listener-foreign-bot-owner.test.ts
  */
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
 

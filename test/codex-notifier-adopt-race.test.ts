@@ -18,7 +18,7 @@
  *
  * Run: pnpm vitest run test/codex-notifier-adopt-race.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const mocks = vi.hoisted(() => ({
   transferring: new WeakSet<object>(),

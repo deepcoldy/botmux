@@ -8,7 +8,7 @@
  * location, the `seed --resume` handoff, and that it inherits Claude's bridge
  * machinery (claudeDataDir / hook / type-ahead) verbatim.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { join, dirname } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';

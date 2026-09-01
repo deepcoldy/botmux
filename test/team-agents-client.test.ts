@@ -2,7 +2,7 @@
  * 团队维度 Agent 互查 / 拉群的 machine-auth 客户端。
  * Run: pnpm vitest run test/team-agents-client.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   fetchTeamAgents,
   fetchTeams,

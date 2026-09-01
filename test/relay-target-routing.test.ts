@@ -3,7 +3,7 @@
  * resolveRegularGroupMode is mocked so we control the 普通群 mode directly
  * without standing up a bot registry.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const resolveRegularGroupModeMock = vi.fn();
 vi.mock('../src/services/chat-reply-mode-store.js', () => ({

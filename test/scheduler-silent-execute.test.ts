@@ -19,7 +19,7 @@
  * forkWorker / lark client are stubbed (same pattern as
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 

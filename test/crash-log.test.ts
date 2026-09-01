@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { stripAnsiForLog, tailChars } from '../src/utils/crash-log.js';
 
 describe('tailChars', () => {

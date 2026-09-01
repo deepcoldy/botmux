@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'bun:test';
 
 // triggerSessionTurn must mirror the inbound @ routing: in a 普通群 `new-topic`
 // chat every webhook opens its own topic + session instead of folding into the

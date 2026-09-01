@@ -13,7 +13,7 @@
  *
  * Run:  pnpm vitest run test/worker-ready-display-mode.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { EventEmitter } from 'node:events';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────

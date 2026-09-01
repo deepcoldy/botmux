@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS,
   DAEMON_SHUTDOWN_MAX_MS,

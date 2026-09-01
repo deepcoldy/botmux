@@ -9,7 +9,7 @@
  * getChatNameAndMode and isRelayableRealSession are external; we stub them so
  * the test exercises selection + sort logic in isolation.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 vi.mock('../src/im/lark/client.js', () => ({
   // Resolve every group chat to a stable friendly name so the mapping step

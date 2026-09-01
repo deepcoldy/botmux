@@ -16,7 +16,7 @@
  * Run: pnpm vitest run test/rate-limit-notify.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

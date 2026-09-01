@@ -11,7 +11,7 @@
  *  - the toggle/card cycle never reuses a retained root to cycle back into a
  *    topic; leaving a fresh topic parks at top-level.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   resolveScheduledTaskScope,
   resolveScheduledTaskExecutionPosition,

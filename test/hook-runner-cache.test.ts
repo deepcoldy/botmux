@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 describe('loadHookConfigs mtime cache', () => {
   it('reuses file parse results until mtime or size changes', async () => {

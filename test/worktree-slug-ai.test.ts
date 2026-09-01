@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { config } from '../src/config.js';
 import { worktreeSlugFromContextAI } from '../src/services/worktree-slug-ai.js';
 import { existsSync } from 'node:fs';

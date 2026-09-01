@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/session-discovery.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 

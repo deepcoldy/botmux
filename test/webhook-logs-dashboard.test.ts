@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildWebhookLogSearchParams } from '../src/dashboard/web/webhook-logs-page.js';
 
 describe('webhook invocation log dashboard', () => {

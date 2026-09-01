@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { handleResourceMonitorApi, type ResourceMonitorService } from '../src/dashboard/resource-monitor-service.js';
 
 function makeRes(): any {

@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 import { CardBehaviorSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { ManageDialog } from '../src/dashboard/web/groups-page.js';
 import { StreamingCardPinToggle } from '../src/dashboard/web/streaming-card-pin-toggle.js';

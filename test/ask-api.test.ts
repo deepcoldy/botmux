@@ -4,7 +4,7 @@
  *
  * Run:  pnpm vitest run test/ask-api.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { parseAskBody } from '../src/core/ask-api.js';
 

@@ -24,7 +24,7 @@
  * Each was checked by reverting the corresponding fix and confirming it goes red
  * (see the mutation notes on the individual cases).
  */
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach } from 'bun:test';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';

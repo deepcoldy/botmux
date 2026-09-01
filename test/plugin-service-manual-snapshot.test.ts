@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { selectRunningManualPluginServiceIds } from '../src/core/plugins/service-manager.js';
 import type { InstalledPluginRecord } from '../src/core/plugins/types.js';
 

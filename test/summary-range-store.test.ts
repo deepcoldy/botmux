@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   DEFAULT_SUMMARY_LIMIT,
   DEFAULT_SUMMARY_SINCE_HOURS,

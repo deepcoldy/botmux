@@ -5,7 +5,7 @@
  *
  * Run:  bun run test -- test/lark-error-format.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 // bot-registry imports the Lark SDK at module load — stub it so the test needn't
 // open real connections.

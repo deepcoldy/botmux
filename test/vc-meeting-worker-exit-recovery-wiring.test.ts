@@ -3,7 +3,7 @@
  * store's double-callback result and recovery controller are tested behaviorally
  * in their dedicated suites. */
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 

@@ -20,7 +20,7 @@
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 import { createDaemonInternalApi, type DaemonInternalApiDeps } from '../src/dashboard/daemon-internal-api.js';
 import { createDaemonClient } from '../src/dashboard/daemon-internal-client.js';

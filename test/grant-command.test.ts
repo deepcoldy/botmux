@@ -2,7 +2,7 @@
  * grant-command：parseGrantTarget 纯函数 + tryHandleGrantCommand 端到端（@bot /grant @user）。
  * Run: pnpm vitest run test/grant-command.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }

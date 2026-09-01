@@ -6,7 +6,7 @@
  * describe；golden 锁「无 resultSchema 的 goal.txt 不含 result.json 契约」。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

@@ -21,7 +21,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { type ChildProcess } from 'node:child_process';
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import type { DaemonToWorker } from '../src/types.js';
 import { spawnTsScript } from './helpers/ts-runner.js';

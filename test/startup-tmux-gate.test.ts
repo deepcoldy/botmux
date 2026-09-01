@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/startup-tmux-gate.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { shouldHardFailStartupForMissingTmux } from '../src/setup/index.js';
 
 const base = {

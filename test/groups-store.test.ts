@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/groups-store.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // chat.create is configurable per test via this stub so we can test both the
 // happy path and error responses.

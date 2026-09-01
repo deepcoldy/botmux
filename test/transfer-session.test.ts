@@ -12,7 +12,7 @@
  * Dedicated lifecycle cases below use a fake child process to cover the real
  * daemon-side detach fence.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({

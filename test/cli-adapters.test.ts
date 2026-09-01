@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';

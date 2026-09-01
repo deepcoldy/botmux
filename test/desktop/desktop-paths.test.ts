@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { resolveDesktopPaths } from '../../src/desktop/main/paths.js';
 
 describe('desktop paths', () => {

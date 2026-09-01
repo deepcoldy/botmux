@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async () => 'u-test'),

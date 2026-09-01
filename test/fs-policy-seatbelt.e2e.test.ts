@@ -8,7 +8,7 @@
  * `(deny file-read* (subpath "/"))` SIGABRTs every process at dyld bootstrap;
  * the fix (import Apple's bsd.sb base) must keep working across OS updates.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   DASHBOARD_LIVENESS_GRACE_MS,
   DASHBOARD_READY_WAIT_MS,

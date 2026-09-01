@@ -5,7 +5,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 const state = vi.hoisted(() => ({ dataDir: '' }));
 vi.mock('../src/config.js', () => ({

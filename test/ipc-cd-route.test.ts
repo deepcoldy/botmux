@@ -11,7 +11,7 @@
 // 调用 os.homedir()（POSIX 下优先读 $HOME），故 beforeAll 把 HOME 指到临时
 // 目录并在其中建 botmux-roles/role-a，即可用真实校验逻辑（realpath 归一 +
 // dev/ino 包含判断）覆盖 403/400 分支，而不 mock role-library 本身。
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

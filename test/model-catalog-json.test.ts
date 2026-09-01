@@ -3,7 +3,7 @@
  * 共享解析（src/adapters/cli/model-catalog-json.ts）。
  * 三个适配器的 detectModels 都复用它，过滤/容错行为在这里统一覆盖。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { parseDebugModelsJson } from '../src/adapters/cli/model-catalog-json.js';
 
 const REAL_SHAPE = (models: unknown[]) => JSON.stringify({ models });

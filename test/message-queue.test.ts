@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/message-queue.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // ─── In-memory FS simulation ─────────────────────────────────────────────────
 

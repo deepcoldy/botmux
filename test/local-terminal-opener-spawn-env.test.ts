@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 
 // Mock child_process so we can (a) make a terminal resolve on PATH via

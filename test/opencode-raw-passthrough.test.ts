@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createOpenCode2Adapter } from '../src/adapters/cli/opencode2.js';
 import { rawCommandWriteOptionsFor } from '../src/core/raw-command-write-options.js';

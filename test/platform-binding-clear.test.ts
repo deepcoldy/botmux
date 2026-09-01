@@ -1,6 +1,6 @@
 // test/platform-binding-clear.test.ts
 // 解绑：clearPlatformBinding 删本地绑定文件 ~/.botmux/platform.json，存在才删、不存在 no-op、删失败不抛。
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const unlinkSecureHostFileSync = vi.fn();
 vi.mock('../src/platform/secure-host-file.js', () => ({

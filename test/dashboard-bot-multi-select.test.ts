@@ -17,7 +17,7 @@
  *     silently drop a bot that was selected while a different search was active.
  *     The dialog now reads selection from controlled state, so it survives.
  */
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'bun:test';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import TestRenderer, { act } from 'react-test-renderer';

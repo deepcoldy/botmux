@@ -1,7 +1,7 @@
 // test/tunnel-client-ip-family.test.ts
 // 隧道客户端不再强制单协议族：WebSocket 构造始终不传 family，
 // 让 Node 内置 happy-eyeballs 自动选最优路径（IPv4/IPv6 谁先到用谁）。
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 const { FakeWebSocket, createWebSocketStream, netConnect } = vi.hoisted(() => {
   const fakeStream = () => {

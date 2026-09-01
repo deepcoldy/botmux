@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 

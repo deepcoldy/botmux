@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { CodexUpdateDialogGuard } from '../src/utils/codex-update-dialog.js';
 
 describe('CodexUpdateDialogGuard', () => {

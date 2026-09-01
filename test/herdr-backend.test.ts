@@ -17,7 +17,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),

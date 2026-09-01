@@ -1,5 +1,5 @@
 // test/timezone.test.ts
-import { afterEach, describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';

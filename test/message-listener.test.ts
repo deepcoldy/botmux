@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   evaluateMessageListener,

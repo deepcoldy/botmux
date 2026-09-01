@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/prompt-builder.test.ts
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'bun:test';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 

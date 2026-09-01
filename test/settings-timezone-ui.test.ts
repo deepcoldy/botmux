@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { TimeZoneRow } from '../src/dashboard/web/settings-page.js';
 import { FieldTitle } from '../src/dashboard/web/dashboard-components.js';
 

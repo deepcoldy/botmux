@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { validateDag, type V3Dag } from '../src/workflows/v3/dag.js';
 import type { Spec } from '../src/workflows/v3/contract.js';

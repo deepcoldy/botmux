@@ -22,7 +22,7 @@
  * `standalone` parameter threaded in by the test.
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { resolveCliSpawn } from '../src/core/self-spawn.js';
 
 const REAL_ARGV1 = process.argv[1];

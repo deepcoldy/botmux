@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import {
   installWorkerIpcPreload,
   WORKER_IPC_HANDLER_READY_EVENT,

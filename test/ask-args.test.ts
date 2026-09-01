@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/ask-args.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import {
   AskArgsError,

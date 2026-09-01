@@ -5,7 +5,7 @@
  *   - 成功的 bot 仍登记花名册、卡仍撤回。
  * Run: pnpm vitest run test/card-handler-grant-partial.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }

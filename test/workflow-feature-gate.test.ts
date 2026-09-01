@@ -17,7 +17,7 @@
  * The v3 Workflow family is `botmux-workflow`, `botmux-workflow-create`,
  * `botmux-goal-ask`. `botmux-orchestrate` is deliberately NOT gated.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

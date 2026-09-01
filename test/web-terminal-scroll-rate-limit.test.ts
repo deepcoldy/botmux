@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { ReadOnlyRemoteScrollLimiter } from '../src/utils/web-terminal-scroll.js';
 import type { ReadOnlyRemoteScrollPayload } from '../src/utils/web-terminal-scroll.js';
 

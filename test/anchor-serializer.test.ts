@@ -10,7 +10,7 @@
  *
  * Run: pnpm vitest run test/anchor-serializer.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 import { serializeByAnchor, __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 
 const delayPush = (order: string[], label: string, ms: number) => () =>

@@ -4,7 +4,7 @@
  * --settings. So the only adapter-level contract left to assert is that it
  * declares the capability and never smuggles a sandbox block into --settings.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 vi.mock('node:child_process', () => ({ execSync: vi.fn(() => '') }));
 

@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/git-worktree.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';

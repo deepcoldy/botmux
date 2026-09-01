@@ -9,7 +9,7 @@
  * screenshot-renderer test. Here we verify the routing + the dimensions
  * end up correct after clamping.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
 // shim has no `importActual`, and a fill that resolved without loading the module would

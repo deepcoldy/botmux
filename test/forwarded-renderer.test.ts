@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/forwarded-renderer.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { renderForwardedXml, type ForwardedNode } from '../src/im/lark/forwarded-renderer.js';
 
 describe('renderForwardedXml: empty', () => {

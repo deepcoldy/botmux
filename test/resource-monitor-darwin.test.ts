@@ -1,5 +1,5 @@
 import { freemem } from 'node:os';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { attributeResources } from '../src/core/resource-monitor/attribution.js';
 import {
   applyFootprints,

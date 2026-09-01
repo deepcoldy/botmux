@@ -10,7 +10,7 @@
  *
  * Run: pnpm vitest run test/inline-mentions.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { applyInlineMentions } from '../src/im/lark/inline-mentions.js';
 
 const zhang = { open_id: 'ou_zhangsan', name: '张三' };

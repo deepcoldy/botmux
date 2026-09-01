@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { reapOrphanWorkers, type ProcSnapshot } from '../src/core/worker-pool.js';

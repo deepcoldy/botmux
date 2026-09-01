@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import {

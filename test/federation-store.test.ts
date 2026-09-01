@@ -5,7 +5,7 @@
 import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import { getDeploymentIdentity, setDeploymentName } from '../src/services/deployment-identity.js';
 import {
   registerDeployment, syncDeployment, getDeploymentByToken, removeDeploymentByToken,

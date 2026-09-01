@@ -7,7 +7,7 @@
  * Codex caught.
  * Run:  pnpm vitest run test/screen-capture-decision.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { shouldCaptureScreen, isScreenSelfDriven } from '../src/utils/transient-snapshot.js';
 
 describe('shouldCaptureScreen', () => {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';

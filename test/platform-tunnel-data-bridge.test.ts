@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { createServer, type Server as NetServer } from 'node:net';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';

@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/builtin-skills.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { ASK_SKILL, BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME, WORKFLOW_FEATURE_SKILLS } from '../src/skills/definitions.js';
 
 /** The v3 Workflow skill family is factored out of BUILTIN_SKILLS into a

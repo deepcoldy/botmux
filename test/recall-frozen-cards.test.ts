@@ -7,7 +7,7 @@
  *
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';

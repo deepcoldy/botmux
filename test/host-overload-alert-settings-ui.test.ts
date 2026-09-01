@@ -1,6 +1,6 @@
 import React, { type ComponentProps } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { HostOverloadAlertSettingsEditor } from '../src/dashboard/web/settings-page.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;

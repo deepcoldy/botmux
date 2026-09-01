@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { extractKiroSessionIdFromOutput } from '../src/services/kiro-session.js';
 
 const KIROID = 'f2946a26-3735-4b08-8d05-c928010302d5';

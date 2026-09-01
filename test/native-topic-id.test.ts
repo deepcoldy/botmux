@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { fillNativeTopicId, isNativeTopicId } from '../src/core/native-topic-id.js';
 
 describe('native topic id persistence', () => {

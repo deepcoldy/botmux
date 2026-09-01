@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 // A plain module-level const, deliberately NOT `vi.hoisted`. `vi.hoisted` is a
 // vitest TRANSFORM (it physically lifts the call above the imports) and `bun test`

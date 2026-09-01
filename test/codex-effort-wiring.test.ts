@@ -2,7 +2,7 @@
  * Guards the per-turn model/reasoningEffort consumption chain (adapter args /
  * thread config) with source-level checks where worker.ts has no public seam.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 // codex-app buildArgs resolves the codex binary via resolveCommand; return the

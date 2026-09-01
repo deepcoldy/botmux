@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { safeDashboardH5ReturnTo } from '../src/dashboard/h5-auth.js';
 import {

@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/api-only-card-patch-suppression.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 // Record every Feishu transport call. Any invocation here is a FAILURE for a
 // no-transport session.

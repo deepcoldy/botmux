@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/ambient-history.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { filterAmbientChatMessages } from '../src/im/lark/client.js';
 
 function msg(id: string, createTime: string, rootId?: string) {

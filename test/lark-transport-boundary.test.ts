@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/lark-transport-boundary.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const getBotMock = vi.fn();
 // A fake Lark client whose calls would resolve — so if the gate DIDN'T fire, the

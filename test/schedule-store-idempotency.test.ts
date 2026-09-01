@@ -7,7 +7,7 @@
  * Mirrors the test scaffolding in schedule-store.test.ts (real fs in temp
  * dirs, mocked config/logger).
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

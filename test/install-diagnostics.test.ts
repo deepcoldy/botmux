@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { checkNode, analyzeInstalls, type InstallProbeDeps } from '../src/utils/install-diagnostics.js';
 
 describe('checkNode', () => {

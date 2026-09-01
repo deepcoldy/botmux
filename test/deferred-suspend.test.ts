@@ -2,7 +2,7 @@
 // `pendingSuspendReason`，真正的 kill 推迟到会话转入 idle/limited 后由
 // runPendingSuspendIfSettled 兑现。这里钉住兑现函数的状态门控与幂等；
 // 排队半边（IPC 路由）见 ipc-suspend-route.test.ts。
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 

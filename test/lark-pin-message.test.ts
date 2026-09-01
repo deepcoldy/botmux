@@ -2,7 +2,7 @@
  * pinMessage / unpinMessage 的 boolean 契约：只有 Lark 明确 code===0 才返回 true；
  * SDK 抛错或非 0 / missing code 返回 false（Pin 是 QoL，必须 fail-open）。
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'bun:test';
 import { logger } from '../src/utils/logger.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {

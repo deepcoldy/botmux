@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { resolveSkillPolicy } from '../src/core/skills/policy.js';
 import type { SkillPackage, SkillPack } from '../src/core/skills/types.js';
 

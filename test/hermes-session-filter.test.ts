@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { filterHermesEventsForBotmuxSession } from '../src/services/hermes-session-filter.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
 

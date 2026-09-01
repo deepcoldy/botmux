@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 // codex #818 P1-5 — transfer-gate atMostOnce forwarding behavioral proof.
 //

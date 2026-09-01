@@ -7,7 +7,7 @@
  *
  * Run: pnpm vitest run test/open-platform-avatar.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { crc32 } from 'node:zlib';
 import {
   AVATAR_IMAGE_MAX_BYTES,

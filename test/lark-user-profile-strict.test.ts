@@ -13,7 +13,7 @@
  *
  * Run: pnpm vitest run test/lark-user-profile-strict.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Plain const, not `vi.hoisted`: that helper is a vitest TRANSFORM (it lifts the
 // call above the imports) with no bun equivalent. The factory below only reads

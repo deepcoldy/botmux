@@ -4,7 +4,7 @@
  * per-turn sidecar 的写入、turnId 权威绑定 claim/pop、前缀兜底、淘汰。
  * Run: pnpm vitest run test/prompt-context-store.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

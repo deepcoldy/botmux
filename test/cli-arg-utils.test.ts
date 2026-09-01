@@ -5,7 +5,7 @@
  *
  * Run:  pnpm vitest run test/cli-arg-utils.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { firstPositional, hasFlagOrEq, unknownFlags } from '../src/cli/arg-utils.js';
 
 describe('firstPositional', () => {

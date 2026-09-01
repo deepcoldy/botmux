@@ -7,7 +7,7 @@
  * scan rooted at `resolve(workingDir, '..')`, which surfaced unrelated
  * sibling repos; this pins the corrected "scan-from-self" behavior.)
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const mockGetBot = vi.fn();
 vi.mock('../src/bot-registry.js', () => ({

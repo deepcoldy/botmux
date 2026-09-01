@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { CodexAppTurnDispatchQueue } from '../src/utils/codex-app-turn-dispatch.js';
 
 describe('CodexAppTurnDispatchQueue', () => {

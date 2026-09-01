@@ -6,7 +6,7 @@
  *   (b) 幂等——二次调用内容不变
  *   (c) 既有无关配置保留（合并而非覆盖）
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Capture every `zellij` invocation the observe backend makes. dump-screen
 // returns bare-`\n` content (as real zellij does) so we can assert normalisation.

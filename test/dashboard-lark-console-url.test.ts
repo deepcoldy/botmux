@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { larkConsoleUrl } from '../src/dashboard/web/ui.js';
 
 // 飞书/Lark 开放平台后台深链的 host 必须按 bot 的 brand 派生:feishu 与国际版

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import {
   authorizeV3SavedWorkflowInvocation,
   deliverV3SavedWorkflowNotification,

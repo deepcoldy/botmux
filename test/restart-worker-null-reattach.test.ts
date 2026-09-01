@@ -24,7 +24,7 @@
  * Run:  pnpm vitest run test/restart-worker-null-reattach.test.ts
  */
 import { readFileSync } from 'node:fs';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },

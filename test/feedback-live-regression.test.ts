@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';

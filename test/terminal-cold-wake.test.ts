@@ -16,7 +16,7 @@
  *
  * Run:  bun run vitest run --project unit test/terminal-cold-wake.test.ts
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 import type { SessionProbe } from '../src/adapters/backend/types.js';
 import type { DaemonSession } from '../src/core/types.js';

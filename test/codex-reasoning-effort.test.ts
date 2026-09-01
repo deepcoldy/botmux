@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   GROK_COMMON_REASONING_EFFORTS,
   GROK_REASONING_EFFORTS,

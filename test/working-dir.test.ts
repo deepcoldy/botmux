@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { configuredWorkingDirs, invalidWorkingDirs, parseWorkingDirList } from '../src/utils/working-dir.js';
 import { validateWorkingDir } from '../src/core/working-dir.js';
 

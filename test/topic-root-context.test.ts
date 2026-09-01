@@ -12,7 +12,7 @@
  *
  * Run:  pnpm vitest run test/topic-root-context.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Mock the (previously used) network / side-effecting deps purely to ASSERT
 // they are never called — the hint approach must do zero first-turn fetch.

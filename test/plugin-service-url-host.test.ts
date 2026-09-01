@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 
 // Only the dashboard external host matters for URL shape; a getter lets each
 // test flip it. formatUrlHost stays REAL so the IPv6-bracketing fix is exercised

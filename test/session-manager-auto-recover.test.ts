@@ -12,7 +12,7 @@
  * dozens of surviving sessions doesn't spike on restart, and skips any session
  * whose worker a real message already woke (no clobbering a live turn).
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({ config: { workingDir: '~' } }),

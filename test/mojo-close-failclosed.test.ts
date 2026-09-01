@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'bun:test';
 
 // Real-process cases: each drives a live bash child through spawn/kill plus
 // /proc enumeration, and the product's own settle/proof windows (8s destroy

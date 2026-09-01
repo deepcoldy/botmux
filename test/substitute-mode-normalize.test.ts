@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { normalizeSubstituteMode } from '../src/services/substitute-mode-normalize.js';
 
 describe('normalizeSubstituteMode', () => {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
   devboxDashboardBaseUrl: vi.fn(() => null),

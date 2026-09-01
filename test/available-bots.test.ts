@@ -3,7 +3,7 @@
  * (b) reliably @-mentionable, identifying self by larkAppId (not cliId).
  * Run: pnpm vitest run test/available-bots.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: vi.fn(),

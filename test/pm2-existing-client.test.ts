@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { runExistingPm2Command } from '../src/cli/pm2-existing.js';
 import { captureReadonlyPm2Jlist } from '../src/cli/pm2-readonly.js';
 import { inspectLinuxPm2GodOwnership } from '../src/core/pm2-lifecycle-owner.js';

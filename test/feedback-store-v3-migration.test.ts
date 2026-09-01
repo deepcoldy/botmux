@@ -1,7 +1,7 @@
 import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 
 const dirs: string[] = [];

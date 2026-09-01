@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { WebSocketServer, type RawData } from 'ws';
 import {
   connectRealtimeVoiceTransport,

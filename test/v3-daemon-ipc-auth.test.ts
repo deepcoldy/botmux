@@ -1,7 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import {
   WORKFLOW_DAEMON_IPC_BODY_LIMIT_BYTES,

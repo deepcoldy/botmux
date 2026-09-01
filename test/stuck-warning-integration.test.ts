@@ -18,7 +18,7 @@
  *
  * Run:  pnpm vitest run test/stuck-warning-integration.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import {
   initWorkerPool,

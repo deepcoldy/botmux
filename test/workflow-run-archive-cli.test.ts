@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 
 import { parseWorkflowRunArchiveCliOptions } from '../src/cli/workflow-run-archive.js';

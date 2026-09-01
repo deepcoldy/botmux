@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { evaluateVcMeetingConsumerIsolation } from '../src/services/vc-meeting-consumer-isolation.js';
 
 describe('VC meeting consumer managed side-effect isolation (plan B: operator owns sandbox)', () => {

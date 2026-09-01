@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { AgentWorkbenchView } from '../src/dashboard/web/agent-workbench-view.js';
 import {
   TERMINAL_WRITE_TIMEOUT_MS,

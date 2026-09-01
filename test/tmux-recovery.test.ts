@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { tmuxRestartJitterMs } from '../src/core/tmux-recovery.js';
 import { tmuxLifecycleInitialDelayMs } from '../src/adapters/backend/tmux-pipe-backend.js';
 

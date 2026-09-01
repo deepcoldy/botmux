@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/quoted-render.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { renderQuotedMessage } from '../src/cli/quoted-render.js';
 import type { LarkMessage } from '../src/types.js';
 import type { MessageResource } from '../src/im/lark/message-parser.js';

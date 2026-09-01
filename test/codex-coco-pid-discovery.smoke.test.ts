@@ -8,7 +8,7 @@
  * transcript.test.ts` 的纯逻辑单测，这套 smoke 覆盖 macOS lsof 兜底回归
  * （没有这个测试，Linux CI 永远绿、macOS 上 /adopt 实际坏掉也察觉不到）。
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';

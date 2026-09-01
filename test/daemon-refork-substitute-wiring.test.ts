@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 describe('daemon stopped-worker substitute refork wiring', () => {
   it('passes the resolved substitute trigger into the refork builder and preserves its reaction', () => {

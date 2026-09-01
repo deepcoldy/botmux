@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { parseLoadavg, parseMeminfo, parseProcessStat, parseSmapsRollupPss, parseSystemCpuTimes, parseSystemStat } from '../src/core/resource-monitor/procfs.js';
 
 describe('resource procfs parsers', () => {

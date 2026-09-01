@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import { renderConnectorTopicTemplate } from '../src/services/connector-topic-template.js';
 import type { ConnectorDefinition } from '../src/services/connector-store.js';

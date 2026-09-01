@@ -33,7 +33,7 @@
  * (which this machine's fleet depends on) is never touched.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, statSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';

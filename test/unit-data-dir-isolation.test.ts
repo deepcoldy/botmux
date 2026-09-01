@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
-import { beforeEach, describe, expect, inject, it } from 'vitest';
+import { beforeEach, describe, expect, inject, it } from 'bun:test';
 import { config } from '../src/config.js';
 import * as sessionStore from '../src/services/session-store.js';
 

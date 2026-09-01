@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/user-token-brand.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { generateAuthUrl } from '../src/utils/user-token.js';
 
 describe('generateAuthUrl — brand-aware authorize host', () => {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { selectTrackedSessions } from '../src/core/resource-monitor/top-selector.js';
 import type { ResourceSessionCurrent } from '../src/core/resource-monitor/types.js';
 

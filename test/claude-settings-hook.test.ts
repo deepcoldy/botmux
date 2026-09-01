@@ -13,7 +13,7 @@
  *   退出才渲染输入框、而 worker 在第一条信号就放行首条 prompt → 抢跑触发 paste-burst → 软换行
  *   `\` 字面残留。单一全局来源消除竞态。
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 

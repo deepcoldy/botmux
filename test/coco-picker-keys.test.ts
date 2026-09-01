@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { computeCocoPickerKeys } from '../src/core/coco-picker-keys.js';
 import type { AskQuestion } from '../src/core/ask-types.js';
 

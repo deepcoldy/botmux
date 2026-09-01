@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   ISSUE_ACTION_CLAIM_CONFIRM,
   ISSUE_ACTION_CLAIM_OPEN,

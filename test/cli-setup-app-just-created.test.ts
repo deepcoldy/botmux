@@ -12,7 +12,7 @@
  *
  * Run: pnpm vitest run test/cli-setup-app-just-created.test.ts
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 // vi.mock 工厂在文件顶部提升，引用不到普通的顶层 const，用 vi.hoisted 提前建好桩。
 const mocks = vi.hoisted(() => ({

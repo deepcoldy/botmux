@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 import { recordDispatchRegistryEntry } from '../src/core/dispatch-registry.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';

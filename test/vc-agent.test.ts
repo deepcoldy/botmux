@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { normalizeVcMeetingEvents } from '../src/vc-agent/normalizer.js';
 import {
   beginVcIngestionPass,

@@ -1,5 +1,5 @@
 // test/terminal-proxy.test.ts
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { connect } from 'node:net';
 import { WebSocketServer, WebSocket } from 'ws';

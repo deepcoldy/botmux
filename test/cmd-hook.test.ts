@@ -5,7 +5,7 @@
  * cmdHook 本身仅作薄包装（读 stdin + 调 runHook），不在本文件中直接测试。
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runHook } from '../src/cli.js';
 import type { AskResult } from '../src/core/ask-types.js';

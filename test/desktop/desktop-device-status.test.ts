@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { sanitizeDeviceStatusCommandResult } from '../../src/desktop/main/device-status.js';
 
 describe('desktop device status boundary', () => {

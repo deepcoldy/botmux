@@ -1,5 +1,5 @@
 // test/terminal-url.test.ts
-import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'bun:test';
 import { config } from '../src/config.js';
 
 vi.mock('../src/global-config.js', () => ({

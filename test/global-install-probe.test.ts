@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 // The Windows probe behaviour cannot be proven on Linux CI with a fake
 // executable: a shebang script named pnpm.cmd runs without a shell, so even

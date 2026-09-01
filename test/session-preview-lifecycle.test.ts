@@ -11,7 +11,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),

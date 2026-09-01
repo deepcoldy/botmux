@@ -5,7 +5,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import { getBotOwner, setBotOwner, clearBotOwner, listBotOwners } from '../src/services/bot-owner-store.js';
 
 let dataDir: string;

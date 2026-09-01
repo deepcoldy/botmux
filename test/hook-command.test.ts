@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { hookCommandFor, sessionReadyHookCommand } from '../src/adapters/hook-command.js';
 
 // 回归保护：hook 命令必须指向 cli.js（有 `hook` 子命令分发），

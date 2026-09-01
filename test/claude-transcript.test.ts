@@ -6,7 +6,7 @@
  *   - pickAssistantTextEvents filters out user / sidechain / tool-only events.
  *   - extractAssistantText / joinAssistantText concatenate multi-block text.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';

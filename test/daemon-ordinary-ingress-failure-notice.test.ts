@@ -19,7 +19,7 @@
  *
  * Run:  pnpm vitest run test/daemon-ordinary-ingress-failure-notice.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const mocks = vi.hoisted(() => {
   const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-ingress-notice-${process.pid}`;

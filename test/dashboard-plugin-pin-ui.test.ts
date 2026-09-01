@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 const app = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf-8');
 const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf-8');

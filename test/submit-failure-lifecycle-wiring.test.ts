@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 /**
  * worker.ts 的 submit-failure 生命周期接线（结构化 source pin）：

@@ -9,7 +9,7 @@
  * this file pins the actual schema so a regression cannot sneak through.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { composeSections } from '../src/dashboard/settings-card-model.js';
 import {

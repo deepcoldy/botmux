@@ -7,7 +7,7 @@
 // import 走命名空间访问，spy 即时生效）。allowlist 依赖 getBotTuiSlashAllow
 // （bot-registry 内存态注册表的只读 accessor）——同样用 vi.spyOn(bot-registry
 // 命名空间) 打桩，避免真的注册 bot / 构造 Lark client。
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'bun:test';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';

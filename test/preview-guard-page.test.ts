@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { runInNewContext } from 'node:vm';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { PREVIEW_CONTENT_SEGMENT } from '../src/core/session-preview.js';
 import {
   projectWorkbenchOperationCapabilities,

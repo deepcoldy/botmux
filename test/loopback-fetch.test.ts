@@ -18,7 +18,7 @@
  *
  * Run: npx vitest run test/loopback-fetch.test.ts
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { createServer, type RequestListener, type Server } from 'node:http';
 import { getEventListeners } from 'node:events';
 import { loopbackFetch, isLoopbackUrl } from '../src/core/loopback-fetch.js';

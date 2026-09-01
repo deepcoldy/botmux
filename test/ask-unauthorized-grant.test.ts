@@ -7,7 +7,7 @@
  *  2. ask-card 点击链路：unauthorized → 升级发卡 + 新 toast，且 ask 仍 pending，
  *     owner 授权后**再点一次**才作答（申晗要的关键区别）。
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 import {
   _resetForTest as _resetBroker,

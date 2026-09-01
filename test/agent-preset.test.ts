@@ -8,7 +8,7 @@
  *
  * Run: pnpm vitest run test/agent-preset.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   PRESET_VERSION,
   PRESET_GUIDE,

@@ -6,7 +6,7 @@
 //   - announcePendingRepoSession announces card-waiting sessions (which have
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { enrichHistorySenders } from '../src/dashboard/history-senders.js';
 
 describe('dashboard history sender enrichment', () => {

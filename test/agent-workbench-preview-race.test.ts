@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import type { PreviewInteractionState, WorkbenchApi } from '../src/dashboard/web/agent-workbench-api.js';
 import type { WorkbenchCapabilities } from '../src/dashboard/web/agent-workbench-capabilities.js';
 import { TerminalPane, WebPane } from '../src/dashboard/web/agent-workbench-panes.js';

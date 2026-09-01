@@ -2,7 +2,7 @@
  * Message quota enforcement wiring.
  * Run: pnpm vitest run test/message-quota-enforcement.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const mocks = vi.hoisted(() => ({
   consumeQuota: vi.fn(),

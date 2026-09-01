@@ -5,7 +5,7 @@
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import {
   getBotProfile, getBotCapability, setBotCapability, clearBotCapability, listBotProfiles,
   getBotSpecialties, setBotSpecialties,

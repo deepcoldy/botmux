@@ -14,7 +14,7 @@
  * 只需 stub window.requestAnimationFrame。所有交互通过队首 dialog 的 props
  * (onClick / onCancel) 及卡片内 input/button 的 props 触发。
  */
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'bun:test';
 import { createElement } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { confirm, promptText, ConfirmModalRoot } from '../src/dashboard/web/confirm-modal.js';

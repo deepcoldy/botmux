@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 describe('desktop local source installer docs', () => {
   it('keeps Desktop installation outside the botmux CLI command surface', () => {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { applyAllowedUsersResolve } from '../src/utils/allowed-users-apply.js';
 import type { EntryResolveStatus } from '../src/im/lark/client.js';
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { __setGroupsSnapshotForTest, buildBotCards } from '../src/dashboard/web/overview.js';
 
 describe('dashboard overview bot cards', () => {

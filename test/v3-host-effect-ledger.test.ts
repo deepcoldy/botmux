@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { openV3HostEffects } from '../src/workflows/v3/host-effect-ledger.js';
 import type { StoredEvent } from '../src/workflows/v3/journal.js';

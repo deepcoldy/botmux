@@ -7,7 +7,7 @@
  *  - Lark open_ids are app-scoped, so the auto-invited operator open_id must
  *    come from the SAME bot we use as creator.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { pickCreatorForGroup, type DaemonInfoForPick } from '../src/dashboard/operator-selector.js';
 
 function lookupFrom(daemons: DaemonInfoForPick[]) {

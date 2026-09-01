@@ -8,7 +8,7 @@
  * 后续 daemon e2e 覆盖）。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   existsSync,
   mkdtempSync,

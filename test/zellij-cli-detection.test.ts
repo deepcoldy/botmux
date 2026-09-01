@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { cliIdFromCommArgv } from '../src/core/zellij-adopt-discovery.js';
 
 describe('cliIdFromCommArgv', () => {

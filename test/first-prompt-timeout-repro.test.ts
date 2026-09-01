@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/first-prompt-timeout-repro.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { IdleDetector } from '../src/utils/idle-detector.js';

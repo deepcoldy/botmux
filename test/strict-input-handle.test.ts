@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { strictInputHandle } from '../src/adapters/cli/strict-input-handle.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 

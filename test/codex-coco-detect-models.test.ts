@@ -8,7 +8,7 @@
  * importOriginal 保留 spawnSync（不污染 resolveCommand），mock 以
  * (err, { stdout, stderr }) 两参回调，默认 promisify 直接 resolve 该对象。
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const execFileCalls: { file: string; args: string[] }[] = [];
 let execFileStdout = '';

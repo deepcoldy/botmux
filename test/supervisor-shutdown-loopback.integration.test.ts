@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import {
   setIpcAuthSecret,

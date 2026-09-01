@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 import {

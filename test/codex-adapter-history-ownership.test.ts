@@ -14,7 +14,7 @@
  * (so the ownership probe has a live pid to enumerate) and assert the RESULT is
  * B — not merely "not A", which a permanently-wedged bridge would also satisfy.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';

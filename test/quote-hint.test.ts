@@ -5,7 +5,7 @@
  *
  * Run:  pnpm vitest run test/quote-hint.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { buildQuoteHint } from '../src/im/lark/quote-hint.js';
 
 describe('buildQuoteHint', () => {

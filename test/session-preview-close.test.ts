@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/bot-registry.js', () => ({

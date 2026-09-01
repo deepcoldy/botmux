@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { readSkillFrontmatter } from '../src/core/skills/frontmatter.js';
 
 /** The installed-skill card renders `description`; when the frontmatter reader

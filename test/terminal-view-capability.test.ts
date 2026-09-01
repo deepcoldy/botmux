@@ -3,7 +3,7 @@
 // These helpers are what the dashboard uses to REPLACE the worker's unbound
 // per-boot token in /api/sessions/:id/view-link responses, and what the front
 // proxy uses to map a presented capability back to its auth session.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   deriveWorkerViewGeneration,
   issueTerminalControlGrant,

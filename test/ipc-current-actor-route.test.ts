@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/im/lark/identity-cache.js', () => ({
   resolveVerifiedUserIdentity: vi.fn(async (_app: string, openId: string) => ({

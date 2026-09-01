@@ -2,7 +2,7 @@ import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach } from 'vitest';
+import { afterEach } from 'bun:test';
 import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { spawnTsScript } from './ts-runner.js';

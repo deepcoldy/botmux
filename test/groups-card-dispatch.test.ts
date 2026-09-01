@@ -8,7 +8,7 @@
  *    updateMessage — that's the stale-render fix carried over from settings).
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<typeof import('../src/im/lark/client.js')>(

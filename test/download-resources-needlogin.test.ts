@@ -7,7 +7,7 @@
  *
  * Run: pnpm vitest run test/download-resources-needlogin.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Define the error class INSIDE the factory to avoid vi.mock hoisting issues;
 // session-manager imports UserTokenMissingError from this same mocked module,

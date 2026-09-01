@@ -1,7 +1,7 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { createRuntimeService, type BundledRuntimeCandidate, type ExternalRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
 
 const paths = {

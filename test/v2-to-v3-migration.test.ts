@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import type { BotConfig } from '../src/bot-registry.js';
 import type { WorkflowDefinition } from '../src/workflows/definition.js';

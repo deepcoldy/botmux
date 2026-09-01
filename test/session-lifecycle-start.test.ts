@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
 const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({

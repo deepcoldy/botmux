@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { cleanupExplicitSessionBacking } from '../src/core/explicit-session-backing-cleanup.js';
 
 const SID = 'abcd1234-1111-2222-3333-444444444444';

@@ -6,7 +6,7 @@
  * `no bot scope bound`. It must enumerate every per-bot store and address each
  * one explicitly (codex #611 finding 2). Real fs in a temp botmux-home tree.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';

@@ -22,7 +22,7 @@
  * loads and prevents oh-my-zsh's update prompt. The wrapper unsets it again
  * before launching the CLI, preserving the CLI's normal environment.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';

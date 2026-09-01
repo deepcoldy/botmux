@@ -7,7 +7,7 @@
  * wrapped queuedPrompt, clears queued). The CLI process is external — forkWorker
  * is stubbed so we exercise the routing/parking logic in isolation.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 import type { Session } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 

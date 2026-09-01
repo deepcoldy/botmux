@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   CHAT_NAME_MAX_CODE_POINTS,
   ChatRenameCooldown,

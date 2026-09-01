@@ -9,7 +9,7 @@
  * a `t()`-based check passes silently even when en is incomplete.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { t } from '../src/i18n/index.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';

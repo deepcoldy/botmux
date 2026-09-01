@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 // The mock is created INSIDE the factory and imported back below, rather than held
 // in a module-level const. Three measured constraints force this exact shape:

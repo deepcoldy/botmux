@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { resolveSubstituteTargets, type SubstituteResolveDeps } from '../src/services/substitute-mode-store.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {} }));

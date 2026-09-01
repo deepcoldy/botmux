@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 vi.mock('../src/adapters/backend/pty-backend.js', () => ({
   PtyBackend: class MockPtyBackend {},

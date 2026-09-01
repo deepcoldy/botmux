@@ -12,7 +12,7 @@
  *
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   beginReplyTargetTurn,
   buildTurnParticipantsFrom,

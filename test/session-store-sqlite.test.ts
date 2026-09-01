@@ -10,7 +10,7 @@
  *
  * Run:  bunx vitest run test/session-store-sqlite.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'fs';
 import { spawn } from 'node:child_process';
 import { join } from 'path';

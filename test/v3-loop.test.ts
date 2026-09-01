@@ -11,7 +11,7 @@
  *   - orchestrator/runtime: expansion scheduling + exit evaluation — task #19
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

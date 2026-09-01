@@ -12,7 +12,7 @@
  *   - drainEmittable holds back started turns that have no assistant text
  *     yet (e.g. Claude is still in tool-use mid-turn)
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';

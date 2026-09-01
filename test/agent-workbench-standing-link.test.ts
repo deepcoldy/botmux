@@ -15,7 +15,7 @@
  */
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import {
   WorkbenchAppearanceMenu,

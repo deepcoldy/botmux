@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 const larkGet = vi.fn();
 const getBotClient = vi.fn(() => ({ marker: true }));

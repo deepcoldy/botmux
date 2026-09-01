@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   PREVIEW_SANDBOX_TOKENS,

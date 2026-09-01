@@ -5,7 +5,7 @@
  * capability and keeps its normal spawn args (bypass on → codex's own nested
  * sandbox off, outer Seatbelt is the enforcer).
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 vi.mock('node:child_process', () => ({ execSync: vi.fn(() => '') }));
 

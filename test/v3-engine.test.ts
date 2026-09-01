@@ -6,7 +6,7 @@
  * IO，不 spawn worker、不碰飞书、不依赖 codex 的 ephemeral-pool/manifest。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, rmSync, appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

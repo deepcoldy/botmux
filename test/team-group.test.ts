@@ -4,7 +4,7 @@
  * forwarded to a different creator daemon).
  * Run: pnpm vitest run test/team-group.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { buildTeamGroupCreatePayload, planGroupCreator } from '../src/dashboard/team-group.js';
 
 const onlineAll = () => true;

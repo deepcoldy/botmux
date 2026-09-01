@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { Aggregator, subscribeDaemon } from '../src/dashboard/aggregator.js';
 import { reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
 

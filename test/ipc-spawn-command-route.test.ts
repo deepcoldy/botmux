@@ -8,7 +8,7 @@
 //   - active 但无命令（riff / warm reattach / daemon 刚重启还没 ready）→ 404 unavailable。
 //
 // 手法沿用 test/ipc-cd-route.test.ts：真实 IPC server(port 0) + fetch + spyOn。
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'bun:test';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';

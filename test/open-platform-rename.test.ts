@@ -6,7 +6,7 @@
  *
  * Run: pnpm vitest run test/open-platform-rename.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { renameBotOnOpenPlatform } from '../src/services/open-platform-rename.js';
 import { OpenPlatformApiError, type StoredCookie } from '../src/setup/open-platform-automation.js';
 

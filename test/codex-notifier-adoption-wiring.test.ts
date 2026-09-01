@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { startCodexNotifierAdoptionSession } from '../src/features/codex-notifier/adoption.js';

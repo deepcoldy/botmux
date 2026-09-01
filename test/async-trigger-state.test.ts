@@ -8,7 +8,7 @@
  *
  * Run:  pnpm vitest run test/async-trigger-state.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../src/services/async-trigger-state.js';
 
 describe('decideAsyncOwnership — fail-closed cross-bot isolation (P1-1)', () => {

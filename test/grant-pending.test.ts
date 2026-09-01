@@ -2,7 +2,7 @@
  * grant-pending：nonce 防重放 + deny 冷却节流。
  * Run: pnpm vitest run test/grant-pending.test.ts
  */
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'bun:test';
 import {
   openPending,
   checkNonce,

@@ -12,7 +12,7 @@
  *   - On success, delegates to transferSession (we stub the body of it to
  *     observe arguments without actually touching tmux / forking workers).
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'bun:test';
 
 // Stub sessionStore writes so transferSession's persist call is a no-op.
 vi.mock('../src/services/session-store.js', () => ({

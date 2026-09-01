@@ -6,7 +6,7 @@
  * Covers the two production rendering bugs that motivated the markdown-it
  * rewrite plus baseline behaviors that must not regress.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { homedir, tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';

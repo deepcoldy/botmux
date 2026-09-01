@@ -30,7 +30,7 @@
  * collapsing it would be the bug.
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import {
   hookCommandParts,
   hookCommandFor,

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { parseAntigravityInsight } from '../src/services/insight/antigravity-span-reader.js';
 import { parseClaudeInsight } from '../src/services/insight/claude-span-reader.js';
 import { parseCodexInsight } from '../src/services/insight/codex-span-reader.js';

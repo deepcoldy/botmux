@@ -2,7 +2,7 @@
  * ASR 配置解析（evaluateAsrConfig）+ OpenAI 兼容转写适配器（transcribeAudioFile）。
  * Run: pnpm vitest run test/voice-asr.test.ts
  */
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

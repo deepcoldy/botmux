@@ -3,7 +3,7 @@
  * (services/schedule-split-migration.ts). Real fs in a temp botmux-home tree,
  * mocked config/logger — same scaffolding as schedule-store.test.ts.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { createDashboardSummaryEndpoint } from '../src/dashboard/dashboard-summary-endpoint.js';
 import type { DashboardSummary } from '../src/dashboard/dashboard-summary.js';
 

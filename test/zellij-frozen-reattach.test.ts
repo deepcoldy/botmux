@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/zellij-frozen-reattach.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Mock child_process so ZellijBackend.hasSession()/probeSession() are
 // controllable: a 'true'-looking list-sessions output simulates the not-yet-

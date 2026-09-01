@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { Aggregator } from '../src/dashboard/aggregator.js';
 import { createSessionPresentationCoordinator } from '../src/dashboard/session-presentation.js';

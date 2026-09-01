@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { updateAndRestartBotmux, updateResponseNeedsRestart } from '../src/dashboard/web/update-action.js';
 
 function json(status: number, body: unknown): Response {

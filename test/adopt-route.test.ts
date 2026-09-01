@@ -5,7 +5,7 @@
  * 全部依赖注入，不访问真实 /proc / ps / 网络。
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import {
   getAncestorPids,
   queryCliSession,

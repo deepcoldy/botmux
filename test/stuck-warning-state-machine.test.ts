@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/stuck-warning-state-machine.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { clearStuckWarningAuthority, invalidateStuckWarning } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 

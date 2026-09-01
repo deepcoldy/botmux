@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import {

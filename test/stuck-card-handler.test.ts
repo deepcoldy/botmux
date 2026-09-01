@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/stuck-card-handler.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 

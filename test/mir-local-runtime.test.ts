@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { ensureMiramcpBridgeStarted, ensureMiramcpSandboxAllows, getMiraRuntimePaths } from '../src/mir-local-runtime.js';
 
 describe('getMiraRuntimePaths', () => {

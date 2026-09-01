@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { extractDedupKey, getJsonPathValue } from '../src/services/webhook-lifecycle-extractors.js';
 
 describe('webhook-lifecycle-extractors', () => {

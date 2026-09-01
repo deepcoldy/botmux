@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 function dashboardSource(file: string): string {
   return readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8');

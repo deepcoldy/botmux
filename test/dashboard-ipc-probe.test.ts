@@ -9,7 +9,7 @@
  *
  * Run: pnpm vitest run test/dashboard-ipc-probe.test.ts
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { startIpcServer } from '../src/core/dashboard-ipc-server.js';
 
 const handles: Array<{ close: () => Promise<void> }> = [];

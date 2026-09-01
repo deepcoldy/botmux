@@ -7,7 +7,7 @@
  * is routed as a command; human senders are never gated by it. See daemon.ts's
  * two invocation-parse sites.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 vi.mock('node:fs', async (importOriginal) => {
   const orig = await importOriginal<typeof import('node:fs')>();

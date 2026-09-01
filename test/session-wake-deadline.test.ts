@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { SESSION_WAKE_TIMEOUT_MS, sessionWakeAcquireTimeoutMs } from '../src/core/session-wake-deadline.js';
 
 describe('sessionWakeAcquireTimeoutMs', () => {

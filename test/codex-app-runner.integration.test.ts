@@ -13,7 +13,7 @@ import {
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';

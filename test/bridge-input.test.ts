@@ -4,7 +4,7 @@
  * unaware) — it must not see <session_id>, <botmux_reminder>, or any "use
  * botmux send" hints.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 // Whiteboard is opt-in (global config, default OFF), so the <whiteboard> block
 // would never render here and the no-transport whiteboard-gate cases below would

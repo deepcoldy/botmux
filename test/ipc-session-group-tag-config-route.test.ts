@@ -13,7 +13,7 @@
  *
  * Run:  pnpm vitest run test/ipc-session-group-tag-config-route.test.ts
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import {
   setIpcAuthSecret,
   setLarkAppId,

@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/mojo-quarantine-notice-policy.test.ts
  */
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },

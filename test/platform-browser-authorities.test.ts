@@ -6,7 +6,7 @@
 // 两个子域按用途分档（见 platformBrowserAuthorities 的 surface 参数）：终端 WS 升级
 // 认 m-/t-（终端页就住在 t-，#960 的首开可写链路依赖它）；有副作用的管理类 POST 只
 // 认 m-（SPA 与 CSRF 票据只在那张壳页里）。本文件两组用例分别钉住这两档。
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const readSecureHostFileSync = vi.fn();
 vi.mock('../src/platform/secure-host-file.js', () => ({

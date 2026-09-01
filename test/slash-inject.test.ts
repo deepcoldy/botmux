@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { validateSlashInjection } from '../src/core/slash-inject.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 

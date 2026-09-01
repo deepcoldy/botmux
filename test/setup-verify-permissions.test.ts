@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-verify-permissions.test.ts
  */
-import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'bun:test';
 
 // 占位 mock — 单测里不真实调 Lark.Client. checkRequiredScopes / applyScopesUnverified
 // 单测都需要 mock 这个.

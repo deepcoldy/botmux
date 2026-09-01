@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 import type { VcMeetingDeliveryRequest } from '../src/services/vc-meeting-delivery-protocol.js';
 import type { VcMeetingAmbiguousReceiptRef } from '../src/services/vc-meeting-delivery-store.js';

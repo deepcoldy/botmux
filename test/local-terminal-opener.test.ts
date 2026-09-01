@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { localCliCommandForSession, localTerminalCapable, terminalLaunchArgs } from '../src/core/local-terminal-opener.js';
 import type { DaemonSession } from '../src/core/types.js';
 

@@ -16,7 +16,7 @@
  *
  * Run:  pnpm vitest run --project unit test/worker-startup-retry-wiring.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { EventEmitter } from 'node:events';
 
 vi.mock('../src/im/lark/client.js', () => {

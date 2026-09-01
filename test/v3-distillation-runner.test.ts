@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import {
   readLinuxBootIdentity,
   readProcessStartIdentity,

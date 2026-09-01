@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { sessionRuntimeCounts } from '../src/dashboard/web/sessions.js';
 
 describe('dashboard session residency summary', () => {

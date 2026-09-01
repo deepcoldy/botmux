@@ -11,7 +11,7 @@
  * config > the session's own historical record (only when the session is pinned
  * to a CLI the bot no longer runs, where the live model belongs to another CLI).
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 
 const ds = (session: { cliId?: any; model?: string }, spawnModelOverride?: string) =>

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { messages as enMessages } from '../src/i18n/en.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
 import { t } from '../src/i18n/index.js';

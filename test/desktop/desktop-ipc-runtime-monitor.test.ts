@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 const handlers = new Map<string, (...args: any[]) => unknown>();
 const electronMock = vi.hoisted(() => {

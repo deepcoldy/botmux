@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createRiffAdapter } from '../src/adapters/cli/riff.js';

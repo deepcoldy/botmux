@@ -7,7 +7,7 @@
  * established daemon closure coverage in initial-passthrough-ownership.test.ts.
  */
 import { readFileSync } from 'node:fs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {

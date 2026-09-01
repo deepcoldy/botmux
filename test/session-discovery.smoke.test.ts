@@ -8,7 +8,7 @@
  * - smoke 测试切实抓平台命令兼容性（macOS BSD ps 不支持 GNU 长选项 `--ppid`
  *   等历史回归，纯 mock 测不到）
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, realpathSync } from 'node:fs';

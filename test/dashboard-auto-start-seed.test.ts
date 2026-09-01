@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { AutoStartControls } from '../src/dashboard/web/bot-defaults-page.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;

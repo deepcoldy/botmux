@@ -24,7 +24,7 @@
  *
  * The real forkWorker spawns a child process; we inject a spy via opts.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 vi.mock('../src/services/session-store.js', () => {
   let counter = 0;

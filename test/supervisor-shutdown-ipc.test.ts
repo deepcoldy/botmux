@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { isExactSupervisorShutdownRequest } from '../src/core/supervisor-shutdown-ipc.js';
 
 const identity = {

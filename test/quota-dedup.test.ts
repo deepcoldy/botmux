@@ -2,7 +2,7 @@
  * quota-dedup：消息额度扣费去重的 fresh/pending/done 三态机。
  * Run: pnpm vitest run test/quota-dedup.test.ts
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import { beginCharge, commitCharge, abortCharge, _resetForTest } from '../src/services/quota-dedup.js';
 
 beforeEach(() => _resetForTest());

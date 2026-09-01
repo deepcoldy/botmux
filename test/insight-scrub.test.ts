@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { scrubSecrets, safeScrubAndTruncate } from '../src/services/insight/scrub.js';
 
 describe('insight scrub', () => {

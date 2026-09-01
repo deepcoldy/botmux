@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 describe('desktop main lifecycle', () => {
   it('prevents duplicate app instances and focuses the existing window', () => {

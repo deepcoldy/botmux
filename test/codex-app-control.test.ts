@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createConnection, createServer, type Server } from 'node:net';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import {
   CODEX_APP_CONTROL_LINE_MAX_BYTES,
   CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,

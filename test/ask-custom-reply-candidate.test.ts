@@ -13,7 +13,7 @@
  *
  * Run: pnpm vitest run test/ask-custom-reply-candidate.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { askCustomReplyCandidate } from '../src/im/lark/event-dispatcher.js';
 import { parseEventMessage } from '../src/im/lark/message-parser.js';
 

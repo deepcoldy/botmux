@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 describe('desktop dashboard compat validation', () => {
   it('accepts the current runtime compat manifest', async () => {

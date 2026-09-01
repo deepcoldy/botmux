@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { attributeResources } from '../src/core/resource-monitor/attribution.js';
 import type { ProcessResourceSample } from '../src/core/resource-monitor/types.js';
 

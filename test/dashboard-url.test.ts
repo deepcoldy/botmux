@@ -1,5 +1,5 @@
 // test/dashboard-url.test.ts
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Mock the two gates buildDashboardUrl consults. Defaults: remote access OFF,
 // no platform binding — i.e. an unbound / local-only host.

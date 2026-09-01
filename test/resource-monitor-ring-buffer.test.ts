@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { NumericRingSeries } from '../src/core/resource-monitor/ring-buffer.js';
 
 describe('NumericRingSeries', () => {

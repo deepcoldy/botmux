@@ -10,7 +10,7 @@
  * flipping `boundaryProven` on the diagnostic-clean branch, nulling a residual,
  * or widening `ok` into the gate must all turn a test red.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   terminationOutcomeFromQuiescence,
   type TurnQuiescence,

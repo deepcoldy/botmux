@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { parseReadOnlyRemoteScrollPayload } from '../src/utils/web-terminal-scroll.js';
 
 describe('read-only web terminal remote scroll payloads', () => {

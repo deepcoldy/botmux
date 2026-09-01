@@ -8,7 +8,7 @@
  * simply not displayed), and the error-path explicit complete when the
  * terminal batch fails.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 const request = vi.fn();
 vi.mock('../src/bot-registry.js', () => ({

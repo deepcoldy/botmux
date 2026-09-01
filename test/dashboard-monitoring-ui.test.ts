@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { MonitoringPage, SessionResourceTable } from '../src/dashboard/web/monitoring-page.js';
 

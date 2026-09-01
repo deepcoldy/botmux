@@ -11,7 +11,7 @@
  *
  * Run: pnpm vitest run test/web-terminal-listen.test.ts
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { createServer, type Server } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { listenWebTerminalWithFallback } from '../src/utils/web-terminal-listen.js';

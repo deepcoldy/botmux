@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { resolveAllowedUsersWithMap } from '../src/im/lark/client.js';
 import { applyAllowedUsersResolve } from '../src/utils/allowed-users-apply.js';
 import { registerBot } from '../src/bot-registry.js';

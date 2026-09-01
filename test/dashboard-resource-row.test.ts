@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/core/cost-calculator.js', () => ({

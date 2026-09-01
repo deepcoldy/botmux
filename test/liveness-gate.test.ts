@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from '../src/adapters/backend/liveness-gate.js';
 
 describe('LivenessGate', () => {

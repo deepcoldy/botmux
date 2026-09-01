@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { resolveEffectiveBotmuxVersion } from '../src/utils/version-info.js';
 
 describe('version info', () => {

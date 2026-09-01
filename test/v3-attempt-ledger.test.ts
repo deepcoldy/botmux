@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { openV3WorkerAttempts } from '../src/workflows/v3/attempt-ledger.js';
 import type { StoredEvent, V3Event } from '../src/workflows/v3/journal.js';

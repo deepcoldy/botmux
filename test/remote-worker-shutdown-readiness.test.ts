@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { remoteWorkerShutdownInputBlocker } from '../src/core/remote-worker-shutdown-readiness.js';
 
 const idle = {

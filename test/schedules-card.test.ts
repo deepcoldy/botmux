@@ -2,7 +2,7 @@
  * PR3 `/dashboard schedules` slice 1 + 2a — card builder + callback handler tests.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import type { ScheduleCardTaskInput } from '../src/dashboard/schedule-card-model.js';
 import { toScheduleDetailDto } from '../src/dashboard/schedule-card-model.js';

@@ -6,7 +6,7 @@
  * plus the JSON-channel escape hatch for `object` / `array` params.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import {
   coerceWorkflowParams,

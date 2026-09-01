@@ -12,7 +12,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliSource = readFileSync(join(__dirname, '..', 'src', 'cli.ts'), 'utf8');

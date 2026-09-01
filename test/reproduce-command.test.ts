@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { buildReproduceCommand, selectReproduceLaunch } from '../src/adapters/backend/reproduce-command.js';
 
 // Dashboard「复现命令」跨后端准确性（codex review issue 1）。

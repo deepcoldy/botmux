@@ -3,7 +3,7 @@
  * msg_type=audio → 下载 opus → ASR 转写 → 带 🎤 前缀文本。
  * Run: pnpm vitest run test/audio-transcribe.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 import { resolveInboundAudio, AUDIO_TRANSCRIPTION_PREFIX } from '../src/im/lark/audio-transcribe.js';
 import type { ResolvedAsrConfig } from '../src/services/voice/asr.js';
 

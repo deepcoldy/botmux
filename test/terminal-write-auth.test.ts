@@ -15,7 +15,7 @@
 // capability in its own right: the owner explicitly issued that link, so it
 // grants write even when the platform authenticated the viewer as guest.
 import { createHmac } from 'node:crypto';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import * as terminalWriteAuth from '../src/core/terminal-write-auth.js';
 import {
   deriveTerminalWriteToken,

@@ -15,7 +15,7 @@
  * does NOT call `updateMessage`.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'bun:test';
 
 // Mock the Lark client module so we can assert updateMessage is NOT called.
 vi.mock('../src/im/lark/client.js', async () => {

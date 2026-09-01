@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from '../src/cli/session-list-liveness.js';
 
 describe('botmux list session liveness', () => {

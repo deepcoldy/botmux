@@ -11,7 +11,7 @@
  *   - queued/steered input writes its user record at dequeue time (user1 →
  *     tools → user2 → single assistant_final).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

@@ -8,7 +8,7 @@
  *
  * Run:  pnpm vitest run test/private-card-audience.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 
 // Mutable bot state the mocked getBot returns; each test rewrites it.

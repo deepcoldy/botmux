@@ -8,7 +8,7 @@
  *      with the attributed turn; history/unattributed events don't; observer
  *      errors never break attribution.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 
 import { extractAssistantThinking, extractCotEntries, type TranscriptEvent } from '../src/services/claude-transcript.js';
 import { BridgeTurnQueue, type BridgePendingTurn } from '../src/services/bridge-turn-queue.js';

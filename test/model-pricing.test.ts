@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/model-pricing.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   BUILT_IN_MODEL_PRICES,
   DEFAULT_USD_CNY,

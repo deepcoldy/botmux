@@ -5,7 +5,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import {
   recordTeamBot, isTeamBot, listTeamBots, removeTeamBot, DEFAULT_EXPIRY_MS,
 } from '../src/services/team-bots-store.js';

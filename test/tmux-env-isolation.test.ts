@@ -16,7 +16,7 @@
  * The fix is `tmuxEnv(env?)` — strips TMUX / TMUX_PANE and is the env every
  * tmux invocation in the codebase MUST pass.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { execSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

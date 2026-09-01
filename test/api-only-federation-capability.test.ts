@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { registerDeployment, syncDeployment, type FederatedBot } from '../src/services/federation-store.js';
 import { buildFederatedRoster } from '../src/services/federation-roster.js';
 

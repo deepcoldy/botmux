@@ -8,7 +8,7 @@
  *
  * Run:  pnpm vitest run test/mojo-isolated-workspace.test.ts
  */
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { mkdtempSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

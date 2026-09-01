@@ -4,7 +4,7 @@
  *
  * Run:  pnpm vitest run test/lark-upload.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Capture every SDK Client constructed by lark-upload + stub the upload call.
 const constructed: Array<Record<string, unknown>> = [];

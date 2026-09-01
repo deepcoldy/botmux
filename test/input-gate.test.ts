@@ -12,7 +12,7 @@
  *
  * Run: pnpm vitest run test/input-gate.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,

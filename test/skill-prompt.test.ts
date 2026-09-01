@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { renderSkillCatalogBlock } from '../src/core/skills/prompt.js';
 import type { SessionSkillManifest } from '../src/core/skills/types.js';

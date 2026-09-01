@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 import { handleV3RunSaveAction, isV3RunSaveAction } from '../src/im/lark/v3-run-save-card-handler.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';

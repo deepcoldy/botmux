@@ -8,7 +8,7 @@
 //   - 跨会话 capability → 403
 //   - 无 capability → 403
 //   - trusted-host HMAC → 200（不依赖 capability）
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import {
   setIpcAuthSecret,
   startIpcServer,

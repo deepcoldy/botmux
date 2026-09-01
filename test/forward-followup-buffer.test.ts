@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { ForwardFollowupBuffer } from '../src/im/lark/forward-followup-buffer.js';
 
 describe('ForwardFollowupBuffer', () => {

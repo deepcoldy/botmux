@@ -12,7 +12,7 @@
  *
  * 仅在 linux 且 bwrap 可用（含 unprivileged userns）时运行，否则 skip。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';

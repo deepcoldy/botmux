@@ -7,7 +7,7 @@
  *
  * Run:  pnpm vitest run test/schedule-store.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync,
   existsSync,
   mkdtempSync,

@@ -1,7 +1,7 @@
 // POST /api/sessions/:sessionId/close route-level authorization matrix.
 // Trusted host callers retain dashboard/admin behavior; an untrusted in-session
 // caller may only close the exact live session whose rotating capability it owns.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import {
   setIpcAuthSecret,
   startIpcServer,

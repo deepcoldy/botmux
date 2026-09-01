@@ -12,7 +12,7 @@
  *
  * Run: pnpm vitest run test/ready-gate.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { ReadyGate, shouldArmReadyGate } from '../src/utils/ready-gate.js';
 
 describe('shouldArmReadyGate', () => {

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { ALL_CLI_IDS, createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { discoverNativeCliSkillGroups } from '../src/core/skills/discovery.js';

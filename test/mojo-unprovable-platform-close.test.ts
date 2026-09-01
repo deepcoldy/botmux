@@ -19,7 +19,7 @@
  *
  * Run:  pnpm vitest run test/mojo-unprovable-platform-close.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { classifyUnprovenTermination } from '../src/adapters/backend/destroy-result.js';
 
 describe('classifyUnprovenTermination', () => {

@@ -11,7 +11,7 @@
  *
  * Run:  pnpm vitest run test/inflight-input-tracker.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 

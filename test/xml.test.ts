@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../src/utils/xml.js';
 
 describe('escapeXmlText', () => {

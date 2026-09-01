@@ -9,7 +9,7 @@
  *
  * Run: pnpm vitest run test/listen-with-probe.test.ts
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { createServer, get, type Server } from 'node:http';
 import { listenWithProbe } from '../src/utils/listen-with-probe.js';
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { createFontDownloadAgent } from '../src/setup/ensure-fonts.js';
 
 const PROXY_ENV_KEYS = [

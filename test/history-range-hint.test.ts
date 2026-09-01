@@ -22,7 +22,7 @@
  *
  * Run:  bun run vitest run test/history-range-hint.test.ts
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll } from 'bun:test';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 

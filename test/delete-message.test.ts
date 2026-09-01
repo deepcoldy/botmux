@@ -3,7 +3,7 @@
  * SDK 抛错或非 0 code 返回 false（grant 撤回兜底依赖这个真实行为）。
  * Run: pnpm vitest run test/delete-message.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }

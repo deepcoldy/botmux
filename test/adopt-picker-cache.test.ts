@@ -3,7 +3,7 @@
  * The cache exists so search / page re-renders of the picker card don't
  * re-shell-out to tmux; these pin the store / TTL / clear semantics.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 
 const discovery = vi.hoisted(() => ({
   tmux: vi.fn(() => []),

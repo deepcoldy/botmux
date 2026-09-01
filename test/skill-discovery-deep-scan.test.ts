@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'bun:test';
 import { discoverLocalSkillCandidates } from '../src/services/skill-registry-store.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest } from '../src/dashboard/skill-install-request.js';
 

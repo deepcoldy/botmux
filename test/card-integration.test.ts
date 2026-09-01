@@ -20,7 +20,7 @@
  * Run:  pnpm vitest run test/card-integration.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
+import { describe, it, expect, beforeEach, vi, type Mock } from 'bun:test';
 import { FakeLarkClient } from './fixtures/fake-lark-client.js';
 import {
   makeToggleEvent,

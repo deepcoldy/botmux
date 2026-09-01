@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
  * 产物而非整箱；selector 未命中 → GoalInputs.omitted（reason 'selectorMiss'），
  * 缺失对 agent 可见而非静默。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

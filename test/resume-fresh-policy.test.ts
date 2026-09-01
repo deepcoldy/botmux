@@ -17,7 +17,7 @@
  *
  * Run: pnpm vitest run test/resume-fresh-policy.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';

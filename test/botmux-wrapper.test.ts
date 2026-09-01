@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from '../src/core/botmux-wrapper.js';
 
 describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {

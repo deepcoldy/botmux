@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { issueTerminalControlGrant } from '../src/core/terminal-control-grant.js';
 import {
   PREVIEW_CONTENT_CAPABILITY_PATTERN,

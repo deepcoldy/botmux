@@ -5,7 +5,7 @@
  * The malformed-result branch previously had no coverage, and `'ok' in raw`
  * accepted { ok: 'yes' } as a successful teardown.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildCloseResultMessage, mayRestoreWriteAdmission, normalizeDestroyResult } from '../src/adapters/backend/destroy-result.js';
 
 describe('normalizeDestroyResult', () => {

@@ -1,5 +1,5 @@
 import { describe as bunDescribe, expect, it as bunIt, jest, mock, setSystemTime } from 'bun:test';
-import { vi } from 'vitest';
+import { vi } from 'bun:test';
 
 /**
  * Fills in the `vi.*` helpers `bun test` does not implement, for the subset

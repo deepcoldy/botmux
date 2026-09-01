@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { config } from '../src/config.js';
 import { DEFAULT_PROBE_SPAN } from '../src/utils/listen-with-probe.js';
 

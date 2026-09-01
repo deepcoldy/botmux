@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { cloneBotConfig } from '../src/setup/bot-config-editor.js';
 import { applyCloneDefaults, cloneSourceDefaultsFrom } from '../src/dashboard/web/bot-onboarding.js';
 

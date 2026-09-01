@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { detectDashboardLocale, normalizeDashboardLocale } from '../src/dashboard/web/i18n.js';
 import { stripMentionPrefix } from '../src/dashboard/web/ui.js';
 import {

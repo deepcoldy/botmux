@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import {
   CODEX_APP_INPUT_PREFIX,

@@ -11,7 +11,7 @@
  *
  * Run:  pnpm vitest run test/claude-code-cwd.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import {
   existsSync,
   lstatSync,

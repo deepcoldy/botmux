@@ -14,7 +14,7 @@
  *
  * Run: pnpm vitest run test/substitute-control-card.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 

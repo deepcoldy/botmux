@@ -10,7 +10,7 @@
  *   - 3 consecutive failures give up and DO NOT commit the dedup marker
  *     (so any retransmit can still deliver)
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const updateMessageMock = vi.fn(async () => {});

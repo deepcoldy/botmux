@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 // Source-level regression guard for the iOS third-party IME fix injected into
 // the web terminal page (getTerminalHtml in src/worker.ts). That block is a

@@ -5,7 +5,7 @@
  * instead of the CLI running in the pane. The tmux backends must cancel
  * copy-mode before forwarding chat input.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(),

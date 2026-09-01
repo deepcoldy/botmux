@@ -39,7 +39,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker } from '../src/types.js';

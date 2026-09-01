@@ -1,5 +1,5 @@
 /** Unit tests for the task-level topic → top-level → new-topic position cycle. */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import type { ScheduledTask } from '../src/types.js';
 
 const store = new Map<string, ScheduledTask>();

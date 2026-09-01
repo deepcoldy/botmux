@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/session-adopt.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 

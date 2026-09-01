@@ -21,7 +21,7 @@
  * Run: pnpm vitest run test/raw-input-followup-atomicity.test.ts
  */
 import { readFileSync } from 'node:fs';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import {
   finalizeRawCommandDelivery,
   writeRawCommandLine,

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { computeSessionPickerScrollWindow } from '../src/cli/session-picker-viewport.js';
 
 /**

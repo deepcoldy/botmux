@@ -2,7 +2,7 @@
  * p2pOpen：私聊对话全开（talk-only），管理权仍限 allowedUsers。
  * Run: pnpm vitest run test/p2p-open.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {

@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run --project unit test/crash-loop-diagnostic.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 import { EventEmitter } from 'node:events';
 
 // ─── Mocks (mirror worker-ready-display-mode.test.ts harness) ────────────────

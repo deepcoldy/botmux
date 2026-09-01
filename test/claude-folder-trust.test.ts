@@ -3,7 +3,7 @@
  * per-project folder-trust dialog so freshly spawned `claude` sessions in an
  * untrusted workingDir don't block on the interactive confirmation screen.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

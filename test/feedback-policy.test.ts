@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { normalizeFeedbackPolicy, resolveFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 describe('feedback policy', () => {

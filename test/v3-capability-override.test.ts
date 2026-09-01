@@ -2,7 +2,7 @@
  * v3 capability override（P2）— schema 校验 + 合并语义 + goal 渲染。
  * Workflow 权限姿态固定为 bypass；节点只允许改模型/追加指令。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 
 import { validateDag, DagValidationError } from '../src/workflows/v3/dag.js';
 import { mergeNodeCapability, renderGoalFile } from '../src/workflows/v3/runtime.js';

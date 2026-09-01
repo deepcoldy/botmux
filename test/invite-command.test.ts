@@ -4,7 +4,7 @@
  * 解析（唯一/未解析/歧义）、已在群内幂等、批量失败逐个回退。
  * Run: pnpm vitest run test/invite-command.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }

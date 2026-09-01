@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { SkillPacksTab } from '../src/dashboard/web/skills/skill-packs-tab.js';
 import type { SkillPackRow, SkillRow } from '../src/dashboard/web/skills/types.js';
 

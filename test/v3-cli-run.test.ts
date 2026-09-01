@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { authorizeManualCliRun } from '../src/workflows/v3/cli-run.js';

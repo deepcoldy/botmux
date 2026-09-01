@@ -22,7 +22,7 @@
  *
  * Run:  bun run vitest run test/history-thread-window.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 const hoisted = vi.hoisted(() => {
   const state = {

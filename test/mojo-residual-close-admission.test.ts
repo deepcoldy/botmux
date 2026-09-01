@@ -46,7 +46,7 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'bun:test';
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import type { TerminationOutcome } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux } from './helpers/synthetic-proc.js';

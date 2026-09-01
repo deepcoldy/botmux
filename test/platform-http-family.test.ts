@@ -1,6 +1,6 @@
 // test/platform-http-family.test.ts
 // postJson：平台 HTTP 助手的 IP 协议族强制路由——family 6 只走 IPv6、family 4 只走 IPv4。
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll } from 'bun:test';
 import { createServer, type Server } from 'node:http';
 import { lookup } from 'node:dns/promises';
 import { postJson } from '../src/platform/platform-http.js';

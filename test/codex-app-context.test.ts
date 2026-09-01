@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   CODEX_APP_CONTEXT_CHUNK_BYTES,
   addCodexAppContext,

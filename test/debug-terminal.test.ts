@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'bun:test';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';

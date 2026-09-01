@@ -6,7 +6,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 

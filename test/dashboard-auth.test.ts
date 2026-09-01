@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';

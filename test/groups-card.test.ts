@@ -5,7 +5,7 @@
  * matrix aggregation, detail management actions, and handler arms.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import type {
   GroupsBotInput,

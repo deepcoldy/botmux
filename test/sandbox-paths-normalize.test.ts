@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { normalizeSandboxPaths } from '../src/services/sandbox-store.js';
 import { effectiveAccess } from '../src/dashboard/web/bot-defaults-page.js';
 

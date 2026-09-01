@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildSkillGraph, danglingSkillNames, selectInstallCandidates } from '../src/dashboard/web/skills/shared.js';
 
 const installed = [{ name: 'deploy' }, { name: 'review' }, { name: 'release' }];

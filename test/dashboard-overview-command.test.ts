@@ -11,7 +11,7 @@
  *   - non-owner is blocked at the owner gate before reaching the handler.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { handleDashboardCommand } from '../src/core/dashboard-command/index.js';

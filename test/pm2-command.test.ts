@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildPm2SpawnCommand } from '../src/cli/pm2-command.js';
 
 describe('buildPm2SpawnCommand', () => {

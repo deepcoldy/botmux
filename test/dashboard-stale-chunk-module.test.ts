@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from '../src/dashboard/stale-chunk-module.js';
 
 describe('dashboard missing stale chunk module', () => {

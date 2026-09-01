@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/persistent-backend-type.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // Mutable per-test bot backend config the mocked getBot returns.
 const bot = vi.hoisted(() => ({ backendType: undefined as string | undefined }));

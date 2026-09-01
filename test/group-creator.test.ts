@@ -13,7 +13,7 @@
  *  - sendMessage throw surfaces as `notifyError`, chatId still returned
  *  - createChat throw bubbles up (caller decides exit code)
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'bun:test';
 
 const mockCreateChat = vi.fn();
 const mockTransferChatOwner = vi.fn();

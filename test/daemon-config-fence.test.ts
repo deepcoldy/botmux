@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import { reloadExactDaemonBotConfig } from '../src/core/daemon-config-fence.js';
 
 describe('explicit daemon final raw-index fence', () => {

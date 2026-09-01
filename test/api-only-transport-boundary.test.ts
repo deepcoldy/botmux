@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'bun:test';
 
 /**
  * Behavioral tests for PR D · API-only (core-only) transport boundary.

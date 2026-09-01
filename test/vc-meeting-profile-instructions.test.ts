@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   VC_MEETING_PROFILE_INSTRUCTIONS_MAX_CHARS,
   computeVcMeetingConsumerProfileHash,

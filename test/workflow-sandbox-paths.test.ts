@@ -7,7 +7,7 @@
  * sandboxHidePaths/sandboxReadonlyPaths crossed the boundary, silently dropping
  * the readWrite tier and any user-declared deny.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { botToSnapshot, parseFrozenBotSnapshots, serializeFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
 import { buildFsPolicy, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';

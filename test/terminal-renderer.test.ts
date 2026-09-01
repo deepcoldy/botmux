@@ -9,7 +9,7 @@
  * cols, and the resulting screenshot showed duplicated / stair-stepped
  * content + stretched gray bars.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { resolveRenderDimensions } from '../src/utils/render-dimensions.js';
 

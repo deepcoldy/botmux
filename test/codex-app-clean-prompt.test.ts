@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 vi.mock('../src/services/session-store.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/session-store.js')>()),

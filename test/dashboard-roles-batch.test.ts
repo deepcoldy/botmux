@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 import {
   MAX_ROLE_BATCH_TARGETS,
   aggregateRoleBatch,

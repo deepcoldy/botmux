@@ -5,7 +5,7 @@
  *
  * Run: pnpm vitest run test/codex-app-token-usage.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   TurnTokenUsageAccumulator,
   parseCodexTokenBreakdown,

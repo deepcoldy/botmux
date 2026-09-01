@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { buildRuntimeMonitorSummary, sessionRuntimeBucket } from '../src/core/resource-monitor/runtime.js';
 import type { ResourceBotCurrent, ResourceSessionCurrent } from '../src/core/resource-monitor/types.js';
 

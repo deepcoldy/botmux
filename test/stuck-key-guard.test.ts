@@ -16,7 +16,7 @@
  *
  * Run:  pnpm vitest run test/stuck-key-guard.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector, type StuckKeyGuardDeps, type StuckKeyGuardMessage } from '../src/utils/stuck-key-guard.js';
 
 const LEVEL_1_SNAPSHOT = 'Hooks\n\n⚠ 1 hook needs review before it can run.\n\nPress t to trust all; enter to review hooks; esc to close';

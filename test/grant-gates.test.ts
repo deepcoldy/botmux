@@ -2,7 +2,7 @@
  * 闸门接入：chatGrant 仅放行 canTalk，不放行 canOperate。
  * Run: pnpm vitest run test/grant-gates.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }

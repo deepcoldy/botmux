@@ -7,7 +7,7 @@
  * （cliId=opencode）当成唯一 hit，V2 hook 的问题被错投到 V1 话题。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { matchCliSession } from '../src/daemon.js';
 import type { DaemonSession } from '../src/core/types.js';
 

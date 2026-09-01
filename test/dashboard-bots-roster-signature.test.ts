@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import { botsRosterSignature } from '../src/dashboard/registry.js';
 import type { DaemonInfo } from '../src/dashboard/registry.js';
 

@@ -10,7 +10,7 @@
  *
  * Run: pnpm vitest run test/available-bots-collapse.test.ts
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'bun:test';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
 import { normalizeMircliPrompt, summarizeAvailableBots } from '../src/mir-prompt.js';
 import { getDefaultLocale, setDefaultLocale, type Locale } from '../src/i18n/index.js';

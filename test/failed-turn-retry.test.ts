@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/failed-turn-retry.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   RETRY_COOLDOWN_MS,
   shouldRecordFailedTurn,

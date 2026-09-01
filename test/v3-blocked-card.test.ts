@@ -3,7 +3,7 @@
  * 镜像 v3-gate-card 系测试：卡片纯函数断言 + handler 的注入 seam 测试。
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

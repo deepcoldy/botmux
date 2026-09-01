@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/card-handler-repo-select.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
 
 // ─── Mocks (before importing the module under test) ───────────────────────
 

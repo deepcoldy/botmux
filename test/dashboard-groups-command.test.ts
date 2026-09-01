@@ -6,7 +6,7 @@
  * the matrix card to the owner DM and confirms via `dm_sent` in the topic.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'bun:test';
 
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { handleDashboardCommand } from '../src/core/dashboard-command/index.js';

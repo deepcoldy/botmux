@@ -17,7 +17,7 @@
  *
  * Run:  pnpm vitest run test/tmux-probe.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'bun:test';
 
 // ⚠️ `require` INSIDE the factory, not the factory's `importOriginal` argument:
 // that argument is vitest-only (bun passes nothing, so awaiting it throws and the

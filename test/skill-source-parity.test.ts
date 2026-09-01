@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { detectSourceType } from '../src/dashboard/web/skills/skill-library-tab.js';
 import { parseSkillInstallSource } from '../src/core/skills/sources.js';
 import { discoverDashboardSkills, parseDashboardSkillInstallRequest } from '../src/dashboard/skill-install-request.js';

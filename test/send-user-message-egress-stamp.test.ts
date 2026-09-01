@@ -15,7 +15,7 @@
  *
  * Run: pnpm vitest run test/send-user-message-egress-stamp.test.ts
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'bun:test';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }

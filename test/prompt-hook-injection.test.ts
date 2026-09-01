@@ -6,7 +6,7 @@
  *   - off / 不支持的 CLI / preflight 失败 → inline（历史行为）
  * Run: pnpm vitest run test/prompt-hook-injection.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 
 // ─── Mocks（与 prompt-builder.test.ts 同一套） ─────────────────────────────
 

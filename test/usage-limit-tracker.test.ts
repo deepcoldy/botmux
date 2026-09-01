@@ -13,7 +13,7 @@
  * Run: pnpm vitest run test/usage-limit-tracker.test.ts
  */
 import { readFileSync } from 'node:fs';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 import { bridgeTurnOutcome, createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
 import { shouldSuppressBridgeEmit, structuredFallbackKind } from '../src/services/bridge-fallback-gate.js';

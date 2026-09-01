@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/idle-detector.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';

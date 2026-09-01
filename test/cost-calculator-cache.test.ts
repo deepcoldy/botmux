@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/cost-calculator-cache.test.ts
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'bun:test';
 vi.mock('node:fs', () => {
   // `require` inside the factory, not the vitest-only `importOriginal` argument
   // (bun passes none) and not a top-level import (vitest hoists this call above

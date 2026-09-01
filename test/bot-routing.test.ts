@@ -8,7 +8,7 @@
  * the one bound to the outbound chat. `pickBotEntryByName` now prefers
  * the entry whose `oncallChats` includes the outbound `chatId`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'bun:test';
 import {
   buildFooterAddressing,
   hasKnownBotMention,

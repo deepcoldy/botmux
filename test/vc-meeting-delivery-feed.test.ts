@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import type { NormalizedVcMeetingItem } from '../src/vc-agent/types.js';
 import {
   buildVcMeetingDeliveryEntries,

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 
 describe('Codex per-Bot reasoning effort', () => {

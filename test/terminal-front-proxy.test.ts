@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { DashboardSessionStore } from '../src/dashboard/h5-auth.js';
 import {
   issueTerminalControlGrant,

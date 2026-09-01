@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/lark-api-gate.test.ts
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'bun:test';
 
 const logMocks = vi.hoisted(() => ({
   info: vi.fn(),
