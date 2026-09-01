@@ -5719,6 +5719,15 @@ function bridgeDrainAndMaybeEmit(): void {
  *  Caches per-path drains so a batch of turns from the same file only reads
  *  the transcript once (O(jsonl size) per distinct path). */
 function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
+  // Retire the journal entries of turns the queue dropped head-of-line. These
+  // never reach `ready`, so this must run BEFORE the empty-`ready` early return
+  // below — a drop very often coincides with a tick that emits nothing.
+  for (const dropped of bridgeQueue.takeDroppedNeedingJournalClear()) {
+    journalBridgeTurnClear(dropped.turnId, dropped.dispatchAttempt);
+    if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+    log(`Bridge journal cleared for head-of-line dropped turn ${dropped.turnId.substring(0, 8)} `
+      + `— it produced no assistant text and a newer turn started`);
+  }
   const ready = bridgeQueue.drainEmittable(opts.explicitTerminalOnly
     ? { explicitTerminalOnly: true }
     : {
@@ -5881,6 +5890,28 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   for (const turn of ready) {
     if (turn.rateLimited) continue;
     const outcome = turn.terminalOutcome;
+    // A SYNTHESISED local turn has no Lark turn behind it: `local-*` /
+    // `local-headless-*` ids are minted by the queue for transcript activity
+    // that matched no pending mark (terminal-typed input, or — after a restart
+    // — replayed history whose original mark is long gone). Its FALLBACK is
+    // already suppressed unconditionally (shouldSuppressBridgeEmit returns true
+    // for isLocal in non-adopt), so letting its FAILURE terminal through means
+    // the daemon posts a 「本轮执行失败」card for a turn the user never sent —
+    // and, because the daemon stamps the card with `new Date()` and the
+    // session's *current* lastUserPrompt, that card names the wrong time and
+    // the wrong task. MEASURED: a provider_server_error from 10h earlier was
+    // re-surfaced as a fresh failure card on two consecutive daemon restarts.
+    //
+    // Scoped deliberately to the failure arm: a local turn's `completed`
+    // terminal stays, because that is what settles bookkeeping (dedupe claim,
+    // durable-turn release, CoT finalize) without showing the user anything.
+    // Non-local turns are untouched — a real Lark turn that genuinely failed
+    // must still raise its card, which is the whole point of that path.
+    if (turn.isLocal && outcome && outcome.status !== 'completed') {
+      log(`Bridge terminal suppressed for synthesised local turn ${turn.turnId.substring(0, 8)} `
+        + `(${outcome.status}${outcome.errorCode ? `/${outcome.errorCode}` : ''}) — no Lark turn to notify`);
+      continue;
+    }
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
