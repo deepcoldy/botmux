@@ -66,6 +66,27 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('voice configuration', () => {
+  it('preserves a MiniMax per-bot override', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([
+      makeCfg({
+        voice: {
+          engine: 'minimax',
+          speaker: 'voice-id',
+          minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+        },
+      }),
+    ]));
+
+    expect(config.voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+});
+
 // ─── registerBot ──────────────────────────────────────────────────────────
 
 describe('registerBot', () => {
